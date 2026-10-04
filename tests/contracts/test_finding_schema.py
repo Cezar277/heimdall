@@ -86,6 +86,22 @@ class FindingSchemaTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertFalse(self.validator.is_valid(dict(self.base, **{field: "PLACEHOLDER"})))
 
+    def test_trailing_line_terminators_rejected(self):
+        for field in ("file", "type", "snippet_hash"):
+            for suffix in ("\n", "\r", "\r\n", "\u2028", "\u2029"):
+                with self.subTest(field=field, suffix=repr(suffix)):
+                    self.assertFalse(self.validator.is_valid(
+                        dict(self.base, **{field: self.base[field] + suffix})
+                    ))
+
+    def test_string_length_boundaries(self):
+        for field, limit in (("file", 4096), ("type", 64)):
+            with self.subTest(field=field):
+                self.validator.validate(dict(self.base, **{field: "a" * limit}))
+                self.assertFalse(self.validator.is_valid(
+                    dict(self.base, **{field: "a" * (limit + 1)})
+                ))
+
     def test_root_must_be_object(self):
         for value in ([], None, "finding", 42):
             with self.subTest(value=value):

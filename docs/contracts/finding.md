@@ -5,7 +5,7 @@ Décisions : [ADR-001](../adr/001-finding-et-etats.md).
 
 | Champ | Contrat |
 | --- | --- |
-| `file` | Chemin relatif au dépôt avec `/`, sans chemin absolu ni segment `.` ou `..` |
+| `file` | Chemin relatif au dépôt avec `/`, 1 à 4096 caractères, sans chemin absolu ni segment `.` ou `..` |
 | `line` | Entier supérieur ou égal à 1 |
 | `type` | Catégorie en snake_case ASCII, 1 à 64 caractères |
 | `entropy` | Nombre entre 0 et 8, Shannon sur les octets UTF-8 du candidat |
@@ -16,6 +16,11 @@ Décisions : [ADR-001](../adr/001-finding-et-etats.md).
 Tous les champs sont obligatoires ; les propriétés inconnues sont rejetées.
 Le JSON Schema draft 2020-12 est validé hors ligne : `$schema` est un
 identifiant de dialecte, sans obligation de télécharger ce document.
+`$id` est l'identifiant stable du contrat ; il ne constitue pas un endpoint à
+télécharger. Les consommateurs doivent enregistrer le schéma localement.
+Les chaînes sont ancrées par `(?![\s\S])` pour imposer une vraie fin de chaîne,
+sans l'ambiguïté de `$` devant un saut de ligne final. Les chemins excluent
+aussi les séparateurs de ligne Unicode U+2028 et U+2029.
 
 ## Machine d'états
 
@@ -74,6 +79,17 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r tests/contracts/requirements.txt
 .venv/Scripts/python.exe -m unittest discover -s tests/contracts -v
 ```
+
+Linux/macOS :
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r tests/contracts/requirements.txt
+.venv/bin/python -m unittest discover -s tests/contracts -v
+```
+
+Le `.gitignore` accompagne uniquement ces tests : il exclut leur environnement
+virtuel et les caches Python générés localement.
 
 L'installation du validateur est une opération de développement. Les tests
 et le contrat n'effectuent aucun appel réseau. Ils vérifient le schéma contre

@@ -273,6 +273,57 @@
         "source": "regex",
         "secret": "PLACEHOLDER_NOT_A_SECRET"
       }
+    },
+    {
+      "name": "file avec LF final",
+      "reason": "Fin stricte : LF final interdit",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "src/config.py\n",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "type avec LF final",
+      "reason": "Fin stricte : LF final interdit",
+      "validator": "pattern",
+      "path": [
+        "type"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key\n",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "snippet_hash avec LF final",
+      "reason": "Fin stricte : LF final interdit",
+      "validator": "pattern",
+      "path": [
+        "snippet_hash"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000\n",
+        "status": "detecte",
+        "source": "regex"
+      }
     }
   ]
 }
