@@ -1,0 +1,380 @@
+{
+  "valid": [
+    {
+      "name": "detecte",
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "confirme",
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "confirme",
+        "source": "entropy"
+      }
+    },
+    {
+      "name": "vaulte",
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "vaulte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "rote",
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "rote",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "faux_positif",
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "faux_positif",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "signal consultatif llm",
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "llm"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "ligne zéro",
+      "reason": "ligne zéro",
+      "validator": "minimum",
+      "path": [
+        "line"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 0,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "ligne texte",
+      "reason": "ligne texte",
+      "validator": "type",
+      "path": [
+        "line"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": "12",
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "entropie négative",
+      "reason": "entropie négative",
+      "validator": "minimum",
+      "path": [
+        "entropy"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": -1,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "entropie trop élevée",
+      "reason": "entropie trop élevée",
+      "validator": "maximum",
+      "path": [
+        "entropy"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 9,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "état inconnu",
+      "reason": "état inconnu",
+      "validator": "enum",
+      "path": [
+        "status"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "rejete",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "source inconnue",
+      "reason": "source inconnue",
+      "validator": "enum",
+      "path": [
+        "source"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "remote"
+      }
+    },
+    {
+      "name": "empreinte trop courte",
+      "reason": "empreinte trop courte",
+      "validator": "pattern",
+      "path": [
+        "snippet_hash"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "chemin traversal",
+      "reason": "chemin traversal",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "../config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "chemin absolu Windows",
+      "reason": "chemin absolu Windows",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "C:/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "type vide",
+      "reason": "type vide",
+      "validator": "pattern",
+      "path": [
+        "type"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "champ obligatoire absent",
+      "reason": "snippet_hash obligatoire",
+      "validator": "required",
+      "path": [],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "champ secret interdit",
+      "reason": "propriété supplémentaire interdite, valeur purement synthétique",
+      "validator": "additionalProperties",
+      "path": [],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex",
+        "secret": "PLACEHOLDER_NOT_A_SECRET"
+      }
+    },
+    {
+      "name": "file avec LF final",
+      "reason": "Fin stricte : LF final interdit",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "src/config.py\n",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "type avec LF final",
+      "reason": "Fin stricte : LF final interdit",
+      "validator": "pattern",
+      "path": [
+        "type"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key\n",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "snippet_hash avec LF final",
+      "reason": "Fin stricte : LF final interdit",
+      "validator": "pattern",
+      "path": [
+        "snippet_hash"
+      ],
+      "finding": {
+        "file": "src/config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000\n",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "séparateur final",
+      "reason": "Chaque segment de file doit être non vide, sans séparateur final",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "src/config.py/",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "segment vide",
+      "reason": "Chaque segment de file doit être non vide, sans séparateur final",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "src//config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "segments vides multiples",
+      "reason": "Chaque segment de file doit être non vide, sans séparateur final",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "src///config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Heimdall Finding v1",
+  "description": "Contrat commun scanner, MCP, CLI et Vault. Aucune valeur de secret.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "file",
+    "line",
+    "type",
+    "entropy",
+    "snippet_hash",
+    "status",
+    "source"
+  ],
+  "properties": {
+    "file": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))[^/\\\\:\\u0000-\\u001f\\u007f\\u2028\\u2029]+(?:/[^/\\\\:\\u0000-\\u001f\\u007f\\u2028\\u2029]+)*(?![\\s\\S])",
+      "description": "Chemin relatif au dépôt, séparateurs / ; segments non vides, sans / final ; résolution confinée au dépôt par le consommateur.",
+      "maxLength": 4096
+    },
+    "line": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Ligne indexée à partir de 1."
+    },
+    "type": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}(?![\\s\\S])",
+      "description": "Identifiant de catégorie, par exemple api_key, password, private_key ou unknown.",
+      "maxLength": 64
+    },
+    "entropy": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 8,
+      "description": "Entropie de Shannon en bits par octet du candidat encodé en UTF-8."
+    },
+    "snippet_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}(?![\\s\\S])",
+      "description": "HMAC-SHA-256 du candidat, hexadécimal minuscule ; jamais la valeur brute. Voir ADR-001.",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "detecte",
+        "confirme",
+        "vaulte",
+        "rote",
+        "faux_positif"
+      ]
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "regex",
+        "entropy",
+        "llm"
+      ],
+      "description": "Origine du signal ; llm ne confère aucun droit de transition."
+    }
+  },
+  "$id": "https://github.com/Cezar277/heimdall/schemas/finding.schema.json"
+}
