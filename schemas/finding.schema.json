@@ -17,8 +17,8 @@
     "file": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))[^\\\\:\\u0000-\\u001f\\u007f\\u2028\\u2029]+(?![\\s\\S])",
-      "description": "Chemin relatif au dépôt, séparateurs / ; résolution confinée au dépôt par le consommateur.",
+      "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))[^/\\\\:\\u0000-\\u001f\\u007f\\u2028\\u2029]+(?:/[^/\\\\:\\u0000-\\u001f\\u007f\\u2028\\u2029]+)*(?![\\s\\S])",
+      "description": "Chemin relatif au dépôt, séparateurs / ; segments non vides, sans / final ; résolution confinée au dépôt par le consommateur.",
       "maxLength": 4096
     },
     "line": {

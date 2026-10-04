@@ -324,6 +324,57 @@
         "status": "detecte",
         "source": "regex"
       }
+    },
+    {
+      "name": "séparateur final",
+      "reason": "Chaque segment de file doit être non vide, sans séparateur final",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "src/config.py/",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "segment vide",
+      "reason": "Chaque segment de file doit être non vide, sans séparateur final",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "src//config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
+    },
+    {
+      "name": "segments vides multiples",
+      "reason": "Chaque segment de file doit être non vide, sans séparateur final",
+      "validator": "pattern",
+      "path": [
+        "file"
+      ],
+      "finding": {
+        "file": "src///config.py",
+        "line": 12,
+        "type": "api_key",
+        "entropy": 4.25,
+        "snippet_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "detecte",
+        "source": "regex"
+      }
     }
   ]
 }

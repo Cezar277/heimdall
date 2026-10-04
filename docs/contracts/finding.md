@@ -5,7 +5,7 @@ Décisions : [ADR-001](../adr/001-finding-et-etats.md).
 
 | Champ | Contrat |
 | --- | --- |
-| `file` | Chemin relatif au dépôt avec `/`, 1 à 4096 caractères, sans chemin absolu ni segment `.` ou `..` |
+| `file` | Chemin relatif au dépôt avec `/`, 1 à 4096 caractères, sans chemin absolu, segment vide, segment `.` ou `..`, ni `/` final |
 | `line` | Entier supérieur ou égal à 1 |
 | `type` | Catégorie en snake_case ASCII, 1 à 64 caractères |
 | `entropy` | Nombre entre 0 et 8, Shannon sur les octets UTF-8 du candidat |

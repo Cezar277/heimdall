@@ -81,6 +81,16 @@ class FindingSchemaTests(unittest.TestCase):
             with self.subTest(hash=value):
                 self.assertFalse(self.validator.is_valid(dict(self.base, snippet_hash=value)))
 
+    def test_empty_and_trailing_path_segments_rejected(self):
+        for value in ("src/", "config.py/", "src//config.py", "src///config.py",
+                      "src/nested//config.py", "src//", "/", "//config.py"):
+            with self.subTest(file=value):
+                self.assertFalse(self.validator.is_valid(dict(self.base, file=value)))
+        for value in ("config.py", "src/nested/config.py", "src/.config.py",
+                      "src/name..py", "src/été.py"):
+            with self.subTest(valid_file=value):
+                self.validator.validate(dict(self.base, file=value))
+
     def test_unknown_fields_rejected(self):
         for field in ("secret", "value", "snippet", "unexpected"):
             with self.subTest(field=field):
