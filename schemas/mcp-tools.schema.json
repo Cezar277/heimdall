@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Cezar277/heimdall/schemas/mcp-tools.schema.json",
+  "title": "Heimdall - contrat des outils MCP (v1)",
+  "description": "Surface STRICTEMENT limitee exposee au LLM local. 4 outils, tous en lecture seule. Toute modification de ce fichier passe par PR relue par les 4 membres + note ADR (ticket #16).",
+  "x-version": "1.1.0",
+  "x-tools": {
+    "read_diff": {
+      "mode": "read-only",
+      "input": {"$ref": "#/$defs/ReadDiffInput"},
+      "output": {"$ref": "#/$defs/ReadDiffResult"}
+    },
+    "sanitize_file": {
+      "mode": "read-only",
+      "input": {"$ref": "#/$defs/SanitizeFileInput"},
+      "output": {"$ref": "#/$defs/SanitizeFileResult"}
+    },
+    "list_candidates": {
+      "mode": "read-only",
+      "input": {"$ref": "#/$defs/ListCandidatesInput"},
+      "output": {"$ref": "#/$defs/ListCandidatesResult"}
+    },
+    "propose_patch": {
+      "mode": "read-only",
+      "input": {"$ref": "#/$defs/ProposePatchInput"},
+      "output": {"$ref": "#/$defs/ProposePatchResult"}
+    }
+  },
+  "x-guarantees": {
+    "note": "Un JSON Schema ne peut pas prouver qu'un outil n'ecrit pas. Les modes ci-dessus sont des EXIGENCES verifiees en relecture de code (ticket #27) et par les tests du serveur MCP, pas par ce fichier. Ce qui est ici est en revanche verifiable statiquement: surface fermee, entrees/sorties strictes, dependances, invariants conditionnels.",
+    "verified_by": "tests/contracts/test_mcp_tools_schema.py (part statique) + relecture de #27 (part comportementale)"
+  },
+  "x-obligations": {
+    "note": "Regles que le programme doit respecter et que ce schema ne peut pas exprimer, parce qu'elles portent sur deux champs independants ou sur des effets de bord. Ecrites ici pour que #27 et #30 les aient sous les yeux au moment du code; reprises dans le .md.",
+    "env_example_line_matches_env_var_name": "env_example_line DOIT valoir exactement env_var_name + '='. Un schema ne peut pas comparer deux champs distincts, donc une ligne 'OTHER=' passerait la validation. A verifier cote programme avant serialisation (#30).",
+    "proposal_id_always_present": "proposal_id reste obligatoire meme si manual_remediation vaut true, pour que la forme de la reponse ne depende pas du contenu du fichier: le LLM ne doit rien pouvoir deduire de la presence ou de l'absence d'un champ (#30).",
+    "env_var_name_uniqueness": "Si deux candidats de la meme session aboutissent au meme nom, le second recoit le suffixe _2 (#30.2).",
+    "snapshot_is_computed_in_memory": "snapshot_id est un SHA-256 calcule en memoire sur la sortie de `git diff --raw` concatenee aux OID de blob lus. Interdits explicites: git write-tree, git add, git stash, git commit, et toute ecriture dans .git/. Un outil qui ecrit dans .git/ viole l'invariant lecture seule (#27.4).",
+    "snapshot_for_working_tree": "En scope working_tree il n'y a pas d'OID d'index: le SHA-256 porte sur path + \\x00 + sha256(octets lus) pour chaque fichier EFFECTIVEMENT OUVERT pendant l'appel, trie par octets du chemin, avec le prefixe de version 'heimdall-snapshot-v1\\x00' et des separateurs \\x00 entre champs. Ne hacher que les fichiers contenant un candidat est INTERDIT: deux implementations divergeraient pour la meme liste. Si truncated vaut true, inclure un marqueur 'truncated' et ne couvrir que le prefixe examine: la CLI recalcule sur le perimetre complet a l'application, donc une proposition issue d'une liste tronquee est refusee (STALE_CANDIDATE).",
+    "every_removed_line_is_masked": "Dans patch_preview, CHAQUE ligne '-' doit porter au moins un marqueur <REDACTED:. Le schema ne l'exige que pour l'apercu entier (une seule ligne suffise a le satisfaire): le masquage ligne a ligne est une obligation de #27, a prouver par un test qui cherche une valeur en clair dans chaque ligne '-'. De meme, une ligne '+' ne doit jamais contenir la valeur d'origine."
+  },
+  "$defs": {
+    "RelPath": {
+      "description": "Chemin RELATIF a la racine du depot (la racine est fixee au demarrage du serveur, jamais fournie par le LLM). Meme grammaire que le champ file du contrat Finding (#14): separateurs /, pas de segment vide, pas de segment . ou .., pas de / final, pas de chemin absolu. Ce schema n'est qu'un premier filtre: la vraie garde (resolve + is_relative_to, refus des liens symboliques sortants) est la fonction unique du ticket #27.3.1.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))[^/\\\\:\\u0000-\\u001f\\u007f\\u2028\\u2029]+(?:/[^/\\\\:\\u0000-\\u001f\\u007f\\u2028\\u2029]+)*(?![\\s\\S])"
+    },
+    "CandidateId": {
+      "description": "Identifiant opaque attribue par le serveur pendant la session, valable uniquement dans le snapshot qui l'a produit. Un identifiant inconnu du snapshot courant est rejete (UNKNOWN_CANDIDATE); un identifiant connu mais perime est rejete (STALE_CANDIDATE).",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}(?![\\s\\S])"
+    },
+    "SnapshotId": {
+      "description": "Empreinte du perimetre analyse, calculee EN MEMOIRE par le serveur, prefixe de version 'heimdall-snapshot-v1\\x00'. Scope staged: SHA-256 sur le prefixe + les octets de `git diff --cached --raw --no-ext-diff --no-textconv` (les OID de blob y figurent deja). Scope working_tree: SHA-256 sur le prefixe + pour chaque fichier EFFECTIVEMENT OUVERT par le scanner pendant cet appel, trie par octets du chemin (filtre `file` inclus s'il est fourni), 'path + \\x00 + sha256(octets lus)'. Sans filtre, c'est l'ensemble des fichiers suivis non ignores qui ont ete ouverts. Si truncated vaut true, l'empreinte couvre uniquement le prefixe examine et inclut un marqueur 'truncated': une proposition issue d'une liste tronquee est liee a un perimetre partiel et sera refusee (STALE_CANDIDATE) au moment de l'application, qui recalcule sur le perimetre complet. Aucun objet n'est ecrit dans .git/: `git write-tree` est exclu parce qu'il ecrirait dans .git/objects et violerait l'invariant lecture seule. 64 caracteres hexadecimaux minuscules.",
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+    },
+    "EnvVarName": {
+      "description": "Nom de variable d'environnement propose par le LLM (entree NON fiable). Valide a nouveau cote programme (ticket #30.2): interdits PATH, LD_PRELOAD, PYTHONPATH...",
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{1,63}(?![\\s\\S])"
+    },
+    "EnvExampleLine": {
+      "description": "Ligne pour .env.example: NOM= (valeur toujours vide). L'ancre de fin de chaine est (?!\\s\\S) et non $, sinon une valeur suivie d'un saut de ligne passerait le controle et ajouterait une ligne dans le fichier.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 65,
+      "pattern": "^[A-Z][A-Z0-9_]{1,63}=(?![\\s\\S])"
+    },
+    "SecretStatus": {
+      "description": "Etats du secret du contrat Finding (#14), a l'identique. Le test test_mcp_tools_schema.py::test_candidate_matches_finding_contract verifie cette synchronisation.",
+      "enum": ["detecte", "confirme", "vaulte", "rote", "faux_positif"]
+    },
+    "SecretType": {
+      "description": "Categorie de secret, meme grammaire que le champ type du contrat Finding (#14). Le motif impose deja au moins un caractere, minLength est donc redondant et volontairement absent.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]{0,63}(?![\\s\\S])"
+    },
+    "SnippetHash": {
+      "description": "HMAC-SHA-256 hexadecimal minuscule de l'extrait, jamais l'extrait lui-meme (ADR-001).",
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+    },
+    "Source": {
+      "description": "Origine du signal. llm ne confère aucun droit de transition (contrat Finding #14).",
+      "enum": ["regex", "entropy", "llm"]
+    },
+    "ErrorCode": {
+      "enum": [
+        "INVALID_INPUT",
+        "PATH_ESCAPE",
+        "NOT_FOUND",
+        "FORBIDDEN_PATH",
+        "BINARY_FILE",
+        "TOO_LARGE",
+        "UNKNOWN_CANDIDATE",
+        "STALE_CANDIDATE",
+        "NOT_A_GIT_REPO",
+        "INTERNAL"
+      ],
+      "description": "Canaux d'echec. Le cas ambigu n'en fait PAS partie: il est un succes avec manual_remediation: true, pas une erreur (voir x-obligations). Reconnaitre un cas ambigu n'est pas un echec de l'outil, c'est sa reponse correcte."
+    },
+    "ErrorMessage": {
+      "description": "Message court, sans chemin absolu ni contenu de fichier ni valeur de secret. Les caracteres de controle sont refuses: un message d'erreur est relu par le LLM et ne doit pas pouvoir lui injecter une consigne (#34.3).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300,
+      "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]+(?![\\s\\S])"
+    },
+    "ToolError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"$ref": "#/$defs/ErrorCode"},
+        "message": {"$ref": "#/$defs/ErrorMessage"}
+      }
+    },
+    "ErrorResponse": {
+      "description": "Forme d'echec, commune aux 4 outils, et seule forme d'echec acceptee. Fail-closed: en cas de doute, on renvoie une erreur, jamais un resultat partiel silencieux.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {"$ref": "#/$defs/ToolError"}
+      }
+    },
+    "AddedLine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["line", "text"],
+      "properties": {
+        "line": {"type": "integer", "minimum": 1},
+        "text": {
+          "description": "Ligne ajoutee, valeurs candidates remplacees par <REDACTED:type:len=N>.",
+          "type": "string",
+          "maxLength": 2000
+        }
+      }
+    },
+    "DiffFile": {
+      "description": "Invariant: un fichier binaire ne peut pas porter de lignes. Sans cela le LLM pourrait lire un fichier binaire comme du texte et le traiter comme du code.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "binary", "added_lines"],
+      "properties": {
+        "file": {"$ref": "#/$defs/RelPath"},
+        "binary": {
+          "description": "true si git a classe le fichier en binaire. Les octets ne sont alors jamais convertis en texte.",
+          "type": "boolean"
+        },
+        "added_lines": {
+          "description": "Lignes ajoutees, videes si binary vaut true.",
+          "type": "array",
+          "maxItems": 5000,
+          "items": {"$ref": "#/$defs/AddedLine"}
+        }
+      },
+      "if": {"properties": {"binary": {"const": true}}, "required": ["binary"]},
+      "then": {"properties": {"added_lines": {"maxItems": 0}}}
+    },
+    "ReadDiffInput": {
+      "description": "Aucun parametre de chemin ni de racine: le LLM ne choisit pas ce qu'il voit, il voit ce qui va etre commite.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_bytes": {
+          "description": "Taille maximale de la reponse, en octets.",
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 65536,
+          "default": 32768
+        }
+      }
+    },
+    "ReadDiffOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files", "truncated"],
+      "properties": {
+        "files": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {"$ref": "#/$defs/DiffFile"}
+        },
+        "truncated": {
+          "description": "true si le diff a ete tronque (taille ou nombre de fichiers). Le LLM doit le traiter comme une information incomplete, jamais comme un diff vide.",
+          "type": "boolean"
+        }
+      }
+    },
+    "ReadDiffResult": {
+      "description": "Toute reponse de read_diff: succes OU erreur. Les deux formes sont exclusives (chacune est rejetee par l'autre), donc exactement une des deux s'applique.",
+      "oneOf": [
+        {"$ref": "#/$defs/ReadDiffOutput"},
+        {"$ref": "#/$defs/ErrorResponse"}
+      ]
+    },
+    "SanitizeFileInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"$ref": "#/$defs/RelPath"},
+        "start_line": {"type": "integer", "minimum": 1, "default": 1},
+        "max_lines": {"type": "integer", "minimum": 1, "maximum": 400, "default": 200}
+      }
+    },
+    "SanitizeFileOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "start_line", "end_line", "total_lines", "content", "redactions", "truncated"],
+      "properties": {
+        "path": {"$ref": "#/$defs/RelPath"},
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 0},
+        "total_lines": {"type": "integer", "minimum": 0},
+        "content": {
+          "description": "Extrait du fichier, valeurs candidates remplacees par <REDACTED:type:len=N>. Tronque a 100000 caracteres: le nombre de lignes est deja borne par max_lines, la longueur des lignes ne l'est pas (fichier minifie, fichier de donnees).",
+          "type": "string",
+          "maxLength": 100000
+        },
+        "redactions": {"type": "integer", "minimum": 0},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "SanitizeFileResult": {
+      "description": "Toute reponse de sanitize_file: succes OU erreur.",
+      "oneOf": [
+        {"$ref": "#/$defs/SanitizeFileOutput"},
+        {"$ref": "#/$defs/ErrorResponse"}
+      ]
+    },
+    "Candidate": {
+      "description": "Finding du scanner deterministe (champs du ticket #14) + contexte masque. La valeur du secret n'apparait JAMAIS en clair dans cette structure, ni dans aucune autre sortie du serveur.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "file", "line", "type", "entropy", "snippet_hash", "masked_snippet", "status", "source"],
+      "properties": {
+        "candidate_id": {"$ref": "#/$defs/CandidateId"},
+        "file": {"$ref": "#/$defs/RelPath"},
+        "line": {"type": "integer", "minimum": 1},
+        "type": {"$ref": "#/$defs/SecretType"},
+        "entropy": {
+          "description": "Entropie de Shannon en bits par octet, 0 a 8. Meme borne que le contrat Finding (#14).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 8
+        },
+        "snippet_hash": {"$ref": "#/$defs/SnippetHash"},
+        "masked_snippet": {
+          "description": "Extrait masque: la valeur en clair n'apparait jamais. La forme (type, longueur, contexte) suffit au LLM pour classer le candidat.",
+          "type": "string",
+          "maxLength": 200
+        },
+        "status": {"$ref": "#/$defs/SecretStatus"},
+        "source": {"$ref": "#/$defs/Source"},
+        "context_before": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {"type": "string", "maxLength": 2000}
+        },
+        "context_after": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {"type": "string", "maxLength": 2000}
+        }
+      }
+    },
+    "ListCandidatesInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scope": {"enum": ["staged", "working_tree"], "default": "staged"},
+        "file": {"$ref": "#/$defs/RelPath"},
+        "offset": {"type": "integer", "minimum": 0, "default": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+      }
+    },
+    "ListCandidatesOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_id", "candidates", "total", "truncated"],
+      "properties": {
+        "snapshot_id": {"$ref": "#/$defs/SnapshotId"},
+        "candidates": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {"$ref": "#/$defs/Candidate"}
+        },
+        "total": {"type": "integer", "minimum": 0},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "ListCandidatesResult": {
+      "description": "Toute reponse de list_candidates: succes OU erreur.",
+      "oneOf": [
+        {"$ref": "#/$defs/ListCandidatesOutput"},
+        {"$ref": "#/$defs/ErrorResponse"}
+      ]
+    },
+    "ProposePatchInput": {
+      "description": "Le LLM ne fournit QUE l'identifiant du candidat et un nom de variable. Ni le patch, ni la ligne d'origine, ni la valeur: le programme calcule tout et ne renvoie qu'un apercu expurge.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "env_var_name"],
+      "properties": {
+        "candidate_id": {"$ref": "#/$defs/CandidateId"},
+        "env_var_name": {"$ref": "#/$defs/EnvVarName"},
+        "rationale": {
+          "description": "Justification courte, journalisee (ticket #33). Jamais executee ni interpretee.",
+          "type": "string",
+          "maxLength": 500
+        }
+      }
+    },
+    "PatchPreview": {
+      "description": "APERCU du diff, et non le diff. Les lignes '-' doivent porter <REDACTED:type:len=N> a la place de la valeur. ATTENTION, ce que ce schema verifie est une FORME MINIMALE: un apercu non vide contient au moins un marqueur de masquage. Il n'est PAS verifie qu'aucune valeur en clair ne subsiste a cote de ce marqueur, ni que chaque ligne '-' est masquee: c'est une obligation de #27 (voir x-obligations), a prouver par test de masquage, pas par ce schema. Le diff reel ne quitte jamais le processus: il reste cote serveur, referencable par proposal_id, et seul le developpeur le voit, dans le terminal de confiance, au moment du Y/N/E.",
+      "type": "string",
+      "maxLength": 20000,
+      "anyOf": [
+        {"maxLength": 0},
+        {"pattern": "^(?=[\\s\\S]*<REDACTED:)[\\s\\S]+(?![\\s\\S])"}
+      ]
+    },
+    "ProposePatchOutput": {
+      "description": "Un APERCU expurge, jamais une ecriture et jamais le diff reel. applied vaut toujours false. Ce que la CLI applique apres validation humaine Y/N/E (ticket #32) est le diff reel, resolu cote serveur via proposal_id; patch_preview ne quitte jamais le processus et n'est jamais ecrit sur disque.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "snapshot_id", "proposal_id", "applied", "manual_remediation", "patch_preview", "env_var_name", "env_example_line"],
+      "properties": {
+        "candidate_id": {"$ref": "#/$defs/CandidateId"},
+        "snapshot_id": {
+          "description": "Empreinte du perimetre sur lequel la proposition a ete calculee. Si le perimetre a change au moment de l'application, la CLI abandonne (STALE_CANDIDATE): mieux vaut ne rien faire que modifier autre chose que ce qui a ete valide.",
+          "$ref": "#/$defs/SnapshotId"
+        },
+        "proposal_id": {
+          "description": "Reference opaque, cote serveur, vers le diff reel et la ligne .env a ecrire. Toujours present, y compris quand manual_remediation vaut true (voir x-obligations): le LLM ne peut ni le deviner ni le resoudre, il n'a aucun acces en lecture au Vault ni au diff complet.",
+          "$ref": "#/$defs/CandidateId"
+        },
+        "applied": {"const": false},
+        "manual_remediation": {
+          "description": "true si le cas est ambigu (f-string, concatenation...): patch_preview vide, remediation manuelle. Mieux vaut refuser que corrompre le code.",
+          "type": "boolean"
+        },
+        "patch_preview": {"$ref": "#/$defs/PatchPreview"},
+        "env_var_name": {
+          "description": "Nom final apres validation et dedoublonnage (_2, _3...). Cohérence avec env_example_line verifiee par le programme, pas par ce schema (voir x-obligations).",
+          "allOf": [{"$ref": "#/$defs/EnvVarName"}]
+        },
+        "env_example_line": {"$ref": "#/$defs/EnvExampleLine"}
+      },
+      "if": {
+        "properties": {"manual_remediation": {"const": true}},
+        "required": ["manual_remediation"]
+      },
+      "then": {
+        "properties": {"patch_preview": {"const": ""}}
+      },
+      "else": {
+        "properties": {"patch_preview": {"minLength": 1}}
+      }
+    },
+    "ProposePatchResult": {
+      "description": "Toute reponse de propose_patch: succes OU erreur.",
+      "oneOf": [
+        {"$ref": "#/$defs/ProposePatchOutput"},
+        {"$ref": "#/$defs/ErrorResponse"}
+      ]
+    }
+  }
+}
