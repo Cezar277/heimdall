@@ -3,7 +3,7 @@
   "$id": "https://github.com/Cezar277/heimdall/schemas/mcp-tools.schema.json",
   "title": "Heimdall - contrat des outils MCP (v1)",
   "description": "Surface STRICTEMENT limitee exposee au LLM local. 4 outils, tous en lecture seule. Toute modification de ce fichier passe par PR relue par les 4 membres + note ADR (ticket #16).",
-  "x-version": "1.1.0",
+  "x-version": "1.2.0",
   "x-tools": {
     "read_diff": {
       "mode": "read-only",
@@ -37,7 +37,8 @@
     "env_var_name_uniqueness": "Si deux candidats de la meme session aboutissent au meme nom, le second recoit le suffixe _2 (#30.2).",
     "snapshot_is_computed_in_memory": "snapshot_id est un SHA-256 calcule en memoire sur la sortie de `git diff --raw` concatenee aux OID de blob lus. Interdits explicites: git write-tree, git add, git stash, git commit, et toute ecriture dans .git/. Un outil qui ecrit dans .git/ viole l'invariant lecture seule (#27.4).",
     "snapshot_for_working_tree": "En scope working_tree il n'y a pas d'OID d'index: le SHA-256 porte sur path + \\x00 + sha256(octets lus) pour chaque fichier EFFECTIVEMENT OUVERT pendant l'appel, trie par octets du chemin, avec le prefixe de version 'heimdall-snapshot-v1\\x00' et des separateurs \\x00 entre champs. Ne hacher que les fichiers contenant un candidat est INTERDIT: deux implementations divergeraient pour la meme liste. Si truncated vaut true, inclure un marqueur 'truncated' et ne couvrir que le prefixe examine: la CLI recalcule sur le perimetre complet a l'application, donc une proposition issue d'une liste tronquee est refusee (STALE_CANDIDATE).",
-    "every_removed_line_is_masked": "Dans patch_preview, CHAQUE ligne '-' doit porter au moins un marqueur <REDACTED:. Le schema ne l'exige que pour l'apercu entier (une seule ligne suffise a le satisfaire): le masquage ligne a ligne est une obligation de #27, a prouver par un test qui cherche une valeur en clair dans chaque ligne '-'. De meme, une ligne '+' ne doit jamais contenir la valeur d'origine."
+    "every_removed_line_is_masked": "Dans patch_preview, CHAQUE ligne '-' doit porter au moins un marqueur <REDACTED:. Le schema ne l'exige que pour l'apercu entier (une seule ligne suffise a le satisfaire): le masquage ligne a ligne est une obligation de #27, a prouver par un test qui cherche une valeur en clair dans chaque ligne '-'. De meme, une ligne '+' ne doit jamais contenir la valeur d'origine.",
+    "masking_before_serialization": "TOUS les champs texte lus par le LLM doivent etre masques par le programme AVANT l'appel a json.dumps: AddedLine.text, SanitizeFileOutput.content, Candidate.masked_snippet, context_before, context_after, PatchPreview. Masquer apres serialisation laisserait la valeur dans un buffer ou une trace. Les filets structurels du schema (DiffFile.redactions implique un marqueur dans added_lines, SanitizeFileOutput.redactions implique un marqueur dans content, PatchPreview non vide implique un marqueur) detectent un masquage OUBLIE, pas un masquage PARTIEL: une valeur en clair subsistant a cote d'un marqueur passe la validation. #27 doit donc prouver le masquage par des tests qui cherchent une valeur connue dans CHAQUE champ texte de chaque sortie, pas par la validation du schema."
   },
   "$defs": {
     "RelPath": {
@@ -105,7 +106,7 @@
         "NOT_A_GIT_REPO",
         "INTERNAL"
       ],
-      "description": "Canaux d'echec. Le cas ambigu n'en fait PAS partie: il est un succes avec manual_remediation: true, pas une erreur (voir x-obligations). Reconnaitre un cas ambigu n'est pas un echec de l'outil, c'est sa reponse correcte."
+      "description": "Vocabulaire GLOBAL des echecs. Chaque outil n'accepte qu'un sous-ensemble (voir ReadDiffError, SanitizeFileError, ListCandidatesError, ProposePatchError): read_diff ne renvoie jamais UNKNOWN_CANDIDATE, propose_patch ne renvoie jamais PATH_ESCAPE. Le cas ambigu n'en fait PAS partie: il est un succes avec manual_remediation: true, pas une erreur (voir x-obligations). Reconnaitre un cas ambigu n'est pas un echec de l'outil, c'est sa reponse correcte."
     },
     "ErrorMessage": {
       "description": "Message court, sans chemin absolu ni contenu de fichier ni valeur de secret. Les caracteres de controle sont refuses: un message d'erreur est relu par le LLM et ne doit pas pouvoir lui injecter une consigne (#34.3).",
@@ -115,6 +116,7 @@
       "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]+(?![\\s\\S])"
     },
     "ToolError": {
+      "description": "Forme d'echec generique: le SERVEUR ne la renvoie jamais telle quelle, chaque outil a sa propre enveloppe (ci-dessous) qui en reprend la forme avec un sous-ensemble de codes. Elle reste ici comme reference documentaire de l'enveloppe commune.",
       "type": "object",
       "additionalProperties": false,
       "required": ["code", "message"],
@@ -124,12 +126,84 @@
       }
     },
     "ErrorResponse": {
-      "description": "Forme d'echec, commune aux 4 outils, et seule forme d'echec acceptee. Fail-closed: en cas de doute, on renvoie une erreur, jamais un resultat partiel silencieux.",
+      "description": "Forme d'echec generique, NON renvoyee directement: voir ReadDiffErrorResponse, SanitizeFileErrorResponse, ListCandidatesErrorResponse, ProposePatchErrorResponse. Fail-closed: en cas de doute, on renvoie une erreur, jamais un resultat partiel silencieux.",
       "type": "object",
       "additionalProperties": false,
       "required": ["error"],
       "properties": {
         "error": {"$ref": "#/$defs/ToolError"}
+      }
+    },
+    "ReadDiffError": {
+      "description": "Echecs possibles de read_diff, et eux seuls. Pas de chemin en entree, pas de candidat: PATH_ESCAPE, NOT_FOUND, FORBIDDEN_PATH, BINARY_FILE, UNKNOWN_CANDIDATE et STALE_CANDIDATE sont impossibles ici et leur renvoi est une erreur du serveur.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"enum": ["INVALID_INPUT", "TOO_LARGE", "NOT_A_GIT_REPO", "INTERNAL"]},
+        "message": {"$ref": "#/$defs/ErrorMessage"}
+      }
+    },
+    "ReadDiffErrorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {"$ref": "#/$defs/ReadDiffError"}
+      }
+    },
+    "SanitizeFileError": {
+      "description": "Echecs possibles de sanitize_file, et eux seuls. Les codes de chemin (PATH_ESCAPE, NOT_FOUND, FORBIDDEN_PATH, BINARY_FILE, TOO_LARGE) viennent de l'entree path; UNKNOWN_CANDIDATE et STALE_CANDIDATE sont impossibles ici.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"enum": ["INVALID_INPUT", "PATH_ESCAPE", "NOT_FOUND", "FORBIDDEN_PATH", "BINARY_FILE", "TOO_LARGE", "NOT_A_GIT_REPO", "INTERNAL"]},
+        "message": {"$ref": "#/$defs/ErrorMessage"}
+      }
+    },
+    "SanitizeFileErrorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {"$ref": "#/$defs/SanitizeFileError"}
+      }
+    },
+    "ListCandidatesError": {
+      "description": "Echecs possibles de list_candidates, et eux seuls. Les codes de chemin viennent du filtre file optionnel (inexistant: NOT_FOUND, interdit: FORBIDDEN_PATH, evasif: PATH_ESCAPE); list_candidates produit des candidats mais n'en consomme pas, donc UNKNOWN_CANDIDATE et STALE_CANDIDATE sont impossibles ici.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"enum": ["INVALID_INPUT", "PATH_ESCAPE", "NOT_FOUND", "FORBIDDEN_PATH", "NOT_A_GIT_REPO", "INTERNAL"]},
+        "message": {"$ref": "#/$defs/ErrorMessage"}
+      }
+    },
+    "ListCandidatesErrorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {"$ref": "#/$defs/ListCandidatesError"}
+      }
+    },
+    "ProposePatchError": {
+      "description": "Echecs possibles de propose_patch, et eux seuls. L'outil ne prend ni chemin ni fichier en entree: PATH_ESCAPE, NOT_FOUND, FORBIDDEN_PATH, BINARY_FILE et TOO_LARGE sont impossibles ici et leur renvoi est une erreur du serveur.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"enum": ["INVALID_INPUT", "UNKNOWN_CANDIDATE", "STALE_CANDIDATE", "NOT_A_GIT_REPO", "INTERNAL"]},
+        "message": {"$ref": "#/$defs/ErrorMessage"}
+      }
+    },
+    "ProposePatchErrorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {"$ref": "#/$defs/ProposePatchError"}
       }
     },
     "AddedLine": {
@@ -139,22 +213,27 @@
       "properties": {
         "line": {"type": "integer", "minimum": 1},
         "text": {
-          "description": "Ligne ajoutee, valeurs candidates remplacees par <REDACTED:type:len=N>.",
+          "description": "Ligne ajoutee, valeurs candidates remplacees par <REDACTED:type:len=N> AVANT serialisation (obligation #27, voir x-obligations). Une ligne sans secret ne porte legitiment aucun marqueur: le schema ne peut donc pas l'exiger ici.",
           "type": "string",
           "maxLength": 2000
         }
       }
     },
     "DiffFile": {
-      "description": "Invariant: un fichier binaire ne peut pas porter de lignes. Sans cela le LLM pourrait lire un fichier binaire comme du texte et le traiter comme du code.",
+      "description": "Invariant: un fichier binaire ne peut pas porter de lignes. Sans cela le LLM pourrait lire un fichier binaire comme du texte et le traiter comme du code. Invariant de masquage: si redactions vaut 1 ou plus, au moins une ligne porte un marqueur <REDACTED: (filet structurel; le masquage de CHAQUE ligne reste une obligation de #27, voir x-obligations).",
       "type": "object",
       "additionalProperties": false,
-      "required": ["file", "binary", "added_lines"],
+      "required": ["file", "binary", "redactions", "added_lines"],
       "properties": {
         "file": {"$ref": "#/$defs/RelPath"},
         "binary": {
           "description": "true si git a classe le fichier en binaire. Les octets ne sont alors jamais convertis en texte.",
           "type": "boolean"
+        },
+        "redactions": {
+          "description": "Nombre de valeurs masquees dans les lignes ajoutees de ce fichier. Compte par le programme pendant le masquage, avant serialisation.",
+          "type": "integer",
+          "minimum": 0
         },
         "added_lines": {
           "description": "Lignes ajoutees, videes si binary vaut true.",
@@ -163,8 +242,16 @@
           "items": {"$ref": "#/$defs/AddedLine"}
         }
       },
-      "if": {"properties": {"binary": {"const": true}}, "required": ["binary"]},
-      "then": {"properties": {"added_lines": {"maxItems": 0}}}
+      "allOf": [
+        {
+          "if": {"properties": {"binary": {"const": true}}, "required": ["binary"]},
+          "then": {"properties": {"added_lines": {"maxItems": 0}}}
+        },
+        {
+          "if": {"properties": {"redactions": {"minimum": 1}}, "required": ["redactions"]},
+          "then": {"properties": {"added_lines": {"contains": {"properties": {"text": {"pattern": "<REDACTED:"}}, "required": ["text"]}}}}
+        }
+      ]
     },
     "ReadDiffInput": {
       "description": "Aucun parametre de chemin ni de racine: le LLM ne choisit pas ce qu'il voit, il voit ce qui va etre commite.",
@@ -197,10 +284,10 @@
       }
     },
     "ReadDiffResult": {
-      "description": "Toute reponse de read_diff: succes OU erreur. Les deux formes sont exclusives (chacune est rejetee par l'autre), donc exactement une des deux s'applique.",
+      "description": "Toute reponse de read_diff: succes OU echec propre a read_diff (INVALID_INPUT, TOO_LARGE, NOT_A_GIT_REPO, INTERNAL). Les deux formes sont exclusives (chacune est rejetee par l'autre), donc exactement une des deux s'applique.",
       "oneOf": [
         {"$ref": "#/$defs/ReadDiffOutput"},
-        {"$ref": "#/$defs/ErrorResponse"}
+        {"$ref": "#/$defs/ReadDiffErrorResponse"}
       ]
     },
     "SanitizeFileInput": {
@@ -214,6 +301,7 @@
       }
     },
     "SanitizeFileOutput": {
+      "description": "Invariant de masquage: si redactions vaut 1 ou plus, content porte au moins un marqueur <REDACTED: (filet structurel; le masquage de chaque valeur reste une obligation de #27, voir x-obligations).",
       "type": "object",
       "additionalProperties": false,
       "required": ["path", "start_line", "end_line", "total_lines", "content", "redactions", "truncated"],
@@ -223,23 +311,29 @@
         "end_line": {"type": "integer", "minimum": 0},
         "total_lines": {"type": "integer", "minimum": 0},
         "content": {
-          "description": "Extrait du fichier, valeurs candidates remplacees par <REDACTED:type:len=N>. Tronque a 100000 caracteres: le nombre de lignes est deja borne par max_lines, la longueur des lignes ne l'est pas (fichier minifie, fichier de donnees).",
+          "description": "Extrait du fichier, valeurs candidates remplacees par <REDACTED:type:len=N> AVANT serialisation (obligation #27). Tronque a 100000 caracteres: le nombre de lignes est deja borne par max_lines, la longueur des lignes ne l'est pas (fichier minifie, fichier de donnees).",
           "type": "string",
           "maxLength": 100000
         },
-        "redactions": {"type": "integer", "minimum": 0},
+        "redactions": {
+          "description": "Nombre de valeurs masquees dans content. Compte par le programme pendant le masquage, avant serialisation.",
+          "type": "integer",
+          "minimum": 0
+        },
         "truncated": {"type": "boolean"}
-      }
+      },
+      "if": {"properties": {"redactions": {"minimum": 1}}, "required": ["redactions"]},
+      "then": {"properties": {"content": {"pattern": "<REDACTED:"}}}
     },
     "SanitizeFileResult": {
-      "description": "Toute reponse de sanitize_file: succes OU erreur.",
+      "description": "Toute reponse de sanitize_file: succes OU echec propre a sanitize_file.",
       "oneOf": [
         {"$ref": "#/$defs/SanitizeFileOutput"},
-        {"$ref": "#/$defs/ErrorResponse"}
+        {"$ref": "#/$defs/SanitizeFileErrorResponse"}
       ]
     },
     "Candidate": {
-      "description": "Finding du scanner deterministe (champs du ticket #14) + contexte masque. La valeur du secret n'apparait JAMAIS en clair dans cette structure, ni dans aucune autre sortie du serveur.",
+      "description": "Finding du scanner deterministe (champs du ticket #14) + contexte masque. Exigence: la valeur du secret ne figure en clair dans AUCUNE sortie du serveur (masked_snippet, context_before, context_after, AddedLine.text, SanitizeFileOutput.content, PatchPreview). Ce que le schema verifie est structurel et partiel (voir DiffFile, SanitizeFileOutput, PatchPreview); le masquage effectif avant serialisation est une obligation de #27 (voir x-obligations).",
       "type": "object",
       "additionalProperties": false,
       "required": ["candidate_id", "file", "line", "type", "entropy", "snippet_hash", "masked_snippet", "status", "source"],
@@ -256,18 +350,20 @@
         },
         "snippet_hash": {"$ref": "#/$defs/SnippetHash"},
         "masked_snippet": {
-          "description": "Extrait masque: la valeur en clair n'apparait jamais. La forme (type, longueur, contexte) suffit au LLM pour classer le candidat.",
+          "description": "Extrait masque AVANT serialisation (obligation #27): la valeur en clair ne doit jamais y figurer. La forme (type, longueur, contexte) suffit au LLM pour classer le candidat.",
           "type": "string",
           "maxLength": 200
         },
         "status": {"$ref": "#/$defs/SecretStatus"},
         "source": {"$ref": "#/$defs/Source"},
         "context_before": {
+          "description": "Lignes de contexte masquees AVANT serialisation (obligation #27, comme masked_snippet). Une ligne sans secret ne porte legitiment aucun marqueur.",
           "type": "array",
           "maxItems": 5,
           "items": {"type": "string", "maxLength": 2000}
         },
         "context_after": {
+          "description": "Lignes de contexte masquees AVANT serialisation (obligation #27, comme masked_snippet). Une ligne sans secret ne porte legitiment aucun marqueur.",
           "type": "array",
           "maxItems": 5,
           "items": {"type": "string", "maxLength": 2000}
@@ -300,10 +396,10 @@
       }
     },
     "ListCandidatesResult": {
-      "description": "Toute reponse de list_candidates: succes OU erreur.",
+      "description": "Toute reponse de list_candidates: succes OU echec propre a list_candidates.",
       "oneOf": [
         {"$ref": "#/$defs/ListCandidatesOutput"},
-        {"$ref": "#/$defs/ErrorResponse"}
+        {"$ref": "#/$defs/ListCandidatesErrorResponse"}
       ]
     },
     "ProposePatchInput": {
@@ -369,10 +465,10 @@
       }
     },
     "ProposePatchResult": {
-      "description": "Toute reponse de propose_patch: succes OU erreur.",
+      "description": "Toute reponse de propose_patch: succes OU echec propre a propose_patch (dont UNKNOWN_CANDIDATE et STALE_CANDIDATE).",
       "oneOf": [
         {"$ref": "#/$defs/ProposePatchOutput"},
-        {"$ref": "#/$defs/ErrorResponse"}
+        {"$ref": "#/$defs/ProposePatchErrorResponse"}
       ]
     }
   }

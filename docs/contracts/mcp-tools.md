@@ -28,7 +28,7 @@ Un JSON Schema décrit des **formes de données**. Il ne prouve pas qu'un outil 
 |---|---|
 | Surface fermée : 4 outils, aucun autre nom appelable | **prouvé statiquement** |
 | Entrées/sorties strictes, invariants conditionnels, erreurs exclusives du succès | **prouvé statiquement** |
-| Aucune valeur de secret en clair | **forme minimale prouvée** (`PatchPreview`, `SnippetHash`) ; masquage ligne à ligne à prouver en revue de #27 |
+| Aucune valeur de secret en clair | **forme minimale prouvée** (`PatchPreview`, `SnippetHash`, filets `redactions` ⇒ marqueur) ; masquage ligne à ligne et champs libres à prouver en revue de #27 |
 | Aucun outil n'écrit, ni dans le dépôt ni dans `.git/` | **exigence, non preuve** (revue #27) |
 | Le diff réel ne quitte pas le processus | **exigence, non preuve** (revue #27, ADR) |
 | La garde de chemin bloque `..` et les liens sortants | **grammaire prouvée** ; résolution réelle à prouver en revue de #27.3.1 |
@@ -65,11 +65,11 @@ Chaque outil renvoie **exactement une** des deux formes suivantes :
 {"files": [...], "truncated": false}         {"error": {"code": "PATH_ESCAPE", "message": "..."}}
 ```
 
-Dans le schéma, `x-tools[<outil>].output` pointe vers un `oneOf` succès / `ErrorResponse` (`ReadDiffResult`, `SanitizeFileResult`, `ListCandidatesResult`, `ProposePatchResult`). C'est ce qui **rattache les codes d'erreur à chaque outil** au lieu de laisser `ErrorResponse` isolé : lire `ProposePatchResult` suffit à savoir que `UNKNOWN_CANDIDATE` et `STALE_CANDIDATE` sont des échecs possibles de `propose_patch`. Les deux formes sont exclusives (chacune est rejetée par l'autre schéma), donc un message hybridant succès et erreur est refusé plutôt que résolu au hasard.
+Dans le schéma, `x-tools[<outil>].output` pointe vers un `oneOf` succès / erreur **propre à l'outil** (`ReadDiffResult`, `SanitizeFileResult`, `ListCandidatesResult`, `ProposePatchResult`). Chaque enveloppe d'échec (`ReadDiffErrorResponse` et les 3 autres) reprend la forme commune `{error: {code, message}}` mais restreint `code` au sous-ensemble de l'outil (section 6) : `read_diff` ne peut pas renvoyer `UNKNOWN_CANDIDATE`, `propose_patch` ne peut pas renvoyer `PATH_ESCAPE`. Un code hors sous-ensemble échoue la validation au lieu de passer — c'est une erreur du serveur, pas une réponse. Les deux formes restent exclusives (chacune est rejetée par l'autre schéma), donc un message hybridant succès et erreur est refusé plutôt que résolu au hasard.
 
 ### 3.2 Correspondance `$defs` ↔ sections
 
-Chaque outil a un `<Outil>Input`, un `<Outil>Output` et un `<Outil>Result` (le `oneOf` de 3.1). Les `$defs` transverses : `RelPath` (chemin confiné), `CandidateId` (identifiant opaque de session), `SnapshotId` (empreinte du périmètre, 4.4.2), `EnvVarName` et `EnvExampleLine` (4.4), `ErrorResponse` / `ToolError` / `ErrorMessage` / `ErrorCode` (section 6), et `SecretType` / `SecretStatus` / `SnippetHash` / `Source` repris du contrat Finding (#14, section 8).
+Chaque outil a un `<Outil>Input`, un `<Outil>Output` et un `<Outil>Result` (le `oneOf` de 3.1), plus une enveloppe d'échec `<Outil>ErrorResponse` avec son sous-ensemble de codes. Les `$defs` transverses : `RelPath` (chemin confiné), `CandidateId` (identifiant opaque de session), `SnapshotId` (empreinte du périmètre, 4.4.2), `EnvVarName` et `EnvExampleLine` (4.4), `ErrorResponse` / `ToolError` / `ErrorMessage` / `ErrorCode` (forme commune et vocabulaire global, section 6), et `SecretType` / `SecretStatus` / `SnippetHash` / `Source` repris du contrat Finding (#14, section 8).
 
 ## 4. Détail des outils
 
@@ -91,9 +91,10 @@ git -C <racine> diff --cached --unified=0 --no-color --no-ext-diff --no-textconv
 | `--no-color` | des séquences ANSI dans la sortie sont du bruit qui casse le comptage d'octets de `max_bytes`. |
 
 - **Entrée** : `{ "max_bytes": 1024..65536 }` (défaut 32768). Aucun chemin, aucune racine.
-- **Sortie** : `{ "files": [{ "file", "binary", "added_lines": [{ "line", "text" }] }], "truncated": bool }`.
+- **Sortie** : `{ "files": [{ "file", "binary", "redactions", "added_lines": [{ "line", "text" }] }], "truncated": bool }`.
 - Limites : 200 fichiers, 5000 lignes ajoutées par fichier, 2000 caractères par ligne. Ces trois plafonds sont des garde-fous d'affichage : au-delà, `truncated: true` est le comportement attendu, et le LLM ne doit pas conclure « rien à signaler » sur la foi d'un diff tronqué.
 - Un fichier binaire est listé avec `binary: true` et **zéro ligne**. Invariant `if/then` : `binary: true` ⇒ `added_lines` vide. Sans lui, le LLM lirait des octets comme du texte et traiterait une image comme du code.
+- Chaque fichier porte `redactions`, le nombre de valeurs masquées dans ses lignes. Filet structurel (`if/then` avec `contains`) : `redactions >= 1` ⇒ au moins une ligne porte `<REDACTED:`. Cela détecte un masquage **oublié**, pas un masquage **partiel** : exiger un marqueur sur chaque ligne serait faux, car la plupart des lignes n'ont légitimement aucun secret. Le masquage de chaque valeur, avant sérialisation, est une obligation de #27 (`x-obligations.masking_before_serialization`).
 - `truncated: true` signifie **information incomplète**, jamais « diff vide ». Si la sortie git dépasse `max_bytes`, le parseur tronque **et** pose le drapeau : ne jamais renvoyer un diff partiel en le présentant comme complet.
 - **Piège d'implémentation** : `git diff` affiche `/dev/null` pour un fichier ajouté ou supprimé, et `git diff -M` nomme un renommage `old.py{old => new}.py`. `/dev/null` est un chemin absolu, donc `RelPath` le refuse : le parseur doit l'écarter **avant** de valider, sinon il renvoie `INVALID_INPUT` sur une sortie qu'il a lui-même fabriquée. La forme `{...}` passe en revanche `RelPath` (pas de `/`, pas de segment `..`) : responsabilité du parseur, pas du schéma.
 
@@ -103,7 +104,7 @@ git -C <racine> diff --cached --unified=0 --no-color --no-ext-diff --no-textconv
 Lit un extrait d'un fichier du dépôt pour donner du contexte au LLM, avec les valeurs candidates masquées.
 
 - **Entrée** : `{ "path": RelPath, "start_line": >=1 (défaut 1), "max_lines": 1..400 (défaut 200) }`.
-- **Sortie** : `{ "path", "start_line", "end_line", "total_lines", "content", "redactions", "truncated" }`. `content` est plafonné à 100 000 caractères (le nombre de lignes est borné par `max_lines`, pas la longueur d'une ligne : fichier minifié, fichier de données).
+- **Sortie** : `{ "path", "start_line", "end_line", "total_lines", "content", "redactions", "truncated" }`. `content` est plafonné à 100 000 caractères (le nombre de lignes est borné par `max_lines`, pas la longueur d'une ligne : fichier minifié, fichier de données). Filet structurel : `redactions >= 1` ⇒ `content` porte au moins un marqueur (masquage oublié détecté ; masquage partiel : obligation #27, comme en 4.1).
 - Refus (`FORBIDDEN_PATH`) : `.git/`, `.env*`, fichiers ignorés par `.gitignore`, tout ce qui est hors racine (`PATH_ESCAPE`).
 - Refus (`BINARY_FILE`) : fichiers binaires. Refus (`TOO_LARGE`) : fichier de plus de 1 Mo.
 - Ouverture avec `O_NOFOLLOW` (limite TOCTOU à consigner dans l'ADR).
@@ -116,6 +117,7 @@ Expose les résultats du scanner déterministe (regex + entropie). C'est le LLM 
 - **Sortie** : `{ "snapshot_id", "candidates": [Candidate], "total", "truncated" }`.
 - `snapshot_id` est l'empreinte du périmètre analysé (4.4.2). Elle est **obligatoire** : sans elle, aucune proposition ultérieure ne peut être datée.
 - `Candidate` = **exactement** les champs du #14 (`file`, `line`, `type`, `entropy`, `snippet_hash`, `status`, `source`, tous obligatoires, mêmes bornes et mêmes grammaires) + `candidate_id` (opaque, attribué par le serveur), `masked_snippet` et `context_before` / `context_after` (5 lignes max, masquées). La synchronisation avec `finding.schema.json` est vérifiée par un test : si #14 bouge, ce contrat casse en CI.
+- `masked_snippet` et les contextes sont masqués **avant sérialisation** par le programme (obligation #27) : le schéma ne peut pas y exiger de marqueur, car une ligne de contexte sans secret n'en porte légitimement aucun. Même régime que `AddedLine.text` (4.1).
 - Le LLM ne peut référencer qu'un `candidate_id` renvoyé par cet outil (sinon `UNKNOWN_CANDIDATE`).
 
 ### 4.4 `propose_patch`
@@ -198,18 +200,20 @@ La colonne « Prouvé par » sépare ce que le schéma démontre de ce qui devra
 
 ## 6. Codes d'erreur
 
-| Code | Quand |
-|---|---|
-| `INVALID_INPUT` | L'entrée ne respecte pas le schéma |
-| `PATH_ESCAPE` | Le chemin sort de la racine (`..`, absolu, lien symbolique sortant) |
-| `NOT_FOUND` | Le fichier n'existe pas |
-| `FORBIDDEN_PATH` | `.git/`, `.env*`, fichier ignoré |
-| `BINARY_FILE` | Fichier binaire |
-| `TOO_LARGE` | Fichier ou diff dépassant les limites |
-| `UNKNOWN_CANDIDATE` | `candidate_id` inconnu du serveur ou d'un autre snapshot |
-| `STALE_CANDIDATE` | Le candidat ou la proposition date d'un périmètre qui a changé (4.4.2) |
-| `NOT_A_GIT_REPO` | La racine n'est pas un dépôt Git |
-| `INTERNAL` | Erreur interne ; message générique, sans chemin absolu ni contenu |
+`ErrorCode` est le vocabulaire global ; chaque outil n'accepte que son sous-ensemble (enveloppes `ReadDiffError`, `SanitizeFileError`, `ListCandidatesError`, `ProposePatchError`). Un code hors sous-ensemble échoue la validation : c'est une erreur du serveur, pas une réponse.
+
+| Code | Quand | Outils |
+|---|---|---|
+| `INVALID_INPUT` | L'entrée ne respecte pas le schéma | les 4 |
+| `PATH_ESCAPE` | Le chemin sort de la racine (`..`, absolu, lien symbolique sortant) | `sanitize_file`, `list_candidates` (filtre `file`) |
+| `NOT_FOUND` | Le fichier n'existe pas (y compris le filtre `file` de `list_candidates`) | `sanitize_file`, `list_candidates` |
+| `FORBIDDEN_PATH` | `.git/`, `.env*`, fichier ignoré (y compris le filtre `file` de `list_candidates`) | `sanitize_file`, `list_candidates` |
+| `BINARY_FILE` | Fichier binaire | `sanitize_file` (`read_diff` liste les binaires au lieu d'échouer) |
+| `TOO_LARGE` | Fichier ou diff dépassant les limites | `read_diff`, `sanitize_file` |
+| `UNKNOWN_CANDIDATE` | `candidate_id` inconnu du serveur ou d'un autre snapshot | `propose_patch` (`list_candidates` produit les identifiants, il n'en consomme pas) |
+| `STALE_CANDIDATE` | Le candidat ou la proposition date d'un périmètre qui a changé (4.4.2) | `propose_patch` |
+| `NOT_A_GIT_REPO` | La racine n'est pas un dépôt Git | les 4 |
+| `INTERNAL` | Erreur interne ; message générique, sans chemin absolu ni contenu | les 4 |
 
 Les messages d'erreur ne contiennent **jamais** de chemin absolu, de contenu de fichier ni de valeur de secret. Ils refusent aussi les caractères de contrôle (`ErrorMessage`) : le LLM les relit, donc un message ne doit pas pouvoir lui glisser une consigne sur une nouvelle ligne.
 
@@ -245,6 +249,8 @@ Le schéma est une barrière faible : il décrit des formes, il n'empêche rien.
 3. **Le masquage précède la sortie.** Masquer après sérialisation laisserait la valeur dans un buffer ou une trace : le masquage doit précéder l'appel à `json.dumps`.
 4. **Shape stable.** Un champ de sortie ajouté à côté du `oneOf` au lieu du `…Output` correspondant produirait une réponse que le schéma refuse alors que le programme la produit. `binary` est obligatoire dans `DiffFile` pour la même raison que `applied` en `const`.
 5. **`$defs` hors de portée du LLM.** Le LLM voit le schéma résolu d'un seul outil (`input` / `output`), jamais le document entier.
+6. **Compteurs de masquage.** `DiffFile.redactions >= 1` ⇒ au moins une ligne porte un marqueur (`contains`) ; `SanitizeFileOutput.redactions >= 1` ⇒ `content` porte un marqueur. Testé par `test_conditional_invariants_reject_violations`. Filet contre l'oubli, pas contre le partiel (voir 4.4.1).
+7. **Erreurs par outil.** Chaque enveloppe d'échec restreint `code` à son sous-ensemble (section 6). Testé par `test_each_tool_accepts_only_its_error_codes` : les 10 codes × les 4 outils, acceptés ou refusés selon le sous-ensemble.
 
 ### 9.2 Obligation du programme (`x-obligations`)
 
@@ -253,6 +259,7 @@ Ces règles ne sont **pas** exprimables en JSON Schema. Elles sont la cible des 
 | Obligation | Pourquoi le schéma ne peut pas |
 |---|---|
 | Chaque ligne `-` de `patch_preview` est masquée | Le schéma voit une chaîne, pas ses lignes. `-KEY = "sk_live_abc"` à côté d'un marqueur passe la validation (4.4.1). |
+| Tous les champs texte lus par le LLM sont masqués avant `json.dumps` | `AddedLine.text`, `masked_snippet`, contextes : exiger un marqueur y serait faux, la plupart des lignes n'ont légitimement aucun secret. Le schéma ne distingue pas « ligne sans secret » de « secret non masqué ». |
 | `env_example_line` vaut exactement `env_var_name` + `=` | Un schéma ne compare pas deux champs distincts : `OTHER=` passerait. |
 | `proposal_id` reste présent même si `manual_remediation` | Déjà le cas ici ; l'obligation est de ne pas le rendre optionnel, pour que la forme de la réponse ne dépende pas du contenu du fichier. |
 | `snapshot_id` calculé en mémoire, sans écriture dans `.git/` | Le schéma ne voit aucun effet de bord (4.4.2). |
@@ -294,9 +301,11 @@ Ligne SAMM concernée : *Surface d'attaque minimale / moindre privilège*.
 | Preuve | Où | Nature |
 |---|---|---|
 | Surface fermée : 4 outils, aucun outil d'écriture ni réseau | `x-tools` + `::test_exactly_four_tools_all_read_only`, `::test_no_forbidden_tool_in_the_registry` | statique |
-| Erreurs rattachées à chaque outil, exclusives du succès | `ReadDiffResult` et les 3 autres + `::test_success_and_error_forms_are_mutually_exclusive` | statique |
+| Erreurs rattachées à chaque outil, sous-ensemble par outil, exclusives du succès | `ReadDiffResult` et les 3 autres + `::test_success_and_error_forms_are_mutually_exclusive`, `::test_each_tool_accepts_only_its_error_codes` | statique |
 | Un diff n'est jamais appliqué par l'outil | `ProposePatchOutput.applied` en `const: false` | statique (contrainte sur la réponse ; effet réel : revue #27) |
 | **Forme minimale** de l'aperçu : au moins un marqueur de masquage, et rien de plus | `PatchPreview` + `::test_patch_preview_never_carries_a_clear_value`, `::test_patch_preview_check_is_minimal_and_we_say_so` | statique |
+| Filets de masquage `DiffFile` / `SanitizeFileOutput` (`redactions` ⇒ marqueur) | `::test_conditional_invariants_reject_violations` | statique |
+| Champs texte libres sans filet structurel, masquage déclaré en obligation | `x-obligations.masking_before_serialization` + `::test_free_text_fields_have_no_structural_redaction_check` | statique + revue #27 |
 | Interdits I1 à I15, avec colonne « Prouvé par » | section 5 | mixte |
 | Ce qui n'est **pas** démontré | sections 1 bis et 9.2 | — |
 

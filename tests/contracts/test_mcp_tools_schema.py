@@ -4,7 +4,9 @@ Ce que ces tests peuvent prouver:
   * le document est un JSON Schema draft 2020-12 valide;
   * la surface exposee est fermee: 4 outils, surface d'entree/sortie declaree;
   * les entrees et sorties sont strictes (additionalProperties: false);
-  * les invariants conditionnels (if/then) tiennent;
+  * les invariants conditionnels (if/then) tiennent, y compris les filets
+    de masquage (redactions implique marqueur);
+  * chaque outil n'accepte que son sous-ensemble de codes d'erreur;
   * les $defs sont coherents entre eux et avec le contrat Finding (#14);
   * les formes d'echec sont exclusives des formes de succes;
   * les exemples valides passent, les exemples invalides sont rejetés pour le
@@ -14,6 +16,9 @@ Ce que ces tests ne peuvent PAS prouver, et qui est donc verifie autrement:
   * qu'un outil n'ecrit reellement rien, ni dans le depot ni dans .git/ (#27);
   * que CHAQUE ligne '-' d'un apercu est masquee: le schema exige au moins un
     marqueur, pas un masquage ligne a ligne (voir x-obligations, #27);
+  * que les champs texte libres (AddedLine.text, masked_snippet, contextes)
+    sont masques: exiger un marqueur y serait faux, c'est une obligation
+    de #27 avant serialisation (voir x-obligations);
   * que env_example_line vaut bien env_var_name + '=' (comparaison de deux
     champs, impossible en JSON Schema, #30);
   * que la garde de chemin resout correctement les liens symboliques (#27.3.1).
@@ -37,6 +42,21 @@ FINDING = json.loads(FINDING_SCHEMA_PATH.read_text(encoding="utf-8"))
 CONTRACT_MD = CONTRACT_MD_PATH.read_text(encoding="utf-8")
 
 EXPECTED_TOOLS = {"read_diff", "sanitize_file", "list_candidates", "propose_patch"}
+# Sous-ensemble de codes d'erreur accepte par chaque outil (miroir des
+# *Error du schema). Tout code hors de cette liste est une erreur du serveur.
+TOOL_ERROR_CODES = {
+    "read_diff": ("ReadDiffResult", "ReadDiffErrorResponse",
+                  {"INVALID_INPUT", "TOO_LARGE", "NOT_A_GIT_REPO", "INTERNAL"}),
+    "sanitize_file": ("SanitizeFileResult", "SanitizeFileErrorResponse",
+                       {"INVALID_INPUT", "PATH_ESCAPE", "NOT_FOUND", "FORBIDDEN_PATH",
+                        "BINARY_FILE", "TOO_LARGE", "NOT_A_GIT_REPO", "INTERNAL"}),
+    "list_candidates": ("ListCandidatesResult", "ListCandidatesErrorResponse",
+                         {"INVALID_INPUT", "PATH_ESCAPE", "NOT_FOUND", "FORBIDDEN_PATH",
+                          "NOT_A_GIT_REPO", "INTERNAL"}),
+    "propose_patch": ("ProposePatchResult", "ProposePatchErrorResponse",
+                       {"INVALID_INPUT", "UNKNOWN_CANDIDATE", "STALE_CANDIDATE",
+                        "NOT_A_GIT_REPO", "INTERNAL"}),
+}
 # Registre des outils MOTEUR: aucun de ces noms ne doit exister dans x-tools,
 # quel que soit le contenu des $defs.
 FORBIDDEN_TOOL_NAMES = {
@@ -100,15 +120,20 @@ VALID = [
     ("ReadDiffInput", {}),
     ("ReadDiffInput", {"max_bytes": 4096}),
     ("ReadDiffOutput", {
-        "files": [{"file": "a/b.py", "binary": False,
+        "files": [{"file": "a/b.py", "binary": False, "redactions": 1,
                    "added_lines": [{"line": 3, "text": "KEY = <REDACTED:aws:len=20>"}]}],
         "truncated": False,
     }),
-    ("ReadDiffOutput", {"files": [{"file": "a/logo.png", "binary": True, "added_lines": []}],
+    ("ReadDiffOutput", {"files": [{"file": "a/b.py", "binary": False, "redactions": 0,
+                                   "added_lines": [{"line": 3, "text": "x = 1"}]}],
                         "truncated": False}),
-    # formes d'echec, acceptees par le wrapper de resultat
+    ("ReadDiffOutput", {"files": [{"file": "a/logo.png", "binary": True, "redactions": 0,
+                                   "added_lines": []}],
+                        "truncated": False}),
+    # formes d'echec, acceptees par le wrapper de resultat PROPRE A L'OUTIL
     ("ReadDiffResult", {"files": [], "truncated": False}),
     ("ReadDiffResult", {"error": {"code": "NOT_A_GIT_REPO", "message": "Racine non versionnee."}}),
+    ("ReadDiffResult", {"error": {"code": "TOO_LARGE", "message": "Diff trop gros."}}),
     ("SanitizeFileInput", {"path": "src/app.py"}),
     ("SanitizeFileInput", {"path": "src/app.py", "start_line": 10, "max_lines": 50}),
     ("SanitizeFileOutput", {
@@ -116,16 +141,19 @@ VALID = [
         "content": "a\nb\nc", "redactions": 0, "truncated": False,
     }),
     ("SanitizeFileResult", {"error": {"code": "FORBIDDEN_PATH", "message": "Chemin interdit."}}),
+    ("SanitizeFileResult", {"error": {"code": "BINARY_FILE", "message": "Fichier binaire."}}),
     ("ListCandidatesInput", {}),
     ("ListCandidatesInput", {"scope": "working_tree", "file": "x.py", "limit": 10}),
     ("ListCandidatesOutput", {"snapshot_id": SNAPSHOT, "candidates": [candidate()],
                               "total": 1, "truncated": False}),
     ("ListCandidatesResult", {"error": {"code": "INTERNAL", "message": "Erreur interne."}}),
+    ("ListCandidatesResult", {"error": {"code": "PATH_ESCAPE", "message": "Filtre hors du depot."}}),
     ("ProposePatchInput", {"candidate_id": "c1", "env_var_name": "AWS_ACCESS_KEY_ID"}),
     ("ProposePatchOutput", patch_out()),
     # remediation manuelle: l'aperçu doit etre vide
     ("ProposePatchOutput", patch_out(manual_remediation=True, patch_preview="")),
     ("ProposePatchResult", {"error": {"code": "STALE_CANDIDATE", "message": "Candidat perime."}}),
+    ("ProposePatchResult", {"error": {"code": "UNKNOWN_CANDIDATE", "message": "Candidat inconnu."}}),
     ("ErrorResponse", {"error": {"code": "PATH_ESCAPE", "message": "Chemin hors du depot."}}),
 ]
 
@@ -193,6 +221,14 @@ INVALID = [
     # un aperçu vide sans remediation manuelle: le programme pretend avoir
     # propose sans rien proposer (couvert aussi par l'invariant conditionnel)
     ("ProposePatchOutput", patch_out(patch_preview=""), "minLength", ["patch_preview"]),
+    # filet structurel: redactions >= 1 sans marqueur (masquage oublie)
+    ("DiffFile", {"file": "a.py", "binary": False, "redactions": 1,
+                  "added_lines": [{"line": 1, "text": "x = 1"}]},
+     "contains", ["added_lines"]),
+    ("SanitizeFileOutput", {
+        "path": "src/app.py", "start_line": 1, "end_line": 3, "total_lines": 3,
+        "content": "a\nb\nc", "redactions": 2, "truncated": False,
+    }, "pattern", ["content"]),
     # candidat: pas de valeur en clair, hash obligatoire, statut et source connus
     ("ListCandidatesOutput", {"snapshot_id": SNAPSHOT,
                               "candidates": [candidate(secret_value="sk_live_x")],
@@ -233,8 +269,17 @@ INVALID = [
 # Invariants conditionnels: (nom $defs, payload qui doit etre REJETE, motif attendu)
 CONDITIONAL_INVALID = [
     # fichier binaire avec des lignes: le LLM pourrait le lire comme du code
-    ("DiffFile", {"file": "logo.png", "binary": True, "added_lines": [{"line": 1, "text": "x"}]},
+    ("DiffFile", {"file": "logo.png", "binary": True, "redactions": 0,
+                  "added_lines": [{"line": 1, "text": "x"}]},
      "maxItems"),
+    # redactions annoncees mais aucune ligne masquee: masquage oublie
+    ("DiffFile", {"file": "a.py", "binary": False, "redactions": 2,
+                  "added_lines": [{"line": 1, "text": "x = 1"}]},
+     "contains"),
+    ("SanitizeFileOutput", {
+        "path": "src/app.py", "start_line": 1, "end_line": 1, "total_lines": 1,
+        "content": "password = 'x'", "redactions": 1, "truncated": False,
+    }, "pattern"),
     # remediation manuelle avec un aperçu non vide: le programme ne sait pas
     # comment patcher, donc il n'a pas le droit de proposer un diff
     ("ProposePatchOutput", patch_out(manual_remediation=True), "const"),
@@ -309,16 +354,33 @@ class McpToolsSchemaTests(TestCase):
     # --- formes de reponse ----------------------------------------------------
 
     def test_each_tool_output_is_success_or_error(self):
-        """x-tools[output] doit pointer vers un oneOf succes/erreur: c'est ce
-        qui attache les codes d'erreur a chaque outil au lieu de laisser
-        ErrorResponse isole."""
+        """x-tools[output] doit pointer vers un oneOf succes/erreur PROPRE A
+        L'OUTIL: c'est ce qui attache les codes d'erreur a chaque outil au
+        lieu de laisser une enveloppe globale. Un code hors sous-ensemble
+        (ex. UNKNOWN_CANDIDATE pour read_diff) est une erreur du serveur."""
         for name, spec in SCHEMA["x-tools"].items():
             with self.subTest(tool=name):
                 result = SCHEMA["$defs"][spec["output"]["$ref"].removeprefix("#/$defs/")]
                 self.assertIn("oneOf", result, name)
                 branches = [b["$ref"].removeprefix("#/$defs/") for b in result["oneOf"]]
-                self.assertIn("ErrorResponse", branches, name)
                 self.assertEqual(len(branches), 2, name)
+                self.assertEqual(branches[1], TOOL_ERROR_CODES[name][1], name)
+
+    def test_each_tool_accepts_only_its_error_codes(self):
+        """Chaque outil accepte ses codes et refuse tous les autres: un
+        read_diff qui renverrait UNKNOWN_CANDIDATE, ou un propose_patch qui
+        renverrait PATH_ESCAPE, echoue la validation au lieu de passer."""
+        all_codes = set(SCHEMA["$defs"]["ErrorCode"]["enum"])
+        for tool, (result, _, allowed) in TOOL_ERROR_CODES.items():
+            for code in sorted(all_codes):
+                payload = {"error": {"code": code, "message": "Message de test."}}
+                with self.subTest(tool=tool, code=code):
+                    if code in allowed:
+                        self.assertTrue(validator(result).is_valid(payload),
+                                        f"{tool} devrait accepter {code}")
+                    else:
+                        self.assertFalse(validator(result).is_valid(payload),
+                                         f"{tool} accepte {code} alors qu'il ne le devrait pas")
 
     def test_success_and_error_forms_are_mutually_exclusive(self):
         """Une charge utile de succes ne doit pas pouvoir etre lue comme une
@@ -328,12 +390,14 @@ class McpToolsSchemaTests(TestCase):
             result = SCHEMA["$defs"][result_name]
             branches = result["oneOf"]
             ok = next(n for n in (b["$ref"].removeprefix("#/$defs/") for b in branches)
-                      if n != "ErrorResponse")
+                      if not n.endswith("ErrorResponse"))
+            err_name = next(n for n in (b["$ref"].removeprefix("#/$defs/") for b in branches)
+                            if n.endswith("ErrorResponse"))
             ok_payload = next(p for n, p in VALID if n == ok)
             with self.subTest(tool=tool):
                 self.assertTrue(validator(result_name).is_valid(ok_payload))
                 self.assertEqual(len(list(validator(result_name).iter_errors(ok_payload))), 0)
-                err = validator("ErrorResponse")
+                err = validator(err_name)
                 self.assertFalse(err.is_valid(ok_payload))
 
     def test_a_response_cannot_be_both_success_and_error(self):
@@ -421,9 +485,10 @@ class McpToolsSchemaTests(TestCase):
     # --- le secret ne sort pas ------------------------------------------------
 
     def test_patch_preview_never_carries_a_clear_value(self):
-        """L'aperçu est la seule sortie qui pourrait laisser fuir la valeur:
-        un diff unifie contient la ligne d'origine. On exige au moins un
-        marqueur de masquage dans tout aperçu non vide."""
+        """Un aperçu sans aucun marqueur est refuse: soit il est vide avec
+        manual_remediation (cas ambigu assume), soit il montre au moins une
+        valeur masquee. Voir aussi test_patch_preview_check_is_minimal pour
+        la limite de ce filet."""
         pp = Draft202012Validator(SCHEMA["$defs"]["PatchPreview"])
         self.assertTrue(pp.is_valid(""))
         self.assertTrue(pp.is_valid(preview()))
@@ -434,6 +499,20 @@ class McpToolsSchemaTests(TestCase):
         ):
             with self.subTest(value=value):
                 self.assertFalse(pp.is_valid(value))
+
+    def test_free_text_fields_have_no_structural_redaction_check(self):
+        """AddedLine.text, masked_snippet et les contextes acceptent une
+        valeur sans marqueur, et c'est NORMAL: exiger un marqueur y serait
+        faux, car la plupart des lignes n'ont legitimement aucun secret.
+        Le masquage de ces champs est donc une obligation de #27 AVANT
+        serialisation (x-obligations.masking_before_serialization), a prouver
+        par des tests qui cherchent une valeur connue dans chaque champ texte,
+        pas par ce schema."""
+        self.assertTrue(validator("AddedLine").is_valid({"line": 1, "text": "AKIA1234567890"}))
+        self.assertTrue(validator("Candidate").is_valid(candidate(masked_snippet="AKIA1234567890")))
+        self.assertTrue(validator("Candidate").is_valid(
+            candidate(context_before=["password = 'hunter2'"])))
+        self.assertIn("masking_before_serialization", SCHEMA["x-obligations"])
 
     def test_patch_preview_check_is_minimal_and_we_say_so(self):
         """Ce test verifie la LIMITE connue de PatchPreview, pour qu'on ne la
