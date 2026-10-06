@@ -1,0 +1,460 @@
+openapi: 3.1.0
+info:
+  title: Heimdall Vault API
+  version: 1.0.0
+  description: >-
+    Contrat du Vault sur réseau privé. Les valeurs sont transportées uniquement
+    dans les corps JSON sous TLS et chiffrées au repos. Aucun service Internet.
+  contact:
+    name: Heimdall team
+    url: https://github.com/Cezar277/heimdall
+servers:
+  - url: https://127.0.0.1:8443
+    description: Instance locale ; remplacer par l'adresse TLS du réseau privé.
+tags:
+  - name: Secrets
+    description: Secrets isolés par projet et environnement.
+  - name: Health
+    description: Santé minimale sans information sensible.
+security:
+  - ProjectApiKey: []
+paths:
+  /api/v1/secrets:
+    post:
+      tags: [Secrets]
+      operationId: createSecret
+      summary: Créer un secret
+      description: >-
+        La clé doit autoriser l'écriture dans le projet et l'environnement.
+        Crée un secret vaulté après persistance chiffrée ; n'écrase jamais un
+        secret existant. La réponse ne contient pas la valeur.
+      requestBody:
+        description: >-
+          Le serveur DOIT (MUST) rejeter avec HTTP 400 bad_request tout corps
+          supérieur à 1 Mio (1 048 576 octets) avant parsing JSON. Compter le
+          flux effectivement reçu, même sans Content-Length ou en transfert
+          segmenté ; interrompre la lecture dès dépassement. Exigence runtime
+          à tester dans #25, indépendante du maxLength des champs.
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SecretCreate'
+            example:
+              project: demo
+              env: dev
+              name: DEMO_PASSWORD
+              value: PLACEHOLDER_NOT_A_SECRET
+      responses:
+        '201':
+          description: Secret créé et persisté sous forme chiffrée.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretMetadata'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /api/v1/secrets/{project}/{env}/{name}:
+    parameters:
+      - $ref: '#/components/parameters/Project'
+      - $ref: '#/components/parameters/Environment'
+      - $ref: '#/components/parameters/Name'
+    get:
+      tags: [Secrets]
+      operationId: getSecret
+      summary: Lire la valeur courante d'un secret
+      description: >-
+        Autorise le projet et l'environnement avant toute recherche du secret.
+        Déchiffre uniquement pour le destinataire autorisé. Un secret roté ne
+        permet pas de récupérer l'ancienne valeur ; la rotation est hors v1.
+      responses:
+        '200':
+          description: Valeur courante, à ne jamais journaliser ni mettre en cache.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretRead'
+              example:
+                project: demo
+                env: dev
+                name: DEMO_PASSWORD
+                status: vaulte
+                value: PLACEHOLDER_NOT_A_SECRET
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /api/v1/secrets/{project}/{env}/{name}/state:
+    parameters:
+      - $ref: '#/components/parameters/Project'
+      - $ref: '#/components/parameters/Environment'
+      - $ref: '#/components/parameters/Name'
+    get:
+      tags: [Secrets]
+      operationId: getSecretState
+      summary: Lire l'état sans exposer la valeur
+      description: >-
+        Même contrôle d'accès que la lecture. Aucun changement d'état demandé
+        par le client ; les états sont déterminés par le composant responsable.
+      responses:
+        '200':
+          description: Métadonnées uniquement.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretMetadata'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /api/v1/health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Vérifier la santé minimale
+      description: >-
+        Accessible sans clé sur le réseau privé. Ne divulgue ni version,
+        configuration, projets, clés ni chemins. Renvoie 503 si indisponible.
+      security: []
+      responses:
+        '200':
+          description: Service disponible.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+components:
+  securitySchemes:
+    ProjectApiKey:
+      type: apiKey
+      in: header
+      name: X-Heimdall-API-Key
+      description: >-
+        Clé liée à un projet et à ses permissions. Jamais dans une URL ou un log.
+        Le serveur DOIT stocker uniquement un haché de vérification de la clé,
+        jamais sa valeur brute, et comparer les empreintes de longueur fixe
+        via hmac.compare_digest. Clé absente, inconnue, invalide ou révoquée :
+        même réponse 401 générique et chemin de vérification de coût comparable,
+        sans oracle temporel exploitable (hors rejet préalable de taille ou débit).
+        TLS obligatoire : le client DOIT vérifier la chaîne de confiance et
+        l'identité du serveur, même en développement ; aucun mode non vérifié.
+  parameters:
+    Project:
+      name: project
+      in: path
+      required: true
+      description: Identifiant public du projet ; aucune valeur secrète.
+      schema:
+        $ref: '#/components/schemas/ProjectId'
+    Environment:
+      name: env
+      in: path
+      required: true
+      description: Environnement autorisé ; aucune valeur secrète.
+      schema:
+        $ref: '#/components/schemas/EnvironmentId'
+    Name:
+      name: name
+      in: path
+      required: true
+      description: Nom de variable ; aucune valeur secrète.
+      schema:
+        $ref: '#/components/schemas/SecretName'
+  headers:
+    NoStore:
+      required: true
+      description: Réponse interdite de mise en cache.
+      schema:
+        type: string
+        const: no-store
+    RetryAfter:
+      required: true
+      description: >-
+        Délai avant nouvelle tentative, entier de 1 à 3600 secondes incluses.
+        Le client DOIT refuser une valeur hors contrat sans attendre ce délai,
+        sans retry immédiat automatique ni boucle illimitée ; signaler l'erreur.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 3600
+  responses:
+    BadRequest:
+      description: JSON mal formé, champ invalide ou propriété supplémentaire ; aucune entrée reflétée.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BadRequestError'
+    Unauthorized:
+      description: Clé absente, invalide ou révoquée ; même réponse générique.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UnauthorizedError'
+    Forbidden:
+      description: Clé valide mais projet, environnement ou opération non autorisés.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ForbiddenError'
+    NotFound:
+      description: Ressource absente après autorisation ; jamais utilisée pour révéler un autre projet.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotFoundError'
+    Conflict:
+      description: Ce nom existe déjà dans le projet et l'environnement ; aucun écrasement.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ConflictError'
+    TooManyRequests:
+      description: >-
+        Limite dépassée. Bucket par identifiant de clé API validée, erreurs
+        400/401 incluses ; requêtes sans clé valide et health limités par pair
+        réseau et limite globale. X-Forwarded-For ignoré hors proxy explicitement
+        approuvé ; ne jamais utiliser une clé arbitraire comme bucket illimité.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RateLimitedError'
+    Unavailable:
+      description: Service indisponible ; aucun détail interne.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UnavailableError'
+    UnexpectedError:
+      description: Erreur inattendue ; message générique sans secret ni trace interne.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InternalError'
+    InternalServerError:
+      description: >-
+        Erreur interne : application/json avec code internal_error et message
+        Erreur interne uniquement. Le handler DOIT intercepter les exceptions
+        inattendues ; jamais de HTML, traceback ni entrée utilisateur.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InternalError'
+          example:
+            code: internal_error
+            message: Erreur interne
+  schemas:
+    InternalError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: internal_error
+        message:
+          type: string
+          const: Erreur interne
+    ProjectId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[a-z][a-z0-9_-]{0,63}(?![\s\S])'
+    EnvironmentId:
+      type: string
+      minLength: 1
+      maxLength: 32
+      pattern: '^[a-z][a-z0-9_-]{0,31}(?![\s\S])'
+    SecretName:
+      type: string
+      minLength: 2
+      maxLength: 64
+      pattern: '^[A-Z][A-Z0-9_]{1,63}(?![\s\S])'
+    SecretStatus:
+      type: string
+      enum: [vaulte, rote]
+      description: États persistés ; detecte, confirme et faux_positif restent côté client.
+    SecretValue:
+      type: string
+      minLength: 1
+      maxLength: 65536
+      description: Valeur UTF-8, éventuellement multiligne ; jamais dans URL, logs ou métadonnées.
+    SecretCreate:
+      type: object
+      additionalProperties: false
+      required: [project, env, name, value]
+      properties:
+        project:
+          $ref: '#/components/schemas/ProjectId'
+        env:
+          $ref: '#/components/schemas/EnvironmentId'
+        name:
+          $ref: '#/components/schemas/SecretName'
+        value:
+          $ref: '#/components/schemas/SecretValue'
+    SecretMetadata:
+      type: object
+      additionalProperties: false
+      required: [project, env, name, status]
+      properties:
+        project:
+          $ref: '#/components/schemas/ProjectId'
+        env:
+          $ref: '#/components/schemas/EnvironmentId'
+        name:
+          $ref: '#/components/schemas/SecretName'
+        status:
+          $ref: '#/components/schemas/SecretStatus'
+    SecretRead:
+      type: object
+      additionalProperties: false
+      required: [project, env, name, status, value]
+      properties:
+        project:
+          $ref: '#/components/schemas/ProjectId'
+        env:
+          $ref: '#/components/schemas/EnvironmentId'
+        name:
+          $ref: '#/components/schemas/SecretName'
+        status:
+          $ref: '#/components/schemas/SecretStatus'
+        value:
+          $ref: '#/components/schemas/SecretValue'
+    BadRequestError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: bad_request
+        message:
+          type: string
+          const: "Requête invalide"
+    UnauthorizedError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: unauthorized
+        message:
+          type: string
+          const: "Authentification requise"
+    ForbiddenError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: forbidden
+        message:
+          type: string
+          const: "Accès interdit"
+    NotFoundError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: not_found
+        message:
+          type: string
+          const: "Ressource introuvable"
+    ConflictError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: conflict
+        message:
+          type: string
+          const: "Secret déjà existant"
+    RateLimitedError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: rate_limited
+        message:
+          type: string
+          const: "Trop de requêtes"
+    UnavailableError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: unavailable
+        message:
+          type: string
+          const: "Service indisponible"
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok

@@ -1,0 +1,45 @@
+name: Vault contract
+
+on:
+  pull_request:
+    paths:
+      - openapi.yaml
+      - .spectral.yaml
+      - schemas/**
+      - tests/contracts/**
+      - docs/contracts/vault-api.md
+      - .github/workflows/vault-contract.yml
+  push:
+    branches: [main, 15-t15-specification-openapi-du-vault-v1]
+    paths:
+      - openapi.yaml
+      - .spectral.yaml
+      - schemas/**
+      - tests/contracts/**
+      - docs/contracts/vault-api.md
+      - .github/workflows/vault-contract.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python venv and install dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r tests/contracts/requirements.txt
+
+      - name: Validate schemas and FastAPI contract
+        run: |
+          .venv/bin/python -m unittest discover -s tests/contracts -v
+
+      - name: Lint OpenAPI
+        run: npx --yes @stoplight/spectral-cli@6.15.0 lint openapi.yaml --fail-severity warn
