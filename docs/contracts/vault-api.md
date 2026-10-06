@@ -27,9 +27,14 @@ décodage de l'URL. Ces identifiants ne sont pas des chemins de fichiers.
 
 La valeur n'apparaît que dans le corps POST et dans la réponse GET autorisée.
 Elle accepte les clés multilignes et est limitée à 65536 caractères Unicode.
-Le serveur doit également borner la taille totale du corps en octets (limite
-proposée : 1 Mio, réponse 400 générique) avant parsing. Cette limite runtime
-ne peut pas être garantie par le schéma de la valeur seule.
+Le serveur **DOIT (MUST) rejeter avec HTTP 400 tout corps de requête supérieur
+à 1 Mio (1 048 576 octets), avant le parsing JSON**, avec
+`{"code":"bad_request","message":"Requête invalide"}`. Il DOIT compter les
+octets effectivement reçus, y compris sans `Content-Length` ou en transfert
+segmenté, et interrompre la lecture dès dépassement. Un `Content-Length`
+annoncé supérieur à cette limite permet un rejet anticipé ; il ne remplace
+pas le comptage du flux. Cette exigence runtime ne s'exprime pas avec
+`maxLength` OpenAPI et ne peut pas être prouvée par le schéma de la valeur seule.
 
 POST n'accepte pas d'état choisi par le client. Il retourne `vaulte` après
 persistance chiffrée. Le Finding côté CLI ne peut passer à `vaulte` qu'après
@@ -144,6 +149,8 @@ les dépendances, exécute tous les tests de contrats et le lint Spectral sur
 un runner Ubuntu GitHub à chaque modification du contrat sur cette PR.
 Son résultat distant reste à vérifier après push ; les résultats locaux
 ne permettent pas de cocher « CI verte ».
+Les trois actions GitHub sont épinglées à leurs SHA de commit officiels
+avec commentaire de version, pour éviter les changements de tags mutables.
 
 ## Comparaison avec FastAPI et limites de la preuve
 
@@ -168,6 +175,14 @@ tests HTTP de 400/401/403/404/409/429, isolement interprojets, health limité,
 headers proxy falsifiés, no-store et
 handlers sans fuite. Le chiffrement, TLS, la limitation de débit et la
 révocation sont des exigences, pas des propriétés prouvées par cette PR.
+
+Test runtime obligatoire dans #25 pour la taille du corps : vérifier le rejet
+400 au-delà de 1 048 576 octets avant tout appel au parser JSON, avec et sans
+`Content-Length` et en transfert segmenté. Vérifier aussi qu'un corps JSON
+valide à la limite, respectant les contraintes de champs, n'est pas rejeté
+pour sa seule taille. Aucun octet du corps rejeté ne doit apparaître dans
+la réponse ni les logs. Ce test nécessite le serveur réel et reste hors
+périmètre de la fixture de contrat.
 
 ## Relecture et preuves
 

@@ -29,6 +29,12 @@ paths:
         Crée un secret vaulté après persistance chiffrée ; n'écrase jamais un
         secret existant. La réponse ne contient pas la valeur.
       requestBody:
+        description: >-
+          Le serveur DOIT (MUST) rejeter avec HTTP 400 bad_request tout corps
+          supérieur à 1 Mio (1 048 576 octets) avant parsing JSON. Compter le
+          flux effectivement reçu, même sans Content-Length ou en transfert
+          segmenté ; interrompre la lecture dès dépassement. Exigence runtime
+          à tester dans #25, indépendante du maxLength des champs.
         required: true
         content:
           application/json:
