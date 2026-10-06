@@ -9,7 +9,7 @@ info:
     name: Heimdall team
     url: https://github.com/Cezar277/heimdall
 servers:
-  - url: https://localhost:8443
+  - url: https://127.0.0.1:8443
     description: Instance locale ; remplacer par l'adresse TLS du réseau privé.
 tags:
   - name: Secrets
@@ -55,8 +55,6 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
-        '404':
-          $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
         '429':
@@ -156,6 +154,8 @@ paths:
                 $ref: '#/components/schemas/Health'
               example:
                 status: ok
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         '503':
           $ref: '#/components/responses/Unavailable'
         default:
@@ -234,7 +234,11 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     TooManyRequests:
-      description: Limite de requêtes dépassée.
+      description: >-
+        Limite dépassée. Bucket par identifiant de clé API validée, erreurs
+        400/401 incluses ; requêtes sans clé valide et health limités par pair
+        réseau et limite globale. X-Forwarded-For ignoré hors proxy explicitement
+        approuvé ; ne jamais utiliser une clé arbitraire comme bucket illimité.
       headers:
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
@@ -267,9 +271,9 @@ components:
       pattern: '^[a-z][a-z0-9_-]{0,31}(?![\s\S])'
     SecretName:
       type: string
-      minLength: 1
-      maxLength: 128
-      pattern: '^[A-Z_][A-Z0-9_]{0,127}(?![\s\S])'
+      minLength: 2
+      maxLength: 64
+      pattern: '^[A-Z][A-Z0-9_]{1,63}(?![\s\S])'
     SecretStatus:
       type: string
       enum: [vaulte, rote]
@@ -330,9 +334,81 @@ components:
           enum: [bad_request, unauthorized, forbidden, not_found, conflict, rate_limited, unavailable, internal_error]
         message:
           type: string
-          minLength: 1
-          maxLength: 256
-          description: Message générique constant ; jamais de valeur ni entrée utilisateur reflétée.
+          enum: ["Requête invalide", "Authentification requise", "Accès interdit", "Ressource introuvable", "Secret déjà existant", "Trop de requêtes", "Service indisponible", "Erreur interne"]
+          description: Message constant lié au code ; aucune entrée utilisateur reflétée.
+      allOf:
+        - if:
+            properties:
+              code:
+                const: bad_request
+            required: [code]
+          then:
+            properties:
+              message:
+                const: "Requête invalide"
+        - if:
+            properties:
+              code:
+                const: unauthorized
+            required: [code]
+          then:
+            properties:
+              message:
+                const: "Authentification requise"
+        - if:
+            properties:
+              code:
+                const: forbidden
+            required: [code]
+          then:
+            properties:
+              message:
+                const: "Accès interdit"
+        - if:
+            properties:
+              code:
+                const: not_found
+            required: [code]
+          then:
+            properties:
+              message:
+                const: "Ressource introuvable"
+        - if:
+            properties:
+              code:
+                const: conflict
+            required: [code]
+          then:
+            properties:
+              message:
+                const: "Secret déjà existant"
+        - if:
+            properties:
+              code:
+                const: rate_limited
+            required: [code]
+          then:
+            properties:
+              message:
+                const: "Trop de requêtes"
+        - if:
+            properties:
+              code:
+                const: unavailable
+            required: [code]
+          then:
+            properties:
+              message:
+                const: "Service indisponible"
+        - if:
+            properties:
+              code:
+                const: internal_error
+            required: [code]
+          then:
+            properties:
+              message:
+                const: "Erreur interne"
     Health:
       type: object
       additionalProperties: false

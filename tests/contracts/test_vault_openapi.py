@@ -1,19 +1,28 @@
 """Validation hors ligne et comparaison indépendante avec FastAPI."""
 import copy
+import json
 import unittest
 from pathlib import Path
+from urllib.parse import unquote
 
 import yaml
 from jsonschema import Draft202012Validator
 from openapi_spec_validator import validate
 
-from fastapi_contract_fixture import build_app
+from fastapi_contract_fixture import Error, build_app
+from pydantic import ValidationError
 
 
 ROOT = Path(__file__).resolve().parent
 if not (ROOT / "openapi.yaml").exists():
     ROOT = Path(__file__).resolve().parents[2]
 SPEC = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
+MESSAGES = {
+    "bad_request": "Requête invalide", "unauthorized": "Authentification requise",
+    "forbidden": "Accès interdit", "not_found": "Ressource introuvable",
+    "conflict": "Secret déjà existant", "rate_limited": "Trop de requêtes",
+    "unavailable": "Service indisponible", "internal_error": "Erreur interne",
+}
 
 
 def resolve(value, document):
@@ -135,7 +144,7 @@ class VaultContractTests(unittest.TestCase):
                         error_schema = resolve(response, SPEC)["content"]["application/json"]["schema"]
                         self.assertEqual(error_schema, schema)
                         Draft202012Validator(error_schema).validate(
-                            {"code": expected[code], "message": "Message générique"})
+                            {"code": expected[code], "message": MESSAGES[expected[code]]})
 
     def test_error_rejects_sensitive_extra_fields(self):
         validator = Draft202012Validator(SPEC["components"]["schemas"]["Error"])
@@ -155,6 +164,73 @@ class VaultContractTests(unittest.TestCase):
             validator.validate(value)
         for value in ("", "x" * 65537, None):
             self.assertFalse(validator.is_valid(value))
+
+    def test_error_message_cannot_reflect_input_or_traceback(self):
+        validator = Draft202012Validator(SPEC["components"]["schemas"]["Error"])
+        for code, message in MESSAGES.items():
+            value = {"code": code, "message": message}
+            validator.validate(value)
+            Error.model_validate(value)
+            for invalid in ("Entrée invalide DEMO_PASSWORD", "Traceback: internal/path.py",
+                            message + " DEMO_PASSWORD", "Message générique"):
+                with self.subTest(code=code, message=invalid):
+                    value = {"code": code, "message": invalid}
+                    self.assertFalse(validator.is_valid(value))
+                    with self.assertRaises(ValidationError):
+                        Error.model_validate(value)
+
+    def test_error_message_must_match_code(self):
+        validator = Draft202012Validator(SPEC["components"]["schemas"]["Error"])
+        for code in MESSAGES:
+            for other_code, message in MESSAGES.items():
+                if other_code != code:
+                    value = {"code": code, "message": message}
+                    self.assertFalse(validator.is_valid(value))
+                    with self.assertRaises(ValidationError):
+                        Error.model_validate(value)
+
+    def test_decoded_url_identifiers_rejected(self):
+        for name in ("ProjectId", "EnvironmentId", "SecretName"):
+            validator = Draft202012Validator(SPEC["components"]["schemas"][name])
+            for encoded in ("%2F", "%2E%2E", "%5C", "%0A", ".", "..",
+                            "demo%2Fname", "DEMO%0A"):
+                with self.subTest(schema=name, encoded=encoded):
+                    self.assertFalse(validator.is_valid(encoded))
+                    self.assertFalse(validator.is_valid(unquote(encoded)))
+
+    def test_identifier_exact_boundaries(self):
+        for name, minimum, maximum, character in (
+                ("ProjectId", 1, 64, "a"), ("EnvironmentId", 1, 32, "a"),
+                ("SecretName", 2, 64, "A")):
+            schema = SPEC["components"]["schemas"][name]
+            validator = Draft202012Validator(schema)
+            for length in (minimum, maximum):
+                validator.validate(character * length)
+            for length in (minimum - 1, maximum + 1):
+                errors = list(validator.iter_errors(character * length))
+                self.assertTrue(any(error.validator == "pattern" for error in errors))
+                self.assertTrue(any(error.validator in ("minLength", "maxLength") for error in errors))
+
+    def test_secret_name_matches_mcp_variable_invariant(self):
+        mcp = json.loads((ROOT / "schemas/mcp-tools.schema.json").read_text(encoding="utf-8"))
+        expected = mcp["$defs"]["EnvVarName"]
+        actual = SPEC["components"]["schemas"]["SecretName"]
+        self.assertEqual(actual["pattern"], expected["pattern"])
+        validator = Draft202012Validator(actual)
+        mcp_validator = Draft202012Validator(expected)
+        for value in ("_FOO", "A", "A" * 65, "A" * 129):
+            self.assertFalse(validator.is_valid(value))
+            self.assertFalse(mcp_validator.is_valid(value))
+        for value in ("AB", "DEMO_PASSWORD", "A" * 64):
+            validator.validate(value)
+            mcp_validator.validate(value)
+
+    def test_health_rate_limit_and_post_responses(self):
+        response = resolve(SPEC["paths"]["/api/v1/health"]["get"]["responses"]["429"], SPEC)
+        self.assertEqual(response["headers"]["Retry-After"]["schema"],
+                         {"type": "integer", "minimum": 1})
+        self.assertNotIn("404", SPEC["paths"]["/api/v1/secrets"]["post"]["responses"])
+        self.assertEqual(SPEC["servers"][0]["url"], "https://127.0.0.1:8443")
 
 
 if __name__ == "__main__":

@@ -19,7 +19,9 @@ tickets associés. Ce ticket ne fournit pas de serveur fonctionnel.
 L'identité du secret est le triplet `(project, env, name)`, pas le
 `snippet_hash` local du Finding. Les identifiants dans les chemins ne doivent
 pas contenir de secret : `project` et `env` sont des slugs ASCII, `name` est
-un nom de variable d'environnement. Les segments, slashs, caractères de
+un nom de variable d'environnement aligné sur `EnvVarName` du MCP :
+`^[A-Z][A-Z0-9_]{1,63}(?![\s\S])`, soit 2 à 64 caractères et une lettre initiale.
+Les segments, slashs, caractères de
 contrôle et fins de ligne non conformes sont rejetés, y compris après
 décodage de l'URL. Ces identifiants ne sont pas des chemins de fichiers.
 
@@ -47,9 +49,10 @@ une ressource inexistante obtient 404. Pas de clé dans l'URL, les exemples,
 les traces ou le corps d'erreur.
 
 Le serveur et le client utilisent TLS sur le réseau privé, avec validation
-du certificat. `https://localhost:8443` est une adresse de développement
+du certificat. `https://127.0.0.1:8443` est une adresse de développement
 configurable, pas un appel vers Internet. `/api/v1/health` est public sur ce
-réseau et ne divulgue aucune configuration. Les dépendances des tests se
+réseau et ne divulgue aucune configuration ; elle est aussi limitée et peut
+retourner 429 avec `Retry-After`. Les dépendances des tests se
 téléchargent lors de l'installation uniquement ; les tests restent hors ligne.
 
 Les réponses de succès contenant des métadonnées ou une valeur portent
@@ -61,18 +64,40 @@ outil pour lire une valeur Vault.
 ## Erreurs communes
 
 Chaque erreur retourne `application/json`, un objet strict `{code, message}`.
-Le message est générique et constant pour sa classe d'erreur.
+Le schéma impose un message constant par code via `enum` et `allOf` conditionnel.
+Les messages suivants sont les seules valeurs autorisées ; une autre chaîne
+ou un message constant associé au mauvais code est rejeté.
 
-| HTTP | `code` | Signification |
+| HTTP | `code` | `message` constant |
 | --- | --- | --- |
-| 400 | `bad_request` | JSON, paramètre, champ ou taille invalide |
-| 401 | `unauthorized` | Clé absente, invalide ou révoquée |
-| 403 | `forbidden` | Projet, environnement ou action non autorisés |
-| 404 | `not_found` | Ressource absente après autorisation |
-| 409 | `conflict` | POST sur une identité existante, sans écrasement |
-| 429 | `rate_limited` | Limitation ; `Retry-After` en secondes entières positives |
-| 503 | `unavailable` | Health indisponible |
-| 500 / autre erreur inattendue | `internal_error` | Échec générique, sans détail interne |
+| 400 | `bad_request` | Requête invalide |
+| 401 | `unauthorized` | Authentification requise |
+| 403 | `forbidden` | Accès interdit |
+| 404 | `not_found` | Ressource introuvable |
+| 409 | `conflict` | Secret déjà existant |
+| 429 | `rate_limited` | Trop de requêtes |
+| 503 | `unavailable` | Service indisponible |
+| 500 / autre erreur inattendue | `internal_error` | Erreur interne |
+
+404 concerne uniquement les lectures : le POST de collection ne renvoie pas
+404. Le serveur reste responsable d'associer le bon code HTTP à l'erreur.
+
+## Limitation de débit et proxies (#25)
+
+Le bucket des requêtes authentifiées est lié à l'identifiant interne de la
+clé API validée. Les erreurs 400 et 401 doivent consommer le budget applicable,
+au même titre que les succès ; une erreur ne contourne jamais la limitation.
+Une clé absente, invalide ou révoquée n'offre pas de bucket arbitraire : ces
+requêtes sont limitées par l'adresse du pair réseau et une limite globale.
+Health utilise ces limites publiques. Ne jamais stocker la valeur brute de
+la clé dans le bucket ni créer un bucket pour chaque clé fournie par l'attaquant.
+
+`X-Forwarded-For` est ignoré par défaut. Son usage n'est autorisé que derrière
+un proxy explicitement approuvé, avec liste de pairs de confiance, suppression
+des en-têtes fournis par le client et parsing contrôlé de la chaîne de proxies.
+Les tests runtime #25 devront montrer qu'un header falsifié ou un changement
+de clé invalide ne remet pas le compteur à zéro. Les quotas précis sont une
+configuration du serveur ; toutes les routes ont une limite globale.
 
 Exemple sans donnée utilisateur :
 
@@ -114,6 +139,12 @@ git diff --check
 Les exemples de valeur sont des placeholders explicites, jamais des clés
 réalistes, même expirées.
 
+Le workflow [Vault contract](../../.github/workflows/vault-contract.yml) installe
+les dépendances, exécute tous les tests de contrats et le lint Spectral sur
+un runner Ubuntu GitHub à chaque modification du contrat sur cette PR.
+Son résultat distant reste à vérifier après push ; les résultats locaux
+ne permettent pas de cocher « CI verte ».
+
 ## Comparaison avec FastAPI et limites de la preuve
 
 [fastapi_contract_fixture.py](../../tests/contracts/fastapi_contract_fixture.py)
@@ -133,7 +164,8 @@ ces contraintes dans l'application réelle ou un filtre équivalent testé.
 
 La comparaison n'est pas encore une preuve de conformité du serveur #25.
 À son arrivée, remplacer `build_app()` par sa vraie factory et ajouter les
-tests HTTP de 400/401/403/404/409/429, isolement interprojets, no-store et
+tests HTTP de 400/401/403/404/409/429, isolement interprojets, health limité,
+headers proxy falsifiés, no-store et
 handlers sans fuite. Le chiffrement, TLS, la limitation de débit et la
 révocation sont des exigences, pas des propriétés prouvées par cette PR.
 
