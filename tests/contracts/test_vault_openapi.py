@@ -1,4 +1,5 @@
 """Validation hors ligne et comparaison indépendante avec FastAPI."""
+import asyncio
 import copy
 import json
 import unittest
@@ -9,7 +10,8 @@ import yaml
 from jsonschema import Draft202012Validator
 from openapi_spec_validator import validate
 
-from fastapi_contract_fixture import Error, InternalError, build_app
+from fastapi_contract_fixture import ERROR_MODELS, InternalError, build_app, project_api_key
+from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 
@@ -22,6 +24,18 @@ MESSAGES = {
     "forbidden": "Accès interdit", "not_found": "Ressource introuvable",
     "conflict": "Secret déjà existant", "rate_limited": "Trop de requêtes",
     "unavailable": "Service indisponible", "internal_error": "Erreur interne",
+}
+
+ERROR_SCHEMAS = {
+    "400": ("BadRequestError", "bad_request"),
+    "401": ("UnauthorizedError", "unauthorized"),
+    "403": ("ForbiddenError", "forbidden"),
+    "404": ("NotFoundError", "not_found"),
+    "409": ("ConflictError", "conflict"),
+    "429": ("RateLimitedError", "rate_limited"),
+    "500": ("InternalError", "internal_error"),
+    "503": ("UnavailableError", "unavailable"),
+    "default": ("InternalError", "internal_error"),
 }
 
 
@@ -99,16 +113,14 @@ class VaultContractTests(unittest.TestCase):
 
     def test_drift_detects_weakened_object_and_error_constraints(self):
         baseline = build_app().openapi()
-        for model in ("SecretCreate", "SecretMetadata", "SecretRead", "Error", "InternalError", "Health"):
+        for model in ("SecretCreate", "SecretMetadata", "SecretRead", "Health",
+                      *(name for name, _ in ERROR_SCHEMAS.values())):
             with self.subTest(model=model):
                 changed = copy.deepcopy(baseline)
                 del changed["components"]["schemas"][model]["additionalProperties"]
                 self.assertNotEqual(wire_contract(SPEC), wire_contract(changed))
         changed = copy.deepcopy(baseline)
-        changed["components"]["schemas"]["Error"]["properties"]["message"] = {"type": "string"}
-        self.assertNotEqual(wire_contract(SPEC), wire_contract(changed))
-        # Retirer aussi les conditions simule un message réellement libre.
-        del changed["components"]["schemas"]["Error"]["allOf"]
+        changed["components"]["schemas"]["BadRequestError"]["properties"]["message"] = {"type": "string"}
         self.assertNotEqual(wire_contract(SPEC), wire_contract(changed))
 
     def test_identifiers_reject_noncanonical_values(self):
@@ -147,21 +159,20 @@ class VaultContractTests(unittest.TestCase):
                     self.assertEqual(item[method].get("security", SPEC["security"]), [{"ProjectApiKey": []}])
 
     def test_error_format_and_codes(self):
-        expected = {"400": "bad_request", "401": "unauthorized", "403": "forbidden",
-                    "404": "not_found", "409": "conflict", "429": "rate_limited",
-                    "500": "internal_error", "503": "unavailable", "default": "internal_error"}
-        schema = SPEC["components"]["schemas"]["Error"]
         for item in SPEC["paths"].values():
             for method in ("get", "post"):
-                for code, response in item.get(method, {}).get("responses", {}).items():
-                    if code in expected:
-                        error_schema = resolve(response, SPEC)["content"]["application/json"]["schema"]
-                        self.assertEqual(error_schema, SPEC["components"]["schemas"]["InternalError"] if code == "500" else schema)
-                        Draft202012Validator(error_schema).validate(
-                            {"code": expected[code], "message": MESSAGES[expected[code]]})
+                for status, response in item.get(method, {}).get("responses", {}).items():
+                    if status in ERROR_SCHEMAS:
+                        name, code = ERROR_SCHEMAS[status]
+                        content = resolve(response, SPEC)["content"]
+                        self.assertEqual(set(content), {"application/json"})
+                        schema = content["application/json"]["schema"]
+                        self.assertEqual(schema, SPEC["components"]["schemas"][name])
+                        Draft202012Validator(schema).validate(
+                            {"code": code, "message": MESSAGES[code]})
 
     def test_error_rejects_sensitive_extra_fields(self):
-        validator = Draft202012Validator(SPEC["components"]["schemas"]["Error"])
+        validator = Draft202012Validator(SPEC["components"]["schemas"]["BadRequestError"])
         for field in ("value", "traceback", "api_key", "input"):
             self.assertFalse(validator.is_valid(
                 dict(code="bad_request", message="Requête invalide", **{field: "PLACEHOLDER"})))
@@ -180,28 +191,44 @@ class VaultContractTests(unittest.TestCase):
             self.assertFalse(validator.is_valid(value))
 
     def test_error_message_cannot_reflect_input_or_traceback(self):
-        validator = Draft202012Validator(SPEC["components"]["schemas"]["Error"])
-        for code, message in MESSAGES.items():
+        for status, (name, code) in ERROR_SCHEMAS.items():
+            validator = Draft202012Validator(SPEC["components"]["schemas"][name])
+            model = ERROR_MODELS[int(status) if status != "default" else 500]
+            message = MESSAGES[code]
             value = {"code": code, "message": message}
             validator.validate(value)
-            Error.model_validate(value)
+            model.model_validate(value)
             for invalid in ("Entrée invalide DEMO_PASSWORD", "Traceback: internal/path.py",
                             message + " DEMO_PASSWORD", "Message générique"):
-                with self.subTest(code=code, message=invalid):
+                with self.subTest(status=status, message=invalid):
                     value = {"code": code, "message": invalid}
                     self.assertFalse(validator.is_valid(value))
                     with self.assertRaises(ValidationError):
-                        Error.model_validate(value)
+                        model.model_validate(value)
 
-    def test_error_message_must_match_code(self):
-        validator = Draft202012Validator(SPEC["components"]["schemas"]["Error"])
-        for code in MESSAGES:
-            for other_code, message in MESSAGES.items():
-                if other_code != code:
-                    value = {"code": code, "message": message}
-                    self.assertFalse(validator.is_valid(value))
-                    with self.assertRaises(ValidationError):
-                        Error.model_validate(value)
+    def test_error_code_matches_http_status(self):
+        for path, item in SPEC["paths"].items():
+            for method in ("get", "post"):
+                for status, response in item.get(method, {}).get("responses", {}).items():
+                    if status not in ERROR_SCHEMAS:
+                        continue
+                    _, expected_code = ERROR_SCHEMAS[status]
+                    validator = Draft202012Validator(
+                        resolve(response, SPEC)["content"]["application/json"]["schema"])
+                    model = ERROR_MODELS[int(status) if status != "default" else 500]
+                    # Matrice exhaustive code/message : un seul couple autorisé.
+                    for code in MESSAGES:
+                        for message in MESSAGES.values():
+                            with self.subTest(path=path, method=method, status=status,
+                                              code=code, message=message):
+                                value = {"code": code, "message": message}
+                                valid = code == expected_code and message == MESSAGES[expected_code]
+                                self.assertEqual(validator.is_valid(value), valid)
+                                if valid:
+                                    model.model_validate(value)
+                                else:
+                                    with self.assertRaises(ValidationError):
+                                        model.model_validate(value)
 
     def test_decoded_url_identifiers_rejected(self):
         for name in ("ProjectId", "EnvironmentId", "SecretName"):
@@ -281,6 +308,55 @@ class VaultContractTests(unittest.TestCase):
                         self.assertFalse(validator.is_valid(value))
                         with self.assertRaises(ValidationError):
                             InternalError.model_validate(value)
+
+    def test_headers_required_and_omission_changes_contract(self):
+        baseline = build_app().openapi()
+        expected = [
+            ("/api/v1/secrets", "post", "201", "Cache-Control"),
+            ("/api/v1/secrets/{project}/{env}/{name}", "get", "200", "Cache-Control"),
+            ("/api/v1/secrets/{project}/{env}/{name}/state", "get", "200", "Cache-Control"),
+        ]
+        expected += [(path, method, "429", "Retry-After")
+                     for path, item in SPEC["paths"].items()
+                     for method in ("get", "post") if method in item]
+        for path, method, status, name in expected:
+            with self.subTest(path=path, status=status, header=name):
+                response = resolve(SPEC["paths"][path][method]["responses"][status], SPEC)
+                self.assertIs(response["headers"][name].get("required"), True)
+                for mutation in ("missing_required", "optional", "missing_header"):
+                    changed = copy.deepcopy(baseline)
+                    headers = changed["paths"][path][method]["responses"][status]["headers"]
+                    if mutation == "missing_header":
+                        del headers[name]
+                    elif mutation == "optional":
+                        headers[name]["required"] = False
+                    else:
+                        del headers[name]["required"]
+                    self.assertNotEqual(wire_contract(SPEC), wire_contract(changed))
+
+    def test_fixture_auth_is_manual_and_rejects_all_credentials(self):
+        self.assertIs(project_api_key.auto_error, False)
+        app = build_app()
+        for item in app.openapi()["paths"].values():
+            for method in ("get", "post"):
+                if method in item:
+                    self.assertNotIn("422", item[method]["responses"])
+        # ASGI en mémoire, sans port réseau ; la fixture n'a aucune clé valide.
+        async def exercise():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://fixture.test") as client:
+                for headers in ({}, {"X-Heimdall-API-Key": ""},
+                                {"X-Heimdall-API-Key": "PLACEHOLDER_NOT_A_KEY"}):
+                    for method, path in (
+                            ("POST", "/api/v1/secrets"),
+                            ("GET", "/api/v1/secrets/demo/dev/DEMO_PASSWORD"),
+                            ("GET", "/api/v1/secrets/demo/dev/DEMO_PASSWORD/state")):
+                        with self.subTest(method=method, path=path, headers=headers):
+                            response = await client.request(method, path, headers=headers)
+                            self.assertEqual(response.status_code, 401)
+                            self.assertEqual(response.headers["content-type"], "application/json")
+                            self.assertEqual(response.json(), {
+                                "code": "unauthorized", "message": "Authentification requise"})
+        asyncio.run(exercise())
 
 
 if __name__ == "__main__":

@@ -213,11 +213,13 @@ components:
         $ref: '#/components/schemas/SecretName'
   headers:
     NoStore:
+      required: true
       description: Réponse interdite de mise en cache.
       schema:
         type: string
         const: no-store
     RetryAfter:
+      required: true
       description: >-
         Délai avant nouvelle tentative, entier de 1 à 3600 secondes incluses.
         Le client DOIT refuser une valeur hors contrat sans attendre ce délai,
@@ -232,31 +234,31 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/BadRequestError'
     Unauthorized:
       description: Clé absente, invalide ou révoquée ; même réponse générique.
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/UnauthorizedError'
     Forbidden:
       description: Clé valide mais projet, environnement ou opération non autorisés.
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/ForbiddenError'
     NotFound:
       description: Ressource absente après autorisation ; jamais utilisée pour révéler un autre projet.
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/NotFoundError'
     Conflict:
       description: Ce nom existe déjà dans le projet et l'environnement ; aucun écrasement.
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/ConflictError'
     TooManyRequests:
       description: >-
         Limite dépassée. Bucket par identifiant de clé API validée, erreurs
@@ -269,19 +271,19 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/RateLimitedError'
     Unavailable:
       description: Service indisponible ; aucun détail interne.
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/UnavailableError'
     UnexpectedError:
       description: Erreur inattendue ; message générique sans secret ni trace interne.
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/InternalError'
     InternalServerError:
       description: >-
         Erreur interne : application/json avec code internal_error et message
@@ -371,91 +373,83 @@ components:
           $ref: '#/components/schemas/SecretStatus'
         value:
           $ref: '#/components/schemas/SecretValue'
-    Error:
+    BadRequestError:
       type: object
       additionalProperties: false
       required: [code, message]
       properties:
         code:
           type: string
-          enum: [bad_request, unauthorized, forbidden, not_found, conflict, rate_limited, unavailable, internal_error]
+          const: bad_request
         message:
           type: string
-          enum: ["Requête invalide", "Authentification requise", "Accès interdit", "Ressource introuvable", "Secret déjà existant", "Trop de requêtes", "Service indisponible", "Erreur interne"]
-          description: Message constant lié au code ; aucune entrée utilisateur reflétée.
-      allOf:
-        - if:
-            properties:
-              code:
-                const: bad_request
-            required: [code]
-          then:
-            properties:
-              message:
-                const: "Requête invalide"
-        - if:
-            properties:
-              code:
-                const: unauthorized
-            required: [code]
-          then:
-            properties:
-              message:
-                const: "Authentification requise"
-        - if:
-            properties:
-              code:
-                const: forbidden
-            required: [code]
-          then:
-            properties:
-              message:
-                const: "Accès interdit"
-        - if:
-            properties:
-              code:
-                const: not_found
-            required: [code]
-          then:
-            properties:
-              message:
-                const: "Ressource introuvable"
-        - if:
-            properties:
-              code:
-                const: conflict
-            required: [code]
-          then:
-            properties:
-              message:
-                const: "Secret déjà existant"
-        - if:
-            properties:
-              code:
-                const: rate_limited
-            required: [code]
-          then:
-            properties:
-              message:
-                const: "Trop de requêtes"
-        - if:
-            properties:
-              code:
-                const: unavailable
-            required: [code]
-          then:
-            properties:
-              message:
-                const: "Service indisponible"
-        - if:
-            properties:
-              code:
-                const: internal_error
-            required: [code]
-          then:
-            properties:
-              message:
-                const: "Erreur interne"
+          const: "Requête invalide"
+    UnauthorizedError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: unauthorized
+        message:
+          type: string
+          const: "Authentification requise"
+    ForbiddenError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: forbidden
+        message:
+          type: string
+          const: "Accès interdit"
+    NotFoundError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: not_found
+        message:
+          type: string
+          const: "Ressource introuvable"
+    ConflictError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: conflict
+        message:
+          type: string
+          const: "Secret déjà existant"
+    RateLimitedError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: rate_limited
+        message:
+          type: string
+          const: "Trop de requêtes"
+    UnavailableError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: unavailable
+        message:
+          type: string
+          const: "Service indisponible"
     Health:
       type: object
       additionalProperties: false

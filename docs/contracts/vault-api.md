@@ -94,7 +94,8 @@ contournement : configurer explicitement la confiance appropriée. Un échec
 de vérification TLS DOIT interrompre la connexion, sans repli non vérifié.
 
 Les réponses de succès contenant des métadonnées ou une valeur portent
-`Cache-Control: no-store`. Le serveur doit aussi protéger ses logs, les
+`Cache-Control: no-store`. Le Header Object partagé `NoStore` impose
+`required: true` sur le POST 201 et les deux GET 200 de secrets. Le serveur doit aussi protéger ses logs, les
 traces middleware et les erreurs de validation : jamais de corps de requête,
 clé, valeur déchiffrée ou entrée utilisateur reflétée. Le MCP/LLM n'a aucun
 outil pour lire une valeur Vault.
@@ -102,7 +103,10 @@ outil pour lire une valeur Vault.
 ## Erreurs communes
 
 Chaque erreur retourne `application/json`, un objet strict `{code, message}`.
-Le schéma impose un message constant par code via `enum` et `allOf` conditionnel.
+Chaque réponse HTTP référence un schéma dédié avec `code` et `message` en
+`const` et `additionalProperties: false`. Le statut impose donc le couple
+exact : par exemple un 401 ne peut pas contenir `forbidden`, même avec le
+message correspondant. `default` utilise lui aussi `InternalError`.
 Les messages suivants sont les seules valeurs autorisées ; une autre chaîne
 ou un message constant associé au mauvais code est rejeté.
 
@@ -143,7 +147,8 @@ de clé invalide ne remet pas le compteur à zéro. Les quotas précis sont une
 configuration du serveur ; toutes les routes ont une limite globale.
 
 `Retry-After` DOIT être un délai entier de **1 à 3600 secondes incluses**,
-pas une date HTTP. Le serveur DOIT respecter cette borne. Un client recevant
+pas une date HTTP. Son Header Object partagé impose `required: true` pour
+toutes les réponses 429, y compris health. Le serveur DOIT respecter cette borne. Un client recevant
 une valeur absente, mal formée ou hors bornes DOIT signaler une erreur de
 protocole : il ne doit ni attendre le délai aberrant ni recommencer aussitôt
 automatiquement. Les retries conformes doivent également rester bornés.
@@ -200,8 +205,14 @@ avec commentaire de version, pour éviter les changements de tags mutables.
 
 [fastapi_contract_fixture.py](../../tests/contracts/fastapi_contract_fixture.py)
 est une fixture indépendante, sans lecture du YAML, sans stockage et sans
-serveur lancé. Ses handlers lèvent `NotImplementedError`. Elle ne doit pas
-être utilisée comme application Vault.
+port réseau. Les handlers métier lèvent `NotImplementedError`. Le garde
+d'authentification utilise `APIKeyHeader(auto_error=False)` et une exception
+dédiée, transformée manuellement en JSON 401 sans enveloppe `detail`. En
+l'absence de registre de clés, il refuse **toutes** les clés : aucune clé
+factice ne permet un accès. Ne pas copier les réponses automatiques
+d'authentification/validation de FastAPI (403/401/422 selon version) ; #25
+doit brancher la vérification réelle et les handlers conformes au contrat.
+Cette fixture ne doit pas être utilisée comme application Vault.
 
 Le test compare les documents après résolution des références locales :
 routes et méthodes, operationId, paramètres, corps, modèles, contraintes,
@@ -210,6 +221,13 @@ et l'ordre des champs obligatoires sont normalisés. Un test de mutation
 vérifie qu'une contrainte ou méthode supplémentaire fait diverger le contrat,
 ainsi que la suppression de `additionalProperties: false` ou l'élargissement
 du message d'erreur en chaîne libre.
+Les tests vérifient aussi la présence des en-têtes obligatoires et détectent
+la suppression de l'en-tête, la suppression de `required` ou son passage à
+`false`. Une matrice de tous les couples code/message est vérifiée contre
+chaque réponse d'erreur déclarée. Le test ASGI d'authentification s'exécute
+en mémoire via HTTPX, sans socket ni TLS : il prouve uniquement le JSON 401
+de la fixture pour une clé absente, vide ou factice. L'absence de 422 dans
+l'OpenAPI généré est testée ; les vrais handlers 400 restent à prouver dans #25.
 
 Les patterns stricts utilisent des regex Python compilées dans la fixture,
 car le moteur Rust de Pydantic ne gère pas les lookaheads. Il faut conserver
