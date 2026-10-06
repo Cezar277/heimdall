@@ -53,12 +53,45 @@ projet obtient 403 quelle que soit l'existence du secret. Un accès autorisé à
 une ressource inexistante obtient 404. Pas de clé dans l'URL, les exemples,
 les traces ou le corps d'erreur.
 
+Le serveur **DOIT (MUST) stocker les clés API uniquement sous forme de hachés
+de vérification**, jamais leur valeur brute (base, sauvegardes et journaux
+inclus). Cette règle porte sur les clés d'authentification du serveur ; le
+client doit conserver son credential dans un stockage local protégé pour
+pouvoir s'authentifier. Le serveur DOIT comparer des empreintes de même type
+et de longueur fixe via `hmac.compare_digest`, sans comparaison `==` des
+valeurs sensibles.
+
+Pour une clé absente, inconnue, invalide ou révoquée, le serveur DOIT renvoyer
+le même HTTP 401 et `{"code":"unauthorized","message":"Authentification requise"}`,
+avec les mêmes en-têtes observables d'authentification. Le chemin de
+vérification DOIT avoir un coût comparable : utiliser une empreinte factice
+si la clé manque ou n'existe pas et effectuer la comparaison avant de rejeter
+une clé révoquée. Aucun retour anticipé ne doit révéler l'existence d'une clé.
+Cette règle s'applique aux échecs d'authentification après les garde-fous
+globaux de taille et de débit ; un rejet préalable 400 ou 429 reste possible.
+
+L'objectif est l'absence d'oracle temporel exploitable, pas une durée réseau
+strictement identique à chaque requête. `compare_digest` ne suffit pas à
+garantir cette propriété pour la recherche en base et le handler complet :
+#25 DOIT vérifier le chemin de traitement et comparer les distributions de
+latence des différents cas à charge comparable, en plus des tests fonctionnels.
+
 Le serveur et le client utilisent TLS sur le réseau privé, avec validation
 du certificat. `https://127.0.0.1:8443` est une adresse de développement
 configurable, pas un appel vers Internet. `/api/v1/health` est public sur ce
 réseau et ne divulgue aucune configuration ; elle est aussi limitée et peut
 retourner 429 avec `Retry-After`. Les dépendances des tests se
 téléchargent lors de l'installation uniquement ; les tests restent hors ligne.
+
+Le client **DOIT (MUST) vérifier la chaîne de confiance et l'identité du
+serveur**, même en développement et dans les tests d'intégration. Il est
+interdit de désactiver cette vérification avec `verify=False`, `-k`,
+`ssl._create_unverified_context` ou un équivalent. Utiliser une CA interne
+explicitement approuvée ; pour `https://127.0.0.1`, le certificat doit contenir
+`127.0.0.1` en SAN de type IP. Pour une adresse DNS privée, le SAN doit
+correspondre au nom configuré. Un certificat autosigné n'autorise aucun
+contournement : configurer explicitement la confiance appropriée. Un échec
+de vérification TLS DOIT interrompre la connexion, sans repli non vérifié.
 
 Les réponses de succès contenant des métadonnées ou une valeur portent
 `Cache-Control: no-store`. Le serveur doit aussi protéger ses logs, les
@@ -86,6 +119,11 @@ ou un message constant associé au mauvais code est rejeté.
 
 404 concerne uniquement les lectures : le POST de collection ne renvoie pas
 404. Le serveur reste responsable d'associer le bon code HTTP à l'erreur.
+Chaque route déclare aussi explicitement 500 avec le schéma `InternalError`,
+qui n'accepte que `{"code":"internal_error","message":"Erreur interne"}`.
+Le handler global DOIT intercepter les exceptions inattendues, renvoyer ce
+JSON et désactiver les réponses de debug HTML/traceback. `default` reste un
+filet documentaire ; il n'autorise pas une réponse non conforme au 500 explicite.
 
 ## Limitation de débit et proxies (#25)
 
@@ -103,6 +141,12 @@ des en-têtes fournis par le client et parsing contrôlé de la chaîne de proxi
 Les tests runtime #25 devront montrer qu'un header falsifié ou un changement
 de clé invalide ne remet pas le compteur à zéro. Les quotas précis sont une
 configuration du serveur ; toutes les routes ont une limite globale.
+
+`Retry-After` DOIT être un délai entier de **1 à 3600 secondes incluses**,
+pas une date HTTP. Le serveur DOIT respecter cette borne. Un client recevant
+une valeur absente, mal formée ou hors bornes DOIT signaler une erreur de
+protocole : il ne doit ni attendre le délai aberrant ni recommencer aussitôt
+automatiquement. Les retries conformes doivent également rester bornés.
 
 Exemple sans donnée utilisateur :
 
@@ -163,7 +207,9 @@ Le test compare les documents après résolution des références locales :
 routes et méthodes, operationId, paramètres, corps, modèles, contraintes,
 codes de réponse, en-têtes et sécurité. Seules les annotations documentaires
 et l'ordre des champs obligatoires sont normalisés. Un test de mutation
-vérifie qu'une contrainte ou méthode supplémentaire fait diverger le contrat.
+vérifie qu'une contrainte ou méthode supplémentaire fait diverger le contrat,
+ainsi que la suppression de `additionalProperties: false` ou l'élargissement
+du message d'erreur en chaîne libre.
 
 Les patterns stricts utilisent des regex Python compilées dans la fixture,
 car le moteur Rust de Pydantic ne gère pas les lookaheads. Il faut conserver
@@ -171,10 +217,13 @@ ces contraintes dans l'application réelle ou un filtre équivalent testé.
 
 La comparaison n'est pas encore une preuve de conformité du serveur #25.
 À son arrivée, remplacer `build_app()` par sa vraie factory et ajouter les
-tests HTTP de 400/401/403/404/409/429, isolement interprojets, health limité,
+tests HTTP de 400/401/403/404/409/429/500, isolement interprojets, health limité,
 headers proxy falsifiés, no-store et
 handlers sans fuite. Le chiffrement, TLS, la limitation de débit et la
 révocation sont des exigences, pas des propriétés prouvées par cette PR.
+Vérifier aussi les 401 indistinguables, le stockage haché des clés, les
+certificats non approuvés et SAN incorrects rejetés, `Retry-After` borné et le
+500 JSON constant sur une exception injectée (mode debug désactivé).
 
 Test runtime obligatoire dans #25 pour la taille du corps : vérifier le rejet
 400 au-delà de 1 048 576 octets avant tout appel au parser JSON, avec et sans

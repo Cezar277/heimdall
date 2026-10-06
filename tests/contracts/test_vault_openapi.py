@@ -9,7 +9,7 @@ import yaml
 from jsonschema import Draft202012Validator
 from openapi_spec_validator import validate
 
-from fastapi_contract_fixture import Error, build_app
+from fastapi_contract_fixture import Error, InternalError, build_app
 from pydantic import ValidationError
 
 
@@ -97,6 +97,20 @@ class VaultContractTests(unittest.TestCase):
             changed["paths"]["/api/v1/secrets"]["post"])
         self.assertNotEqual(wire_contract(SPEC), wire_contract(changed))
 
+    def test_drift_detects_weakened_object_and_error_constraints(self):
+        baseline = build_app().openapi()
+        for model in ("SecretCreate", "SecretMetadata", "SecretRead", "Error", "InternalError", "Health"):
+            with self.subTest(model=model):
+                changed = copy.deepcopy(baseline)
+                del changed["components"]["schemas"][model]["additionalProperties"]
+                self.assertNotEqual(wire_contract(SPEC), wire_contract(changed))
+        changed = copy.deepcopy(baseline)
+        changed["components"]["schemas"]["Error"]["properties"]["message"] = {"type": "string"}
+        self.assertNotEqual(wire_contract(SPEC), wire_contract(changed))
+        # Retirer aussi les conditions simule un message réellement libre.
+        del changed["components"]["schemas"]["Error"]["allOf"]
+        self.assertNotEqual(wire_contract(SPEC), wire_contract(changed))
+
     def test_identifiers_reject_noncanonical_values(self):
         for name in ("ProjectId", "EnvironmentId", "SecretName"):
             validator = Draft202012Validator(SPEC["components"]["schemas"][name])
@@ -135,14 +149,14 @@ class VaultContractTests(unittest.TestCase):
     def test_error_format_and_codes(self):
         expected = {"400": "bad_request", "401": "unauthorized", "403": "forbidden",
                     "404": "not_found", "409": "conflict", "429": "rate_limited",
-                    "503": "unavailable", "default": "internal_error"}
+                    "500": "internal_error", "503": "unavailable", "default": "internal_error"}
         schema = SPEC["components"]["schemas"]["Error"]
         for item in SPEC["paths"].values():
             for method in ("get", "post"):
                 for code, response in item.get(method, {}).get("responses", {}).items():
                     if code in expected:
                         error_schema = resolve(response, SPEC)["content"]["application/json"]["schema"]
-                        self.assertEqual(error_schema, schema)
+                        self.assertEqual(error_schema, SPEC["components"]["schemas"]["InternalError"] if code == "500" else schema)
                         Draft202012Validator(error_schema).validate(
                             {"code": expected[code], "message": MESSAGES[expected[code]]})
 
@@ -228,9 +242,45 @@ class VaultContractTests(unittest.TestCase):
     def test_health_rate_limit_and_post_responses(self):
         response = resolve(SPEC["paths"]["/api/v1/health"]["get"]["responses"]["429"], SPEC)
         self.assertEqual(response["headers"]["Retry-After"]["schema"],
-                         {"type": "integer", "minimum": 1})
+                         {"type": "integer", "minimum": 1, "maximum": 3600})
         self.assertNotIn("404", SPEC["paths"]["/api/v1/secrets"]["post"]["responses"])
         self.assertEqual(SPEC["servers"][0]["url"], "https://127.0.0.1:8443")
+
+    def test_retry_after_bounds_on_every_rate_limited_route(self):
+        for path, item in SPEC["paths"].items():
+            for method in ("get", "post"):
+                if method not in item:
+                    continue
+                with self.subTest(path=path, method=method):
+                    response = resolve(item[method]["responses"]["429"], SPEC)
+                    validator = Draft202012Validator(response["headers"]["Retry-After"]["schema"])
+                    for value in (1, 3600):
+                        validator.validate(value)
+                    for value in (0, -1, 3601, 10**20, 1.5, "tomorrow", None, True):
+                        self.assertFalse(validator.is_valid(value))
+
+    def test_500_requires_exact_json_error_on_every_route(self):
+        valid = {"code": "internal_error", "message": "Erreur interne"}
+        invalid = ["<html>Traceback</html>",
+                   {"code": "bad_request", "message": "Requête invalide"},
+                   {"code": "internal_error", "message": "Traceback DEMO_PASSWORD"},
+                   {**valid, "traceback": "PLACEHOLDER"}]
+        for path, item in SPEC["paths"].items():
+            for method in ("get", "post"):
+                if method not in item:
+                    continue
+                with self.subTest(path=path, method=method):
+                    responses = item[method]["responses"]
+                    self.assertIn("default", responses)
+                    content = resolve(responses["500"], SPEC)["content"]
+                    self.assertEqual(set(content), {"application/json"})
+                    validator = Draft202012Validator(content["application/json"]["schema"])
+                    validator.validate(valid)
+                    InternalError.model_validate(valid)
+                    for value in invalid:
+                        self.assertFalse(validator.is_valid(value))
+                        with self.assertRaises(ValidationError):
+                            InternalError.model_validate(value)
 
 
 if __name__ == "__main__":

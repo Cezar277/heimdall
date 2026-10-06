@@ -75,14 +75,20 @@ class Health(StrictModel):
     status: Literal["ok"]
 
 
+class InternalError(StrictModel):
+    code: Literal["internal_error"]
+    message: Literal["Erreur interne"]
+
+
 def build_app():
     app = FastAPI(title="Heimdall Vault API", version="1.0.0")
     key = APIKeyHeader(name="X-Heimdall-API-Key", scheme_name="ProjectApiKey")
     responses = {code: {"model": Error} for code in (400, 401, 403, 404, 429)}
     responses["default"] = {"model": Error}
+    responses[500] = {"model": InternalError}
     no_store = {"Cache-Control": {"schema": {"type": "string", "const": "no-store"}}}
     responses[429]["headers"] = {
-        "Retry-After": {"schema": {"type": "integer", "minimum": 1}}
+        "Retry-After": {"schema": {"type": "integer", "minimum": 1, "maximum": 3600}}
     }
 
     @app.post("/api/v1/secrets", response_model=SecretMetadata, status_code=201,
@@ -103,7 +109,7 @@ def build_app():
         raise NotImplementedError("Fixture de contrat uniquement")
 
     @app.get("/api/v1/health", response_model=Health, operation_id="getHealth",
-             responses={429: responses[429], 503: {"model": Error}, "default": {"model": Error}})
+             responses={429: responses[429], 500: responses[500], 503: {"model": Error}, "default": {"model": Error}})
     def health():
         raise NotImplementedError("Fixture de contrat uniquement")
 

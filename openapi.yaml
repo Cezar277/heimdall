@@ -65,6 +65,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
         default:
           $ref: '#/components/responses/UnexpectedError'
   /api/v1/secrets/{project}/{env}/{name}:
@@ -106,6 +108,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
         default:
           $ref: '#/components/responses/UnexpectedError'
   /api/v1/secrets/{project}/{env}/{name}/state:
@@ -140,6 +144,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
         default:
           $ref: '#/components/responses/UnexpectedError'
   /api/v1/health:
@@ -164,6 +170,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '503':
           $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
         default:
           $ref: '#/components/responses/UnexpectedError'
 components:
@@ -174,7 +182,13 @@ components:
       name: X-Heimdall-API-Key
       description: >-
         Clé liée à un projet et à ses permissions. Jamais dans une URL ou un log.
-        TLS obligatoire, y compris sur le réseau privé.
+        Le serveur DOIT stocker uniquement un haché de vérification de la clé,
+        jamais sa valeur brute, et comparer les empreintes de longueur fixe
+        via hmac.compare_digest. Clé absente, inconnue, invalide ou révoquée :
+        même réponse 401 générique et chemin de vérification de coût comparable,
+        sans oracle temporel exploitable (hors rejet préalable de taille ou débit).
+        TLS obligatoire : le client DOIT vérifier la chaîne de confiance et
+        l'identité du serveur, même en développement ; aucun mode non vérifié.
   parameters:
     Project:
       name: project
@@ -204,10 +218,14 @@ components:
         type: string
         const: no-store
     RetryAfter:
-      description: Délai avant nouvelle tentative, en secondes entières.
+      description: >-
+        Délai avant nouvelle tentative, entier de 1 à 3600 secondes incluses.
+        Le client DOIT refuser une valeur hors contrat sans attendre ce délai,
+        sans retry immédiat automatique ni boucle illimitée ; signaler l'erreur.
       schema:
         type: integer
         minimum: 1
+        maximum: 3600
   responses:
     BadRequest:
       description: JSON mal formé, champ invalide ou propriété supplémentaire ; aucune entrée reflétée.
@@ -264,7 +282,30 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    InternalServerError:
+      description: >-
+        Erreur interne : application/json avec code internal_error et message
+        Erreur interne uniquement. Le handler DOIT intercepter les exceptions
+        inattendues ; jamais de HTML, traceback ni entrée utilisateur.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InternalError'
+          example:
+            code: internal_error
+            message: Erreur interne
   schemas:
+    InternalError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: internal_error
+        message:
+          type: string
+          const: Erreur interne
     ProjectId:
       type: string
       minLength: 1
