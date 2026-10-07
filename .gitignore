@@ -1,4 +1,36 @@
+# --- Python ---
 .venv/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# --- Sécurité Heimdall : JAMAIS de secret dans le dépôt ---
+# Le vrai .env (secrets locaux) ne doit jamais être commité.
+# Seul .env.example (noms de variables, aucune valeur) est versionné.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.local.json
+
+# --- Outils / OS / IDE ---
+bandit-report.json
+node_modules/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
