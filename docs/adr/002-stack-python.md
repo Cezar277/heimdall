@@ -55,8 +55,11 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
 ## Décision : reproductibilité
 
 - Toutes les dépendances sont en `==` dans `pyproject.toml` (+ `[dev]`).
-- `requirements.lock` = `pip freeze` complet après `pip install -e .[dev]`,
-  horodaté en en-tête, régénéré par la commande qui y figure.
+- `requirements.lock` est compilé avec
+  `pip-compile --generate-hashes --extra dev -o requirements.lock pyproject.toml`
+  (hashes SHA-256) et s'installe avec
+  `pip install --require-hashes -r requirements.lock` puis
+  `pip install -e . --no-deps`. L'en-tête du lock donne les commandes exactes.
 - `tests/contracts/requirements.txt` garde ses `==` + **hashes SHA-256**
   (`--require-hashes` en CI) ; Spectral est figé via `package.json` +
   `package-lock.json` + `npm ci` (voir correctif LOW-4 dans la PR).

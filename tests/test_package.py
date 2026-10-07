@@ -85,6 +85,9 @@ class PackageSmokeTests(unittest.TestCase):
             "http://127.0.0.1:8443",  # HTTPS obligatoire même en local.
             "https://user:PLACEHOLDER@127.0.0.1:8443/",  # jamais de credential en URL.
             "https://[::1.evil.example]/",
+            "https://127.0.0.1:8443\nInjected: x",  # CRLF : concaténation dangereuse en #25.
+            "https://127.0.0.1:8443\tx",
+            "https://127.0.0.1:8443 x",
             "",
         ):
             with self.subTest(base_url=base_url):

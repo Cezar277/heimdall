@@ -1,9 +1,17 @@
 """Confinement crypto : `cryptography`/`argon2` UNIQUEMENT dans vault/crypto.py. (#17)
 
 Invariant 5 : tout import direct, `from`-import ou chargement dynamique
-(`__import__`, `importlib.import_module`) d'une lib crypto hors
-`heimdall/vault/crypto.py` fait échouer la suite. Détection par AST (pas de
-regex contournable) + méta-tests du détecteur sur extraits piégés.
+explicite (`__import__("cryptography")`, `importlib.import_module("argon2")`)
+d'une lib crypto hors `heimdall/vault/crypto.py` fait échouer la suite.
+Détection par AST (pas de regex contournable) + méta-tests du détecteur
+sur extraits piégés.
+
+Limite connue et assumée : l'obfuscation (`__import__(var)`,
+`"crypto" + "graphy"`, `getattr(importlib, "import_module")(...)`) n'est PAS
+détectée — un garde statique ne voit pas les chaînes construites à
+l'exécution. Compléments : relecture humaine (obligatoire sur `main`) +
+`bandit -r heimdall` dans le gate. Ne jamais présenter ce test comme
+exhaustif (voir `test_obfuscated_dynamic_import_is_a_documented_limit`).
 Preuve SAMM : cycle de vie, module + ligne.
 """
 
@@ -103,6 +111,16 @@ class CryptoConfinementTests(unittest.TestCase):
             )
             offenders = find_offenders(package)
             self.assertEqual(offenders, [client])
+
+    def test_obfuscated_dynamic_import_is_a_documented_limit(self) -> None:
+        """Limite assumée : l'obfuscation passe le garde (revue + bandit requis)."""
+        for source in (
+            "__import__(module_name)",
+            '__import__("crypto" + "graphy")',
+            'getattr(importlib, "import_module")("cryptography")',
+        ):
+            with self.subTest(source=source):
+                self.assertFalse(imports_crypto_lib(source))
 
     def test_crypto_module_exists(self) -> None:
         self.assertTrue((PKG / "vault" / "crypto.py").is_file())

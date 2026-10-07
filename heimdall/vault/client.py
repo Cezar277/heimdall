@@ -4,11 +4,14 @@ Parle au Vault EXCLUSIVEMENT en HTTPS vers une adresse de boucle locale
 (invariant 12 ; allowlist : ``127.0.0.1``, ``::1``, ``localhost``), avec
 vérification TLS obligatoire (chaîne + SAN, CA interne explicitement
 approuvée). Interdit : ``verify=False``, ``-k``, contexte SSL non vérifié,
-repli non vérifié, credentials dans l'URL. Le client conserve son credential
-dans un stockage local protégé (#26 : mode 600), jamais dans l'URL ni les
-logs — ``repr()`` est redacté et la clé ne doit jamais être journalisée.
+repli non vérifié, credentials dans l'URL, espaces ou caractères de contrôle
+dans l'URL (concaténation ``f"{base_url}/..."`` dangereuse en #25).
+Le client conserve son credential dans un stockage local protégé (#26 : mode
+600), jamais dans l'URL ni les logs — ``repr()`` est redacté et la clé ne
+doit jamais être journalisée.
 """
 
+import re
 from urllib.parse import urlparse
 
 _ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -18,6 +21,8 @@ class VaultClient:
     """Client HTTPS du Vault (boucle locale uniquement)."""
 
     def __init__(self, base_url: str, api_key: str) -> None:
+        if re.search(r"[\x00-\x20\x7f]", base_url):
+            raise ValueError("espaces et contrôles interdits dans l'URL du Vault")
         parsed = urlparse(base_url)
         if parsed.scheme != "https":
             raise ValueError("le Vault n'est joignable qu'en HTTPS")

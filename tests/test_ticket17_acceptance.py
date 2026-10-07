@@ -127,6 +127,30 @@ class Ticket17AcceptanceTests(unittest.TestCase):
         self.assertIn(".env", lines)
         self.assertNotIn(".env.example", lines)
 
+    def test_gitignore_actually_ignores_key_material(self) -> None:
+        """Preuve comportementale : git ignore vraiment les secrets (LOW review)."""
+        git_bin = shutil.which("git")
+        if git_bin is None:
+            self.skipTest("git requis")
+        for name in ("id_rsa", "id_ed25519", ".env", "prod.jks", "prod.keystore"):
+            with self.subTest(name=name):
+                completed = subprocess.run(
+                    [git_bin, "check-ignore", "-q", name],
+                    cwd=ROOT,
+                    capture_output=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, msg=f"{name} ne serait pas ignoré")
+        ignored = subprocess.run(
+            [git_bin, "check-ignore", "-q", ".env.example"],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(ignored.returncode, 1, msg=".env.example doit rester versionnable")
+
     def test_license_mit(self) -> None:
         content = (ROOT / "LICENSE").read_text(encoding="utf-8")
         self.assertTrue(content.strip())
