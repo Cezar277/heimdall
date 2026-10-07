@@ -76,7 +76,7 @@ Avec Python 3.10 ou supérieur, depuis la racine du dépôt :
 
 ```powershell
 python -m venv .venv
-.venv/Scripts/python.exe -m pip install -r tests/contracts/requirements.txt
+.venv/Scripts/python.exe -m pip install --require-hashes -r tests/contracts/requirements.txt
 .venv/Scripts/python.exe -m unittest discover -s tests/contracts -v
 ```
 
@@ -84,7 +84,7 @@ Linux/macOS :
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -r tests/contracts/requirements.txt
+.venv/bin/python -m pip install --require-hashes -r tests/contracts/requirements.txt
 .venv/bin/python -m unittest discover -s tests/contracts -v
 ```
 

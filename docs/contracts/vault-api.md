@@ -54,8 +54,14 @@ une ressource inexistante obtient 404. Pas de clé dans l'URL, les exemples,
 les traces ou le corps d'erreur.
 
 Le serveur **DOIT (MUST) stocker les clés API uniquement sous forme de hachés
-de vérification**, jamais leur valeur brute (base, sauvegardes et journaux
-inclus). Cette règle porte sur les clés d'authentification du serveur ; le
+salés de vérification**, jamais leur valeur brute (base, sauvegardes et
+journaux inclus). Chaque clé est générée à **au moins 256 bits d'entropie via
+`secrets.token_urlsafe(32)`**, jamais dérivée de données prédictibles
+(identifiant, horodatage, compteur), et n'est affichée qu'une seule fois à
+la création. Le sel est unique par clé ; à défaut, un HMAC avec un pepper
+serveur **distinct de la KEK** de chiffrement est admis. La fonction de
+hachage et la gestion du sel sont documentées pour #25.
+Cette règle porte sur les clés d'authentification du serveur ; le
 client doit conserver son credential dans un stockage local protégé pour
 pouvoir s'authentifier. Le serveur DOIT comparer des empreintes de même type
 et de longueur fixe via `hmac.compare_digest`, sans comparaison `==` des
@@ -116,13 +122,22 @@ ou un message constant associé au mauvais code est rejeté.
 | 401 | `unauthorized` | Authentification requise |
 | 403 | `forbidden` | Accès interdit |
 | 404 | `not_found` | Ressource introuvable |
+| 405 | `method_not_allowed` | Méthode non autorisée |
 | 409 | `conflict` | Secret déjà existant |
 | 429 | `rate_limited` | Trop de requêtes |
 | 503 | `unavailable` | Service indisponible |
 | 500 / autre erreur inattendue | `internal_error` | Erreur interne |
 
 404 concerne uniquement les lectures : le POST de collection ne renvoie pas
-404. Le serveur reste responsable d'associer le bon code HTTP à l'erreur.
+404. **405 est déclaré sur chaque opération** : une méthode non déclarée sur
+une route existante (ex. `DELETE /api/v1/secrets`) renvoie
+`{"code":"method_not_allowed","message":"Méthode non autorisée"}`.
+Les erreurs du routeur (route inconnue → 404 `not_found`, méthode non
+déclarée → 405) **DOIVENT** passer par des handlers catch-all Starlette qui
+renvoient ce format ; l'enveloppe `{"detail": ...}` du framework est
+interdite sur le fil (fingerprint). Prouvé par
+`test_router_errors_use_contract_format_without_detail` (client ASGI en
+mémoire, avec et sans clé).
 Chaque route déclare aussi explicitement 500 avec le schéma `InternalError`,
 qui n'accepte que `{"code":"internal_error","message":"Erreur interne"}`.
 Le handler global DOIT intercepter les exceptions inattendues, renvoyer ce
@@ -148,7 +163,9 @@ configuration du serveur ; toutes les routes ont une limite globale.
 
 `Retry-After` DOIT être un délai entier de **1 à 3600 secondes incluses**,
 pas une date HTTP. Son Header Object partagé impose `required: true` pour
-toutes les réponses 429, y compris health. Le serveur DOIT respecter cette borne. Un client recevant
+toutes les réponses 429 **et pour la 503 de health** : en indisponibilité,
+un client sans signal de backoff boucle sans délai et aggrave l'incident
+(retry storm). Le serveur DOIT respecter cette borne. Un client recevant
 une valeur absente, mal formée ou hors bornes DOIT signaler une erreur de
 protocole : il ne doit ni attendre le délai aberrant ni recommencer aussitôt
 automatiquement. Les retries conformes doivent également rester bornés.
@@ -161,7 +178,9 @@ Exemple sans donnée utilisateur :
 
 En #25, remplacer le 422 par défaut de FastAPI et les erreurs HTTP de
 Starlette par ce format, avec des handlers qui ne reflètent jamais les
-entrées. Le schéma OpenAPI ne configure pas les handlers runtime. Les
+entrées (le 404/405 routeur est déjà verrouillé ici par la réponse 405
+déclarée sur chaque opération et le handler catch-all de la fixture).
+Le schéma OpenAPI ne configure pas les handlers runtime. Les
 réponses `default` documentent les erreurs inattendues ; elles ne doivent
 pas être utilisées pour contourner les codes ci-dessus.
 
@@ -173,9 +192,10 @@ Windows / PowerShell :
 
 ```powershell
 python -m venv .venv
-.venv/Scripts/python.exe -m pip install -r tests/contracts/requirements.txt
+.venv/Scripts/python.exe -m pip install --require-hashes -r tests/contracts/requirements.txt
 .venv/Scripts/python.exe -m unittest discover -s tests/contracts -v
-npx --yes @stoplight/spectral-cli@6.15.0 lint openapi.yaml --fail-severity warn
+npm ci --no-audit --no-fund
+./node_modules/.bin/spectral lint openapi.yaml --fail-severity warn
 git diff --check
 ```
 
@@ -183,11 +203,17 @@ Linux/macOS :
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -r tests/contracts/requirements.txt
+.venv/bin/python -m pip install --require-hashes -r tests/contracts/requirements.txt
 .venv/bin/python -m unittest discover -s tests/contracts -v
-npx --yes @stoplight/spectral-cli@6.15.0 lint openapi.yaml --fail-severity warn
+npm ci --no-audit --no-fund
+./node_modules/.bin/spectral lint openapi.yaml --fail-severity warn
 git diff --check
 ```
+
+`tests/contracts/requirements.txt` est compilé avec hashes SHA-256
+(`requirements.in` + `pip-compile --generate-hashes`, LOW-4) et installé
+avec `--require-hashes`. Spectral est figé par `package.json` +
+`package-lock.json` et installé via `npm ci` (intégrité vérifiée).
 
 [.spectral.yaml](../../.spectral.yaml) active les règles OpenAPI standard.
 Les exemples de valeur sont des placeholders explicites, jamais des clés

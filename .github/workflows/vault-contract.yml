@@ -5,6 +5,8 @@ on:
     paths:
       - openapi.yaml
       - .spectral.yaml
+      - package.json
+      - package-lock.json
       - schemas/**
       - tests/contracts/**
       - docs/contracts/vault-api.md
@@ -14,6 +16,8 @@ on:
     paths:
       - openapi.yaml
       - .spectral.yaml
+      - package.json
+      - package-lock.json
       - schemas/**
       - tests/contracts/**
       - docs/contracts/vault-api.md
@@ -35,11 +39,16 @@ jobs:
         run: |
           python3 -m venv .venv
           .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install -r tests/contracts/requirements.txt
+          # LOW-4 : hashes SHA-256 vérifiés à l'installation.
+          .venv/bin/pip install --require-hashes -r tests/contracts/requirements.txt
 
       - name: Validate schemas and FastAPI contract
         run: |
           .venv/bin/python -m unittest discover -s tests/contracts -v
 
       - name: Lint OpenAPI
-        run: npx --yes @stoplight/spectral-cli@6.15.0 lint openapi.yaml --fail-severity warn
+        # LOW-4 : Spectral figé par package-lock.json, installé via `npm ci`
+        # (intégrité vérifiée) au lieu d'un `npx` sans vérification.
+        run: |
+          npm ci --no-audit --no-fund
+          ./node_modules/.bin/spectral lint openapi.yaml --fail-severity warn
