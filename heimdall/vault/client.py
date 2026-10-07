@@ -17,7 +17,7 @@ logs — ``repr()`` est redacté et la clé ne doit jamais être journalisée.
 """
 
 import re
-from typing import NoReturn
+from typing import Any, NoReturn
 from urllib.parse import urlparse
 
 _ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -25,12 +25,15 @@ _MAX_PORT = 65535
 
 
 class VaultClient:
-    """Client HTTPS du Vault (boucle locale uniquement)."""
+    """Client HTTPS du Vault (boucle locale uniquement). Non héritable."""
 
-    # Pas de __dict__ : un log accidentel de vars(client) lève TypeError au
-    # lieu d'exposer la clé (ne couvre ni pickle/copy ni subclassement sans
-    # __slots__ — la vraie garde reste « ne jamais journaliser l'objet », #26).
+    # __slots__ bloque __dict__/vars() ; __reduce__ bloque pickle/copy ; le
+    # sous-classement (qui réintroduirait __dict__) est interdit ci-dessous —
+    # la vraie garde reste de ne jamais journaliser l'objet (#26).
     __slots__ = ("_base_url", "_api_key")
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise TypeError("VaultClient non héritable (secret en mémoire)")
 
     def __init__(self, base_url: str, api_key: str) -> None:
         if not isinstance(base_url, str) or not base_url:

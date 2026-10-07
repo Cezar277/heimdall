@@ -124,6 +124,14 @@ class PackageSmokeTests(unittest.TestCase):
                 with self.assertRaises(TypeError):
                     dump(client)
 
+    def test_vault_client_not_inheritable(self) -> None:
+        """LOW : le sous-classement (qui réintroduirait __dict__) est interdit."""
+
+        with self.assertRaises(TypeError):
+
+            class Evil(heimdall.vault.client.VaultClient):
+                pass
+
     def test_vault_client_rejects_empty_key_and_non_canonical_url(self) -> None:
         """LOW : refus local précoce + URL stockée canonique (concaténation sûre)."""
         for key in ("", None):
