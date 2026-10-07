@@ -111,10 +111,12 @@ class Ticket17AcceptanceTests(unittest.TestCase):
         self.assertEqual(missing, {}, f"stack non justifiée en ADR : {sorted(missing)}")
 
     def test_adr_lock_doc_is_coherent(self) -> None:
-        """LOW review : l'ADR-002 ne doit plus mentionner `pip freeze`."""
+        """LOW review : l'ADR-002 ne doit plus mentionner `pip freeze` ni `ignore_errors`."""
         text = (ROOT / "docs" / "adr" / "002-stack-python.md").read_text(encoding="utf-8")
         self.assertNotIn("pip freeze", text)
         self.assertIn("pip-compile --generate-hashes", text)
+        self.assertNotIn("ignore_errors", text)
+        self.assertNotIn("ignore_errors", (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     # --- Tâche : .gitignore / LICENSE / README --------------------------
     def test_gitignore_python(self) -> None:
@@ -208,7 +210,13 @@ class Ticket17AcceptanceTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, msg=completed.stderr[-2000:])
 
     def test_pip_install_editable(self) -> None:
-        """« pip install -e . fonctionne » : venv isolé + entrée console réelle."""
+        """« pip install -e . fonctionne » : venv isolé + entrée console réelle.
+
+        Preuve d'installabilité, PAS de vérification supply-chain : les hashes
+        sont couverts par test_lock_carries_hashes (statique) et la CI
+        --require-hashes. Le pip du venv de preuve n'est pas épinglé
+        volontairement (outil bootstrap, pas dépendance livrée).
+        """
         if shutil.which("git") is None:  # pragma: no cover - garde-fou.
             self.skipTest("git requis pour le venv de preuve")
         with tempfile.TemporaryDirectory(prefix="heimdall-t17-") as tmp:

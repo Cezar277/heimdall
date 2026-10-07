@@ -114,6 +114,8 @@ class PackageSmokeTests(unittest.TestCase):
         # La clé reste nécessaire en mémoire pour s'authentifier : la
         # mitigation est de ne jamais journaliser l'objet ni __dict__.
         self.assertEqual(client._api_key, key)
+        with self.assertRaises(TypeError):  # __slots__ : pas de __dict__ à logger.
+            vars(client)
 
     def test_vault_client_rejects_empty_key_and_non_canonical_url(self) -> None:
         """LOW : refus local précoce + URL stockée canonique (concaténation sûre)."""

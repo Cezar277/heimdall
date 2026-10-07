@@ -49,7 +49,7 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
 | CLI | Typer 0.27.3 | Typer au-dessus de Click : `--help` typé, `scan --ci` fail-closed testé par `CliRunner`. Écarté : `argparse` nu (plus de code, plus de preuves). |
 | Tests | pytest 9.1.1 | Collecte aussi les `TestCase` unittest des contrats : une seule commande `pytest` couvre squelette + contrats. `unittest discover` reste supporté (CI contrat). |
 | Lint | Ruff 0.16.10 | Remplace flake8/isort (vitesse, une config). Règles `E,F,I,UP,B,S,PL`. |
-| Types | Mypy 2.4.0, `strict = true` | Le `strict` fige les stubs (`-> None`, pas de `Any` implicite) avant #22/#25/#27. Fixtures de contrats exclues (`ignore_errors`). |
+| Types | Mypy 2.4.0, `strict = true` | Le `strict` fige les stubs (`-> None`, pas de `Any` implicite) avant #22/#25/#27, fixture de contrat incluse. Seul le reformat ruff est gelé sur `tests/contracts/`. |
 | SAST | Bandit 1.9.4 | Garde-fou `subprocess`/`shell` (critique : `read_diff` bannit `shell=True`, #16 §4.1). |
 
 ## Décision : reproductibilité
@@ -115,5 +115,11 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
   (`NoReturn`, handlers typés) et le SAST y est appliqué en CI
   (`vault-contract.yml` : `bandit` + `ruff --select S` sur la fixture).
   La preuve de format reste portée par les tests de schémas eux-mêmes
-  (comparaison wire + matrice code/message) + Spectral. Pas de section `coverage` avant
+  (comparaison wire + matrice code/message) + Spectral. En revanche les
+  FICHIERS DE TESTS des contrats restent hors SAST par construction : ils
+  embarquent volontairement des faux réalistes (`sk_live_x` en
+  `test_mcp_tools_schema.py:234` pour tester le masquage), donc
+  `bandit`/`ruff-S` y lèvent B106/S106 par design — forcer le gate exigerait
+  des `noqa` dans les preuves gelées #14/#16. Leur garde est la validation
+  de schémas, pas le scan de secrets. Pas de section `coverage` avant
   #20 (seuil CI à définir en réunion, cf. DEFINITION_OF_DONE).
