@@ -9,24 +9,24 @@ en CI (`heimdall scan --ci`), un secret en clair fait échouer le pipeline.
 
 ## Installation
 
-Python 3.10 ou supérieur :
+Python 3.10 ou supérieur. Voie vérifiée **en premier** (hashes SHA-256) :
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -e .        # runtime
-.venv/bin/python -m pip install -e .[dev]    # + pytest, ruff, mypy, bandit, validateurs de contrats
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install --require-hashes -r requirements.lock
+.venv/bin/python -m pip install -e . --no-deps
 ```
 
 Windows / PowerShell : remplacer `.venv/bin/python` par `.venv\Scripts\python.exe`.
 
+> Avertissement supply-chain : `pip install -e .[dev]` seul résout sans
+> vérification d'intégrité — pratique pour développer, **jamais pour une
+> preuve** (preuve = bloc vérifié ci-dessus).
+
 Builds reproductibles : versions en `==` dans `pyproject.toml`
 (voir [ADR-002](docs/adr/002-stack-python.md)), gel transitif **avec hashes
-SHA-256** dans `requirements.lock` :
-
-```sh
-.venv/bin/pip install --require-hashes -r requirements.lock
-.venv/bin/pip install -e . --no-deps
-```
+SHA-256** dans `requirements.lock` (en-tête du fichier = commandes exactes).
 
 ## Usage
 

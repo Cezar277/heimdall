@@ -1,6 +1,8 @@
 """Fumée du paquet #17 : imports, version, CLI fail-closed. (#17, DoD)"""
 
+import copy
 import os
+import pickle
 import tempfile
 import unittest
 
@@ -98,6 +100,7 @@ class PackageSmokeTests(unittest.TestCase):
             "https://127.0.0.1:8443%23frag",  # fragment encodé : même refus.
             "https://127.0.0.1:99999",  # port hors 1-65535.
             "https://127.0.0.1:0",  # port 0 interdit.
+            "https://[0:0:0:0:0:0:0:1]:8443",  # ::1 expansé : rejet fail-closed (choix).
             "",
         ):
             with self.subTest(base_url=base_url):
@@ -116,6 +119,10 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(client._api_key, key)
         with self.assertRaises(TypeError):  # __slots__ : pas de __dict__ à logger.
             vars(client)
+        for dump in (pickle.dumps, copy.copy):
+            with self.subTest(dump=dump.__name__):
+                with self.assertRaises(TypeError):
+                    dump(client)
 
     def test_vault_client_rejects_empty_key_and_non_canonical_url(self) -> None:
         """LOW : refus local précoce + URL stockée canonique (concaténation sûre)."""

@@ -17,6 +17,7 @@ logs — ``repr()`` est redacté et la clé ne doit jamais être journalisée.
 """
 
 import re
+from typing import NoReturn
 from urllib.parse import urlparse
 
 _ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -71,6 +72,11 @@ class VaultClient:
 
     def __repr__(self) -> str:
         return f"VaultClient({self._base_url!r}, api_key=<REDACTED>)"
+
+    def __reduce__(self) -> NoReturn:
+        # Invariant 8 : la clé ne doit jamais quitter la mémoire vers un
+        # buffer sérialisé (pickle/copy). Refus total, même en local.
+        raise TypeError("VaultClient n'est pas sérialisable (secret en mémoire)")
 
     def health(self) -> dict[str, object]:
         """Vérifie la santé minimale (ticket #25)."""

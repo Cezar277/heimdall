@@ -171,6 +171,14 @@ class Ticket17AcceptanceTests(unittest.TestCase):
             with self.subTest(keyword=keyword):
                 self.assertIn(keyword, content)
 
+    def test_readme_install_verified_first(self) -> None:
+        """LOW review : le premier bloc d'install du README est la voie vérifiée."""
+        content = (ROOT / "README.md").read_text(encoding="utf-8")
+        blocks = re.findall(r"```sh\n(.*?)```", content, re.DOTALL)
+        install_blocks = [block for block in blocks if "pip install" in block]
+        self.assertTrue(install_blocks, "aucun bloc pip install dans le README")
+        self.assertIn("--require-hashes", install_blocks[0])
+
     # --- « Verrouille les versions » --------------------------------------
     def test_versions_pinned_and_locked(self) -> None:
         pyproject = _load_pyproject()
