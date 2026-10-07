@@ -106,14 +106,10 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
   `Import`/`ImportFrom`/`__import__`/`importlib.import_module` et n'autorise
   que `heimdall/vault/crypto.py` (fichier exact, pas le dossier) ; méta-tests
   sur extraits piégés + arborescence synthétique.
-- **Outillage sur `tests/contracts/`** : pas de reformat ni de `strict`
-  (gel #14/#15/#16, refs SAMM stables) — la preuve y est portée par les
-  tests de schémas eux-mêmes + Spectral. Même logique pour bandit
-  (`bandit -r heimdall` ne couvre pas la fixture) : la fixture
-  `fastapi_contract_fixture.py` ne fait ni shell, ni crypto, ni SQL
-  (vérifié : `bandit` vert dessus) et toute régression de son format
-  `{code,message}` est attrapée plus fort que par le lint — par la
-  comparaison wire `test_fastapi_wire_contract_matches` et la matrice
-  exhaustive des couples code/message. Le SAST est en outre appliqué en CI
-  (`vault-contract.yml` : `bandit` + `ruff --select S` sur la fixture). Pas de section `coverage` avant
+- **Outillage sur `tests/contracts/`** : seul le reformat ruff est gelé
+  (refs SAMM stables) — `mypy --strict` couvre aussi la fixture
+  (`NoReturn`, handlers typés) et le SAST y est appliqué en CI
+  (`vault-contract.yml` : `bandit` + `ruff --select S` sur la fixture).
+  La preuve de format reste portée par les tests de schémas eux-mêmes
+  (comparaison wire + matrice code/message) + Spectral. Pas de section `coverage` avant
   #20 (seuil CI à définir en réunion, cf. DEFINITION_OF_DONE).

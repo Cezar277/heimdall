@@ -65,7 +65,7 @@ openapi.yaml         contrat Vault API v1 (#15)
 .venv/bin/python -m pytest                      # squelette + contrats
 .venv/bin/python -m unittest discover -s tests/contracts -v   # contrats seuls
 .venv/bin/ruff check heimdall tests
-.venv/bin/mypy heimdall
+.venv/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
 .venv/bin/bandit -r heimdall -q
 git diff --check
 ```

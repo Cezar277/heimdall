@@ -109,6 +109,25 @@ class PackageSmokeTests(unittest.TestCase):
         # mitigation est de ne jamais journaliser l'objet ni __dict__.
         self.assertEqual(client._api_key, key)
 
+    def test_vault_client_rejects_empty_key_and_non_canonical_url(self) -> None:
+        """LOW : refus local précoce + URL stockée canonique (concaténation sûre)."""
+        for key in ("", None):
+            with self.subTest(key=repr(key)):
+                with self.assertRaises(ValueError):
+                    heimdall.vault.client.VaultClient(
+                        "https://127.0.0.1:8443",
+                        key,  # type: ignore[arg-type]
+                    )
+        for base_url in (
+            "https://127.0.0.1:8443/",  # / final : f"{base_url}/api/..." doublerait le slash.
+            "HTTPS://127.0.0.1:8443",  # casse non normalisée.
+        ):
+            with self.subTest(base_url=base_url):
+                with self.assertRaises(ValueError):
+                    heimdall.vault.client.VaultClient(base_url, "PLACEHOLDER")
+        client = heimdall.vault.client.VaultClient("https://127.0.0.1:8443", "PLACEHOLDER")
+        self.assertEqual(client._base_url, "https://127.0.0.1:8443")
+
 
 if __name__ == "__main__":
     unittest.main()
