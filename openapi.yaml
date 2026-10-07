@@ -61,6 +61,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '409':
           $ref: '#/components/responses/Conflict'
         '429':
@@ -106,6 +108,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '429':
           $ref: '#/components/responses/TooManyRequests'
         '500':
@@ -142,6 +146,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '429':
           $ref: '#/components/responses/TooManyRequests'
         '500':
@@ -168,6 +174,8 @@ paths:
                 status: ok
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '503':
           $ref: '#/components/responses/Unavailable'
         '500':
@@ -182,13 +190,21 @@ components:
       name: X-Heimdall-API-Key
       description: >-
         Clé liée à un projet et à ses permissions. Jamais dans une URL ou un log.
-        Le serveur DOIT stocker uniquement un haché de vérification de la clé,
-        jamais sa valeur brute, et comparer les empreintes de longueur fixe
-        via hmac.compare_digest. Clé absente, inconnue, invalide ou révoquée :
-        même réponse 401 générique et chemin de vérification de coût comparable,
-        sans oracle temporel exploitable (hors rejet préalable de taille ou débit).
-        TLS obligatoire : le client DOIT vérifier la chaîne de confiance et
-        l'identité du serveur, même en développement ; aucun mode non vérifié.
+        Génération : le serveur DOIT générer chaque clé à au moins 256 bits
+        d'entropie via secrets.token_urlsafe(32), jamais dérivée de données
+        prédictibles (identifiant, horodatage, compteur), et ne l'afficher
+        qu'une seule fois à la création.
+        Stockage : le serveur DOIT stocker uniquement un haché salé de
+        vérification de la clé (sel unique par clé, ou HMAC avec un pepper
+        serveur distinct de la KEK de chiffrement), jamais sa valeur brute ;
+        la fonction de hachage et la gestion du sel sont documentées pour #25.
+        Le serveur DOIT comparer des empreintes de même type et de longueur
+        fixe via hmac.compare_digest. Clé absente, inconnue, invalide ou
+        révoquée : même réponse 401 générique et chemin de vérification de
+        coût comparable, sans oracle temporel exploitable (hors rejet
+        préalable de taille ou débit). TLS obligatoire : le client DOIT
+        vérifier la chaîne de confiance et l'identité du serveur, même en
+        développement ; aucun mode non vérifié.
   parameters:
     Project:
       name: project
@@ -253,6 +269,17 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/NotFoundError'
+    MethodNotAllowed:
+      description: >-
+        Méthode non déclarée sur une route existante (ex. DELETE sur la
+        collection). Les erreurs du routeur (404 sur route inconnue, 405)
+        DOIVENT utiliser ce même format {code,message} via des handlers
+        catch-all, jamais l'enveloppe {detail: ...} du framework. Une route
+        inconnue utilise not_found / Ressource introuvable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MethodNotAllowedError'
     Conflict:
       description: Ce nom existe déjà dans le projet et l'environnement ; aucun écrasement.
       content:
@@ -274,6 +301,9 @@ components:
             $ref: '#/components/schemas/RateLimitedError'
     Unavailable:
       description: Service indisponible ; aucun détail interne.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
       content:
         application/json:
           schema:
@@ -417,6 +447,17 @@ components:
         message:
           type: string
           const: "Ressource introuvable"
+    MethodNotAllowedError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          const: method_not_allowed
+        message:
+          type: string
+          const: "Méthode non autorisée"
     ConflictError:
       type: object
       additionalProperties: false

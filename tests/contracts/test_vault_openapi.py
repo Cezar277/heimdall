@@ -22,6 +22,7 @@ SPEC = yaml.safe_load((ROOT / "openapi.yaml").read_text(encoding="utf-8"))
 MESSAGES = {
     "bad_request": "Requête invalide", "unauthorized": "Authentification requise",
     "forbidden": "Accès interdit", "not_found": "Ressource introuvable",
+    "method_not_allowed": "Méthode non autorisée",
     "conflict": "Secret déjà existant", "rate_limited": "Trop de requêtes",
     "unavailable": "Service indisponible", "internal_error": "Erreur interne",
 }
@@ -31,6 +32,7 @@ ERROR_SCHEMAS = {
     "401": ("UnauthorizedError", "unauthorized"),
     "403": ("ForbiddenError", "forbidden"),
     "404": ("NotFoundError", "not_found"),
+    "405": ("MethodNotAllowedError", "method_not_allowed"),
     "409": ("ConflictError", "conflict"),
     "429": ("RateLimitedError", "rate_limited"),
     "500": ("InternalError", "internal_error"),
@@ -319,6 +321,8 @@ class VaultContractTests(unittest.TestCase):
         expected += [(path, method, "429", "Retry-After")
                      for path, item in SPEC["paths"].items()
                      for method in ("get", "post") if method in item]
+        # LOW-3 : la 503 porte le même signal de backoff que les 429.
+        expected += [("/api/v1/health", "get", "503", "Retry-After")]
         for path, method, status, name in expected:
             with self.subTest(path=path, status=status, header=name):
                 response = resolve(SPEC["paths"][path][method]["responses"][status], SPEC)
@@ -333,6 +337,50 @@ class VaultContractTests(unittest.TestCase):
                     else:
                         del headers[name]["required"]
                     self.assertNotEqual(wire_contract(SPEC), wire_contract(changed))
+
+    def test_unavailable_carries_bounded_retry_after(self):
+        """LOW-3 : 503 avec Retry-After borné 1..3600, comme les 429."""
+        response = resolve(SPEC["paths"]["/api/v1/health"]["get"]["responses"]["503"], SPEC)
+        self.assertIs(response["headers"]["Retry-After"].get("required"), True)
+        validator = Draft202012Validator(response["headers"]["Retry-After"]["schema"])
+        for value in (1, 3600):
+            validator.validate(value)
+        for value in (0, 3601, 1.5, "tomorrow", None):
+            self.assertFalse(validator.is_valid(value))
+
+    def test_api_key_lifecycle_musts_documented(self):
+        """LOW-2 : génération ≥ 256 bits + hachage salé exigés dans le contrat."""
+        description = SPEC["components"]["securitySchemes"]["ProjectApiKey"]["description"]
+        for keyword in ("secrets.token_urlsafe(32)", "256 bits", "une seule fois",
+                        "salé", "pepper", "hmac.compare_digest"):
+            with self.subTest(keyword=keyword):
+                self.assertIn(keyword, description)
+
+    def test_router_errors_use_contract_format_without_detail(self):
+        """LOW-1 : 404 routeur et 405 sans enveloppe {detail: ...} du framework."""
+        app = build_app()
+        cases = [
+            ("DELETE", "/api/v1/secrets", 405,
+             {"code": "method_not_allowed", "message": "Méthode non autorisée"}),
+            ("PUT", "/api/v1/secrets/demo/dev/DEMO_PASSWORD", 405,
+             {"code": "method_not_allowed", "message": "Méthode non autorisée"}),
+            ("DELETE", "/api/v1/health", 405,
+             {"code": "method_not_allowed", "message": "Méthode non autorisée"}),
+            ("GET", "/route-inconnue", 404,
+             {"code": "not_found", "message": "Ressource introuvable"}),
+        ]
+        # ASGI en mémoire ; le routeur répond avant la garde d'authentification.
+        async def exercise():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://fixture.test") as client:
+                for method, path, status, body in cases:
+                    for headers in ({}, {"X-Heimdall-API-Key": "PLACEHOLDER_NOT_A_KEY"}):
+                        with self.subTest(method=method, path=path, headers=bool(headers)):
+                            response = await client.request(method, path, headers=headers)
+                            self.assertEqual(response.status_code, status)
+                            self.assertEqual(response.headers["content-type"], "application/json")
+                            self.assertEqual(response.json(), body)
+                            self.assertNotIn("detail", response.json())
+        asyncio.run(exercise())
 
     def test_fixture_auth_is_manual_and_rejects_all_credentials(self):
         self.assertIs(project_api_key.auto_error, False)

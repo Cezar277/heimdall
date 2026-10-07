@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heimdall"
+version = "0.1.0"
+description = "Heimdall: 100 % local DevSecOps sentry. Deterministic secret interception, local agentic remediation (MCP/Ollama), encrypted on-premise vault sync."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Heimdall team" }]
+keywords = ["devsecops", "secrets", "vault", "mcp", "ollama"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Security",
+]
+dependencies = [
+  # --- Runtime (versions verrouillées, voir docs/adr/002-stack-python.md) ---
+  "fastapi==0.142.2",       # API du Vault (#25). Épinglé à l'identique de tests/contracts/requirements.txt
+  "pydantic==2.13.5",       # Modèles + génération OpenAPI comparée au contrat (#15)
+  "uvicorn==0.54.0",        # Serveur ASGI du Vault (#25), réseau privé + TLS uniquement
+  "mcp==2.3.0",             # SDK officiel du serveur MCP stdio (#27)
+  "ollama==0.6.3",          # Client du LLM 100 % local, jamais d'appel Internet
+  "cryptography==50.0.2",   # Chiffrement au repos du Vault — import confiné à heimdall/vault/crypto.py
+  "argon2-cffi==25.1.0",    # Dérivation/hachage côté Vault — import confiné à heimdall/vault/crypto.py
+  "httpx==0.28.1",          # Client HTTP (tests ASGI + futur client Vault avec verify obligatoire)
+  "typer==0.27.3",          # CLI `heimdall` (Typer au-dessus de Click)
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "ruff==0.16.10",
+  "mypy==2.4.0",
+  "bandit==1.9.4",
+  "tomli==2.5.0; python_version < '3.11'",  # lecture TOML des tests d'acceptation sur 3.10
+  # Dépendances des tests de contrats (#14/#15/#16), alignées sur tests/contracts/requirements.txt
+  "jsonschema==4.26.0",
+  "PyYAML==6.0.3",
+  "openapi-spec-validator==0.9.0",
+]
+
+[project.scripts]
+heimdall = "heimdall.cli.main:main"
+
+[project.urls]
+Homepage = "https://github.com/Cezar277/heimdall"
+
+[tool.setuptools.packages.find]
+include = ["heimdall*"]
+
+# --- pytest: `pytest` seul doit découvrir tests/ (dont les TestCase unittest des contrats) ---
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# --- ruff: lint + format ---
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+# tests/contracts/ est gouverné par #14/#15/#16 (fixture + schémas gelés) :
+# T17 ne le reformate ni ne le relinte (preuves SAMM module + ligne stables).
+exclude = ["tests/contracts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "PL"]
+ignore = ["S101"]  # assert autorisé dans les tests
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = ["S101", "PLR2004"]
+# Acceptation #17 : argv figés (sys.executable, venv éphémère), jamais de shell=True.
+"tests/test_ticket17_acceptance.py" = ["S101", "PLR2004", "S603"]
+
+# --- mypy : typage strict sur le paquet ET la fixture de contrat ---
+# (le gel ruff format de tests/contracts/ reste justifié en ADR-002).
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+show_error_codes = true
+# Pas de section coverage : le seuil (70 % sur modules critiques, cf.
+# DEFINITION_OF_DONE) sera défini et branché par la CI du repo (#20).
+# Justification des exclusions : voir ADR-002 (« Outillage »).

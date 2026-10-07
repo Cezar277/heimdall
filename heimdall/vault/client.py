@@ -1,0 +1,86 @@
+"""Client du Vault — squelette (tickets #25/#26).
+
+Parle au Vault EXCLUSIVEMENT en HTTPS vers une adresse de boucle locale
+(invariant 12 ; allowlist : ``127.0.0.1``, ``::1``, ``localhost``), avec
+vérification TLS obligatoire (chaîne + SAN, CA interne explicitement
+approuvée). Interdit : ``verify=False``, ``-k``, contexte SSL non vérifié,
+repli non vérifié, credentials dans l'URL, espaces ou caractères de contrôle
+dans l'URL, formes encodées ``%XX`` (``%3F``/``%23`` contourneraient le rejet
+de query/fragment), ports hors 1-65535 (concaténation ``f"{base_url}/..."``
+dangereuse en #25).
+La clé API doit être une chaîne non vide et non blanche (refus local précoce
+plutôt qu'un 401 générique en #25) et l'URL une chaîne non vide, stockée sous
+forme canonique reconstruite depuis hôte+port (sans `/` final, casse
+normalisée) pour une concaténation sûre. Le client conserve son credential
+dans un stockage local protégé (#26 : mode 600), jamais dans l'URL ni les
+logs — ``repr()`` est redacté et la clé ne doit jamais être journalisée.
+"""
+
+import re
+from typing import Any, NoReturn
+from urllib.parse import urlparse
+
+_ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_MAX_PORT = 65535
+
+
+class VaultClient:
+    """Client HTTPS du Vault (boucle locale uniquement). Non héritable."""
+
+    # __slots__ bloque __dict__/vars() ; __reduce__ bloque pickle/copy ; le
+    # sous-classement (qui réintroduirait __dict__) est interdit ci-dessous —
+    # la vraie garde reste de ne jamais journaliser l'objet (#26).
+    __slots__ = ("_base_url", "_api_key")
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise TypeError("VaultClient non héritable (secret en mémoire)")
+
+    def __init__(self, base_url: str, api_key: str) -> None:
+        if not isinstance(base_url, str) or not base_url:
+            raise ValueError("URL du Vault requise (chaîne non vide)")
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ValueError("clé API requise (chaîne non vide, non blanche)")
+        # \s couvre les blancs Unicode (\u00a0, \u2007…) ; la classe explicite
+        # couvre les contrôles non blancs (\x00-\x08, \x0e-\x1f, \x7f).
+        if re.search(r"\s|[\x00-\x09\x0e-\x1f\x7f]", base_url):
+            raise ValueError("espaces et contrôles interdits dans l'URL du Vault")
+        if "%" in base_url:
+            raise ValueError("formes encodées interdites dans l'URL du Vault")
+        parsed = urlparse(base_url)
+        if parsed.scheme != "https":
+            raise ValueError("le Vault n'est joignable qu'en HTTPS")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("aucun credential dans l'URL du Vault")
+        if "?" in base_url or "#" in base_url:
+            raise ValueError("ni query ni fragment dans l'URL du Vault")
+        host = (parsed.hostname or "").lower()
+        if host not in _ALLOWED_LOOPBACK_HOSTS:
+            raise ValueError(
+                "le Vault n'est joignable que sur boucle locale (127.0.0.1, ::1, localhost)"
+            )
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("port invalide dans l'URL du Vault (1-65535)") from None
+        if port is not None and not 1 <= port <= _MAX_PORT:
+            raise ValueError("port invalide dans l'URL du Vault (1-65535)")
+        authority = f"[{host}]" if ":" in host else host
+        if port is not None:
+            authority = f"{authority}:{port}"
+        canonical = f"{parsed.scheme}://{authority}"
+        if base_url != canonical:
+            raise ValueError("URL du Vault non canonique (attendu : scheme://hôte[:port])")
+        self._base_url = canonical
+        self._api_key = api_key
+
+    def __repr__(self) -> str:
+        return f"VaultClient({self._base_url!r}, api_key=<REDACTED>)"
+
+    def __reduce__(self) -> NoReturn:
+        # Invariant 8 : la clé ne doit jamais quitter la mémoire vers un
+        # buffer sérialisé (pickle/copy). Refus total, même en local.
+        raise TypeError("VaultClient n'est pas sérialisable (secret en mémoire)")
+
+    def health(self) -> dict[str, object]:
+        """Vérifie la santé minimale (ticket #25)."""
+        raise NotImplementedError("client Vault non implémenté (voir #25)")

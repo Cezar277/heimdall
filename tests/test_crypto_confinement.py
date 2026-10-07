@@ -1,0 +1,157 @@
+"""Confinement crypto : `cryptography`/`argon2` UNIQUEMENT dans vault/crypto.py. (#17)
+
+Invariant 5 : tout import direct, `from`-import ou chargement dynamique
+explicite (`__import__("cryptography")`, `importlib.import_module("argon2")`)
+d'une lib crypto hors `heimdall/vault/crypto.py` fait échouer la suite.
+Détection par AST (pas de regex contournable) + méta-tests du détecteur
+sur extraits piégés.
+
+Limite connue et assumée : l'obfuscation (`__import__(var)`,
+`"crypto" + "graphy"`, `getattr(importlib, "import_module")(...)`) n'est PAS
+détectée — un garde statique ne voit pas les chaînes construites à
+l'exécution. Compléments : relecture humaine (obligatoire sur `main`) +
+`bandit -r heimdall` dans le gate. Ne jamais présenter ce test comme
+exhaustif (voir `test_obfuscated_dynamic_import_is_a_documented_limit`).
+Preuve SAMM : cycle de vie, module + ligne.
+"""
+
+import ast
+import pathlib
+import tempfile
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+PKG = ROOT / "heimdall"
+CRYPTO_LIBS = frozenset({"cryptography", "argon2"})
+
+
+def _call_loads_crypto(node: ast.Call) -> bool:
+    """Vrai si l'appel charge explicitement une lib crypto par son nom."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        qualified = func.id
+    elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        qualified = f"{func.value.id}.{func.attr}"
+    else:
+        return False
+    if qualified not in {"__import__", "importlib.import_module", "import_module"}:
+        return False
+    cands = list(node.args[:1]) + [
+        kw.value for kw in node.keywords if kw.arg in ("name", "module", None)
+    ]
+    return any(
+        isinstance(arg, ast.Constant)
+        and isinstance(arg.value, str)
+        and arg.value.split(".")[0] in CRYPTO_LIBS
+        for arg in cands
+    )
+
+
+def imports_crypto_lib(source: str) -> bool:
+    """Détecte tout chargement d'une lib crypto dans un source Python."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return True  # fail-closed : un fichier illisible est signalé, pas ignoré.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] in CRYPTO_LIBS for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in CRYPTO_LIBS:
+                return True
+            if not node.module and any(
+                alias.name.split(".")[0] in CRYPTO_LIBS for alias in node.names
+            ):
+                return True  # from . import cryptography (module relatif vide).
+        elif isinstance(node, ast.Call) and _call_loads_crypto(node):
+            return True
+    return False
+
+
+def _reads_crypto(path: pathlib.Path) -> bool:
+    try:
+        return imports_crypto_lib(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        return True  # fail-closed (invariant 1) : illisible = suspect, pas ignoré.
+
+
+def find_offenders(package_root: pathlib.Path) -> list[pathlib.Path]:
+    """Modules chargeant une lib crypto hors `vault/crypto.py` (vide = OK)."""
+    crypto = package_root / "vault" / "crypto.py"
+    return sorted(
+        path for path in package_root.rglob("*.py") if path != crypto and _reads_crypto(path)
+    )
+
+
+class CryptoConfinementTests(unittest.TestCase):
+    def test_repo_confinement(self) -> None:
+        offenders = [path.relative_to(ROOT).as_posix() for path in find_offenders(PKG)]
+        self.assertEqual(offenders, [])
+
+    def test_detector_catches_import_forms(self) -> None:
+        cases = {
+            "import cryptography": True,
+            "from cryptography.hazmat.primitives import hashes": True,
+            "import argon2": True,
+            "from argon2 import PasswordHasher": True,
+            '__import__("cryptography")': True,
+            "import importlib\nimportlib.import_module('argon2')": True,
+            "from importlib import import_module\nimport_module('cryptography')": True,
+            '__import__(name="cryptography")': True,
+            "importlib.import_module(name='argon2')": True,
+            "from . import cryptography": True,
+            "from .cryptography import x": True,
+            "import os": False,
+            "import httpx": False,
+            "x = 'cryptography'  # simple chaîne, pas un chargement": False,
+            "# import cryptography (commentaire)": False,
+            "": False,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(imports_crypto_lib(source), expected)
+
+    def test_detector_catches_dynamic_import_in_vault_client(self) -> None:
+        """Si `vault/client.py` chargeait de la crypto (même via importlib),
+        le garde le signalerait : preuve sur arborescence synthétique."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-crypto-") as tmp:
+            package = pathlib.Path(tmp) / "heimdall"
+            vault = package / "vault"
+            vault.mkdir(parents=True)
+            (vault / "crypto.py").write_text('"""Crypto."""\n', encoding="utf-8")
+            client = vault / "client.py"
+            client.write_text(
+                '"""Client."""\nimport importlib\n_lib = importlib.import_module("cryptography")\n',
+                encoding="utf-8",
+            )
+            offenders = find_offenders(package)
+            self.assertEqual(offenders, [client])
+
+    def test_obfuscated_dynamic_import_is_a_documented_limit(self) -> None:
+        """Limite assumée : l'obfuscation passe le garde (revue + bandit requis)."""
+        for source in (
+            "__import__(module_name)",
+            '__import__("crypto" + "graphy")',
+            'getattr(importlib, "import_module")("cryptography")',
+        ):
+            with self.subTest(source=source):
+                self.assertFalse(imports_crypto_lib(source))
+
+    def test_unreadable_file_is_flagged_not_ignored(self) -> None:
+        """Invariant 1 : un fichier illisible/non-UTF-8 est suspect, pas sauté."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-crypto-") as tmp:
+            package = pathlib.Path(tmp) / "heimdall"
+            vault = package / "vault"
+            vault.mkdir(parents=True)
+            (vault / "crypto.py").write_text('"""Crypto."""\n', encoding="utf-8")
+            broken = vault / "broken.py"
+            broken.write_bytes(b"\xff\xfe pas de l'UTF-8 : \x00\x01")
+            self.assertEqual(find_offenders(package), [broken])
+
+    def test_crypto_module_exists(self) -> None:
+        self.assertTrue((PKG / "vault" / "crypto.py").is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

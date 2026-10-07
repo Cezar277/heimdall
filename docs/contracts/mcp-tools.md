@@ -271,7 +271,7 @@ Le contrat se valide hors ligne, sans appel réseau (comme le contrat Finding #1
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -r tests/contracts/requirements.txt
+.venv/bin/python -m pip install --require-hashes -r tests/contracts/requirements.txt
 .venv/bin/python -m unittest discover -s tests/contracts -v
 ```
 
