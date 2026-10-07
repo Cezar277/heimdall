@@ -18,6 +18,8 @@ MCP_TOOLS: Final[tuple[str, ...]] = (
 def run_stdio(root: str) -> None:
     """Démarre le serveur MCP sur stdio, confiné à ``root``.
 
-    Lève ``NotImplementedError`` tant que #27 n'est pas livré.
+    Lève ``NotImplementedError`` tant que #27 n'est pas livré. Message
+    statique : aucune entrée n'est reflétée (invariant 8).
     """
-    raise NotImplementedError(f"serveur MCP non implémenté (voir #27) : {root!r}")
+    del root  # #27 utilisera ce paramètre ; en attendant, rien n'est reflété.
+    raise NotImplementedError("serveur MCP non implémenté (voir #27)")

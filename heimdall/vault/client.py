@@ -6,10 +6,10 @@ vérification TLS obligatoire (chaîne + SAN, CA interne explicitement
 approuvée). Interdit : ``verify=False``, ``-k``, contexte SSL non vérifié,
 repli non vérifié, credentials dans l'URL, espaces ou caractères de contrôle
 dans l'URL (concaténation ``f"{base_url}/..."`` dangereuse en #25).
-La clé API doit être une chaîne non vide (refus local précoce plutôt qu'un
-401 générique en #25) et l'URL est stockée sous forme canonique
-``scheme://hôte[:port]`` (sans `/` final, casse normalisée) pour une
-concaténation sûre. Le client conserve son credential dans un stockage
+La clé API doit être une chaîne non vide et non blanche (refus local précoce
+plutôt qu'un 401 générique en #25) et l'URL une chaîne non vide stockée sous
+forme canonique ``scheme://hôte[:port]`` (sans `/` final, casse normalisée)
+pour une concaténation sûre. Le client conserve son credential dans un stockage
 local protégé (#26 : mode 600), jamais dans l'URL ni les logs — ``repr()``
 est redacté et la clé ne doit jamais être journalisée.
 """
@@ -24,8 +24,10 @@ class VaultClient:
     """Client HTTPS du Vault (boucle locale uniquement)."""
 
     def __init__(self, base_url: str, api_key: str) -> None:
-        if not isinstance(api_key, str) or not api_key:
-            raise ValueError("clé API requise (chaîne non vide)")
+        if not isinstance(base_url, str) or not base_url:
+            raise ValueError("URL du Vault requise (chaîne non vide)")
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ValueError("clé API requise (chaîne non vide, non blanche)")
         # \s couvre les blancs Unicode (\u00a0, \u2007…) ; la classe explicite
         # couvre les contrôles non blancs (\x00-\x08, \x0e-\x1f, \x7f).
         if re.search(r"\s|[\x00-\x09\x0e-\x1f\x7f]", base_url):

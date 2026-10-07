@@ -128,6 +128,30 @@ class PackageSmokeTests(unittest.TestCase):
         client = heimdall.vault.client.VaultClient("https://127.0.0.1:8443", "PLACEHOLDER")
         self.assertEqual(client._base_url, "https://127.0.0.1:8443")
 
+    def test_vault_client_rejects_non_string_url_and_blank_key(self) -> None:
+        """LOW : TypeError interdit (ValueError contractuel) + clé blanche refusée."""
+        for base_url in (None, 123, b"https://127.0.0.1:8443"):
+            with self.subTest(base_url=repr(base_url)):
+                with self.assertRaises(ValueError):
+                    heimdall.vault.client.VaultClient(
+                        base_url,  # type: ignore[arg-type]
+                        "PLACEHOLDER",
+                    )
+        for key in ("   ", "\t", " \n "):
+            with self.subTest(key=repr(key)):
+                with self.assertRaises(ValueError):
+                    heimdall.vault.client.VaultClient("https://127.0.0.1:8443", key)
+
+    def test_stubs_never_reflect_input(self) -> None:
+        """Invariant 8 : aucune entrée reflétée en exception (pattern #22/#27)."""
+        marker = "SENTINELLE_ENTREE_NON_FIABLE"
+        with self.assertRaises(NotImplementedError) as ctx:
+            heimdall.scanner.detect.find_candidates(marker)
+        self.assertNotIn(marker, str(ctx.exception))
+        with self.assertRaises(NotImplementedError) as ctx:
+            heimdall.mcp.server.run_stdio(marker)
+        self.assertNotIn(marker, str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

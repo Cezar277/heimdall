@@ -14,6 +14,8 @@ def find_candidates(path: str) -> list[dict[str, object]]:
     """Repère les candidats secrets sous ``path`` (diff stagé ou dépôt).
 
     Lève ``NotImplementedError`` tant que #22 n'est pas livré (fail-closed :
-    aucun résultat partiel silencieux, jamais de verdict inventé).
+    aucun résultat partiel silencieux, jamais de verdict inventé). Message
+    statique : aucune entrée n'est reflétée (invariant 8).
     """
-    raise NotImplementedError(f"scanner non implémenté (voir #22) : {path!r}")
+    del path  # #22 utilisera ce paramètre ; en attendant, rien n'est reflété.
+    raise NotImplementedError("scanner non implémenté (voir #22)")
