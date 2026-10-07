@@ -4,6 +4,10 @@ Les sous-commandes réelles arrivent avec leurs tickets :
 ``scan`` (#22 scanner + #32 validation Y/N/E), ``vault`` (#25/#26),
 ``mcp`` (#27). En attendant, comportement fail-closed : ``scan`` bloque
 avec un message explicite au lieu d'inventer un verdict.
+
+Codes de sortie (invariant 11) : 0 propre, 1 secrets détectés, 2 erreur
+d'outillage. Un scanner non implémenté est une panne d'outillage, donc 2 —
+jamais 1, réservé aux secrets avérés.
 """
 
 import typer
@@ -35,7 +39,7 @@ def scan(
     """Scanne le diff (ou le dépôt) à la recherche de secrets."""
     del path, ci  # #22 branchera le scanner réel ici.
     typer.echo("heimdall scan: scanner non implémenté (voir #22) — refus par défaut.", err=True)
-    raise typer.Exit(code=1)
+    raise typer.Exit(code=2)
 
 
 def main() -> None:

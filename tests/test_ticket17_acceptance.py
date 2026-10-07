@@ -148,8 +148,17 @@ class Ticket17AcceptanceTests(unittest.TestCase):
         locked = _lock_names()
         self.assertTrue(locked, "aucun fichier de lock (requirements.lock, uv.lock…)")
         direct = _dep_names(pyproject["project"]["dependencies"])
+        self.assertGreaterEqual(len(direct), 9, "le socle runtime #17 a 9 directs")
         missing = {name for name in direct if name not in locked}
         self.assertEqual(missing, set(), f"hors du lock : {sorted(missing)}")
+
+    def test_lock_carries_hashes(self) -> None:
+        """Supply-chain : requirements.lock est installé avec --require-hashes."""
+        path = ROOT / "requirements.lock"
+        self.assertTrue(path.is_file(), "pas de requirements.lock")
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("--hash=sha256:", content)
+        self.assertIn("--require-hashes", content)
 
     # --- Piège : crypto confinée ------------------------------------------
     def test_crypto_module_exists_in_vault(self) -> None:

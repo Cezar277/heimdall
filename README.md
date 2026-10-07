@@ -20,8 +20,13 @@ python3 -m venv .venv
 Windows / PowerShell : remplacer `.venv/bin/python` par `.venv\Scripts\python.exe`.
 
 Builds reproductibles : versions en `==` dans `pyproject.toml`
-(voir [ADR-002](docs/adr/002-stack-python.md)), gel transitif dans
-`requirements.lock`.
+(voir [ADR-002](docs/adr/002-stack-python.md)), gel transitif **avec hashes
+SHA-256** dans `requirements.lock` :
+
+```sh
+.venv/bin/pip install --require-hashes -r requirements.lock
+.venv/bin/pip install -e . --no-deps
+```
 
 ## Usage
 

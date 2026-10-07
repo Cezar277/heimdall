@@ -80,3 +80,30 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
   `tests/test_crypto_confinement.py`, `requirements.lock`.
 - Lier la PR (`Closes #17`), coller `pip install -e .[dev]` + `pytest` verts,
   renseigner la feuille SAMM avec liens permanents au SHA (touche `y`).
+
+## Suivi review (correctifs post-relecture)
+
+- **Build reproductible de bout en bout** : `setuptools==80.9.0` épinglé
+  dans `[build-system]` (un `>=` laissait le backend se résoudre
+  différemment demain) ; `requirements.lock` est compilé avec
+  `pip-compile --generate-hashes` depuis les extras `[dev]` et s'installe
+  avec `pip install --require-hashes -r requirements.lock` puis
+  `pip install -e . --no-deps` (l'editable local n'est pas hachable).
+- **Codes de sortie CLI** (invariant 11 : 0 propre, 1 secrets, 2 erreur) :
+  `scan` non implémenté sort en **2** (panne d'outillage), jamais 1 réservé
+  aux secrets avérés ; testé (`test_scan_is_fail_closed_until_22`,
+  `test_scan_reports_on_stderr`, isolation du cwd + aucun fichier créé).
+- **VaultClient confiné au local** (invariant 12) : allowlist
+  `127.0.0.1`/`::1`/`localhost` via `urllib.parse`, credentials en URL
+  refusés, `repr()` redacté (`api_key=<REDACTED>`), clé conservée en mémoire
+  uniquement pour s'authentifier et jamais journalisée (stockage mode 600
+  en #26). Testé contre `https://evil.example`,
+  `https://127.0.0.1.evil.example`, `http://…` et `https://user:…@…`.
+- **Confinement crypto prouvé par AST** : le garde analyse
+  `Import`/`ImportFrom`/`__import__`/`importlib.import_module` et n'autorise
+  que `heimdall/vault/crypto.py` (fichier exact, pas le dossier) ; méta-tests
+  sur extraits piégés + arborescence synthétique.
+- **Outillage sur `tests/contracts/`** : pas de reformat ni de `strict`
+  (gel #14/#15/#16, refs SAMM stables) — la preuve y est portée par les
+  tests de schémas eux-mêmes + Spectral. Pas de section `coverage` avant
+  #20 (seuil CI à définir en réunion, cf. DEFINITION_OF_DONE).

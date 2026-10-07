@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -87,12 +87,6 @@ show_error_codes = true
 [[tool.mypy.overrides]]
 module = "tests.contracts.*"
 ignore_errors = true
-
-# --- coverage (seuil suivi en réunion, cf. DEFINITION_OF_DONE) ---
-[tool.coverage.run]
-source = ["heimdall"]
-branch = true
-
-[tool.coverage.report]
-fail_under = 0
-show_missing = true
+# Pas de section coverage : le seuil (70 % sur modules critiques, cf.
+# DEFINITION_OF_DONE) sera défini et branché par la CI du repo (#20).
+# Justification des exclusions : voir ADR-002 (« Outillage »).

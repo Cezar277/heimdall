@@ -1,5 +1,7 @@
 """Fumée du paquet #17 : imports, version, CLI fail-closed. (#17, DoD)"""
 
+import os
+import tempfile
 import unittest
 
 from typer.testing import CliRunner
@@ -40,13 +42,27 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertIn(heimdall.__version__, version.output)
 
     def test_scan_is_fail_closed_until_22(self) -> None:
-        """Sans scanner (#22), `scan` bloque au lieu d'inventer un verdict."""
+        """Sans scanner (#22), `scan` bloque en erreur d'outillage (exit 2)."""
         runner = CliRunner()
+        previous = os.getcwd()
         for argv in (["scan"], ["scan", "--ci"]):
             with self.subTest(argv=argv):
-                result = runner.invoke(heimdall.cli.main.app, argv)
-                self.assertNotEqual(result.exit_code, 0)
-                self.assertIn("#22", result.output)
+                with tempfile.TemporaryDirectory(prefix="heimdall-scan-") as tmp:
+                    os.chdir(tmp)
+                    try:
+                        result = runner.invoke(heimdall.cli.main.app, argv)
+                    finally:
+                        os.chdir(previous)
+                    self.assertEqual(result.exit_code, 2)
+                    self.assertIn("#22", result.output)
+                    # Invariant 11 : 2 = panne d'outillage, jamais 1 (secrets).
+                    # Le stub n'écrit aucun fichier.
+                    self.assertEqual(os.listdir(tmp), [])
+
+    def test_scan_reports_on_stderr(self) -> None:
+        result = CliRunner().invoke(heimdall.cli.main.app, ["scan"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("#22", result.stderr)
 
     def test_stubs_raise_not_implemented(self) -> None:
         with self.assertRaises(NotImplementedError):
@@ -57,6 +73,34 @@ class PackageSmokeTests(unittest.TestCase):
             heimdall.vault.crypto.encrypt_at_rest(b"x", "k")
         with self.assertRaises(ValueError):
             heimdall.vault.client.VaultClient("http://127.0.0.1:8443", "PLACEHOLDER")
+
+    def test_vault_client_allows_loopback_https_only(self) -> None:
+        """HIGH : tout hôte non local est rejeté (exfiltration impossible)."""
+        client = heimdall.vault.client.VaultClient("https://127.0.0.1:8443", "PLACEHOLDER")
+        self.assertIsInstance(client, heimdall.vault.client.VaultClient)
+        for base_url in (
+            "https://evil.example",
+            "https://127.0.0.1.evil.example",
+            "https://localhost.evil.example:8443/api",
+            "http://127.0.0.1:8443",  # HTTPS obligatoire même en local.
+            "https://user:PLACEHOLDER@127.0.0.1:8443/",  # jamais de credential en URL.
+            "https://[::1.evil.example]/",
+            "",
+        ):
+            with self.subTest(base_url=base_url):
+                with self.assertRaises(ValueError):
+                    heimdall.vault.client.VaultClient(base_url, "PLACEHOLDER")
+
+    def test_vault_client_repr_never_leaks_api_key(self) -> None:
+        """LOW : un log de l'objet ne doit jamais exposer la clé."""
+        key = "PLACEHOLDER_NOT_A_KEY_VAULT_REPR"
+        client = heimdall.vault.client.VaultClient("https://127.0.0.1:8443", key)
+        text = repr(client)
+        self.assertNotIn(key, text)
+        self.assertIn("<REDACTED>", text)
+        # La clé reste nécessaire en mémoire pour s'authentifier : la
+        # mitigation est de ne jamais journaliser l'objet ni __dict__.
+        self.assertEqual(client._api_key, key)
 
 
 if __name__ == "__main__":
