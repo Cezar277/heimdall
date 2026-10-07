@@ -39,6 +39,7 @@ dev = [
   "ruff==0.16.10",
   "mypy==2.4.0",
   "bandit==1.9.4",
+  "tomli==2.5.0; python_version < '3.11'",  # lecture TOML des tests d'acceptation sur 3.10
   # Dépendances des tests de contrats (#14/#15/#16), alignées sur tests/contracts/requirements.txt
   "jsonschema==4.26.0",
   "PyYAML==6.0.3",
@@ -73,6 +74,8 @@ ignore = ["S101"]  # assert autorisé dans les tests
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["S101", "PLR2004"]
+# Acceptation #17 : argv figés (sys.executable, venv éphémère), jamais de shell=True.
+"tests/test_ticket17_acceptance.py" = ["S101", "PLR2004", "S603"]
 
 # --- mypy: typage strict sur le paquet, plus souple sur les fixtures de contrats ---
 [tool.mypy]
