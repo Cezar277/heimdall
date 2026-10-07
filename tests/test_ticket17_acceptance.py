@@ -110,6 +110,12 @@ class Ticket17AcceptanceTests(unittest.TestCase):
         missing = {kw: files for kw, files in covered.items() if not files}
         self.assertEqual(missing, {}, f"stack non justifiée en ADR : {sorted(missing)}")
 
+    def test_adr_lock_doc_is_coherent(self) -> None:
+        """LOW review : l'ADR-002 ne doit plus mentionner `pip freeze`."""
+        text = (ROOT / "docs" / "adr" / "002-stack-python.md").read_text(encoding="utf-8")
+        self.assertNotIn("pip freeze", text)
+        self.assertIn("pip-compile --generate-hashes", text)
+
     # --- Tâche : .gitignore / LICENSE / README --------------------------
     def test_gitignore_python(self) -> None:
         content = (ROOT / ".gitignore").read_text(encoding="utf-8")

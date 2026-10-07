@@ -88,6 +88,8 @@ class PackageSmokeTests(unittest.TestCase):
             "https://127.0.0.1:8443\nInjected: x",  # CRLF : concaténation dangereuse en #25.
             "https://127.0.0.1:8443\tx",
             "https://127.0.0.1:8443 x",
+            "https://127.0.0.1:8443\u00a0x",  # NBSP U+00A0 (escape explicite).
+            "https://127.0.0.1:8443\u2007x",  # figure space U+2007.
             "",
         ):
             with self.subTest(base_url=base_url):

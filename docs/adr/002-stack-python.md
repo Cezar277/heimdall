@@ -26,7 +26,7 @@ heimdall/                  paquet unique, une frontière par composant
 tests/  test_package.py, test_crypto_confinement.py + tests/contracts/ existants
 docs/   adr/, contracts/, meetings/
 pyproject.toml             manifeste unique (dépendances ==, extras [dev], entrée console)
-requirements.lock          gel transitif horodaté (régénéré par `pip freeze`)
+requirements.lock          gel transitif vérifié (compilé par `pip-compile --generate-hashes`)
 ```
 
 Un seul paquet (pas de monorepo multi-paquets) : imports absolus
@@ -108,5 +108,11 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
   sur extraits piégés + arborescence synthétique.
 - **Outillage sur `tests/contracts/`** : pas de reformat ni de `strict`
   (gel #14/#15/#16, refs SAMM stables) — la preuve y est portée par les
-  tests de schémas eux-mêmes + Spectral. Pas de section `coverage` avant
+  tests de schémas eux-mêmes + Spectral. Même logique pour bandit
+  (`bandit -r heimdall` ne couvre pas la fixture) : la fixture
+  `fastapi_contract_fixture.py` ne fait ni shell, ni crypto, ni SQL
+  (vérifié : `bandit` vert dessus) et toute régression de son format
+  `{code,message}` est attrapée plus fort que par le lint — par la
+  comparaison wire `test_fastapi_wire_contract_matches` et la matrice
+  exhaustive des couples code/message. Pas de section `coverage` avant
   #20 (seuil CI à définir en réunion, cf. DEFINITION_OF_DONE).

@@ -21,7 +21,9 @@ class VaultClient:
     """Client HTTPS du Vault (boucle locale uniquement)."""
 
     def __init__(self, base_url: str, api_key: str) -> None:
-        if re.search(r"[\x00-\x20\x7f]", base_url):
+        # \s couvre les blancs Unicode (\u00a0, \u2007…) ; la classe explicite
+        # couvre les contrôles non blancs (\x00-\x08, \x0e-\x1f, \x7f).
+        if re.search(r"\s|[\x00-\x09\x0e-\x1f\x7f]", base_url):
             raise ValueError("espaces et contrôles interdits dans l'URL du Vault")
         parsed = urlparse(base_url)
         if parsed.scheme != "https":
