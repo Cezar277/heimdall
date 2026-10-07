@@ -90,6 +90,8 @@ class PackageSmokeTests(unittest.TestCase):
             "https://127.0.0.1:8443 x",
             "https://127.0.0.1:8443\u00a0x",  # NBSP U+00A0 (escape explicite).
             "https://127.0.0.1:8443\u2007x",  # figure space U+2007.
+            "https://127.0.0.1:8443?x=1",  # query avalerait le path en #25.
+            "https://127.0.0.1:8443#frag",  # fragment tronquerait l'URL en #25.
             "",
         ):
             with self.subTest(base_url=base_url):

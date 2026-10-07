@@ -46,6 +46,14 @@ jobs:
         run: |
           .venv/bin/python -m unittest discover -s tests/contracts -v
 
+      - name: SAST contract fixture
+        # LOW review : la fixture qui prouve le 404/405 est aussi passée au
+        # SAST (bandit + ruff S). Le gel de format ruff reste exclu via
+        # pyproject, mais un fichier passé explicitement est toujours vérifié.
+        run: |
+          .venv/bin/bandit tests/contracts/fastapi_contract_fixture.py
+          .venv/bin/ruff check --select S tests/contracts/fastapi_contract_fixture.py
+
       - name: Lint OpenAPI
         # LOW-4 : Spectral figé par package-lock.json, installé via `npm ci`
         # (intégrité vérifiée) au lieu d'un `npx` sans vérification.

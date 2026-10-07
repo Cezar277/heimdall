@@ -30,6 +30,8 @@ class VaultClient:
             raise ValueError("le Vault n'est joignable qu'en HTTPS")
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("aucun credential dans l'URL du Vault")
+        if "?" in base_url or "#" in base_url:
+            raise ValueError("ni query ni fragment dans l'URL du Vault")
         host = (parsed.hostname or "").lower()
         if host not in _ALLOWED_LOOPBACK_HOSTS:
             raise ValueError(

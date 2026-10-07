@@ -114,5 +114,6 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
   (vérifié : `bandit` vert dessus) et toute régression de son format
   `{code,message}` est attrapée plus fort que par le lint — par la
   comparaison wire `test_fastapi_wire_contract_matches` et la matrice
-  exhaustive des couples code/message. Pas de section `coverage` avant
+  exhaustive des couples code/message. Le SAST est en outre appliqué en CI
+  (`vault-contract.yml` : `bandit` + `ruff --select S` sur la fixture). Pas de section `coverage` avant
   #20 (seuil CI à définir en réunion, cf. DEFINITION_OF_DONE).

@@ -194,6 +194,8 @@ Windows / PowerShell :
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install --require-hashes -r tests/contracts/requirements.txt
 .venv/Scripts/python.exe -m unittest discover -s tests/contracts -v
+.venv/Scripts/python.exe -m bandit tests/contracts/fastapi_contract_fixture.py
+.venv/Scripts/python.exe -m ruff check --select S tests/contracts/fastapi_contract_fixture.py
 npm ci --no-audit --no-fund
 ./node_modules/.bin/spectral lint openapi.yaml --fail-severity warn
 git diff --check
@@ -205,6 +207,8 @@ Linux/macOS :
 python3 -m venv .venv
 .venv/bin/python -m pip install --require-hashes -r tests/contracts/requirements.txt
 .venv/bin/python -m unittest discover -s tests/contracts -v
+.venv/bin/bandit tests/contracts/fastapi_contract_fixture.py
+.venv/bin/ruff check --select S tests/contracts/fastapi_contract_fixture.py
 npm ci --no-audit --no-fund
 ./node_modules/.bin/spectral lint openapi.yaml --fail-severity warn
 git diff --check
@@ -212,7 +216,8 @@ git diff --check
 
 `tests/contracts/requirements.txt` est compilé avec hashes SHA-256
 (`requirements.in` + `pip-compile --generate-hashes`, LOW-4) et installé
-avec `--require-hashes`. Spectral est figé par `package.json` +
+avec `--require-hashes`. Il inclut bandit + ruff pour le SAST de la fixture.
+Spectral est figé par `package.json` +
 `package-lock.json` et installé via `npm ci` (intégrité vérifiée).
 
 [.spectral.yaml](../../.spectral.yaml) active les règles OpenAPI standard.
