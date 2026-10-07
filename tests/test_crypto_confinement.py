@@ -36,11 +36,14 @@ def _call_loads_crypto(node: ast.Call) -> bool:
         return False
     if qualified not in {"__import__", "importlib.import_module", "import_module"}:
         return False
+    cands = list(node.args[:1]) + [
+        kw.value for kw in node.keywords if kw.arg in ("name", "module", None)
+    ]
     return any(
         isinstance(arg, ast.Constant)
         and isinstance(arg.value, str)
         and arg.value.split(".")[0] in CRYPTO_LIBS
-        for arg in node.args[:1]
+        for arg in cands
     )
 
 
@@ -57,18 +60,27 @@ def imports_crypto_lib(source: str) -> bool:
         elif isinstance(node, ast.ImportFrom):
             if (node.module or "").split(".")[0] in CRYPTO_LIBS:
                 return True
+            if not node.module and any(
+                alias.name.split(".")[0] in CRYPTO_LIBS for alias in node.names
+            ):
+                return True  # from . import cryptography (module relatif vide).
         elif isinstance(node, ast.Call) and _call_loads_crypto(node):
             return True
     return False
+
+
+def _reads_crypto(path: pathlib.Path) -> bool:
+    try:
+        return imports_crypto_lib(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        return True  # fail-closed (invariant 1) : illisible = suspect, pas ignoré.
 
 
 def find_offenders(package_root: pathlib.Path) -> list[pathlib.Path]:
     """Modules chargeant une lib crypto hors `vault/crypto.py` (vide = OK)."""
     crypto = package_root / "vault" / "crypto.py"
     return sorted(
-        path
-        for path in package_root.rglob("*.py")
-        if path != crypto and imports_crypto_lib(path.read_text(encoding="utf-8"))
+        path for path in package_root.rglob("*.py") if path != crypto and _reads_crypto(path)
     )
 
 
@@ -86,6 +98,10 @@ class CryptoConfinementTests(unittest.TestCase):
             '__import__("cryptography")': True,
             "import importlib\nimportlib.import_module('argon2')": True,
             "from importlib import import_module\nimport_module('cryptography')": True,
+            '__import__(name="cryptography")': True,
+            "importlib.import_module(name='argon2')": True,
+            "from . import cryptography": True,
+            "from .cryptography import x": True,
             "import os": False,
             "import httpx": False,
             "x = 'cryptography'  # simple chaîne, pas un chargement": False,
@@ -121,6 +137,17 @@ class CryptoConfinementTests(unittest.TestCase):
         ):
             with self.subTest(source=source):
                 self.assertFalse(imports_crypto_lib(source))
+
+    def test_unreadable_file_is_flagged_not_ignored(self) -> None:
+        """Invariant 1 : un fichier illisible/non-UTF-8 est suspect, pas sauté."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-crypto-") as tmp:
+            package = pathlib.Path(tmp) / "heimdall"
+            vault = package / "vault"
+            vault.mkdir(parents=True)
+            (vault / "crypto.py").write_text('"""Crypto."""\n', encoding="utf-8")
+            broken = vault / "broken.py"
+            broken.write_bytes(b"\xff\xfe pas de l'UTF-8 : \x00\x01")
+            self.assertEqual(find_offenders(package), [broken])
 
     def test_crypto_module_exists(self) -> None:
         self.assertTrue((PKG / "vault" / "crypto.py").is_file())

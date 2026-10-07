@@ -76,8 +76,10 @@ class PackageSmokeTests(unittest.TestCase):
 
     def test_vault_client_allows_loopback_https_only(self) -> None:
         """HIGH : tout hôte non local est rejeté (exfiltration impossible)."""
-        client = heimdall.vault.client.VaultClient("https://127.0.0.1:8443", "PLACEHOLDER")
-        self.assertIsInstance(client, heimdall.vault.client.VaultClient)
+        for base_url in ("https://127.0.0.1:8443", "https://[::1]:8443", "https://localhost:8443"):
+            with self.subTest(base_url=base_url):
+                client = heimdall.vault.client.VaultClient(base_url, "PLACEHOLDER")
+                self.assertEqual(client._base_url, base_url)
         for base_url in (
             "https://evil.example",
             "https://127.0.0.1.evil.example",
@@ -92,6 +94,10 @@ class PackageSmokeTests(unittest.TestCase):
             "https://127.0.0.1:8443\u2007x",  # figure space U+2007.
             "https://127.0.0.1:8443?x=1",  # query avalerait le path en #25.
             "https://127.0.0.1:8443#frag",  # fragment tronquerait l'URL en #25.
+            "https://127.0.0.1:8443%3Fx=1",  # query encodée : même refus.
+            "https://127.0.0.1:8443%23frag",  # fragment encodé : même refus.
+            "https://127.0.0.1:99999",  # port hors 1-65535.
+            "https://127.0.0.1:0",  # port 0 interdit.
             "",
         ):
             with self.subTest(base_url=base_url):

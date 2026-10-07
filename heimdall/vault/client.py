@@ -5,19 +5,22 @@ Parle au Vault EXCLUSIVEMENT en HTTPS vers une adresse de boucle locale
 vérification TLS obligatoire (chaîne + SAN, CA interne explicitement
 approuvée). Interdit : ``verify=False``, ``-k``, contexte SSL non vérifié,
 repli non vérifié, credentials dans l'URL, espaces ou caractères de contrôle
-dans l'URL (concaténation ``f"{base_url}/..."`` dangereuse en #25).
+dans l'URL, formes encodées ``%XX`` (``%3F``/``%23`` contourneraient le rejet
+de query/fragment), ports hors 1-65535 (concaténation ``f"{base_url}/..."``
+dangereuse en #25).
 La clé API doit être une chaîne non vide et non blanche (refus local précoce
-plutôt qu'un 401 générique en #25) et l'URL une chaîne non vide stockée sous
-forme canonique ``scheme://hôte[:port]`` (sans `/` final, casse normalisée)
-pour une concaténation sûre. Le client conserve son credential dans un stockage
-local protégé (#26 : mode 600), jamais dans l'URL ni les logs — ``repr()``
-est redacté et la clé ne doit jamais être journalisée.
+plutôt qu'un 401 générique en #25) et l'URL une chaîne non vide, stockée sous
+forme canonique reconstruite depuis hôte+port (sans `/` final, casse
+normalisée) pour une concaténation sûre. Le client conserve son credential
+dans un stockage local protégé (#26 : mode 600), jamais dans l'URL ni les
+logs — ``repr()`` est redacté et la clé ne doit jamais être journalisée.
 """
 
 import re
 from urllib.parse import urlparse
 
 _ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_MAX_PORT = 65535
 
 
 class VaultClient:
@@ -32,6 +35,8 @@ class VaultClient:
         # couvre les contrôles non blancs (\x00-\x08, \x0e-\x1f, \x7f).
         if re.search(r"\s|[\x00-\x09\x0e-\x1f\x7f]", base_url):
             raise ValueError("espaces et contrôles interdits dans l'URL du Vault")
+        if "%" in base_url:
+            raise ValueError("formes encodées interdites dans l'URL du Vault")
         parsed = urlparse(base_url)
         if parsed.scheme != "https":
             raise ValueError("le Vault n'est joignable qu'en HTTPS")
@@ -44,7 +49,16 @@ class VaultClient:
             raise ValueError(
                 "le Vault n'est joignable que sur boucle locale (127.0.0.1, ::1, localhost)"
             )
-        canonical = f"{parsed.scheme}://{parsed.netloc}"
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("port invalide dans l'URL du Vault (1-65535)") from None
+        if port is not None and not 1 <= port <= _MAX_PORT:
+            raise ValueError("port invalide dans l'URL du Vault (1-65535)")
+        authority = f"[{host}]" if ":" in host else host
+        if port is not None:
+            authority = f"{authority}:{port}"
+        canonical = f"{parsed.scheme}://{authority}"
         if base_url != canonical:
             raise ValueError("URL du Vault non canonique (attendu : scheme://hôte[:port])")
         self._base_url = canonical

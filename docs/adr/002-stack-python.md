@@ -101,9 +101,10 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
   refusés, `repr()` redacté (`api_key=<REDACTED>`), clé conservée en mémoire
   uniquement pour s'authentifier et jamais journalisée (stockage mode 600
   en #26). Gardes de type : URL non-chaîne et clé vide/blanche rejetées en
-  `ValueError` (jamais de `TypeError`) ; messages d'exception des stubs
-  statiques, sans interpolation d'entrée (invariant 8). Testé contre
-  `https://evil.example`,
+  `ValueError` (jamais de `TypeError`) ; formes `%XX`, query/fragment, ports
+  hors 1-65535 refusés ; URL stockée canonique reconstruite depuis hôte+port
+  (IPv6 re-crocheté) ; messages d'exception des stubs statiques, sans
+  interpolation d'entrée (invariant 8). Testé contre `https://evil.example`,
   `https://127.0.0.1.evil.example`, `http://…` et `https://user:…@…`.
 - **Confinement crypto prouvé par AST** : le garde analyse
   `Import`/`ImportFrom`/`__import__`/`importlib.import_module` et n'autorise
