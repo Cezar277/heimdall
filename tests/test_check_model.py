@@ -241,3 +241,73 @@ def test_untrusted_text_is_not_echoed(model: Path, capsys: pytest.CaptureFixture
     output = capsys.readouterr().out
     assert "Malformed scenario at line" in output
     assert marker not in output
+
+
+def test_spoofed_flow_edge_is_rejected(model: Path) -> None:
+    # ident[:3] folding previously accepted F01-evil as F01.
+    replace(model, "dfd.drawio", 'id="F01"', 'id="F01-evil"')
+    assert any("Unexpected DFD edge" in error for error in checker.check_model(model))
+
+
+def test_drawio_cell_flood_is_rejected(model: Path) -> None:
+    cells = "".join(f'<mxCell id="flood-{i}" />' for i in range(checker.MAX_XML_CELLS + 1))
+    payload = (
+        "<mxfile><diagram><mxGraphModel><root>" + cells + "</root></mxGraphModel></diagram></mxfile>"
+    )
+    (model / "dfd.drawio").write_text(payload, encoding="utf-8")
+    assert any("Too many draw.io cells" in error for error in checker.check_model(model))
+
+
+@pytest.mark.parametrize("depth", [checker.MAX_XML_DEPTH + 1, checker.MAX_XML_DEPTH + 100])
+def test_deeply_nested_xml_is_rejected_before_parsing(
+    model: Path, depth: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = "<mxfile>" + "<a>" * depth + "</a>" * depth + "</mxfile>"
+
+    def forbidden_parse(*args: object, **kwargs: object) -> None:
+        pytest.fail("Deeply nested XML was handed to ElementTree")
+
+    monkeypatch.setattr(checker.ET, "fromstring", forbidden_parse)
+    (model / "dfd.drawio").write_text(payload, encoding="utf-8")
+    assert any("Invalid DFD XML" in error for error in checker.check_model(model))
+
+
+def test_shallow_nesting_never_reaches_parser_limit(model: Path) -> None:
+    assert not checker.xml_nesting_exceeds((model / "dfd.drawio").read_text(encoding="utf-8"))
+    assert checker.check_model(model) == []
+
+
+@pytest.mark.parametrize(
+    ("snippet", "exceeds"),
+    [
+        ("<mxfile><!-- comment --></mxfile>", False),
+        ("<mxfile><!-- " + "<a>" * 200 + " --></mxfile>", False),
+        ("<mxfile><!-- unterminated", True),
+        ("<mxfile><![CDATA[<a><a>]]></mxfile>", False),
+        ("<mxfile><![CDATA[" + "<a>" * 200 + "]]></mxfile>", False),
+        ("<mxfile><![CDATA[unterminated", True),
+        ('<mxfile><mxCell value="a>b" /></mxfile>', False),
+        ("<mxfile><mxCell value='a>b' /></mxfile>", False),
+        ("<mxfile><a", True),
+        ("<mxfile><", True),
+        ("</a><mxfile/>", True),
+        ("<?xml version='1.0'?><mxfile/>", False),
+    ],
+)
+def test_nesting_scanner_branches(snippet: str, exceeds: bool) -> None:
+    assert checker.xml_nesting_exceeds(snippet) is exceeds
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"<mxfile><diagram",
+        b"<mxfile><",
+        b"</a><mxfile/>",
+        b"<mxfile><!-- never closed",
+    ],
+    ids=["unterminated-tag", "trailing-lt", "stray-close", "unterminated-comment"],
+)
+def test_malformed_xml_prefix_is_rejected(model: Path, payload: bytes) -> None:
+    (model / "dfd.drawio").write_bytes(payload)
+    assert any("Invalid DFD XML" in error for error in checker.check_model(model))

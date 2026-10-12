@@ -55,7 +55,9 @@ protection de `main` ; ce paramétrage n'est pas effectué par le fichier YAML.
 
 La vérification contrôle les 48 scénarios, leurs scores, les dix liens de
 risque, les exigences associées, les liens locaux et les identifiants du DFD.
-Le XML est borné à 2 Mio, UTF-8 uniquement, sans DTD ni déclaration d'entité.
+Le XML est borné à 2 Mio, UTF-8 uniquement, sans DTD ni déclaration d'entité,
+avec au plus 5000 cellules et une imbrication limitée à 64 niveaux (tout
+dépassement est rejeté avant passage au parser).
 Le PNG n'est contrôlé que par son en-tête et une plage de dimensions lisibles
 (640–8192 × 400–8192, ratio paysage 1–2,2, au maximum 32 mégapixels).
 Une signature et des dimensions acceptées **ne prouvent pas le contenu**.

@@ -7,6 +7,11 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 MAX_XML_BYTES = 2 * 1024 * 1024
 MAX_MARKDOWN_BYTES = 2 * 1024 * 1024
+# Untrusted D1 input: baseline is 64 cells at ~6 nesting levels, so both
+# bounds leave wide room for legitimate DFD evolution while failing closed
+# before expat ever sees a mass or deeply nested payload.
+MAX_XML_CELLS = 5000
+MAX_XML_DEPTH = 64
 SCENARIO_COLUMNS = 7
 TOP_RISK_COUNT = 10
 PNG_HEADER_BYTES = 33
@@ -74,6 +79,57 @@ def check_links(root: Path, repository: Path) -> list[str]:
     return errors
 
 
+def xml_nesting_exceeds(text: str, limit: int = MAX_XML_DEPTH) -> bool:
+    """Quote-aware tag depth scan; fail-closed before handing text to expat."""
+    depth = 0
+    index = 0
+    size = len(text)
+    while index < size:
+        if text[index] != "<":
+            index += 1
+            continue
+        if text.startswith("<!--", index):
+            end = text.find("-->", index + 4)
+            if end == -1:
+                return True
+            index = end + 3
+            continue
+        if text.startswith("<![CDATA[", index):
+            end = text.find("]]>", index + 9)
+            if end == -1:
+                return True
+            index = end + 3
+            continue
+        # Tag end respecting quotes: attribute values may legally hold '>'.
+        cursor = index + 1
+        quote: str | None = None
+        while cursor < size:
+            char = text[cursor]
+            if quote is not None:
+                if char == quote:
+                    quote = None
+            elif char in ("'", '"'):
+                quote = char
+            elif char == ">":
+                break
+            cursor += 1
+        if cursor >= size:
+            return True
+        tag = text[index : cursor + 1]
+        if tag.startswith("</"):
+            depth -= 1
+            if depth < 0:
+                return True
+        elif tag.endswith("/>") or tag.startswith("<?") or tag.startswith("<!"):
+            pass
+        else:
+            depth += 1
+            if depth > limit:
+                return True
+        index = cursor + 1
+    return False
+
+
 def load_drawio(path: Path) -> ET.Element:
     """Parse only bounded UTF-8 XML without DTDs or entity declarations."""
     with path.open("rb") as stream:
@@ -85,6 +141,8 @@ def load_drawio(path: Path) -> ET.Element:
     text = data.decode("utf-8-sig")
     if "\x00" in text or re.search(r"<!\s*(?:DOCTYPE|ENTITY)\b", text, re.I):
         raise ValueError("DFD XML must be UTF-8 without DTD or entity declarations")
+    if xml_nesting_exceeds(text):
+        raise ValueError("DFD XML nesting exceeds bound")
     return ET.fromstring(text)  # noqa: S314 -- bounded, DTD/entities rejected above
 
 
@@ -159,16 +217,25 @@ def check_model(root: Path) -> list[str]:  # noqa: PLR0912, PLR0915
     if len(tree.findall("diagram")) != 1:
         errors.append("DFD must have one page")
     cells = tree.findall(".//mxCell")
+    if len(cells) > MAX_XML_CELLS:
+        errors.append("Too many draw.io cells")
+        return errors
     ids = [cell.get("id") for cell in cells]
     if len(ids) != len(set(ids)):
         errors.append("Duplicate draw.io cell IDs")
     nodes = {ident for ident in ids if ident and re.fullmatch(r"[EPD]\d", ident)}
     if nodes != {"E1", "E2", "E3", "P1", "P2", "P3", "P4", "P5", "D1", "D2", "D3", "D4"}:
         errors.append("DFD must identify all twelve elements")
+    # F13 legitimately splits into two edges; every other flow has one edge.
+    # Exact whitelist: ident[:3] folding previously accepted F01-evil as F01.
+    allowed_edges = {f"F{n:02}" for n in range(1, 17)} | {"F13a", "F13b"}
     flow_ids = set()
     for edge_number, edge in enumerate((c for c in cells if c.get("edge") == "1"), 1):
         ident = edge.get("id", "")
-        flow_ids.add(ident[:3])
+        if ident not in allowed_edges:
+            errors.append(f"Unexpected DFD edge at edge {edge_number}")
+            continue
+        flow_ids.add("F13" if ident in ("F13a", "F13b") else ident)
         if (
             edge.get("source") not in nodes
             or edge.get("target") not in nodes
