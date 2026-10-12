@@ -58,6 +58,7 @@ openapi.yaml         contrat Vault API v1 (#15)
 - [Outils MCP exposés au LLM (surface strictement limitée)](docs/contracts/mcp-tools.md)
 - [ADR-001 : Finding et faux positifs](docs/adr/001-finding-et-etats.md)
 - [ADR-002 : Stack Python et structure du dépôt](docs/adr/002-stack-python.md)
+- [Modèle de menaces : DFD, actifs, STRIDE et risques prioritaires (T18)](docs/security/README.md)
 
 ## Vérifier
 
