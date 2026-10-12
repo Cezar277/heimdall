@@ -30,12 +30,31 @@ jobs:
           .venv-security/bin/python -m pytest tests/test_check_model.py --cov=docs/security --cov-branch --cov-report=term-missing --cov-fail-under=95
       - name: Check PR whitespace and identify reviewed artifacts
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        shell: bash
         run: |
-          if [ -n "$BASE_SHA" ]; then
-            git diff --check "$BASE_SHA"...HEAD
-          else
-            git show --format= --check HEAD
-          fi
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request)
+              [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad BASE_SHA"; exit 1; }
+              git cat-file -e "$BASE_SHA^{commit}"
+              git diff --check "$BASE_SHA"...HEAD
+              ;;
+            push)
+              [[ "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad BEFORE_SHA"; exit 1; }
+              if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+                # New branch: compare the full tree against the empty Git tree.
+                EMPTY_TREE=$(git hash-object -t tree --stdin < /dev/null)
+                git diff --check "$EMPTY_TREE" HEAD
+              else
+                # Two endpoints also cover force-pushes without assuming ancestry.
+                git cat-file -e "$BEFORE_SHA^{commit}"
+                git diff --check "$BEFORE_SHA" HEAD
+              fi
+              ;;
+            *) echo "unsupported event"; exit 1 ;;
+          esac
           git rev-parse HEAD
           sha256sum docs/security/dfd.drawio docs/security/dfd.png

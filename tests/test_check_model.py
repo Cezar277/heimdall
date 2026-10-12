@@ -1,6 +1,7 @@
 """Adversarial document mutations; no Git state or network required."""
 
 import importlib.util
+import os
 import re
 import shutil
 import struct
@@ -169,3 +170,74 @@ def test_cli_reports_failure(model: Path, capsys: pytest.CaptureFixture[str]) ->
     (model / "dfd.drawio").write_bytes(b"<broken>")
     assert checker.main(model) == 1
     assert "Invalid DFD XML" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("kind", ["relative-escape", "absolute", "symlink"])
+def test_links_cannot_read_outside_repository(
+    model: Path, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = model.parent.parent
+    outside = repository.parent / f"{repository.name}-outside.md"
+    outside.write_text("# Outside\nSYNTHETIC_NON_SECRET_CANARY\n", encoding="utf-8")
+    if kind == "symlink":
+        link = model / "escape.md"
+        try:
+            link.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"OS does not permit symlink creation: {exc.errno}")
+        destination = "escape.md"
+    elif kind == "absolute":
+        destination = outside.as_posix()
+    else:
+        destination = os.path.relpath(outside, model).replace(os.sep, "/")
+    with (model / "risks.md").open("a", encoding="utf-8") as stream:
+        stream.write(f"\n[Untrusted target]({destination}#outside)\n")
+    original_open = Path.open
+
+    def guarded_open(path: Path, *args: object, **kwargs: object):
+        if path.resolve() == outside.resolve():
+            pytest.fail("Outside file was opened")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    errors = checker.check_model(model)
+    assert any("Unsafe" in error for error in errors)
+    assert "SYNTHETIC_NON_SECRET_CANARY" not in "\n".join(errors)
+
+
+@pytest.mark.parametrize(
+    "destination", ["/etc/hostname", "C:/outside.md", "C:outside.md", "\\\\host\\share\\x.md"]
+)
+def test_absolute_link_forms_are_rejected(model: Path, destination: str) -> None:
+    with (model / "risks.md").open("a", encoding="utf-8") as stream:
+        stream.write(f"\n[Link]({destination}#heading)\n")
+    assert any("Unsafe local link" in error for error in checker.check_model(model))
+
+
+def test_relative_links_within_repository_remain_valid(model: Path) -> None:
+    (model.parent / "sibling.md").write_text("# Valid\n", encoding="utf-8")
+    with (model / "risks.md").open("a", encoding="utf-8") as stream:
+        stream.write("\n[Sibling](../sibling.md#valid)\n")
+    assert checker.check_model(model) == []
+
+
+@pytest.mark.parametrize("name", ["stride.md", "notes.md", "linked.md"])
+def test_markdown_reads_are_bounded(model: Path, name: str) -> None:
+    (model / name).write_bytes(b"x" * (checker.MAX_MARKDOWN_BYTES + 1))
+    if name == "linked.md":
+        with (model / "risks.md").open("a", encoding="utf-8") as stream:
+            stream.write("\n[Too large](linked.md#heading)\n")
+    assert checker.check_model(model)
+
+
+def test_untrusted_text_is_not_echoed(model: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    marker = "SYNTHETIC_NON_SECRET_CANARY"
+    with (model / "stride.md").open("a", encoding="utf-8") as stream:
+        stream.write(f'\n| <a id="broken"></a> {marker} |\n')
+    with (model / "risks.md").open("a", encoding="utf-8") as stream:
+        stream.write(f"\n[Bad link](missing-{marker}.md#heading)\n")
+    replace(model, "dfd.drawio", 'id="F01"', f'id="{marker}"')
+    assert checker.main(model) == 1
+    output = capsys.readouterr().out
+    assert "Malformed scenario at line" in output
+    assert marker not in output

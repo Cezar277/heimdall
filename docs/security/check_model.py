@@ -3,9 +3,10 @@
 import re
 import struct
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 MAX_XML_BYTES = 2 * 1024 * 1024
+MAX_MARKDOWN_BYTES = 2 * 1024 * 1024
 SCENARIO_COLUMNS = 7
 TOP_RISK_COUNT = 10
 PNG_HEADER_BYTES = 33
@@ -14,6 +15,63 @@ PNG_MIN_HEIGHT = 400
 PNG_MAX_SIDE = 8192
 PNG_MAX_RATIO = 2.2
 PNG_MAX_PIXELS = 32_000_000
+
+
+def confined_file(path: Path, repository: Path) -> Path:
+    """Resolve a static checkout path before any content read, including symlinks."""
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(repository) or not resolved.is_file():
+        raise ValueError("File outside repository or not a regular file")
+    return resolved
+
+
+def read_document(path: Path, repository: Path) -> str:
+    """Bound Markdown reads; do not include file contents in diagnostics."""
+    target = confined_file(path, repository)
+    with target.open("rb") as stream:
+        data = stream.read(MAX_MARKDOWN_BYTES + 1)
+    if len(data) > MAX_MARKDOWN_BYTES:
+        raise ValueError("Markdown exceeds 2 MiB")
+    return data.decode("utf-8-sig")
+
+
+def check_links(root: Path, repository: Path) -> list[str]:
+    """Allow relative links within the checkout, never absolute/outgoing links."""
+    errors: list[str] = []
+    for doc_number, doc in enumerate(sorted(root.glob("*.md")), 1):
+        try:
+            content = read_document(doc, repository)
+        except (OSError, ValueError, RuntimeError):
+            errors.append(f"Invalid Markdown document {doc_number}")
+            continue
+        for link_number, destination in enumerate(re.findall(r"\]\(([^)]+)\)", content), 1):
+            if destination.startswith(("https://", "http://")):
+                continue
+            location = f"document {doc_number}, link {link_number}"
+            path, _, anchor = destination.partition("#")
+            # Also reject Windows drives/UNC when running on Linux and vice versa.
+            if (
+                PurePosixPath(path).is_absolute()
+                or PureWindowsPath(path).drive
+                or path.startswith("\\")
+            ):
+                errors.append(f"Unsafe local link at {location}")
+                continue
+            try:
+                target = confined_file(doc.parent / path if path else doc, repository)
+                if anchor and target.suffix == ".md":
+                    target_text = read_document(target, repository)
+                    headings = {
+                        re.sub(r"[^\w\- ]", "", h.lower()).replace(" ", "-")
+                        for h in re.findall(r"^#+ (.+)$", target_text, re.M)
+                    }
+                    if anchor not in headings and f'id="{anchor}"' not in target_text:
+                        errors.append(f"Missing anchor at {location}")
+            except FileNotFoundError:
+                errors.append(f"Missing local link at {location}")
+            except (OSError, ValueError, RuntimeError):
+                errors.append(f"Unsafe or unreadable local link at {location}")
+    return errors
 
 
 def load_drawio(path: Path) -> ET.Element:
@@ -34,35 +92,40 @@ def load_drawio(path: Path) -> ET.Element:
 def check_model(root: Path) -> list[str]:  # noqa: PLR0912, PLR0915
     """Return human-readable errors without modifying files or using the network."""
     errors: list[str] = []
-    stride = (root / "stride.md").read_text(encoding="utf-8")
-    risks = (root / "risks.md").read_text(encoding="utf-8")
+    repository = root.parent.parent.resolve()
+    try:
+        stride = read_document(root / "stride.md", repository)
+        risks = read_document(root / "risks.md", repository)
+        dfd = read_document(root / "dfd.md", repository)
+    except (OSError, ValueError, RuntimeError):
+        return ["Invalid required model document"]
     expected = {
         f"{c}-{s}"
         for c in ("SCN", "MCP", "LLM", "CLI", "HOOK", "VLT", "STO", "CI")
         for s in "STRIDE"
     }
     scores: dict[str, tuple[int, int, int]] = {}
-    for line in stride.splitlines():
+    for line_number, line in enumerate(stride.splitlines(), 1):
         if not line.startswith('| <a id="'):
             continue
         cols = [c.strip() for c in line.strip("|").split("|")]
         match = re.fullmatch(r'<a id="([a-z]+-[a-z])"></a>([A-Z]+-[A-Z])', cols[0])
         if match is None or len(cols) != SCENARIO_COLUMNS:
-            errors.append(f"Malformed scenario: {line}")
+            errors.append(f"Malformed scenario at line {line_number}")
             continue
         ident = match[2]
         if ident in scores or match[1] != ident.lower():
-            errors.append(f"Duplicate ID / anchor mismatch: {ident}")
+            errors.append(f"Duplicate ID / anchor mismatch at line {line_number}")
         try:
             impact, probability, score = map(int, cols[3:6])
         except ValueError:
-            errors.append(f"Invalid numeric score: {ident}")
+            errors.append(f"Invalid numeric score at line {line_number}")
             continue
         scores[ident] = impact, probability, score
         if impact not in (1, 2, 3) or probability not in (1, 2, 3) or score != impact * probability:
-            errors.append(f"Incorrect score: {ident}")
+            errors.append(f"Incorrect score at line {line_number}")
         if not all(cols) or not re.search(r"#\d+", cols[2]):
-            errors.append(f"Empty field or missing mitigation owner: {ident}")
+            errors.append(f"Empty field or missing mitigation owner at line {line_number}")
     if set(scores) != expected:
         errors.append("Expected exactly 8 components x 6 STRIDE scenarios")
     top = re.findall(
@@ -87,26 +150,10 @@ def check_model(root: Path) -> list[str]:  # noqa: PLR0912, PLR0915
         score[2] > min(ranked) for ident, score in scores.items() if ident not in selected
     ):
         errors.append("A higher scored scenario was omitted from the top ten")
-    for doc in root.glob("*.md"):
-        content = doc.read_text(encoding="utf-8")
-        for destination in re.findall(r"\]\(([^)]+)\)", content):
-            if destination.startswith(("https://", "http://")):
-                continue
-            path, _, anchor = destination.partition("#")
-            target = (doc.parent / path) if path else doc
-            if not target.is_file():
-                errors.append(f"Missing local link in {doc.name}: {destination}")
-            elif anchor and target.suffix == ".md":
-                target_text = target.read_text(encoding="utf-8")
-                headings = {
-                    re.sub(r"[^\w\- ]", "", h.lower()).replace(" ", "-")
-                    for h in re.findall(r"^#+ (.+)$", target_text, re.M)
-                }
-                if anchor not in headings and f'id="{anchor}"' not in target_text:
-                    errors.append(f"Missing anchor in {doc.name}: {destination}")
+    errors.extend(check_links(root, repository))
     try:
-        tree = load_drawio(root / "dfd.drawio")
-    except (OSError, ValueError, ET.ParseError) as exc:
+        tree = load_drawio(confined_file(root / "dfd.drawio", repository))
+    except (OSError, ValueError, RuntimeError, ET.ParseError) as exc:
         errors.append(f"Invalid DFD XML: {type(exc).__name__}")
         return errors
     if len(tree.findall("diagram")) != 1:
@@ -119,7 +166,7 @@ def check_model(root: Path) -> list[str]:  # noqa: PLR0912, PLR0915
     if nodes != {"E1", "E2", "E3", "P1", "P2", "P3", "P4", "P5", "D1", "D2", "D3", "D4"}:
         errors.append("DFD must identify all twelve elements")
     flow_ids = set()
-    for edge in (c for c in cells if c.get("edge") == "1"):
+    for edge_number, edge in enumerate((c for c in cells if c.get("edge") == "1"), 1):
         ident = edge.get("id", "")
         flow_ids.add(ident[:3])
         if (
@@ -127,10 +174,9 @@ def check_model(root: Path) -> list[str]:  # noqa: PLR0912, PLR0915
             or edge.get("target") not in nodes
             or ident + "-label" not in ids
         ):
-            errors.append(f"Missing DFD endpoint or label: {ident}")
+            errors.append(f"Missing DFD endpoint or label at edge {edge_number}")
     if flow_ids != {f"F{n:02}" for n in range(1, 17)}:
         errors.append("DFD must cover flows F01..F16")
-    dfd = (root / "dfd.md").read_text(encoding="utf-8")
     if set(re.findall(r"^\| (F\d{2}) \|", dfd, re.M)) != flow_ids:
         errors.append("DFD flow register and diagram disagree")
     for boundary in range(1, 6):
@@ -140,9 +186,9 @@ def check_model(root: Path) -> list[str]:  # noqa: PLR0912, PLR0915
             errors.append(f"DFD missing boundary B{boundary}")
     # Header sanity only: no claim of image integrity or graphical equivalence.
     try:
-        with (root / "dfd.png").open("rb") as stream:
+        with confined_file(root / "dfd.png", repository).open("rb") as stream:
             png = stream.read(PNG_HEADER_BYTES)
-    except OSError:
+    except (OSError, ValueError, RuntimeError):
         errors.append("Missing or unreadable PNG")
         return errors
     if (
