@@ -12,6 +12,10 @@ modifier la page unique, puis exporter en PNG avec le fond blanc et toutes
 les zones visibles. La source et l'image doivent être mises à jour ensemble.
 L'export initial a été rendu depuis les mêmes cellules et coordonnées avec
 Pillow ; l'inspection visuelle fait partie de la vérification documentaire.
+Toute nouvelle exportation exige une comparaison source/image par le
+relecteur C, avec capture datée, dimensions et SHA-256 archivés suivant
+[la procédure de preuve](review-and-evidence.md#preuve-visuelle-obligatoire-avant-fusion).
+Le contrôle automatique d'en-tête PNG ne prouve pas la fidélité du rendu.
 
 ## Éléments
 

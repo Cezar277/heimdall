@@ -52,6 +52,14 @@ ci-dessous ne devient « implémentée » grâce à sa seule présence dans ce d
 Ces points restent ouverts : ils ne justifient ni un contournement TLS, ni
 un accès direct du LLM au Vault, ni l'acceptation d'un scan incomplet.
 
+**Condition de fusion H1/H4 :** obtenir dans #19 un engagement écrit du
+porteur : tant que ces décisions ne sont pas arbitrées, seules les cibles
+`127.0.0.1`, `::1` et `localhost` avec TLS vérifié sont autorisées pour le
+client. Les flux distants représentés restent hypothétiques et n'autorisent
+aucun déploiement. Toute ouverture distante exige une PR dédiée alignant
+contrat, client, TLS/SAN, authentification/droits, quotas, tests et DFD.
+L'engagement dans #19 reste à publier et à faire valider avant fusion.
+
 ## Maintenir ce modèle
 
 À chaque modification de contrat, outil MCP, endpoint, droit, stockage,
