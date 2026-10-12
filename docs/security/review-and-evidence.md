@@ -55,6 +55,9 @@ protection de `main` ; ce paramétrage n'est pas effectué par le fichier YAML.
 
 La vérification contrôle les 48 scénarios, leurs scores, les dix liens de
 risque, les exigences associées, les liens locaux et les identifiants du DFD.
+Chaque lecture rouvre puis revérifie le descripteur après ouverture
+(confinement, identité, procfs) : un remplacement concurrent par un lien
+sortant est rejeté avant toute lecture.
 Le XML est borné à 2 Mio, UTF-8 uniquement, sans DTD ni déclaration d'entité,
 avec au plus 5000 cellules et une imbrication limitée à 64 niveaux (tout
 dépassement est rejeté avant passage au parser).

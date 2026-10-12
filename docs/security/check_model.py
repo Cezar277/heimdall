@@ -1,8 +1,12 @@
 """Check cross-document consistency only; no runtime security assertions."""
 
+import contextlib
+import os
 import re
+import stat
 import struct
 import xml.etree.ElementTree as ET
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 MAX_XML_BYTES = 2 * 1024 * 1024
@@ -22,22 +26,74 @@ PNG_MAX_RATIO = 2.2
 PNG_MAX_PIXELS = 32_000_000
 
 
-def confined_file(path: Path, repository: Path) -> Path:
-    """Resolve a static checkout path before any content read, including symlinks."""
-    resolved = path.resolve(strict=True)
-    if not resolved.is_relative_to(repository) or not resolved.is_file():
+@contextlib.contextmanager
+def _open_verified(path: Path, repository: Path) -> Iterator[int]:
+    """Open-then-verify descriptor; closes the resolve-then-open (TOCTOU) window.
+
+    A bare resolve() + is_relative_to() + open() lets a concurrent swap of the
+    resolved file for an outgoing symlink read outside the repository. Here the
+    resolved path is opened and the *descriptor* is re-verified: containment is
+    re-resolved after opening, descriptor identity is compared against the path,
+    and on procfs the kernel-reported target must stay inside the repository.
+    In-repo symlinks keep working (the resolved target is opened, never the link).
+    """
+    try:
+        pre = path.resolve(strict=True)
+    except FileNotFoundError:
+        raise
+    if not pre.is_relative_to(repository) or not pre.is_file():
         raise ValueError("File outside repository or not a regular file")
-    return resolved
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)  # Windows: no CRLF translation, raw bytes.
+    )
+    # Harmless for legitimate files (pre is fully resolved, so no symlink
+    # remains); a planted final-component symlink fails here with ELOOP.
+    fd = os.open(pre, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("Not a regular file")
+        # Single swap (file or parent directory) is caught here even where
+        # O_NOFOLLOW/procfs are unavailable (Windows dev machines).
+        post = pre.resolve(strict=True)
+        if not post.is_relative_to(repository):
+            raise ValueError("File outside repository")
+        st_post, st_fd = os.stat(post), os.fstat(fd)
+        if (st_post.st_dev, st_post.st_ino) != (st_fd.st_dev, st_fd.st_ino):
+            raise ValueError("File replaced during read")
+        try:
+            location = Path(f"/proc/self/fd/{fd}").resolve(strict=True)
+        except OSError:
+            location = None  # No procfs (Windows/macOS): checks above still apply.
+        if location is not None and not location.is_relative_to(repository):
+            raise ValueError("File outside repository")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def read_confined_bytes(path: Path, repository: Path, limit: int) -> bytes:
+    """Bounded open-then-verify read; raises when content exceeds limit."""
+    with _open_verified(path, repository) as fd:
+        chunks = []
+        remaining = limit + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        raise ValueError("File exceeds bound")
+    return data
 
 
 def read_document(path: Path, repository: Path) -> str:
     """Bound Markdown reads; do not include file contents in diagnostics."""
-    target = confined_file(path, repository)
-    with target.open("rb") as stream:
-        data = stream.read(MAX_MARKDOWN_BYTES + 1)
-    if len(data) > MAX_MARKDOWN_BYTES:
-        raise ValueError("Markdown exceeds 2 MiB")
-    return data.decode("utf-8-sig")
+    return read_confined_bytes(path, repository, MAX_MARKDOWN_BYTES).decode("utf-8-sig")
 
 
 def check_links(root: Path, repository: Path) -> list[str]:
@@ -63,15 +119,18 @@ def check_links(root: Path, repository: Path) -> list[str]:
                 errors.append(f"Unsafe local link at {location}")
                 continue
             try:
-                target = confined_file(doc.parent / path if path else doc, repository)
-                if anchor and target.suffix == ".md":
-                    target_text = read_document(target, repository)
+                candidate = doc.parent / path if path else doc
+                if anchor and candidate.suffix == ".md":
+                    target_text = read_document(candidate, repository)
                     headings = {
                         re.sub(r"[^\w\- ]", "", h.lower()).replace(" ", "-")
                         for h in re.findall(r"^#+ (.+)$", target_text, re.M)
                     }
                     if anchor not in headings and f'id="{anchor}"' not in target_text:
                         errors.append(f"Missing anchor at {location}")
+                else:
+                    # Existence alone proves nothing (TOCTOU): verified open it.
+                    read_confined_bytes(candidate, repository, MAX_MARKDOWN_BYTES)
             except FileNotFoundError:
                 errors.append(f"Missing local link at {location}")
             except (OSError, ValueError, RuntimeError):
@@ -130,12 +189,9 @@ def xml_nesting_exceeds(text: str, limit: int = MAX_XML_DEPTH) -> bool:
     return False
 
 
-def load_drawio(path: Path) -> ET.Element:
+def load_drawio(path: Path, repository: Path) -> ET.Element:
     """Parse only bounded UTF-8 XML without DTDs or entity declarations."""
-    with path.open("rb") as stream:
-        data = stream.read(MAX_XML_BYTES + 1)
-    if len(data) > MAX_XML_BYTES:
-        raise ValueError("DFD XML exceeds 2 MiB")
+    data = read_confined_bytes(path, repository, MAX_XML_BYTES)
     # Decode before inspection: UTF-16/32 cannot bypass the declaration guard
     # with interleaved NULs. Draw.io source in this repository is UTF-8 only.
     text = data.decode("utf-8-sig")
@@ -210,7 +266,7 @@ def check_model(root: Path) -> list[str]:  # noqa: PLR0912, PLR0915
         errors.append("A higher scored scenario was omitted from the top ten")
     errors.extend(check_links(root, repository))
     try:
-        tree = load_drawio(confined_file(root / "dfd.drawio", repository))
+        tree = load_drawio(root / "dfd.drawio", repository)
     except (OSError, ValueError, RuntimeError, ET.ParseError) as exc:
         errors.append(f"Invalid DFD XML: {type(exc).__name__}")
         return errors
@@ -253,8 +309,8 @@ def check_model(root: Path) -> list[str]:  # noqa: PLR0912, PLR0915
             errors.append(f"DFD missing boundary B{boundary}")
     # Header sanity only: no claim of image integrity or graphical equivalence.
     try:
-        with confined_file(root / "dfd.png", repository).open("rb") as stream:
-            png = stream.read(PNG_HEADER_BYTES)
+        with _open_verified(root / "dfd.png", repository) as png_fd:
+            png = os.read(png_fd, PNG_HEADER_BYTES)
     except (OSError, ValueError, RuntimeError):
         errors.append("Missing or unreadable PNG")
         return errors

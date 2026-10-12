@@ -192,17 +192,114 @@ def test_links_cannot_read_outside_repository(
         destination = os.path.relpath(outside, model).replace(os.sep, "/")
     with (model / "risks.md").open("a", encoding="utf-8") as stream:
         stream.write(f"\n[Untrusted target]({destination}#outside)\n")
-    original_open = Path.open
+    # The checker reads through os.open descriptors, never Path.open: guard that.
+    real_os_open = os.open
 
-    def guarded_open(path: Path, *args: object, **kwargs: object):
-        if path.resolve() == outside.resolve():
+    def guarded_os_open(path, *args: object, **kwargs: object):
+        if isinstance(path, (str, os.PathLike)) and Path(path).resolve() == outside.resolve():
             pytest.fail("Outside file was opened")
-        return original_open(path, *args, **kwargs)
+        return real_os_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(checker.os, "open", guarded_os_open)
     errors = checker.check_model(model)
     assert any("Unsafe" in error for error in errors)
     assert "SYNTHETIC_NON_SECRET_CANARY" not in "\n".join(errors)
+
+
+def test_swap_between_check_and_open_is_rejected(
+    model: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A planted symlink winning the resolve→open race must fail closed."""
+    repository = model.parent.parent
+    outside = repository.parent / f"{repository.name}-swap-outside.md"
+    outside.write_text("# Outside\nSYNTHETIC_NON_SECRET_CANARY\n", encoding="utf-8")
+    probe = model / "probe-link"
+    try:
+        probe.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"OS does not permit symlink creation: {exc.errno}")
+    probe.unlink()
+    victim = model / "risks.md"
+    victim_target = victim.resolve()
+    backup = victim.read_bytes()
+    real_os_open = os.open
+    planted = False
+
+    def swapping_open(path, *args: object, **kwargs: object):
+        nonlocal planted
+        if not planted and isinstance(path, (str, os.PathLike)) and Path(path) == victim_target:
+            planted = True
+            victim.unlink()
+            victim.symlink_to(outside)
+        return real_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(checker.os, "open", swapping_open)
+    try:
+        errors = checker.check_model(model)
+    finally:
+        if victim.is_symlink():
+            victim.unlink()
+        victim.write_bytes(backup)
+    assert planted
+    assert errors
+    assert "SYNTHETIC_NON_SECRET_CANARY" not in "\n".join(errors)
+
+
+def test_reswap_after_open_is_rejected(model: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Path swapped back after opening must fail on descriptor identity."""
+    if os.name == "nt":
+        pytest.skip("Windows locks open files against unlink/recreate swaps")
+    repository = model.parent.parent
+    victim = model / "risks.md"
+    backup = victim.read_bytes()
+    real_os_open = os.open
+
+    def reswapping_open(path, *args: object, **kwargs: object):
+        fd = real_os_open(path, *args, **kwargs)
+        if isinstance(path, (str, os.PathLike)) and Path(path) == victim.resolve():
+            victim.unlink()
+            victim.write_bytes(b"swapped-underneath")
+        return fd
+
+    monkeypatch.setattr(checker.os, "open", reswapping_open)
+    try:
+        with pytest.raises(ValueError, match="replaced"):
+            checker.read_document(victim, repository)
+    finally:
+        victim.write_bytes(backup)
+
+
+def test_swap_with_directory_is_rejected(model: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A path swapped for a directory between check and open must fail closed."""
+    if os.name == "nt":
+        pytest.skip("Opening a directory behaves differently on Windows")
+    repository = model.parent.parent
+    victim = model / "risks.md"
+    backup = victim.read_bytes()
+    real_os_open = os.open
+    planted = False
+
+    def planting_open(path, *args: object, **kwargs: object):
+        nonlocal planted
+        if (
+            not planted
+            and isinstance(path, (str, os.PathLike))
+            and Path(path) == victim.resolve()
+        ):
+            planted = True
+            victim.unlink()
+            victim.mkdir()
+        return real_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(checker.os, "open", planting_open)
+    try:
+        with pytest.raises(ValueError, match="regular"):
+            checker.read_document(victim, repository)
+    finally:
+        if victim.is_dir():
+            victim.rmdir()
+        victim.write_bytes(backup)
+    assert planted
 
 
 @pytest.mark.parametrize(
