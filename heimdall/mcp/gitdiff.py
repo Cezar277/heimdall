@@ -33,6 +33,7 @@ import os
 import re
 import shutil
 import subprocess  # nosec B404
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,6 +95,18 @@ MAX_LINE_CHARS: Final[int] = 2000
 
 # `@@ -12,0 +1,3 @@ fonction; seule la position côté nouveau compte.
 _HUNK_HEADER: Final[re.Pattern[str]] = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
+    """Interrompt un sous-processus et attend sa fin sans bloquer ni lever."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 class GitAccess:
@@ -172,7 +185,13 @@ class GitAccess:
         raise ToolFailure("INTERNAL")
 
     def staged_diff(self, max_bytes: int) -> tuple[bytes, bool]:
-        """Sortie brute de ``git diff --cached``, plafonnée à ``max_bytes``.
+        """Sortie brute de ``git diff --cached``, lue en flux borné à ``max_bytes``.
+
+        Pour éviter tout déni de service mémoire (OOM sur un dépôt piégé par
+        un blob géant stagé), la sortie n'est JAMAIS bufferisée intégralement
+        avant coupe : le flux stdout est lu jusqu'à au plus ``max_bytes + 1``
+        octets. Si ce plafond est dépassé, le sous-processus est immédiatement
+        interrompu (kill) et ``truncated: True`` est posé.
 
         La coupe tombe sur la dernière ligne COMPLÈTE : couper à l'octet
         près laisserait une ligne tronquée dont le masquage échouerait
@@ -183,10 +202,45 @@ class GitAccess:
         la première ligne est courte), la coupe part telle quelle — une
         en-tête sans `\n` ne porte aucune ligne ajoutée à fuir.
         """
-        raw = self.run(DIFF_ARGUMENTS)
-        if len(raw) <= max_bytes:
-            return raw, False
-        return raw[:max_bytes].rsplit(b"\n", 1)[0], True
+        try:
+            proc = subprocess.Popen(  # noqa: S603 # nosec B603
+                [self._git, *GIT_CONFIG_OVERRIDES, "-C", str(self._root), *DIFF_ARGUMENTS],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=confined_environment(self._root),
+            )
+        except OSError:
+            raise ToolFailure("INTERNAL") from None
+
+        timer = threading.Timer(GIT_TIMEOUT_SECONDS, proc.kill)
+        timer.daemon = True
+        timer.start()
+        try:
+            raw = b""
+            if proc.stdout is not None:
+                raw = proc.stdout.read(max_bytes + 1)
+        except OSError:
+            _terminate_process(proc)
+            raise ToolFailure("INTERNAL") from None
+        finally:
+            timer.cancel()
+            if proc.stdout is not None:
+                proc.stdout.close()
+
+        if len(raw) > max_bytes:
+            _terminate_process(proc)
+            return raw[:max_bytes].rsplit(b"\n", 1)[0], True
+
+        try:
+            ret = proc.wait(timeout=GIT_TIMEOUT_SECONDS)
+        except (subprocess.TimeoutExpired, OSError):
+            _terminate_process(proc)
+            raise ToolFailure("INTERNAL") from None
+
+        if ret != 0:
+            raise ToolFailure("INTERNAL")
+
+        return raw, False
 
 
 @dataclass(frozen=True)

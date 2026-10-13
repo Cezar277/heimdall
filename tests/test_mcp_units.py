@@ -136,6 +136,13 @@ class ToolBoundaryTests(unittest.TestCase):
         self.assertTrue(result["isError"])
         self.assertEqual(json.loads(result["content"][0]["text"])["error"]["code"], "INVALID_INPUT")
 
+    def test_unserializable_meta_is_refused_not_raised(self) -> None:
+        """_meta non sérialisable (ex. bytes) : TypeError rattrapée dans l'enveloppe."""
+        result = self.run_gate("read_diff", {"_meta": b"\x00"})
+        self.assertTrue(result["isError"])
+        self.assertEqual(json.loads(result["content"][0]["text"])["error"]["code"], "INVALID_INPUT")
+
+
     def test_unknown_field_is_refused(self) -> None:
         payload = json.loads(self.run_gate("read_diff", {"root": "/etc"})["content"][0]["text"])
         self.assertEqual(payload["error"]["code"], "INVALID_INPUT")
@@ -337,6 +344,53 @@ class GitAccessDirectTests(unittest.TestCase):
         _, truncated = access.staged_diff(10)
         self.assertTrue(truncated)
 
+    def test_staged_diff_popen_failure_is_internal(self) -> None:
+        access = gitdiff.GitAccess(self.repo.root)
+        with mock.patch("subprocess.Popen", side_effect=OSError("echec")):
+            with self.assertRaises(ToolFailure):
+                access.staged_diff(1024)
+
+    def test_staged_diff_stdout_read_error_is_internal(self) -> None:
+        access = gitdiff.GitAccess(self.repo.root)
+        proc = mock.MagicMock()
+        proc.stdout.read.side_effect = OSError("read error")
+        with mock.patch("subprocess.Popen", return_value=proc):
+            with self.assertRaises(ToolFailure):
+                access.staged_diff(1024)
+        proc.kill.assert_called_once()
+        proc.wait.assert_called_once()
+
+    def test_staged_diff_process_nonzero_exit_is_internal(self) -> None:
+        access = gitdiff.GitAccess(self.repo.root)
+        proc = mock.MagicMock()
+        proc.stdout.read.return_value = b"some diff"
+        proc.wait.return_value = 1
+        with mock.patch("subprocess.Popen", return_value=proc):
+            with self.assertRaises(ToolFailure):
+                access.staged_diff(1024)
+
+    def test_staged_diff_process_wait_timeout_is_internal(self) -> None:
+        access = gitdiff.GitAccess(self.repo.root)
+        proc = mock.MagicMock()
+        proc.stdout.read.return_value = b"some diff"
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=30)
+        with mock.patch("subprocess.Popen", return_value=proc):
+            with self.assertRaises(ToolFailure):
+                access.staged_diff(1024)
+        proc.kill.assert_called_once()
+
+    def test_run_success_returns_stdout(self) -> None:
+        access = gitdiff.GitAccess(self.repo.root)
+        out = access.run(("rev-parse", "--is-inside-work-tree"))
+        self.assertEqual(out.strip(), b"true")
+
+    def test_terminate_process_ignores_oserror_and_timeout(self) -> None:
+        proc = mock.MagicMock()
+        proc.kill.side_effect = OSError("already dead")
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=1)
+        gitdiff._terminate_process(proc)
+
+
     def test_resolve_root_refuses_garbage(self) -> None:
         for bad in ("", "/definitely/not/here", "\x00"):
             with self.subTest(root=bad):
@@ -477,6 +531,27 @@ class DirectToolErrorTests(unittest.TestCase):
         payload = json.loads(self.tools["read_diff"](max_bytes=1024))
         self.assertTrue(payload["truncated"])
         self.assertLessEqual(len(json.dumps(payload).encode()), 1024)
+
+    def test_internal_failure_does_not_leak_paths_or_secrets_to_stderr(self) -> None:
+        """Exceptions inattendues : message statique seul, aucun secret ni chemin dans stderr."""
+        with mock.patch.object(gitdiff, "GIT_CONFIG_OVERRIDES", ("-c", "hostile.invalid=1")):
+            with mock.patch.object(
+                gitdiff.GitAccess,
+                "staged_diff",
+                side_effect=RuntimeError(
+                    "erreur /tmp/secret_dir avec KEY=sk_live_1234567890"  # noqa: S108
+                ),
+            ):
+                with self.assertLogs("heimdall.mcp.server", level="ERROR") as cm:
+                    res = self.tools["read_diff"]()
+                payload = json.loads(res)
+                self.assertEqual(payload["error"]["code"], "INTERNAL")
+                logged = "\n".join(cm.output)
+                self.assertIn("échec inattendu d'un outil MCP", logged)
+                self.assertNotIn("/tmp/", logged)  # noqa: S108
+                self.assertNotIn("sk_live", logged)
+                self.assertNotIn("KEY=", logged)
+
 
     def test_sanitize_rejects_bad_bounds(self) -> None:
         for arguments in ({"start_line": 0}, {"max_lines": 0}, {"max_lines": 401}):

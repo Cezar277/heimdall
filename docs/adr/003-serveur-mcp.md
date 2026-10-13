@@ -43,7 +43,7 @@ signalait à tort (faux positif documenté dans `docs/mcp-server.md`).
 Écart assumé au contrat #16 : `ping` n'en fait pas partie. Il répond
 `{"pong": true}`, aucune donnée du dépôt, et ne sera ni intégré au contrat
 ni retiré en passant — par PR dédiée relue. Preuve : `SERVER_TOOLS` dans
-`heimdall/mcp/server.py:57`, test de registre fermé.
+`heimdall/mcp/server.py` (`SERVER_TOOLS`, `ping`), test de registre fermé.
 
 ### 3. Frontière d'entrée : le contrat appliqué pour de vrai
 
@@ -56,7 +56,7 @@ refusée (`additionalProperties: false` comportemental, invariant 11),
 **type exact** (`bool` n'est pas un `int`), paramètres **requis** déduits de
 la signature (source unique : un paramètre ajouté devient acceptable — et
 requis s'il est sans défaut). `_meta` (protocole) est la seule clé
-tolérée. Preuve : `heimdall/mcp/server.py:106` + `ArgumentGateTests` +
+tolérée. Preuve : `heimdall/mcp/server.py` (`_ToolBoundary`) + `ArgumentGateTests` +
 tests unitaires de la frontière.
 
 ### 4. Échecs en enveloppe close, jamais en exception, jamais libres
@@ -80,7 +80,7 @@ module `heimdall/mcp/errors.py` (messages statiques ASCII,
 `build_server` résout la racine une fois ; les outils sont des closures
 dessus. Aucun outil ne prend de paramètre `root` (vérifié par test) : le
 piège du #27 (« laisser le LLM fournir la racine ») est impossible par
-construction, pas par vigilance. Preuve : `heimdall/mcp/server.py:482`.
+construction, pas par vigilance. Preuve : `heimdall/mcp/server.py` (`_tools`, closures sur la racine).
 
 ### 6. Git : argv figé, environnement reconstruit, config locale neutralisée
 
@@ -88,15 +88,6 @@ construction, pas par vigilance. Preuve : `heimdall/mcp/server.py:482`.
 --no-textconv`, sans `shell=True`, binaire résolu hors PATH hérité
 (`shutil.which("git", path=os.defpath)` : un PATH compromis ne détourne
 pas l'exécutable ; absent du défaut système = panne, jamais de repli),
-délai 30 s. L'environnement est **reconstruit** (`PATH` vide, `HOME` =
-racine, `GIT_CONFIG_*` neutralisées) : `GIT_DIR`/`GIT_INDEX_FILE` hérités
-ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
---no-textconv` rendent inopérants `diff.external` et les filtres `textconv`
-(exécution de commande pilotée par le contenu scanné, interdit I5).
-Prouvé par des tests hostiles (`GIT_DIR` piégé, `diff.external` piégé.
-
-`git -C <racine> diff --cached --unified=0 --no-color --no-ext-diff
---no-textconv`, sans `shell=True`, binaire résolu par `shutil.which`,
 délai 30 s. L'environnement est **reconstruit** (`PATH` vide, `HOME` =
 racine, `GIT_CONFIG_*` neutralisées) : `GIT_DIR`/`GIT_INDEX_FILE` hérités
 ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
@@ -113,9 +104,15 @@ avec hook planté : canari écrit). Chaque appel est donc préfixé de
 désactive vraiment (vérifié avec un binaire `false` piégé dans le PATH :
 jamais exécuté). Le pager hostile est prouvé inopérant (sorties toujours
 pipées) : aucun override pager, aucune surface ajoutée.
+
+Le flux du diff indexé est lu en streaming borné (`proc.stdout.read(max_bytes + 1)`
+puis arrêt immédiat par kill si le plafond est dépassé) : aucun buffering
+intégral préalable en mémoire, immunisant contre les OOM sur dépôts piégés par
+des blobs géants stagés.
 La commande est entièrement construite par le programme : suppressions
-`noqa`/`nosec` justifiées en place. Preuve : `heimdall/mcp/gitdiff.py:38`,
-`:53`, `:94`.
+`noqa`/`nosec` justifiées en place. Preuve : `heimdall/mcp/gitdiff.py`
+(`DIFF_ARGUMENTS`, `GIT_CONFIG_OVERRIDES`, `confined_environment`,
+`GitAccess.execute`, `GitAccess.staged_diff`).
 
 ### 7. Masquage conservateur avant `json.dumps`, règles nues incluses
 
@@ -147,11 +144,14 @@ jamais une promesse : une coupe à 2000 caractères (ligne) ou 100 000
 sinon l'invariant structurel du schéma — faille réelle trouvée par audit
 et corrigée, avec tests. Le budget `max_bytes` est vérifié sur la réponse
 sérialisée (fichiers retirés en dernier, `truncated: true`). Preuve :
-`heimdall/mcp/server.py:441` (`_masked_files`), `:408` (`_fit_budget`),
+`heimdall/mcp/server.py` (`_masked_files`, `_fit_budget`),
 `tests/test_mcp_hardening.py::TruncationInvariantTests`.
 
 ### 8 bis. Coupe sur lignes complètes, FIFO refusés, binaires innommables
 
+- `staged_diff` lit la sortie de `git diff` en streaming borné (`proc.stdout.read(max_bytes + 1)`
+  puis interruption immédiate par `kill` si le budget est dépassé) au lieu de bufferiser
+  l'intégralité du diff : immunité DoS mémoire / OOM face à des dépôts piégés par des blobs géants stagés.
 - `staged_diff` coupe `raw[:max_bytes]` sur le dernier `\n` complet : une
   ligne tronquée à cheval (guillemet fermant manquant, `max_bytes` choisi
   par le LLM + remplissage attaquant) fuyait son préfixe en clair. La
@@ -180,7 +180,7 @@ est réduite à deux appels système, mais un attaquant avec écriture sur le
 dépôt entre les deux reste hors de portée. `check-ignore` répond dès
 qu'une règle couvre le chemin, même suivi : lecture stricte et prudente
 du contrat 4.2 (un suivi-mais-ignoré est refusé). Preuve :
-`heimdall/mcp/paths.py:114`, `heimdall/mcp/server.py:343`.
+`heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`, `is_forbidden_path`).
 
 ### 10. Noms git décodés en octets, irreprésentable = panne
 
@@ -192,8 +192,8 @@ files … and …` traite `/dev/null` en priorité (nom avec `and` dedans
 correct). Un nom non représentable dans le contrat (contrôle, `..`,
 UTF-8 invalide) est une **panne** (`INTERNAL`), pas un fichier sauté en
 silence : mieux vaut refuser que cacher des lignes au LLM (fail-closed
-délibéré, épinglé par test). Preuve : `heimdall/mcp/gitdiff.py:196`,
-`:219`, `:360`.
+délibéré, épinglé par test). Preuve : `heimdall/mcp/gitdiff.py`
+(`parse_diff`, `DiffEntry`, `staged_diff`).
 
 ### 11. `.git`/`.env` insensibles à la casse, binaires et tailles
 

@@ -200,8 +200,8 @@ class _ToolBoundary:
         """`_meta` tolérée sous 1 Kio, jamais propagée sans regard."""
         try:
             size = len(json.dumps(meta, ensure_ascii=True).encode("utf-8"))
-        except (ValueError, RecursionError, MemoryError):
-            # Imbrication hostile (~10⁵ niveaux) ou volume inallouable :
+        except (ValueError, TypeError, RecursionError, MemoryError):
+            # Imbrication hostile (~10⁵ niveaux), type non sérialisable ou volume inallouable :
             # refusé, jamais remonté hors enveloppe (fail-closed).
             return False
         return size <= _META_MAX_BYTES
@@ -250,9 +250,10 @@ def tool_handler(fn: _F) -> _F:
     fail-closed du contrat : jamais de résultat partiel silencieux, jamais
     de trace ni de valeur reflétée.
 
-    Seules les exceptions **inattendues** sont journalisées avec leur trace :
-    un refus de chemin est un fonctionnement normal, pas une panne, et
-    l'inonderait la sortie d'erreur du sous-processus.
+    Seules les exceptions inattendues sont journalisées avec un message
+    statique : un refus de chemin est un fonctionnement normal, pas une
+    panne. Jamais de ``str(exc)`` ni de trace brute dans les logs (invariant 8 :
+    un message d'exception pourrait embarquer un chemin absolu ou un secret).
     """
 
     @functools.wraps(fn)
@@ -264,7 +265,7 @@ def tool_handler(fn: _F) -> _F:
         except paths.PathEscape:
             return errors.failure("PATH_ESCAPE")
         except Exception:
-            logger.exception("échec inattendu d'un outil MCP")
+            logger.error("échec inattendu d'un outil MCP")
             return errors.failure("INTERNAL")
 
     return cast("_F", wrapper)

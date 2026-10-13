@@ -77,9 +77,13 @@ class GitRepoTestCase(unittest.TestCase):
     def stage(self, *relative: str) -> None:
         _git(self.repo, "add", "--", *relative)
 
-    def call_read_diff(self, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    def call_read_diff(
+        self, arguments: dict[str, Any] | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
         """Appelle l'outil sur ce dépôt et renvoie sa charge utile décodée."""
-        return tool_payload(call_tool("read_diff", arguments or {}, root=self.repo))
+        params = dict(arguments or {})
+        params.update(kwargs)
+        return tool_payload(call_tool("read_diff", params, root=self.repo))
 
 
 class ReadDiffToolTests(GitRepoTestCase):
@@ -383,3 +387,15 @@ class GitEnvironmentTests(GitRepoTestCase):
         payload = self.call_read_diff()
         self.assertFalse(canary.exists(), "le pager a été exécuté !")
         self.assertEqual([item["file"] for item in payload["files"]], ["app.py"])
+
+    def test_giant_staged_diff_bounded_and_no_oom(self) -> None:
+        """Diff géant (~50 Mo) lu avec max_bytes borné : flux en streaming, pas d'OOM."""
+        chunk = "a" * 1024 + "\n"
+        blob_path = self.repo / "giant.txt"
+        with blob_path.open("w", encoding="utf-8") as f:
+            for _ in range(50 * 1024):
+                f.write(chunk)
+        self.stage("giant.txt")
+        payload = self.call_read_diff(max_bytes=1024)
+        self.assertTrue(payload["truncated"])
+        self.assertLessEqual(len(json.dumps(payload)), 100_000)

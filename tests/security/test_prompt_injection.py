@@ -138,6 +138,9 @@ _OS_ALLOWED_ATTRS = frozenset(
         "O_RDONLY",
         "O_CLOEXEC",
         "O_BINARY",
+        "O_NONBLOCK",
+        "defpath",
+        "devnull",
     }
 )
 _PATHLIB_ALLOWED_NAMES = frozenset({"Path", "PurePath", "PurePosixPath", "PureWindowsPath"})
@@ -176,20 +179,20 @@ def _fixed_argv_violations(path: Path) -> list[str]:
 
 
 def _os_usage_violations(path: Path) -> list[str]:
-    """Usages os/pathlib hors allowlist de garde de chemin (vide = OK)."""
+    """Usages os/pathlib hors allowlist de garde de chemin, ou détournements getattr/__import__."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
-                if top in ("os", "pathlib"):
+                if top in ("os", "pathlib", "subprocess"):
                     aliases[alias.asname or alias.name] = top
         elif (
             isinstance(node, ast.ImportFrom)
             and node.level == 0
             and node.module
-            and node.module.split(".")[0] in ("os", "pathlib")
+            and node.module.split(".")[0] in ("os", "pathlib", "subprocess")
         ):
             for alias in node.names:
                 aliases[alias.asname or alias.name] = node.module
@@ -201,6 +204,24 @@ def _os_usage_violations(path: Path) -> list[str]:
                 found.append(f"os.{node.attr}")
             elif canonical == "pathlib" and node.attr not in _PATHLIB_ALLOWED_NAMES:
                 found.append(f"pathlib.{node.attr}")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+                found.append("__import__")
+            elif isinstance(node.func, ast.Name) and node.func.id == "getattr":
+                if node.args and isinstance(node.args[0], ast.Name):
+                    target = aliases.get(node.args[0].id, node.args[0].id)
+                    if target in ("os", "os.path"):
+                        if (
+                            len(node.args) >= 2
+                            and isinstance(node.args[1], ast.Constant)
+                            and isinstance(node.args[1].value, str)
+                            and node.args[1].value in _OS_ALLOWED_ATTRS
+                        ):
+                            pass
+                        else:
+                            found.append("getattr(os, ...)")
+                    elif target == "subprocess":
+                        found.append("getattr(subprocess, ...)")
     return found
 
 
@@ -318,8 +339,30 @@ def test_no_llm_in_ci() -> None:
     # (mandat #74, contrat 4.1) — controle par _fixed_argv_violations.
     for path in (CLI_MAIN, MCP_SERVER):
         assert _network_or_exec_violations(path) == [], path.name
+    for path in (CLI_MAIN, MCP_SERVER, MCP_GITDIFF):
         assert _os_usage_violations(path) == [], path.name
     assert _fixed_argv_violations(MCP_GITDIFF) == []
     req = REQUIREMENTS.read_text(encoding="utf-8")
     assert "REQ-SEC-02" in req
     assert "scan --ci" in req
+
+
+def test_ast_guard_detects_getattr_and_import_escapes(tmp_path: Path) -> None:
+    """Garde AST : getattr(os, 'system') ou dynamique est détecté et refusé."""
+    witness = tmp_path / "witness.py"
+    witness.write_text('import os\ngetattr(os, "system")("id")\n', encoding="utf-8")
+    assert _os_usage_violations(witness) == ["getattr(os, ...)"]
+
+    witness_dyn = tmp_path / "witness_dyn.py"
+    witness_dyn.write_text('import os\ngetattr(os, "sy" + "stem")("id")\n', encoding="utf-8")
+    assert _os_usage_violations(witness_dyn) == ["getattr(os, ...)"]
+
+    witness_subp = tmp_path / "witness_subp.py"
+    witness_subp.write_text(
+        'import subprocess\ngetattr(subprocess, "call")(["ls"])\n', encoding="utf-8"
+    )
+    assert _os_usage_violations(witness_subp) == ["getattr(subprocess, ...)"]
+
+    witness_imp = tmp_path / "witness_imp.py"
+    witness_imp.write_text('mod = __import__("os")\n', encoding="utf-8")
+    assert _os_usage_violations(witness_imp) == ["__import__"]
