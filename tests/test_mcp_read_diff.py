@@ -418,3 +418,14 @@ class GitEnvironmentTests(GitRepoTestCase):
         )
         self.assertNotIn("error", sanitize_payload)
         self.assertEqual(sanitize_payload["path"], "neuf.py")
+
+    def test_subfolder_server_root_does_not_expose_parent_diff(self) -> None:
+        """Serveur lancé sur sous-dossier : GIT_CEILING_DIRECTORIES et is_repository refusent."""
+        self.write("top.txt", "top secret\n")
+        self.stage("top.txt")
+        sub = self.repo / "sub"
+        sub.mkdir()
+        res = call_tool("read_diff", {}, root=sub)
+        self.assertTrue(res.is_error)
+        payload = tool_payload(res)
+        self.assertEqual(payload["error"]["code"], "NOT_A_GIT_REPO")

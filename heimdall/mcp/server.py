@@ -279,6 +279,14 @@ def tool_handler(fn: _F) -> _F:
 # ---------------------------------------------------------------------------
 
 
+def _clean_trailing_marker(text: str) -> str:
+    """Évite qu'une coupe à MAX_LINE_CHARS ne laisse un marqueur incomplet sans '>' fermant."""
+    last_marker = text.rfind(masking.REDACTION_MARKER)
+    if last_marker != -1 and ">" not in text[last_marker:]:
+        return text[:last_marker]
+    return text
+
+
 def _tools(root: Path) -> dict[str, Callable[..., str]]:
     """Construit les outils, chacun fermé sur la racine résolue.
 
@@ -345,10 +353,15 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
             raise errors.ToolFailure("FORBIDDEN_PATH")
         content, total_lines, truncated = _read_extract(confined.absolute, start_line, max_lines)
         pieces: list[str] = []
-        for line in content:
-            masked, _ = masking.mask_text(line)
+        for raw_line in content:
+            if len(raw_line) > gitdiff.MAX_LINE_CHARS + 500:
+                line_to_mask = raw_line[: gitdiff.MAX_LINE_CHARS + 500]
+                truncated = True
+            else:
+                line_to_mask = raw_line
+            masked, _ = masking.mask_text(line_to_mask)
             if len(masked) > gitdiff.MAX_LINE_CHARS:
-                masked = masked[: gitdiff.MAX_LINE_CHARS]
+                masked = _clean_trailing_marker(masked[: gitdiff.MAX_LINE_CHARS])
                 truncated = True
             pieces.append(masked)
         # Borne de contenu du contrat (100 000 caractères) : elle s'applique
@@ -447,7 +460,7 @@ def _read_extract(absolute: Path, start_line: int, max_lines: int) -> tuple[list
         data = _read_bounded(handle)
         if len(data) > MAX_FILE_BYTES:
             raise errors.ToolFailure("TOO_LARGE")
-        if b"\x00" in data[:_BINARY_SNIFF_BYTES]:
+        if b"\x00" in data:
             raise errors.ToolFailure("BINARY_FILE")
     finally:
         os.close(handle)
@@ -503,10 +516,15 @@ def _masked_files(entries: list[gitdiff.DiffEntry]) -> tuple[list[dict[str, obje
     for entry in entries:
         added: list[dict[str, object]] = []
         finals: list[str] = []
-        for number, text in entry.lines:
-            masked, _ = masking.mask_text(text)
+        for number, raw_text in entry.lines:
+            if len(raw_text) > gitdiff.MAX_LINE_CHARS + 500:
+                text_to_mask = raw_text[: gitdiff.MAX_LINE_CHARS + 500]
+                truncated = True
+            else:
+                text_to_mask = raw_text
+            masked, _ = masking.mask_text(text_to_mask)
             if len(masked) > gitdiff.MAX_LINE_CHARS:
-                masked = masked[: gitdiff.MAX_LINE_CHARS]
+                masked = _clean_trailing_marker(masked[: gitdiff.MAX_LINE_CHARS])
                 truncated = True
             added.append({"line": number, "text": masked})
             finals.append(masked)

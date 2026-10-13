@@ -254,6 +254,12 @@ class SanitizeFileToolTests(FileRepoTestCase):
         self.assertIn("<REDACTED:", payload["content"])
         self.assertNotIn(FAKE_GITHUB_TOKEN, payload["content"])
 
+    def test_nul_byte_beyond_8k_is_detected_as_binary(self) -> None:
+        """Octet NUL au-delà de 8 Ko (offset 9000) : détecté comme BINARY_FILE."""
+        self.write_bytes("nul_late.bin", b"a" * 9000 + b"\x00" + b"b" * 100)
+        payload = self.read({"path": "nul_late.bin"})
+        self.assertEqual(payload["error"]["code"], "BINARY_FILE")
+
     def test_response_conforms_to_the_contract(self) -> None:
         """Critère d'acceptation du #27 : réponse conforme au schéma."""
         payload = self.read({"path": "app.py"})

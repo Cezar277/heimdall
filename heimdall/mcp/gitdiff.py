@@ -81,6 +81,7 @@ def confined_environment(root: Path) -> dict[str, str]:
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",  # aucun verrou optionnel pris dans .git/
+        "GIT_CEILING_DIRECTORIES": str(root.resolve().parent),
     }
 
 
@@ -152,14 +153,17 @@ class GitAccess:
             raise ToolFailure("INTERNAL") from None
 
     def is_repository(self) -> bool:
-        """True si la racine est un dépôt Git avec arbre de travail.
+        """True si la racine est un dépôt Git avec arbre de travail à cette racine exacte.
 
-        Un code de retour non nul (« not a git repository ») n'est PAS une
-        panne : c'est le diagnostic attendu, traduit en ``NOT_A_GIT_REPO``
-        par l'appelant.
+        Un code de retour non nul (« not a git repository ») ou une racine
+        qui pointe vers un dépôt parent n'est PAS une panne : c'est le diagnostic
+        attendu, traduit en ``NOT_A_GIT_REPO`` par l'appelant.
         """
-        completed = self.execute(("rev-parse", "--is-inside-work-tree"))
-        return completed.returncode == 0 and completed.stdout.strip() == b"true"
+        completed = self.execute(("rev-parse", "--show-toplevel"))
+        if completed.returncode != 0:
+            return False
+        top = completed.stdout.strip().decode("utf-8", errors="replace")
+        return Path(top).resolve() == self._root.resolve()
 
     def is_ignored(self, relative_path: str) -> bool:
         """True si le chemin est ignoré par les .gitignore du dépôt.

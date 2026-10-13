@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from support.fake_secrets import fake_token
+from support.fake_secrets import FAKE_GITHUB_TOKEN, fake_token
 from support.git_repo import GitRepo
 
 from heimdall.mcp import __main__ as entry
@@ -459,6 +459,11 @@ class MaskingRulesTests(unittest.TestCase):
     def test_empty_string_has_zero_entropy(self) -> None:
         self.assertEqual(masking.shannon_entropy(""), 0.0)
 
+    def test_bare_dense_token_low_entropy_is_not_masked(self) -> None:
+        masked, count = masking.mask_text(" " + "0" * 40 + " ")
+        self.assertEqual(count, 0)
+        self.assertNotIn("<REDACTED:", masked)
+
     def test_secret_type_matrix(self) -> None:
         cases = (
             (None, "ghp_abc", "github"),
@@ -618,6 +623,15 @@ class DirectToolErrorTests(unittest.TestCase):
         payload = json.loads(self.tools["sanitize_file"](path="long_line.txt"))
         self.assertTrue(payload["truncated"])
         self.assertEqual(len(payload["content"]), gitdiff.MAX_LINE_CHARS)
+
+    def test_redaction_marker_straddling_2000_char_boundary_is_cleaned(self) -> None:
+        """Secret chevauchant la borne 2000 car : aucun fragment sans '>' fermant."""
+        line = "x" * 1980 + f"'{FAKE_GITHUB_TOKEN}'\n"
+        self.repo.write("straddle.py", line)
+        payload = json.loads(self.tools["sanitize_file"](path="straddle.py"))
+        content = payload["content"]
+        self.assertNotIn("<REDACTED:", content)
+        self.assertEqual(payload["redactions"], 0)
 
     def test_sanitize_too_large_precheck(self) -> None:
         big = self.repo.root / "gros.bin"
