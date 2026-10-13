@@ -23,6 +23,7 @@ Trois règles structurantes, reprises à chaque outil :
 
 import functools
 import inspect
+import json
 import logging
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -31,7 +32,7 @@ from typing import Any, Final, TypeVar, cast
 from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import MCPServer
 
-from heimdall.mcp import errors
+from heimdall.mcp import errors, gitdiff, masking
 from heimdall.mcp.errors import ToolFailure
 
 # Nom du serveur annoncé au client (tools/list → serverInfo).
@@ -50,7 +51,13 @@ MCP_TOOLS: Final[tuple[str, ...]] = (
 # (#73, puis #74, puis #75). ``ping`` est la sonde de vie du ticket #73 :
 # elle ne renvoie aucune donnée du dépôt (juste ``pong``) et sera intégrée
 # au contrat ou retirée par une PR dédiée — écart documenté dans docs/mcp-server.md.
-SERVER_TOOLS: Final[tuple[str, ...]] = ("ping",)
+SERVER_TOOLS: Final[tuple[str, ...]] = ("ping", "read_diff")
+
+# Budget de réponse par défaut de read_diff et bornes du contrat
+# (ReadDiffInput.max_bytes : 1024..65536, défaut 32768).
+DEFAULT_MAX_BYTES: Final[int] = 32768
+MIN_MAX_BYTES: Final[int] = 1024
+MAX_MAX_BYTES: Final[int] = 65536
 
 logger = logging.getLogger(__name__)
 
@@ -79,19 +86,31 @@ def _expected_types(fn: Callable[..., str]) -> dict[str, type]:
     return declared
 
 
-class _StrictArgumentGate:
-    """Refuse les entrées hors du contrat AVANT l'exécution de l'outil.
+class _ToolBoundary:
+    """Frontière des appels d'outils : entrée refusée, échec signalé.
 
-    Deux motifs, tous deux issus du contrat #16 :
+    Deux moitiés, toutes deux issues du contrat #16 :
 
-    - invariant 11 (``additionalProperties: false``) : une clé inconnue
-      est refusée au lieu d'être ignorée, donc aucune consigne ne peut
-      être glissée dans un champ « bonus » ;
-    - invariant 8 (aucune entrée reflétée) : le SDK, lui, répond par une
-      exception pydantic qui recopie la valeur reçue
-      (``input_value=…``) dans le texte renvoyé au LLM. La garde valide
-      donc les types elle-même et renvoie notre enveloppe statique, de
-      sorte que la validation du SDK n'ait jamais lieu.
+    **Avant l'exécution** — refuser ce que le contrat interdit :
+
+    - invariant 11 (``additionalProperties: false``) : une clé inconnue est
+      refusée au lieu d'être ignorée, donc aucune consigne ne peut être
+      glissée dans un champ « bonus ». Le SDK 2.3.0, lui, écarte en silence
+      les clés qu'aucun paramètre ne déclare et se contente de les
+      journaliser ;
+    - invariant 8 (aucune entrée reflétée) : sur un type invalide, le SDK
+      répond par une exception pydantic qui recopie la valeur reçue
+      (``input_value=…``) dans le texte renvoyé au LLM. La frontière valide
+      donc les types elle-même et renvoie notre enveloppe statique, de sorte
+      que la validation du SDK n'ait jamais lieu.
+
+    **Après l'exécution** — marquer ``isError`` :
+
+    une réponse portant une enveloppe d'échec ``{"error": {…}}`` est marquée
+    ``isError: true``, quel que soit l'outil. Les deux formes du contrat
+    étant exclusives (3.1), un succès ne peut jamais être pris pour un
+    échec. Centralisé ici, le marquage ne peut pas être oublié par un outil
+    de plus.
     """
 
     def __init__(self, tools: Mapping[str, Callable[..., str]]) -> None:
@@ -119,17 +138,41 @@ class _StrictArgumentGate:
             if key == "_meta":
                 continue  # métadonnée de protocole MCP, pas un champ d'outil.
             wanted = self._expected[name].get(key)
-            # Type exact : un booléan n'est pas un entier (isinstance(True, int)
+            # Type exact : un booléen n'est pas un entier (isinstance(True, int)
             # est vrai en Python), une sous-classe serait une valeur forgée.
             if wanted is None or type(value) is not wanted:
                 logger.info("outil %s : argument hors contrat refusé", name)
                 return _error_result(errors.failure("INVALID_INPUT"))
-        return await call_next(ctx)
+        return _mark_failure(await call_next(ctx))
 
 
 def _error_result(payload: str) -> dict[str, Any]:
     """Résultat MCP d'échec : notre enveloppe JSON, marquée ``isError``."""
     return {"content": [{"type": "text", "text": payload}], "isError": True}
+
+
+def _mark_failure(result: Any) -> Any:
+    """Pose ``isError`` sur les résultats portant une enveloppe d'échec."""
+    if not isinstance(result, dict):
+        return result
+    content = result.get("content")
+    if not isinstance(content, list) or not content:
+        return result
+    block = content[0]
+    if not isinstance(block, dict) or block.get("type") != "text":
+        return result
+    text = block.get("text")
+    if not isinstance(text, str):
+        return result
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return result
+    # Exclusivité des deux formes du contrat (3.1) : « exactement la clé
+    # error » ne peut être qu'un échec, jamais un succès.
+    if isinstance(payload, dict) and set(payload) == {"error"}:
+        result["isError"] = True
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +225,85 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
         """
         return errors.dumps({"pong": True})
 
-    return {"ping": ping}
+    @tool_handler
+    def read_diff(max_bytes: int = DEFAULT_MAX_BYTES) -> str:
+        """Lignes ajoutées du diff indexé, valeurs masquées (contrat 4.1).
+
+        Aucun paramètre de chemin ni de racine : le LLM voit ce qui va être
+        commité, il ne choisit pas le périmètre. La commande git est figée,
+        sans ``shell=True`` et avec ``--no-ext-diff --no-textconv`` pour que
+        la configuration du dépôt ne puisse pas déclencher une commande.
+        """
+        if not MIN_MAX_BYTES <= max_bytes <= MAX_MAX_BYTES:
+            raise errors.ToolFailure("INVALID_INPUT")
+        access = gitdiff.GitAccess(root)
+        if not access.is_repository():
+            raise errors.ToolFailure("NOT_A_GIT_REPO")
+        raw, truncated = access.staged_diff(max_bytes)
+        entries, parse_truncated = gitdiff.parse_diff(raw.decode("utf-8", errors="replace"))
+        files, mask_truncated = _masked_files(entries)
+        if _fit_budget(files, max_bytes):
+            truncated = True
+        return errors.dumps(
+            {"files": files, "truncated": truncated or parse_truncated or mask_truncated}
+        )
+
+    return {"ping": ping, "read_diff": read_diff}
+
+
+def _masked_files(entries: list[gitdiff.DiffEntry]) -> tuple[list[dict[str, object]], bool]:
+    """Construit les ``DiffFile`` du contrat, masquage puis bornes.
+
+    Ordre volontaire : on masque **avant** de tronquer une ligne à 2000
+    caractères. Tronquer d'abord couperait une valeur en deux et le masquage
+    ne la reconnaîtrait plus ; masquer d'abord la raccourcit, donc la borne
+    reste respectée.
+    """
+    files: list[dict[str, object]] = []
+    truncated = False
+    for entry in entries:
+        redactions = 0
+        added: list[dict[str, object]] = []
+        for number, text in entry.lines:
+            masked, count = masking.mask_text(text)
+            if len(masked) > gitdiff.MAX_LINE_CHARS:
+                masked = masked[: gitdiff.MAX_LINE_CHARS]
+                truncated = True
+            redactions += count
+            added.append({"line": number, "text": masked})
+        if entry.line_overflow:
+            truncated = True
+        files.append(
+            {
+                "file": entry.path,
+                "binary": entry.binary,
+                "redactions": redactions,
+                "added_lines": added,
+            }
+        )
+    return files, truncated
+
+
+def _fit_budget(files: list[dict[str, object]], max_bytes: int) -> bool:
+    """Garantit que la réponse tient dans le budget ``max_bytes``.
+
+    Le coût du JSON n'est pas négligeable (clés, marqueurs de masquage) : on
+    retire des fichiers entiers, les derniers d'abord, jusqu'à ce que la
+    réponse sérialisée tienne. La boucle s'arrête toujours : une réponse
+    vide est minuscule, donc elle passe sous n'importe quel budget. Un
+    fichier retiré est signalé par ``truncated: true`` — la réponse dit
+    « information incomplète », jamais « diff vide ».
+    """
+    truncated = False
+    while files and _encoded_size(files) > max_bytes:
+        files.pop()
+        truncated = True
+    return truncated
+
+
+def _encoded_size(files: list[dict[str, object]]) -> int:
+    """Taille de la réponse sérialisée, en octets UTF-8."""
+    return len(errors.dumps({"files": files, "truncated": True}).encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +329,7 @@ def build_server(root: str) -> MCPServer:
     """Construit le serveur MCP confiné à ``root`` sans le démarrer."""
     repo_root = _resolve_root(root)
     tools = _tools(repo_root)
-    server = MCPServer(name=SERVER_NAME, middleware=[_StrictArgumentGate(tools)])
+    server = MCPServer(name=SERVER_NAME, middleware=[_ToolBoundary(tools)])
     for name, tool in tools.items():
         # structured_output=False : un seul canal de sortie (le texte JSON),
         # pour que la réponse vue par le LLM soit exactement celle que le

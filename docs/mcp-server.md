@@ -42,8 +42,8 @@ et ne fait aucun appel réseau.
 
 Les deux derniers outils du contrat #16 ne sont **pas** encore exposés : ce
 livrable couvre `ping`, `read_diff` et `sanitize_file`. Le registre est fermé
-(registre des outils du serveur, `SERVER_TOOLS` dans `heimdall/mcp/server.py`) :
-un nom hors liste est refusé par le SDK.
+(`SERVER_TOOLS` dans `heimdall/mcp/server.py`) : un nom hors liste est refusé par
+le SDK, et la garde d'entrée refuse tout argument hors contrat.
 
 **Écart assumé au contrat : `ping`.** `ping` n'est pas l'un des 4 outils du
 contrat #16. Il est la sonde de vie demandée par le #73 : il ne renvoie aucune
@@ -51,10 +51,30 @@ donnée du dépôt (juste `{"pong": true}`), donc il n'élargit pas la surface d
 fuite. Son intégration au contrat (ou son retrait) se fait par PR dédiée, avec
 relecture — pas en passant, conformément aux règles de gel du contrat.
 
+## 2 bis. Ce que `read_diff` garantit
+
+L'outil est la seule fenêtre du LLM sur le commit en cours
+(`heimdall/mcp/gitdiff.py`).
+
+| Garantie | Comment | Preuve |
+|---|---|---|
+| commande git figée, `shell=True` proscrit | argv constant, binaire résolu par `shutil.which` | `tests/test_mcp_read_diff.py` |
+| `diff.external` / `textconv` inopérants (interdit I5) | `--no-ext-diff --no-textconv` imposés | `GitEnvironmentTests` |
+| l'environnement hérité ne redirige pas le dépôt | `GIT_DIR`, `GIT_INDEX_FILE`, `HOME`, `PATH` reconstruits à zéro | `GitEnvironmentTests` |
+| aucune valeur en clair renvoyée | masquage `<REDACTED:type:len=N>` **avant** `json.dumps` | `test_secret_values_are_masked_before_serialization` |
+| réponse bornée par `max_bytes` | budget vérifié **après** sérialisation, fichiers retirés en dernier | `test_response_never_exceeds_max_bytes` |
+| limite atteinte = information incomplète | `truncated: true`, jamais « diff vide » | tests de troncature |
+| réponse conforme au contrat #16 | validée contre `ReadDiffResult` (oneOf succès / échec) | `ReadDiffConformanceTests` |
+
+Masquage (`heimdall/mcp/masking.py`) : volontairement conservateur — en cas de
+doute on masque. Le LLM juge sur la forme (type, longueur, contexte), pas sur
+la valeur. Ces règles seront remplacées par celles du scanner déterministe
+(#22) sans changer l'interface `mask_text`.
+
 ## 3. Vérifier le canal avec un client MCP
 
 Voie vérifiée : petit client Python, hors ligne, aucune dépendance réseau
-(utilisé par `tests/test_mcp_server.py` et `tests/test_mcp_client.py`).
+(utilisé par `tests/support/mcp_client.py`, partagé par tous les tests du serveur).
 
 ```python
 import asyncio, sys
