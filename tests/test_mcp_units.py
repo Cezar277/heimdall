@@ -652,6 +652,36 @@ class MaskingRulesTests(unittest.TestCase):
                 token = prefix + "X" * 40
                 self.assertNotEqual(masking._secret_type(None, token), "generic_secret")
 
+    def test_bare_and_typing_vocabularies_cannot_diverge(self) -> None:
+        """Un préfixe masqué est forcément un préfixe connu (par construction).
+
+        `_KNOWN_PREFIXES` est dérivé de `_BARE_PREFIXES` : l'oubli de
+        `pk_test_` (jeton masqué mais typé `generic_secret`, donc tri LLM
+        dégradé) ne peut plus se reproduire. Le test verrouille le lien, au
+        cas où quelqu'un remplacerait un jour la dérivation par une liste.
+        """
+        normalised = {prefix.lower().replace("\\", "") for prefix in masking._BARE_PREFIXES}
+        self.assertEqual(normalised, set(masking._KNOWN_PREFIXES))
+
+    def test_stripe_test_key_prefixes_are_typed_as_stripe(self) -> None:
+        """`pk_test_` / `rk_test_` : masqués ET typés `stripe`.
+
+        Régression de revue : ces préfixes n'étaient que dans le vocabulaire
+        de masquage, donc un jeton Stripe en mode test partait en
+        `<REDACTED:generic_secret>` — pas de fuite, mais un tri dégradé que
+        le LLM ne peut pas rattraper.
+        """
+        for prefix in ("pk_test_", "rk_test_", "pk_live_", "rk_live_"):
+            token = fake_token(prefix, 40)
+            with self.subTest(prefix=prefix):
+                self.assertEqual(masking._secret_type(None, token), "stripe")
+                bare, count = masking.mask_text(token)
+                self.assertEqual(count, 1)
+                self.assertEqual(bare, f"<REDACTED:stripe:len={len(token)}>")
+                assigned, count = masking.mask_text(f'CLE = "{token}"')
+                self.assertEqual(count, 1)
+                self.assertEqual(assigned, f'CLE = "<REDACTED:stripe:len={len(token)}>"')
+
     def test_looks_like_secret_matrix(self) -> None:
         self.assertFalse(masking._looks_like_secret(None, ""))
         self.assertFalse(masking._looks_like_secret(None, "$MY_VAR"))

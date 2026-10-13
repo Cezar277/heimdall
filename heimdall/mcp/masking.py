@@ -86,6 +86,7 @@ _BARE_PREFIXES: Final[tuple[str, ...]] = (
     r"pk_live_",
     r"pk_test_",
     r"rk_live_",
+    r"rk_test_",
     r"ghp_",
     r"gho_",
     r"ghu_",
@@ -141,29 +142,19 @@ _SECRET_KEY: Final[re.Pattern[str]] = re.compile(
 )
 
 # Préfixes de jetons connus (liste courte, à compléter avec #22).
-_KNOWN_PREFIXES: Final[tuple[str, ...]] = (
-    "akia",
-    "asia",
-    "sk_live_",
-    "sk_test_",
-    "pk_live_",
-    "rk_live_",
-    "ghp_",
-    "gho_",
-    "ghu_",
-    "ghs_",
-    "ghr_",
-    "github_pat_",
-    "glpat-",
-    "xoxb-",
-    "xoxp-",
-    "xoxa-",
-    "shpat_",
-    "whsec_",
-    "npm_",
-    "dop_v1_",
-    "aiza",
-    "ya29.",
+#
+# **DÉRIVÉS** de `_BARE_PREFIXES` : le vocabulaire qui masque un jeton nu et
+# celui qui sait dire de quel fournisseur il s'agit ne peuvent plus diverger.
+# La liste était recopiée à la main, et `pk_test_` en manquait — le jeton
+# était bien masqué, mais typé `generic_secret` : pas de fuite, un tri
+# dégradé et un test d'invariant (`prefix_vocabulary_is_fully_mapped`) qui
+# passait parce qu'il ne parcourait que la liste de typage. Un préfixe
+# ajouté au masquage est donc maintenant connu partout, sans double saisie.
+# Normalisation : minuscules (le motif nu est `IGNORECASE`) et échappements
+# regex retirés (`ya29\.` → `ya29.`), comme le fait `_secret_type` qui
+# compare toujours `value.lower()`.
+_KNOWN_PREFIXES: Final[tuple[str, ...]] = tuple(
+    prefix.lower().replace("\\", "") for prefix in _BARE_PREFIXES
 )
 
 
@@ -199,7 +190,7 @@ def _secret_type(key: str | None, value: str) -> str:
             (("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"), "github"),
             (("glpat-",), "gitlab"),
             (("xoxb-", "xoxp-", "xoxa-"), "slack"),
-            (("sk_live_", "sk_test_", "pk_live_", "rk_live_"), "stripe"),
+            (("sk_live_", "sk_test_", "pk_live_", "pk_test_", "rk_live_", "rk_test_"), "stripe"),
             (("shpat_", "whsec_"), "webhook_secret"),
             (("npm_", "dop_v1_"), "package_token"),
             (("aiza", "ya29."), "google_api_key"),

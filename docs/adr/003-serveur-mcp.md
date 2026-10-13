@@ -152,7 +152,14 @@ citées, en-têtes `Authorization`, `user:pass@` d'URI, balises PEM **et**
 jetons nus (préfixe connu, ou ≥ 32 caractères denses à entropie ≥ 3,9 —
 `_BARE_KNOWN_TOKEN`, `_BARE_DENSE_TOKEN`). La fusion est par
 **spécificité** (le mot de passe d'une URI part seul, l'hôte reste lisible)
-puis par position. Les motifs sont linéaires (aucun quantificateur
+puis par position. **Vocabulaire unique** : `_KNOWN_PREFIXES` (typage et
+`_looks_like_secret`) est DÉRIVÉ de `_BARE_PREFIXES` (détection), donc un
+préfixe ajouté au masquage est automatiquement connu partout — la liste
+recopiée à la main avait laissé `pk_test_` masqué mais typé
+`generic_secret` (pas de fuite, tri LLM dégradé), et l'invariant
+`prefix_vocabulary_is_fully_mapped` ne le voyait pas puisqu'il ne parcourait
+que la liste de typage. `rk_test_` (clé restreinte Stripe en mode test)
+ajouté au même moment. Les motifs sont linéaires (aucun quantificateur
 imbriqué) : garde-fou temporel anti-ReDoS en test. Le jour où #22 arrive,
 ses règles remplacent `_looks_like_secret` sans changer `mask_text`.
 Limites honnêtes : un jeton **sans préfixe connu, noyé dans 100 Ko de
@@ -332,7 +339,7 @@ renseigner la feuille SAMM avec liens permanents au SHA :
 | entrées refusées, échecs en enveloppe | `heimdall/mcp/server.py` (`_ToolBoundary`, `tool_handler`), `heimdall/mcp/errors.py` |
 | git confiné, diff typé | `heimdall/mcp/gitdiff.py` (`DIFF_ARGUMENTS`, `confined_environment`, `parse_diff`) |
 | canal stdio jamais hérité par git, plafond de découverte | `heimdall/mcp/gitdiff.py` (`GitAccess.execute`, `GitAccess.staged_diff`, `confined_environment`), `tests/security/test_prompt_injection.py` (`_fixed_argv_violations`) |
-| masquage avant sérialisation, compteurs vrais | `heimdall/mcp/masking.py` (`mask_text`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`) |
+| masquage avant sérialisation, compteurs vrais | `heimdall/mcp/masking.py` (`mask_text`, `_KNOWN_PREFIXES`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`) |
 | garde unique, TOCTOU réduite, FIFO refusés | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |
 | coupe sur lignes complètes | `heimdall/mcp/gitdiff.py` (`staged_diff`) |
 | format de diff non compris → `truncated`, jamais du silence | `heimdall/mcp/gitdiff.py` (`_COMBINED_HUNK_HEADER`, `_DiffParser._hunk_header`) |
