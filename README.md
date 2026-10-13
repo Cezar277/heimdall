@@ -60,6 +60,7 @@ openapi.yaml         contrat Vault API v1 (#15)
 - [Serveur MCP stdio : lancement, outils, invariants (#27)](docs/mcp-server.md)
 - [ADR-001 : Finding et faux positifs](docs/adr/001-finding-et-etats.md)
 - [ADR-002 : Stack Python et structure du dépôt](docs/adr/002-stack-python.md)
+- [ADR-003 : Serveur MCP, décisions et limites (#27)](docs/adr/003-serveur-mcp.md)
 - [Modèle de menaces : DFD, actifs, STRIDE et risques prioritaires (T18)](docs/security/README.md)
 
 ## Vérifier

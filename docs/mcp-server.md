@@ -64,6 +64,8 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 | aucune valeur en clair renvoyée | masquage `<REDACTED:type:len=N>` **avant** `json.dumps` | `test_secret_values_are_masked_before_serialization` |
 | réponse bornée par `max_bytes` | budget vérifié **après** sérialisation, fichiers retirés en dernier | `test_response_never_exceeds_max_bytes` |
 | limite atteinte = information incomplète | `truncated: true`, jamais « diff vide » | tests de troncature |
+| compteur `redactions` toujours vrai | recompté sur les lignes finales : une coupe n'y laisse jamais un compteur sans marqueur | `TruncationInvariantTests` |
+| noms git décodés en octets puis UTF-8 | pas de mojibake (`café.py`), irreprésentable = `INTERNAL` (fail-closed) | `UnquoteTests` |
 | réponse conforme au contrat #16 | validée contre `ReadDiffResult` (oneOf succès / échec) | `ReadDiffConformanceTests` |
 
 Masquage (`heimdall/mcp/masking.py`) : volontairement conservateur — en cas de
@@ -84,6 +86,8 @@ Le chemin vient du LLM : il est traité comme une entrée piégée
 | binaire, > 1 Mo, absent, dossier | codes dédiés (`BINARY_FILE`, `TOO_LARGE`, `NOT_FOUND`) | idem |
 | ouverture sans suivre un lien | `O_NOFOLLOW` + comparaison dev/ino (TOCTOU) | `GuardWiringTests` |
 | extrait masqué avant sérialisation | `masking.mask_text`, puis borne 100 000 caractères | `test_no_clear_value_ever_reaches_the_llm` |
+| jetons nus et corps PEM masqués | préfixe connu ou ≥ 32 caractères denses, fusion par spécificité | `BareTokenMaskingTests` |
+| paramètre `path` manquant refusé | enveloppe `INVALID_INPUT`, pas « Field required » du SDK | `RequiredParametersTests` |
 | réponse conforme au contrat #16 | validée contre `SanitizeFileResult` | `test_response_conforms_to_the_contract` |
 
 **Choix fail-closed assumé** : un fichier **suivi** mais couvert par une règle
@@ -165,6 +169,8 @@ restent vérifiées.
 | aucune entrée reflétée au LLM | messages statiques d'`errors.py` | `test_refusal_message_is_static` |
 | stdout = protocole uniquement | aucun `print` dans `heimdall/mcp/` | `StdoutIsProtocolOnlyTests` |
 | registre fermé | `SERVER_TOOLS` + garde d'entrée | `test_ping_is_declared_to_the_client` |
+| décisions et limites (ADR) | SDK v2, `ping` hors contrat, TOCTOU, écarts | `docs/adr/003-serveur-mcp.md` |
+| 100 % instructions / branches mesuré | tests unitaires in-process déterministes (+ 96 e2e) | `tests/test_mcp_units.py` + `coverage report` |
 | session adverse conforme au contrat | vrai client stdio, réponses validées | `tests/test_mcp_client.py::EndToEndSessionTests` |
 | aucun port / INET / socket nommé | `/proc` + `ss`, paire anonyme asyncio seule autorisée | `NoNetworkTests` (+ contrôle négatif `http.server`) |
 | aucun import réseau dans le serveur | analyse AST de `heimdall/mcp/` | `NoTrafficTests` |
