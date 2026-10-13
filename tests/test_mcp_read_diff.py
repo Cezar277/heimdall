@@ -10,7 +10,9 @@ client MCP : c'est la réponse réellement sérialisée qui est vérifiée.
 """
 
 import json
+import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -278,3 +280,89 @@ class ReadDiffConformanceTests(GitRepoTestCase):
                 expected = bool(CONTRACT_REL_PATH.match(candidate))
                 expected = expected and 1 <= len(candidate) <= maximum
                 self.assertEqual(is_rel_path(candidate), expected, "dérive du contrat RelPath")
+
+
+class GitEnvironmentTests(GitRepoTestCase):
+    """Le sous-processus git ne doit rien hériter ni exécuter du dépôt.
+
+    Chaque test piège le dépôt (variable détournée, commande configurée,
+    hook) puis prouve par l'absence du canari que le serveur ne l'a pas
+    suivi — avec une réponse d'outil correcte par ailleurs.
+    """
+
+    def _plant_hook(self, name: str) -> Path:
+        """Script-canari : son exécution laisse un fichier témoin hors dépôt."""
+        canary = Path(self._tmp.name) / f"canary-{name}"
+        hook = self.repo / f"faux-{name}.sh"
+        hook.write_text(f'#!/bin/sh\necho "PWNED" >> {canary}\n', encoding="utf-8")
+        hook.chmod(stat.S_IRWXU)
+        return canary
+
+    def test_inherited_git_environment_cannot_redirect_the_repository(self) -> None:
+        """`GIT_DIR` / `GIT_INDEX_FILE` hérités ne redirigent pas l'analyse."""
+        self.write("app.py", "x = 1\n")
+        self.stage("app.py")
+        other = Path(self._tmp.name) / "piege-repo"
+        other.mkdir()
+        _git(other, "init", "-q")
+        _git(other, "config", "user.email", "test@example.invalid")
+        _git(other, "config", "user.name", "Heimdall Test")
+        (other / "piege.py").write_text("TOKEN = 'ghp_factice'\n", encoding="utf-8")
+        _git(other, "add", "-A")
+        _git(other, "commit", "-qm", "piege")
+        names = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+        previous = {name: os.environ.get(name) for name in names}
+        os.environ.update(
+            {
+                "GIT_DIR": str(other / ".git"),
+                "GIT_WORK_TREE": str(other),
+                "GIT_INDEX_FILE": str(other / ".git" / "index"),
+            }
+        )
+        try:
+            payload = self.call_read_diff()
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        self.assertEqual([item["file"] for item in payload["files"]], ["app.py"])
+        self.assertNotIn("piege.py", json.dumps(payload))
+
+    def test_no_command_from_the_repository_configuration_is_executed(self) -> None:
+        """``diff.external`` configuré dans le dépôt reste inopérant (I5)."""
+        self.write("app.py", "x = 1\n")
+        self.stage("app.py")
+        marker = "SENTINELLE_EXT_DIFF"
+        hook = self.repo / "faux-diff"
+        hook.write_text(f'#!/bin/sh\necho "{marker}"\ncat\n', encoding="utf-8")
+        hook.chmod(stat.S_IRWXU)
+        _git(self.repo, "config", "diff.external", str(hook))
+        payload = self.call_read_diff()
+        self.assertNotIn(marker, json.dumps(payload))
+        self.assertEqual([item["file"] for item in payload["files"]], ["app.py"])
+
+    def test_fsmonitor_hook_is_never_executed(self) -> None:
+        """`core.fsmonitor` piégé : chaque appel git porte
+        `-c core.fsmonitor=false` (désactivation réelle, pas un nom)."""
+        canary = self._plant_hook("fsmonitor")
+        _git(self.repo, "config", "core.fsmonitor", str(self.repo / "faux-fsmonitor.sh"))
+        self.write("app.py", "x = 1\n")
+        self.stage("app.py")
+        canary.unlink(missing_ok=True)  # le `git add` ci-dessus a déjà déclenché le hook :
+        payload = self.call_read_diff()  # seul l'appel outil compte désormais.
+        self.assertFalse(canary.exists(), "le hook fsmonitor a été exécuté !")
+        self.assertEqual([item["file"] for item in payload["files"]], ["app.py"])
+
+    def test_hostile_pager_is_never_executed(self) -> None:
+        """Pager piégé + sorties toujours pipées : jamais exécuté, donc
+        aucun override pager (pas de surface ajoutée)."""
+        canary = self._plant_hook("pager")
+        _git(self.repo, "config", "core.pager", str(self.repo / "faux-pager.sh"))
+        self.write("app.py", "x = 1\n")
+        self.stage("app.py")
+        canary.unlink(missing_ok=True)
+        payload = self.call_read_diff()
+        self.assertFalse(canary.exists(), "le pager a été exécuté !")
+        self.assertEqual([item["file"] for item in payload["files"]], ["app.py"])

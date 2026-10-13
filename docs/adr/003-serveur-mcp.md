@@ -59,7 +59,7 @@ requis s'il est sans défaut). `_meta` (protocole) est la seule clé
 tolérée. Preuve : `heimdall/mcp/server.py:106` + `ArgumentGateTests` +
 tests unitaires de la frontière.
 
-### 4. Échecs en enveloppe, jamais en exception
+### 4. Échecs en enveloppe close, jamais en exception, jamais libres
 
 `tool_handler` traduit `ToolFailure` (code du contrat), `PathEscape`
 (`PATH_ESCAPE`) et toute autre exception (`INTERNAL` statique) en
@@ -67,9 +67,13 @@ tests unitaires de la frontière.
 journalisées avec trace (sur stderr, jamais sur stdout) ; un refus de
 chemin est un fonctionnement normal. Les échecs sont marqués `isError` de
 façon centrale (`_mark_failure`) : les deux formes du contrat étant
-exclusives, un succès ne peut pas être pris pour un échec. Preuve :
-`heimdall/mcp/server.py:164`, `198`, module `heimdall/mcp/errors.py`
-(messages statiques ASCII, `allow_nan=False`, `ensure_ascii=True`).
+exclusives, un succès ne peut pas être pris pour un échec. Le message
+libre a été **supprimé** de `ToolFailure`/`failure()` : un futur `raise
+ToolFailure("INTERNAL", valeur)` refléterait un secret au LLM, donc l'API
+ne le permet plus. La `_meta` protocole est tolérée mais bornée à 1 Kio.
+Preuve : `heimdall/mcp/server.py` (`tool_handler`, `_ToolBoundary`),
+module `heimdall/mcp/errors.py` (messages statiques ASCII,
+`allow_nan=False`, `ensure_ascii=True`).
 
 ### 5. Racine fixée au démarrage, absente des signatures
 
@@ -78,7 +82,18 @@ dessus. Aucun outil ne prend de paramètre `root` (vérifié par test) : le
 piège du #27 (« laisser le LLM fournir la racine ») est impossible par
 construction, pas par vigilance. Preuve : `heimdall/mcp/server.py:482`.
 
-### 6. Git : argv figé, environnement reconstruit, options imposées
+### 6. Git : argv figé, environnement reconstruit, config locale neutralisée
+
+`git -C <racine> diff --cached --unified=0 --no-color --no-ext-diff
+--no-textconv`, sans `shell=True`, binaire résolu hors PATH hérité
+(`shutil.which("git", path=os.defpath)` : un PATH compromis ne détourne
+pas l'exécutable ; absent du défaut système = panne, jamais de repli),
+délai 30 s. L'environnement est **reconstruit** (`PATH` vide, `HOME` =
+racine, `GIT_CONFIG_*` neutralisées) : `GIT_DIR`/`GIT_INDEX_FILE` hérités
+ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
+--no-textconv` rendent inopérants `diff.external` et les filtres `textconv`
+(exécution de commande pilotée par le contenu scanné, interdit I5).
+Prouvé par des tests hostiles (`GIT_DIR` piégé, `diff.external` piégé.
 
 `git -C <racine> diff --cached --unified=0 --no-color --no-ext-diff
 --no-textconv`, sans `shell=True`, binaire résolu par `shutil.which`,
@@ -87,7 +102,17 @@ racine, `GIT_CONFIG_*` neutralisées) : `GIT_DIR`/`GIT_INDEX_FILE` hérités
 ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
 --no-textconv` rendent inopérants `diff.external` et les filtres `textconv`
 (exécution de commande pilotée par le contenu scanné, interdit I5).
-Prouvé par des tests hostiles (`GIT_DIR` piégé, `diff.external` piégé).
+Prouvé par des tests hostiles (`GIT_DIR` piégé, `diff.external` piégé,
+hook `core.fsmonitor` piégé, pager piégé, binaire `git` piégé en tête de
+PATH).
+
+Le `.git/config` du dépôt scanné reste lu par git : `core.fsmonitor` y
+exécute une commande à chaque `diff`/`check-ignore` (prouvé par exécution
+avec hook planté : canari écrit). Chaque appel est donc préfixé de
+`-c core.fsmonitor=false` — `-c` gagne sur tous les fichiers, `false`
+désactive vraiment (vérifié avec un binaire `false` piégé dans le PATH :
+jamais exécuté). Le pager hostile est prouvé inopérant (sorties toujours
+pipées) : aucun override pager, aucune surface ajoutée.
 La commande est entièrement construite par le programme : suppressions
 `noqa`/`nosec` justifiées en place. Preuve : `heimdall/mcp/gitdiff.py:38`,
 `:53`, `:94`.
@@ -106,7 +131,12 @@ imbriqué) : garde-fou temporel anti-ReDoS en test. Le jour où #22 arrive,
 ses règles remplacent `_looks_like_secret` sans changer `mask_text`.
 Limites honnêtes : un jeton **sans préfixe connu, noyé dans 100 Ko de
 remplissage**, reste indétectable par fenêtre ; un SHA de commit copié en
-clair est masqué (faux positif bénin assumé). Preuve :
+clair est masqué (faux positif bénin assumé) ; une valeur courte (< 16
+caractères) à nom neutre (`MY_DATA="motdepasse12"`) N'EST PAS masquée —
+l'alternative (masquer toute valeur affectée dès 8 caractères) noierait
+le tri (`name="production"`, indiscernable par entropie) et apprendrait
+au LLM à ignorer les marqueurs. La détection de précision appartient au
+scanner #22 mesuré en #21. Preuve :
 `heimdall/mcp/masking.py`, `tests/test_mcp_hardening.py::BareTokenMaskingTests`.
 
 ### 8. Compteurs recomptés, budgets vérifiés après sérialisation

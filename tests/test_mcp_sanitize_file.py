@@ -153,10 +153,33 @@ class SanitizeFileToolTests(FileRepoTestCase):
         self.assertEqual(payload["error"]["code"], "FORBIDDEN_PATH")
 
     def test_env_files_are_forbidden(self) -> None:
-        for path in (".env", ".env.example", "sub/.env.local"):
+        """Contrat §4.2 (`.env*`) : sauvegardes incluses, pas juste `.env`.
+
+        `.env-backup` / `.env_old` / `.env~` contournaient l'ancien test
+        (`startswith(".env.")`) : une sauvegarde lue, même masquée, viole
+        l'interdit. Le sur-blocage (`.envelope.py`) est assumé et épinglé.
+        """
+        for path in (
+            ".env",
+            ".env.example",
+            "sub/.env.local",
+            ".env-backup",
+            ".env_old",
+            ".env~",
+            ".env.bak",
+            "backups/.env-backup",
+        ):
             with self.subTest(path=path):
+                self.write(path, "TOKEN=factice\n")
                 payload = self.read({"path": path})
                 self.assertEqual(payload["error"]["code"], "FORBIDDEN_PATH")
+
+    def test_envelope_lookalike_is_overblocked(self) -> None:
+        """`.envelope.py` n'est pas un `.env*` légitime à lire : le contrat
+        dit `.env*`, fail-closed l'emporte sur la disponibilité."""
+        self.write(".envelope.py", "x = 1\n")
+        payload = self.read({"path": ".envelope.py"})
+        self.assertEqual(payload["error"]["code"], "FORBIDDEN_PATH")
 
     def test_ignored_file_is_forbidden(self) -> None:
         """``ignore.txt`` est dans le .gitignore du dépôt."""

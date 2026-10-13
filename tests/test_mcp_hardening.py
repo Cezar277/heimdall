@@ -120,6 +120,14 @@ class BareTokenMaskingTests(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(masking.mask_text(line), (line, 0))
 
+    def test_short_neutral_value_is_left_visible_by_design(self) -> None:
+        """Borne documentée (ADR-003 §7), pas un oubli : sans indice (nom
+        neutre, < 16 caractères), le filet ne masque pas — la détection de
+        précision appartient au scanner #22 mesuré en #21. Ce test épingle
+        la frontière pour que personne ne la déplace en silence."""
+        line = 'MY_DATA = "motdepasse12"'
+        self.assertEqual(masking.mask_text(line), (line, 0))
+
     def test_short_lookalikes_are_not_masked(self) -> None:
         """`ghp_abc` isolé : trop court pour être exploitable, on le laisse."""
         self.assertEqual(masking.mask_text("voir ghp_abc ci-dessus"), ("voir ghp_abc ci-dessus", 0))

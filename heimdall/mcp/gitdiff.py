@@ -10,6 +10,15 @@ verrouillé :
   sans toucher au code ; ils sont simplement absents de l'environnement
   passé au sous-processus. Idem ``HOME`` et les configurations
   système/global ;
+- **configuration locale neutralisée**. Le `.git/config` du dépôt scanné
+  est toujours lu par git : `core.fsmonitor` y exécute une commande à
+  chaque `diff`/`check-ignore` (prouvé par exécution). Chaque appel est
+  donc préfixé de `-c core.fsmonitor=false` (désactivation réelle,
+  vérifiée avec PATH hostile). Le pager hostile est prouvé inopérant
+  (sorties toujours pipées) : aucun override, aucune surface ajoutée ;
+- **binaire résolu hors PATH hérité**. `shutil.which("git",
+  path=os.defpath)` : un PATH compromis ne détourne pas l'exécutable.
+  Absent du défaut système → panne d'outillage, jamais de repli ;
 - **options du contrat imposées** : ``--no-ext-diff`` et ``--no-textconv``
   empêchent git d'exécuter ``diff.external`` ou les filtres ``textconv``
   configurés dans le dépôt — de l'exécution de commande pilotée par le
@@ -43,6 +52,16 @@ DIFF_ARGUMENTS: Final[tuple[str, ...]] = (
     "--no-ext-diff",
     "--no-textconv",
 )
+
+# Neutralise la configuration LOCALE du dépôt scanné, lue par chaque appel
+# git : `core.fsmonitor` y exécute une commande du dépôt à chaque `diff`
+# ou `check-ignore` (prouvé par exécution avec hook planté : canari écrit
+# sans l'override, absent avec). `-c` gagne sur tous les fichiers de
+# config ; `false` désactive vraiment (vérifié avec un PATH hostile
+# contenant un binaire `false` piégé : jamais exécuté). Le pager hostile
+# est lui prouvé inopérant (sorties toujours pipées : test dédié), donc
+# aucun override pager — pas de surface ajoutée.
+GIT_CONFIG_OVERRIDES: Final[tuple[str, ...]] = ("-c", "core.fsmonitor=false")
 
 
 # Environnement minimal du sous-processus git. Aucune variable de
@@ -84,7 +103,12 @@ class GitAccess:
 
     def __init__(self, root: Path) -> None:
         self._root = root
-        binary = shutil.which("git")
+        # Jamais le PATH hérité : un PATH compromis (poste, CI, direnv)
+        # détournerait le binaire exécuté à chaque outil. `os.defpath`
+        # (`/bin:/usr/bin` sur POSIX) est le défaut système sûr, pas une
+        # liste codée en dur (portable : Nix, macOS...). Absent → panne
+        # d'outillage, jamais de repli vers un PATH non fiable.
+        binary = shutil.which("git", path=os.defpath)
         if binary is None:
             # Panne d'outillage : message statique, jamais de chemin ni de
             # contenu reflété (invariant 8).
@@ -96,14 +120,14 @@ class GitAccess:
 
         Les deux suppressions (`noqa`/`nosec`) sont justifiées : la liste
         d'arguments est entièrement construite par le programme — binaire
-        git résolu par ``shutil.which`` puis des constantes de ce module, et
-        ``arguments`` qui vient du même module. Aucune valeur issue du LLM
-        ou du contenu du dépôt n'entre dans la commande, et ``shell=True``
-        n'est jamais utilisé.
+        git résolu hors PATH hérité, overrides `-c` puis constantes de ce
+        module, et `arguments` qui vient du même module. Aucune valeur issue
+        du LLM ou du contenu du dépôt n'entre dans la commande (ni dans sa
+        configuration d'exécution), et ``shell=True`` n'est jamais utilisé.
         """
         try:
             return subprocess.run(  # noqa: S603 # nosec B603
-                [self._git, "-C", str(self._root), *arguments],
+                [self._git, *GIT_CONFIG_OVERRIDES, "-C", str(self._root), *arguments],
                 capture_output=True,
                 check=False,
                 timeout=GIT_TIMEOUT_SECONDS,

@@ -74,6 +74,12 @@ MAX_CONTENT_CHARS: Final[int] = 100_000
 # même). Évite de décoder un exécutable comme du texte.
 _BINARY_SNIFF_BYTES: Final[int] = 8192
 
+# Métadonnée de protocole MCP tolérée (_meta) : bornée, jamais un champ.
+# Un client modifié pourrait y glisser un volume arbitraire ; nos outils
+# ne la lisent ni ne la renvoient (le SDK l'ignore), mais on refuse
+# au-delà d'un Kio plutôt que de laisser passer sans regard.
+_META_MAX_BYTES: Final[int] = 1024
+
 logger = logging.getLogger(__name__)
 
 _F = TypeVar("_F", bound=Callable[..., str])
@@ -123,6 +129,8 @@ class _ToolBoundary:
       paramètres **requis** : sans ``path``, le SDK répond « Field
       required », un texte hors de notre enveloppe ``{"error": …}`` donc
       non conforme au contrat 3.1.
+    - `_meta` (protocole) toléré mais borné à 1 Kio : un volume arbitraire
+      via un client modifié est refusé, jamais propagé sans regard.
 
     **Après l'exécution** — marquer ``isError`` :
 
@@ -155,8 +163,12 @@ class _ToolBoundary:
         arguments = ctx.params.get("arguments")
         if arguments is None:
             arguments = {}
-        if not isinstance(arguments, dict):
+        if not isinstance(arguments, dict) or not self._arguments_valid(name, arguments):
             return _error_result(errors.failure("INVALID_INPUT"))
+        return _mark_failure(await call_next(ctx))
+
+    def _arguments_valid(self, name: str, arguments: dict[str, Any]) -> bool:
+        """Entrée conforme au contrat de l'outil (types, requis, `_meta`)."""
         for key, value in arguments.items():
             if key == "_meta":
                 continue  # métadonnée de protocole MCP, pas un champ d'outil.
@@ -165,14 +177,23 @@ class _ToolBoundary:
             # est vrai en Python), une sous-classe serait une valeur forgée.
             if wanted is None or type(value) is not wanted:
                 logger.info("outil %s : argument hors contrat refusé", name)
-                return _error_result(errors.failure("INVALID_INPUT"))
+                return False
+        if "_meta" in arguments and not self._meta_bounded(arguments["_meta"]):
+            logger.info("outil %s : métadonnée hors borne refusée", name)
+            return False
         provided = {key for key in arguments if key != "_meta"}
         if not self._required[name] <= provided:
             # Paramètre requis absent : le SDK répondrait « Field required »,
             # hors enveloppe. On refuse nous-mêmes, avec notre enveloppe.
             logger.info("outil %s : paramètre requis absent", name)
-            return _error_result(errors.failure("INVALID_INPUT"))
-        return _mark_failure(await call_next(ctx))
+            return False
+        return True
+
+    @staticmethod
+    def _meta_bounded(meta: Any) -> bool:
+        """`_meta` tolérée sous 1 Kio, jamais propagée sans regard."""
+        size = len(json.dumps(meta, ensure_ascii=True).encode("utf-8"))
+        return size <= _META_MAX_BYTES
 
 
 def _error_result(payload: str) -> dict[str, Any]:
@@ -228,7 +249,7 @@ def tool_handler(fn: _F) -> _F:
         try:
             return fn(*args, **kwargs)
         except ToolFailure as failure:
-            return errors.failure(failure.code, failure.message)
+            return errors.failure(failure.code)
         except paths.PathEscape:
             return errors.failure("PATH_ESCAPE")
         except Exception:
@@ -352,12 +373,17 @@ def is_forbidden_path(relative: str) -> bool:
     la casse (Windows, macOS), ``.GIT/config`` ouvre le même fichier que
     ``.git/config``. Refuser ``.Git`` en trop est un faux positif bénin
     (fail-closed) ; laisser passer ``.GIT`` serait une évasion.
+
+    Préfixe large (`.env`, `.env-backup`, `.env_old`, `.env~`…) comme
+    l'exige le contrat (`.env*`, §4.2) : sur-bloquer `.envelope` est un
+    faux positif bénin assumé, laisser passer `.env-backup` serait un
+    contournement de l'interdit (sauvegardes !).
     """
     for segment in relative.split("/"):
         lowered = segment.lower()
         if lowered == ".git":
             return True
-        if lowered == ".env" or lowered.startswith(".env."):
+        if lowered.startswith(".env"):
             return True
     return False
 

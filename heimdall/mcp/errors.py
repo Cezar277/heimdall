@@ -55,15 +55,17 @@ ERROR_MESSAGES: Final[dict[ErrorCode, str]] = {
 class ToolFailure(Exception):
     """Échec d'outil, converti en enveloppe d'erreur par ``tool_handler``.
 
-    Porte un code du contrat (pas un message libre) : c'est ce code qui
-    est sérialisé, le message restant statique.
+    Porte un code du contrat, et RIEN d'autre : le message est toujours le
+    statique d'`ERROR_MESSAGES`. Le paramètre libre a été supprimé
+    volontairement — un `raise ToolFailure("INTERNAL", valeur)` futur
+    refléterait un secret ou un chemin absolu au LLM (invariant 8). Ce qui
+    ne peut pas s'écrire ne peut pas fuir.
     """
 
-    def __init__(self, code: ErrorCode, message: str | None = None) -> None:
-        text = ERROR_MESSAGES[code] if message is None else message
-        super().__init__(text)
+    def __init__(self, code: ErrorCode) -> None:
+        super().__init__(ERROR_MESSAGES[code])
         self.code: ErrorCode = code
-        self.message: str = text
+        self.message: str = ERROR_MESSAGES[code]
 
 
 def dumps(payload: object) -> str:
@@ -78,7 +80,6 @@ def dumps(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
 
 
-def failure(code: ErrorCode, message: str | None = None) -> str:
+def failure(code: ErrorCode) -> str:
     """Enveloppe d'échec ``{"error": {"code", "message"}}`` (contrat 3.1)."""
-    text = ERROR_MESSAGES[code] if message is None else message
-    return dumps({"error": {"code": code, "message": text}})
+    return dumps({"error": {"code": code, "message": ERROR_MESSAGES[code]}})

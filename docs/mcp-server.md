@@ -58,7 +58,9 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 
 | Garantie | Comment | Preuve |
 |---|---|---|
-| commande git figée, `shell=True` proscrit | argv constant, binaire résolu par `shutil.which` | `tests/test_mcp_read_diff.py` |
+| commande git figée, `shell=True` proscrit | argv constant, binaire résolu hors PATH hérité (`os.defpath`) | `tests/test_mcp_read_diff.py` |
+| config locale neutralisée | `-c core.fsmonitor=false` sur chaque appel (hook prouvé exécuté sans) | `test_fsmonitor_hook_is_never_executed` |
+| pager hostile inopérant | sorties toujours pipées, prouvé sans override | `test_hostile_pager_is_never_executed` |
 | `diff.external` / `textconv` inopérants (interdit I5) | `--no-ext-diff --no-textconv` imposés | `GitEnvironmentTests` |
 | l'environnement hérité ne redirige pas le dépôt | `GIT_DIR`, `GIT_INDEX_FILE`, `HOME`, `PATH` reconstruits à zéro | `GitEnvironmentTests` |
 | aucune valeur en clair renvoyée | masquage `<REDACTED:type:len=N>` **avant** `json.dumps` | `test_secret_values_are_masked_before_serialization` |
@@ -82,7 +84,7 @@ Le chemin vient du LLM : il est traité comme une entrée piégée
 |---|---|---|
 | une seule garde, appelée par tout outil qui reçoit un chemin | `paths.confine` : refus de forme, `resolve()`, `is_relative_to` | `tests/test_mcp_paths.py` |
 | refus de `..`, des chemins absolus, des liens sortants | résolution réelle + confinement sur `Path` résolus | `RefusalTests` |
-| `.git/`, `.env*`, fichiers ignorés interdits | segments interdits + `git check-ignore` | `tests/test_mcp_sanitize_file.py` |
+| `.git/`, `.env*`, fichiers ignorés interdits | segments interdits (`.env-backup` inclus, `.envelope` sur-bloqué assumé) + `git check-ignore` | `tests/test_mcp_sanitize_file.py` |
 | binaire, > 1 Mo, absent, dossier | codes dédiés (`BINARY_FILE`, `TOO_LARGE`, `NOT_FOUND`) | idem |
 | ouverture sans suivre un lien | `O_NOFOLLOW` + comparaison dev/ino (TOCTOU) | `GuardWiringTests` |
 | extrait masqué avant sérialisation | `masking.mask_text`, puis borne 100 000 caractères | `test_no_clear_value_ever_reaches_the_llm` |
@@ -166,6 +168,7 @@ restent vérifiées.
 | champ d'entrée hors contrat refusé | `_ToolBoundary` | `ArgumentGateTests` |
 | échecs dans l'enveloppe `{"error": …}`, jamais en exception | `tool_handler`, `heimdall/mcp/errors.py` | tests de chaque outil |
 | échec marqué `isError`, succès jamais | `_ToolBoundary._mark_failure` | `test_failure_envelopes_are_flagged` |
+| enveloppe close, `_meta` bornée | pas de message libre (`TypeError` sinon), `_meta` > 1 Kio refusée | `test_tool_failure_has_no_free_message_channel` |
 | aucune entrée reflétée au LLM | messages statiques d'`errors.py` | `test_refusal_message_is_static` |
 | stdout = protocole uniquement | aucun `print` dans `heimdall/mcp/` | `StdoutIsProtocolOnlyTests` |
 | registre fermé | `SERVER_TOOLS` + garde d'entrée | `test_ping_is_declared_to_the_client` |

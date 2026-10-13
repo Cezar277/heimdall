@@ -221,6 +221,14 @@ def _secret_type(key: str | None, value: str) -> str:
 # Seuils d'entropie (bits par caractère) et de longueur : sans indice dans
 # le nom de la variable, une valeur courte ou prévisible n'est pas un secret.
 # Ces valeurs seront remplacées par celles du scanner #22.
+# Borne assumée et documentée (ADR-003 §7) : une valeur courte (moins de 16
+# caractères) à nom neutre (`MY_DATA="motdepasse12"`) N'EST PAS masquée.
+# L'alternative — masquer toute valeur affectée dès 8 caractères —
+# noierait le tri sous les faux positifs (`name="production"`,
+# `host="database-01"` : indiscernables par entropie) et apprendrait au LLM
+# à ignorer les marqueurs (fatigue d'alerte). La détection de précision
+# appartient au scanner déterministe (#22) mesuré en #21 ; ce module reste
+# un filet large, jamais un détecteur.
 MIN_ENTROPY_LENGTH: Final[int] = 16
 MIN_ENTROPY_BITS: Final[float] = 3.5
 

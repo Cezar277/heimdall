@@ -13,6 +13,7 @@ import errno
 import inspect
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -65,9 +66,13 @@ class ErrorsTests(unittest.TestCase):
         self.assertEqual(failure.message, errors.ERROR_MESSAGES["NOT_FOUND"])
         self.assertEqual(str(failure), errors.ERROR_MESSAGES["NOT_FOUND"])
 
-    def test_tool_failure_accepts_an_explicit_message(self) -> None:
-        failure = ToolFailure("INTERNAL", "panne précise")
-        self.assertEqual((failure.code, failure.message), ("INTERNAL", "panne précise"))
+    def test_tool_failure_has_no_free_message_channel(self) -> None:
+        """L'API libre est supprimée : aucun futur appel ne peut refléter
+        une valeur (invariant 8 structurel, pas disciplinaire)."""
+        with self.assertRaises(TypeError):
+            ToolFailure("INTERNAL", "valeur")  # type: ignore[call-arg]
+        with self.assertRaises(TypeError):
+            errors.failure("INTERNAL", "valeur")  # type: ignore[call-arg]
 
     def test_dumps_is_compact_ascii_and_rejects_nan(self) -> None:
         self.assertEqual(errors.dumps({"a": 1}), '{"a":1}')
@@ -115,6 +120,10 @@ class ToolBoundaryTests(unittest.TestCase):
 
     def test_meta_is_protocol_not_a_tool_field(self) -> None:
         self.assertEqual(self.run_gate("read_diff", {"_meta": {"x": 1}}), {"ok": True})
+
+    def test_oversized_meta_is_refused_in_process(self) -> None:
+        result = self.run_gate("read_diff", {"_meta": "x" * 100_000})
+        self.assertTrue(result["isError"])
 
     def test_unknown_field_is_refused(self) -> None:
         payload = json.loads(self.run_gate("read_diff", {"root": "/etc"})["content"][0]["text"])
@@ -260,6 +269,30 @@ class GitAccessDirectTests(unittest.TestCase):
             with self.assertRaises(ToolFailure) as ctx:
                 gitdiff.GitAccess(self.repo.root)
         self.assertEqual(ctx.exception.code, "INTERNAL")
+
+    def test_hostile_path_cannot_hijack_the_git_binary(self) -> None:
+        """Un `git` piégé en tête de PATH n'est jamais exécuté : le binaire
+        vient de `os.defpath` (défaut système), pas de l'héritage."""
+        if gitdiff.shutil.which("git", path=os.defpath) is None:
+            self.skipTest("git introuvable dans le PATH système")
+        with tempfile.TemporaryDirectory(prefix="heimdall-evilbin-") as bindir:
+            canary = _Path(tempfile.gettempdir()) / "heimdall-git-hijack-canary"
+            canary.unlink(missing_ok=True)
+            fake = _Path(bindir) / "git"
+            fake.write_text(f'#!/bin/sh\necho "PWNED" >> {canary}\n', encoding="utf-8")
+            fake.chmod(stat.S_IRWXU)
+            previous = os.environ.get("PATH")
+            os.environ["PATH"] = f"{bindir}{os.pathsep}{previous or ''}"
+            try:
+                access = gitdiff.GitAccess(self.repo.root)
+                self.assertTrue(access.is_repository())
+            finally:
+                if previous is None:
+                    os.environ.pop("PATH", None)
+                else:
+                    os.environ["PATH"] = previous
+            self.assertFalse(canary.exists(), "le faux binaire git a été exécuté !")
+            self.assertNotEqual(os.path.dirname(access._git), bindir)
 
     def test_repository_detection(self) -> None:
         self.assertTrue(gitdiff.GitAccess(self.repo.root).is_repository())

@@ -64,6 +64,18 @@ class ArgumentGateTests(unittest.TestCase):
         self.assertTrue(result.is_error)
         self.assertEqual(tool_payload(result)["error"]["code"], "INVALID_INPUT")
 
+    def test_oversized_meta_is_refused(self) -> None:
+        """`_meta` de 100 Ko via un client modifié : refusé, pas propagé."""
+        result = call_tool("ping", {"_meta": "x" * 100_000})
+        self.assertTrue(result.is_error)
+        self.assertEqual(tool_payload(result)["error"]["code"], "INVALID_INPUT")
+
+    def test_small_meta_is_tolerated(self) -> None:
+        """Compatibilité protocole : une petite `_meta` passe (ignorée)."""
+        result = call_tool("ping", {"_meta": {"progressToken": 1}})
+        self.assertFalse(result.is_error)
+        self.assertEqual(tool_payload(result), {"pong": True})
+
     def test_success_is_never_flagged_as_an_error(self) -> None:
         """Exclusivité des deux formes : un succès n'est jamais isError."""
         result = call_tool("ping", {})
