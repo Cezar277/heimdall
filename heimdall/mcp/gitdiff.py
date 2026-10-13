@@ -172,11 +172,21 @@ class GitAccess:
         raise ToolFailure("INTERNAL")
 
     def staged_diff(self, max_bytes: int) -> tuple[bytes, bool]:
-        """Sortie brute de ``git diff --cached``, plafonnée à ``max_bytes``."""
+        """Sortie brute de ``git diff --cached``, plafonnée à ``max_bytes``.
+
+        La coupe tombe sur la dernière ligne COMPLÈTE : couper à l'octet
+        près laisserait une ligne tronquée dont le masquage échouerait
+        (guillemet fermant manquant → préfixe de secret en clair, plaçable
+        à cheval par remplissage + `max_bytes` choisi). Le reste est
+        signalé `truncated`, jamais présenté comme complet. Sans `\n`
+        dans la coupe (en-tête géant : impossible avec un vrai git, dont
+        la première ligne est courte), la coupe part telle quelle — une
+        en-tête sans `\n` ne porte aucune ligne ajoutée à fuir.
+        """
         raw = self.run(DIFF_ARGUMENTS)
         if len(raw) <= max_bytes:
             return raw, False
-        return raw[:max_bytes], True
+        return raw[:max_bytes].rsplit(b"\n", 1)[0], True
 
 
 @dataclass(frozen=True)
@@ -361,6 +371,13 @@ class _DiffParser:
         self._new_line = 0
         if builder is None:
             return
+        if builder.binary and builder.path is None:
+            # Binaire innommable : un binaire ne porte aucune ligne à
+            # montrer, mais son absence doit être signalée (information
+            # incomplète), jamais escamotée en silence — et sans tuer
+            # toute la réponse pour un nom (disponibilité).
+            self.truncated = True
+            return
         entry = builder.entry()
         if entry is None:
             return
@@ -398,8 +415,11 @@ class _DiffParser:
         if raw.startswith("Binary files ") or raw.startswith("GIT binary patch"):
             builder.binary = True
             # ``Binary files /dev/null and b/x differ`` : sans `+++`, c'est la
-            # seule ligne qui porte le côté nouveau du chemin.
-            if builder.path is None:
+            # seule ligne qui porte le côté nouveau du chemin. `GIT binary
+            # patch` (jamais émis sans `--binary`, que nous ne passons pas)
+            # ne nomme rien : on ne lui applique pas le découpage prévu
+            # pour l'autre forme (offset faux → nom fantôme).
+            if builder.path is None and raw.startswith("Binary files "):
                 path = _binary_path(raw)
                 if path is not None:
                     builder.path = path

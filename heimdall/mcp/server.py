@@ -74,6 +74,12 @@ MAX_CONTENT_CHARS: Final[int] = 100_000
 # même). Évite de décoder un exécutable comme du texte.
 _BINARY_SNIFF_BYTES: Final[int] = 8192
 
+# `O_NONBLOCK` n'existe pas sur Windows : repli à 0 (aucun effet) pour
+# rester importable partout. Sur POSIX il est indispensable : sans lui,
+# un FIFO substitué entre `lstat` et `open` bloquerait AVANT le contrôle
+# post-ouverture. Sans effet sur les réguliers (lecture normale).
+_NONBLOCK: Final[int] = getattr(os, "O_NONBLOCK", 0)
+
 # Métadonnée de protocole MCP tolérée (_meta) : bornée, jamais un champ.
 # Un client modifié pourrait y glisser un volume arbitraire ; nos outils
 # ne la lisent ni ne la renvoient (le SDK l'ignore), mais on refuse
@@ -192,7 +198,12 @@ class _ToolBoundary:
     @staticmethod
     def _meta_bounded(meta: Any) -> bool:
         """`_meta` tolérée sous 1 Kio, jamais propagée sans regard."""
-        size = len(json.dumps(meta, ensure_ascii=True).encode("utf-8"))
+        try:
+            size = len(json.dumps(meta, ensure_ascii=True).encode("utf-8"))
+        except (ValueError, RecursionError, MemoryError):
+            # Imbrication hostile (~10⁵ niveaux) ou volume inallouable :
+            # refusé, jamais remonté hors enveloppe (fail-closed).
+            return False
         return size <= _META_MAX_BYTES
 
 
@@ -400,10 +411,15 @@ def _read_extract(absolute: Path, start_line: int, max_lines: int) -> tuple[list
         raise errors.ToolFailure("NOT_FOUND") from None
     if stat.S_ISDIR(before.st_mode):
         raise errors.ToolFailure("NOT_FOUND")
+    if not stat.S_ISREG(before.st_mode):
+        # FIFO, socket, périphérique : aucun texte à renvoyer — et surtout,
+        # ouvrir un FIFO en lecture bloquerait pour toujours (DoS du canal
+        # stdio, sans timeout possible). Refus avant ouverture.
+        raise errors.ToolFailure("BINARY_FILE")
     if before.st_size > MAX_FILE_BYTES:
         raise errors.ToolFailure("TOO_LARGE")
     try:
-        handle = os.open(absolute, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        handle = os.open(absolute, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | _NONBLOCK)
     except OSError as error:
         # ELOOP : le fichier est devenu un lien symbolique entre la garde et
         # l'ouverture. On refuse (fail-closed) plutôt que de suivre.
@@ -415,6 +431,11 @@ def _read_extract(absolute: Path, start_line: int, max_lines: int) -> tuple[list
         if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
             # Le fichier a été remplacé (ou recréé) entre les deux appels :
             # le contenu lu ne serait pas celui qui a été validé.
+            raise errors.ToolFailure("INTERNAL")
+        if not stat.S_ISREG(after.st_mode):
+            # Remplacé par un FIFO/socket entre lstat et open : l'ouverture
+            # non bloquante a laissé passer, le contenu reste illisible.
+            # Anomalie d'intégrité (comme dev/ino), donc INTERNAL.
             raise errors.ToolFailure("INTERNAL")
         data = _read_bounded(handle)
         if len(data) > MAX_FILE_BYTES:

@@ -150,6 +150,23 @@ sérialisée (fichiers retirés en dernier, `truncated: true`). Preuve :
 `heimdall/mcp/server.py:441` (`_masked_files`), `:408` (`_fit_budget`),
 `tests/test_mcp_hardening.py::TruncationInvariantTests`.
 
+### 8 bis. Coupe sur lignes complètes, FIFO refusés, binaires innommables
+
+- `staged_diff` coupe `raw[:max_bytes]` sur le dernier `\n` complet : une
+  ligne tronquée à cheval (guillemet fermant manquant, `max_bytes` choisi
+  par le LLM + remplissage attaquant) fuyait son préfixe en clair. La
+  ligne incomplète est abandonnée, `truncated: true`.
+- `sanitize_file` refuse tout non-régulier **avant** ouverture (FIFO =
+  `BINARY_FILE` : ouvrir un FIFO en lecture bloque pour toujours, DoS du
+  canal stdio sans timeout possible) et revérifie **après** (`INTERNAL`
+  si le type a changé). Ouverture `O_NONBLOCK` : sans effet sur les
+  réguliers, indispensable contre le swap régulier→FIFO entre `lstat` et
+  `open` (le blocage aurait lieu AVANT le contrôle).
+- Binaire innommable (jamais vu sans `--binary`, que nous ne passons pas)
+  : abandonné avec `truncated: true`, jamais escamoté en silence — et
+  sans tuer toute la réponse pour un nom (un binaire ne porte aucune
+  ligne ; tuer la réponse serait un DoS par fichier bizarre).
+
 ### 9. Garde de chemin unique + TOCTOU documentée (exigence #76)
 
 `confine` : refus de forme (grammaire `RelPath` du contrat, chemins absolus
@@ -222,6 +239,7 @@ renseigner la feuille SAMM avec liens permanents au SHA :
 | entrées refusées, échecs en enveloppe | `heimdall/mcp/server.py` (`_ToolBoundary`, `tool_handler`), `heimdall/mcp/errors.py` |
 | git confiné, diff typé | `heimdall/mcp/gitdiff.py` (`DIFF_ARGUMENTS`, `confined_environment`, `parse_diff`) |
 | masquage avant sérialisation, compteurs vrais | `heimdall/mcp/masking.py` (`mask_text`), `heimdall/mcp/server.py` (`_masked_files`) |
-| garde unique, TOCTOU réduite | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |
+| garde unique, TOCTOU réduite, FIFO refusés | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |
+| coupe sur lignes complètes | `heimdall/mcp/gitdiff.py` (`staged_diff`) |
 | aucun réseau | `tests/test_mcp_client.py` (`NoNetworkTests`, `NoTrafficTests`) |
 | 100 % / 100 % mesuré | `tests/test_mcp_units.py` + sortie `coverage report` |

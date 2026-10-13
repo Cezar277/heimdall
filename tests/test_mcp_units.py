@@ -13,9 +13,11 @@ import errno
 import inspect
 import json
 import os
+import socket
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path as _Path
 from types import SimpleNamespace
@@ -124,6 +126,15 @@ class ToolBoundaryTests(unittest.TestCase):
     def test_oversized_meta_is_refused_in_process(self) -> None:
         result = self.run_gate("read_diff", {"_meta": "x" * 100_000})
         self.assertTrue(result["isError"])
+
+    def test_deeply_nested_meta_is_refused_not_raised(self) -> None:
+        """~10⁵ niveaux : RecursionError rattrapée dans l'enveloppe."""
+        nested: Any = "x"
+        for _ in range(100_000):
+            nested = [nested]
+        result = self.run_gate("read_diff", {"_meta": nested})
+        self.assertTrue(result["isError"])
+        self.assertEqual(json.loads(result["content"][0]["text"])["error"]["code"], "INVALID_INPUT")
 
     def test_unknown_field_is_refused(self) -> None:
         payload = json.loads(self.run_gate("read_diff", {"root": "/etc"})["content"][0]["text"])
@@ -534,6 +545,22 @@ class DirectToolErrorTests(unittest.TestCase):
             payload = json.loads(self.tools["sanitize_file"](path="f.txt"))
             self.assertEqual(payload["error"]["code"], "INTERNAL")
 
+    def test_sanitize_type_swapped_between_stat_and_open(self) -> None:
+        """Régulier → FIFO entre les deux appels : l'ouverture non bloquante
+        laisse passer, le contrôle post-ouverture refuse (INTERNAL)."""
+        self.repo.write("f.txt", "x\n")
+        real_fstat = server.os.fstat
+
+        def swapped(handle: int) -> Any:
+            info = real_fstat(handle)
+            fields = list(tuple(info))
+            fields[0] = stat.S_IFIFO | 0o600
+            return server.os.stat_result(tuple(fields))
+
+        with mock.patch.object(server.os, "fstat", side_effect=swapped):
+            payload = json.loads(self.tools["sanitize_file"](path="f.txt"))
+            self.assertEqual(payload["error"]["code"], "INTERNAL")
+
     def test_sanitize_grown_between_stat_and_read(self) -> None:
         """Le fichier grossit après `lstat` : second garde-fou `TOO_LARGE`."""
         self.repo.write("f.txt", "x\n")
@@ -559,6 +586,37 @@ class DirectToolErrorTests(unittest.TestCase):
     def test_sanitize_binary_sniff(self) -> None:
         self.repo.write_bytes("b.bin", b"AB\x00CD")
         payload = json.loads(self.tools["sanitize_file"](path="b.bin"))
+        self.assertEqual(payload["error"]["code"], "BINARY_FILE")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO POSIX uniquement")
+    def test_fifo_does_not_hang_the_server(self) -> None:
+        """Un FIFO piégé : enveloppe, pas de blocage (DoS du canal stdio).
+
+        Appel direct in-process dans un thread avec timeout : sans le
+        garde-fou, ce test pendrait au lieu d'échouer (le thread démon
+        ne bloque jamais la suite ; une exception inattendue y laisse
+        `box` vide et fait échouer l'assertion, en clair).
+        """
+        os.mkfifo(self.repo.root / "creds.txt")
+        box: dict[str, Any] = {}
+
+        def call() -> None:
+            box["payload"] = json.loads(self.tools["sanitize_file"](path="creds.txt"))
+
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        worker.join(timeout=15)
+        self.assertFalse(worker.is_alive(), "sanitize_file pendu sur le FIFO !")
+        self.assertIn("payload", box)
+        self.assertEqual(box["payload"]["error"]["code"], "BINARY_FILE")
+
+    def test_socket_file_is_refused(self) -> None:
+        sock = socket.socket(socket.AF_UNIX)
+        try:
+            sock.bind(str(self.repo.root / "sock"))
+        finally:
+            sock.close()
+        payload = json.loads(self.tools["sanitize_file"](path="sock"))
         self.assertEqual(payload["error"]["code"], "BINARY_FILE")
 
     def test_mark_failure_remaining_shapes(self) -> None:
@@ -676,17 +734,32 @@ class UnquoteTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertEqual(len(entries[0].lines), gitdiff.MAX_LINES_PER_FILE)
 
-    def test_garbage_binary_line_is_ignored(self) -> None:
-        entries, _ = self.parse(
+    def test_garbage_binary_line_is_ignored_but_flagged(self) -> None:
+        entries, truncated = self.parse(
             "diff --git a/x b/x",
             "Binary files nonsense without separator",
             "@@ -0,0 +1 @@",
             "+x",
         )
         self.assertEqual(entries, [])
+        self.assertTrue(truncated)
+
+    def test_git_binary_patch_is_flagged_not_smuggled(self) -> None:
+        """`GIT binary patch` (jamais émis sans `--binary`) : pas de nom
+        fantôme par mauvais offset, fichier signalé incomplet."""
+        entries, truncated = self.parse(
+            "diff --git a/logo.png b/logo.png",
+            "new file mode 100644",
+            "index 0000000..8194775",
+            "GIT binary patch",
+            "literal 3",
+            "KcmZQ",
+        )
+        self.assertEqual(entries, [])
+        self.assertTrue(truncated)
 
     def test_degenerate_binary_separator_is_ignored(self) -> None:
-        """Ligne `Binary files` difforme : rien à nommer, rien ne plante."""
+        """Ligne `Binary files` difforme : rien à nommer, incomplet signalé."""
         entries, truncated = self.parse(
             "diff --git a/x b/x",
             "Binary files  and  differ",
@@ -694,7 +767,7 @@ class UnquoteTests(unittest.TestCase):
             "+x",
         )
         self.assertEqual(entries, [])
-        self.assertFalse(truncated)
+        self.assertTrue(truncated)
 
     def test_added_and_deleted_binary_fast_paths(self) -> None:
         added, _ = self.parse(

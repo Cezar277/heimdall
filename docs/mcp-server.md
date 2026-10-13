@@ -67,6 +67,8 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 | réponse bornée par `max_bytes` | budget vérifié **après** sérialisation, fichiers retirés en dernier | `test_response_never_exceeds_max_bytes` |
 | limite atteinte = information incomplète | `truncated: true`, jamais « diff vide » | tests de troncature |
 | compteur `redactions` toujours vrai | recompté sur les lignes finales : une coupe n'y laisse jamais un compteur sans marqueur | `TruncationInvariantTests` |
+| coupe `max_bytes` sur lignes complètes | la ligne à cheval est abandonnée (aucun préfixe en clair) | `test_secret_never_straddles_any_budget` |
+| FIFO/socket/device refusés, `O_NONBLOCK` | pas de blocage infini (DoS), revérifié après ouverture | `test_fifo_does_not_hang_the_server` |
 | noms git décodés en octets puis UTF-8 | pas de mojibake (`café.py`), irreprésentable = `INTERNAL` (fail-closed) | `UnquoteTests` |
 | réponse conforme au contrat #16 | validée contre `ReadDiffResult` (oneOf succès / échec) | `ReadDiffConformanceTests` |
 

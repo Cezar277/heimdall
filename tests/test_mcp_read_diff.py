@@ -163,6 +163,23 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.assertTrue(payload["truncated"])
         self.assertLessEqual(len(entry["added_lines"][0]["text"]), 2000)
 
+    def test_secret_never_straddles_any_budget(self) -> None:
+        """Quel que soit `max_bytes` (contrôlé par le LLM), aucun fragment
+        de secret en clair : la ligne incomplète est abandonnée, la ligne
+        complète est masquée. Balayage de tous les alignements autour du
+        secret (l'index git fait varier les offsets de quelques octets)."""
+        token = FAKE_GITHUB_TOKEN
+        self.write("f.py", "Z" * 900 + "\n" + f'TOKEN = "{token}"\n')
+        self.stage("f.py")
+        for budget in range(1000, 1120, 7):
+            with self.subTest(max_bytes=budget):
+                payload = self.call_read_diff({"max_bytes": budget})
+                text = json.dumps(payload)
+                self.assertNotIn(token, text)
+                if "TOKEN" in text:
+                    self.assertIn("<REDACTED:github:", text)
+                self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
     def test_many_files_are_capped_and_flagged(self) -> None:
         """200 fichiers : au-delà, la liste est incomplète et le dit."""
         names = [f"f{index}.txt" for index in range(205)]
