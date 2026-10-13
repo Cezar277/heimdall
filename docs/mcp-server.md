@@ -127,6 +127,32 @@ L'inspecteur officiel (`npx @modelcontextprotocol/inspector`) reste utilisable
 pour une démo manuelle, mais il **télécharge** des paquets npm : hors ligne, lui
 préférer le client Python ci-dessus (règle « 100 % local »).
 
+## 3 bis. Ce que les tests client prouvent (#78)
+
+`tests/test_mcp_client.py` ne teste plus un client poli mais un **client
+adverse** (donc ce que le LLM tentera) :
+
+| Preuve | Comment |
+|---|---|
+| session complète comme celle de l'agent Ollama (#28) | `initialize` → `tools/list` → `read_diff` + `sanitize_file`, chaque réponse validée contre le contrat #16 |
+| injection de prompt renvoyée comme une donnée | une consigne piégée dans le diff revient telle quelle (jamais exécutée), seule la valeur est masquée |
+| aucun outil hors registre n'est appelable | `exec`, `shell`, `write_file`, `propose_patch`… refusés |
+| contrebande d'arguments sans effet | champ `root`/`cwd` bonus → `INVALID_INPUT`, types jamais convertis en silence |
+| aucun message ne fuit un chemin ou une valeur | messages statiques, sans `\n` (le LLM les relit) |
+| aucun outil n'écrit | l'arborescence du dépôt est identique avant/après tous les appels |
+| aucun port, aucun socket INET, aucun socket nommé | inspection `/proc` + recoupe `ss -anp` (voir ci-dessous) |
+
+**Pourquoi « aucun socket » demandait un correctif.** Le serveur tourne sur
+asyncio, qui crée au démarrage une paire de sockets UNIX **anonymes**
+(auto-réveil de la boucle). Elles ne sont ni des ports, ni des connexions,
+ni des chemins vers un tiers : interdire toute présence de `socket:` les
+signalait à tort. Le test autorise donc exactement cette paire anonyme et
+interdit tout le reste — avec un contrôle négatif (un `http.server` témoin
+est bien signalé, par `/proc/net/tcp` **et** par `ss`). Sans `ss` sur la
+machine, le recoupe des pairs distants est sauté ; les tables `/proc` et la
+preuve statique (aucun import réseau dans `heimdall/mcp/`, `NoTrafficTests`)
+restent vérifiées.
+
 ## 4. Ce que le serveur garantit, et comment c'est prouvé
 
 | Garantie | Où | Preuve |
@@ -139,6 +165,9 @@ préférer le client Python ci-dessus (règle « 100 % local »).
 | aucune entrée reflétée au LLM | messages statiques d'`errors.py` | `test_refusal_message_is_static` |
 | stdout = protocole uniquement | aucun `print` dans `heimdall/mcp/` | `StdoutIsProtocolOnlyTests` |
 | registre fermé | `SERVER_TOOLS` + garde d'entrée | `test_ping_is_declared_to_the_client` |
+| session adverse conforme au contrat | vrai client stdio, réponses validées | `tests/test_mcp_client.py::EndToEndSessionTests` |
+| aucun port / INET / socket nommé | `/proc` + `ss`, paire anonyme asyncio seule autorisée | `NoNetworkTests` (+ contrôle négatif `http.server`) |
+| aucun import réseau dans le serveur | analyse AST de `heimdall/mcp/` | `NoTrafficTests` |
 
 ## 5. Lancement en CI / debug
 
