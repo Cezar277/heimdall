@@ -7,8 +7,10 @@ ni supprimer un candidat en silence, ni decider en CI. L'implementation
 complete (#28/#32/#33) devra conserver ces invariants.
 Limite assumee : les gardes ci-dessous sont des controles AST statiques sur
 les squelettes (garde-doc). Elles ne voient ni les imports dynamiques
-obfusques ni le comportement runtime : la preuve d'absence d'appel LLM en CI
-reste due par les tests runtime de #28.
+obfusques (`__import__` variable, `getattr(os,"sy"+"stem")`), ni `pty` ou
+`multiprocessing` utilises sans import en clair, ni le comportement runtime :
+la preuve d'absence d'appel LLM en CI (dont un test reseau sans egress et
+l'observation `Retry-After`) reste due par les tests runtime de #28.
 """
 
 import ast
@@ -27,8 +29,11 @@ REQUIREMENTS = REPO / "docs" / "security" / "requirements.md"
 # Garde AST statique : aucun import reseau/subprocess ni appel shell/exec dans
 # le chemin CLI/MCP actuel. Une denylist par chaines ("httpx" not in src) est
 # contournable par urllib.request/http.client/subprocess : l'AST voit tous les
-# imports, quel que soit le module. L'obfuscation dynamique reste hors de
-# portee (preuve runtime due en #28).
+# imports, quel que soit le module. `os` est interdit a l'import car
+# os.execv/spawn/fork/system echappent aux noms de modules reseau ; `pty`,
+# `multiprocessing` et `importlib` (chargement dynamique) aussi. L'obfuscation
+# dynamique (`__import__` variable, getattr concatene) reste hors de portee
+# (preuve runtime due en #28).
 _FORBIDDEN_IMPORTS = frozenset(
     {
         "socket",
@@ -41,9 +46,37 @@ _FORBIDDEN_IMPORTS = frozenset(
         "subprocess",
         "telnetlib",
         "smtplib",
+        "os",
+        "pty",
+        "multiprocessing",
+        "importlib",
     }
 )
-_FORBIDDEN_CALLS = frozenset({"system", "popen", "run", "call", "Popen", "exec", "eval"})
+_FORBIDDEN_CALLS = frozenset(
+    {
+        "system",
+        "popen",
+        "run",
+        "call",
+        "Popen",
+        "exec",
+        "eval",
+        "__import__",
+        "execv",
+        "execve",
+        "execl",
+        "execlp",
+        "execvp",
+        "execvpe",
+        "spawnl",
+        "spawnlp",
+        "spawnv",
+        "spawnvp",
+        "spawnve",
+        "spawn",
+        "fork",
+    }
+)
 
 
 def _network_or_exec_violations(path: Path) -> list[str]:

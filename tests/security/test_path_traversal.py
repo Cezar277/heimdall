@@ -51,7 +51,11 @@ def _relpath_rejects(value: str) -> bool:
     return re.fullmatch(pattern, value) is None
 
 
-# Sinks d'ecriture/suppression bannis du squelette MCP (lecture seule).
+# Sinks d'ecriture/suppression/execution bannis du squelette MCP (lecture
+# seule). Couvre os/niveau descripteur, pathlib, shutil et exec/spawn : un
+# `shutil.copyfile` ou `os.symlink` futur passerait un set limite a
+# open/write. Reste hors portee : acces dynamiques (getattr), `pty` (couvert
+# par "spawn" si appele en clair).
 _WRITE_SINK_ATTRS = frozenset(
     {
         "open",
@@ -60,12 +64,33 @@ _WRITE_SINK_ATTRS = frozenset(
         "write_bytes",
         "writelines",
         "mkdir",
+        "makedirs",
+        "symlink",
         "symlink_to",
+        "link",
         "unlink",
         "rename",
         "replace",
         "remove",
         "rmdir",
+        "rmtree",
+        "copy",
+        "copyfile",
+        "copytree",
+        "move",
+        "execv",
+        "execve",
+        "execl",
+        "execlp",
+        "execvp",
+        "execvpe",
+        "spawnl",
+        "spawnlp",
+        "spawnv",
+        "spawnvp",
+        "spawnve",
+        "spawn",
+        "fork",
     }
 )
 
@@ -155,10 +180,11 @@ def test_mcp_read_only_surface() -> None:
         assert schema["$defs"][name]["additionalProperties"] is False, name
     # Le serveur squelette est fail-closed et n'ecrit rien : interdiction AST
     # des sinks d'ecriture (un test par chaines "open(" est contournable par
-    # Path.write_bytes, os.open, io.open...). Limite assumee : l'AST ne voit
-    # pas les acces dynamiques (getattr) ; la vraie preuve (aucune valeur
-    # connue dans les champs serialises, aucune ecriture hors racine) reste
-    # due par les tests runtime de #27/#30, qui reecriront cette garde.
+    # Path.write_bytes, os.open, io.open, shutil.copyfile, os.symlink...).
+    # Limite assumee : l'AST ne voit pas les acces dynamiques (getattr,
+    # `getattr(os,"sy"+"stem")`) ; la vraie preuve (aucune valeur connue dans
+    # les champs serialises, aucune ecriture hors racine) reste due par les
+    # tests runtime de #27/#30, qui reecriront cette garde.
     assert _write_sink_calls(MCP_SERVER) == []
     src = MCP_SERVER.read_text(encoding="utf-8")
     assert "sans outil d'écriture, d'exécution ou réseau" in src

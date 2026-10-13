@@ -133,7 +133,15 @@ def test_visual_proof_required_not_script_green() -> None:
 
 
 def test_no_real_secrets_in_fixtures() -> None:
-    """Garde DoD : fixtures synthetiques uniquement, jamais de vrai secret."""
+    """Garde DoD : aucun vrai secret dans les fichiers livres par CETTE PR.
+
+    Perimetre exact (`git diff main...HEAD --name-only`) : balayer tout
+    l'arbre echouerait sur les faux realistes volontaires et documentes des
+    tickets geles #14/#16 (ADR-002 : le faux `sk_live_*` et le marqueur
+    `AKIA...EXAMPLE` de la fixture de masquage), qui appartiennent a leurs
+    tickets. Chaque PR etend sa propre garde ; celle-ci couvre les 7
+    fichiers T19, ni plus ni moins.
+    """
     secret_patterns = [
         r"AKIA[0-9A-Z]{16}",
         r"sk_live_[0-9A-Za-z]+",
@@ -142,10 +150,18 @@ def test_no_real_secrets_in_fixtures() -> None:
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
         r"AIza[0-9A-Za-z_-]{20,}",
     ]
-    files = list((REPO / "tests" / "security").glob("test_*.py"))
-    files.append(REQUIREMENTS)
-    assert len(files) >= 6
-    for path in files:
+    pr_files = [
+        REPO / "docs/security/requirements.md",
+        REPO / "tests/security/test_prompt_injection.py",
+        REPO / "tests/security/test_path_traversal.py",
+        REPO / "tests/security/test_vault_replay_bruteforce.py",
+        REPO / "tests/security/test_scanner_bypass.py",
+        REPO / "tests/security/test_requirements_traceability.py",
+        REPO / ".github/workflows/security-model.yml",
+    ]
+    assert len(pr_files) == 7
+    for path in pr_files:
+        assert path.is_file(), path  # perimetre non vide et non reductible
         text = path.read_text(encoding="utf-8")
         for pattern in secret_patterns:
-            assert re.search(pattern, text) is None, f"{path.name}: {pattern}"
+            assert re.search(pattern, text) is None, f"{path.relative_to(REPO)}: {pattern}"

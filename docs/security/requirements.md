@@ -91,7 +91,7 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
 (`test_obfuscation_corpus_is_mandatory`), échange de lien concurrent rejeté
 (`test_symlink_swap_rejected_at_use`), traçabilité complète
 (`test_all_requirements_have_tests`), formulations non vagues
-(`test_no_vague_requirements`), fixtures sans vrai secret
+(`test_no_vague_requirements`), balayage anti-secrets des 7 fichiers de la PR
 (`test_no_real_secrets_in_fixtures`).
 
 ## Exigences détaillées
