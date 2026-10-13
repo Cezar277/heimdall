@@ -85,7 +85,7 @@ cette allowlist loopback avec URL canonique et refus des formes encodées.
 | `REQ-SEC-07` | Scanner : base64/concat détectés, incomplet JAMAIS propre | R1, [SCN-T](stride.md#scn-t) | `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean` |
 | `REQ-SEC-08` | Hook contournable : CI de confiance indépendante requise | R5, [HOOK-T](stride.md#hook-t) | `tests/security/test_scanner_bypass.py::test_hook_bypass_requires_trusted_ci` |
 | `REQ-SEC-09` | H1/H4 : loopback + TLS vérifié seuls avant PR dédiée | R6/R8, H1/H4, B3/B4 | `tests/security/test_requirements_traceability.py::test_h1_h4_loopback_engagement` |
-| `REQ-SEC-10` | Preuve visuelle DFD exigée, vert script seul insuffisant | Transverse T18 | `tests/security/test_requirements_traceability.py::test_visual_proof_required_not_script_green` |
+| `REQ-SEC-10` | Preuve visuelle DFD exigée, vert script seul insuffisant | R8 transverse, [CI-E](stride.md#ci-e) | `tests/security/test_requirements_traceability.py::test_visual_proof_required_not_script_green` |
 
 Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
 (`test_obfuscation_corpus_is_mandatory`), échange de lien concurrent rejeté

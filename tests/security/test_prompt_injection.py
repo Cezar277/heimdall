@@ -72,10 +72,11 @@ def test_llm_rejection_never_silent() -> None:
     for snippet in HOSTILE_SNIPPETS:
         assert "SYNTHETIC" in snippet
         assert "AKIA" not in snippet and "sk_live" not in snippet
-    # 7. Squelette MCP fail-closed : demarrage impossible sans implementation.
+    # 7. Squelette MCP fail-closed : demarrage impossible sans implementation,
+    # avec message statique (l'entree `root` est detruite, jamais refletee).
     server_src = MCP_SERVER.read_text(encoding="utf-8")
     assert "raise NotImplementedError" in server_src
-    assert "réflexion" not in server_src  # message statique, pas d'echo
+    assert "del root" in server_src
 
 
 def test_no_llm_in_ci() -> None:

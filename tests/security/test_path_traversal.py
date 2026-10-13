@@ -137,7 +137,15 @@ def test_symlink_swap_rejected_at_use(tmp_path: Path) -> None:
     data = checker.read_confined_bytes(victim, repository.resolve(), 1024)
     assert data == b"v1\n"
     # Un repertoire a la place du fichier est refuse (pas un fichier regulier).
+    # Sur Windows, l'ouverture echoue directement (OSError) ; sur POSIX,
+    # le descripteur est rejete comme non regulier (ValueError).
     victim.unlink()
     victim.mkdir()
-    with pytest.raises(ValueError, match="regular"):
+    try:
         checker.read_confined_bytes(victim, repository.resolve(), 1024)
+    except ValueError as exc:
+        assert "regular" in str(exc)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("repertoire accepte comme fichier regulier")
