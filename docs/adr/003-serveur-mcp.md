@@ -136,7 +136,11 @@ au LLM à ignorer les marqueurs ; **une valeur quotée dépassant 20 000
 caractères sur une seule ligne n'est pas masquée** (borne anti-ReDoS
 assumée : `_QUOTED_ASSIGNMENT` bornée à `{4,20000}`, un credential réel
 ne fait pas plus de 20 Ko et les lignes sont de toute façon plafonnées
-par le contrat). La détection de précision appartient au
+par le contrat) ; **coût masquage ≤ 1 Mo/ligne, masquer-puis-tronquer assumé** : dans
+`sanitize_file`, une ligne peut atteindre 1 Mo et fait passer les expressions régulières
+sur la ligne complète avant troncature à 2 000 caractères (`MAX_LINE_CHARS`), garantissant
+qu'aucune valeur de secret n'est sectionnée avant détection (coût CPU borné à 1 Mo, regex
+linéaires sans ReDoS). La détection de précision appartient au
 scanner #22 mesuré en #21. Preuve :
 `heimdall/mcp/masking.py`, `tests/test_mcp_hardening.py::BareTokenMaskingTests`,
 `tests/test_mcp_hardening.py::MaskingPerformanceTests`.

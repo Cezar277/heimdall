@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -229,24 +230,29 @@ class SanitizeFileToolTests(FileRepoTestCase):
         self.assertTrue(payload["truncated"])
 
     def test_giant_line_is_bounded_to_max_line_chars_without_blocking(self) -> None:
-        """Ligne géante (~900 Ko) : chaque ligne est bornée à 2 000 caractères, pas de blocage."""
+        """Ligne géante (~900 Ko) : bornée à 2 000 caractères en temps borné."""
         (self.repo / "giant.txt").write_text("a" * 900_000, encoding="utf-8")
+        start = time.perf_counter()
         payload = self.read({"path": "giant.txt"})
+        duration = time.perf_counter() - start
+        self.assertLess(duration, 10.0, "Le traitement de la ligne géante ne doit pas bloquer")
         self.assertLessEqual(len(payload["content"]), 2_000)
         self.assertTrue(payload["truncated"])
 
     def test_hardlink_alias_behavior_is_documented_boundary(self) -> None:
         """Hardlink alias innocent pointant vers .env.
 
-        Lu sous son alias : limite documentée ADR-003 §9.
+        Lu sous son alias avec contenu masqué : limite documentée ADR-003 §9.
         """
+        self.write(".env", f"SECRET_KEY='{FAKE_GITHUB_TOKEN}'\n")
         try:
             os.link(self.repo / ".env", self.repo / "innocent.txt")
         except OSError:
             self.skipTest("hardlinks non supportés sur ce système de fichiers")
         payload = self.read({"path": "innocent.txt"})
         self.assertEqual(payload["path"], "innocent.txt")
-        self.assertIn("TOKEN=valeur", payload["content"])
+        self.assertIn("<REDACTED:", payload["content"])
+        self.assertNotIn(FAKE_GITHUB_TOKEN, payload["content"])
 
     def test_response_conforms_to_the_contract(self) -> None:
         """Critère d'acceptation du #27 : réponse conforme au schéma."""
