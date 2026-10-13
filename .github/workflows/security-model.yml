@@ -4,7 +4,7 @@ name: Security model
 on:
   pull_request:
   push:
-    branches: [main, 18-t18-modele-de-menaces-stride-et-dfd]
+    branches: [main, 18-t18-modele-de-menaces-stride-et-dfd, 19-t19-exigences-de-securite-et-abuse-cases]
 
 permissions:
   contents: read
@@ -27,7 +27,7 @@ jobs:
       - name: Check documents and regression coverage
         run: |
           .venv-security/bin/python docs/security/check_model.py
-          .venv-security/bin/python -m pytest tests/test_check_model.py --cov=docs/security --cov-branch --cov-report=term-missing --cov-fail-under=95
+          .venv-security/bin/python -m pytest tests/test_check_model.py tests/security --cov=docs/security --cov-branch --cov-report=term-missing --cov-fail-under=95
       - name: Check PR whitespace and identify reviewed artifacts
         env:
           EVENT_NAME: ${{ github.event_name }}
