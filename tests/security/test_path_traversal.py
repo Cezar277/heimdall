@@ -51,14 +51,15 @@ def _relpath_rejects(value: str) -> bool:
     return re.fullmatch(pattern, value) is None
 
 
-# Sinks d'ecriture/suppression/execution bannis du squelette MCP (lecture
+# Sinks d'ecriture/suppression/execution bannis du serveur MCP (lecture
 # seule). Couvre os/niveau descripteur, pathlib, shutil et exec/spawn : un
 # `shutil.copyfile` ou `os.symlink` futur passerait un set limite a
-# open/write. Reste hors portee : acces dynamiques (getattr), `pty` (couvert
-# par "spawn" si appele en clair).
+# open/write. `os.open` N'EST PAS un sink en soi : la lecture seule
+# (`O_RDONLY` + `O_NOFOLLOW`, mandat #76, garde TOCTOU) est autorisee et
+# controlee separement par `_write_mode_open_violations`. Reste hors portee :
+# acces dynamiques (getattr), `pty` (couvert par "spawn" si appele en clair).
 _WRITE_SINK_ATTRS = frozenset(
     {
-        "open",
         "write",
         "write_text",
         "write_bytes",
@@ -93,6 +94,57 @@ _WRITE_SINK_ATTRS = frozenset(
         "fork",
     }
 )
+
+# Fanions d'ouverture en ecriture/creation : refuses. `os.open` n'est
+# autorise qu'en lecture seule (`O_RDONLY` exige), sans aucun de ces
+# fanions — c'est le motif impose par #76 (O_NOFOLLOW, garde TOCTOU
+# fail-closed). Un appel sans fanion lisible (variable) est refuse par
+# defaut : en cas de doute on bloque, pas l'inverse.
+_WRITE_OPEN_FLAGS = frozenset(
+    {"O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC", "O_EXCL", "O_TMPFILE"}
+)
+
+
+def _open_flag_names(call: ast.Call) -> set[str]:
+    """Noms O_* du 2e argument positionnel (ou mot-clé `flags`) d'os.open."""
+    target = None
+    if len(call.args) >= 2:
+        target = call.args[1]
+    else:
+        for keyword in call.keywords:
+            if keyword.arg == "flags":
+                target = keyword.value
+                break
+    if target is None:
+        return set()
+    return {
+        node.attr if isinstance(node, ast.Attribute) else node.id
+        for node in ast.walk(target)
+        if isinstance(node, (ast.Attribute, ast.Name))
+    }
+
+
+def _write_mode_open_violations(path: Path) -> list[str]:
+    """Ouvertures en ecriture ou indeterminees (vide = lecture seule)."""
+    found = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "open":
+            flags = _open_flag_names(node)
+            if "O_RDONLY" not in flags or not flags.isdisjoint(_WRITE_OPEN_FLAGS):
+                found.append(".open(write-mode)")
+        elif isinstance(func, ast.Name) and func.id == "open":
+            mode = "r"
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                mode = node.args[1].value
+            for keyword in node.keywords:
+                if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+                    mode = keyword.value.value
+            if not isinstance(mode, str) or any(char in mode for char in "wax+"):
+                found.append("open(write-mode)")
+    return found
 
 
 def _write_sink_calls(path: Path) -> list[str]:
@@ -185,17 +237,29 @@ def test_mcp_read_only_surface() -> None:
     # sur les entrees (verification sur un echantillon d'objets).
     for name in ("ReadDiffInput", "SanitizeFileInput", "ListCandidatesInput", "ProposePatchInput"):
         assert schema["$defs"][name]["additionalProperties"] is False, name
-    # Le serveur squelette est fail-closed et n'ecrit rien : interdiction AST
-    # des sinks d'ecriture (un test par chaines "open(" est contournable par
-    # Path.write_bytes, os.open, io.open, shutil.copyfile, os.symlink...).
+    # Le serveur #27 est implémenté et lit en lecture seule (O_RDONLY +
+    # O_NOFOLLOW, garde TOCTOU) sans jamais écrire : interdiction AST des
+    # sinks d'écriture (un test par chaines "open(" est contournable par
+    # Path.write_bytes, os.open, io.open, shutil.copyfile, os.symlink...),
+    # avec contrôle précis des modes d'ouverture (garde réécrite par #27
+    # comme anticipé ci-dessus : `os.open` en lecture seule autorisé,
+    # tout mode d'écriture refusé).
     # Limite assumee : l'AST ne voit pas les acces dynamiques (getattr,
     # `getattr(os,"sy"+"stem")`) ; la vraie preuve (aucune valeur connue dans
     # les champs serialises, aucune ecriture hors racine) reste due par les
-    # tests runtime de #27/#30, qui reecriront cette garde.
+    # tests runtime de #27/#30.
     assert _write_sink_calls(MCP_SERVER) == []
+    assert _write_mode_open_violations(MCP_SERVER) == []
     src = MCP_SERVER.read_text(encoding="utf-8")
-    assert "sans outil d'écriture, d'exécution ou réseau" in src
-    assert "raise NotImplementedError" in src
+    # La docstring est reformatée sur deux lignes : comparaison insensible
+    # aux retours (le fond — aucun outil d'écriture/exécution/réseau — est
+    # prouvé par le registre fermé + les tests runtime).
+    assert "sans outil d'écriture, d'exécution ou réseau" in " ".join(src.split())
+    # Le squelette qui levait NotImplementedError est implémenté (#27) :
+    # échecs fail-closed en enveloppe, garde à l'usage. Ancres runtime
+    # stables, prouvées en exécution par tests/test_mcp_*.py.
+    for token in ("PATH_ESCAPE", "O_NOFOLLOW", "errors.failure", '"isError"'):
+        assert token in src, token
     # Codes d'erreur de chemin rattaches aux bons outils uniquement.
     sanitize_codes = schema["$defs"]["SanitizeFileError"]["properties"]["code"]["enum"]
     assert "PATH_ESCAPE" in sanitize_codes and "FORBIDDEN_PATH" in sanitize_codes

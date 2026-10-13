@@ -23,6 +23,7 @@ MCP_SCHEMA = REPO / "schemas" / "mcp-tools.schema.json"
 MCP_DOC = REPO / "docs" / "contracts" / "mcp-tools.md"
 FINDING_DOC = REPO / "docs" / "contracts" / "finding.md"
 MCP_SERVER = REPO / "heimdall" / "mcp" / "server.py"
+MCP_GITDIFF = REPO / "heimdall" / "mcp" / "gitdiff.py"
 CLI_MAIN = REPO / "heimdall" / "cli" / "main.py"
 REQUIREMENTS = REPO / "docs" / "security" / "requirements.md"
 
@@ -96,7 +97,16 @@ def _network_or_exec_violations(path: Path) -> list[str]:
             found.append(node.module)
         elif isinstance(node, ast.Call):
             func = node.func
-            if isinstance(func, ast.Name) and func.id in _FORBIDDEN_CALLS:
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "run"
+                and any(keyword.arg == "transport" for keyword in node.keywords)
+            ):
+                # Lanceur MCP stdio (`server.run(transport="stdio")`, voir
+                # #27) : demarre le protocole sur stdin/stdout, pas un
+                # sous-processus shell. Tout autre `.run(` reste banni.
+                pass
+            elif isinstance(func, ast.Name) and func.id in _FORBIDDEN_CALLS:
                 found.append(func.id)
             elif isinstance(func, ast.Attribute) and func.attr in _FORBIDDEN_CALLS:
                 found.append(func.attr)
@@ -111,16 +121,18 @@ def _network_or_exec_violations(path: Path) -> list[str]:
 
 
 # `os`/`pathlib` sont autorises UNIQUEMENT pour la garde de chemin confine
-# (resolve/is_relative_to/open avec O_NOFOLLOW, sur le modele de
-# check_model.py) : bannir `os` en bloc interdirait l'implementation reelle
-# de REQ-SEC-04 en #27. Tout autre usage (exec/spawn/system, makedirs...)
-# reste refuse ici (noms couverts) ou en #27/#30 (preuve runtime).
+# (resolve/is_relative_to/open avec O_NOFOLLOW, lstat sans suivre les liens,
+# sur le modele de check_model.py) : bannir `os` en bloc interdirait
+# l'implementation reelle de REQ-SEC-04 en #27. Tout autre usage
+# (exec/spawn/system, makedirs...) reste refuse ici (noms couverts) ou en
+# #27/#30 (preuve runtime).
 _OS_ALLOWED_ATTRS = frozenset(
     {
         "open",
         "read",
         "close",
         "fstat",
+        "lstat",
         "stat",
         "O_NOFOLLOW",
         "O_RDONLY",
@@ -129,6 +141,38 @@ _OS_ALLOWED_ATTRS = frozenset(
     }
 )
 _PATHLIB_ALLOWED_NAMES = frozenset({"Path", "PurePath", "PurePosixPath", "PureWindowsPath"})
+
+
+def _fixed_argv_violations(path: Path) -> list[str]:
+    """`subprocess` autorisé en #27 pour UNE commande git figée : argv en
+    liste littérale, jamais `shell=True` (CWE-78, mandat explicite du #74 :
+    `subprocess.run([...])` sans `shell=True`, options `--no-ext-diff
+    --no-textconv` contre l'exécution pilotée par le dépôt). Tout appel
+    hors de ce motif (chaîne formatée, `shell=True`, Popen...) est une
+    violation, même si la commande semble inoffensive."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "subprocess"
+            and func.attr in ("run", "call", "check_call", "check_output", "Popen")
+        ):
+            continue
+        for keyword in node.keywords:
+            if (
+                keyword.arg == "shell"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+            ):
+                found.append("shell=True")
+        if not node.args or not isinstance(node.args[0], (ast.List, ast.Tuple)):
+            found.append(f"subprocess.{func.attr}(argv-non-liste)")
+    return found
 
 
 def _os_usage_violations(path: Path) -> list[str]:
@@ -244,11 +288,14 @@ def test_llm_rejection_never_silent() -> None:
     for snippet in HOSTILE_SNIPPETS:
         assert "SYNTHETIC" in snippet
         assert "AKIA" not in snippet and "sk_live" not in snippet
-    # 7. Squelette MCP fail-closed : demarrage impossible sans implementation,
-    # avec message statique (l'entree `root` est detruite, jamais refletee).
+    # 7. Serveur #27 fail-closed au runtime (le squelette qui levait
+    # NotImplementedError est implémenté : voir #27) : racine invalide
+    # refusée sans reflet, tout échec d'outil converti en enveloppe
+    # {"error": …} jamais silencieuse (fail-closed du contrat, prouvé en
+    # exécution par tests/test_mcp_*.py).
     server_src = MCP_SERVER.read_text(encoding="utf-8")
-    assert "raise NotImplementedError" in server_src
-    assert "del root" in server_src
+    for token in ("ToolFailure", "errors.failure", '"isError"', "PATH_ESCAPE"):
+        assert token in server_src, token
 
 
 def test_no_llm_in_ci() -> None:
@@ -267,9 +314,12 @@ def test_no_llm_in_ci() -> None:
     # serveur stdio (mcp/server.py). `os`/`pathlib` restent autorises pour la
     # garde de chemin (resolve/is_relative_to/open avec O_NOFOLLOW, comme
     # check_model.py) : leurs usages sont controles par _os_usage_violations.
+    # Commande git confinee (#27) : argv fige en liste, jamais de shell
+    # (mandat #74, contrat 4.1) — controle par _fixed_argv_violations.
     for path in (CLI_MAIN, MCP_SERVER):
         assert _network_or_exec_violations(path) == [], path.name
         assert _os_usage_violations(path) == [], path.name
+    assert _fixed_argv_violations(MCP_GITDIFF) == []
     req = REQUIREMENTS.read_text(encoding="utf-8")
     assert "REQ-SEC-02" in req
     assert "scan --ci" in req
