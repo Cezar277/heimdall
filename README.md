@@ -39,13 +39,22 @@ heimdall scan --ci        # idem : refuse par défaut plutôt que d'inventer un 
 
 ### Serveur Vault
 
-Le serveur Vault démarre sur la boucle locale (127.0.0.1:8443 par défaut) :
+Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) :
 
 ```sh
+# Lancement avec validation stricte de l'hôte (recommandé) :
+python -m heimdall.vault.app
+
+# Ou directement via uvicorn (respecter impérativement l'adresse de boucle locale) :
 uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443
 ```
 
-Vérifier la santé minimale (`/api/v1/health` contractuel, `/health` alias) :
+> **Note sécurité & dette technique** :
+> Ce squelette minimal (ticket #25) est confiné à la boucle locale (`127.0.0.1`).
+> Le support TLS (certificat SAN IP obligatoire, `https://`) sera intégré avec les routes à secrets dans les tickets suivants (#64/#65).
+> Ne jamais exposer ce serveur en clair hors de localhost.
+
+Vérifier la santé minimale (`/api/v1/health` contractuel, `/health` alias local) :
 
 ```sh
 curl http://127.0.0.1:8443/api/v1/health

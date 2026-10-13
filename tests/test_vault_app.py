@@ -3,8 +3,9 @@
 Vérifie l'application FastAPI, la configuration via variables d'environnement
 (pydantic-settings), l'absence de fuite d'informations sur `/health` et `/api/v1/health`,
 la désactivation par défaut de la documentation OpenAPI (/docs, /openapi.json),
+la conformité contractuelle du schéma OpenAPI sur `/api/v1/health`,
 la gestion d'erreurs contractuelle (400, 401, 403, 404, 405, 409, 429, 503)
-sans enveloppe framework, et l'allowlist stricte de boucle locale (127.0.0.0/8, ::1, localhost).
+sans enveloppe framework, et l'allowlist alignée sur VaultClient (127.0.0.1, ::1, localhost).
 """
 
 import os
@@ -22,6 +23,7 @@ from heimdall.vault.app import (
     app,
     create_app,
     get_settings,
+    run_server,
 )
 
 
@@ -68,8 +70,8 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
                     {"code": "not_found", "message": "Ressource introuvable"},
                 )
 
-    async def test_docs_enabled_explicitly_in_dev(self) -> None:
-        """En mode dev explicite (enable_docs=True), /docs et /openapi.json sont disponibles."""
+    async def test_docs_enabled_explicitly_in_dev_declares_contractual_responses(self) -> None:
+        """En mode dev, le schéma OpenAPI déclare toutes les réponses contractuelles."""
         dev_app = create_app(VaultSettings(enable_docs=True))
         async with AsyncClient(
             transport=ASGITransport(app=dev_app), base_url="http://127.0.0.1:8443"
@@ -79,8 +81,19 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
             openapi_resp = await dev_client.get("/openapi.json")
             self.assertEqual(openapi_resp.status_code, 200)
             schema = openapi_resp.json()
-            # La route /api/v1/health est présente dans le schéma OpenAPI
+
+            # La route /api/v1/health est présente et conforme
             self.assertIn("/api/v1/health", schema["paths"])
+            responses = schema["paths"]["/api/v1/health"]["get"]["responses"]
+            for expected_code in ("200", "405", "429", "500", "503", "default"):
+                self.assertIn(expected_code, responses)
+
+            # Retry-After est obligatoire sur 429 et 503
+            for code in ("429", "503"):
+                headers = responses[code]["headers"]
+                self.assertIn("Retry-After", headers)
+                self.assertTrue(headers["Retry-After"]["required"])
+
             # La route de confort /health est exclue du schéma (include_in_schema=False)
             self.assertNotIn("/health", schema["paths"])
 
@@ -124,7 +137,6 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
                 response.json(),
                 {"code": "bad_request", "message": "Requête invalide"},
             )
-            # Ne fuit aucun détail interne ni reflet du corps envoyé
             self.assertNotIn("detail", response.json())
             self.assertNotIn("not-an-int", response.text)
 
@@ -185,6 +197,19 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertNotIn("Secret crash detail", resp.text)
 
+    async def test_non_loopback_client_rejected_by_middleware(self) -> None:
+        """Défense en profondeur : une requête d'une IP distante/LAN est bloquée en 403."""
+        test_app = create_app()
+        # Simule un appel ASGI avec un client non local (192.168.1.50)
+        transport = ASGITransport(app=test_app, client=("192.168.1.50", 54321))
+        async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8443") as c:
+            response = await c.get("/health")
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(
+                response.json(),
+                {"code": "forbidden", "message": "Accès interdit"},
+            )
+
 
 class VaultSettingsTests(unittest.TestCase):
     """Tests de la configuration et des garde-fous pydantic-settings."""
@@ -197,17 +222,15 @@ class VaultSettingsTests(unittest.TestCase):
         self.assertFalse(settings.enable_docs)
 
     def test_loopback_allowlist_accepts_valid_loopback_hosts(self) -> None:
-        """L'allowlist accepte localhost et la boucle locale (127.0.0.0/8, ::1)."""
+        """L'allowlist accepte localhost, 127.0.0.1 et ::1 (aligné sur VaultClient)."""
         valid_hosts = (
             "127.0.0.1",
-            "127.0.0.2",
-            "127.255.255.254",
             "::1",
             "localhost",
             "  127.0.0.1  ",
             "LOCALHOST",
         )
-        allowed = {"127.0.0.1", "127.0.0.2", "127.255.255.254", "::1", "localhost"}
+        allowed = {"127.0.0.1", "::1", "localhost"}
         for valid_host in valid_hosts:
             with self.subTest(host=valid_host):
                 cfg = VaultSettings(host=valid_host)
@@ -227,6 +250,7 @@ class VaultSettingsTests(unittest.TestCase):
             "::ffff:0.0.0.0",
             "localhost.evil.com",
             "evil.example.com",
+            "127.0.0.2",  # Hors allowlist canonique {127.0.0.1, ::1, localhost}
         )
         for invalid_host in invalid_hosts:
             with self.subTest(host=invalid_host):
@@ -246,13 +270,13 @@ class VaultSettingsTests(unittest.TestCase):
     def test_load_settings_from_environment_variables(self) -> None:
         """La configuration doit lire les variables d'environnement préfixées HEIMDALL_VAULT_."""
         env = {
-            "HEIMDALL_VAULT_HOST": "127.0.0.2",
+            "HEIMDALL_VAULT_HOST": "localhost",
             "HEIMDALL_VAULT_PORT": "9443",
             "HEIMDALL_VAULT_ENABLE_DOCS": "true",
         }
         with patch.dict(os.environ, env, clear=False):
             loaded = VaultSettings()
-            self.assertEqual(loaded.host, "127.0.0.2")
+            self.assertEqual(loaded.host, "localhost")
             self.assertEqual(loaded.port, 9443)
             self.assertTrue(loaded.enable_docs)
 
@@ -265,7 +289,7 @@ class VaultSettingsTests(unittest.TestCase):
 
     def test_create_app_factory_applies_settings_parameter(self) -> None:
         """create_app applique les paramètres transmis et ne les ignore pas."""
-        custom_settings = VaultSettings(host="127.0.0.3", port=8445, enable_docs=True)
+        custom_settings = VaultSettings(host="::1", port=8445, enable_docs=True)
         custom_app = create_app(custom_settings)
         self.assertIsInstance(custom_app, FastAPI)
         self.assertEqual(custom_app.title, "Heimdall Vault API")
@@ -277,6 +301,10 @@ class VaultSettingsTests(unittest.TestCase):
         """Le modèle de santé interdit tout champ supplémentaire."""
         with self.assertRaises(ValidationError):
             HealthResponse(status="ok", extra="unauthorized")  # type: ignore[call-arg]
+
+    def test_run_server_is_callable(self) -> None:
+        """run_server est défini et appelable comme point d'entrée."""
+        self.assertTrue(callable(run_server))
 
 
 if __name__ == "__main__":

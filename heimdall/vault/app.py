@@ -7,10 +7,15 @@ Lancement du serveur :
     uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443
 
 RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
-- Allowlist boucle locale : écoute EXCLUSIVEMENT sur la boucle locale (127.0.0.0/8, ::1, localhost).
+- Allowlist boucle locale : écoute EXCLUSIVEMENT sur la boucle locale (127.0.0.1, ::1, localhost),
+  strictement alignée sur `heimdall.vault.client._ALLOWED_LOOPBACK_HOSTS`.
   Toute adresse LAN, WAN, broadcast ou 0.0.0.0 est rejetée (mitigation Network exposure / Spoofing).
+- Garde de défense en profondeur : middleware HTTP bloquant avec 403 toute requête provenant d'une
+  IP non-loopback même si le serveur était lancé par mégarde sur toutes les interfaces.
 - Documentation désactivée par défaut : docs_url, redoc_url et openapi_url sont désactivés
   pour interdire la reconnaissance d'empreinte (fingerprinting) et l'exposition de version/schéma.
+- Schéma OpenAPI conforme : /api/v1/health déclare l'ensemble des réponses contractuelles (200, 405,
+  429, 500, 503, default) avec header Retry-After obligatoire sur 429 et 503.
 - La route /api/v1/health (et son alias /health) ne divulgue JAMAIS de version, de détails
   de configuration, de chemins ou de données internes (mitigation Information Disclosure).
 - Confinement crypto (ticket #17) : ce module n'importe JAMAIS cryptography ou
@@ -25,8 +30,9 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 
 import ipaddress
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
+import uvicorn
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -34,6 +40,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
+
+_ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
 
 _ERROR_PAYLOADS: dict[int, dict[str, str]] = {
     400: {"code": "bad_request", "message": "Requête invalide"},
@@ -45,6 +53,63 @@ _ERROR_PAYLOADS: dict[int, dict[str, str]] = {
     429: {"code": "rate_limited", "message": "Trop de requêtes"},
     500: {"code": "internal_error", "message": "Erreur interne"},
     503: {"code": "unavailable", "message": "Service indisponible"},
+}
+
+
+class MethodNotAllowedError(BaseModel):
+    """Erreur 405 contractuelle."""
+
+    model_config = ConfigDict(extra="forbid")
+    code: Literal["method_not_allowed"] = "method_not_allowed"
+    message: Literal["Méthode non autorisée"] = "Méthode non autorisée"
+
+
+class RateLimitedError(BaseModel):
+    """Erreur 429 contractuelle."""
+
+    model_config = ConfigDict(extra="forbid")
+    code: Literal["rate_limited"] = "rate_limited"
+    message: Literal["Trop de requêtes"] = "Trop de requêtes"
+
+
+class UnavailableError(BaseModel):
+    """Erreur 503 contractuelle."""
+
+    model_config = ConfigDict(extra="forbid")
+    code: Literal["unavailable"] = "unavailable"
+    message: Literal["Service indisponible"] = "Service indisponible"
+
+
+class InternalError(BaseModel):
+    """Erreur 500 contractuelle."""
+
+    model_config = ConfigDict(extra="forbid")
+    code: Literal["internal_error"] = "internal_error"
+    message: Literal["Erreur interne"] = "Erreur interne"
+
+
+_RETRY_AFTER_HEADER = {
+    "Retry-After": {
+        "required": True,
+        "description": "Délai en secondes avant nouvelle tentative.",
+        "schema": {"type": "integer", "minimum": 1, "maximum": 3600},
+    }
+}
+
+_HEALTH_RESPONSES: dict[int | str, dict[str, Any]] = {
+    405: {"model": MethodNotAllowedError, "description": "Méthode non autorisée"},
+    429: {
+        "model": RateLimitedError,
+        "description": "Trop de requêtes",
+        "headers": _RETRY_AFTER_HEADER,
+    },
+    500: {"model": InternalError, "description": "Erreur interne"},
+    503: {
+        "model": UnavailableError,
+        "description": "Service indisponible",
+        "headers": _RETRY_AFTER_HEADER,
+    },
+    "default": {"model": InternalError, "description": "Erreur inattendue"},
 }
 
 
@@ -75,23 +140,14 @@ class VaultSettings(BaseSettings):
     @field_validator("host")
     @classmethod
     def validate_host(cls, value: str) -> str:
-        """Valide que l'hôte appartient exclusivement à la boucle locale (allowlist)."""
+        """Valide que l'hôte appartient à l'allowlist loopback alignée sur VaultClient."""
         cleaned = value.strip().lower()
         if not cleaned:
             raise ValueError("L'adresse d'hôte ne peut pas être vide ou blanche.")
-        if cleaned == "localhost":
-            return "localhost"
-        try:
-            addr = ipaddress.ip_address(cleaned)
-        except ValueError as err:
+        if cleaned not in _ALLOWED_LOOPBACK_HOSTS:
             raise ValueError(
-                f"Adresse d'hôte invalide : {value!r}. "
-                "Seules les adresses de boucle locale sont autorisées."
-            ) from err
-        if not addr.is_loopback:
-            raise ValueError(
-                f"Adresse d'hôte non locale interdite : {value!r}. "
-                "Le Vault doit écouter exclusivement sur la boucle locale."
+                f"Adresse d'hôte non autorisée : {value!r}. "
+                "Le Vault doit écouter sur la boucle locale (127.0.0.1, ::1, localhost)."
             )
         return cleaned
 
@@ -128,6 +184,28 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
         openapi_url=openapi_url,
     )
     app.state.settings = effective_settings
+
+    @app.middleware("http")
+    async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:
+        """Défense en profondeur : bloque toute connexion ne provenant pas de localhost."""
+        client = request.client
+        if client and client.host:
+            host = client.host
+            if host != "testclient":
+                try:
+                    addr = ipaddress.ip_address(host)
+                    if not addr.is_loopback:
+                        return JSONResponse(
+                            status_code=403,
+                            content=_ERROR_PAYLOADS[403],
+                        )
+                except ValueError:
+                    if host not in _ALLOWED_LOOPBACK_HOSTS:
+                        return JSONResponse(
+                            status_code=403,
+                            content=_ERROR_PAYLOADS[403],
+                        )
+        return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
@@ -169,6 +247,7 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
     @app.get(
         "/api/v1/health",
         response_model=HealthResponse,
+        responses=_HEALTH_RESPONSES,
         tags=["Health"],
         summary="Vérifier la santé minimale",
         operation_id="getHealth",
@@ -193,21 +272,30 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
 
 app = create_app()
 
-__all__ = [
-    "HealthResponse",
-    "Settings",
-    "VaultSettings",
-    "app",
-    "create_app",
-    "get_settings",
-]
 
-if __name__ == "__main__":
-    import uvicorn
-
+def run_server() -> None:
+    """Démarre le serveur Vault avec les paramètres validés (localhost uniquement)."""
     server_settings = get_settings()
     uvicorn.run(
         "heimdall.vault.app:app",
         host=server_settings.host,
         port=server_settings.port,
     )
+
+
+__all__ = [
+    "HealthResponse",
+    "InternalError",
+    "MethodNotAllowedError",
+    "RateLimitedError",
+    "Settings",
+    "UnavailableError",
+    "VaultSettings",
+    "app",
+    "create_app",
+    "get_settings",
+    "run_server",
+]
+
+if __name__ == "__main__":
+    run_server()
