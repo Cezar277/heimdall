@@ -37,6 +37,21 @@ heimdall scan             # bloqué tant que le scanner #22 n'est pas livré (fa
 heimdall scan --ci        # idem : refuse par défaut plutôt que d'inventer un verdict
 ```
 
+### Serveur Vault
+
+Le serveur Vault démarre sur la boucle locale (127.0.0.1:8443 par défaut) :
+
+```sh
+uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443
+```
+
+Vérifier la santé minimale (`/api/v1/health` contractuel, `/health` alias) :
+
+```sh
+curl http://127.0.0.1:8443/api/v1/health
+# {"status": "ok"}
+```
+
 ## Structure
 
 ```text
