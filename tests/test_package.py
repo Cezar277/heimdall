@@ -70,8 +70,6 @@ class PackageSmokeTests(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             heimdall.scanner.detect.find_candidates(".")
         with self.assertRaises(NotImplementedError):
-            heimdall.mcp.server.run_stdio(".")
-        with self.assertRaises(NotImplementedError):
             heimdall.vault.crypto.encrypt_at_rest(b"x", "k")
         with self.assertRaises(ValueError):
             heimdall.vault.client.VaultClient("http://127.0.0.1:8443", "PLACEHOLDER")
@@ -171,7 +169,8 @@ class PackageSmokeTests(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as ctx:
             heimdall.scanner.detect.find_candidates(marker)
         self.assertNotIn(marker, str(ctx.exception))
-        with self.assertRaises(NotImplementedError) as ctx:
+        # #27 : run_stdio valide sa racine en ValueError, message statique.
+        with self.assertRaises(ValueError) as ctx:
             heimdall.mcp.server.run_stdio(marker)
         self.assertNotIn(marker, str(ctx.exception))
 

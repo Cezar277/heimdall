@@ -13,6 +13,7 @@ jamais 1, réservé aux secrets avérés.
 import typer
 
 import heimdall
+from heimdall.mcp.server import run_stdio
 
 app = typer.Typer(
     name="heimdall",
@@ -40,6 +41,25 @@ def scan(
     del path, ci  # #22 branchera le scanner réel ici.
     typer.echo("heimdall scan: scanner non implémenté (voir #22) — refus par défaut.", err=True)
     raise typer.Exit(code=2)
+
+
+@app.command()
+def mcp(
+    root: str = typer.Option(".", "--root", help="Racine du dépôt exposée au LLM."),
+) -> None:
+    """Démarre le serveur MCP sur stdio (outils en lecture seule, contrat #16).
+
+    Le serveur vit en sous-processus et n'ouvre aucun port. La racine est
+    fixée ici, au démarrage : le LLM ne la fournit jamais (contrat #16,
+    invariant 2). stdout ne porte que le protocole — tout le reste va sur
+    stderr, sous peine de casser le canal.
+    """
+    try:
+        run_stdio(root)
+    except ValueError as exc:
+        # Message statique : aucune entrée reflétée (invariant 8).
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from None
 
 
 def main() -> None:
