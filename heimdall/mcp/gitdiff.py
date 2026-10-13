@@ -10,6 +10,13 @@ verrouillé :
   sans toucher au code ; ils sont simplement absents de l'environnement
   passé au sous-processus. Idem ``HOME`` et les configurations
   système/global ;
+- **découverte plafonnée à la racine**. ``GIT_CEILING_DIRECTORIES`` vaut le
+  parent de la racine : git n'y entre jamais, donc aucun dépôt au-dessus de
+  la racine n'est découvert — le refus vient de git, pas seulement de
+  ``is_repository()`` (invariant 3) ;
+- **stdin fermé**. ``stdin=subprocess.DEVNULL`` sur chaque appel : le fils
+  n'hérite pas du pipe JSON-RPC du serveur, donc aucune sous-commande
+  future ne peut en consommer les octets ni s'y bloquer ;
 - **configuration locale neutralisée**. Le `.git/config` du dépôt scanné
   est toujours lu par git : `core.fsmonitor` y exécute une commande à
   chaque `diff`/`check-ignore` (prouvé par exécution). Chaque appel est
@@ -81,6 +88,26 @@ def confined_environment(root: Path) -> dict[str, str]:
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",  # aucun verrou optionnel pris dans .git/
+        # Plafond de découverte = le PREMIER dossier que git ascendererait,
+        # c'est-à-dire le PARENT de la racine : git refuse d'y entrer, donc
+        # aucun dépôt au-dessus de la racine n'est découvert (invariant 3).
+        #
+        # Ne pas « corriger » en mettant la racine elle-même : git n'exclut
+        # que l'entrée dans un dossier plafond, et il est DÉJÀ dans la
+        # racine — le plafond ne bloquerait alors rien. Matrice prouvée par
+        # exécution (racine = `repo/sous`, dépôt en `repo`) :
+        #
+        #   plafond = parent : `rev-parse --show-toplevel` → rc=128,
+        #                       « not a git repository » : le dépôt parent
+        #                       est INATTEIGNABLE, et ce refus vient de git,
+        #                       pas de notre test d'égalité — donc un outil
+        #                       futur qui oublierait `is_repository()`
+        #                       n'hériterait de rien non plus.
+        #   plafond = racine : rc=0, toplevel = le dépôt PARENT : la
+        #                       garantie retomberait sur chaque appelant.
+        #
+        # Prouvé aussi qu'un worktree lié répond sa propre racine (le `.git`
+        # y est un fichier), donc un dépôt à la racine reste découvert.
         "GIT_CEILING_DIRECTORIES": str(root.resolve().parent),
     }
 
@@ -159,10 +186,21 @@ class GitAccess:
         module, et `arguments` qui vient du même module. Aucune valeur issue
         du LLM ou du contenu du dépôt n'entre dans la commande (ni dans sa
         configuration d'exécution), et ``shell=True`` n'est jamais utilisé.
+
+        ``stdin=DEVNULL`` : sans lui le fils hérite du **canal stdio MCP**,
+        c'est-à-dire du pipe JSON-RPC du serveur. Aucune sous-commande
+        actuelle ne le lit (`GIT_TERMINAL_PROMPT=0` coupe aussi toute
+        invite), mais un appel futur qui lirait stdin — ou un filtre qui
+        lui parlerait — consommerait des octets du protocole ou bloquerait
+        dessus : l'interférence serait pilotable par le dépôt scanné, donc
+        on ne laisse pas l'héritage en place. Le garde-fou est statique
+        (`tests/security/test_prompt_injection.py` refuse tout appel git
+        sans `stdin=subprocess.DEVNULL`), pas seulement la ligne ci-dessous.
         """
         try:
             return subprocess.run(  # noqa: S603 # nosec B603
                 [self._git, *GIT_CONFIG_OVERRIDES, "-C", str(self._root), *arguments],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 check=False,
                 timeout=GIT_TIMEOUT_SECONDS,
@@ -219,10 +257,14 @@ class GitAccess:
         dans la coupe (en-tête géant : impossible avec un vrai git, dont
         la première ligne est courte), la coupe part telle quelle — une
         en-tête sans `\n` ne porte aucune ligne ajoutée à fuir.
+
+        ``stdin=DEVNULL`` : le pipe JSON-RPC du serveur ne doit jamais être
+        hérité par le fils (même raison que dans ``execute``).
         """
         try:
             proc = subprocess.Popen(  # noqa: S603 # nosec B603
                 [self._git, *GIT_CONFIG_OVERRIDES, "-C", str(self._root), *DIFF_ARGUMENTS],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 env=confined_environment(self._root),

@@ -99,6 +99,29 @@ racine, `GIT_CONFIG_*` neutralisées) : `GIT_DIR`/`GIT_INDEX_FILE` hérités
 ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
 --no-textconv` rendent inopérants `diff.external` et les filtres `textconv`
 (exécution de commande pilotée par le contenu scanné, interdit I5).
+Chaque appel passe aussi **`stdin=subprocess.DEVNULL`** : sans lui le
+sous-processus hérite du pipe JSON-RPC du serveur, donc une sous-commande
+future qui lirait stdin (`apply`, `hash-object --stdin`, un `textconv` si
+l'option sautait) consommerait des octets du protocole ou s'y bloquerait —
+interférence pilotable par le dépôt scanné. Garde **statique**, pas
+seulement la ligne de code : `tests/security/test_prompt_injection.py`
+refuse tout appel git sans `stdin=subprocess.DEVNULL` (avec témoin négatif
+qui prouve que la garde mord).
+
+**Plafond de découverte = le PARENT de la racine**
+(`GIT_CEILING_DIRECTORIES`), parce que git n'exclut que l'**entrée** dans
+un dossier plafond, et que le premier dossier qu'il ascendererait depuis la
+racine est son parent. Prouvé par exécution (racine = `repo/sous`, dépôt en
+`repo`) : `rev-parse --show-toplevel` répond **rc=128** « not a git
+repository » — le dépôt parent est inatteignable, et **le refus vient de
+git**, pas de `is_repository()`. Un outil futur qui oublierait ce test
+n'hériterait de rien non plus (`staged_diff` et `is_ignored` lèvent
+`INTERNAL` sur une racine non-dépôt). Corollaire documenté pour éviter
+une « correction » involontaire : mettre **la racine** comme plafond est
+plus **faible** (rc=0, `toplevel` = dépôt parent), pas plus fort — la
+découverte retomberait sur chaque appelant. Preuve de non-régression :
+`tests/test_mcp_units.py::RepositoryCeilingTests` échoue si le plafond
+redevenait la racine.
 Prouvé par des tests hostiles (`GIT_DIR` piégé, `diff.external` piégé,
 hook `core.fsmonitor` piégé, pager piégé, binaire `git` piégé en tête de
 PATH).
@@ -308,6 +331,7 @@ renseigner la feuille SAMM avec liens permanents au SHA :
 | stdio, racine fixée, registre fermé | `heimdall/mcp/server.py` (`run_stdio`, `build_server`, `SERVER_TOOLS`) |
 | entrées refusées, échecs en enveloppe | `heimdall/mcp/server.py` (`_ToolBoundary`, `tool_handler`), `heimdall/mcp/errors.py` |
 | git confiné, diff typé | `heimdall/mcp/gitdiff.py` (`DIFF_ARGUMENTS`, `confined_environment`, `parse_diff`) |
+| canal stdio jamais hérité par git, plafond de découverte | `heimdall/mcp/gitdiff.py` (`GitAccess.execute`, `GitAccess.staged_diff`, `confined_environment`), `tests/security/test_prompt_injection.py` (`_fixed_argv_violations`) |
 | masquage avant sérialisation, compteurs vrais | `heimdall/mcp/masking.py` (`mask_text`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`) |
 | garde unique, TOCTOU réduite, FIFO refusés | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |
 | coupe sur lignes complètes | `heimdall/mcp/gitdiff.py` (`staged_diff`) |

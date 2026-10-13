@@ -328,6 +328,75 @@ class ConfinedEnvironmentTests(unittest.TestCase):
         self.assertEqual(env["HOME"], tmp)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
 
+    def test_discovery_ceiling_is_the_parent_of_the_root(self) -> None:
+        """Plafond = le parent, parce que c'est lui que git ascendererait.
+
+        git n'exclut que l'**entrée** dans un dossier plafond. Depuis la
+        racine, le premier dossier que git ascendedrait est son PARENT :
+        c'est donc le parent qu'il faut plafonner. Mettre la racine
+        elle-même ne bloquerait rien (git est déjà dedans) et rouvrirait la
+        découverte du dépôt parent — prouvé par `RepositoryCeilingTests`
+        ci-dessous, qui échouerait si le plafond redevenait la racine.
+        """
+        with tempfile.TemporaryDirectory(prefix="heimdall-ceil-") as tmp:
+            root = _Path(tmp) / "racine"
+            root.mkdir()
+            env = gitdiff.confined_environment(root)
+            self.assertEqual(env["GIT_CEILING_DIRECTORIES"], str(root.resolve().parent))
+
+
+class RepositoryCeilingTests(unittest.TestCase):
+    """Preuve par exécution : c'est GIT qui refuse de monter au-dessus.
+
+    Indépendant de `is_repository()` : même un appelant qui oublierait le
+    test d'égalité n'hériterait d'aucun dépôt parent, parce que git ne le
+    découvre pas. C'est la réplique directe au reproche « la garantie
+    repose sur chaque appelant qui n'oublie pas le test ».
+    """
+
+    def setUp(self) -> None:
+        self.repo = GitRepo("heimdall-plafond-", self)
+
+    def test_root_is_still_discovered(self) -> None:
+        """Plafond au parent, dépôt à la racine : le cas normal fonctionne."""
+        access = gitdiff.GitAccess(self.repo.root)
+        self.assertTrue(access.is_repository())
+        self.repo.write("a.txt", "x\n")
+        self.repo.stage("a.txt")
+        raw, truncated = access.staged_diff(10**6)
+        self.assertFalse(truncated)
+        self.assertIn(b"a.txt", raw)
+
+    def test_parent_repository_is_unreachable_from_a_subfolder(self) -> None:
+        """Sous-dossier du dépôt : git lui-même refuse (rc≠0), pas nous."""
+        sub = self.repo.root / "sous" / "profond"
+        sub.mkdir(parents=True)
+        for child in (sub, self.repo.root / "sous"):
+            with self.subTest(root=child.name):
+                access = gitdiff.GitAccess(child)
+                self.assertFalse(access.is_repository())
+                # Preuve directe : le code de retour de git, sans notre test.
+                completed = access.execute(("rev-parse", "--show-toplevel"))
+                self.assertNotEqual(completed.returncode, 0, "git a découvert un dépôt parent")
+
+    def test_tools_on_a_subfolder_fail_closed_without_is_repository(self) -> None:
+        """Sans `is_repository()`, `staged_diff`/`is_ignored` refusent aussi.
+
+        Preuve que la barrière est réelle pour TOUT appelant futur :
+        `staged_diff` lève `INTERNAL` (git sort en erreur, aucune sortie
+        n'est lue) et `is_ignored` lève `INTERNAL` (code de retour
+        inattendu, jamais un « non » par défaut).
+        """
+        sub = self.repo.root / "sous"
+        sub.mkdir()
+        access = gitdiff.GitAccess(sub)
+        with self.assertRaises(ToolFailure) as ctx:
+            access.staged_diff(1024)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+        with self.assertRaises(ToolFailure) as ctx:
+            access.is_ignored("nimporte.txt")
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+
 
 class GitAccessDirectTests(unittest.TestCase):
     """`GitAccess` sans serveur : dépôts jetables, dans le processus."""
@@ -405,6 +474,34 @@ class GitAccessDirectTests(unittest.TestCase):
         self.assertIn(b"a.txt", raw)
         _, truncated = access.staged_diff(10)
         self.assertTrue(truncated)
+
+    def test_no_git_call_inherits_the_server_stdin_pipe(self) -> None:
+        """`stdin=DEVNULL` sur TOUS les appels git (le canal JSON-RPC).
+
+        Le serveur parle MCP sur stdin : un sous-processus qui hérite de ce
+        pipe pourrait en consommer les octets (protocole corrompu) ou s'y
+        bloquer (canal figé, aucun timeout possible côté serveur). Les
+        sous-commandes actuelles ne lisent pas stdin, mais un appel futur
+        (`apply`, `hash-object --stdin`, un `textconv` si l'option sautait)
+        le ferait : on ne laisse donc pas l'héritage en place.
+        """
+        access = gitdiff.GitAccess(self.repo.root)
+        with mock.patch("subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b""
+            )
+            access.execute(("rev-parse", "--is-inside-work-tree"))
+        self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        proc = mock.MagicMock()
+        proc.stdout.read.return_value = b""
+        proc.wait.return_value = 0
+        with mock.patch("subprocess.Popen", return_value=proc) as popen:
+            access.staged_diff(1024)
+        self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        # Les deux autres descripteurs restent capturés/devnull comme avant :
+        # stdout est le seul à être lu, et rien n'est écrit sur le canal.
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.PIPE)
 
     def test_staged_diff_popen_failure_is_internal(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
@@ -701,11 +798,32 @@ class DirectToolErrorTests(unittest.TestCase):
         self.assertFalse(hasattr(server, "_BINARY_SNIFF_BYTES"))
 
     def test_sanitize_open_failures(self) -> None:
+        """Échec d'ouverture du FICHIER visé : code d'erreur dédié.
+
+        Seul le chemin visé est intercepté. Depuis `stdin=DEVNULL`,
+        `subprocess` ouvre aussi `/dev/null` — via `os.open` (le module `io`
+        passe par là depuis Python 3.13) — dans le processus parent : un
+        mock global ferait échouer l'appel git avant même que la garde
+        n'ouvre le fichier, et le code d'erreur testé serait masqué.
+        """
         target = self.repo.write("f.txt", "x\n")
-        with mock.patch.object(server.os, "open", side_effect=OSError(errno.ELOOP, "lien")):
+        real_open = server.os.open
+
+        def failing(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            if os.fspath(path) == str(target):
+                raise OSError(errno.ELOOP, "lien")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(server.os, "open", side_effect=failing):
             payload = json.loads(self.tools["sanitize_file"](path="f.txt"))
             self.assertEqual(payload["error"]["code"], "INTERNAL")
-        with mock.patch.object(server.os, "open", side_effect=OSError(errno.ENOENT, "rien")):
+
+        def missing(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            if os.fspath(path) == str(target):
+                raise OSError(errno.ENOENT, "rien")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(server.os, "open", side_effect=missing):
             payload = json.loads(self.tools["sanitize_file"](path="f.txt"))
             self.assertEqual(payload["error"]["code"], "NOT_FOUND")
         self.assertTrue(target.is_file())

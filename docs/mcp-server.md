@@ -66,6 +66,8 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 | pager hostile inopérant | sorties toujours pipées, prouvé sans override | `test_hostile_pager_is_never_executed` |
 | `diff.external` / `textconv` inopérants (interdit I5) | `--no-ext-diff --no-textconv` imposés | `GitEnvironmentTests` |
 | l'environnement hérité ne redirige pas le dépôt | `GIT_DIR`, `GIT_INDEX_FILE`, `HOME`, `PATH` reconstruits à zéro | `GitEnvironmentTests` |
+| le canal stdio MCP n'est jamais hérité par git | `stdin=subprocess.DEVNULL` sur chaque appel, garde statique dans `tests/security/test_prompt_injection.py` | `test_no_git_call_inherits_the_server_stdin_pipe` |
+| aucun dépôt parent découvert | `GIT_CEILING_DIRECTORIES` = parent de la racine : git refuse lui-même de remonter (rc=128), sans dépendre de `is_repository()` | `RepositoryCeilingTests` |
 | aucune valeur en clair renvoyée | masquage `<REDACTED:type:len=N>` **avant** `json.dumps`, sur la ligne entière puis troncature | `test_secret_values_are_masked_before_serialization` |
 | une valeur citée longue n'est jamais sectionnée avant masquage | pas de fenêtre préalable : `mask_text` voit le guillemet fermant (régression de revue fermée) | `test_long_quoted_value_is_masked_not_windowed` |
 | réponse bornée par `max_bytes` | budget vérifié **après** sérialisation, fichiers retirés en dernier (une seule sérialisation par fichier) | `test_response_never_exceeds_max_bytes` |

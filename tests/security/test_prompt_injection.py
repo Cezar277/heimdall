@@ -150,8 +150,13 @@ def _fixed_argv_violations(path: Path) -> list[str]:
     """`subprocess` autorisé en #27 pour UNE commande git figée : argv en
     liste littérale, jamais `shell=True` (CWE-78, mandat explicite du #74 :
     `subprocess.run([...])` sans `shell=True`, options `--no-ext-diff
-    --no-textconv` contre l'exécution pilotée par le dépôt). Tout appel
-    hors de ce motif (chaîne formatée, `shell=True`, Popen...) est une
+    --no-textconv` contre l'exécution pilotée par le dépôt), et
+    `stdin=subprocess.DEVNULL` sur chaque appel. Sans ce dernier, le fils
+    hérite du pipe JSON-RPC du serveur MCP : une sous-commande qui lirait
+    stdin (`hash-object --stdin`, `apply`, un `textconv` si l'option sautait)
+    consommerait des octets du protocole ou s'y bloquerait — une
+    interférence pilotable par le dépôt scanné. Tout appel hors de ce
+    motif (chaîne formatée, `shell=True`, stdin hérité, Popen...) est une
     violation, même si la commande semble inoffensive."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     found = []
@@ -173,6 +178,15 @@ def _fixed_argv_violations(path: Path) -> list[str]:
                 and keyword.value.value is True
             ):
                 found.append("shell=True")
+        stdin = next((keyword for keyword in node.keywords if keyword.arg == "stdin"), None)
+        if not (
+            stdin is not None
+            and isinstance(stdin.value, ast.Attribute)
+            and isinstance(stdin.value.value, ast.Name)
+            and stdin.value.value.id == "subprocess"
+            and stdin.value.attr == "DEVNULL"
+        ):
+            found.append(f"subprocess.{func.attr}(stdin-non-devnull)")
         if not node.args or not isinstance(node.args[0], (ast.List, ast.Tuple)):
             found.append(f"subprocess.{func.attr}(argv-non-liste)")
     return found
@@ -345,6 +359,30 @@ def test_no_llm_in_ci() -> None:
     req = REQUIREMENTS.read_text(encoding="utf-8")
     assert "REQ-SEC-02" in req
     assert "scan --ci" in req
+
+
+def test_ast_guard_detects_inherited_stdin(tmp_path: Path) -> None:
+    """Garde AST : un appel git sans `stdin=DEVNULL` est détecté et refusé.
+
+    Témoin négatif obligatoire : une garde qui ne détecterait jamais rien
+    ne prouverait rien. Le témoin imite exactement la forme qu'un futur
+    appel aurait (argv figée, pas de shell) en oubliant le stdin fermé.
+    """
+    leaking = tmp_path / "temoin_stdin.py"
+    leaking.write_text(
+        'import subprocess\n'
+        'subprocess.run(["git", "diff"], capture_output=True)\n',
+        encoding="utf-8",
+    )
+    assert _fixed_argv_violations(leaking) == ["subprocess.run(stdin-non-devnull)"]
+
+    correct = tmp_path / "temoin_sain.py"
+    correct.write_text(
+        'import subprocess\n'
+        'subprocess.run(["git", "diff"], stdin=subprocess.DEVNULL, capture_output=True)\n',
+        encoding="utf-8",
+    )
+    assert _fixed_argv_violations(correct) == []
 
 
 def test_ast_guard_detects_getattr_and_import_escapes(tmp_path: Path) -> None:
