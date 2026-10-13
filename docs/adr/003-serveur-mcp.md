@@ -132,7 +132,9 @@ clair est masqué (faux positif bénin assumé) ; une valeur courte (< 16
 caractères) à nom neutre (`MY_DATA="motdepasse12"`) N'EST PAS masquée —
 l'alternative (masquer toute valeur affectée dès 8 caractères) noierait
 le tri (`name="production"`, indiscernable par entropie) et apprendrait
-au LLM à ignorer les marqueurs ; **une valeur quotée dépassant 20 000
+au LLM à ignorer les marqueurs ; **une affectation non quotée à nom évocateur est masquée dès 6 caractères**
+(`_UNQUOTED_ASSIGNMENT` bornée à `{6,4096}` et filtrée par `_looks_like_secret`, protégeant `PASSWORD=hunter2`
+ou `SECRET=abc12345`) ; **une valeur quotée dépassant 20 000
 caractères sur une seule ligne n'est pas masquée** (borne anti-ReDoS
 assumée : `_QUOTED_ASSIGNMENT` bornée à `{4,20000}`, un credential réel
 ne fait pas plus de 20 Ko et les lignes sont de toute façon plafonnées
@@ -154,7 +156,8 @@ sinon l'invariant structurel du schéma — faille réelle trouvée par audit
 et corrigée, avec tests. Dans `sanitize_file`, chaque ligne est bornée à 2 000 caractères
 (`MAX_LINE_CHARS`) après masquage (`truncated: true`), immunisant le canal contre le DoS CPU
 face à des fichiers piégés à ligne unique géante (jusqu'à 1 Mo). Le budget `max_bytes` est vérifié sur la réponse
-sérialisée (fichiers retirés en dernier, `truncated: true`). Preuve :
+sérialisée (fichiers retirés en dernier, `truncated: true` ; coût de calcul `_fit_budget` borné à ≤ 200 dumps JSON
+sans impact de latence). Preuve :
 `heimdall/mcp/server.py` (`_masked_files`, `_fit_budget`, `sanitize_file`),
 `tests/test_mcp_hardening.py::TruncationInvariantTests`.
 

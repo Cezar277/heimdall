@@ -639,6 +639,10 @@ class DirectToolErrorTests(unittest.TestCase):
         payload = json.loads(self.tools["sanitize_file"](path="gros.bin"))
         self.assertEqual(payload["error"]["code"], "TOO_LARGE")
 
+    def test_binary_sniff_bytes_constant_removed(self) -> None:
+        """La constante morte _BINARY_SNIFF_BYTES a été supprimée (sniff complet)."""
+        self.assertFalse(hasattr(server, "_BINARY_SNIFF_BYTES"))
+
     def test_sanitize_open_failures(self) -> None:
         target = self.repo.write("f.txt", "x\n")
         with mock.patch.object(server.os, "open", side_effect=OSError(errno.ELOOP, "lien")):

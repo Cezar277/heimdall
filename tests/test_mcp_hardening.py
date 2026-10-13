@@ -16,7 +16,7 @@ from support.fake_secrets import fake_pem_body, fake_token
 from support.git_repo import GitRepo
 from support.mcp_client import call_tool, tool_payload
 
-from heimdall.mcp import gitdiff, masking
+from heimdall.mcp import gitdiff, masking, server
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.paths import is_rel_path
 
@@ -299,6 +299,24 @@ class MaskingPerformanceTests(unittest.TestCase):
         masked, count = masking.mask_text(line)
         self.assertEqual(count, 0)
         self.assertEqual(masked, line)
+
+    def test_fit_budget_with_200_files_is_bounded_in_time(self) -> None:
+        """200 fichiers au plafond + max_bytes=1024 : _fit_budget borné en temps (< 2s)."""
+        files = [
+            {
+                "file": f"f{i}.py",
+                "binary": False,
+                "redactions": 0,
+                "added_lines": [{"line": 1, "text": "x" * 200}],
+            }
+            for i in range(200)
+        ]
+        started = time.monotonic()
+        truncated = server._fit_budget(files, 1024)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0, f"_fit_budget trop lent : {elapsed:.2f}s")
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(files), 10)
 
 
 

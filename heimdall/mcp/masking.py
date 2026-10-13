@@ -37,7 +37,7 @@ _QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 _UNQUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
     r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
     r"\s*[:=]\s*"
-    r"(?P<value>[^\s\"'`,;)}\]]{12,4096})"
+    r"(?P<value>[^\s\"'`,;)}\]]{6,4096})"
 )
 
 # Authorization: Bearer <jeton>
@@ -233,9 +233,16 @@ MIN_ENTROPY_LENGTH: Final[int] = 16
 MIN_ENTROPY_BITS: Final[float] = 3.5
 
 
+_AUTH_SCHEMES: Final[frozenset[str]] = frozenset(
+    {"bearer", "basic", "token", "digest", "negotiate", "aws4-hmac-sha256", "mac", "hoba"}
+)
+
+
 def _looks_like_secret(key: str | None, value: str) -> bool:
     """Décide si une valeur doit être masquée (conservateur en cas de doute)."""
     if not value or _ENV_REFERENCE.match(value):
+        return False
+    if key is not None and key.lower() == "authorization" and value.lower() in _AUTH_SCHEMES:
         return False
     if value.lower().startswith(_KNOWN_PREFIXES):
         return True

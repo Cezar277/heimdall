@@ -429,3 +429,13 @@ class GitEnvironmentTests(GitRepoTestCase):
         self.assertTrue(res.is_error)
         payload = tool_payload(res)
         self.assertEqual(payload["error"]["code"], "NOT_A_GIT_REPO")
+
+    def test_unquoted_short_secret_with_evocative_key_is_masked(self) -> None:
+        """Secret court non quoté à clé évocatrice (ex. PASSWORD=hunter2) : masqué."""
+        self.write("auth.sh", "PASSWORD=hunter2\nSECRET=abc12345\n")
+        self.stage("auth.sh")
+        payload = self.call_read_diff()
+        content = json.dumps(payload)
+        self.assertNotIn("hunter2", content)
+        self.assertNotIn("abc12345", content)
+        self.assertIn("<REDACTED:", content)

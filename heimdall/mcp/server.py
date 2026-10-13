@@ -69,10 +69,6 @@ MAX_SANITIZE_LINES: Final[int] = 400
 MAX_FILE_BYTES: Final[int] = 1024 * 1024
 MAX_CONTENT_CHARS: Final[int] = 100_000
 
-# Nombre d'octets examinés pour décider qu'un fichier est binaire : la
-# présence d'un octet nul dans l'en-tête est le test usuel (git fait de
-# même). Évite de décoder un exécutable comme du texte.
-_BINARY_SNIFF_BYTES: Final[int] = 8192
 
 # `O_NONBLOCK` n'existe pas sur Windows : repli à 0 (aucun effet) pour
 # rester importable partout. Sur POSIX il est indispensable : sans lui,
