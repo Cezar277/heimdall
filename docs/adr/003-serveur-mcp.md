@@ -144,12 +144,14 @@ scanner #22 mesuré en #21. Preuve :
 ### 8. Compteurs recomptés, budgets vérifiés après sérialisation
 
 `redactions` compte les marqueurs **de la réponse** (recompté après coupe),
-jamais une promesse : une coupe à 2000 caractères (ligne) ou 100 000
+jamais une promesse : une coupe à 2000 caractères (ligne dans `read_diff` et `sanitize_file`) ou 100 000
 (caractères, `sanitize_file`) qui emporterait le seul marqueur violerait
 sinon l'invariant structurel du schéma — faille réelle trouvée par audit
-et corrigée, avec tests. Le budget `max_bytes` est vérifié sur la réponse
+et corrigée, avec tests. Dans `sanitize_file`, chaque ligne est bornée à 2 000 caractères
+(`MAX_LINE_CHARS`) après masquage (`truncated: true`), immunisant le canal contre le DoS CPU
+face à des fichiers piégés à ligne unique géante (jusqu'à 1 Mo). Le budget `max_bytes` est vérifié sur la réponse
 sérialisée (fichiers retirés en dernier, `truncated: true`). Preuve :
-`heimdall/mcp/server.py` (`_masked_files`, `_fit_budget`),
+`heimdall/mcp/server.py` (`_masked_files`, `_fit_budget`, `sanitize_file`),
 `tests/test_mcp_hardening.py::TruncationInvariantTests`.
 
 ### 8 bis. Coupe sur lignes complètes, FIFO refusés, binaires innommables
@@ -172,17 +174,22 @@ sérialisée (fichiers retirés en dernier, `truncated: true`). Preuve :
   sans tuer toute la réponse pour un nom (un binaire ne porte aucune
   ligne ; tuer la réponse serait un DoS par fichier bizarre).
 
-### 9. Garde de chemin unique + TOCTOU documentée (exigence #76)
+### 9. Garde de chemin unique + TOCTOU et hardlinks documentés (exigence #76)
 
 `confine` : refus de forme (grammaire `RelPath` du contrat, chemins absolus
 toutes familles), `resolve()` (suit les liens sortants), `is_relative_to`
 sur chemins résolus (jamais `startswith` : `/repo-evil` commence par
 `/repo`). Le chemin renvoyé est **reconstruit** depuis le résolu, pas
 recopié (aucune entrée reflétée). Ouverture `O_NOFOLLOW` + comparaison
-dev/ino entre `lstat` et `fstat` (ELOOP refusé). **Limite connue** : entre
+dev/ino entre `lstat` et `fstat` (ELOOP refusé). **Limite TOCTOU connue** : entre
 la résolution et l'ouverture, un fichier peut être remplacé — la fenêtre
 est réduite à deux appels système, mais un attaquant avec écriture sur le
-dépôt entre les deux reste hors de portée. `check-ignore` répond dès
+dépôt entre les deux reste hors de portée. **Limite des hardlinks locaux** :
+`is_forbidden_path` et `is_ignored` contrôlent le nom canonique ; un alias hardlink
+(`os.link(".env", "innocent.txt")`) pointerait vers le même inode sous un nom innocent.
+Git ne conservant pas les liens physiques au clone, cette exploitation requiert un attaquant
+local concurrent écrivant sur le système hôte, ce qui est hors du modèle de menace Git
+(analogue à la fenêtre TOCTOU). `check-ignore` répond dès
 qu'une règle couvre le chemin, même suivi : lecture stricte et prudente
 du contrat 4.2 (un suivi-mais-ignoré est refusé). Preuve :
 `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`, `is_forbidden_path`).

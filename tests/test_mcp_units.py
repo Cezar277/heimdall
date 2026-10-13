@@ -608,10 +608,16 @@ class DirectToolErrorTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "FORBIDDEN_PATH")
 
     def test_sanitize_huge_content_is_capped_in_process(self) -> None:
-        self.repo.write("gros.txt", "z" * 120_000 + "\n")
+        self.repo.write("gros.txt", ("z" * 1500 + "\n") * 80)
         payload = json.loads(self.tools["sanitize_file"](path="gros.txt"))
         self.assertTrue(payload["truncated"])
-        self.assertLessEqual(len(payload["content"]), server.MAX_CONTENT_CHARS)
+        self.assertEqual(len(payload["content"]), server.MAX_CONTENT_CHARS)
+
+    def test_sanitize_line_longer_than_2000_is_capped(self) -> None:
+        self.repo.write("long_line.txt", "y" * 5000 + "\n")
+        payload = json.loads(self.tools["sanitize_file"](path="long_line.txt"))
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(len(payload["content"]), gitdiff.MAX_LINE_CHARS)
 
     def test_sanitize_too_large_precheck(self) -> None:
         big = self.repo.root / "gros.bin"

@@ -346,8 +346,11 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
         content, total_lines, truncated = _read_extract(confined.absolute, start_line, max_lines)
         pieces: list[str] = []
         for line in content:
-            text, _ = masking.mask_text(line)
-            pieces.append(text)
+            masked, _ = masking.mask_text(line)
+            if len(masked) > gitdiff.MAX_LINE_CHARS:
+                masked = masked[: gitdiff.MAX_LINE_CHARS]
+                truncated = True
+            pieces.append(masked)
         # Borne de contenu du contrat (100 000 caractères) : elle s'applique
         # APRÈS masquage, pour les mêmes raisons que read_diff.
         joined = "\n".join(pieces)

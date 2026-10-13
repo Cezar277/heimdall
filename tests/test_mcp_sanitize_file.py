@@ -223,10 +223,30 @@ class SanitizeFileToolTests(FileRepoTestCase):
 
     def test_content_is_capped_at_100k_characters(self) -> None:
         """Borne du contrat, appliquée après masquage."""
-        (self.repo / "minifie.js").write_text("a" * 120_000, encoding="utf-8")
+        (self.repo / "minifie.js").write_text(("x" * 1500 + "\n") * 80, encoding="utf-8")
         payload = self.read({"path": "minifie.js"})
         self.assertLessEqual(len(payload["content"]), 100_000)
         self.assertTrue(payload["truncated"])
+
+    def test_giant_line_is_bounded_to_max_line_chars_without_blocking(self) -> None:
+        """Ligne géante (~900 Ko) : chaque ligne est bornée à 2 000 caractères, pas de blocage."""
+        (self.repo / "giant.txt").write_text("a" * 900_000, encoding="utf-8")
+        payload = self.read({"path": "giant.txt"})
+        self.assertLessEqual(len(payload["content"]), 2_000)
+        self.assertTrue(payload["truncated"])
+
+    def test_hardlink_alias_behavior_is_documented_boundary(self) -> None:
+        """Hardlink alias innocent pointant vers .env.
+
+        Lu sous son alias : limite documentée ADR-003 §9.
+        """
+        try:
+            os.link(self.repo / ".env", self.repo / "innocent.txt")
+        except OSError:
+            self.skipTest("hardlinks non supportés sur ce système de fichiers")
+        payload = self.read({"path": "innocent.txt"})
+        self.assertEqual(payload["path"], "innocent.txt")
+        self.assertIn("TOKEN=valeur", payload["content"])
 
     def test_response_conforms_to_the_contract(self) -> None:
         """Critère d'acceptation du #27 : réponse conforme au schéma."""
