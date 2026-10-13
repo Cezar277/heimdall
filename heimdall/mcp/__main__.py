@@ -31,9 +31,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         run_stdio(args.root)
+    except BrokenPipeError:
+        return 0
     except ValueError as exc:
         # Message statique (racine invalide) : aucune entrée reflétée.
         print(str(exc), file=sys.stderr)
+        return 2
+    except Exception:
+        # Échec inattendu au démarrage : message statique seul (invariant 8).
+        print("erreur au démarrage du serveur MCP", file=sys.stderr)
         return 2
     return 0
 

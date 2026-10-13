@@ -884,6 +884,31 @@ class UnquoteTests(unittest.TestCase):
         )
         self.assertEqual([entry.path for entry in entries], ["y"])
 
+    def test_copy_to_header_extracts_exact_path(self) -> None:
+        """`copy to neuf.txt` extrait 'neuf.txt', pas 'ef.txt'."""
+        entries, _ = self.parse(
+            "diff --git a/source.txt b/neuf.txt",
+            "copy from source.txt",
+            "copy to neuf.txt",
+            "--- a/source.txt",
+            "+++ b/neuf.txt",
+            "@@ -0,0 +1 @@",
+            "+z",
+        )
+        self.assertEqual([entry.path for entry in entries], ["neuf.txt"])
+
+    def test_copy_to_nowhere_keeps_previous_path(self) -> None:
+        """`copy to /dev/null` conserve le chemin précédent si aucun nom valide."""
+        entries, _ = self.parse(
+            "diff --git a/x b/y",
+            "--- a/x",
+            "+++ b/y",
+            "copy to /dev/null",
+            "@@ -0,0 +1 @@",
+            "+z",
+        )
+        self.assertEqual([entry.path for entry in entries], ["y"])
+
 
 class ParserStateTests(unittest.TestCase):
     def test_combined_diff_starts_a_file(self) -> None:
@@ -940,6 +965,29 @@ class MainEntryTests(unittest.TestCase):
         with mock.patch.object(entry, "run_stdio") as run:
             self.assertEqual(entry.main(["--root", "/srv/depot"]), 0)
         run.assert_called_once_with("/srv/depot")
+
+    def test_main_handles_unexpected_startup_exception(self) -> None:
+        """Échec MCPServer / démarrage : exit 2 + stderr sans chemin absolu ni secret."""
+        leak_path = "/tmp/sensitive_installation/path.py"  # noqa: S108
+        with mock.patch.object(
+            entry, "run_stdio", side_effect=RuntimeError(f"crash at {leak_path}")
+        ):
+            with mock.patch("sys.stderr") as stderr:
+                code = entry.main(["--root", "."])
+        self.assertEqual(code, 2)
+        written = "".join(call.args[0] for call in stderr.write.call_args_list)
+        self.assertNotIn("/tmp/", written)  # noqa: S108
+        self.assertNotIn("secret", written)
+        self.assertIn("erreur au démarrage du serveur MCP", written)
+
+    def test_main_handles_broken_pipe_silently(self) -> None:
+        """BrokenPipeError au démarrage ou à la coupure stdio : sortie silencieuse 0."""
+        with mock.patch.object(entry, "run_stdio", side_effect=BrokenPipeError):
+            with mock.patch("sys.stderr") as stderr:
+                code = entry.main(["--root", "."])
+        self.assertEqual(code, 0)
+        written = "".join(call.args[0] for call in stderr.write.call_args_list)
+        self.assertEqual(written, "")
 
     def test_run_stdio_builds_then_runs(self) -> None:
         """`run_stdio` assemble puis démarre — `run` mocké, sans bloquer."""

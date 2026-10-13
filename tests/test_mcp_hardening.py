@@ -293,6 +293,14 @@ class MaskingPerformanceTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertLessEqual(len(entries), 200)
 
+    def test_quoted_assignment_above_20k_chars_is_documented_boundary(self) -> None:
+        """Borne actée ADR-003 §7 : SECRET='a'*50000 sur une ligne n'est pas masqué."""
+        line = 'SECRET = "' + "a" * 50_000 + '"'
+        masked, count = masking.mask_text(line)
+        self.assertEqual(count, 0)
+        self.assertEqual(masked, line)
+
+
 
 if __name__ == "__main__":
     unittest.main()

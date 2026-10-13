@@ -132,9 +132,14 @@ clair est masqué (faux positif bénin assumé) ; une valeur courte (< 16
 caractères) à nom neutre (`MY_DATA="motdepasse12"`) N'EST PAS masquée —
 l'alternative (masquer toute valeur affectée dès 8 caractères) noierait
 le tri (`name="production"`, indiscernable par entropie) et apprendrait
-au LLM à ignorer les marqueurs. La détection de précision appartient au
+au LLM à ignorer les marqueurs ; **une valeur quotée dépassant 20 000
+caractères sur une seule ligne n'est pas masquée** (borne anti-ReDoS
+assumée : `_QUOTED_ASSIGNMENT` bornée à `{4,20000}`, un credential réel
+ne fait pas plus de 20 Ko et les lignes sont de toute façon plafonnées
+par le contrat). La détection de précision appartient au
 scanner #22 mesuré en #21. Preuve :
-`heimdall/mcp/masking.py`, `tests/test_mcp_hardening.py::BareTokenMaskingTests`.
+`heimdall/mcp/masking.py`, `tests/test_mcp_hardening.py::BareTokenMaskingTests`,
+`tests/test_mcp_hardening.py::MaskingPerformanceTests`.
 
 ### 8. Compteurs recomptés, budgets vérifiés après sérialisation
 

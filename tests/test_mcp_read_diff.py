@@ -399,3 +399,22 @@ class GitEnvironmentTests(GitRepoTestCase):
         payload = self.call_read_diff(max_bytes=1024)
         self.assertTrue(payload["truncated"])
         self.assertLessEqual(len(json.dumps(payload)), 100_000)
+
+    def test_copy_to_roundtrip_with_sanitize_file(self) -> None:
+        """Copie git (`copy to`) : nom exact extrait, et sanitize_file trouve le fichier."""
+        self.write("src.py", "line\n" * 10)
+        self.stage("src.py")
+        _git(self.repo, "commit", "-m", "initial commit")
+        self.write("neuf.py", "line\n" * 10 + "added\n")
+        self.write("src.py", "modified\n")
+        self.stage("neuf.py", "src.py")
+        _git(self.repo, "config", "diff.renames", "copies")
+        payload = self.call_read_diff()
+        files = [item["file"] for item in payload["files"]]
+        self.assertIn("neuf.py", files)
+        self.assertNotIn("uf.py", files)
+        sanitize_payload = tool_payload(
+            call_tool("sanitize_file", {"path": "neuf.py"}, root=self.repo)
+        )
+        self.assertNotIn("error", sanitize_payload)
+        self.assertEqual(sanitize_payload["path"], "neuf.py")

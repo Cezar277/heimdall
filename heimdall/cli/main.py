@@ -56,9 +56,15 @@ def mcp(
     """
     try:
         run_stdio(root)
+    except BrokenPipeError:
+        raise typer.Exit(code=0) from None
     except ValueError as exc:
         # Message statique : aucune entrée reflétée (invariant 8).
         typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from None
+    except Exception:
+        # Échec inattendu au démarrage : message statique seul (invariant 8).
+        typer.echo("erreur au démarrage du serveur MCP", err=True)
         raise typer.Exit(code=2) from None
 
 

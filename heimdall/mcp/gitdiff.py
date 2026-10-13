@@ -461,8 +461,13 @@ class _DiffParser:
             if path is not None:
                 builder.path = path
             return
-        if raw.startswith("rename to ") or raw.startswith("copy to "):
-            path = _path_from_header(raw[10:].strip())
+        if raw.startswith("rename to "):
+            path = _path_from_header(raw[len("rename to "):].strip())
+            if path is not None:
+                builder.path = path
+            return
+        if raw.startswith("copy to "):
+            path = _path_from_header(raw[len("copy to "):].strip())
             if path is not None:
                 builder.path = path
             return

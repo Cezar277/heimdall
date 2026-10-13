@@ -5,6 +5,7 @@ import os
 import pickle
 import tempfile
 import unittest
+from unittest import mock
 
 from typer.testing import CliRunner
 
@@ -65,6 +66,23 @@ class PackageSmokeTests(unittest.TestCase):
         result = CliRunner().invoke(heimdall.cli.main.app, ["scan"])
         self.assertEqual(result.exit_code, 2)
         self.assertIn("#22", result.stderr)
+
+    def test_cli_mcp_handles_broken_pipe_and_exception(self) -> None:
+        """CLI `heimdall mcp` : BrokenPipeError -> 0, exception inattendue -> 2 sans fuite."""
+        runner = CliRunner()
+        with mock.patch("heimdall.cli.main.run_stdio", side_effect=BrokenPipeError):
+            result = runner.invoke(heimdall.cli.main.app, ["mcp"])
+            self.assertEqual(result.exit_code, 0)
+
+        with mock.patch(
+            "heimdall.cli.main.run_stdio",
+            side_effect=RuntimeError("crash /tmp/secret_installation/dir"),  # noqa: S108
+        ):
+            result = runner.invoke(heimdall.cli.main.app, ["mcp"])
+            self.assertEqual(result.exit_code, 2)
+            self.assertNotIn("/tmp/", result.output)  # noqa: S108
+            self.assertIn("erreur au démarrage du serveur MCP", result.output)
+
 
     def test_stubs_raise_not_implemented(self) -> None:
         with self.assertRaises(NotImplementedError):
