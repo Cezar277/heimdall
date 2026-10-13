@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+from support.fake_secrets import fake_token
 from support.git_repo import GitRepo
 
 from heimdall.mcp import __main__ as entry
@@ -348,7 +349,7 @@ class MaskingRulesTests(unittest.TestCase):
             (None, "shpat_abc", "webhook_secret"),
             (None, "npm_abc", "package_token"),
             (None, "AIza-abc", "google_api_key"),
-            (None, "AKIAIOSFODNN7EXAMPLE", "aws"),
+            (None, fake_token("AKIA", 36), "aws"),
             (None, "-----BEGIN X", "private_key"),
             ("my_private_key", "abc", "private_key"),
             ("aws_region", "abc", "aws"),

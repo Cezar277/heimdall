@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from support import mcp_contract
+from support.fake_secrets import FAKE_GITHUB_TOKEN
 from support.mcp_client import call_tool, tool_payload
 
 from heimdall.mcp.paths import is_rel_path
@@ -84,7 +85,7 @@ class ReadDiffToolTests(GitRepoTestCase):
         """Fait quand (#74) : le diff indexé est lu sur un repo d'exemple."""
         self.write(
             "app.py",
-            'TOKEN = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"\nprint("bonjour")\n',
+            f'TOKEN = "{FAKE_GITHUB_TOKEN}"\nprint("bonjour")\n',
         )
         self.stage("app.py")
         payload = self.call_read_diff()
@@ -97,7 +98,7 @@ class ReadDiffToolTests(GitRepoTestCase):
 
     def test_secret_values_are_masked_before_serialization(self) -> None:
         """Obligation masking_before_serialization : la valeur ne sort jamais."""
-        jeton = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"
+        jeton = FAKE_GITHUB_TOKEN
         self.write("app.py", f'TOKEN = "{jeton}"\n')
         self.stage("app.py")
         response = json.dumps(self.call_read_diff())
@@ -108,7 +109,7 @@ class ReadDiffToolTests(GitRepoTestCase):
         """Filet du contrat : redactions >= 1 implique un marqueur présent."""
         self.write(
             "app.py",
-            'A = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"\npassword = "hunter2"\n',
+            f'A = "{FAKE_GITHUB_TOKEN}"\npassword = "hunter2"\n',
         )
         self.stage("app.py")
         entry = self.call_read_diff()["files"][0]
@@ -217,7 +218,7 @@ class ReadDiffConformanceTests(GitRepoTestCase):
 
     def test_diff_response_conforms_to_the_contract(self) -> None:
         """Succès validé contre ReadDiffResult (oneOf succès / échec)."""
-        self.write("app.py", 'TOKEN = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"\n')
+        self.write("app.py", f'TOKEN = "{FAKE_GITHUB_TOKEN}"\n')
         self.stage("app.py")
         payload = self.call_read_diff()
         self.assert_conforms(payload, "ReadDiffResult")

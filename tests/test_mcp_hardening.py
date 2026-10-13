@@ -6,37 +6,19 @@ doc. Toutes les valeurs sensibles ci-dessous sont des **factices** (préfixe
 réel + charge aléatoire déterministe, jamais une clé fonctionnelle).
 """
 
-import base64
-import hashlib
 import random
 import time
 import unittest
 from typing import Any
 
 from support import mcp_contract
+from support.fake_secrets import fake_pem_body, fake_token
 from support.git_repo import GitRepo
 from support.mcp_client import call_tool, tool_payload
 
 from heimdall.mcp import gitdiff, masking
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.paths import is_rel_path
-
-
-def fake_token(prefix: str, length: int = 40) -> str:
-    """Factice à la forme d'un vrai jeton (jamais une clé fonctionnelle)."""
-    digest = hashlib.sha256(f"heimdall-factice-{prefix}".encode()).digest()
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    stream = (digest * ((length // len(digest)) + 1))[:length]
-    return prefix + "".join(alphabet[byte % len(alphabet)] for byte in stream)
-
-
-def fake_pem_body(lines: int = 4, width: int = 64) -> str:
-    """Corps de clé factice : base64 dense, structure DER invalide."""
-    out: list[str] = []
-    for index in range(lines):
-        raw = hashlib.sha256(f"heimdall-fausse-cle-{index}".encode()).digest()
-        out.append(base64.b64encode((raw * 4)[:48]).decode())
-    return "\n".join(line[:width] for line in out)
 
 
 class RequiredParametersTests(unittest.TestCase):

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from support import mcp_contract
+from support.fake_secrets import FAKE_GITHUB_TOKEN
 from support.mcp_client import call_tool, tool_payload
 
 from heimdall.mcp.paths import confine
@@ -35,7 +36,7 @@ class FileRepoTestCase(unittest.TestCase):
         self.git("init", "-q")
         self.git("config", "user.email", "test@example.invalid")
         self.git("config", "user.name", "Heimdall Test")
-        self.write("app.py", "ligne1\nAPI = 'ghp_16C7e42F292c6912E7710c838347Ae178B4a'\nligne3\n")
+        self.write("app.py", f"ligne1\nAPI = '{FAKE_GITHUB_TOKEN}'\nligne3\n")
         self.write("vide.txt", "")
         self.write("sub/profond.py", "a\nb\nc\nd\ne\n")
         self.write("crlf.txt", "un\r\ndeux\r\n")
@@ -93,7 +94,7 @@ class SanitizeFileToolTests(FileRepoTestCase):
 
     def test_no_clear_value_ever_reaches_the_llm(self) -> None:
         """Obligation masking_before_serialization (contrat 4.2)."""
-        jeton = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"
+        jeton = FAKE_GITHUB_TOKEN
         for arguments in (
             {"path": "app.py"},
             {"path": "app.py", "start_line": 2, "max_lines": 1},
