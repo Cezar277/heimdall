@@ -61,15 +61,20 @@ trois textes hors de notre enveloppe `{"error": …}` (contrat 3.1).
 refusée (`additionalProperties: false` comportemental, invariant 11),
 **type exact** (`bool` n'est pas un `int`), paramètres **requis** déduits de
 la signature (source unique : un paramètre ajouté devient acceptable — et
-requis s'il est sans défaut). `_meta` (protocole) est la seule clé
-tolérée. Preuve : `heimdall/mcp/server.py` (`_ToolBoundary`) + `ArgumentGateTests` +
-tests unitaires de la frontière.
+requis s'il est sans défaut), et **outil inconnu refusé en `INVALID_INPUT`**
+(le SDK répondrait « Unknown tool », un texte brut hors enveloppe —
+la frontière ne laisse jamais passer un nom hors registre). `_meta`
+(protocole) est la seule clé tolérée. Preuve : `heimdall/mcp/server.py`
+(`_ToolBoundary`) + `ArgumentGateTests` + tests unitaires de la frontière.
 
 ### 4. Échecs en enveloppe close, jamais en exception, jamais libres
 
 `tool_handler` traduit `ToolFailure` (code du contrat), `PathEscape`
 (`PATH_ESCAPE`) et toute autre exception (`INTERNAL` statique) en
-`{"error": {"code", "message"}}`. Seules les exceptions inattendues sont
+`{"error": {"code", "message"}}` — et `_ToolBoundary` refuse un outil
+inconnu dans la même enveloppe (`INVALID_INPUT`, sans refléter le nom) :
+aucun chemin de refus ne contourne l'enveloppe unique (contrat 3.1,
+invariant 1). Seules les exceptions inattendues sont
 journalisées avec trace (sur stderr, jamais sur stdout) ; un refus de
 chemin est un fonctionnement normal. Les échecs sont marqués `isError` de
 façon centrale (`_mark_failure`) : les deux formes du contrat étant
@@ -208,11 +213,15 @@ repartaient **en clair après le marqueur**, une fuite déguisée en masquage.
 La classe de valeur exclut l'espace et les quotes, donc une affectation
 reste bornée par son segment. Le nouveau motif est mesuré **plus rapide**
 que l'ancien sur 1 Mo (3,1 s contre 4,3 s) ;
-**une valeur quotée dépassant 20 000
-caractères sur une seule ligne n'est pas masquée** (borne anti-ReDoS
-assumée : `_QUOTED_ASSIGNMENT` bornée à `{4,20000}`, un credential réel
-ne fait pas plus de 20 Ko et les lignes sont de toute façon plafonnées
-par le contrat) ; **coût masquage ≤ 1 Mo/ligne, masquer-puis-tronquer assumé** : dans
+**la valeur quotée est masquée EN ENTIER, sans borne haute**
+(`_QUOTED_ASSIGNMENT` en `{4,}`, pas `{4,20000}`) : la borne coupait le
+match — sur `SECRET="` + 50000 caractères + `"`, la valeur ne matchait
+plus, aucun filet ne la rattrapait à basse entropie, puis le préfixe de
+2000 caractères partait **en clair** vers le LLM (vérifié par exécution).
+La borne ne protégeait de rien (motif linéaire, valeur bornée par sa
+ligne de toute façon) : supprimée, épinglée par
+`tests/test_mcp_hardening.py::MaskingPerformanceTests`
+(`test_quoted_assignment_above_20k_chars_is_masked_whole`) ; **coût masquage ≤ 1 Mo/ligne, masquer-puis-tronquer assumé** : dans
 `read_diff` comme dans `sanitize_file`, `mask_text` passe sur la ligne
 **complète**, la troncature à 2 000 caractères (`MAX_LINE_CHARS`) vient
 **après** — garantit qu'aucune valeur n'est sectionnée avant détection
@@ -328,8 +337,13 @@ files … and …` traite `/dev/null` en priorité (nom avec `and` dedans
 correct). Un nom non représentable dans le contrat (contrôle, `..`,
 UTF-8 invalide) est une **panne** (`INTERNAL`), pas un fichier sauté en
 silence : mieux vaut refuser que cacher des lignes au LLM (fail-closed
-délibéré, épinglé par test). Preuve : `heimdall/mcp/gitdiff.py`
-(`parse_diff`, `DiffEntry`, `staged_diff`).
+délibéré, épinglé par test). Pour un binaire **modifié** dont le nom
+contient `" and "`, l'ancien et le nouveau côté nommant le MÊME fichier,
+la découpe retenue est celle où les deux côtés concordent (`f and g.bin`
+entier, plus `g.bin` tronqué qui cassait l'aller-retour vers
+`sanitize_file`) ; vraiment ambigu → `None`, signalé `truncated`, jamais
+un nom tronqué. Preuve : `heimdall/mcp/gitdiff.py`
+(`parse_diff`, `DiffEntry`, `staged_diff`, `_binary_path`).
 
 ### 11. `.git`/`.env` insensibles à la casse, binaires et tailles
 
@@ -338,6 +352,12 @@ insensible à la casse). Binaire (octet nul dans les 8 premiers Kio),
 > 1 Mo (`TOO_LARGE`, double garde : avant **et** après lecture),
 absent/dossier (`NOT_FOUND`), `start_line` hors bornes (extrait vide,
 `end_line: 0`, rien d'inventé).
+
+**`NOT_FOUND` réservé à l'absence** (`ENOENT`/`ENOTDIR`) : une permission
+refusée (`EACCES`/`EPERM`, `lstat` comme `open`), un nom trop long ou toute
+autre anomalie vaut `INTERNAL`, pas `NOT_FOUND` — sinon un fichier
+illisible serait annoncé « introuvable », faussant le tri et masquant une
+panne d'intégrité. Les deux restent fail-closed (rien ne fuit).
 
 **Codes d'erreur stables pour un même objet, dans les deux ordres
 possibles** (distinction voulue, épinglée par test) : un non-régulier
@@ -390,11 +410,11 @@ renseigner la feuille SAMM avec liens permanents au SHA :
 | Garantie | Module + ligne (au SHA du merge) |
 |---|---|
 | stdio, racine fixée, registre fermé | `heimdall/mcp/server.py` (`run_stdio`, `build_server`, `SERVER_TOOLS`) |
-| entrées refusées, échecs en enveloppe | `heimdall/mcp/server.py` (`_ToolBoundary`, `tool_handler`), `heimdall/mcp/errors.py` |
+| entrées refusées, échecs en enveloppe (outil inconnu inclus) | `heimdall/mcp/server.py` (`_ToolBoundary`, `tool_handler`), `heimdall/mcp/errors.py` |
 | git confiné, diff typé | `heimdall/mcp/gitdiff.py` (`DIFF_ARGUMENTS`, `confined_environment`, `parse_diff`) |
 | canal stdio jamais hérité par git, plafond de découverte | `heimdall/mcp/gitdiff.py` (`GitAccess.execute`, `GitAccess.staged_diff`, `confined_environment`), `tests/security/test_prompt_injection.py` (`_fixed_argv_violations`) |
-| masquage avant sérialisation, compteurs vrais | `heimdall/mcp/masking.py` (`mask_text`, `_KNOWN_PREFIXES`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`) |
-| garde unique, TOCTOU réduite, FIFO refusés | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |
+| masquage avant sérialisation, compteurs vrais, quotée sans borne haute | `heimdall/mcp/masking.py` (`mask_text`, `_KNOWN_PREFIXES`, `_QUOTED_ASSIGNMENT`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`) |
+| garde unique, TOCTOU réduite, FIFO refusés, `NOT_FOUND` réservé à l'absence | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |
 | coupe sur lignes complètes | `heimdall/mcp/gitdiff.py` (`staged_diff`) |
 | format de diff non compris → `truncated`, jamais du silence | `heimdall/mcp/gitdiff.py` (`_COMBINED_HUNK_HEADER`, `_DiffParser._hunk_header`) |
 | aucun réseau | `tests/test_mcp_client.py` (`NoNetworkTests`, `NoTrafficTests`) |

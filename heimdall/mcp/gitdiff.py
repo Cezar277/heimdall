@@ -145,6 +145,10 @@ _HUNK_PREFIX: Final[str] = "@@"
 # chemin, donc le parseur doit signaler l'incomplétude.
 _UNMERGED_PATH: Final[str] = "* Unmerged path "
 
+# Nombre de morceaux quand la ligne `Binary files` ne contient qu'un seul
+# ` and ` : le découpage ancien/nouveau est alors non ambigu.
+_BINARY_UNAMBIGUOUS_PARTS: Final[int] = 2
+
 
 def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
     """Interrompt un sous-processus et attend sa fin sans bloquer ni lever."""
@@ -635,17 +639,38 @@ def parse_diff(text: str) -> tuple[list[DiffEntry], bool]:
     return _DiffParser().feed(text)
 
 
+def _strip_binary_side(raw: str) -> str:
+    """Côté d'une ligne ``Binary files`` sans validation ni préfixe git.
+
+    Miroir de ``_path_from_header`` sans le contrôle ``RelPath`` (qui lève)
+    : pour CHERCHER le bon découpage, pas pour décider. Seul le préfixe est
+    retiré (pas de découpe sur tabulation : les deux côtés nommant le même
+    fichier, elle ne changerait aucune égalité). Le côté retenu est toujours
+    validé ensuite par ``_path_from_header`` (qui lève `INTERNAL` sur un nom
+    irreprésentable, comme avant).
+    """
+    for prefix in ("a/", "b/", "i/", "w/", "o/", "c/"):
+        if raw.startswith(prefix):
+            return raw[2:]
+    return raw
+
+
 def _binary_path(line: str) -> str | None:
     """Chemin côté nouveau depuis ``Binary files a/x and b/y differ``.
 
     Les cas ajout/suppression sont traités en priorité : ``/dev/null``
     est un marqueur git, jamais un nom de fichier, donc le découpage y
-    est exact même si le vrai nom contient ``" and "`` (ex. ``x and
-    y.bin`` : ``rpartition(" and ")`` renvoyait ``y.bin``). Ne reste
-    ambigu que le binaire **modifié** dont le nom contient ``" and "``
-    (git ne cite pas les espaces) : limite documentée, impact nul sur la
-    sécurité (un binaire ne porte jamais de lignes, seul son nom est
-    affiché).
+    est exact même si le vrai nom contient ``" and "``. Pour un binaire
+    **modifié**, l'ancien et le nouveau côté nomment le MÊME fichier :
+    on essaie chaque découpe sur ``" and "`` et on retient celle où les
+    deux côtés désignent le même chemin (ex. ``a/f and g.bin and b/f and
+    g.bin`` → ``f and g.bin`` ; l'ancien ``rpartition`` rendait ``g.bin``,
+    cassant l'aller-retour `read_diff` → `sanitize_file`). Découpe unique
+    sans égalité (renommage sans en-têtes) : repli sur le côté nouveau,
+    comme avant. Plusieurs découpes sans égalité : vraiment ambigu (git ne
+    cite pas les espaces) → `None`, signalé `truncated` par l'appelant,
+    jamais un nom tronqué. Pas de fuite dans tous les cas (un binaire ne
+    porte aucune ligne, seul son nom est affiché).
     """
     body = line[len("Binary files ") :]
     separator = " and "
@@ -656,7 +681,29 @@ def _binary_path(line: str) -> str | None:
         return _path_from_header(body[len("/dev/null" + separator) :])
     if body.endswith(separator + "/dev/null"):
         return None  # binaire supprimé : aucun côté nouveau à nommer.
-    _old, _, new = body.rpartition(separator)
-    if not new:
+    parts = body.split(separator)
+    matches: list[str] = []
+    for index in range(1, len(parts)):
+        old_raw = separator.join(parts[:index])
+        new_raw = separator.join(parts[index:])
+        if not new_raw:
+            continue
+        if _strip_binary_side(old_raw) == _strip_binary_side(new_raw):
+            matches.append(new_raw)
+    # Pas de cas "plusieurs concordances" : deux découpes concordantes
+    # distinctes sont impossibles (le séparateur fait 5 caractères, le
+    # préfixe retiré 0 ou 2 — les deux égalités exigeraient une longueur
+    # négative pour le segment médian, vérifié par recherche exhaustive).
+    # Une seule concordance suffit donc, sans ambiguïté ; sinon, repli ou
+    # `None` (incomplet signalé, jamais un nom tronqué).
+    if len(matches) == 1:
+        new_side: str | None = matches[0]
+    elif len(parts) == _BINARY_UNAMBIGUOUS_PARTS and parts[1]:
+        # Découpe unique sans concordance (renommage sans en-têtes) : repli
+        # sur le côté nouveau, comme avant.
+        new_side = parts[1]
+    else:
+        new_side = None
+    if new_side is None:
         return None
-    return _path_from_header(new)
+    return _path_from_header(new_side)

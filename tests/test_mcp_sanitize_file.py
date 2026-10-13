@@ -172,6 +172,29 @@ class SanitizeFileToolTests(FileRepoTestCase):
         payload = self.read({"path": "binaire.bin"})
         self.assertEqual(payload["error"]["code"], "BINARY_FILE")
 
+    def test_unreadable_file_is_internal_not_not_found(self) -> None:
+        """Fichier `chmod 000` : `INTERNAL`, pas `NOT_FOUND`.
+
+        Un fichier illisible par droits existe peut-être : l'annoncer
+        « introuvable » fausse le tri et masque une panne d'intégrité.
+        Droits restaurés en `finally` pour ne pas piéger le nettoyage.
+        """
+        target = self.write("illisible.txt", "x\n")
+        target.chmod(0)
+        try:
+            probe = os.open(target, os.O_RDONLY)
+        except OSError:
+            probe = None
+        else:
+            os.close(probe)
+        if probe is not None:
+            self.skipTest("l'environnement lit malgré chmod 000 (root ?)")
+        try:
+            payload = self.read({"path": "illisible.txt"})
+        finally:
+            target.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        self.assertEqual(payload["error"]["code"], "INTERNAL")
+
     def test_directory_is_not_a_file(self) -> None:
         payload = self.read({"path": "sub"})
         self.assertEqual(payload["error"]["code"], "NOT_FOUND")

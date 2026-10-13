@@ -115,10 +115,19 @@ class ArgumentGateTests(unittest.TestCase):
         self.assertNotIn(marker, json.dumps(tool_payload(result)))
 
     def test_unknown_tool_is_refused(self) -> None:
-        """Registre fermé : aucun nom hors liste n'est appelable (I8)."""
-        result = call_tool("exec_shell", {})
-        self.assertTrue(result.is_error)
-        self.assertIn("Unknown tool", [block.text for block in result.content][0])
+        """Registre fermé : aucun nom hors liste n'est appelable (I8).
+
+        La réponse est notre enveloppe `{"error": …}` (contrat 3.1), pas le
+        texte brut « Unknown tool » du SDK — y compris pour un outil du
+        contrat pas encore livré (`propose_patch`) : non exposé = refusé.
+        """
+        for name in ("exec_shell", "propose_patch", "ping2"):
+            with self.subTest(tool=name):
+                result = call_tool(name, {})
+                self.assertTrue(result.is_error)
+                payload = tool_payload(result)
+                self.assertEqual(payload["error"]["code"], "INVALID_INPUT")
+                self.assertNotIn("Unknown tool", json.dumps(payload))
 
     def test_bool_is_not_an_integer(self) -> None:
         """Un booléen ne doit pas passer pour un entier (type exact)."""

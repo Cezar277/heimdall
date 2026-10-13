@@ -293,12 +293,23 @@ class MaskingPerformanceTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertLessEqual(len(entries), 200)
 
-    def test_quoted_assignment_above_20k_chars_is_documented_boundary(self) -> None:
-        """Borne actée ADR-003 §7 : SECRET='a'*50000 sur une ligne n'est pas masqué."""
-        line = 'SECRET = "' + "a" * 50_000 + '"'
+    def test_quoted_assignment_above_20k_chars_is_masked_whole(self) -> None:
+        """Plus de borne haute : `SECRET="` + 50000 car + `"` est masqué en entier.
+
+        L'ancienne borne `{4,20000}` coupait le match et laissait la queue en
+        clair après le marqueur, puis `_masked_line` laissait le préfixe de
+        2000 caractères en clair. La borne ne protégeait de rien (motif
+        linéaire, valeur bornée par sa ligne) : supprimée.
+        """
+        value = "a" * 50_000
+        line = f'SECRET = "{value}"'
         masked, count = masking.mask_text(line)
-        self.assertEqual(count, 0)
-        self.assertEqual(masked, line)
+        self.assertEqual(count, 1)
+        self.assertEqual(masked, 'SECRET = "<REDACTED:generic_secret:len=50000>"')
+        self.assertNotIn("a" * 60, masked)
+        cut, truncated = server._masked_line(line)
+        self.assertFalse(truncated, "une valeur masquée ne doit plus être coupée")
+        self.assertNotIn('SECRET = "aaa', cut)
 
     def test_fit_budget_with_200_files_is_bounded_in_time(self) -> None:
         """200 fichiers au plafond + max_bytes=1024 : borné en temps ET en taille.

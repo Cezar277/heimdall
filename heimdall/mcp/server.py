@@ -136,7 +136,10 @@ class _ToolBoundary:
       que la validation du SDK n'ait jamais lieu. Même motif pour les
       paramètres **requis** : sans ``path``, le SDK répond « Field
       required », un texte hors de notre enveloppe ``{"error": …}`` donc
-      non conforme au contrat 3.1.
+      non conforme au contrat 3.1. Même motif pour un **outil inconnu** :
+      le SDK répondrait « Unknown tool », un texte brut hors enveloppe —
+      la frontière refuse elle-même en ``INVALID_INPUT`` (registre fermé,
+      invariant 1 : une seule enveloppe d'échec).
     - `_meta` (protocole) toléré mais borné à 1 Kio : un volume arbitraire
       via un client modifié est refusé, jamais propagé sans regard.
 
@@ -166,8 +169,13 @@ class _ToolBoundary:
             return await call_next(ctx)
         name = ctx.params.get("name")
         if not isinstance(name, str) or name not in self._expected:
-            # Outil inconnu : le SDK répond « Unknown tool » (registre fermé).
-            return await call_next(ctx)
+            # Outil inconnu : le SDK répondrait « Unknown tool », un texte
+            # brut hors de notre enveloppe `{"error": …}` (contrat 3.1).
+            # La frontière refuse elle-même en `INVALID_INPUT`, sans refléter
+            # le nom reçu (invariant 8 : il est non fiable). `INVALID_INPUT`
+            # appartient au sous-ensemble d'erreur de chaque outil du contrat.
+            logger.info("outil inconnu refuse")
+            return _error_result(errors.failure("INVALID_INPUT"))
         arguments = ctx.params.get("arguments")
         if arguments is None:
             arguments = {}
@@ -444,6 +452,19 @@ def is_forbidden_path(relative: str) -> bool:
     return False
 
 
+def _absent_or_internal(error: OSError) -> ToolFailure:
+    """`NOT_FOUND` réservé à l'absence, tout le reste `INTERNAL`.
+
+    `ELOOP` (lien substitué entre la garde et l'ouverture), `EACCES`/`EPERM`
+    (droits refusés), quota ou nom trop long : anomalie d'intégrité, pas une
+    absence — sinon un fichier illisible serait annoncé « introuvable » et le
+    tri confondrait une panne avec une absence. Les deux restent fail-closed.
+    """
+    if error.errno in (errno.ENOENT, errno.ENOTDIR):
+        return errors.ToolFailure("NOT_FOUND")
+    return errors.ToolFailure("INTERNAL")
+
+
 def _read_extract(absolute: Path, start_line: int, max_lines: int) -> tuple[list[str], int, bool]:
     """Lit les lignes demandées, ou lève le code d'erreur du contrat.
 
@@ -452,8 +473,8 @@ def _read_extract(absolute: Path, start_line: int, max_lines: int) -> tuple[list
     """
     try:
         before = os.lstat(absolute)
-    except OSError:
-        raise errors.ToolFailure("NOT_FOUND") from None
+    except OSError as error:
+        raise _absent_or_internal(error) from None
     if stat.S_ISDIR(before.st_mode):
         raise errors.ToolFailure("NOT_FOUND")
     if not stat.S_ISREG(before.st_mode):
@@ -466,11 +487,10 @@ def _read_extract(absolute: Path, start_line: int, max_lines: int) -> tuple[list
     try:
         handle = os.open(absolute, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | _NONBLOCK)
     except OSError as error:
-        # ELOOP : le fichier est devenu un lien symbolique entre la garde et
-        # l'ouverture. On refuse (fail-closed) plutôt que de suivre.
-        if error.errno == errno.ELOOP:
-            raise errors.ToolFailure("INTERNAL") from None
-        raise errors.ToolFailure("NOT_FOUND") from None
+        # Supprimé entre `lstat` et `open` → `NOT_FOUND` ; le reste (lien
+        # substitué, droits, panne) → `INTERNAL` (voir `_absent_or_internal`).
+        # On refuse (fail-closed) plutôt que de suivre ou d'inventer une absence.
+        raise _absent_or_internal(error) from None
     try:
         after = os.fstat(handle)
         if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):

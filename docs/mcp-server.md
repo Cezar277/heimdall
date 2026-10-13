@@ -70,6 +70,8 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 | aucun dépôt parent découvert | `GIT_CEILING_DIRECTORIES` = parent de la racine : git refuse lui-même de remonter (rc=128), sans dépendre de `is_repository()` | `RepositoryCeilingTests` |
 | aucune valeur en clair renvoyée | masquage `<REDACTED:type:len=N>` **avant** `json.dumps`, sur la ligne entière puis troncature | `test_secret_values_are_masked_before_serialization` |
 | une valeur citée longue n'est jamais sectionnée avant masquage | pas de fenêtre préalable : `mask_text` voit le guillemet fermant (régression de revue fermée) | `test_long_quoted_value_is_masked_not_windowed` |
+| valeur quotée masquée en entier, sans borne haute | `SECRET="` + 50000 car : plus de préfixe en clair (borne `{4,}` sans borne haute) | `test_quoted_assignment_above_20k_chars_is_masked_whole` |
+| binaire modifié avec `" and "` dans le nom : nom entier | découpe retenue = celle où les deux côtés concordent, jamais un nom tronqué | `test_modified_binary_with_and_in_its_name_keeps_the_whole_name` |
 | réponse bornée par `max_bytes` | budget vérifié **après** sérialisation, fichiers retirés en dernier (une seule sérialisation par fichier) | `test_response_never_exceeds_max_bytes` |
 | limite atteinte = information incomplète | `truncated: true`, jamais « diff vide » | tests de troncature |
 | format de diff non compris → rien n'est jeté en silence | hunk combiné `@@@ ` décodé, en-tête illisible ou `* Unmerged path` → `truncated: true` | `test_unmerged_path_is_never_a_silent_empty_diff` |
@@ -95,6 +97,7 @@ Le chemin vient du LLM : il est traité comme une entrée piégée
 | refus de `..`, des chemins absolus, des liens sortants | résolution réelle + confinement sur `Path` résolus | `RefusalTests` |
 | `.git/`, `.env*`, fichiers ignorés interdits | segments interdits (`.env-backup` inclus, `.envelope` sur-bloqué assumé) + `git check-ignore` | `tests/test_mcp_sanitize_file.py` |
 | binaire, > 1 Mo, absent, dossier | codes dédiés (`BINARY_FILE`, `TOO_LARGE`, `NOT_FOUND`) | idem |
+| `NOT_FOUND` réservé à l'absence, droits refusés en `INTERNAL` | `EACCES`/`EPERM` (et `lstat` refusé) = panne d'intégrité, pas « introuvable » | `test_unreadable_file_is_internal_not_not_found` |
 | codes stables, liens jugés par leur cible | FIFO avant garde `BINARY_FILE` / après garde `INTERNAL` ; lien sortant `PATH_ESCAPE` | `test_non_regular_files_keep_a_stable_code` |
 | ouverture sans suivre un lien | `O_NOFOLLOW` + comparaison dev/ino (TOCTOU) | `GuardWiringTests` |
 | extrait masqué avant sérialisation | `masking.mask_text` sur la ligne entière, puis borne 100 000 caractères | `test_no_clear_value_ever_reaches_the_llm` |
@@ -187,6 +190,7 @@ restent vérifiées.
 | aucune entrée reflétée au LLM | messages statiques d'`errors.py` | `test_refusal_message_is_static` |
 | stdout = protocole uniquement | aucun `print` dans `heimdall/mcp/` | `StdoutIsProtocolOnlyTests` |
 | registre fermé | `SERVER_TOOLS` + garde d'entrée | `test_ping_is_declared_to_the_client` |
+| outil inconnu dans l'enveloppe, jamais le texte du SDK | `_ToolBoundary` refuse en `INVALID_INPUT` sans refléter le nom | `test_unknown_tool_is_refused` |
 | décisions et limites (ADR) | SDK v2, `ping` hors contrat, TOCTOU, écarts | `docs/adr/003-serveur-mcp.md` |
 | 100 % instructions / branches mesuré | tests unitaires in-process déterministes (+ 26 e2e stdio) | `tests/test_mcp_units.py` + `coverage report` |
 | session adverse conforme au contrat | vrai client stdio, réponses validées | `tests/test_mcp_client.py::EndToEndSessionTests` |

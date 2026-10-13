@@ -25,11 +25,22 @@ from typing import Final
 REDACTION_MARKER: Final[str] = "<REDACTED:"
 
 # clé = "valeur"  /  clé: 'valeur'  (Python, PHP, JSON, YAML, .env)
+#
+# PAS de borne haute : `{4,}` et non `{4,20000}`. La borne ne protégeait de
+# rien (aucun quantificateur imbriqué, et le groupe de valeur s'arrête au
+# premier guillemet non échappé — donc aucun backtracking catastrophique)
+# mais elle COUPAIT le match : sur `SECRET="` + 50000 caractères + `"`, la
+# valeur ne matchait plus, aucun filet ne la rattrapait à basse entropie,
+# puis `_masked_line` tronquait à 2000 caractères et le préfixe `SECRET="aaa…`
+# repartait **en clair** vers le LLM — vérifié par exécution. La valeur reste
+# bornée par sa ligne (1 Mo au plus, `MAX_FILE_BYTES`), et `_looks_like_secret`
+# décide toujours si elle est un secret. Coût mesuré : linéaire, sans
+# backtracking (voir `MaskingPerformanceTests`).
 _QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
     r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
     r"\s*[:=]\s*"
     r"(?P<quote>[\"'])"
-    r"(?P<value>(?:[^\"'\\\n]|\\.){4,20000})"
+    r"(?P<value>(?:[^\"'\\\n]|\\.){4,})"
     r"(?P=quote)"
 )
 

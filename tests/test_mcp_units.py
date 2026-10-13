@@ -180,9 +180,24 @@ class ToolBoundaryTests(unittest.TestCase):
                     "INVALID_INPUT",
                 )
 
-    def test_unknown_tool_passes_through_to_the_sdk(self) -> None:
-        """Registre fermé = réponse du SDK, pas de la frontière."""
-        self.assertEqual(self.run_gate("exec", {}, result="sdk"), "sdk")
+    def test_unknown_tool_is_refused_in_our_envelope(self) -> None:
+        """Outil inconnu : notre enveloppe `INVALID_INPUT`, pas le texte du SDK.
+
+        Le SDK répondrait « Unknown tool », un texte brut hors de notre
+        enveloppe `{"error": …}` (contrat 3.1) : la frontière refuse
+        elle-même, sans appeler la suite ni refléter le nom reçu.
+        """
+        for name in ("exec", "propose_patch", "ping2", "", 123):
+            with self.subTest(name=name):
+
+                def fail_if_called(ctx: Any) -> Any:
+                    raise AssertionError("la suite ne doit pas être appelée")
+
+                ctx = SimpleNamespace(method="tools/call", params={"name": name, "arguments": {}})
+                result = asyncio.run(self.gate(ctx, fail_if_called))  # type: ignore[arg-type]
+                self.assertTrue(result["isError"])
+                payload = json.loads(result["content"][0]["text"])
+                self.assertEqual(payload["error"]["code"], "INVALID_INPUT")
 
     def test_non_call_method_passes_through(self) -> None:
         async def call_next(ctx: Any) -> Any:
@@ -1048,7 +1063,37 @@ class DirectToolErrorTests(unittest.TestCase):
         with mock.patch.object(server.os, "open", side_effect=missing):
             payload = json.loads(self.tools["sanitize_file"](path="f.txt"))
             self.assertEqual(payload["error"]["code"], "NOT_FOUND")
+
+        def denied(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            if os.fspath(path) == str(target):
+                raise OSError(errno.EACCES, "permission")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(server.os, "open", side_effect=denied):
+            payload = json.loads(self.tools["sanitize_file"](path="f.txt"))
+            self.assertEqual(payload["error"]["code"], "INTERNAL")
+
+        def no_perm(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            if os.fspath(path) == str(target):
+                raise OSError(errno.EPERM, "operation")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(server.os, "open", side_effect=no_perm):
+            payload = json.loads(self.tools["sanitize_file"](path="f.txt"))
+            self.assertEqual(payload["error"]["code"], "INTERNAL")
         self.assertTrue(target.is_file())
+
+    def test_sanitize_lstat_permission_failure_is_internal(self) -> None:
+        """`lstat` refusé (droits du dossier parent) : `INTERNAL`, pas `NOT_FOUND`.
+
+        `NOT_FOUND` est réservé à l'absence (`ENOENT`/`ENOTDIR`) : annoncer
+        « introuvable » un fichier peut-être présent fausse le tri et masque
+        une panne d'intégrité.
+        """
+        self.repo.write("f.txt", "x\n")
+        with mock.patch.object(server.os, "lstat", side_effect=OSError(errno.EACCES, "x")):
+            payload = json.loads(self.tools["sanitize_file"](path="f.txt"))
+            self.assertEqual(payload["error"]["code"], "INTERNAL")
 
     def test_sanitize_replaced_between_stat_and_open(self) -> None:
         self.repo.write("f.txt", "x\n")
@@ -1300,6 +1345,47 @@ class UnquoteTests(unittest.TestCase):
             "Binary files a/o.bin and /dev/null differ",
         )
         self.assertEqual(deleted, [])
+
+    def test_modified_binary_with_and_in_its_name_keeps_the_whole_name(self) -> None:
+        """Binaire modifié `f and g.bin` : nom entier, pas `g.bin` tronqué.
+
+        L'ancien `rpartition(" and ")` coupait au dernier séparateur et
+        cassait l'aller-retour `read_diff` → `sanitize_file` (`NOT_FOUND`
+        sur le nom affiché). L'ancien et le nouveau côté nommant le MÊME
+        fichier, la découpe retenue est celle où les deux côtés concordent.
+        """
+        entries, truncated = self.parse(
+            "diff --git a/f and g.bin b/f and g.bin",
+            "index 1234567..89abcde 100644",
+            "Binary files a/f and g.bin and b/f and g.bin differ",
+        )
+        self.assertFalse(truncated)
+        self.assertEqual([entry.path for entry in entries], ["f and g.bin"])
+        self.assertTrue(entries[0].binary)
+
+    def test_modified_binary_with_several_and_separators_picks_the_matching_split(self) -> None:
+        """`a and b and c.bin` modifié : seule la découpe concordante gagne."""
+        entries, truncated = self.parse(
+            "diff --git a/a and b and c.bin b/a and b and c.bin",
+            "Binary files a/a and b and c.bin and b/a and b and c.bin differ",
+        )
+        self.assertFalse(truncated)
+        self.assertEqual([entry.path for entry in entries], ["a and b and c.bin"])
+
+    def test_truly_ambiguous_binary_name_is_flagged_not_truncated(self) -> None:
+        """Plusieurs découpes sans concordance : `truncated`, jamais un nom tronqué.
+
+        Git ne citant pas les espaces, un nom reste théoriquement ambigu ;
+        on signale l'incomplet plutôt que d'afficher un nom coupé (qui
+        casserait l'aller-retour vers `sanitize_file`). Pas de fuite dans
+        tous les cas : un binaire ne porte aucune ligne.
+        """
+        entries, truncated = self.parse(
+            "diff --git a/x b/y",
+            "Binary files a/p and q and b/r and s differ",
+        )
+        self.assertEqual(entries, [])
+        self.assertTrue(truncated)
 
     def test_deleted_text_file_has_no_new_side(self) -> None:
         """`+++ /dev/null` seul : rien à nommer, le fichier sort de la liste."""
