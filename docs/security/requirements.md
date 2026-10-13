@@ -130,7 +130,9 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   timeout/erreur LLM.
 - Preuve attendue : `tests/security/test_prompt_injection.py::test_no_llm_in_ci`
   (chemin CI sans LLM dans les contrats, CLI fail-closed code 2 en l'absence
-  de scanner, Finding : en CI une valeur en clair bloque quel que soit l'état).
+  de scanner, garde AST statique sans import réseau/subprocess sur le
+  squelette, Finding : en CI une valeur en clair bloque quel que soit l'état ;
+  preuve runtime due en #28).
 - Statut : exigence acceptée par #19 ; implémentation #22/#28 à prouver.
 
 ### REQ-SEC-03 — Écriture confinée, snapshot revérifié
@@ -171,7 +173,8 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   réception puis contournée par échange concurrent.
 - Preuve attendue : `tests/security/test_path_traversal.py::test_mcp_read_only_surface`
   (registre fermé, modes lecture seule, grammaire `RelPath`, erreurs par outil,
-  obligations de masquage).
+  interdiction AST des sinks d'écriture sur le squelette, obligations de
+  masquage ; preuve runtime due en #27/#30).
 - Statut : exigence acceptée par #19 ; implémentation #27/#34 à prouver.
 
 ### REQ-SEC-05 — Rejeu sans écrasement
@@ -295,13 +298,15 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   signature et dimensions valides. Then : vert script inchangé (attendu), mais
   fusion bloquée jusqu'à la preuve visuelle du relecteur C.
 - Échec : SAMM scoré ou fusion prononcée sur le seul `OK` du vérificateur.
-- Constat à la rédaction (mêmes octets que la revue T18) :
+- Constat à la rédaction (octets des artefacts DFD inchangés depuis la revue
+  T18 ; empreintes à reconfirmer au merge par le relecteur C) :
   `dfd.drawio` SHA-256
   `72efd6ac06351a694ab655d52e449b4e0229d82f2ca1b549d7920f31a656ab13`,
   `dfd.png` SHA-256
   `c358038574151dc4dab55e31faf32e2ed67fccaf0f7a33daa533383ee8fed688`,
-  dimensions 2600 × 1680, base `591dd857343f3b4b1f4ba322d5b1b695c7156653`
-  (reprendre le SHA final après push via `git rev-parse HEAD`).
+  dimensions 2600 × 1680. Aucun SHA de branche éphémère n'est une preuve :
+  la référence finale est le SHA du commit de merge sur `main`
+  (voir la procédure de figeage sous le tableau SAMM).
 - Preuve attendue : `tests/security/test_requirements_traceability.py::test_visual_proof_required_not_script_green`
   (mentions obligatoires dans le vérificateur et la procédure de preuve,
   en-tête PNG valide sans sur-promesse).
@@ -363,6 +368,27 @@ jamais par branche.
 | Abuse cases rejeu et force brute Vault | `tests/security/test_vault_replay_bruteforce.py` | `test_replay_without_overwrite`, `test_bruteforce_rate_limit_and_constant_errors` |
 | Abuse cases contournement scanner et hook | `tests/security/test_scanner_bypass.py` | `test_incomplete_scan_never_clean`, `test_hook_bypass_requires_trusted_ci` |
 | Engagements H1/H4 et preuve visuelle (bugs revue T18) | `docs/security/requirements.md`, `tests/security/test_requirements_traceability.py` | `REQ-SEC-09`, `REQ-SEC-10` |
+
+### Figeage au merge (procédure obligatoire)
+
+Les permaliens finaux n'existent qu'après le merge (le squash crée un SHA
+neuf) : aucun SHA de branche cité dans cette PR ne doit figurer dans la
+feuille SAMM. Après merge sur `main` :
+
+```sh
+MERGE_SHA=$(git rev-parse main)
+git grep -n '## Tableau récapitulatif' -- docs/security/requirements.md
+git grep -n '^def test_' -- tests/security/test_prompt_injection.py \
+  tests/security/test_path_traversal.py \
+  tests/security/test_vault_replay_bruteforce.py \
+  tests/security/test_scanner_bypass.py \
+  tests/security/test_requirements_traceability.py
+sha256sum docs/security/dfd.drawio docs/security/dfd.png
+```
+
+Construire chaque preuve `https://github.com/Cezar277/heimdall/blob/<MERGE_SHA>/<module>#L<ligne>`
+avec les lignes relevées, et archiver la sortie des commandes avec le lien de
+la PR dans le rapport.
 
 ## Temps et suivi
 

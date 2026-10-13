@@ -6,6 +6,7 @@ ecriture hors racine. LECTURE MCP (REQ-SEC-04) : 4 outils lecture seule avec
 garde de chemin a l'usage et masquage avant serialisation.
 """
 
+import ast
 import importlib.util
 import json
 import os
@@ -50,6 +51,39 @@ def _relpath_rejects(value: str) -> bool:
     return re.fullmatch(pattern, value) is None
 
 
+# Sinks d'ecriture/suppression bannis du squelette MCP (lecture seule).
+_WRITE_SINK_ATTRS = frozenset(
+    {
+        "open",
+        "write",
+        "write_text",
+        "write_bytes",
+        "writelines",
+        "mkdir",
+        "symlink_to",
+        "unlink",
+        "rename",
+        "replace",
+        "remove",
+        "rmdir",
+    }
+)
+
+
+def _write_sink_calls(path: Path) -> list[str]:
+    """Appels vers des sinks d'ecriture dans un module (vide = OK)."""
+    found = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "open":
+            found.append("open(...)")
+        elif isinstance(func, ast.Attribute) and func.attr in _WRITE_SINK_ATTRS:
+            found.append(f".{func.attr}(...)")
+    return found
+
+
 def test_write_stays_inside_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """REQ-SEC-03 : ecriture confinee, cible reverifiee a l'usage."""
     # 1. La grammaire des chemins (Finding + MCP) refuse deja les vecteurs.
@@ -74,7 +108,7 @@ def test_write_stays_inside_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     real_os_open = os.open
     planted = False
 
-    def swapping_open(path, *args: object, **kwargs: object):
+    def swapping_open(path, flags, *args):
         nonlocal planted
         if not planted and Path(path) == victim.resolve():
             planted = True
@@ -83,9 +117,13 @@ def test_write_stays_inside_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                 victim.symlink_to(outside)
             except OSError:
                 pass
-        return real_os_open(path, *args, **kwargs)
+        return real_os_open(path, flags, *args)
 
-    monkeypatch.setattr(checker.os, "open", swapping_open)
+    # Portee globale assumee : `checker.os is os` (le checker reutilise le
+    # module stdlib, pas une copie) ; le patch est circonscrit a ce test et
+    # reverte par monkeypatch en fin de test. Signature explicite (path,
+    # flags) conforme a l'unique appel `os.open(pre, flags)` du checker.
+    monkeypatch.setattr(os, "open", swapping_open)
     with pytest.raises((ValueError, FileNotFoundError, OSError)):
         checker.read_document(victim, repository.resolve())
     assert planted
@@ -115,11 +153,16 @@ def test_mcp_read_only_surface() -> None:
     # sur les entrees (verification sur un echantillon d'objets).
     for name in ("ReadDiffInput", "SanitizeFileInput", "ListCandidatesInput", "ProposePatchInput"):
         assert schema["$defs"][name]["additionalProperties"] is False, name
-    # Le serveur squelette est fail-closed et n'ecrit rien.
+    # Le serveur squelette est fail-closed et n'ecrit rien : interdiction AST
+    # des sinks d'ecriture (un test par chaines "open(" est contournable par
+    # Path.write_bytes, os.open, io.open...). Limite assumee : l'AST ne voit
+    # pas les acces dynamiques (getattr) ; la vraie preuve (aucune valeur
+    # connue dans les champs serialises, aucune ecriture hors racine) reste
+    # due par les tests runtime de #27/#30, qui reecriront cette garde.
+    assert _write_sink_calls(MCP_SERVER) == []
     src = MCP_SERVER.read_text(encoding="utf-8")
     assert "sans outil d'écriture, d'exécution ou réseau" in src
     assert "raise NotImplementedError" in src
-    assert "open(" not in src and "write(" not in src
     # Codes d'erreur de chemin rattaches aux bons outils uniquement.
     sanitize_codes = schema["$defs"]["SanitizeFileError"]["properties"]["code"]["enum"]
     assert "PATH_ESCAPE" in sanitize_codes and "FORBIDDEN_PATH" in sanitize_codes
