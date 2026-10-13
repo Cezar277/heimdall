@@ -42,17 +42,21 @@ heimdall scan --ci        # idem : refuse par défaut plutôt que d'inventer un 
 Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) :
 
 ```sh
-# Lancement avec validation stricte de l'hôte (recommandé) :
+# Lancement sécurisé via le lanceur dédié (recommandé) :
 python -m heimdall.vault.app
 
-# Ou directement via uvicorn (respecter impérativement l'adresse de boucle locale) :
-uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443
+# Ou via uvicorn (boucle locale impérative, désactivation explicite des proxy headers) :
+uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 --proxy-headers=false
 ```
 
-> **Note sécurité & dette technique** :
-> Ce squelette minimal (ticket #25) est confiné à la boucle locale (`127.0.0.1`).
-> Le support TLS (certificat SAN IP obligatoire, `https://`) sera intégré avec les routes à secrets dans les tickets suivants (#64/#65).
-> Ne jamais exposer ce serveur en clair hors de localhost.
+> **Note sécurité & dette technique (contrat OpenAPI #15)** :
+> Ce squelette minimal (#25) est strictement confiné à la boucle locale (`127.0.0.1`, `::1`, `localhost`).
+> Ne jamais exposer ce serveur en clair hors de localhost. Les exigences runtime suivantes sont tracées et attribuées aux tickets du Vault :
+> - **TLS avec SAN IP obligatoire (`https://127.0.0.1:8443`)** : tickets #64 / #65.
+> - **Authentification par clé API de projet (`X-Heimdall-API-Key`)** : ticket #64.
+> - **Rejet HTTP 400 avant parsing au-delà de 1 Mio (1 048 576 octets)** : ticket #63.
+> - **En-tête `Cache-Control: no-store`** : ticket #63.
+> - **Rate-limit par bucket avec `Retry-After`** : ticket #64.
 
 Vérifier la santé minimale (`/api/v1/health` contractuel, `/health` alias local) :
 

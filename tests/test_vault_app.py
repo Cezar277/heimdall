@@ -5,7 +5,8 @@ Vérifie l'application FastAPI, la configuration via variables d'environnement
 la désactivation par défaut de la documentation OpenAPI (/docs, /openapi.json),
 la conformité contractuelle du schéma OpenAPI sur `/api/v1/health`,
 la gestion d'erreurs contractuelle (400, 401, 403, 404, 405, 409, 429, 503)
-sans enveloppe framework, et l'allowlist alignée sur VaultClient (127.0.0.1, ::1, localhost).
+sans enveloppe framework, l'allowlist d'en-têtes d'erreurs, l'immunité au spoofing
+X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 """
 
 import os
@@ -31,7 +32,7 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
     """Tests du comportement HTTP du serveur Vault."""
 
     async def asyncSetUp(self) -> None:
-        self.transport = ASGITransport(app=app)
+        self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
         self.client = AsyncClient(transport=self.transport, base_url="http://127.0.0.1:8443")
 
     async def asyncTearDown(self) -> None:
@@ -74,7 +75,8 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
         """En mode dev, le schéma OpenAPI déclare toutes les réponses contractuelles."""
         dev_app = create_app(VaultSettings(enable_docs=True))
         async with AsyncClient(
-            transport=ASGITransport(app=dev_app), base_url="http://127.0.0.1:8443"
+            transport=ASGITransport(app=dev_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
         ) as dev_client:
             docs_resp = await dev_client.get("/docs")
             self.assertEqual(docs_resp.status_code, 200)
@@ -129,7 +131,8 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "ok"}
 
         async with AsyncClient(
-            transport=ASGITransport(app=test_app), base_url="http://127.0.0.1:8443"
+            transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
         ) as c:
             response = await c.post("/test-validation", json={"num": "not-an-int"})
             self.assertEqual(response.status_code, 400)
@@ -161,7 +164,8 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
         }
 
         async with AsyncClient(
-            transport=ASGITransport(app=test_app), base_url="http://127.0.0.1:8443"
+            transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
         ) as c:
             for code, expected_body in expected_errors.items():
                 with self.subTest(code=code):
@@ -184,7 +188,9 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
             raise HTTPException(status_code=418)
 
         async with AsyncClient(
-            transport=ASGITransport(app=test_app, raise_app_exceptions=False),
+            transport=ASGITransport(
+                app=test_app, client=("127.0.0.1", 54321), raise_app_exceptions=False
+            ),
             base_url="http://127.0.0.1:8443",
         ) as c:
             for endpoint in ("/trigger-crash", "/trigger-unknown-http"):
@@ -197,13 +203,72 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertNotIn("Secret crash detail", resp.text)
 
+    async def test_exception_headers_allowlist_filtering(self) -> None:
+        """Seuls Allow et Retry-After (1-3600) sont retransmis, les autres sont filtrés."""
+        test_app = create_app()
+
+        @test_app.get("/trigger-headers")
+        async def trigger_headers() -> None:
+            raise HTTPException(
+                status_code=429,
+                headers={
+                    "Retry-After": "60",
+                    "X-Injected-Header": "forbidden_data",
+                },
+            )
+
+        @test_app.get("/trigger-bad-retry")
+        async def trigger_bad_retry() -> None:
+            raise HTTPException(
+                status_code=429,
+                headers={"Retry-After": "9999"},  # Hors borne 1-3600
+            )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as c:
+            resp = await c.get("/trigger-headers")
+            self.assertEqual(resp.headers.get("retry-after"), "60")
+            self.assertNotIn("x-injected-header", resp.headers)
+
+            resp_bad = await c.get("/trigger-bad-retry")
+            self.assertNotIn("retry-after", resp_bad.headers)
+
     async def test_non_loopback_client_rejected_by_middleware(self) -> None:
         """Défense en profondeur : une requête d'une IP distante/LAN est bloquée en 403."""
         test_app = create_app()
-        # Simule un appel ASGI avec un client non local (192.168.1.50)
         transport = ASGITransport(app=test_app, client=("192.168.1.50", 54321))
         async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8443") as c:
             response = await c.get("/health")
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(
+                response.json(),
+                {"code": "forbidden", "message": "Accès interdit"},
+            )
+
+    async def test_middleware_fail_closed_when_client_missing_or_empty(self) -> None:
+        """Garde fail-closed : client absent ou vide rejeté en 403."""
+        test_app = create_app()
+        for bad_client in (None, ("", 0)):
+            with self.subTest(client=bad_client):
+                transport = ASGITransport(app=test_app, client=bad_client)  # type: ignore[arg-type]
+                async with AsyncClient(
+                    transport=transport, base_url="http://127.0.0.1:8443"
+                ) as c:
+                    response = await c.get("/health")
+                    self.assertEqual(response.status_code, 403)
+
+    async def test_spoofed_x_forwarded_for_is_ignored(self) -> None:
+        """Invariant 6 : X-Forwarded-For falsifié ne permet pas de contourner le 403."""
+        test_app = create_app()
+        # Client externe 192.168.1.50 prétendant être 127.0.0.1
+        transport = ASGITransport(app=test_app, client=("192.168.1.50", 54321))
+        async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8443") as c:
+            response = await c.get(
+                "/health",
+                headers={"X-Forwarded-For": "127.0.0.1", "Forwarded": "for=127.0.0.1"},
+            )
             self.assertEqual(response.status_code, 403)
             self.assertEqual(
                 response.json(),
@@ -250,7 +315,7 @@ class VaultSettingsTests(unittest.TestCase):
             "::ffff:0.0.0.0",
             "localhost.evil.com",
             "evil.example.com",
-            "127.0.0.2",  # Hors allowlist canonique {127.0.0.1, ::1, localhost}
+            "127.0.0.2",
         )
         for invalid_host in invalid_hosts:
             with self.subTest(host=invalid_host):

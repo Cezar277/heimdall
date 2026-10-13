@@ -4,20 +4,22 @@ Ce module initialise l'application FastAPI pour le serveur Vault, sa configurati
 lue dans les variables d'environnement (via pydantic-settings) et la route de santé.
 
 Lancement du serveur :
-    uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443
+    python -m heimdall.vault.app
+    # ou :
+    uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 --proxy-headers=false
 
 RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 - Allowlist boucle locale : écoute EXCLUSIVEMENT sur la boucle locale (127.0.0.1, ::1, localhost),
   strictement alignée sur `heimdall.vault.client._ALLOWED_LOOPBACK_HOSTS`.
   Toute adresse LAN, WAN, broadcast ou 0.0.0.0 est rejetée (mitigation Network exposure / Spoofing).
-- Garde de défense en profondeur : middleware HTTP bloquant avec 403 toute requête provenant d'une
-  IP non-loopback même si le serveur était lancé par mégarde sur toutes les interfaces.
+- Garde middleware fail-closed : rejette (HTTP 403) toute requête sans client identifié ou
+  provenant d'une IP non-loopback. Les en-têtes X-Forwarded-For sont ignorés et uvicorn est
+  configuré avec proxy_headers=False (invariant 6 : pas d'usurpation via proxy non approuvé).
 - Documentation désactivée par défaut : docs_url, redoc_url et openapi_url sont désactivés
   pour interdire la reconnaissance d'empreinte (fingerprinting) et l'exposition de version/schéma.
 - Schéma OpenAPI conforme : /api/v1/health déclare l'ensemble des réponses contractuelles (200, 405,
   429, 500, 503, default) avec header Retry-After obligatoire sur 429 et 503.
-- La route /api/v1/health (et son alias /health) ne divulgue JAMAIS de version, de détails
-  de configuration, de chemins ou de données internes (mitigation Information Disclosure).
+- Allowlist sur les en-têtes d'exception : seuls Allow et Retry-After (1-3600) sont retransmis.
 - Confinement crypto (ticket #17) : ce module n'importe JAMAIS cryptography ou
   argon2 (réservés exclusivement à heimdall/vault/crypto.py).
 - Gestion d'erreurs normalisée :
@@ -88,11 +90,13 @@ class InternalError(BaseModel):
     message: Literal["Erreur interne"] = "Erreur interne"
 
 
+_MAX_RETRY_AFTER_SECONDS: int = 3600
+
 _RETRY_AFTER_HEADER = {
     "Retry-After": {
         "required": True,
         "description": "Délai en secondes avant nouvelle tentative.",
-        "schema": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "schema": {"type": "integer", "minimum": 1, "maximum": _MAX_RETRY_AFTER_SECONDS},
     }
 }
 
@@ -187,24 +191,27 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:
-        """Défense en profondeur : bloque toute connexion ne provenant pas de localhost."""
+        """Défense en profondeur fail-closed : bloque toute requête non issue du loopback."""
         client = request.client
-        if client and client.host:
-            host = client.host
-            if host != "testclient":
-                try:
-                    addr = ipaddress.ip_address(host)
-                    if not addr.is_loopback:
-                        return JSONResponse(
-                            status_code=403,
-                            content=_ERROR_PAYLOADS[403],
-                        )
-                except ValueError:
-                    if host not in _ALLOWED_LOOPBACK_HOSTS:
-                        return JSONResponse(
-                            status_code=403,
-                            content=_ERROR_PAYLOADS[403],
-                        )
+        if not client or not client.host:
+            return JSONResponse(
+                status_code=403,
+                content=_ERROR_PAYLOADS[403],
+            )
+        host = client.host
+        try:
+            addr = ipaddress.ip_address(host)
+            if not addr.is_loopback:
+                return JSONResponse(
+                    status_code=403,
+                    content=_ERROR_PAYLOADS[403],
+                )
+        except ValueError:
+            if host not in _ALLOWED_LOOPBACK_HOSTS:
+                return JSONResponse(
+                    status_code=403,
+                    content=_ERROR_PAYLOADS[403],
+                )
         return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
@@ -229,7 +236,21 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
             exc.status_code,
             _ERROR_PAYLOADS[500],
         )
-        headers = dict(exc.headers) if exc.headers else None
+        # Allowlist stricte des en-têtes autorisés pour éviter toute injection ou fuite
+        filtered_headers: dict[str, str] = {}
+        if exc.headers:
+            for key, val in exc.headers.items():
+                lower_key = key.lower()
+                if lower_key == "allow":
+                    filtered_headers["Allow"] = str(val)
+                elif lower_key == "retry-after":
+                    try:
+                        retry_sec = int(val)
+                        if 1 <= retry_sec <= _MAX_RETRY_AFTER_SECONDS:
+                            filtered_headers["Retry-After"] = str(retry_sec)
+                    except ValueError:
+                        pass
+        headers = filtered_headers or None
         return JSONResponse(
             status_code=status_code,
             content=content,
@@ -280,6 +301,8 @@ def run_server() -> None:
         "heimdall.vault.app:app",
         host=server_settings.host,
         port=server_settings.port,
+        proxy_headers=False,
+        forwarded_allow_ips="",
     )
 
 
