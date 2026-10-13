@@ -49,7 +49,10 @@ le SDK, et la garde d'entrée refuse tout argument hors contrat.
 contrat #16. Il est la sonde de vie demandée par le #73 : il ne renvoie aucune
 donnée du dépôt (juste `{"pong": true}`), donc il n'élargit pas la surface de
 fuite. Son intégration au contrat (ou son retrait) se fait par PR dédiée, avec
-relecture — pas en passant, conformément aux règles de gel du contrat.
+relecture — pas en passant, conformément aux règles de gel du contrat, et sans
+réutiliser cette dérogation comme précédent. L'écart est **verrouillé par un
+test** (`tests/test_mcp_server.py::ContractGapTests`) : tant que `ping` n'est
+pas dans `x-tools`, aucun autre nom hors contrat ne peut être exposé.
 
 ## 2 bis. Ce que `read_diff` garantit
 
@@ -63,9 +66,11 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 | pager hostile inopérant | sorties toujours pipées, prouvé sans override | `test_hostile_pager_is_never_executed` |
 | `diff.external` / `textconv` inopérants (interdit I5) | `--no-ext-diff --no-textconv` imposés | `GitEnvironmentTests` |
 | l'environnement hérité ne redirige pas le dépôt | `GIT_DIR`, `GIT_INDEX_FILE`, `HOME`, `PATH` reconstruits à zéro | `GitEnvironmentTests` |
-| aucune valeur en clair renvoyée | masquage `<REDACTED:type:len=N>` **avant** `json.dumps` | `test_secret_values_are_masked_before_serialization` |
-| réponse bornée par `max_bytes` | budget vérifié **après** sérialisation, fichiers retirés en dernier | `test_response_never_exceeds_max_bytes` |
+| aucune valeur en clair renvoyée | masquage `<REDACTED:type:len=N>` **avant** `json.dumps`, sur la ligne entière puis troncature | `test_secret_values_are_masked_before_serialization` |
+| une valeur citée longue n'est jamais sectionnée avant masquage | pas de fenêtre préalable : `mask_text` voit le guillemet fermant (régression de revue fermée) | `test_long_quoted_value_is_masked_not_windowed` |
+| réponse bornée par `max_bytes` | budget vérifié **après** sérialisation, fichiers retirés en dernier (une seule sérialisation par fichier) | `test_response_never_exceeds_max_bytes` |
 | limite atteinte = information incomplète | `truncated: true`, jamais « diff vide » | tests de troncature |
+| format de diff non compris → rien n'est jeté en silence | hunk combiné `@@@ ` décodé, en-tête illisible ou `* Unmerged path` → `truncated: true` | `test_unmerged_path_is_never_a_silent_empty_diff` |
 | compteur `redactions` toujours vrai | recompté sur les lignes finales : une coupe n'y laisse jamais un compteur sans marqueur | `TruncationInvariantTests` |
 | coupe `max_bytes` sur lignes complètes | la ligne à cheval est abandonnée (aucun préfixe en clair) | `test_secret_never_straddles_any_budget` |
 | FIFO/socket/device refusés, `O_NONBLOCK` | pas de blocage infini (DoS), revérifié après ouverture | `test_fifo_does_not_hang_the_server` |
@@ -89,7 +94,8 @@ Le chemin vient du LLM : il est traité comme une entrée piégée
 | `.git/`, `.env*`, fichiers ignorés interdits | segments interdits (`.env-backup` inclus, `.envelope` sur-bloqué assumé) + `git check-ignore` | `tests/test_mcp_sanitize_file.py` |
 | binaire, > 1 Mo, absent, dossier | codes dédiés (`BINARY_FILE`, `TOO_LARGE`, `NOT_FOUND`) | idem |
 | ouverture sans suivre un lien | `O_NOFOLLOW` + comparaison dev/ino (TOCTOU) | `GuardWiringTests` |
-| extrait masqué avant sérialisation | `masking.mask_text`, puis borne 100 000 caractères | `test_no_clear_value_ever_reaches_the_llm` |
+| extrait masqué avant sérialisation | `masking.mask_text` sur la ligne entière, puis borne 100 000 caractères | `test_no_clear_value_ever_reaches_the_llm` |
+| valeur citée > 2,5 Ko jamais sectionnée avant masquage | masquage avant troncature, sans fenêtre préalable | `test_long_quoted_value_is_masked_not_windowed` |
 | jetons nus et corps PEM masqués | préfixe connu ou ≥ 32 caractères denses, fusion par spécificité | `BareTokenMaskingTests` |
 | paramètre `path` manquant refusé | enveloppe `INVALID_INPUT`, pas « Field required » du SDK | `RequiredParametersTests` |
 | réponse conforme au contrat #16 | validée contre `SanitizeFileResult` | `test_response_conforms_to_the_contract` |
@@ -175,7 +181,7 @@ restent vérifiées.
 | stdout = protocole uniquement | aucun `print` dans `heimdall/mcp/` | `StdoutIsProtocolOnlyTests` |
 | registre fermé | `SERVER_TOOLS` + garde d'entrée | `test_ping_is_declared_to_the_client` |
 | décisions et limites (ADR) | SDK v2, `ping` hors contrat, TOCTOU, écarts | `docs/adr/003-serveur-mcp.md` |
-| 100 % instructions / branches mesuré | tests unitaires in-process déterministes (+ 96 e2e) | `tests/test_mcp_units.py` + `coverage report` |
+| 100 % instructions / branches mesuré | tests unitaires in-process déterministes (+ 26 e2e stdio) | `tests/test_mcp_units.py` + `coverage report` |
 | session adverse conforme au contrat | vrai client stdio, réponses validées | `tests/test_mcp_client.py::EndToEndSessionTests` |
 | aucun port / INET / socket nommé | `/proc` + `ss`, paire anonyme asyncio seule autorisée | `NoNetworkTests` (+ contrôle négatif `http.server`) |
 | aucun import réseau dans le serveur | analyse AST de `heimdall/mcp/` | `NoTrafficTests` |

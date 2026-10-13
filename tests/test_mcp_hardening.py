@@ -301,7 +301,14 @@ class MaskingPerformanceTests(unittest.TestCase):
         self.assertEqual(masked, line)
 
     def test_fit_budget_with_200_files_is_bounded_in_time(self) -> None:
-        """200 fichiers au plafond + max_bytes=1024 : _fit_budget borné en temps (< 2s)."""
+        """200 fichiers au plafond + max_bytes=1024 : borné en temps ET en taille.
+
+        Avant correctif, chaque `pop` resérialisait toute la liste (jusqu'à
+        200 `dumps` complets, sur le canal stdio synchrone, avec un contenu
+        pilotable par le dépôt scanné). Le test borne les deux : le temps
+        reste sous 2 s, et la réponse sérialisée respecte le budget — donc
+        les fichiers retirés le sont RÉELLEMENT, pas seulement comptés.
+        """
         files = [
             {
                 "file": f"f{i}.py",
@@ -317,6 +324,10 @@ class MaskingPerformanceTests(unittest.TestCase):
         self.assertLess(elapsed, 2.0, f"_fit_budget trop lent : {elapsed:.2f}s")
         self.assertTrue(truncated)
         self.assertLessEqual(len(files), 10)
+        response = server.errors.dumps({"files": files, "truncated": True}).encode("utf-8")
+        self.assertLessEqual(len(response), 1024)
+        # Le retrait est bien « les derniers d'abord » (le préfixe survit).
+        self.assertEqual([item["file"] for item in files], [f"f{i}.py" for i in range(len(files))])
 
 
 

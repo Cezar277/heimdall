@@ -167,6 +167,37 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.assertTrue(payload["truncated"])
         self.assertLessEqual(len(entry["added_lines"][0]["text"]), 2000)
 
+    def test_long_quoted_value_is_masked_not_windowed(self) -> None:
+        """Régression de revue : plus de fenêtre AVANT le masquage.
+
+        Une valeur citée plus longue que la fenêtre (2500 caractères) ne
+        matchait plus `_QUOTED_ASSIGNMENT` une fois la ligne tronquée, et
+        son préfixe partait en clair au LLM. Le masquage porte désormais sur
+        la ligne entière : la borne de 2000 caractères ne peut plus
+        sectionner une valeur avant détection.
+        """
+        value = "a" * 5000
+        self.write("conf.py", f'SECRET = "{value}"\n')
+        self.stage("conf.py")
+        payload = self.call_read_diff()
+        text = json.dumps(payload)
+        self.assertNotIn(f'SECRET = "{value[:50]}', text)
+        self.assertNotIn(value[:200], text)
+        self.assertIn("<REDACTED:generic_secret:len=5000>", text)
+        self.assertEqual(payload["files"][0]["redactions"], 1)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
+    def test_long_quoted_value_stays_masked_whatever_the_budget(self) -> None:
+        """Le budget (`max_bytes`, choisi par le LLM) ne réouvre pas la fuite."""
+        value = "a" * 5000
+        self.write("conf.py", "Z" * 400 + f'\nSECRET = "{value}"\n')
+        self.stage("conf.py")
+        for budget in (1024, 2048, 4096, 32768):
+            with self.subTest(max_bytes=budget):
+                text = json.dumps(self.call_read_diff({"max_bytes": budget}))
+                self.assertNotIn(f'SECRET = "{value[:50]}', text)
+                self.assertEqual(mcp_contract.errors("ReadDiffResult", json.loads(text)), [])
+
     def test_secret_never_straddles_any_budget(self) -> None:
         """Quel que soit `max_bytes` (contrôlé par le LLM), aucun fragment
         de secret en clair : la ligne incomplète est abandonnée, la ligne
@@ -311,6 +342,36 @@ class GitEnvironmentTests(GitRepoTestCase):
     suivi — avec une réponse d'outil correcte par ailleurs.
     """
 
+    def _conflicting_merge(self, name: str = "conflit.py") -> None:
+        """Laisse un chemin de l'index NON RÉSOLU (merge en cours).
+
+        Le fichier n'est volontairement pas `git add` après le conflit :
+        l'entrée d'index reste aux étapes 1/2/3, et c'est exactement ce que
+        `git diff --cached` rencontre en production.
+        """
+        self.write(name, "tete\ncorps\n")
+        self.stage(name)
+        _git(self.repo, "commit", "-qm", "base")
+        _git(self.repo, "checkout", "-q", "-b", "branche")
+        self.write(name, "tete\ncote branche\n")
+        self.stage(name)
+        _git(self.repo, "commit", "-qm", "branche")
+        _git(self.repo, "checkout", "-q", "-")
+        self.write(name, "tete\ncote principal\n")
+        self.stage(name)
+        _git(self.repo, "commit", "-qm", "principal")
+        completed = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+            [GIT, "-C", str(self.repo), "merge", "branche"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0, "le merge devait conflicter")
+        # Valeur factice laissée dans l'arbre de travail : un chemin non
+        # fusionné ne doit jamais la laisser fuir (ni en clair, ni du tout).
+        self.write(name, f'tete\nTOKEN = "{FAKE_GITHUB_TOKEN}"\n')
+
     def _plant_hook(self, name: str) -> Path:
         """Script-canari : son exécution laisse un fichier témoin hors dépôt."""
         canary = Path(self._tmp.name) / f"canary-{name}"
@@ -429,6 +490,30 @@ class GitEnvironmentTests(GitRepoTestCase):
         self.assertTrue(res.is_error)
         payload = tool_payload(res)
         self.assertEqual(payload["error"]["code"], "NOT_A_GIT_REPO")
+
+    def test_unmerged_path_is_never_a_silent_empty_diff(self) -> None:
+        """Merge en cours : l'information manquante est ANNONCÉE.
+
+        `git diff --cached` ne montre aucune ligne pour un chemin non
+        fusionné (`* Unmerged path x`). Sans drapeau, la réponse aurait
+        ressemblé à un diff vide alors que le dépôt est en cours de
+        fusion — l'inverse du fail-closed (invariant 1).
+        """
+        self._conflicting_merge()
+        payload = self.call_read_diff()
+        self.assertTrue(payload["truncated"], "un chemin non fusionné doit se signaler")
+        self.assertNotIn(FAKE_GITHUB_TOKEN, json.dumps(payload))
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
+    def test_unmerged_path_does_not_hide_the_resolved_files(self) -> None:
+        """Un chemin non fusionné n'annule pas le reste : le reste est montré."""
+        self._conflicting_merge()
+        self.write("autre.py", "x = 1\n")
+        self.stage("autre.py")
+        payload = self.call_read_diff()
+        self.assertIn("autre.py", [item["file"] for item in payload["files"]])
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
     def test_unquoted_short_secret_with_evocative_key_is_masked(self) -> None:
         """Secret court non quoté à clé évocatrice (ex. PASSWORD=hunter2) : masqué."""

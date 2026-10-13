@@ -42,8 +42,14 @@ signalait à tort (faux positif documenté dans `docs/mcp-server.md`).
 
 Écart assumé au contrat #16 : `ping` n'en fait pas partie. Il répond
 `{"pong": true}`, aucune donnée du dépôt, et ne sera ni intégré au contrat
-ni retiré en passant — par PR dédiée relue. Preuve : `SERVER_TOOLS` dans
-`heimdall/mcp/server.py` (`SERVER_TOOLS`, `ping`), test de registre fermé.
+ni retiré en passant — par PR dédiée relue, **sans réutiliser cette
+dérogation comme précédent** (rappel de revue : la PR #27 porte 7 tickets
+en une, et `ping` reste hors schéma). Preuve : `SERVER_TOOLS` dans
+`heimdall/mcp/server.py` (`SERVER_TOOLS`, `ping`), test de registre fermé,
+et `tests/test_mcp_server.py::ContractGapTests` qui **verrouille** l'écart :
+tant que `ping` n'est pas dans `x-tools`, aucun autre nom hors contrat ne
+peut être exposé — donc l'ajout d'un cinquième outil hors contrat échoue au
+lieu de se glisser.
 
 ### 3. Frontière d'entrée : le contrat appliqué pour de vrai
 
@@ -139,11 +145,20 @@ caractères sur une seule ligne n'est pas masquée** (borne anti-ReDoS
 assumée : `_QUOTED_ASSIGNMENT` bornée à `{4,20000}`, un credential réel
 ne fait pas plus de 20 Ko et les lignes sont de toute façon plafonnées
 par le contrat) ; **coût masquage ≤ 1 Mo/ligne, masquer-puis-tronquer assumé** : dans
-`sanitize_file`, une ligne peut atteindre 1 Mo et fait passer les expressions régulières
-sur la ligne complète avant troncature à 2 000 caractères (`MAX_LINE_CHARS`), garantissant
-qu'aucune valeur de secret n'est sectionnée avant détection (coût CPU borné à 1 Mo, regex
-linéaires sans ReDoS). La détection de précision appartient au
-scanner #22 mesuré en #21. Preuve :
+`read_diff` comme dans `sanitize_file`, `mask_text` passe sur la ligne
+**complète**, la troncature à 2 000 caractères (`MAX_LINE_CHARS`) vient
+**après** — garantit qu'aucune valeur n'est sectionnée avant détection
+(coût CPU borné : 1 Mo par fichier, `max_bytes` par diff, regex linéaires
+sans ReDoS). L'ordre inverse était une régression de masquage **prouvée
+par exécution en revue** : la fenêtre `MAX_LINE_CHARS + 500` appliquée
+avant masquage faisait échouer `_QUOTED_ASSIGNMENT` sur toute valeur citée
+dont le guillemet fermant tombait au-delà (donc au-delà de ~2,5 Ko), et le
+préfixe de 2 000 caractères partait en clair au LLM — la borne des 20 Ko
+annoncée ici était donc fausse en pratique. Corrigé, épinglé par
+`tests/test_mcp_units.py::MaskedFilesTests`,
+`tests/test_mcp_read_diff.py::ReadDiffToolTests` et
+`tests/test_mcp_sanitize_file.py::SanitizeFileToolTests`. La détection de
+précision appartient au scanner #22 mesuré en #21. Preuve :
 `heimdall/mcp/masking.py`, `tests/test_mcp_hardening.py::BareTokenMaskingTests`,
 `tests/test_mcp_hardening.py::MaskingPerformanceTests`.
 
@@ -156,10 +171,19 @@ sinon l'invariant structurel du schéma — faille réelle trouvée par audit
 et corrigée, avec tests. Dans `sanitize_file`, chaque ligne est bornée à 2 000 caractères
 (`MAX_LINE_CHARS`) après masquage (`truncated: true`), immunisant le canal contre le DoS CPU
 face à des fichiers piégés à ligne unique géante (jusqu'à 1 Mo). Le budget `max_bytes` est vérifié sur la réponse
-sérialisée (fichiers retirés en dernier, `truncated: true` ; coût de calcul `_fit_budget` borné à ≤ 200 dumps JSON
-sans impact de latence). Preuve :
-`heimdall/mcp/server.py` (`_masked_files`, `_fit_budget`, `sanitize_file`),
-`tests/test_mcp_hardening.py::TruncationInvariantTests`.
+sérialisée (fichiers retirés en dernier, `truncated: true`). **Coût de
+`_fit_budget` : une seule sérialisation par fichier** (les tailles sont
+cumulées, l'additivité de `errors.dumps` compact vérifiée par test contre
+la taille réelle, à l'octet près) — l'ancienne version resérialisait toute
+la liste à chaque `pop`, jusqu'à 200 `dumps` complets, sur le canal stdio
+synchrone, avec un `max_bytes` choisi par le LLM sur un contenu piloté par
+le dépôt. Test : 200 fichiers au plafond + `max_bytes=1024` borné en temps
+ET la réponse sérialisée réellement ≤ 1024 (donc des fichiers retirés, pas
+seulement comptés). Preuve :
+`heimdall/mcp/server.py` (`_masked_files`, `_masked_line`, `_fit_budget`, `_file_sizes`, `_prefix_size`, `sanitize_file`),
+`tests/test_mcp_hardening.py::TruncationInvariantTests`,
+`tests/test_mcp_hardening.py::MaskingPerformanceTests`,
+`tests/test_mcp_units.py::MaskedFilesTests`.
 
 ### 8 bis. Coupe sur lignes complètes, FIFO refusés, binaires innommables
 
@@ -180,6 +204,31 @@ sans impact de latence). Preuve :
   : abandonné avec `truncated: true`, jamais escamoté en silence — et
   sans tuer toute la réponse pour un nom (un binaire ne porte aucune
   ligne ; tuer la réponse serait un DoS par fichier bizarre).
+
+### 8 ter. Formats de diff non reconnus : fail-closed, jamais du silence
+
+Règle unique : **ce que le parseur ne comprend pas, il le signale**
+(`truncated: true`) au lieu de le jeter. Trois cas trouvés en revue :
+
+- **Hunk combiné `@@@ -1,2 -1,2 +1,3 @@@`** (diff de fusion, N parents) :
+  il ne matchait pas `"@@ "`, donc le hunk ne s'ouvrait pas et les lignes
+  `+` suivantes étaient relues comme des en-têtes puis jetées, **sans**
+  `truncated`. Il est maintenant reconnu (`_COMBINED_HUNK_HEADER`) et son
+  corps décodé : un caractère de préfixe par parent (`+` ajouté, `-`
+  absent, espace contexte), seule ligne ajoutée côté **tous** les parents
+  étant reportée. L'argv figé `diff --cached` n'en émet pas sur les
+  versions actuelles de git (vérifié : `* Unmerged path …`), on ne laisse
+  donc pas la grammaire devenir un angle mort.
+- **En-tête de hunk illisible** (`@@ garbage`) : `truncated: true`.
+- **`* Unmerged path x`** : c'est ce que `git diff --cached` renvoie pour
+  un chemin d'index non résolu (merge en cours) — **aucune ligne**. La
+  réponse valait alors « aucun changement indexé » avec
+  `truncated: false`, sur un dépôt en cours de fusion. Drapeau posé,
+  les autres fichiers du diff restant montrés.
+
+Preuve : `heimdall/mcp/gitdiff.py` (`_COMBINED_HUNK_HEADER`, `_DiffParser._hunk_header`,
+`_DiffParser._hunk_line`), `tests/test_mcp_units.py::ParserStateTests`,
+`tests/test_mcp_read_diff.py::GitEnvironmentTests` (merge conflictuel réel).
 
 ### 9. Garde de chemin unique + TOCTOU et hardlinks documentés (exigence #76)
 
@@ -237,10 +286,12 @@ absent/dossier (`NOT_FOUND`), `start_line` hors bornes (extrait vide,
 ## Conséquences
 
 - Couverture mesurée **100 % instructions / 100 % branches** sur
-  `heimdall/mcp` (tests unitaires in-process, déterministes) + 96 tests de
-  bout en bout en sous-processus (vrai client MCP). La transmission de
-  `COVERAGE_PROCESS_START` est câblée dans `tests/support/mcp_client.py`
-  pour que la CI du #20 mesure aussi les sous-processus.
+  `heimdall/mcp` (`coverage run --branch --source=heimdall/mcp -m pytest
+  tests/test_mcp_*.py`), + 26 fonctions de test qui passent par un vrai
+  client MCP en sous-processus (`tests/support/mcp_client.py`). La
+  transmission de `COVERAGE_PROCESS_START` est câblée dans
+  `tests/support/mcp_client.py` pour que la CI du #20 mesure aussi les
+  sous-processus.
 - Risque : masquage conservateur → marqueurs parfois superflus (hashes
   d'intégrité, SHA copiés) ; à mesurer avec #21, jamais à « optimiser »
   en passant.
@@ -257,8 +308,9 @@ renseigner la feuille SAMM avec liens permanents au SHA :
 | stdio, racine fixée, registre fermé | `heimdall/mcp/server.py` (`run_stdio`, `build_server`, `SERVER_TOOLS`) |
 | entrées refusées, échecs en enveloppe | `heimdall/mcp/server.py` (`_ToolBoundary`, `tool_handler`), `heimdall/mcp/errors.py` |
 | git confiné, diff typé | `heimdall/mcp/gitdiff.py` (`DIFF_ARGUMENTS`, `confined_environment`, `parse_diff`) |
-| masquage avant sérialisation, compteurs vrais | `heimdall/mcp/masking.py` (`mask_text`), `heimdall/mcp/server.py` (`_masked_files`) |
+| masquage avant sérialisation, compteurs vrais | `heimdall/mcp/masking.py` (`mask_text`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`) |
 | garde unique, TOCTOU réduite, FIFO refusés | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |
 | coupe sur lignes complètes | `heimdall/mcp/gitdiff.py` (`staged_diff`) |
+| format de diff non compris → `truncated`, jamais du silence | `heimdall/mcp/gitdiff.py` (`_COMBINED_HUNK_HEADER`, `_DiffParser._hunk_header`) |
 | aucun réseau | `tests/test_mcp_client.py` (`NoNetworkTests`, `NoTrafficTests`) |
 | 100 % / 100 % mesuré | `tests/test_mcp_units.py` + sortie `coverage report` |

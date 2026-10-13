@@ -76,6 +76,12 @@ MAX_CONTENT_CHARS: Final[int] = 100_000
 # post-ouverture. Sans effet sur les réguliers (lecture normale).
 _NONBLOCK: Final[int] = getattr(os, "O_NONBLOCK", 0)
 
+# Partie constante de la réponse sérialisée (`{"files":[],"truncated":true}`
+# moins la liste vide), calculée une fois à l'import : `_fit_budget` décide
+# ainsi de ses retraits par arithmétique entière, sans jamais resérialiser
+# la réponse (le coût était O(n²) sérialisations, cf. ADR-003 §8).
+_ENVELOPE_BYTES: Final[int] = len(errors.dumps({"files": [], "truncated": True}).encode("utf-8"))
+
 # Métadonnée de protocole MCP tolérée (_meta) : bornée, jamais un champ.
 # Un client modifié pourrait y glisser un volume arbitraire ; nos outils
 # ne la lisent ni ne la renvoient (le SDK l'ignore), mais on refuse
@@ -283,6 +289,36 @@ def _clean_trailing_marker(text: str) -> str:
     return text
 
 
+def _masked_line(raw_text: str) -> tuple[str, bool]:
+    """Masque une ligne ENTIÈRE, puis la borne à ``MAX_LINE_CHARS``.
+
+    L'ordre est la garantie, pas un détail : sans fenêtre préalable, le
+    guillemet fermant d'une valeur citée est toujours vu par
+    ``mask_text`` et la valeur toujours remplacée. La fenêtre
+    ``MAX_LINE_CHARS + 500`` qui précédait coupait en deux toute valeur
+    citée dont le guillemet fermant tombait au-delà : ``SECRET="`` + 5000
+    caractères + ``"`` ne matchait alors plus ``_QUOTED_ASSIGNMENT``, et le
+    préfixe de 2000 caractères de la valeur partait en clair au LLM
+    (régression de masquage prouvée par exécution en revue, puis épinglée
+    par ``tests/test_mcp_read_diff.py`` et ``tests/test_mcp_units.py``).
+
+    Coût : ``mask_text`` voit au plus ce qu'il voyait déjà — la fenêtre
+    couvrait ``MAX_LINE_CHARS + 500`` par ligne, le fichier entier est
+    plafonné à 1 Mo (``MAX_FILE_BYTES``) et le diff lu à ``max_bytes``,
+    motifs linéaires sans ReDoS. C'est le coût déjà acté en ADR-003 §7.
+
+    Le masquage ne peut que raccourcir une ligne (une valeur entière devient
+    un marqueur), donc masquer d'abord ne fait jamais franchir une borne
+    que la ligne respectait déjà : la troncature ne reste due que là où elle
+    l'était (grosse ligne de remplissage, valeur citée > 20 000 caractères
+    — borne ADR-003 §7 —, fichier minifié).
+    """
+    masked, _ = masking.mask_text(raw_text)
+    if len(masked) <= gitdiff.MAX_LINE_CHARS:
+        return masked, False
+    return _clean_trailing_marker(masked[: gitdiff.MAX_LINE_CHARS]), True
+
+
 def _tools(root: Path) -> dict[str, Callable[..., str]]:
     """Construit les outils, chacun fermé sur la racine résolue.
 
@@ -350,15 +386,8 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
         content, total_lines, truncated = _read_extract(confined.absolute, start_line, max_lines)
         pieces: list[str] = []
         for raw_line in content:
-            if len(raw_line) > gitdiff.MAX_LINE_CHARS + 500:
-                line_to_mask = raw_line[: gitdiff.MAX_LINE_CHARS + 500]
-                truncated = True
-            else:
-                line_to_mask = raw_line
-            masked, _ = masking.mask_text(line_to_mask)
-            if len(masked) > gitdiff.MAX_LINE_CHARS:
-                masked = _clean_trailing_marker(masked[: gitdiff.MAX_LINE_CHARS])
-                truncated = True
+            masked, cut = _masked_line(raw_line)
+            truncated = truncated or cut
             pieces.append(masked)
         # Borne de contenu du contrat (100 000 caractères) : elle s'applique
         # APRÈS masquage, pour les mêmes raisons que read_diff.
@@ -493,10 +522,10 @@ def _split_lines(text: str) -> list[str]:
 def _masked_files(entries: list[gitdiff.DiffEntry]) -> tuple[list[dict[str, object]], bool]:
     """Construit les ``DiffFile`` du contrat, masquage puis bornes.
 
-    Ordre volontaire : on masque **avant** de tronquer une ligne à 2000
-    caractères. Tronquer d'abord couperait une valeur en deux et le masquage
-    ne la reconnaîtrait plus ; masquer d'abord la raccourcit, donc la borne
-    reste respectée.
+    Ordre delegates à ``_masked_line`` : on masque **avant** de tronquer
+    une ligne à 2000 caractères (masquer d'abord la raccourcit, donc la
+    borne reste respectée ; l'inverse couperait une valeur en deux et le
+    masquage ne la reconnaîtrait plus).
 
     Le compteur ``redactions`` est **recompté sur les lignes finales** (les
     marqueurs qui survivent à la coupe), pas sur le masquage brut : une
@@ -513,15 +542,8 @@ def _masked_files(entries: list[gitdiff.DiffEntry]) -> tuple[list[dict[str, obje
         added: list[dict[str, object]] = []
         finals: list[str] = []
         for number, raw_text in entry.lines:
-            if len(raw_text) > gitdiff.MAX_LINE_CHARS + 500:
-                text_to_mask = raw_text[: gitdiff.MAX_LINE_CHARS + 500]
-                truncated = True
-            else:
-                text_to_mask = raw_text
-            masked, _ = masking.mask_text(text_to_mask)
-            if len(masked) > gitdiff.MAX_LINE_CHARS:
-                masked = _clean_trailing_marker(masked[: gitdiff.MAX_LINE_CHARS])
-                truncated = True
+            masked, cut = _masked_line(raw_text)
+            truncated = truncated or cut
             added.append({"line": number, "text": masked})
             finals.append(masked)
         if entry.line_overflow:
@@ -546,18 +568,51 @@ def _fit_budget(files: list[dict[str, object]], max_bytes: int) -> bool:
     réponse sérialisée tienne. La boucle s'arrête toujours : une réponse
     vide est minuscule, donc elle passe sous n'importe quel budget. Un
     fichier retiré est signalé par ``truncated: true`` — la réponse dit
-    « information incomplète », jamais « diff vide ».
+    « information incomplète », jamais « diff vide ». La liste ``files``
+    est raccourcie sur place : c'est elle qui est sérialisée ensuite.
+
+    Coût borné : chaque fichier est sérialisé **une seule fois** par
+    ``_file_sizes``, puis la boucle ne manipule que des tailles entières.
+    L'ancienne version resérialisait toute la liste à chaque ``pop`` —
+    jusqu'à 200 ``dumps`` complets, sur le canal stdio synchrone, avec un
+    contenu pilotable par le dépôt scanné. L'additivité des tailles
+    (``errors.dumps`` compact, un objet = un élément de liste) permet de
+    décider du retrait par sommes cumulées, à coût constant par retrait.
+    ``_encoded_size`` reste la mesure de référence exacte ; un test vérifie
+    que la somme cumulative lui est identique.
     """
     truncated = False
-    while files and _encoded_size(files) > max_bytes:
-        files.pop()
+    sizes = _file_sizes(files)
+    while sizes and _prefix_size(sizes) > max_bytes:
+        sizes.pop()
         truncated = True
+    del files[len(sizes) :]
     return truncated
 
 
+def _file_sizes(files: list[dict[str, object]]) -> list[int]:
+    """Taille sérialisée de chaque fichier, calculée une seule fois."""
+    return [len(errors.dumps(item).encode("utf-8")) for item in files]
+
+
 def _encoded_size(files: list[dict[str, object]]) -> int:
-    """Taille de la réponse sérialisée, en octets UTF-8."""
+    """Taille EXACTE de la réponse sérialisée, en octets UTF-8.
+
+    Référence de contrôle : ``_fit_budget`` passe par les tailles cumulées
+    pour ne pas resérialiser, cette fonction sert à prouver (en test) que
+    la somme cumulative ne dérape pas de la réalité.
+    """
     return len(errors.dumps({"files": files, "truncated": True}).encode("utf-8"))
+
+
+def _prefix_size(sizes: list[int]) -> int:
+    """Taille de la réponse sérialisée pour ce préfixe de fichiers.
+
+    Additivité vérifiée en test : enveloppe à liste vide + somme des
+    éléments + une virgule par élément au-delà du premier (``errors.dumps``
+    compact, donc un objet = un élément de liste).
+    """
+    return _ENVELOPE_BYTES + sum(sizes) + max(len(sizes) - 1, 0)
 
 
 # ---------------------------------------------------------------------------

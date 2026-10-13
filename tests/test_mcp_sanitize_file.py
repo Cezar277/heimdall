@@ -104,6 +104,32 @@ class SanitizeFileToolTests(FileRepoTestCase):
             with self.subTest(**arguments):
                 self.assertNotIn(jeton, str(self.read(arguments)))
 
+    def test_long_quoted_value_is_masked_not_windowed(self) -> None:
+        """Régression de revue : plus de fenêtre AVANT le masquage.
+
+        Une valeur citée dont le guillemet fermant tombait au-delà de la
+        fenêtre de 2500 caractères n'était plus reconnue par
+        `_QUOTED_ASSIGNMENT`, et son préfixe partait en clair au LLM. Le
+        masquage porte désormais sur la ligne entière.
+        """
+        value = "a" * 5000
+        self.write("conf.py", f'SECRET = "{value}"\n')
+        payload = self.read({"path": "conf.py"})
+        content = payload["content"]
+        self.assertNotIn(f'SECRET = "{value[:50]}', content)
+        self.assertNotIn(value[:200], content)
+        self.assertIn("<REDACTED:generic_secret:len=5000>", content)
+        self.assertEqual(payload["redactions"], 1)
+        self.assertFalse(payload["truncated"], "une valeur masquée ne doit plus être coupée")
+        self.assertEqual(mcp_contract.errors("SanitizeFileResult", payload), [])
+
+    def test_long_line_without_secret_is_still_capped(self) -> None:
+        """La borne de 2000 caractères tient toujours (masquage puis coupe)."""
+        self.write("remplissage.txt", "y" * 5000 + "\n")
+        payload = self.read({"path": "remplissage.txt"})
+        self.assertTrue(payload["truncated"])
+        self.assertLessEqual(len(payload["content"]), 2000)
+
     def test_slice_selects_the_requested_lines(self) -> None:
         """``start_line`` / ``max_lines`` bornent l'extrait."""
         payload = self.read({"path": "sub/profond.py", "start_line": 2, "max_lines": 2})

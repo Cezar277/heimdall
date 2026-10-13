@@ -17,6 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from support import mcp_contract
 from support.mcp_client import REPO_ROOT, call_tool, list_tools, tool_payload
 from typer.testing import CliRunner
 
@@ -44,6 +45,31 @@ class PingToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="heimdall-mcp-") as tmp:
             result = call_tool("ping", {}, root=Path(tmp))
             self.assertEqual(tool_payload(result), {"pong": True})
+
+
+class ContractGapTests(unittest.TestCase):
+    """Écart assumé au contrat #16 : `ping` est exposé hors contrat (ADR-003 §2).
+
+    Ce test **verrouille** l'écart, il ne l'approuve pas. Tant que `ping` n'a
+    pas été intégré au schéma figé, aucun AUTRE nom hors contrat ne doit être
+    exposé ; le jour où le contrat l'intègre, ce test échoue et on le
+    supprime — c'est le signal qui évite que la dérogation serve de
+    précédent (« on ajoute, on documentera plus tard »).
+    """
+
+    def test_only_ping_is_exposed_outside_the_contract(self) -> None:
+        contract_tools = set(mcp_contract.contract()["x-tools"])
+        outside = [name for name in mcp_server.SERVER_TOOLS if name not in contract_tools]
+        self.assertEqual(outside, ["ping"])
+
+    def test_contract_tools_delivered_later_are_registered_but_not_exposed(self) -> None:
+        """`MCP_TOOLS` reste la référence figée des 4 outils du contrat."""
+        delivered = set(mcp_server.SERVER_TOOLS) - set(mcp_server.MCP_TOOLS)
+        self.assertEqual(delivered, {"ping"})
+        self.assertEqual(
+            set(mcp_server.MCP_TOOLS) - set(mcp_server.SERVER_TOOLS),
+            {"list_candidates", "propose_patch"},
+        )
 
 
 class ArgumentGateTests(unittest.TestCase):

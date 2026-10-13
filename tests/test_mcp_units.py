@@ -248,12 +248,54 @@ class MaskedFilesTests(unittest.TestCase):
         self.assertEqual(files[0]["redactions"], 0)
         self.assertNotIn(token, files[0]["added_lines"][0]["text"])
 
+    def test_long_quoted_value_is_masked_never_windowed(self) -> None:
+        """Régression de revue : la fenêtre précédait le masquage.
+
+        `SECRET="` + 5000 caractères + `"` ne matchait plus
+        `_QUOTED_ASSIGNMENT` une fois la ligne tronquée avant masquage : le
+        préfixe de 2000 caractères partait en clair. Le guillemet fermant
+        étant désormais toujours vu, la valeur entière est remplacée.
+        """
+        value = "a" * 5000
+        files, truncated = server._masked_files(
+            [gitdiff.DiffEntry("e.py", False, ((1, f'SECRET="{value}"'),))]
+        )
+        self.assertFalse(truncated, "une valeur masquée ne doit plus être coupée")
+        text = files[0]["added_lines"][0]["text"]
+        self.assertEqual(text, 'SECRET="<REDACTED:generic_secret:len=5000>"')
+        self.assertEqual(files[0]["redactions"], 1)
+        self.assertNotIn(value[:50], text)
+
     def test_budget_pops_last_files_first(self) -> None:
         entries = [gitdiff.DiffEntry(f"f{i}.py", False, ((1, "x = 1"),)) for i in range(5)]
         files, truncated = server._masked_files(entries)
         self.assertFalse(truncated)
         self.assertTrue(server._fit_budget(files, 200))
         self.assertLessEqual(server._encoded_size(files), 200)
+        self.assertEqual([item["file"] for item in files], ["f0.py"])  # les derniers partent
+
+    def test_budget_is_sized_without_reserializing_every_file(self) -> None:
+        """Les tailles cumulées valent la taille réelle, à l'octet près.
+
+        C'est ce qui permet à `_fit_budget` de décider du retrait sans
+        resérialiser la réponse à chaque `pop` (coût O(n²) avant correctif).
+        """
+        files = [
+            {"file": f"f{i}.py", "binary": False, "redactions": 0, "added_lines": []}
+            for i in range(7)
+        ]
+        for count in range(len(files) + 1):
+            with self.subTest(files=count):
+                self.assertEqual(
+                    server._prefix_size(server._file_sizes(files[:count])),
+                    server._encoded_size(files[:count]),
+                )
+
+    def test_budget_below_one_file_returns_an_empty_diff(self) -> None:
+        """Budget minuscule : on retire jusqu'à passer, `truncated` le dit."""
+        files = [{"file": "gros.py", "binary": False, "redactions": 0, "added_lines": []}]
+        self.assertTrue(server._fit_budget(files, 1))
+        self.assertEqual(files, [])
 
     def test_empty_budget_is_always_reachable(self) -> None:
         self.assertFalse(server._fit_budget([], 1024))
@@ -379,6 +421,21 @@ class GitAccessDirectTests(unittest.TestCase):
                 access.staged_diff(1024)
         proc.kill.assert_called_once()
         proc.wait.assert_called_once()
+
+    def test_staged_diff_without_a_pipe_returns_no_bytes(self) -> None:
+        """Branche défensive : sans `stdout`, rien à lire, rien à fermer.
+
+        `subprocess.PIPE` est toujours passé par notre argv figé, donc la
+        branche est inatteignable en production ; elle est testée pour que
+        la mesure de couverture annoncée (100 % instructions / 100 %
+        branches, ADR-003 « Preuve ») reste vraie au lieu d'être recopiée.
+        """
+        access = gitdiff.GitAccess(self.repo.root)
+        proc = mock.MagicMock()
+        proc.stdout = None
+        proc.wait.return_value = 0
+        with mock.patch("subprocess.Popen", return_value=proc):
+            self.assertEqual(access.staged_diff(1024), (b"", False))
 
     def test_staged_diff_process_nonzero_exit_is_internal(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
@@ -967,6 +1024,89 @@ class ParserStateTests(unittest.TestCase):
     def test_malformed_hunk_header_is_skipped(self) -> None:
         entries, _ = gitdiff.parse_diff("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ garbage\n+y\n")
         self.assertEqual(entries, [])
+
+    def test_unreadable_hunk_header_flags_truncation(self) -> None:
+        """Format d'hunk non reconnu : fail-closed, jamais du silence.
+
+        Le hunk ne s'ouvre pas, donc les lignes `+` qui suivent ne sont
+        pas montrées — et la réponse doit le dire (`truncated: true`),
+        sinon le LLM lit une absence de changement là où git en montre.
+        """
+        for header in ("@@ garbage", "@@@ nonsense", "@@@@@ @@"):
+            with self.subTest(header=header):
+                entries, truncated = gitdiff.parse_diff(
+                    f"diff --git a/x b/x\n--- a/x\n+++ b/x\n{header}\n+y\n"
+                )
+                self.assertEqual(entries, [])
+                self.assertTrue(truncated)
+
+    def test_combined_hunk_shows_the_lines_added_to_every_parent(self) -> None:
+        """Hunk combiné (`@@@ `) : lu, pas jeté en silence.
+
+        L'argv figé (`diff --cached`) n'émet pas de hunk combiné sur les
+        versions actuelles de git, mais le parseur le comprend quand même :
+        une grammaire non reconnue est un angle mort, pas une garantie.
+        Chaque ligne porte un préfixe PAR PARENT (`+` ajouté, `-` absent,
+        espace contexte) ; seule une ligne ajoutée côté tous les parents
+        est une ligne ajoutée du fichier.
+        """
+        entries, truncated = gitdiff.parse_diff(
+            "diff --cc x\n"
+            "index 751cc53,dd63c94..0000000\n"
+            "mode 100644\n"
+            "--- a/x\n"
+            "+++ b/x\n"
+            "@@@ -1,4 -1,4 +1,5 @@@\n"
+            "  contexte\n"
+            "++ajoutee partout\n"
+            " +ajoutee chez un seul parent\n"
+            " -absente du resultat\n"
+        )
+        self.assertFalse(truncated)
+        self.assertEqual(
+            [(entry.path, entry.lines) for entry in entries],
+            [("x", ((2, "ajoutee partout"),))],
+        )
+
+    def test_combined_hunk_of_three_parents_uses_three_prefixes(self) -> None:
+        """Merge octopus : un préfixe par parent, donc 3 caractères."""
+        entries, _ = gitdiff.parse_diff(
+            "diff --cc x\n"
+            "--- a/x\n"
+            "+++ b/x\n"
+            "@@@ -1,2 -1,2 -1,2 +1,3 @@@\n"
+            "+++ajoutee partout\n"
+            "  +ajoutee chez un seul parent\n"
+        )
+        self.assertEqual(entries[0].lines, ((1, "ajoutee partout"),))
+
+    def test_combined_hunk_with_a_truncated_body_flags_truncation(self) -> None:
+        """Corps plus court que le nombre de parents : fail-closed aussi."""
+        entries, truncated = gitdiff.parse_diff(
+            "diff --cc x\n--- a/x\n+++ b/x\n@@@ -1,2 -1,2 +1,3 @@@\n+\n"
+        )
+        self.assertEqual(entries, [], "aucune ligne lisible, le fichier n'est pas montré")
+        self.assertTrue(truncated)
+
+    def test_unmerged_path_is_flagged_never_a_silent_empty_diff(self) -> None:
+        """`git diff --cached` sur un index en conflit ne montre AUCUNE ligne.
+
+        Sans drapeau, `read_diff` répondrait « aucun changement indexé »
+        alors que le dépôt est en cours de fusion : l'information manquante
+        doit être annoncée (`truncated: true`).
+        """
+        entries, truncated = gitdiff.parse_diff(
+            "diff --git a/nouveau.py b/nouveau.py\n"
+            "new file mode 100644\n"
+            "index 0000000..a1b2c3d\n"
+            "--- /dev/null\n"
+            "+++ b/nouveau.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+x = 1\n"
+            "* Unmerged path conflictuel.py\n"
+        )
+        self.assertEqual([entry.path for entry in entries], ["nouveau.py"])
+        self.assertTrue(truncated)
 
 
 class ConfineDirectTests(unittest.TestCase):

@@ -94,8 +94,29 @@ MAX_FILES: Final[int] = 200
 MAX_LINES_PER_FILE: Final[int] = 5000
 MAX_LINE_CHARS: Final[int] = 2000
 
-# `@@ -12,0 +1,3 @@ fonction; seule la position côté nouveau compte.
-_HUNK_HEADER: Final[re.Pattern[str]] = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# `@@ -12,0 +1,3 @@ fonction` : seule la position côté nouveau compte, et
+# c'est elle que le groupe nommé `new` porte.
+_HUNK_HEADER: Final[re.Pattern[str]] = re.compile(r"^@@ -\d+(?:,\d+)? \+(?P<new>\d+)(?:,\d+)? @@")
+
+# Hunk **combiné** d'un diff de fusion : `@@@ -1,2 -1,2 +1,3 @@@`. Un couple
+# de plages par parent (`parents`), puis la position côté nouveau. Reconnu —
+# bien que l'argv figé `diff --cached` n'en émette pas sur les versions
+# actuelles de git — plutôt qu'ignoré : un format d'hunk non reconnu faisait
+# relire les lignes `+` comme des en-têtes et les jeter **en silence**, à
+# l'inverse du fail-closed (invariant 1).
+_COMBINED_HUNK_HEADER: Final[re.Pattern[str]] = re.compile(
+    r"^@@@ (?P<parents>(?:-\d+(?:,\d+)? )+)\+(?P<new>\d+)(?:,\d+)? @@@"
+)
+
+# Préfixe de hunk simple : `@` seul ne l'ouvre pas, mais toute ligne `@...`
+# qui n'est pas un en-tête d'hunk lisible signale une sortie qu'on ne comprend
+# pas — donc une information perdue.
+_HUNK_PREFIX: Final[str] = "@@"
+
+# `* Unmerged path x` : résumé que `git diff --cached` produit pour un chemin
+# de l'index non résolu (merge en cours). Aucune ligne n'est montrée pour ce
+# chemin, donc le parseur doit signaler l'incomplétude.
+_UNMERGED_PATH: Final[str] = "* Unmerged path "
 
 
 def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
@@ -401,6 +422,11 @@ class _DiffParser:
     ligne qui ne commence pas par ``+``, ``-``, `` `` ou ``\\`` le referme et
     doit être relue comme un en-tête. Sans cette règle, une ligne ajoutée
     telle que ``+++ b/x`` serait prise pour un en-tête, et inversement.
+
+    Principe commun aux formats non reconnus (en-tête de hunk illisible,
+    chemin non fusionné) : on pose ``truncated`` au lieu de laisser croire à
+    une réponse complète. Invariant 1 : mieux vaut une information incomplète
+    annoncée qu'un contenu absent en silence.
     """
 
     def __init__(self) -> None:
@@ -409,6 +435,10 @@ class _DiffParser:
         self._builder: _EntryBuilder | None = None
         self._in_hunk: bool = False
         self._new_line: int = 0
+        # Nombre de parents d'un hunk combiné (= 1 hors fusion) : le corps
+        # porte un caractère de préfixe PAR PARENT (`+` ajouté, `-` absent,
+        # espace contexte), donc le découpage des lignes en dépend.
+        self._parents: int = 1
 
     def feed(self, text: str) -> tuple[list[DiffEntry], bool]:
         for raw in text.split("\n"):
@@ -420,6 +450,7 @@ class _DiffParser:
         builder, self._builder = self._builder, None
         self._in_hunk = False
         self._new_line = 0
+        self._parents = 1
         if builder is None:
             return
         if builder.binary and builder.path is None:
@@ -441,6 +472,11 @@ class _DiffParser:
         if raw.startswith("diff --git ") or raw.startswith("diff --cc "):
             self._flush()
             self._builder = _EntryBuilder()
+            return
+        if raw.startswith(_UNMERGED_PATH):
+            # `* Unmerged path x` : l'index porte un chemin non résolu (merge
+            # en cours), et git n'en montre alors aucune ligne.
+            self.truncated = True
             return
         builder = self._builder
         if builder is None:
@@ -480,24 +516,69 @@ class _DiffParser:
                 if path is not None:
                     builder.path = path
             return
+        if raw.startswith(_HUNK_PREFIX):
+            self._hunk_header(raw)
+
+    def _hunk_header(self, raw: str) -> None:
+        """Ouvre un hunk, ou signale la sortie qu'on n'a pas comprise.
+
+        Deux grammaires, une seule règle : ce qui n'est pas reconnu pose
+        ``truncated``. Sans elle, les lignes ``+`` suivantes seraient
+        relues comme des en-têtes et jetées sans rien dire — un silence,
+        pas un fail-closed (invariant 1).
+        """
+        match: re.Match[str] | None = None
+        parents = 0
         if raw.startswith("@@ "):
             match = _HUNK_HEADER.match(raw)
-            if match is None:
-                return
-            self._in_hunk = True
-            self._new_line = int(match.group(1))
+            parents = 1
+        elif raw.startswith("@@@ "):
+            match = _COMBINED_HUNK_HEADER.match(raw)
+            # Un couple de plages par parent, chacune `-début[,nb] ` : compter
+            # les tirets du préfixe donne donc le nombre de parents, celui
+            # qui décide du nombre de caractères de préfixe par ligne.
+            if match is not None:
+                parents = match.group("parents").count("-")
+        if match is None:
+            self.truncated = True
+            return
+        self._parents = parents
+        self._in_hunk = True
+        self._new_line = int(match.group("new"))
 
     def _hunk_line(self, builder: _EntryBuilder, raw: str) -> None:
-        if raw.startswith("+"):
-            if len(builder.lines) >= MAX_LINES_PER_FILE:
-                self.truncated = True
-                builder.line_overflow = True
-                return
-            builder.lines.append((self._new_line, raw[1:]))
-            self._new_line += 1
+        if self._parents == 1:
+            # Ligne retirée, contexte (absent avec --unified=0) ou
+            # « \ No newline at end of file » : rien à compter.
+            if raw.startswith("+"):
+                self._append(builder, raw[1:])
             return
-        # Ligne retirée, contexte (absent avec --unified=0) ou
-        # « \ No newline at end of file » : rien à compter.
+        # Hunk combiné : un caractère de préfixe par parent (`+` ajouté à
+        # ce parent, `-` absent, espace contexte). La ligne appartient au
+        # résultat si AUCUN préfixe n'est `-` ; elle n'est « ajoutée » que si
+        # elle l'est côté TOUS les parents (sinon c'est un contexte chez
+        # l'un d'eux, pas une ligne que le commit ajoute au fichier).
+        prefixes = raw[: self._parents]
+        if len(prefixes) < self._parents:
+            # Corps plus court que le nombre de parents : grammaire incomprise
+            # (fail-closed, comme un en-tête d'hunk illisible).
+            self.truncated = True
+            return
+        if "-" in prefixes:
+            return  # absente du fichier côté nouveau
+        if prefixes == "+" * self._parents:
+            self._append(builder, raw[self._parents :])
+            return
+        self._new_line += 1  # contexte : occupe une ligne, sans en être ajoutée
+
+    def _append(self, builder: _EntryBuilder, text: str) -> None:
+        """Enregistre une ligne ajoutée, numérotée côté nouveau."""
+        if len(builder.lines) >= MAX_LINES_PER_FILE:
+            self.truncated = True
+            builder.line_overflow = True
+            return
+        builder.lines.append((self._new_line, text))
+        self._new_line += 1
 
 
 def parse_diff(text: str) -> tuple[list[DiffEntry], bool]:
