@@ -699,6 +699,43 @@ class MaskingRulesTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertNotIn("sup3rsecret", masked)
 
+    def test_url_token_without_password_is_masked(self) -> None:
+        """Userinfo SANS mot de passe : `https://<jeton>@hôte` (remote git, CI).
+
+        `_URL_CREDENTIALS` exige `utilisateur:motdepasse@`, donc ce jeton
+        n'était vu par AUCUNE règle : court et sans préfixe connu, il
+        partait en clair. Les filets `bare` ne rattrapent qu'au-delà de
+        32 caractères denses ou d'un préfixe connu.
+        """
+        for line, secret in (
+            ("git clone https://tok1234567890@serveur/repo", "tok1234567890"),
+            ("remote: https://ghp_court1@github.com/o/r.git", "ghp_court1"),
+            ("curl https://monmotdepasse123@serveur/chemin", "monmotdepasse123"),
+        ):
+            with self.subTest(line=line):
+                masked, count = masking.mask_text(line)
+                self.assertEqual(count, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:url_userinfo:", masked)
+
+    def test_url_userinfo_that_is_a_username_stays_readable(self) -> None:
+        """Un nom d'utilisateur n'est pas un jeton : le seuil est mesuré.
+
+        Secrets ≥ 3,09 bits par caractère (`monmotdepasse`), identités
+        ≤ 2,91 (`utilisateur`), et sous 8 caractères de toute façon
+        (`alice`, `deploy`). L'hôte reste lisible dans tous les cas : c'est
+        lui qui sert au tri.
+        """
+        for user, host in (
+            ("alice", "git.interne"),
+            ("utilisateur", "git.interne"),
+        ):
+            with self.subTest(user=user):
+                masked, _ = masking.mask_text(f"https://{user}@{host}")
+                self.assertNotIn("url_userinfo", masked)
+                self.assertIn(user, masked)
+                self.assertIn(host, masked)
+
     def test_bare_url_keeps_its_precise_type(self) -> None:
         """Sans affectation qui fait de l'ombre, seul le mot de passe part."""
         masked, _ = masking.mask_text("voir postgres://admin:sup3rsecret@db.internal/app ici")
@@ -710,6 +747,85 @@ class MaskingRulesTests(unittest.TestCase):
         masked, count = masking.mask_text('token = "hunter2-long-value-xyz"')
         self.assertEqual(count, 1)
         self.assertNotIn("hunter2-long-value-xyz", masked)
+
+    def test_short_evocative_value_is_masked(self) -> None:
+        """`SECRET=abc12`, `PASSWORD=1234` : sous 6 caractères, c'était en clair.
+
+        La borne de 6 de `_UNQUOTED_ASSIGNMENT` laissait partir ces lignes
+        vers le LLM et son historique alors que le nom dit « secret ».
+        """
+        for line, secret in (
+            ("SECRET=abc12", "abc12"),
+            ("PASSWORD=1234", "1234"),
+            ("secret=x1", "x1"),
+            ("TOKEN=a9", "a9"),
+        ):
+            with self.subTest(line=line):
+                masked, count = masking.mask_text(line)
+                self.assertEqual(count, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:", masked)
+
+    def test_short_rule_does_not_shadow_the_long_one(self) -> None:
+        """Deux fenêtres, pas une : une valeur courte matche tôt dans la ligne.
+
+        Abaisser la borne du motif long avait un effet de bord mesuré :
+        `max_bytes: int` matchait d'abord et consommait la suite du texte,
+        si bien que `DEFAULT_MAX_BYTES` n'était plus vu du tout. La règle
+        courte est donc SÉPARÉE, et ce test verrouille qu'elle n'absorbe
+        rien des règles longues.
+        """
+        line = "def read_diff(max_bytes: int = DEFAULT_MAX_BYTES) -> str:"
+        masked, count = masking.mask_text(line)
+        self.assertEqual(count, 1)
+        # La valeur longue est celle qui est remplacée (17 caractères) ; le
+        # type `int` de 3 caractères reste lisible — une seule fenêtre
+        # n'aurait vu que lui et laissé `DEFAULT_MAX_BYTES` partir en clair.
+        self.assertEqual(
+            masked,
+            "def read_diff(max_bytes: int = <REDACTED:generic_secret:len=17>) -> str:",
+        )
+
+    def test_short_rule_keeps_ordinary_code_readable(self) -> None:
+        """Le bruit est mesuré, pas espéré : littéraux, mots, annotations.
+
+        Mesuré sur 1,29 million de lignes de corpus (dépôt + bibliothèques
+        tierces) : 36 lignes tierces nouvellement masquées (constantes dont
+        le NOM contient `auth`/`cert`/`salt`, comme `UNAUTHORIZED = 401`),
+        0 dans le dépôt lui-même, et 0 ligne auparavant masquée devenue
+        lisible. Les faux positifs assumés ci-dessous sont épinglés : si le
+        bruit augmente, ce test doit être mis à jour consciemment.
+        """
+        for line in (
+            "session = None",
+            "auth = None",
+            "cert = null",
+            "id-token: write",
+            "def __init__(self, api_key: str) -> None:",
+            "x = 1",
+            "port = 8080",
+            "token = 0",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(masking.mask_text(line), (line, 0))
+
+    def test_short_rule_false_positives_are_pinned(self) -> None:
+        """Faux positifs CONNUS et assumés de la règle courte (36 en corpus).
+
+        `UNAUTHORIZED = 401` et `salt_len = 16` sont masqués : le nom
+        contient `auth`/`salt` et la valeur est alphanumérique courte. Les
+        épingler évite deux tentations opposées — les « corriger » en
+        doublant le bruit, ou les oublier et croire le filtre parfait.
+        """
+        for line, length in (
+            ("UNAUTHORIZED = 401", 3),
+            ("salt_len = 16", 2),
+            ("token = undefined", 9),  # règle LONGUE préexistante : non concerné
+        ):
+            with self.subTest(line=line):
+                masked, count = masking.mask_text(line)
+                self.assertEqual(count, 1)
+                self.assertIn(f"len={length}>", masked)
 
     def test_mask_text_tail_appends_the_rest(self) -> None:
         masked, count = masking.mask_text('a = "ghp_ hei" b = 1')

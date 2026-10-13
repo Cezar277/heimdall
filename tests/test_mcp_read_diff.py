@@ -167,6 +167,26 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.assertTrue(payload["truncated"])
         self.assertLessEqual(len(entry["added_lines"][0]["text"]), 2000)
 
+    def test_short_evocative_value_is_masked(self) -> None:
+        """`SECRET=abc12`, `PASSWORD=1234` : sous 6 caractères, c'est un secret.
+
+        Ces lignes partaient en clair vers le LLM et son historique : la borne
+        de 6 caractères de la règle d'affectation non citée prenait le pas sur
+        le nom évocateur. Test de bout en bout (dépôt git réel + vrai client
+        MCP), donc la réponse sérialisée est bien celle qui est vérifiée.
+        """
+        self.write("court.env", "SECRET=abc12\nPASSWORD=1234\nTOKEN=x1\nMODE=read\n")
+        self.stage("court.env")
+        payload = self.call_read_diff()
+        content = json.dumps(payload)
+        for secret in ("abc12", "1234", "x1"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(f'"{secret}"', content)
+                self.assertNotIn(f":{secret}", content)
+        self.assertIn("MODE=read", content, "une valeur non secrète reste lisible")
+        self.assertEqual(payload["files"][0]["redactions"], 3)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
     def test_long_quoted_value_is_masked_not_windowed(self) -> None:
         """Régression de revue : plus de fenêtre AVANT le masquage.
 

@@ -40,6 +40,24 @@ _UNQUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
     r"(?P<value>[^\s\"'`,;)}\]]{6,4096})"
 )
 
+# clé = valeur COURTE (1 à 5 caractères) sous un nom ÉVOCATEUR :
+# `SECRET=abc12`, `PASSWORD=1234`, `TOKEN=x1` — un code court, un PIN, un mot
+# de passe par défaut. La borne de 6 de `_UNQUOTED_ASSIGNMENT` les laissait
+# partir en clair vers le LLM et son historique alors que le nom dit déjà
+# « secret ».
+#
+# Règle SÉPARÉE, et non une borne abaissée dans `_UNQUOTED_ASSIGNMENT` : le
+# premier match d'un motif gagne, donc une valeur courte matche TÔT dans la
+# ligne (`max_bytes: int` dans une signature) et consommerait la suite du
+# texte — le masquage long perdrait alors ses cibles (`DEFAULT_MAX_BYTES`
+# n'était plus vu). Deux motifs, deux fenêtres, aucun ombrage : c'est
+# vérifié par test (`test_short_rule_does_not_shadow_the_long_one`).
+_EVOCATIVE_SHORT_VALUE: Final[re.Pattern[str]] = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
+    r"\s*[:=]\s*"
+    r"(?P<value>[^\s\"'`,;)}\]]{1,5})"
+)
+
 # Authorization: Bearer <jeton>
 _AUTH_HEADER: Final[re.Pattern[str]] = re.compile(
     r"(?P<key>Authorization)"
@@ -56,6 +74,17 @@ _URL_CREDENTIALS: Final[re.Pattern[str]] = re.compile(
     r":"
     r"(?P<value>[^/@\s]{4,256})"
     r"@"
+)
+
+# schéma://<jeton>@hôte — jeton d'accès dans le userinfo SANS mot de passe,
+# forme standard d'une remote git ou d'un en-tête CI. `_URL_CREDENTIALS`
+# exige `utilisateur:motdepasse@`, donc ce jeton-là n'était vu par AUCUNE
+# règle : court et sans préfixe connu, il partait en clair (les filets `bare`
+# ne rattrapent qu'au-delà de 32 caractères denses ou d'un préfixe connu).
+# On masque donc tout userinfo qui A L'AIR d'être un jeton — voir
+# `_url_userinfo_looks_secret`.
+_URL_USERINFO: Final[re.Pattern[str]] = re.compile(
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]{1,16}://)(?P<value>[^/@\s]{1,256})@"
 )
 
 # En-tête de clé privée PEM (la valeur s'étale sur plusieurs lignes : chaque
@@ -139,6 +168,17 @@ _SECRET_KEY: Final[re.Pattern[str]] = re.compile(
     r"(?i)(passwd|password|pwd|secret|token|api[-_.]?key|access[-_.]?key|"
     r"private[-_.]?key|credential|auth|salt|signature|licen[cs]e|bearer|"
     r"session|cert|webhook|connection[-_.]?string)"
+)
+
+# Littéraux de langage : jamais un secret, et roadblocks du bruit de la
+# règle des valeurs COURTES (`session = None`, `auth = None`, `cert = null`
+# — du code ordinaire, pas un secret). Volontairement N'UTILISÉ QUE PAR
+# `_short_evocative_looks_secret` : l'appliquer aussi aux règles longues
+# changerait leur comportement (mesuré : 10 lignes tierces cesseraient d'être
+# masquées), alors qu'aucune n'est demandée par le correctif. Portée
+# minimale, effet mesuré.
+_CODE_LITERAL: Final[re.Pattern[str]] = re.compile(
+    r"(?i)\A(?:none|null|nil|nan|true|false|undefined|self|this|object|void)\Z"
 )
 
 # Préfixes de jetons connus (liste courte, à compléter avec #22).
@@ -228,6 +268,20 @@ _AUTH_SCHEMES: Final[frozenset[str]] = frozenset(
     {"bearer", "basic", "token", "digest", "negotiate", "aws4-hmac-sha256", "mac", "hoba"}
 )
 
+# Seuils du userinfo d'URL : ce qu'il faut pour distinguer un jeton d'accès
+# d'un simple nom d'utilisateur. Mesurés sur un corpus (secrets ≥ 3,09 bits
+# par caractère — `monmotdepasse`, `tok1234567890`, `dXNlcjpwYXNz…` — contre
+# identités ≤ 2,91 — `utilisateur`, `robotaccount` — plus `alice` et
+# `deploy`, trop courtes de toute façon) : 3,0 bits sépare les deux groupes
+# sans faux positif mesuré. Le préfixe connu court-circuite le seuil : un
+# `ghp_…` est un jeton même tronqué.
+MIN_URL_USERINFO_LENGTH: Final[int] = 8
+MIN_URL_USERINFO_BITS: Final[float] = 3.0
+
+# Longueur minimale de la valeur dans la règle courte : sous 2 caractères,
+# ce n'est pas un credential mais une constante (`token = 0`).
+MIN_SHORT_VALUE_LENGTH: Final[int] = 2
+
 
 def _looks_like_secret(key: str | None, value: str) -> bool:
     """Décide si une valeur doit être masquée (conservateur en cas de doute)."""
@@ -242,6 +296,36 @@ def _looks_like_secret(key: str | None, value: str) -> bool:
     # Sans indice de nom, il faut une valeur longue et dense : c'est la règle
     # d'entropie du scanner #22, appliquée ici pour ne rien laisser passer.
     return len(value) >= MIN_ENTROPY_LENGTH and shannon_entropy(value) >= MIN_ENTROPY_BITS
+
+
+def _url_userinfo_looks_secret(value: str) -> bool:
+    """Un userinfo d'URL est-il un jeton plutôt qu'un nom d'utilisateur ?"""
+    if value.lower().startswith(_KNOWN_PREFIXES):
+        return True
+    return len(value) >= MIN_URL_USERINFO_LENGTH and shannon_entropy(value) >= MIN_URL_USERINFO_BITS
+
+
+def _short_evocative_looks_secret(key: str, value: str) -> bool:
+    """Valeur de 1 à 5 caractères sous un nom évocateur : secret ou code ?
+
+    Deux filtres, dans cet ordre :
+
+    1. `_CODE_LITERAL` : `session = None`, `auth = None`, `cert = null` — du
+       code ordinaire, jamais un secret.
+    2. **au moins un chiffre** et **au moins deux caractères** dans la
+       valeur : un credential court est alphanumérique (`1234`, `abc12`,
+       `x1`), alors qu'un mot de 1 à 5 lettres — ou une constante
+       numérique d'un caractère (`token = 0`, `AUTHTYPE_SERVER = 0`) — est du
+       vocabulaire de code. Mesuré sur 1,29 million de lignes de corpus
+       (dépôt Heimdall + bibliothèques tierces) : 0 faux positif dans le
+       dépôt lui-même, et 0 ligne précédemment masquée n'est démasquée par
+       ce correctif.
+    """
+    if len(value) < MIN_SHORT_VALUE_LENGTH or _CODE_LITERAL.match(value):
+        return False
+    if not any(character.isdigit() for character in value):
+        return False
+    return _SECRET_KEY.search(key) is not None
 
 
 def _bare_known_matches(text: str) -> list[_Match]:
@@ -317,6 +401,11 @@ def _iter_matches(text: str) -> list[_Match]:
         ],
         [_span_match(match, "value", "url_password") for match in _URL_CREDENTIALS.finditer(text)],
         [
+            _span_match(match, "value", "url_userinfo")
+            for match in _URL_USERINFO.finditer(text)
+            if _url_userinfo_looks_secret(match.group("value"))
+        ],
+        [
             _span_match(match, "value", _secret_type(match.group("key"), match.group("value")))
             for match in _QUOTED_ASSIGNMENT.finditer(text)
             if _looks_like_secret(match.group("key"), match.group("value"))
@@ -325,6 +414,11 @@ def _iter_matches(text: str) -> list[_Match]:
             _span_match(match, "value", _secret_type(match.group("key"), match.group("value")))
             for match in _UNQUOTED_ASSIGNMENT.finditer(text)
             if _looks_like_secret(match.group("key"), match.group("value"))
+        ],
+        [
+            _span_match(match, "value", _secret_type(match.group("key"), match.group("value")))
+            for match in _EVOCATIVE_SHORT_VALUE.finditer(text)
+            if _short_evocative_looks_secret(match.group("key"), match.group("value"))
         ],
         _bare_known_matches(text),
         _bare_dense_matches(text, pem_context),

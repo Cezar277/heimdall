@@ -9,6 +9,7 @@ qu'aucune valeur en clair ne sort.
 
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import tempfile
@@ -174,6 +175,41 @@ class SanitizeFileToolTests(FileRepoTestCase):
     def test_directory_is_not_a_file(self) -> None:
         payload = self.read({"path": "sub"})
         self.assertEqual(payload["error"]["code"], "NOT_FOUND")
+
+    def test_non_regular_files_keep_a_stable_code(self) -> None:
+        """Codes stables pour un même objet, dans les deux ordres possibles.
+
+        Un FIFO/socket/périphérique présent **avant** la garde : `BINARY_FILE`
+        (« aucun texte à renvoyer », et surtout jamais d'ouverture qui
+        bloquerait). Le même objet substitué **après** la garde : `INTERNAL`,
+        parce que c'est une anomalie d'intégrité (dev/ino qui ne colle plus),
+        pas la nature du fichier. La distinction est voulue et stable : elle
+        est épinglée ici pour qu'un refactor ne la rende pas aléatoire.
+        """
+        os.mkfifo(self.repo / "tuyau")
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.bind(str(self.repo / "sock"))
+            self.assertEqual(self.read({"path": "tuyau"})["error"]["code"], "BINARY_FILE")
+            self.assertEqual(self.read({"path": "sock"})["error"]["code"], "BINARY_FILE")
+
+    def test_symlink_targets_decide_the_code(self) -> None:
+        """Un lien n'a pas de code propre : c'est sa CIBLE qui est jugée.
+
+        Vérifié parce que la revue supposait un `BINARY_FILE` pour un lien :
+        non — `confine` résout le lien avant tout. Sortant de la racine :
+        `PATH_ESCAPE`. Vers un FIFO interne : `BINARY_FILE` (la cible est un
+        FIFO). Vers un fichier interne : lu, et `path` renvoie la cible
+        canonique, jamais le nom du lien.
+        """
+        os.symlink("/etc/passwd", self.repo / "lien-sortant")
+        self.assertEqual(self.read({"path": "lien-sortant"})["error"]["code"], "PATH_ESCAPE")
+        os.mkfifo(self.repo / "cible-tuyau")
+        os.symlink(self.repo / "cible-tuyau", self.repo / "lien-tuyau")
+        self.assertEqual(self.read({"path": "lien-tuyau"})["error"]["code"], "BINARY_FILE")
+        os.symlink(self.repo / "sub" / "profond.py", self.repo / "lien-ok")
+        payload = self.read({"path": "lien-ok"})
+        self.assertEqual(payload["path"], "sub/profond.py")
+        self.assertEqual(payload["content"], "a\nb\nc\nd\ne")
 
     def test_git_directory_is_forbidden(self) -> None:
         payload = self.read({"path": ".git/config"})

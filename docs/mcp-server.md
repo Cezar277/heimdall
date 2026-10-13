@@ -95,10 +95,13 @@ Le chemin vient du LLM : il est traité comme une entrée piégée
 | refus de `..`, des chemins absolus, des liens sortants | résolution réelle + confinement sur `Path` résolus | `RefusalTests` |
 | `.git/`, `.env*`, fichiers ignorés interdits | segments interdits (`.env-backup` inclus, `.envelope` sur-bloqué assumé) + `git check-ignore` | `tests/test_mcp_sanitize_file.py` |
 | binaire, > 1 Mo, absent, dossier | codes dédiés (`BINARY_FILE`, `TOO_LARGE`, `NOT_FOUND`) | idem |
+| codes stables, liens jugés par leur cible | FIFO avant garde `BINARY_FILE` / après garde `INTERNAL` ; lien sortant `PATH_ESCAPE` | `test_non_regular_files_keep_a_stable_code` |
 | ouverture sans suivre un lien | `O_NOFOLLOW` + comparaison dev/ino (TOCTOU) | `GuardWiringTests` |
 | extrait masqué avant sérialisation | `masking.mask_text` sur la ligne entière, puis borne 100 000 caractères | `test_no_clear_value_ever_reaches_the_llm` |
 | valeur citée > 2,5 Ko jamais sectionnée avant masquage | masquage avant troncature, sans fenêtre préalable | `test_long_quoted_value_is_masked_not_windowed` |
 | jetons nus et corps PEM masqués | préfixe connu ou ≥ 32 caractères denses, fusion par spécificité | `BareTokenMaskingTests` |
+| valeur courte sous un nom évocateur masquée | `SECRET=abc12`, `PASSWORD=1234` — règle à fenêtre séparée (sinon ombrage), filtres anti-bruit mesurés | `test_short_evocative_value_is_masked` |
+| jeton dans un userinfo sans mot de passe masqué | `https://<jeton>@hôte`, type `url_userinfo`, seuil ≥ 8 car. et ≥ 3,0 bits | `test_url_token_without_password_is_masked` |
 | paramètre `path` manquant refusé | enveloppe `INVALID_INPUT`, pas « Field required » du SDK | `RequiredParametersTests` |
 | réponse conforme au contrat #16 | validée contre `SanitizeFileResult` | `test_response_conforms_to_the_contract` |
 

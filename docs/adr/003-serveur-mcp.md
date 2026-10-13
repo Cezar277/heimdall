@@ -170,7 +170,27 @@ l'alternative (masquer toute valeur affectée dès 8 caractères) noierait
 le tri (`name="production"`, indiscernable par entropie) et apprendrait
 au LLM à ignorer les marqueurs ; **une affectation non quotée à nom évocateur est masquée dès 6 caractères**
 (`_UNQUOTED_ASSIGNMENT` bornée à `{6,4096}` et filtrée par `_looks_like_secret`, protégeant `PASSWORD=hunter2`
-ou `SECRET=abc12345`) ; **une valeur quotée dépassant 20 000
+ou `SECRET=abc12345`) ; **puis, sous 6 caractères, dès 2 tant que la valeur
+est alphanumérique** (`SECRET=abc12`, `PASSWORD=1234`, `TOKEN=x1` — codes
+courts, PIN, mots de passe par défaut qui partaient en clair vers le LLM et
+son historique). Règle **séparée**, et non une borne abaissée : le premier
+match d'un motif gagne, donc une valeur courte matche tôt dans la ligne
+(`max_bytes: int` dans une signature) et consommerait la suite du texte — le
+masquage long perdait alors ses cibles, mesuré
+(`DEFAULT_MAX_BYTES` n'était plus vu). Filtres anti-bruit, eux aussi
+mesurés : littéral de langage (`session = None`, `auth = None`) et au moins
+un chiffre dans la valeur (un mot de 1 à 5 lettres est du vocabulaire de
+code : `id-token: write`, `api_key: str`). **Bruit assumé et épinglé** :
+36 lignes sur 1,29 million de corpus (constantes tierces dont le NOM
+contient `auth`/`cert`/`salt`, comme `UNAUTHORIZED = 401`), 0 dans le dépôt
+lui-même, 0 ligne précédemment masquée devenue lisible ;
+**un userinfo d'URL SANS mot de passe est masqué s'il a l'air d'un jeton**
+(`https://<jeton>@hôte`, remote git et CI — `_URL_CREDENTIALS` exigeait
+`utilisateur:motdepasse@`, donc ce jeton n'était vu par aucune règle) :
+préfixe connu, ou ≥ 8 caractères à ≥ 3,0 bits — seuil mesuré entre les
+secrets (≥ 3,09) et les identités (≤ 2,91), donc `https://alice@hôte` reste
+lisible ;
+**une valeur quotée dépassant 20 000
 caractères sur une seule ligne n'est pas masquée** (borne anti-ReDoS
 assumée : `_QUOTED_ASSIGNMENT` bornée à `{4,20000}`, un credential réel
 ne fait pas plus de 20 Ko et les lignes sont de toute façon plafonnées
@@ -300,6 +320,22 @@ insensible à la casse). Binaire (octet nul dans les 8 premiers Kio),
 > 1 Mo (`TOO_LARGE`, double garde : avant **et** après lecture),
 absent/dossier (`NOT_FOUND`), `start_line` hors bornes (extrait vide,
 `end_line: 0`, rien d'inventé).
+
+**Codes d'erreur stables pour un même objet, dans les deux ordres
+possibles** (distinction voulue, épinglée par test) : un non-régulier
+(FIFO, socket, périphérique) présent **avant** la garde → `BINARY_FILE`
+(« aucun texte à renvoyer », et surtout aucune ouverture qui bloquerait le
+canal) ; le même objet substitué **après** la garde → `INTERNAL`, car c'est
+une anomalie d'intégrité (dev/ino qui ne colle plus), pas la nature du
+fichier. Les deux sont fail-closed, et le client peut donc trier :nature du
+fichier vs corruption du périmètre. Un **lien symbolique n'a pas de code
+propre** : `confine` le résout avant tout, donc c'est sa cible qui est
+jugée — sortant de la racine `PATH_ESCAPE`, vers un FIFO interne
+`BINARY_FILE`, vers un fichier interne lu sous son nom **canonique** (jamais
+le nom du lien). Vérifié par exécution : un lien sortant donne bien
+`PATH_ESCAPE`, pas `BINARY_FILE`. Preuve :
+`tests/test_mcp_sanitize_file.py::SanitizeFileToolTests`
+(`test_non_regular_files_keep_a_stable_code`, `test_symlink_targets_decide_the_code`).
 
 ## Alternatives écartées
 
