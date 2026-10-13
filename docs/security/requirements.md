@@ -91,8 +91,8 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
 (`test_obfuscation_corpus_is_mandatory`), échange de lien concurrent rejeté
 (`test_symlink_swap_rejected_at_use`), traçabilité complète
 (`test_all_requirements_have_tests`), formulations non vagues
-(`test_no_vague_requirements`), balayage anti-secrets des 7 fichiers de la PR
-(`test_no_real_secrets_in_fixtures`).
+(`test_no_vague_requirements`), balayage anti-secrets par globs
+(`tests/security`, `docs/security`, workflows — `test_no_real_secrets_in_fixtures`).
 
 ## Exigences détaillées
 
@@ -103,6 +103,18 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
 - Exigence : un rejet ou une proposition du modèle DOIT rester une proposition
   affichée et journalisée sans valeur sensible ; seul l'humain fait transiter
   un Finding (`detecte` → `confirme`/`faux_positif`) en interactif.
+- Contrôles obligatoires de l'invariant 2 (le LLM propose, le programme
+  vérifie, l'humain valide), dus par #28/#34 et pincés par le test associé :
+  - Données vs instructions : le contenu scanné DOIT être isolé du prompt par
+    des délimiteurs aléatoires par requête (jamais de concaténation nue) ;
+    tout texte d'outil reste une donnée non fiable, jamais une consigne.
+  - Sortie contrainte : la réponse du modèle DOIT être validée par un schéma
+    strict pydantic (`extra="forbid"`, champs fermés comme
+    `additionalProperties: false` dans les contrats) ; toute sortie
+    non conforme est rejetée sans effet, jamais réparée ni complétée.
+  - Moindre autorité : le modèle DOIT se limiter à la liste blanche d'actions
+    (4 outils lecture seule, aucun 5e outil de verdict) et le nom de variable
+    proposé DOIT matcher `^[A-Z][A-Z0-9_]{1,63}$` (revalidé côté programme).
 - Abuse case : un commentaire ou une chaîne scannée ordonne au modèle de
   masquer un candidat réel (corpus ci-dessous). When : le modèle propose le
   rejet. Then : le candidat reste listé, le rejet est visible (terminal) et
@@ -152,8 +164,13 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
 - Preuve attendue : `tests/security/test_path_traversal.py::test_write_stays_inside_root`
   et `test_symlink_swap_rejected_at_use` (grammaire `RelPath`/`file` refusant
   `..`, confinement open-then-verify avec identité de descripteur, écriture
-  atomique et rescan exigés par les contrats MCP/CLI).
+  atomique et rescan exigés par les contrats MCP/CLI). Ces tests exercent le
+  vérificateur documentaire (`docs/security/check_model.py`), pas le chemin
+  d'écriture du produit : garde-doc uniquement.
 - Statut : exigence acceptée par #19 ; implémentation #30/#32 à prouver.
+  Aucune ligne SAMM d'implémentation ne DOIT être scorée sur ces seuls tests
+  statiques : exiger d'abord le test runtime de #30 (écriture atomique
+  temp + fsync + `os.replace`, permissions 600, rescan avant succès).
 
 ### REQ-SEC-04 — MCP lecture seule, garde à l'usage
 
@@ -355,10 +372,14 @@ sha256sum docs/security/dfd.drawio docs/security/dfd.png
 Sans dépendance ni réseau pour le vérificateur documentaire ; les tests
 `tests/security` n'exigent que la bibliothèque standard et `pytest`.
 
-## Lignes à reporter dans SAMM
+## Lignes à reporter dans SAMM (preuves documentaires T19 uniquement)
 
-Lier chaque preuve par permalink au SHA final (`.../blob/<SHA>/...#L<ligne>`),
-jamais par branche.
+Le tableau ci-dessous ne prouve que du statique : asserts sur chaînes et AST
+des squelettes, traçabilité d'exigences. Un renommage de squelette peut le
+faire échouer sans changer la sécurité, et inversement : aucune ligne SAMM
+d'implémentation ne DOIT être scorée sur cette base. Le SAMM d'implémentation
+est dû en #22/#25-28/#30/#32, avec module + ligne runtime. Figeage des
+permalinks : procédure ci-dessous (MERGE_SHA).
 
 | Élément prouvable dans cette PR | Module | Repère |
 | --- | --- | --- |

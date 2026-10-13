@@ -110,7 +110,14 @@ def _write_sink_calls(path: Path) -> list[str]:
 
 
 def test_write_stays_inside_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """REQ-SEC-03 : ecriture confinee, cible reverifiee a l'usage."""
+    """REQ-SEC-03 : ecriture confinee, cible reverifiee a l'usage.
+
+    Garde-doc : exerce le confinement du VERIFICATEUR documentaire
+    (docs/security/check_model.py), pas le chemin d'ecriture CLI/MCP du
+    produit. La preuve runtime (atomique temp + fsync + os.replace, perms
+    600, rescan) est due en #30 et exigee avant tout score SAMM
+    d'implementation (voir REQ-SEC-03).
+    """
     # 1. La grammaire des chemins (Finding + MCP) refuse deja les vecteurs.
     for vector in TRAVERSAL_VECTORS:
         assert _relpath_rejects(vector), vector

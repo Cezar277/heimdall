@@ -4,7 +4,7 @@ name: Security model
 on:
   pull_request:
   push:
-    branches: [main, 18-t18-modele-de-menaces-stride-et-dfd]
+    branches: [main]
 
 permissions:
   contents: read
