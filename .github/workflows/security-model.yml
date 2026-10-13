@@ -13,7 +13,7 @@ jobs:
   security-model:
     name: Security model
     # Do not execute contributor-controlled document tests on the shared runner.
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
