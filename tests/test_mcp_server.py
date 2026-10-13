@@ -37,7 +37,7 @@ class PingToolTests(unittest.TestCase):
         # Registre fermé : la liste annoncée est exactement SERVER_TOOLS,
         # dans l'ordre, et rien d'autre n'est appelable (contrat #16, I8).
         self.assertEqual(listed, list(mcp_server.SERVER_TOOLS))
-        self.assertEqual(listed, ["ping", "read_diff"])
+        self.assertEqual(listed, ["ping", "read_diff", "sanitize_file"])
 
     def test_ping_needs_neither_git_nor_repository(self) -> None:
         """La sonde de vie marche hors dépôt : aucun appel à git pour ping."""

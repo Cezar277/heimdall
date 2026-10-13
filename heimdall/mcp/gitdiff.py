@@ -135,7 +135,10 @@ class GitAccess:
         """True si le chemin est ignoré par les .gitignore du dépôt.
 
         `check-ignore` ne lit aucune configuration du dépôt et n'écrit rien.
-        En cas de doute (code de retour inattendu), on refuse (fail-closed).
+        Il répond dès qu'une règle de `.gitignore` couvre le chemin, **même si
+        le fichier est déjà suivi** : c'est la lecture stricte du contrat 4.2
+        (« fichiers ignorés »), et la plus prudente. En cas de doute (code de
+        retour inattendu), on refuse (fail-closed).
         """
         completed = self.execute(("check-ignore", "-q", "--", relative_path))
         if completed.returncode == 0:

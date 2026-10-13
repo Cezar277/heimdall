@@ -71,6 +71,32 @@ doute on masque. Le LLM juge sur la forme (type, longueur, contexte), pas sur
 la valeur. Ces règles seront remplacées par celles du scanner déterministe
 (#22) sans changer l'interface `mask_text`.
 
+## 2 ter. Ce que `sanitize_file` garantit
+
+Le chemin vient du LLM : il est traité comme une entrée piégée
+(`heimdall/mcp/paths.py` + l'outil dans `heimdall/mcp/server.py`).
+
+| Garantie | Comment | Preuve |
+|---|---|---|
+| une seule garde, appelée par tout outil qui reçoit un chemin | `paths.confine` : refus de forme, `resolve()`, `is_relative_to` | `tests/test_mcp_paths.py` |
+| refus de `..`, des chemins absolus, des liens sortants | résolution réelle + confinement sur `Path` résolus | `RefusalTests` |
+| `.git/`, `.env*`, fichiers ignorés interdits | segments interdits + `git check-ignore` | `tests/test_mcp_sanitize_file.py` |
+| binaire, > 1 Mo, absent, dossier | codes dédiés (`BINARY_FILE`, `TOO_LARGE`, `NOT_FOUND`) | idem |
+| ouverture sans suivre un lien | `O_NOFOLLOW` + comparaison dev/ino (TOCTOU) | `GuardWiringTests` |
+| extrait masqué avant sérialisation | `masking.mask_text`, puis borne 100 000 caractères | `test_no_clear_value_ever_reaches_the_llm` |
+| réponse conforme au contrat #16 | validée contre `SanitizeFileResult` | `test_response_conforms_to_the_contract` |
+
+**Choix fail-closed assumé** : un fichier **suivi** mais couvert par une règle
+`.gitignore` est refusé. `check-ignore` répond dès qu'une règle couvre le chemin,
+même si le fichier est déjà dans l'index ; c'est la lecture stricte du contrat
+4.2. La remédiation (#30) lira ce cas par son propre canal, pas par cet outil.
+
+**Limite connue (TOCTOU)** : entre la résolution du chemin et l'ouverture, un
+fichier peut être remplacé. L'ouverture utilise `O_NOFOLLOW` et vérifie que
+dev/ino n'a pas changé, mais un attaquant capable d'écrire dans le dépôt entre
+les deux appels reste hors de portée de cette garde — à consigner dans l'ADR du
+#27.
+
 ## 3. Vérifier le canal avec un client MCP
 
 Voie vérifiée : petit client Python, hors ligne, aucune dépendance réseau
@@ -107,10 +133,12 @@ préférer le client Python ci-dessus (règle « 100 % local »).
 |---|---|---|
 | stdio seul, aucun port, aucun appel réseau | `heimdall/mcp/server.py` (`run_stdio`) | tests client stdio |
 | racine fixée au démarrage, absente des entrées | `build_server` / `_tools` (closures) | pas de paramètre `root` dans les signatures |
-| champ d'entrée hors contrat refusé | `_StrictArgumentGate` | `ArgumentGateTests` |
+| champ d'entrée hors contrat refusé | `_ToolBoundary` | `ArgumentGateTests` |
 | échecs dans l'enveloppe `{"error": …}`, jamais en exception | `tool_handler`, `heimdall/mcp/errors.py` | tests de chaque outil |
+| échec marqué `isError`, succès jamais | `_ToolBoundary._mark_failure` | `test_failure_envelopes_are_flagged` |
 | aucune entrée reflétée au LLM | messages statiques d'`errors.py` | `test_refusal_message_is_static` |
 | stdout = protocole uniquement | aucun `print` dans `heimdall/mcp/` | `StdoutIsProtocolOnlyTests` |
+| registre fermé | `SERVER_TOOLS` + garde d'entrée | `test_ping_is_declared_to_the_client` |
 
 ## 5. Lancement en CI / debug
 
