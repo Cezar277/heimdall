@@ -34,10 +34,21 @@ _QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 )
 
 # clé = valeur  (shell, export KEY=..., YAML sans guillemets, TOML)
+#
+# PAS de borne haute : `{6,}` et non `{6,4096}`. La borne ne protégeait de
+# rien (aucun quantificateur imbriqué, et rien ne suit le groupe de valeur —
+# donc aucun backtracking possible) mais elle COUPAIT le match : sur
+# `SECRET=` + 5000 caractères, les 4096 premiers étaient masqués et les
+# 904 derniers repartaient **en clair** après le marqueur, vérifié par
+# exécution — une fuite déguisée en masquage. La classe de valeur exclut
+# l'espace, les quotes et la ponctuation : une affectation reste donc
+# bornée par son segment, jamais par le fichier entier. Coût mesuré sur
+# 1 Mo de valeur dense : linéaire, pas de backtracking (voir
+# `MaskingPerformanceTests`).
 _UNQUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
     r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
     r"\s*[:=]\s*"
-    r"(?P<value>[^\s\"'`,;)}\]]{6,4096})"
+    r"(?P<value>[^\s\"'`,;)}\]]{6,})"
 )
 
 # clé = valeur COURTE (1 à 5 caractères) sous un nom ÉVOCATEUR :
@@ -170,6 +181,23 @@ _SECRET_KEY: Final[re.Pattern[str]] = re.compile(
     r"session|cert|webhook|connection[-_.]?string)"
 )
 
+# Noms GÉNÉRIQUES de second rang : un nom qui se TERMINE par `key`/`pass`/
+# `passphrase`, sans qualificatif (`KEY=`, `PASS=`, `AWS_KEY=`, `DB_PASS=`).
+# Ils manquaient, et la valeur partait en clair : `KEY=hunter2`,
+# `PASS=abc12345`, `AWS_KEY="hunter2"` — vérifié par exécution. Un `key`
+# ou `pass` seul est FAIBLE (d'où le second rang, et non l'ajout direct à
+# `_SECRET_KEY` : `key = "production"` et `key: "name"` sont du JSON/YAML
+# ordinaire, pas des secrets).
+#
+# Ancrage par FIN : `key$` attrape `AWS_KEY` et `MYKEY` là où `\bkey\b` les
+# manquerait (`_` et les majuscules sont des caractères de mot), et laisse
+# `keyboard`, `keyword`, `monkey`, `bypass`, `compass` — qui ne se terminent
+# pas par ces mots. Volontairement limité à ces trois radicaux : `seed`,
+# `nonce` et `pin` ont été essayés puis retirés, ils sont trop fréquents
+# hors secret (`cnonce = md5(…)`, `best_key = max(…, key=…)`) pour un gain
+# de couverture réel — le bruit se mesure, il ne se devine pas.
+_GENERIC_SECRET_KEY: Final[re.Pattern[str]] = re.compile(r"(?i)(?:key|pass|passphrase)\Z")
+
 # Littéraux de langage : jamais un secret, et roadblocks du bruit de la
 # règle des valeurs COURTES (`session = None`, `auth = None`, `cert = null`
 # — du code ordinaire, pas un secret). Volontairement N'UTILISÉ QUE PAR
@@ -283,6 +311,24 @@ MIN_URL_USERINFO_BITS: Final[float] = 3.0
 MIN_SHORT_VALUE_LENGTH: Final[int] = 2
 
 
+def _generic_name_carries_a_secret(key: str, value: str) -> bool:
+    """`KEY=`, `PASS=`, `AWS_KEY=` : la valeur vaut-elle un credential ?
+
+    Second rang assumé : le nom est faible (`key`, `pass` sont aussi les
+    champs d'un JSON ou d'un YAML ordinaire), donc la valeur doit encore
+    y ressembler — au moins un chiffre (`hunter2`, `abc12345`, `ab12`) ou
+    un préfixe de jeton connu. Mesuré sur 1,29 million de lignes de corpus
+    : `key = "production"` et `key: "name"` restent lisibles, tandis que
+    `KEY=hunter2`, `PASS=abc12345`, `AWS_KEY="hunter2"` et `MYKEY=ab12`
+    passent au marqueur.
+    """
+    if _GENERIC_SECRET_KEY.search(key) is None:
+        return False
+    if value.lower().startswith(_KNOWN_PREFIXES):
+        return True
+    return any(character.isdigit() for character in value)
+
+
 def _looks_like_secret(key: str | None, value: str) -> bool:
     """Décide si une valeur doit être masquée (conservateur en cas de doute)."""
     if not value or _ENV_REFERENCE.match(value):
@@ -291,8 +337,11 @@ def _looks_like_secret(key: str | None, value: str) -> bool:
         return False
     if value.lower().startswith(_KNOWN_PREFIXES):
         return True
-    if key is not None and _SECRET_KEY.search(key):
-        return True
+    if key is not None:
+        if _SECRET_KEY.search(key):
+            return True
+        if _generic_name_carries_a_secret(key, value):
+            return True
     # Sans indice de nom, il faut une valeur longue et dense : c'est la règle
     # d'entropie du scanner #22, appliquée ici pour ne rien laisser passer.
     return len(value) >= MIN_ENTROPY_LENGTH and shannon_entropy(value) >= MIN_ENTROPY_BITS
@@ -325,7 +374,7 @@ def _short_evocative_looks_secret(key: str, value: str) -> bool:
         return False
     if not any(character.isdigit() for character in value):
         return False
-    return _SECRET_KEY.search(key) is not None
+    return _SECRET_KEY.search(key) is not None or _generic_name_carries_a_secret(key, value)
 
 
 def _bare_known_matches(text: str) -> list[_Match]:

@@ -748,6 +748,82 @@ class MaskingRulesTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertNotIn("hunter2-long-value-xyz", masked)
 
+    def test_generic_key_and_pass_names_are_masked(self) -> None:
+        """Noms génériques : `KEY=`, `PASS=`, `AWS_KEY=`, `MYKEY=`.
+
+        `_SECRET_KEY` exigeait un qualificatif (`api_key`, `access_key`…), donc
+        `KEY=hunter2` et `PASS=abc12345` passaient en clair vers le LLM et son
+        historique — vérifié par exécution avant correctif.
+        """
+        for line, secret in (
+            ("KEY=hunter2", "hunter2"),
+            ("PASS=abc12345", "abc12345"),
+            ("AWS_KEY=hunter2", "hunter2"),
+            ("DB_PASS=hunter2", "hunter2"),
+            ("MYKEY=ab12", "ab12"),
+            ('KEY="hunter2"', "hunter2"),
+            ('AWS_KEY="hunter2"', "hunter2"),
+            ("PASSPHRASE=abc12345", "abc12345"),
+            # Préfixe connu : masqué même SANS chiffre. Par la règle LONGUE le
+            # préfixe est déjà testé en amont de la règle générique ; c'est
+            # donc la règle COURTE qui atteint ce chemin (`ghp_` fait 4
+            # caractères, avec un chiffre pour passer le filtre court).
+            ("MYKEY=ghp_factice", "ghp_factice"),
+            ("KEY=ghp_1", "ghp_1"),
+            ("PASS=akia_7", "akia_7"),
+        ):
+            with self.subTest(line=line):
+                masked, count = masking.mask_text(line)
+                self.assertEqual(count, 1)
+                self.assertNotIn(secret, masked)
+
+    def test_generic_names_keep_ordinary_code_readable(self) -> None:
+        """`key`/`pass` seuls sont faibles : le second rang exige un credential.
+
+        Ancrage par FIN (`key$`) : `AWS_KEY` et `MYKEY` matchent, `keyboard`,
+        `keyword` et `monkey` non. Et la valeur doit encore ressembler à un
+        secret (au moins un chiffre), sinon `key: "name"` d'un JSON ordinaire
+        serait masqué — mesuré sur 1,29 million de lignes de corpus.
+        """
+        for line in (
+            'key = "production"',
+            'key: "name"',
+            "KEY = value",
+            "keyboard = 1",
+            "keyword = 1",
+            "monkey = 1",
+            "bypass = True",
+            "compass = x",
+            "passed = 1",
+            "cnonce = md5(x)",
+            "best_key = max(sizes, key=lambda k: sizes[k])",
+            # 2e rang sans chiffre : `KEY`/`AWS_KEY` seuls sont faibles, la
+            # valeur doit ressembler à un credential. Un nom QUALIFIÉ
+            # (`API_KEY`, `SECRET`) reste masqué sans condition — voir
+            # `test_generic_key_and_pass_names_are_masked`.
+            'AWS_KEY="aws_secret_value"',
+            "KEY=huntervalue",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(masking.mask_text(line), (line, 0))
+
+    def test_long_unquoted_value_is_masked_whole(self) -> None:
+        """`SECRET=` + 5000 caractères : plus de queue en clair.
+
+        La borne `{6,4096}` masquait les 4096 premiers caractères et laissait
+        les 904 suivants en clair APRÈS le marqueur — une fuite déguisée en
+        masquage, vérifiée par exécution. La borne haute ne protégeait de rien
+        (aucun quantificateur imbriqué, rien ne suit le groupe), donc
+        supprimée : `{6,}`.
+        """
+        for length in (5000, 20_000, 100_000):
+            value = "b" * length
+            with self.subTest(length=length):
+                masked, count = masking.mask_text(f"SECRET={value}")
+                self.assertEqual(count, 1)
+                self.assertEqual(masked, f"SECRET=<REDACTED:generic_secret:len={length}>")
+                self.assertNotIn("b" * 60, masked)
+
     def test_short_evocative_value_is_masked(self) -> None:
         """`SECRET=abc12`, `PASSWORD=1234` : sous 6 caractères, c'était en clair.
 

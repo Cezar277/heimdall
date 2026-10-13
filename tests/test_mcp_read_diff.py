@@ -187,6 +187,46 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.assertEqual(payload["files"][0]["redactions"], 3)
         self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
+    def test_generic_key_names_are_masked_end_to_end(self) -> None:
+        """`KEY=hunter2`, `AWS_KEY=...`, `MYKEY=ab12` : bout en bout.
+
+        Dépôt git réel + vrai client MCP : c'est la réponse sérialisée qui est
+        vérifiée, pas l'appel à `mask_text`. Les formes non citées ET citées
+        sont couvertes (elles passaient toutes les deux en clair).
+
+        Les valeurs portent un chiffre, conformément à la règle de second
+        rang : sous un nom générique (`KEY`, `AWS_KEY`), la valeur doit
+        encore ressembler à un credential. La frontière est épinglée par
+        `test_generic_names_keep_ordinary_code_readable`.
+        """
+        self.write(
+            "deploy.env",
+            'KEY=hunter2\nAWS_KEY="aws_secret_value1"\nMYKEY=ab12\nMODE=production\n',
+        )
+        self.stage("deploy.env")
+        payload = self.call_read_diff()
+        content = json.dumps(payload)
+        for secret in ("hunter2", "aws_secret_value1", "ab12"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, content)
+        self.assertIn("MODE=production", content, "une valeur ordinaire reste lisible")
+        self.assertEqual(payload["files"][0]["redactions"], 3)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
+    def test_long_unquoted_value_is_masked_whole_end_to_end(self) -> None:
+        """`SECRET=` + 5000 caractères : aucune queue en clair après le marqueur.
+
+        La borne haute de la règle non citée coupait le match et laissait la
+        queue partir en clair ; la valeur est désormais masquée en entier.
+        """
+        value = "b" * 5000
+        self.write("long.env", f"SECRET={value}\n")
+        self.stage("long.env")
+        content = json.dumps(self.call_read_diff())
+        self.assertNotIn("b" * 60, content)
+        self.assertIn("<REDACTED:generic_secret:len=5000>", content)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", json.loads(content)), [])
+
     def test_long_quoted_value_is_masked_not_windowed(self) -> None:
         """Régression de revue : plus de fenêtre AVANT le masquage.
 

@@ -190,6 +190,24 @@ lui-même, 0 ligne précédemment masquée devenue lisible ;
 préfixe connu, ou ≥ 8 caractères à ≥ 3,0 bits — seuil mesuré entre les
 secrets (≥ 3,09) et les identités (≤ 2,91), donc `https://alice@hôte` reste
 lisible ;
+**les noms GÉNÉRIQUES qui finissent par `key`/`pass`/`passphrase` sont un
+second rang** (`KEY=`, `PASS=`, `AWS_KEY=`, `DB_PASS=`, `MYKEY=` — ils
+n'étaient pas dans le vocabulaire, donc `KEY=hunter2` partait en clair) :
+la valeur doit en plus ressembler à un credential (au moins un chiffre, ou
+préfixe connu), sinon `key: "name"` d'un JSON ordinaire serait masqué.
+Ancrage par **fin** de nom : `key$` attrape `AWS_KEY` là où `\bkey\b` le
+manquerait, et laisse `keyboard`, `keyword`, `monkey`, `bypass`. Bruit
+mesuré sur 1,29 million de lignes : 35 lignes tierces (35 gagnées, **0
+perdue**, 0 dans le dépôt lui-même) ;
+**la valeur non citée est masquée EN ENTIER** (`_UNQUOTED_ASSIGNMENT` en
+`{6,}`, pas `{6,4096}`) : la borne haute ne protégeait de rien (aucun
+quantificateur imbriqué, rien ne suit le groupe de valeur, donc aucun
+backtracking) mais elle **coupait le match** — sur `SECRET=` + 5000
+caractères, les 4096 premiers étaient masqués et les 904 suivants
+repartaient **en clair après le marqueur**, une fuite déguisée en masquage.
+La classe de valeur exclut l'espace et les quotes, donc une affectation
+reste bornée par son segment. Le nouveau motif est mesuré **plus rapide**
+que l'ancien sur 1 Mo (3,1 s contre 4,3 s) ;
 **une valeur quotée dépassant 20 000
 caractères sur une seule ligne n'est pas masquée** (borne anti-ReDoS
 assumée : `_QUOTED_ASSIGNMENT` bornée à `{4,20000}`, un credential réel

@@ -101,6 +101,8 @@ Le chemin vient du LLM : il est traité comme une entrée piégée
 | valeur citée > 2,5 Ko jamais sectionnée avant masquage | masquage avant troncature, sans fenêtre préalable | `test_long_quoted_value_is_masked_not_windowed` |
 | jetons nus et corps PEM masqués | préfixe connu ou ≥ 32 caractères denses, fusion par spécificité | `BareTokenMaskingTests` |
 | valeur courte sous un nom évocateur masquée | `SECRET=abc12`, `PASSWORD=1234` — règle à fenêtre séparée (sinon ombrage), filtres anti-bruit mesurés | `test_short_evocative_value_is_masked` |
+| noms génériques masqués | `KEY=hunter2`, `PASS=abc12345`, `AWS_KEY=`, `MYKEY=` (second rang : nom faible + valeur alphanumérique), `keyboard`/`key: "name"` laissés lisibles | `test_generic_key_names_are_masked_end_to_end` |
+| valeur non citée masquée en entier | `SECRET=` + 5000 caractères : plus de queue en clair après le marqueur (borne `{6,}` sans borne haute) | `test_long_unquoted_value_is_masked_whole_end_to_end` |
 | jeton dans un userinfo sans mot de passe masqué | `https://<jeton>@hôte`, type `url_userinfo`, seuil ≥ 8 car. et ≥ 3,0 bits | `test_url_token_without_password_is_masked` |
 | paramètre `path` manquant refusé | enveloppe `INVALID_INPUT`, pas « Field required » du SDK | `RequiredParametersTests` |
 | réponse conforme au contrat #16 | validée contre `SanitizeFileResult` | `test_response_conforms_to_the_contract` |
