@@ -193,27 +193,82 @@ class _EntryBuilder:
 _QUOTED_MIN_LENGTH: Final[int] = 2
 
 
+# Bornes du décodeur C-quote : `\xHH` fait exactement 2 chiffres hexa, un
+# octet tient sur 3 chiffres octaux au plus et vaut 0..255.
+_HEX_ESCAPE_LENGTH: Final[int] = 2
+_MAX_OCTAL_DIGITS: Final[int] = 3
+_MAX_SINGLE_BYTE: Final[int] = 0xFF
+
+
 def _unquote_path(value: str) -> str:
-    """Retire le guillemaget C de git (``"a/ta\\tb"`` → ``a/ta<TAB>b``)."""
+    """Décode le guillemetage C de git (``"caf\\303\\251.py"`` → ``café.py``).
+
+    Les échappements sont décodés en **octets** puis l'ensemble est décodé
+    en UTF-8 : décoder chaque échappement en caractère produirait du
+    mojibake (``\\303`` → `Ã` au lieu de l'octet 0xC3 de ``é``), donc un
+    faux nom de fichier — avec un aller-retour `read_diff` →
+    `sanitize_file` cassé (404 sur le vrai nom).
+    Tout le jeu d'échappements de git est couvert (`\\a\\b\\f\\n\\r\\t\\v`,
+    octal, `\\xHH`) ; tout le reste après un antislash, ou des octets qui
+    ne sont pas de l'UTF-8 valide, est une panne (`INTERNAL`, fail-closed :
+    un nom de fichier non représentable ne doit pas renvoyer un résultat
+    partiel présenté comme complet).
+    """
     if len(value) < _QUOTED_MIN_LENGTH or not value.startswith('"') or not value.endswith('"'):
         return value
     body = value[1:-1]
+    raw = bytearray()
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            raw.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(body):
+            raise ToolFailure("INTERNAL")
+        esc = body[index]
+        if esc in _SIMPLE_ESCAPES:
+            raw.append(_SIMPLE_ESCAPES[esc])
+            index += 1
+        elif esc == "x":
+            digits = body[index + 1 : index + 1 + _HEX_ESCAPE_LENGTH]
+            if len(digits) != _HEX_ESCAPE_LENGTH or any(
+                c not in "0123456789abcdefABCDEF" for c in digits
+            ):
+                raise ToolFailure("INTERNAL")
+            raw.append(int(digits, 16))
+            index += 1 + _HEX_ESCAPE_LENGTH
+        elif esc in "01234567":
+            end = index
+            while end < len(body) and end < index + _MAX_OCTAL_DIGITS and body[end] in "01234567":
+                end += 1
+            code = int(body[index:end], 8)
+            if code > _MAX_SINGLE_BYTE:
+                raise ToolFailure("INTERNAL")
+            raw.append(code)
+            index = end
+        else:
+            raise ToolFailure("INTERNAL")
+    try:
+        return bytes(raw).decode("utf-8")
+    except UnicodeDecodeError:
+        raise ToolFailure("INTERNAL") from None
 
-    def replace(match: re.Match[str]) -> str:
-        escape = match.group(0)
-        if escape.startswith("\\x"):
-            return chr(int(escape[2:], 16))
-        if escape.startswith("\\"):
-            digits = escape[1:]
-            if digits and all("0" <= c <= "7" for c in digits):
-                return chr(int(digits, 8))
-            return {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"'}.get(digits, escape)
-        return escape
 
-    return _C_ESCAPE.sub(replace, body)
-
-
-_C_ESCAPE: Final[re.Pattern[str]] = re.compile(r"\\x[0-9a-fA-F]{2}|\\[0-7]{1,3}|\\[nrt\\\"]")
+# Échappements simples du guillemetage C de git → octet.
+_SIMPLE_ESCAPES: Final[dict[str, int]] = {
+    "a": 0x07,
+    "b": 0x08,
+    "f": 0x0C,
+    "n": 0x0A,
+    "r": 0x0D,
+    "t": 0x09,
+    "v": 0x0B,
+    "\\": 0x5C,
+    '"': 0x22,
+}
 
 
 def _path_from_header(value: str) -> str | None:
@@ -358,12 +413,26 @@ def parse_diff(text: str) -> tuple[list[DiffEntry], bool]:
 
 
 def _binary_path(line: str) -> str | None:
-    """Chemin côté nouveau depuis ``Binary files a/x and b/y differ``."""
+    """Chemin côté nouveau depuis ``Binary files a/x and b/y differ``.
+
+    Les cas ajout/suppression sont traités en priorité : ``/dev/null``
+    est un marqueur git, jamais un nom de fichier, donc le découpage y
+    est exact même si le vrai nom contient ``" and "`` (ex. ``x and
+    y.bin`` : ``rpartition(" and ")`` renvoyait ``y.bin``). Ne reste
+    ambigu que le binaire **modifié** dont le nom contient ``" and "``
+    (git ne cite pas les espaces) : limite documentée, impact nul sur la
+    sécurité (un binaire ne porte jamais de lignes, seul son nom est
+    affiché).
+    """
     body = line[len("Binary files ") :]
     separator = " and "
     if not body.endswith(" differ") or separator not in body:
         return None
     body = body[: -len(" differ")]
+    if body.startswith("/dev/null" + separator):
+        return _path_from_header(body[len("/dev/null" + separator) :])
+    if body.endswith(separator + "/dev/null"):
+        return None  # binaire supprimé : aucun côté nouveau à nommer.
     _old, _, new = body.rpartition(separator)
     if not new:
         return None

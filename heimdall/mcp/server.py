@@ -84,21 +84,23 @@ _F = TypeVar("_F", bound=Callable[..., str])
 # ---------------------------------------------------------------------------
 
 
-def _expected_types(fn: Callable[..., str]) -> dict[str, type]:
-    """Types déclarés d'un outil, déduits de sa signature (source unique).
+def _expected_types(fn: Callable[..., str]) -> tuple[dict[str, type], frozenset[str]]:
+    """Types et paramètres requis d'un outil, déduits de sa signature.
 
-    Le SDK MCP 2.3.0 écarte silencieusement les clés qu'aucun paramètre
-    ne déclare (et se contente de les journaliser) : sans cette déduction,
-    ``{"path": "../../etc/passwd", "racine": "/"}`` serait ignoré au lieu
-    d'être refusé. Les types sont lus sur la signature réelle, donc un
-    paramètre ajouté à un outil devient automatiquement acceptable — pas
-    de table à maintenir en parallèle.
+    Source unique : la signature réelle. Un paramètre ajouté à un outil
+    devient automatiquement acceptable — et, s'il est sans défaut,
+    automatiquement requis. Seules les annotations ``int``/``str`` du
+    contrat sont reconnues (un futur paramètre d'un autre type serait
+    refusé plutôt qu'accepté en douce : fail-closed).
     """
     declared: dict[str, type] = {}
+    required: set[str] = set()
     for name, parameter in inspect.signature(fn).parameters.items():
         if parameter.annotation in (int, str):
             declared[name] = parameter.annotation
-    return declared
+            if parameter.default is inspect.Parameter.empty:
+                required.add(name)
+    return declared, frozenset(required)
 
 
 class _ToolBoundary:
@@ -117,7 +119,10 @@ class _ToolBoundary:
       répond par une exception pydantic qui recopie la valeur reçue
       (``input_value=…``) dans le texte renvoyé au LLM. La frontière valide
       donc les types elle-même et renvoie notre enveloppe statique, de sorte
-      que la validation du SDK n'ait jamais lieu.
+      que la validation du SDK n'ait jamais lieu. Même motif pour les
+      paramètres **requis** : sans ``path``, le SDK répond « Field
+      required », un texte hors de notre enveloppe ``{"error": …}`` donc
+      non conforme au contrat 3.1.
 
     **Après l'exécution** — marquer ``isError`` :
 
@@ -129,9 +134,12 @@ class _ToolBoundary:
     """
 
     def __init__(self, tools: Mapping[str, Callable[..., str]]) -> None:
-        self._expected: Final[dict[str, dict[str, type]]] = {
-            name: _expected_types(fn) for name, fn in tools.items()
-        }
+        self._expected: Final[dict[str, dict[str, type]]] = {}
+        self._required: Final[dict[str, frozenset[str]]] = {}
+        for tool_name, fn in tools.items():
+            declared, required = _expected_types(fn)
+            self._expected[tool_name] = declared
+            self._required[tool_name] = required
 
     async def __call__(
         self,
@@ -158,6 +166,12 @@ class _ToolBoundary:
             if wanted is None or type(value) is not wanted:
                 logger.info("outil %s : argument hors contrat refusé", name)
                 return _error_result(errors.failure("INVALID_INPUT"))
+        provided = {key for key in arguments if key != "_meta"}
+        if not self._required[name] <= provided:
+            # Paramètre requis absent : le SDK répondrait « Field required »,
+            # hors enveloppe. On refuse nous-mêmes, avec notre enveloppe.
+            logger.info("outil %s : paramètre requis absent", name)
+            return _error_result(errors.failure("INVALID_INPUT"))
         return _mark_failure(await call_next(ctx))
 
 
@@ -294,18 +308,20 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
         if is_forbidden_path(relative) or access.is_ignored(relative):
             raise errors.ToolFailure("FORBIDDEN_PATH")
         content, total_lines, truncated = _read_extract(confined.absolute, start_line, max_lines)
-        redactions = 0
         pieces: list[str] = []
         for line in content:
-            text, count = masking.mask_text(line)
+            text, _ = masking.mask_text(line)
             pieces.append(text)
-            redactions += count
         # Borne de contenu du contrat (100 000 caractères) : elle s'applique
         # APRÈS masquage, pour les mêmes raisons que read_diff.
         joined = "\n".join(pieces)
         if len(joined) > MAX_CONTENT_CHARS:
             joined = joined[:MAX_CONTENT_CHARS]
             truncated = True
+        # Même invariant que read_diff : le compteur est recompté sur le
+        # contenu final, pour qu'une coupe ne laisse jamais un compteur
+        # sans marqueur (forme exigée par le schéma).
+        redactions = joined.count(masking.REDACTION_MARKER)
         if not content:
             end_line = 0
         else:
@@ -331,11 +347,17 @@ def is_forbidden_path(relative: str) -> bool:
     Décidé sur le chemin **canonique** renvoyé par la garde, pas sur
     l'entrée : ``./.git`` ou ``sous/.././.git`` arrivent ici déjà
     normalisés, donc aucune évasion par chemin tordu n'est possible.
+
+    Comparaison en minuscules : sur un système de fichiers insensible à
+    la casse (Windows, macOS), ``.GIT/config`` ouvre le même fichier que
+    ``.git/config``. Refuser ``.Git`` en trop est un faux positif bénin
+    (fail-closed) ; laisser passer ``.GIT`` serait une évasion.
     """
     for segment in relative.split("/"):
-        if segment == ".git":
+        lowered = segment.lower()
+        if lowered == ".git":
             return True
-        if segment == ".env" or segment.startswith(".env."):
+        if lowered == ".env" or lowered.startswith(".env."):
             return True
     return False
 
@@ -412,21 +434,31 @@ def _masked_files(entries: list[gitdiff.DiffEntry]) -> tuple[list[dict[str, obje
     caractères. Tronquer d'abord couperait une valeur en deux et le masquage
     ne la reconnaîtrait plus ; masquer d'abord la raccourcit, donc la borne
     reste respectée.
+
+    Le compteur ``redactions`` est **recompté sur les lignes finales** (les
+    marqueurs qui survivent à la coupe), pas sur le masquage brut : une
+    coupe qui emporterait le seul marqueur d'un fichier violerait sinon
+    l'invariant structurel du contrat (``redactions >= 1`` ⇒ un marqueur
+    présent). Le compte décrit donc la réponse, jamais une promesse.
+    (Si le source contenait déjà le littéral ``<REDACTED:``, il est compté
+    comme un marqueur de la réponse : indiscernable, et l'invariant tient
+    dans tous les cas.)
     """
     files: list[dict[str, object]] = []
     truncated = False
     for entry in entries:
-        redactions = 0
         added: list[dict[str, object]] = []
+        finals: list[str] = []
         for number, text in entry.lines:
-            masked, count = masking.mask_text(text)
+            masked, _ = masking.mask_text(text)
             if len(masked) > gitdiff.MAX_LINE_CHARS:
                 masked = masked[: gitdiff.MAX_LINE_CHARS]
                 truncated = True
-            redactions += count
             added.append({"line": number, "text": masked})
+            finals.append(masked)
         if entry.line_overflow:
             truncated = True
+        redactions = sum(line.count(masking.REDACTION_MARKER) for line in finals)
         files.append(
             {
                 "file": entry.path,
@@ -496,7 +528,8 @@ def run_stdio(root: str) -> None:
     """Démarre le serveur MCP sur stdio, confiné à ``root``.
 
     Bloquant : le serveur vit en sous-processus de la CLI (contrat,
-    invariant 7) et n'ouvre aucun port.
+    invariant 7) et n'ouvre aucun port. Testé en sous-processus par tous
+    les tests client (`tests/test_mcp_*.py`), jamais ici.
     """
     server = build_server(root)
     server.run(transport="stdio")

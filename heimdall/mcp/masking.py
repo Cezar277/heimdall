@@ -62,6 +62,70 @@ _URL_CREDENTIALS: Final[re.Pattern[str]] = re.compile(
 # ligne est masquée séparément, le marqueur suffit au LLM).
 _PEM_HEADER: Final[re.Pattern[str]] = re.compile(r"-----BEGIN[ A-Z0-9]*PRIVATE KEY(?: BLOCK)?-----")
 
+# Pied de clé privée PEM : structurel comme l'en-tête, masqué pour la même
+# raison (cohérence : un bloc dont le corps est masqué ne doit pas garder
+# ses deux balises en clair, le LLM n'en a pas besoin pour trier).
+_PEM_FOOTER: Final[re.Pattern[str]] = re.compile(r"-----END[ A-Z0-9]*PRIVATE KEY(?: BLOCK)?-----")
+
+# Jeton nu à préfixe connu : tableau JSON, secret collé seul, copier-coller
+# sans affectation. Sans `clé =` devant lui, aucune des règles ci-dessus ne
+# le voyait : il sortait en clair (fuite vers l'historique Ollama).
+# La queue minimale (8) attrape les vrais jetons (plusieurs dizaines de
+# caractères) en ignorant les bouts de factices trop courts pour être
+# exploitables. Insensible à la casse : les formes canoniques sont en casse
+# fixe (`AKIA`, `ghp_`) mais un secret recopié à la main peut varier.
+# Pas de garde à gauche volontairement : un secret *collé* à du remplissage
+# (`aaa<jeton>bbb`, évasion par collage) doit être attrapé ; un rattrapage
+# au milieu d'un identifiant n'est qu'un faux positif bénin (un marqueur
+# au lieu du texte, le tri n'en souffre pas).
+_BARE_PREFIXES: Final[tuple[str, ...]] = (
+    r"akia",
+    r"asia",
+    r"sk_live_",
+    r"sk_test_",
+    r"pk_live_",
+    r"pk_test_",
+    r"rk_live_",
+    r"ghp_",
+    r"gho_",
+    r"ghu_",
+    r"ghs_",
+    r"ghr_",
+    r"github_pat_",
+    r"glpat-",
+    r"xoxb-",
+    r"xoxp-",
+    r"xoxa-",
+    r"shpat_",
+    r"whsec_",
+    r"npm_",
+    r"dop_v1_",
+    r"AIza",
+    r"ya29\.",
+)
+_BARE_KNOWN_TOKEN: Final[re.Pattern[str]] = re.compile(
+    r"(?:" + r"|".join(_BARE_PREFIXES) + r")[A-Za-z0-9_\-+=/]{8,256}",
+    re.IGNORECASE,
+)
+
+# Jeton nu sans aucun indice (ni nom, ni préfixe) : il faut exiger plus
+# (32 caractères denses) pour ne pas masquer le code ordinaire. Le tiret
+# et la barre oblique sont exclus de la classe : un UUID (`8-4-4-4-12` à
+# tirets) ou une URL ne matchent jamais — pas de bruit. Un SHA de commit
+# copié dans un commentaire, lui, est masqué : c'est un faux positif
+# bénin assumé (le LLM juge sur la forme, l'humain valide).
+MIN_BARE_DENSE_LENGTH: Final[int] = 32
+MIN_BARE_DENSE_BITS: Final[float] = 3.9
+_BARE_DENSE_TOKEN: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9_~+.=-])[A-Za-z0-9_~+.=]{32,512}(?![A-Za-z0-9_~+.=-])"
+)
+
+# Alphabet base64 strict : dans un contexte PEM, une longue ligne de cet
+# alphabet est le corps d'une clé, pas un hash d'intégrité (`sha512-…`
+# contient un tiret, exclu d'ici).
+_PEM_BODY_MIN_LENGTH: Final[int] = 64
+_STRICT_BASE64: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9+/=]+\Z")
+
 # Une valeur qui n'est qu'une référence d'environnement n'est pas un secret.
 _ENV_REFERENCE: Final[re.Pattern[str]] = re.compile(
     r"^(?:\$\{[^}\s]{1,128}\}|\$[A-Za-z_][A-Za-z0-9_]{0,63}|%[A-Za-z0-9_]{1,64}%|"
@@ -98,7 +162,7 @@ _KNOWN_PREFIXES: Final[tuple[str, ...]] = (
     "whsec_",
     "npm_",
     "dop_v1_",
-    "AIza",
+    "aiza",
     "ya29.",
 )
 
@@ -127,14 +191,18 @@ def _secret_type(key: str | None, value: str) -> str:
     lowered = (key or "").lower()
     token = value.lower()
     if token.startswith(_KNOWN_PREFIXES):
-        for prefixes, secret_type in (
+        # Invariant : chaque préfixe du vocabulaire est mappé ci-dessous
+        # (prouvé par test_prefix_vocabulary_is_fully_mapped). La sortie de
+        # boucle sans retour est donc inatteignable ; le repli générique
+        # reste par sécurité si le vocabulaire bouge sans la table.
+        for prefixes, secret_type in (  # pragma: no branch
             (("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"), "github"),
             (("glpat-",), "gitlab"),
             (("xoxb-", "xoxp-", "xoxa-"), "slack"),
             (("sk_live_", "sk_test_", "pk_live_", "rk_live_"), "stripe"),
             (("shpat_", "whsec_"), "webhook_secret"),
             (("npm_", "dop_v1_"), "package_token"),
-            (("AIza", "ya29."), "google_api_key"),
+            (("aiza", "ya29."), "google_api_key"),
             (("akia", "asia"), "aws"),
         ):
             if token.startswith(prefixes):
@@ -170,68 +238,98 @@ def _looks_like_secret(key: str | None, value: str) -> bool:
     return len(value) >= MIN_ENTROPY_LENGTH and shannon_entropy(value) >= MIN_ENTROPY_BITS
 
 
-def _iter_matches(text: str) -> list[_Match]:
-    """Collecte les valeurs à masquer, sans se recouvrir."""
+def _bare_known_matches(text: str) -> list[_Match]:
+    """Jetons nus à préfixe connu, où qu'ils apparaissent."""
+    return [
+        _Match(match.start(), match.end(), _secret_type(None, match.group(0)), len(match.group(0)))
+        for match in _BARE_KNOWN_TOKEN.finditer(text)
+    ]
+
+
+def _bare_dense_matches(text: str, pem_context: bool) -> list[_Match]:
+    """Longs jetons denses sans indice : secrets probables, jamais du code.
+
+    Pas de contrôle de référence d'environnement ici : la classe du motif
+    exclut `$`, `%`, `<`, `>`, `{`, `}`, `(`, `)`, `[`, `]`, donc aucune
+    valeur du motif ne peut en être une — un contrôle mort serait un
+    passif, pas une défense.
+    """
     found: list[_Match] = []
-
-    for match in _PEM_HEADER.finditer(text):
-        found.append(_Match(match.start(), match.end(), "private_key", match.end() - match.start()))
-
-    for match in _AUTH_HEADER.finditer(text):
-        if _looks_like_secret(match.group("key"), match.group("value")):
-            found.append(
-                _Match(
-                    match.start("value"),
-                    match.end("value"),
-                    _secret_type(match.group("key"), match.group("value")),
-                    len(match.group("value")),
-                )
-            )
-
-    for match in _URL_CREDENTIALS.finditer(text):
-        found.append(
-            _Match(
-                match.start("value"),
-                match.end("value"),
-                "url_password",
-                len(match.group("value")),
-            )
-        )
-
-    for match in _QUOTED_ASSIGNMENT.finditer(text):
-        key = match.group("key")
-        value = match.group("value")
-        if _looks_like_secret(key, value):
-            found.append(
-                _Match(
-                    match.start("value"),
-                    match.end("value"),
-                    _secret_type(key, value),
-                    len(value),
-                )
-            )
-
-    for match in _UNQUOTED_ASSIGNMENT.finditer(text):
-        key = match.group("key")
-        value = match.group("value")
-        if _looks_like_secret(key, value):
-            found.append(
-                _Match(
-                    match.start("value"),
-                    match.end("value"),
-                    _secret_type(key, value),
-                    len(value),
-                )
-            )
-
-    # Premier arrivé, premier servi : si deux motifs se recouvrent (une
-    # assignation citant une URI avec mot de passe), le plus à gauche gagne.
-    found.sort(key=lambda item: (item.start, -(item.end - item.start)))
-    kept: list[_Match] = []
-    for candidate in found:
-        if kept and candidate.start < kept[-1].end:
+    for match in _BARE_DENSE_TOKEN.finditer(text):
+        value = match.group(0)
+        if shannon_entropy(value) < MIN_BARE_DENSE_BITS:
             continue
-        kept.append(candidate)
+        if (
+            pem_context
+            and len(value) >= _PEM_BODY_MIN_LENGTH
+            and _STRICT_BASE64.match(value) is not None
+        ):
+            category = "private_key"
+        else:
+            category = "generic_secret"
+        found.append(_Match(match.start(), match.end(), category, len(value)))
+    return found
+
+
+def _span_match(match: re.Match[str], group: str, secret_type: str) -> _Match:
+    """Construit un masquage sur le groupe nommé d'un match de règle."""
+    return _Match(match.start(group), match.end(group), secret_type, len(match.group(group)))
+
+
+def _overlaps(candidate: _Match, kept: list[_Match]) -> bool:
+    """True si le candidat recouvre un masquage déjà retenu."""
+    return any(
+        candidate.start < kept_item.end and kept_item.start < candidate.end for kept_item in kept
+    )
+
+
+def _iter_matches(text: str) -> list[_Match]:
+    """Collecte les valeurs à masquer, sans se recouvrir.
+
+    Fusion par **spécificité** : quand deux règles se recouvrent, la plus
+    précise gagne (`postgres://u:p@h` → seul le mot de passe part, l'hôte
+    reste lisible pour le tri), pas simplement la plus à gauche. À
+    spécificité égale (impossible entre règles distinctes : leurs motifs
+    ne commencent jamais au même point sauf inclusion, tranchée par
+    l'ordre), l'ordre positionnel est conservé en sortie pour la
+    reconstruction du texte.
+    """
+    pem_context = bool(_PEM_HEADER.search(text) or _PEM_FOOTER.search(text))
+    groups: list[list[_Match]] = [
+        [
+            _Match(match.start(), match.end(), "private_key", match.end() - match.start())
+            for match in _PEM_HEADER.finditer(text)
+        ],
+        [
+            _Match(match.start(), match.end(), "private_key", match.end() - match.start())
+            for match in _PEM_FOOTER.finditer(text)
+        ],
+        [
+            _span_match(match, "value", _secret_type(match.group("key"), match.group("value")))
+            for match in _AUTH_HEADER.finditer(text)
+            if _looks_like_secret(match.group("key"), match.group("value"))
+        ],
+        [_span_match(match, "value", "url_password") for match in _URL_CREDENTIALS.finditer(text)],
+        [
+            _span_match(match, "value", _secret_type(match.group("key"), match.group("value")))
+            for match in _QUOTED_ASSIGNMENT.finditer(text)
+            if _looks_like_secret(match.group("key"), match.group("value"))
+        ],
+        [
+            _span_match(match, "value", _secret_type(match.group("key"), match.group("value")))
+            for match in _UNQUOTED_ASSIGNMENT.finditer(text)
+            if _looks_like_secret(match.group("key"), match.group("value"))
+        ],
+        _bare_known_matches(text),
+        _bare_dense_matches(text, pem_context),
+    ]
+    kept: list[_Match] = []
+    for group in groups:
+        for candidate in group:
+            if _overlaps(candidate, kept):
+                continue
+            kept.append(candidate)
+    kept.sort(key=lambda item: item.start)
     return kept
 
 

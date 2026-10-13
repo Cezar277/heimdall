@@ -12,8 +12,8 @@ import sys
 from heimdall.mcp.server import run_stdio
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Démarre le serveur MCP confiné à ``--root``."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Options de lancement, séparées du démarrage (testable sans bloquer)."""
     parser = argparse.ArgumentParser(
         prog="heimdall.mcp",
         description="Serveur MCP stdio d'Heimdall (outils en lecture seule, contrat #16).",
@@ -23,7 +23,12 @@ def main(argv: list[str] | None = None) -> int:
         default=".",
         help="Racine du dépôt à exposer. Fixée au démarrage, jamais fournie par le LLM.",
     )
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Démarre le serveur MCP confiné à ``--root``."""
+    args = parse_args(argv)
     try:
         run_stdio(args.root)
     except ValueError as exc:
@@ -33,5 +38,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - garde d'exécution, couverte en sous-processus.
     sys.exit(main())

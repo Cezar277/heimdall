@@ -11,6 +11,7 @@ Ce module est un outil de test : il n'est pas importé par le produit.
 
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -26,11 +27,22 @@ TIMEOUT_SECONDS = 60.0
 
 
 def server_parameters(root: Path) -> StdioServerParameters:
-    """Paramètres de lancement du serveur, identiques à ceux de la CLI."""
+    """Paramètres de lancement du serveur, identiques à ceux de la CLI.
+
+    Le SDK ne transmet au serveur qu'un environnement assaini (allowlist) :
+    pour mesurer la couverture des sous-processus (preuve DoD, seuil branché
+    par la CI du #20), on fait suivre explicitement la configuration de
+    mesure — sans effet sur le comportement dès qu'elle est absente.
+    """
+    extra_env = {}
+    coverage_config = os.environ.get("COVERAGE_PROCESS_START")
+    if coverage_config is not None:
+        extra_env["COVERAGE_PROCESS_START"] = coverage_config
     return StdioServerParameters(
         command=sys.executable,
         args=["-m", "heimdall.mcp", "--root", str(root)],
         cwd=str(root),
+        env=extra_env,
     )
 
 

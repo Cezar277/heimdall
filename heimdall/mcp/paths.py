@@ -106,11 +106,6 @@ def _is_absolute(value: str) -> bool:
     return len(value) >= _DRIVE_LENGTH and value[1] == ":" and value[0].isalpha()
 
 
-def _segments(value: str) -> tuple[str, ...]:
-    """Segments du chemin, séparés par ``/`` uniquement (jamais ``\\``)."""
-    return tuple(value.split("/"))
-
-
 def confine(root: Path, untrusted_path: object) -> ConfinedPath:
     """Résout ``untrusted_path`` dans ``root``, ou lève ``PathEscape``.
 
@@ -128,15 +123,15 @@ def confine(root: Path, untrusted_path: object) -> ConfinedPath:
     if not is_rel_path(untrusted_path):
         # `..`, `.`, segment vide, `\`, `:`, chaîne trop longue : refusés
         # ici plutôt que dans la résolution, avec un message unique.
-        raise PathEscape
-    segments = _segments(untrusted_path)
-    if any(segment in ("", ".", "..") for segment in segments):
+        # (La grammaire rejette déjà tous les segments vides/`.`/`..` :
+        # aucun second contrôle n'est nécessaire, et un contrôle mort
+        # serait un passif dans une fonction de sécurité.)
         raise PathEscape
 
     resolved_root = root.resolve()
-    # `joinpath` sur des segments déjà validés : pas de valeur recyclée
-    # depuis l'entrée, donc pas de trajectoire empilée.
-    candidate = resolved_root.joinpath(*segments).resolve()
+    # `joinpath` sur l'entrée déjà validée par la grammaire : pas de valeur
+    # recyclée depuis l'entrée, donc pas de trajectoire empilée.
+    candidate = resolved_root.joinpath(*untrusted_path.split("/")).resolve()
     if not candidate.is_relative_to(resolved_root):
         # Lien symbolique sortant, `..` résolu, racine différente.
         raise PathEscape
