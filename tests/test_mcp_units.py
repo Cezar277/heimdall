@@ -169,6 +169,17 @@ class ToolBoundaryTests(unittest.TestCase):
                 result = self.run_gate("read_diff", arguments)
                 self.assertTrue(result["isError"])
 
+    def test_non_string_keys_in_arguments_are_refused_not_raised(self) -> None:
+        """Clés non-chaînes (ex. int, tuple) : refusées avec INVALID_INPUT dans l'enveloppe."""
+        for bad_args in ({1: "val"}, {("x",): 1}):
+            with self.subTest(arguments=bad_args):
+                result = self.run_gate("read_diff", bad_args)
+                self.assertTrue(result["isError"])
+                self.assertEqual(
+                    json.loads(result["content"][0]["text"])["error"]["code"],
+                    "INVALID_INPUT",
+                )
+
     def test_unknown_tool_passes_through_to_the_sdk(self) -> None:
         """Registre fermé = réponse du SDK, pas de la frontière."""
         self.assertEqual(self.run_gate("exec", {}, result="sdk"), "sdk")
@@ -329,10 +340,19 @@ class GitAccessDirectTests(unittest.TestCase):
             with self.assertRaises(ToolFailure):
                 access.is_ignored("keep.txt")
 
-    def test_run_failure_is_internal(self) -> None:
+    def test_git_access_has_no_unbounded_run_method(self) -> None:
+        """Méthode morte run() supprimée.
+
+        Seul execute() (borné) et staged_diff() (streaming) existent.
+        """
         access = gitdiff.GitAccess(self.repo.root)
-        with self.assertRaises(ToolFailure):
-            access.run(("rev-parse", "--verify", "objet-inexistant-xyz"))
+        self.assertFalse(hasattr(access, "run"))
+
+    def test_execute_failure_is_internal(self) -> None:
+        access = gitdiff.GitAccess(self.repo.root)
+        with mock.patch("subprocess.run", side_effect=OSError("echec")):
+            with self.assertRaises(ToolFailure):
+                access.execute(("rev-parse", "--verify", "objet-inexistant-xyz"))
 
     def test_staged_diff_truncation_flag(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
@@ -379,10 +399,11 @@ class GitAccessDirectTests(unittest.TestCase):
                 access.staged_diff(1024)
         proc.kill.assert_called_once()
 
-    def test_run_success_returns_stdout(self) -> None:
+    def test_execute_success_returns_completed_process(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
-        out = access.run(("rev-parse", "--is-inside-work-tree"))
-        self.assertEqual(out.strip(), b"true")
+        completed = access.execute(("rev-parse", "--is-inside-work-tree"))
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout.strip(), b"true")
 
     def test_terminate_process_ignores_oserror_and_timeout(self) -> None:
         proc = mock.MagicMock()

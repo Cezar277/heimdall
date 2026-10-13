@@ -178,7 +178,7 @@ def _fixed_argv_violations(path: Path) -> list[str]:
     return found
 
 
-def _os_usage_violations(path: Path) -> list[str]:
+def _os_usage_violations(path: Path) -> list[str]:  # noqa: PLR0912
     """Usages os/pathlib hors allowlist de garde de chemin, ou détournements getattr/__import__."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     aliases: dict[str, str] = {}
@@ -366,3 +366,14 @@ def test_ast_guard_detects_getattr_and_import_escapes(tmp_path: Path) -> None:
     witness_imp = tmp_path / "witness_imp.py"
     witness_imp.write_text('mod = __import__("os")\n', encoding="utf-8")
     assert _os_usage_violations(witness_imp) == ["__import__"]
+
+
+def test_gitdiff_ast_has_no_unbounded_run_calls() -> None:
+    """Aucun subprocess.run autre que dans GitAccess.execute, et aucune méthode run() morte."""
+    tree = ast.parse(MCP_GITDIFF.read_text(encoding="utf-8"))
+    run_methods = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run"
+    ]
+    assert run_methods == [], "Méthode morte run() interdite dans gitdiff.py"

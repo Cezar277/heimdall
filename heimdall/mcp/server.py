@@ -176,6 +176,9 @@ class _ToolBoundary:
     def _arguments_valid(self, name: str, arguments: dict[str, Any]) -> bool:
         """Entrée conforme au contrat de l'outil (types, requis, `_meta`)."""
         for key, value in arguments.items():
+            if not isinstance(key, str):
+                logger.info("outil %s : clé non textuelle refusée", name)
+                return False
             if key == "_meta":
                 continue  # métadonnée de protocole MCP, pas un champ d'outil.
             wanted = self._expected[name].get(key)

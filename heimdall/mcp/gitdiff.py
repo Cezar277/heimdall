@@ -151,13 +151,6 @@ class GitAccess:
             # statique, jamais de chemin ni de sortie git reflétés.
             raise ToolFailure("INTERNAL") from None
 
-    def run(self, arguments: Sequence[str]) -> bytes:
-        """Exécute une commande git figée et renvoie sa sortie standard."""
-        completed = self.execute(arguments)
-        if completed.returncode != 0:
-            raise ToolFailure("INTERNAL")
-        return completed.stdout
-
     def is_repository(self) -> bool:
         """True si la racine est un dépôt Git avec arbre de travail.
 
