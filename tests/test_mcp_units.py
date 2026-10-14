@@ -929,6 +929,37 @@ class MaskingRulesTests(unittest.TestCase):
                 self.assertNotIn(secret, masked)
                 self.assertIn("<REDACTED:", masked)
 
+    def test_short_quoted_value_is_masked(self) -> None:
+        """`TOKEN="x1"`, `SECRET="ab1"` : la forme quotée partait en clair.
+
+        `_QUOTED_ASSIGNMENT` exige `{4,}` entre guillemets et les règles
+        courtes excluaient les quotes, alors que `TOKEN=x1` était masqué.
+        Les guillemets d'encadrement sont symétriques et la valeur jugée
+        comme en non quoté (chiffre requis, littéraux exclus).
+        """
+        for line, secret, length in (
+            ('TOKEN="x1"', "x1", 2),
+            ('SECRET="ab1"', "ab1", 3),
+            ("PASSWORD='h1'", "h1", 2),
+            ('KEY="ab12"', "ab12", 4),
+        ):
+            with self.subTest(line=line):
+                masked, count = masking.mask_text(line)
+                self.assertEqual(count, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn(f"<REDACTED:generic_secret:len={length}>", masked)
+
+    def test_short_quoted_value_keeps_ordinary_code_readable(self) -> None:
+        """Guillemets seuls ne masquent rien : nom neutre, littéral ou sans chiffre."""
+        for line in (
+            'MYDATA="x1"',
+            'key = "ab"',
+            'TOKEN="x1',
+            "TOKEN=",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(masking.mask_text(line), (line, 0))
+
     def test_short_rule_does_not_shadow_the_long_one(self) -> None:
         """Deux fenêtres, pas une : une valeur courte matche tôt dans la ligne.
 
@@ -1669,6 +1700,33 @@ class ParserStateTests(unittest.TestCase):
         self.assertEqual([entry.path for entry in entries], ["sain1.py", "sain2.py"])
         self.assertTrue(truncated)
         self.assertNotIn("\n", "".join(entry.path for entry in entries))
+
+    def test_unknown_diff_directive_is_flagged_never_silent(self) -> None:
+        """Directive `diff --*` inconnue : `truncated`, jamais de silence.
+
+        Seuls `diff --git ` et `diff --cc ` sont reconnus (tout ce que
+        l'argv figé émet) : une autre directive (`diff --combined`, futur
+        format git) signale l'incomplet au lieu de disparaître — et les
+        fichiers voisins reconnus restent montrés.
+        """
+        entries, truncated = gitdiff.parse_diff("diff --combined x\n")
+        self.assertEqual(entries, [])
+        self.assertTrue(truncated)
+        entries, truncated = gitdiff.parse_diff(
+            "diff --git a/a.py b/a.py\n"
+            "--- /dev/null\n"
+            "+++ b/a.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+x\n"
+            "diff --combined x\n"
+            "diff --git a/b.py b/b.py\n"
+            "--- /dev/null\n"
+            "+++ b/b.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+y\n"
+        )
+        self.assertEqual([entry.path for entry in entries], ["a.py", "b.py"])
+        self.assertTrue(truncated)
 
 
 class ConfineDirectTests(unittest.TestCase):

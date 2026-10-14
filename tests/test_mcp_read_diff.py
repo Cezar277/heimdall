@@ -187,6 +187,24 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.assertEqual(payload["files"][0]["redactions"], 3)
         self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
+    def test_short_quoted_value_is_masked_end_to_end(self) -> None:
+        """`TOKEN="x1"`, `SECRET="ab1"` stagés : la forme quotée aussi est masquée.
+
+        Dépôt git réel + vrai client MCP : c'est la réponse sérialisée qui est
+        vérifiée. La forme non quotée l'était déjà, la quotée partait en clair.
+        """
+        self.write("court.env", 'TOKEN="x1"\nSECRET="ab1"\nMODE="read"\n')
+        self.stage("court.env")
+        payload = self.call_read_diff()
+        content = json.dumps(payload)
+        for secret in ("x1", "ab1"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, content)
+        self.assertIn("MODE=", content)
+        self.assertIn("read", content, "une valeur non secrète reste lisible")
+        self.assertEqual(payload["files"][0]["redactions"], 2)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
     def test_generic_key_names_are_masked_end_to_end(self) -> None:
         """`KEY=hunter2`, `AWS_KEY=...`, `MYKEY=ab12` : bout en bout.
 

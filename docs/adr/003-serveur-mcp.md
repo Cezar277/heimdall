@@ -184,11 +184,15 @@ caractères) à nom neutre (`MY_DATA="motdepasse12"`) N'EST PAS masquée —
 l'alternative (masquer toute valeur affectée dès 8 caractères) noierait
 le tri (`name="production"`, indiscernable par entropie) et apprendrait
 au LLM à ignorer les marqueurs ; **une affectation non quotée à nom évocateur est masquée dès 6 caractères**
-(`_UNQUOTED_ASSIGNMENT` bornée à `{6,4096}` et filtrée par `_looks_like_secret`, protégeant `PASSWORD=hunter2`
+(`_UNQUOTED_ASSIGNMENT` en `{6,}` sans borne haute, filtrée par `_looks_like_secret`, protégeant `PASSWORD=hunter2`
 ou `SECRET=abc12345`) ; **puis, sous 6 caractères, dès 2 tant que la valeur
 est alphanumérique** (`SECRET=abc12`, `PASSWORD=1234`, `TOKEN=x1` — codes
 courts, PIN, mots de passe par défaut qui partaient en clair vers le LLM et
-son historique). Règle **séparée**, et non une borne abaissée : le premier
+son historique), **y compris entre guillemets** (`TOKEN="x1"`, `SECRET="ab1"` :
+`_QUOTED_ASSIGNMENT` exige `{4,}` et les règles courtes excluaient les quotes,
+donc la forme quotée fuyait là où la non quotée était masquée — guillemets
+d'encadrement optionnels mais symétriques, valeur jugée comme en non quoté,
+sans fermant pas de match). Règle **séparée**, et non une borne abaissée : le premier
 match d'un motif gagne, donc une valeur courte matche tôt dans la ligne
 (`max_bytes: int` dans une signature) et consommerait la suite du texte — le
 masquage long perdait alors ses cibles, mesuré
@@ -305,7 +309,7 @@ seulement comptés). Preuve :
 ### 8 ter. Formats de diff non reconnus : fail-closed, jamais du silence
 
 Règle unique : **ce que le parseur ne comprend pas, il le signale**
-(`truncated: true`) au lieu de le jeter. Trois cas trouvés en revue :
+(`truncated: true`) au lieu de le jeter. Quatre cas trouvés en revue :
 
 - **Hunk combiné `@@@ -1,2 -1,2 +1,3 @@@`** (diff de fusion, N parents) :
   il ne matchait pas `"@@ "`, donc le hunk ne s'ouvrait pas et les lignes
@@ -322,6 +326,10 @@ Règle unique : **ce que le parseur ne comprend pas, il le signale**
   réponse valait alors « aucun changement indexé » avec
   `truncated: false`, sur un dépôt en cours de fusion. Drapeau posé,
   les autres fichiers du diff restant montrés.
+- **Directive `diff --*` inconnue** (`diff --combined`, futur format git) :
+  ni reconnue ni jetée en silence — fichier courant clos, nouveau ouvert,
+  `truncated: true`, fichiers voisins montrés. Inatteignable avec l'argv
+  figé (qui n'émet que `diff --git `) : garde défensive.
 
 **Garde-fou structurel sur l'en-tête combiné** : `_COMBINED_HUNK_HEADER`
 porte des quantificateurs imbriqués, mais l'espace exigé en fin de chaque
@@ -386,10 +394,11 @@ un nom tronqué. Preuve : `heimdall/mcp/gitdiff.py`
 ### 11. `.git`/`.env` insensibles à la casse, binaires et tailles
 
 Segments comparés en minuscules (`.GIT` ouvre le même dossier sur FS
-insensible à la casse). Binaire (octet nul dans les 8 premiers Kio),
-> 1 Mo (`TOO_LARGE`, double garde : avant **et** après lecture),
-absent/dossier (`NOT_FOUND`), `start_line` hors bornes (extrait vide,
-`end_line: 0`, rien d'inventé).
+insensible à la casse). Binaire (octet nul cherché sur **tout le contenu
+lu**, borné à 1 Mo + 1 octet — pas seulement les 8 premiers Kio comme
+l'écrivait une ancienne version de ce paragraphe), > 1 Mo (`TOO_LARGE`,
+double garde : avant **et** après lecture), absent/dossier (`NOT_FOUND`),
+`start_line` hors bornes (extrait vide, `end_line: 0`, rien d'inventé).
 
 **`NOT_FOUND` réservé à l'absence** (`ENOENT`/`ENOTDIR`) : une permission
 refusée (`EACCES`/`EPERM`, `lstat` comme `open`), un nom trop long ou toute
@@ -454,6 +463,6 @@ renseigner la feuille SAMM avec liens permanents au SHA :
 | masquage avant sérialisation, compteurs vrais, quotée sans borne haute | `heimdall/mcp/masking.py` (`mask_text`, `_KNOWN_PREFIXES`, `_QUOTED_ASSIGNMENT`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`) |
 | garde unique, TOCTOU réduite, FIFO refusés, `NOT_FOUND` réservé à l'absence | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |
 | coupe sur lignes complètes | `heimdall/mcp/gitdiff.py` (`staged_diff`) |
-| format de diff non compris → `truncated`, jamais du silence | `heimdall/mcp/gitdiff.py` (`_COMBINED_HUNK_HEADER`, `_DiffParser._hunk_header`) |
+| format de diff non compris → `truncated`, jamais du silence | `heimdall/mcp/gitdiff.py` (`_COMBINED_HUNK_HEADER`, `_DiffParser._hunk_header`, `_DiffParser._feed` pour `diff --*` inconnu) |
 | aucun réseau | `tests/test_mcp_client.py` (`NoNetworkTests`, `NoTrafficTests`) |
 | 100 % / 100 % mesuré | `tests/test_mcp_units.py` + sortie `coverage report` |

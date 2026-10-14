@@ -74,10 +74,20 @@ _UNQUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 # texte — le masquage long perdrait alors ses cibles (`DEFAULT_MAX_BYTES`
 # n'était plus vu). Deux motifs, deux fenêtres, aucun ombrage : c'est
 # vérifié par test (`test_short_rule_does_not_shadow_the_long_one`).
+#
+# Guillemets d'encadrement OPTIONNELS mais symétriques : `TOKEN="x1"` (2 car.)
+# ne matchait aucune règle — `_QUOTED_ASSIGNMENT` exige `{4,}` et les règles
+# courtes excluent les quotes — alors que `TOKEN=x1` était masqué. Le groupe
+# `value` reste l'intérieur nu (le jugement par
+# `_short_evocative_looks_secret` et le marqueur `len=` sont inchangés) ;
+# sans guillemet fermant, le motif échoue au lieu de consommer (pas de
+# match partiel qui masquerait du code).
 _EVOCATIVE_SHORT_VALUE: Final[re.Pattern[str]] = re.compile(
     r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
     r"\s*[:=]\s*"
+    r"(?P<quote>[\"']?)"
     r"(?P<value>[^\s\"'`,;)}\]]{1,5})"
+    r"(?P=quote)"
 )
 
 # Authorization: Bearer <jeton>

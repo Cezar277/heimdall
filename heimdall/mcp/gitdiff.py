@@ -541,6 +541,16 @@ class _DiffParser:
             self._flush()
             self._builder = _EntryBuilder()
             return
+        if raw.startswith("diff "):
+            # Directive inconnue (`diff --combined`, futur format git…) : le
+            # fichier courant est clos, un nouveau est ouvert, et l'incomplet
+            # est signalé — jamais de silence avec `truncated=False`
+            # (invariant 1). Inatteignable avec l'argv figé actuel, qui
+            # n'émet que `diff --git ` : garde défensive, pas du code mort.
+            self._flush()
+            self._builder = _EntryBuilder()
+            self.truncated = True
+            return
         if raw.startswith(_UNMERGED_PATH):
             # `* Unmerged path x` : l'index porte un chemin non résolu (merge
             # en cours), et git n'en montre alors aucune ligne.
