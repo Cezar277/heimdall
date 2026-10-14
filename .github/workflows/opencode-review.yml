@@ -18,6 +18,12 @@ jobs:
       issues: write
       id-token: write
 
+    # Version du binaire opencode, SEULE source de vérité (pas de `latest`
+    # flottant) : pour monter de version, changer cette valeur, vérifier le
+    # diff amont (`github/action.yml` @ OPENCODE_ACTION_PIN) et pousser.
+    env:
+      OPENCODE_VERSION: 1.19.0
+
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -27,36 +33,32 @@ jobs:
       # L'action opencode n'est JAMAIS consommée via `uses: owner/repo` : le
       # tarball du monorepo dépasse les 100s du HttpClient interne du runner
       # (timeout non configurable, codé en dur côté runner). Les étapes
-      # ci-dessous sont recopiées de `github/action.yml` au SHA épinglé
-      # (OPENCODE_ACTION_PIN=77fc88c8ade8e5a620ebbe1197f3a572d29ae91a,
-      # opencode v1.19.0) : pour monter de version, relire le diff amont puis
-      # bumper ce SHA et re-recopier. AUCUN fichier de l'action n'est copié
-      # dans le worktree : une copie sous `./...` casse le `git checkout <PR>`
-      # interne de `opencode github run` (« untracked working tree files would
-      # be overwritten ») et son `git add .` interne la committe ensuite dans
-      # la PR relue (constaté sur la branche 25-t25-vault-minimal : 10 fichiers
+      # ci-dessous sont recopiées de `github/action.yml` au SHA
+      # OPENCODE_ACTION_PIN=77fc88c8ade8e5a620ebbe1197f3a572d29ae91a
+      # (opencode v1.19.0) : pour monter de version, relire le diff amont,
+      # bumper OPENCODE_VERSION ci-dessus puis re-recopier si l'amont a
+      # changé. Le binaire est épinglé via `--version` (pas d'appel
+      # `latest`, pas de clé de cache flottante). AUCUN fichier de l'action
+      # n'est copié dans le worktree : une copie sous `./...` casse le
+      # `git checkout <PR>` interne de `opencode github run` (« untracked
+      # working tree files would be overwritten ») et son `git add .`
+      # interne la committe ensuite dans la PR relue (constaté sur la
+      # branche 25-t25-vault-minimal : 10 fichiers
       # `.github/actions/opencode/github/...` poussés par le bot).
       - name: Clean legacy in-repo action copy
         run: rm -rf .github/actions/opencode
-
-      - name: Get opencode version
-        id: version
-        shell: bash
-        run: |
-          VERSION=$(curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
-          echo "version=${VERSION:-latest}" >> "$GITHUB_OUTPUT"
 
       - name: Cache opencode
         id: cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.opencode/bin
-          key: opencode-${{ runner.os }}-${{ runner.arch }}-${{ steps.version.outputs.version }}
+          key: opencode-${{ runner.os }}-${{ runner.arch }}-${{ env.OPENCODE_VERSION }}
 
       - name: Install opencode
         if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
-        run: curl -fsSL https://opencode.ai/install | bash
+        run: curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
 
       - name: Add opencode to PATH
         shell: bash

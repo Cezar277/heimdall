@@ -41,10 +41,11 @@ node_modules/
 .DS_Store
 Thumbs.db
 
-# --- CI opencode : copie locale de l'action (ne jamais committer) ---
-# Le workflow recopie l'action sous .github/actions/opencode/ sur le runner ;
-# si ces fichiers arrivent dans une PR (via le `git add .` interne du bot),
-# le `git checkout` suivant échoue (« untracked working tree files would be
-# overwritten »). Cette entrée ceinture le workflow corrigé qui ne crée plus
-# aucun fichier dans le dépôt.
+# --- CI opencode : garde-fou historique, aucun workflow ne doit écrire ici ---
+# Aucune étape ne doit (re)créer .github/actions/opencode/ sur le runner :
+# ces fichiers untracked cassaient le `git checkout` interne du bot
+# (« untracked working tree files would be overwritten ») et son `git add .`
+# interne les committait dans les PR relues. Le workflow inline désormais les
+# étapes amont sans rien écrire dans le dépôt ; cette entrée + le `rm -rf` en
+# tête de workflow ne sont qu'une ceinture pour les résidus existants.
 .github/actions/opencode/
