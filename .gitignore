@@ -40,3 +40,12 @@ node_modules/
 .idea/
 .DS_Store
 Thumbs.db
+
+# --- CI opencode : garde-fou historique, aucun workflow ne doit écrire ici ---
+# Aucune étape ne doit (re)créer .github/actions/opencode/ sur le runner :
+# ces fichiers untracked cassaient le `git checkout` interne du bot
+# (« untracked working tree files would be overwritten ») et son `git add .`
+# interne les committait dans les PR relues. Le workflow inline désormais les
+# étapes amont sans rien écrire dans le dépôt ; cette entrée + le `rm -rf` en
+# tête de workflow ne sont qu'une ceinture pour les résidus existants.
+.github/actions/opencode/
