@@ -19,13 +19,18 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v6
+      # Refs épinglées par SHA (pas de tag flottant) : la clé du cache
+      # d'archives d'actions du runner (`ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE`)
+      # est le SHA résolu — avec `@latest`/`@v6`, chaque push upstream
+      # invaliderait le cache et relancerait un téléchargement complet.
+      # SHAs relevés dans un run vert (v6 ; opencode v1.19.0).
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: OpenCode review
-        uses: anomalyco/opencode/github@latest
+        uses: anomalyco/opencode/github@77fc88c8ade8e5a620ebbe1197f3a572d29ae91a # latest au 2026-10-14
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
