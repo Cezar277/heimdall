@@ -51,6 +51,7 @@ jobs:
             git -C "$TMP" sparse-checkout set github
             git -C "$TMP" fetch --depth 1 origin "$ACTION_PIN"
             git -C "$TMP" reset --hard FETCH_HEAD
+            mkdir -p "$(dirname "$CACHE")"
             rm -rf "$CACHE"
             mv "$TMP" "$CACHE"
           fi
