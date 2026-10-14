@@ -19,13 +19,49 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      # L'action opencode n'est JAMAIS téléchargée par le runner : le tarball
+      # du monorepo dépasse les 100s du HttpClient interne sur notre lien
+      # (timeout non configurable, codé en dur côté runner). À la place, un
+      # clone persistant vit sur la machine (`/home/runner/actions-cache`,
+      # protocole git sans timeout artificiel) et l'action est consommée en
+      # LOCAL (`uses: ./...`, rien à télécharger). Le SHA épinglé ci-dessous
+      # est la seule source de vérité de version (opencode v1.19.0) : pour
+      # monter de version, bumper ce SHA (le cache suivra tout seul).
+      - name: Sync opencode action (local-first)
+        env:
+          ACTION_PIN: 77fc88c8ade8e5a620ebbe1197f3a572d29ae91a
+        run: |
+          set -eu
+          CACHE=/home/runner/actions-cache/opencode
+          DEST=./.github/actions/opencode
+          # Pas de pendant infini en cas de lien vraiment mort : avorte vite
+          # au lieu de bloquer le runner (git n'a aucun timeout par défaut).
+          export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120
+          if [ -d "$CACHE/.git" ] && git -C "$CACHE" cat-file -e "$ACTION_PIN^{commit}" 2>/dev/null; then
+            echo "[=] cache hit : $ACTION_PIN déjà sur la machine, zéro téléchargement."
+          else
+            echo "[*] fetch du SHA épinglé..."
+            TMP="$(mktemp -d)"
+            git clone --depth 1 --filter=blob:none --sparse https://github.com/anomalyco/opencode.git "$TMP"
+            git -C "$TMP" sparse-checkout set github
+            git -C "$TMP" fetch --depth 1 origin "$ACTION_PIN"
+            git -C "$TMP" reset --hard FETCH_HEAD
+            rm -rf "$CACHE"
+            mv "$TMP" "$CACHE"
+          fi
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+          cp -r "$CACHE/github" "$DEST/"
+          test -f "$DEST/github/action.yml"
+          echo "[+] action locale prête : $DEST/github (SHA $ACTION_PIN)"
+
       - name: OpenCode review
-        uses: anomalyco/opencode/github@latest
+        uses: ./.github/actions/opencode/github
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

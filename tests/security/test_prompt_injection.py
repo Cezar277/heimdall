@@ -23,6 +23,7 @@ MCP_SCHEMA = REPO / "schemas" / "mcp-tools.schema.json"
 MCP_DOC = REPO / "docs" / "contracts" / "mcp-tools.md"
 FINDING_DOC = REPO / "docs" / "contracts" / "finding.md"
 MCP_SERVER = REPO / "heimdall" / "mcp" / "server.py"
+MCP_GITDIFF = REPO / "heimdall" / "mcp" / "gitdiff.py"
 CLI_MAIN = REPO / "heimdall" / "cli" / "main.py"
 REQUIREMENTS = REPO / "docs" / "security" / "requirements.md"
 
@@ -96,7 +97,16 @@ def _network_or_exec_violations(path: Path) -> list[str]:
             found.append(node.module)
         elif isinstance(node, ast.Call):
             func = node.func
-            if isinstance(func, ast.Name) and func.id in _FORBIDDEN_CALLS:
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "run"
+                and any(keyword.arg == "transport" for keyword in node.keywords)
+            ):
+                # Lanceur MCP stdio (`server.run(transport="stdio")`, voir
+                # #27) : demarre le protocole sur stdin/stdout, pas un
+                # sous-processus shell. Tout autre `.run(` reste banni.
+                pass
+            elif isinstance(func, ast.Name) and func.id in _FORBIDDEN_CALLS:
                 found.append(func.id)
             elif isinstance(func, ast.Attribute) and func.attr in _FORBIDDEN_CALLS:
                 found.append(func.attr)
@@ -111,41 +121,96 @@ def _network_or_exec_violations(path: Path) -> list[str]:
 
 
 # `os`/`pathlib` sont autorises UNIQUEMENT pour la garde de chemin confine
-# (resolve/is_relative_to/open avec O_NOFOLLOW, sur le modele de
-# check_model.py) : bannir `os` en bloc interdirait l'implementation reelle
-# de REQ-SEC-04 en #27. Tout autre usage (exec/spawn/system, makedirs...)
-# reste refuse ici (noms couverts) ou en #27/#30 (preuve runtime).
+# (resolve/is_relative_to/open avec O_NOFOLLOW, lstat sans suivre les liens,
+# sur le modele de check_model.py) : bannir `os` en bloc interdirait
+# l'implementation reelle de REQ-SEC-04 en #27. Tout autre usage
+# (exec/spawn/system, makedirs...) reste refuse ici (noms couverts) ou en
+# #27/#30 (preuve runtime).
 _OS_ALLOWED_ATTRS = frozenset(
     {
         "open",
         "read",
         "close",
         "fstat",
+        "lstat",
         "stat",
         "O_NOFOLLOW",
         "O_RDONLY",
         "O_CLOEXEC",
         "O_BINARY",
+        "O_NONBLOCK",
+        "defpath",
+        "devnull",
     }
 )
-_PATHLIB_ALLOWED_NAMES = frozenset({"Path", "PurePath", "PurePosixPath", "PureWindowsPath"})
+# `cwd` : lecture seule du répertoire courant, utilisée comme ENTRÉE d'un
+# contrôle de confinement (la garde anti-hijack du binaire git refuse un
+# binaire sous le cwd). Ni exécution, ni écriture, ni réseau, ni chargement
+# dynamique : l'ajouter ne rouvre aucune des voies que cette garde ferme.
+_PATHLIB_ALLOWED_NAMES = frozenset({"Path", "PurePath", "PurePosixPath", "PureWindowsPath", "cwd"})
 
 
-def _os_usage_violations(path: Path) -> list[str]:
-    """Usages os/pathlib hors allowlist de garde de chemin (vide = OK)."""
+def _fixed_argv_violations(path: Path) -> list[str]:
+    """`subprocess` autorisé en #27 pour UNE commande git figée : argv en
+    liste littérale, jamais `shell=True` (CWE-78, mandat explicite du #74 :
+    `subprocess.run([...])` sans `shell=True`, options `--no-ext-diff
+    --no-textconv` contre l'exécution pilotée par le dépôt), et
+    `stdin=subprocess.DEVNULL` sur chaque appel. Sans ce dernier, le fils
+    hérite du pipe JSON-RPC du serveur MCP : une sous-commande qui lirait
+    stdin (`hash-object --stdin`, `apply`, un `textconv` si l'option sautait)
+    consommerait des octets du protocole ou s'y bloquerait — une
+    interférence pilotable par le dépôt scanné. Tout appel hors de ce
+    motif (chaîne formatée, `shell=True`, stdin hérité, Popen...) est une
+    violation, même si la commande semble inoffensive."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "subprocess"
+            and func.attr in ("run", "call", "check_call", "check_output", "Popen")
+        ):
+            continue
+        for keyword in node.keywords:
+            if (
+                keyword.arg == "shell"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+            ):
+                found.append("shell=True")
+        stdin = next((keyword for keyword in node.keywords if keyword.arg == "stdin"), None)
+        if not (
+            stdin is not None
+            and isinstance(stdin.value, ast.Attribute)
+            and isinstance(stdin.value.value, ast.Name)
+            and stdin.value.value.id == "subprocess"
+            and stdin.value.attr == "DEVNULL"
+        ):
+            found.append(f"subprocess.{func.attr}(stdin-non-devnull)")
+        if not node.args or not isinstance(node.args[0], (ast.List, ast.Tuple)):
+            found.append(f"subprocess.{func.attr}(argv-non-liste)")
+    return found
+
+
+def _os_usage_violations(path: Path) -> list[str]:  # noqa: PLR0912
+    """Usages os/pathlib hors allowlist de garde de chemin, ou détournements getattr/__import__."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
-                if top in ("os", "pathlib"):
+                if top in ("os", "pathlib", "subprocess"):
                     aliases[alias.asname or alias.name] = top
         elif (
             isinstance(node, ast.ImportFrom)
             and node.level == 0
             and node.module
-            and node.module.split(".")[0] in ("os", "pathlib")
+            and node.module.split(".")[0] in ("os", "pathlib", "subprocess")
         ):
             for alias in node.names:
                 aliases[alias.asname or alias.name] = node.module
@@ -157,6 +222,24 @@ def _os_usage_violations(path: Path) -> list[str]:
                 found.append(f"os.{node.attr}")
             elif canonical == "pathlib" and node.attr not in _PATHLIB_ALLOWED_NAMES:
                 found.append(f"pathlib.{node.attr}")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+                found.append("__import__")
+            elif isinstance(node.func, ast.Name) and node.func.id == "getattr":
+                if node.args and isinstance(node.args[0], ast.Name):
+                    target = aliases.get(node.args[0].id, node.args[0].id)
+                    if target in ("os", "os.path"):
+                        if (
+                            len(node.args) >= 2
+                            and isinstance(node.args[1], ast.Constant)
+                            and isinstance(node.args[1].value, str)
+                            and node.args[1].value in _OS_ALLOWED_ATTRS
+                        ):
+                            pass
+                        else:
+                            found.append("getattr(os, ...)")
+                    elif target == "subprocess":
+                        found.append("getattr(subprocess, ...)")
     return found
 
 
@@ -244,11 +327,14 @@ def test_llm_rejection_never_silent() -> None:
     for snippet in HOSTILE_SNIPPETS:
         assert "SYNTHETIC" in snippet
         assert "AKIA" not in snippet and "sk_live" not in snippet
-    # 7. Squelette MCP fail-closed : demarrage impossible sans implementation,
-    # avec message statique (l'entree `root` est detruite, jamais refletee).
+    # 7. Serveur #27 fail-closed au runtime (le squelette qui levait
+    # NotImplementedError est implémenté : voir #27) : racine invalide
+    # refusée sans reflet, tout échec d'outil converti en enveloppe
+    # {"error": …} jamais silencieuse (fail-closed du contrat, prouvé en
+    # exécution par tests/test_mcp_*.py).
     server_src = MCP_SERVER.read_text(encoding="utf-8")
-    assert "raise NotImplementedError" in server_src
-    assert "del root" in server_src
+    for token in ("ToolFailure", "errors.failure", '"isError"', "PATH_ESCAPE"):
+        assert token in server_src, token
 
 
 def test_no_llm_in_ci() -> None:
@@ -267,9 +353,69 @@ def test_no_llm_in_ci() -> None:
     # serveur stdio (mcp/server.py). `os`/`pathlib` restent autorises pour la
     # garde de chemin (resolve/is_relative_to/open avec O_NOFOLLOW, comme
     # check_model.py) : leurs usages sont controles par _os_usage_violations.
+    # Commande git confinee (#27) : argv fige en liste, jamais de shell
+    # (mandat #74, contrat 4.1) — controle par _fixed_argv_violations.
     for path in (CLI_MAIN, MCP_SERVER):
         assert _network_or_exec_violations(path) == [], path.name
+    for path in (CLI_MAIN, MCP_SERVER, MCP_GITDIFF):
         assert _os_usage_violations(path) == [], path.name
+    assert _fixed_argv_violations(MCP_GITDIFF) == []
     req = REQUIREMENTS.read_text(encoding="utf-8")
     assert "REQ-SEC-02" in req
     assert "scan --ci" in req
+
+
+def test_ast_guard_detects_inherited_stdin(tmp_path: Path) -> None:
+    """Garde AST : un appel git sans `stdin=DEVNULL` est détecté et refusé.
+
+    Témoin négatif obligatoire : une garde qui ne détecterait jamais rien
+    ne prouverait rien. Le témoin imite exactement la forme qu'un futur
+    appel aurait (argv figée, pas de shell) en oubliant le stdin fermé.
+    """
+    leaking = tmp_path / "temoin_stdin.py"
+    leaking.write_text(
+        'import subprocess\n'
+        'subprocess.run(["git", "diff"], capture_output=True)\n',
+        encoding="utf-8",
+    )
+    assert _fixed_argv_violations(leaking) == ["subprocess.run(stdin-non-devnull)"]
+
+    correct = tmp_path / "temoin_sain.py"
+    correct.write_text(
+        'import subprocess\n'
+        'subprocess.run(["git", "diff"], stdin=subprocess.DEVNULL, capture_output=True)\n',
+        encoding="utf-8",
+    )
+    assert _fixed_argv_violations(correct) == []
+
+
+def test_ast_guard_detects_getattr_and_import_escapes(tmp_path: Path) -> None:
+    """Garde AST : getattr(os, 'system') ou dynamique est détecté et refusé."""
+    witness = tmp_path / "witness.py"
+    witness.write_text('import os\ngetattr(os, "system")("id")\n', encoding="utf-8")
+    assert _os_usage_violations(witness) == ["getattr(os, ...)"]
+
+    witness_dyn = tmp_path / "witness_dyn.py"
+    witness_dyn.write_text('import os\ngetattr(os, "sy" + "stem")("id")\n', encoding="utf-8")
+    assert _os_usage_violations(witness_dyn) == ["getattr(os, ...)"]
+
+    witness_subp = tmp_path / "witness_subp.py"
+    witness_subp.write_text(
+        'import subprocess\ngetattr(subprocess, "call")(["ls"])\n', encoding="utf-8"
+    )
+    assert _os_usage_violations(witness_subp) == ["getattr(subprocess, ...)"]
+
+    witness_imp = tmp_path / "witness_imp.py"
+    witness_imp.write_text('mod = __import__("os")\n', encoding="utf-8")
+    assert _os_usage_violations(witness_imp) == ["__import__"]
+
+
+def test_gitdiff_ast_has_no_unbounded_run_calls() -> None:
+    """Aucun subprocess.run autre que dans GitAccess.execute, et aucune méthode run() morte."""
+    tree = ast.parse(MCP_GITDIFF.read_text(encoding="utf-8"))
+    run_methods = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run"
+    ]
+    assert run_methods == [], "Méthode morte run() interdite dans gitdiff.py"
