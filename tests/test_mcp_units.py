@@ -10,6 +10,7 @@ subprocess (transmission de `COVERAGE_PROCESS_START`, voir
 
 import asyncio
 import errno
+import importlib
 import inspect
 import json
 import os
@@ -24,6 +25,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+from support import git_repo as git_repo_helper
 from support import mcp_contract
 from support.fake_secrets import FAKE_GITHUB_TOKEN, fake_token
 from support.git_repo import GitRepo
@@ -449,6 +451,34 @@ class GitAccessDirectTests(unittest.TestCase):
                     os.environ["PATH"] = previous
             self.assertFalse(canary.exists(), "le faux binaire git a été exécuté !")
             self.assertNotEqual(os.path.dirname(access._git), bindir)
+
+    def test_helper_ignores_inherited_path(self) -> None:
+        """Le helper de test applique la même règle que le produit.
+
+        `tests/support/git_repo.py` résout `git` via `os.defpath`, jamais le
+        `PATH` hérité : rechargé sous un `PATH` hostile (faux `git` en tête),
+        il doit lier le vrai binaire — et un `GitRepo` construit dans cet
+        état ne doit jamais l'exécuter (canari). Test-only, mais exécuté
+        avec les privilèges du poste/CI, d'où l'exigence.
+        """
+        if gitdiff.shutil.which("git", path=os.defpath) is None:
+            self.skipTest("git introuvable dans le PATH système")
+        with tempfile.TemporaryDirectory(prefix="heimdall-evilbin-") as bindir:
+            canary = _Path(tempfile.gettempdir()) / "heimdall-helper-hijack-canary"
+            canary.unlink(missing_ok=True)
+            fake = _Path(bindir) / "git"
+            fake.write_text(f'#!/bin/sh\necho "PWNED" >> {canary}\n', encoding="utf-8")
+            fake.chmod(stat.S_IRWXU)
+            saved = git_repo_helper.GIT
+            hostile = f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"
+            with mock.patch.dict(os.environ, {"PATH": hostile}):
+                try:
+                    importlib.reload(git_repo_helper)
+                    self.assertNotEqual(git_repo_helper.GIT, str(fake))
+                    GitRepo("heimdall-helper-", self)
+                finally:
+                    git_repo_helper.GIT = saved
+            self.assertFalse(canary.exists(), "le faux binaire git a été exécuté !")
 
     def test_repository_detection(self) -> None:
         self.assertTrue(gitdiff.GitAccess(self.repo.root).is_repository())

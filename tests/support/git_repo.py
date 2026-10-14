@@ -5,13 +5,19 @@ dépôt par test, dans un répertoire temporaire, jamais le dépôt Heimdall
 lui-même. Ce module n'est pas importé par le produit.
 """
 
+import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-GIT = shutil.which("git")
+# Même règle que le produit (`heimdall/mcp/gitdiff.py`) : résolution hors
+# `PATH` hérité (`os.defpath`, défaut système), jamais d'héritage — sinon un
+# `PATH` compromis sur le poste ou la CI ferait exécuter un `git` piégé à
+# chaque test, avec les privilèges du dev ou de la CI. Absent du défaut
+# système : `SkipTest`, jamais de repli vers un `PATH` non fiable.
+GIT = shutil.which("git", path=os.defpath)
 
 
 class GitRepo:
