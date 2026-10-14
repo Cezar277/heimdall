@@ -6,19 +6,25 @@ lue dans les variables d'environnement (via pydantic-settings) et la route de sa
 Lancement du serveur :
     python -m heimdall.vault.app
     # ou :
-    uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 --proxy-headers=false
+    uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 \
+        --proxy-headers=false --no-server-header --no-date-header
 
 RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 - Allowlist boucle locale : écoute EXCLUSIVEMENT sur la boucle locale (127.0.0.1, ::1, localhost),
   strictement alignée sur `heimdall.vault.client._ALLOWED_LOOPBACK_HOSTS`.
-  Toute adresse LAN, WAN, broadcast ou 0.0.0.0 est rejetée (mitigation Network exposure / Spoofing).
-- Garde middleware fail-closed : rejette (HTTP 403) toute requête sans client identifié ou
-  provenant d'une IP non-loopback. Les en-têtes X-Forwarded-For sont ignorés et uvicorn est
-  configuré avec proxy_headers=False (invariant 6 : pas d'usurpation via proxy non approuvé).
+  Toute adresse LAN, WAN, broadcast, 0.0.0.0 ou adresse loopback hors allowlist (ex: 127.0.0.2)
+  est rejetée (mitigation Network exposure / Spoofing).
+- Garde middleware fail-closed : applique la même allowlist stricte `_ALLOWED_LOOPBACK_HOSTS`
+  (avec support pour la forme IPv4-mappée ::ffff:127.0.0.1) et rejette (HTTP 403) toute
+  requête sans client identifié ou provenant d'une adresse hors allowlist. Les en-têtes
+  X-Forwarded-For sont ignorés et uvicorn est configuré avec proxy_headers=False,
+  forwarded_allow_ips="", server_header=False et date_header=False
+  (anti-spoofing et anti-fingerprinting).
 - Documentation désactivée par défaut : docs_url, redoc_url et openapi_url sont désactivés
   pour interdire la reconnaissance d'empreinte (fingerprinting) et l'exposition de version/schéma.
 - Schéma OpenAPI conforme : /api/v1/health déclare l'ensemble des réponses contractuelles (200, 405,
-  429, 500, 503, default) avec header Retry-After obligatoire sur 429 et 503.
+  429, 500, 503, default) avec header Retry-After obligatoire sur 429 et 503. Seul /api/v1/health
+  est exposé (aucun alias racine non contractuel).
 - Allowlist sur les en-têtes d'exception : seuls Allow et Retry-After (1-3600) sont retransmis.
 - Confinement crypto (ticket #17) : ce module n'importe JAMAIS cryptography ou
   argon2 (réservés exclusivement à heimdall/vault/crypto.py).
@@ -191,7 +197,7 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:
-        """Défense en profondeur fail-closed : bloque toute requête non issue du loopback."""
+        """Défense en profondeur fail-closed : bloque toute requête hors de l'allowlist loopback."""
         client = request.client
         if not client or not client.host:
             return JSONResponse(
@@ -199,19 +205,21 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
                 content=_ERROR_PAYLOADS[403],
             )
         host = client.host
-        try:
-            addr = ipaddress.ip_address(host)
-            if not addr.is_loopback:
-                return JSONResponse(
-                    status_code=403,
-                    content=_ERROR_PAYLOADS[403],
-                )
-        except ValueError:
-            if host not in _ALLOWED_LOOPBACK_HOSTS:
-                return JSONResponse(
-                    status_code=403,
-                    content=_ERROR_PAYLOADS[403],
-                )
+        is_allowed = host in _ALLOWED_LOOPBACK_HOSTS
+        if not is_allowed:
+            try:
+                addr = ipaddress.ip_address(host)
+                mapped = getattr(addr, "ipv4_mapped", None)
+                effective_ip = str(mapped or addr)
+                if effective_ip in _ALLOWED_LOOPBACK_HOSTS:
+                    is_allowed = True
+            except ValueError:
+                pass
+        if not is_allowed:
+            return JSONResponse(
+                status_code=403,
+                content=_ERROR_PAYLOADS[403],
+            )
         return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
@@ -248,7 +256,7 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
                         retry_sec = int(val)
                         if 1 <= retry_sec <= _MAX_RETRY_AFTER_SECONDS:
                             filtered_headers["Retry-After"] = str(retry_sec)
-                    except ValueError:
+                    except (ValueError, TypeError):
                         pass
         headers = filtered_headers or None
         return JSONResponse(
@@ -277,17 +285,6 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
         """Santé minimale : répond 200 {'status': 'ok'} sans métadonnées sensibles."""
         return {"status": "ok"}
 
-    @app.get(
-        "/health",
-        response_model=HealthResponse,
-        tags=["Health"],
-        summary="Vérifier la santé minimale (alias)",
-        include_in_schema=False,
-    )
-    async def health_alias() -> dict[str, str]:
-        """Alias de confort pour /health, exclu du schéma OpenAPI."""
-        return {"status": "ok"}
-
     return app
 
 
@@ -303,6 +300,8 @@ def run_server() -> None:
         port=server_settings.port,
         proxy_headers=False,
         forwarded_allow_ips="",
+        server_header=False,
+        date_header=False,
     )
 
 

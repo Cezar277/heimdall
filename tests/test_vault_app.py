@@ -1,9 +1,10 @@
 """Tests unitaires et d'intégration du squelette Vault FastAPI (ticket #25).
 
 Vérifie l'application FastAPI, la configuration via variables d'environnement
-(pydantic-settings), l'absence de fuite d'informations sur `/health` et `/api/v1/health`,
+(pydantic-settings), l'absence de fuite d'informations sur `/api/v1/health`,
 la désactivation par défaut de la documentation OpenAPI (/docs, /openapi.json),
 la conformité contractuelle du schéma OpenAPI sur `/api/v1/health`,
+l'absence d'alias non contractuel `/health` (404),
 la gestion d'erreurs contractuelle (400, 401, 403, 404, 405, 409, 429, 503)
 sans enveloppe framework, l'allowlist d'en-têtes d'erreurs, l'immunité au spoofing
 X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
@@ -39,26 +40,27 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
 
     async def test_health_returns_200_ok(self) -> None:
-        """Critère d'acceptation : `/health` répond 200 avec {'status': 'ok'}."""
-        response = await self.client.get("/health")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok"})
-
-    async def test_api_v1_health_returns_200_ok(self) -> None:
-        """Conformité OpenAPI v1 (#15) : `/api/v1/health` répond également 200."""
+        """Critère d'acceptation : `/api/v1/health` répond 200 avec {'status': 'ok'}."""
         response = await self.client.get("/api/v1/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
 
+    async def test_root_health_returns_404_not_found(self) -> None:
+        """Le contrat OpenAPI ne définit que /api/v1/health ; /health renvoie 404."""
+        response = await self.client.get("/health")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            response.json(),
+            {"code": "not_found", "message": "Ressource introuvable"},
+        )
+
     async def test_health_does_not_leak_version_or_configuration(self) -> None:
         """Mitigation Information Disclosure (STRIDE) : pas de version ni de config."""
-        for endpoint in ("/health", "/api/v1/health"):
-            with self.subTest(endpoint=endpoint):
-                response = await self.client.get(endpoint)
-                data = response.json()
-                self.assertEqual(list(data.keys()), ["status"])
-                for forbidden in ("version", "config", "port", "host", "env", "debug"):
-                    self.assertNotIn(forbidden, data)
+        response = await self.client.get("/api/v1/health")
+        data = response.json()
+        self.assertEqual(list(data.keys()), ["status"])
+        for forbidden in ("version", "config", "port", "host", "env", "debug"):
+            self.assertNotIn(forbidden, data)
 
     async def test_docs_and_openapi_disabled_by_default(self) -> None:
         """Mitigation reconnaissance pentest : /docs et /openapi.json renvoient 404."""
@@ -110,14 +112,12 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_method_not_allowed_returns_contractual_json(self) -> None:
         """Méthode POST interdite sur /api/v1/health -> 405 sans fuite."""
-        for endpoint in ("/health", "/api/v1/health"):
-            with self.subTest(endpoint=endpoint):
-                response = await self.client.post(endpoint)
-                self.assertEqual(response.status_code, 405)
-                self.assertEqual(
-                    response.json(),
-                    {"code": "method_not_allowed", "message": "Méthode non autorisée"},
-                )
+        response = await self.client.post("/api/v1/health")
+        self.assertEqual(response.status_code, 405)
+        self.assertEqual(
+            response.json(),
+            {"code": "method_not_allowed", "message": "Méthode non autorisée"},
+        )
 
     async def test_validation_error_returns_contractual_400_without_detail(self) -> None:
         """RequestValidationError est converti en 400 bad_request sans écho d'entrée."""
@@ -235,17 +235,87 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
             resp_bad = await c.get("/trigger-bad-retry")
             self.assertNotIn("retry-after", resp_bad.headers)
 
+    async def test_exception_headers_retry_after_non_integer_types(self) -> None:
+        """Garde-fou : un Retry-After non convertible (None, liste, etc.) ne lève pas 500."""
+        test_app = create_app()
+
+        @test_app.get("/trigger-none-retry")
+        async def trigger_none_retry() -> None:
+            raise HTTPException(
+                status_code=429,
+                headers={"Retry-After": None},  # type: ignore[dict-item]
+            )
+
+        @test_app.get("/trigger-list-retry")
+        async def trigger_list_retry() -> None:
+            raise HTTPException(
+                status_code=429,
+                headers={"Retry-After": [1, 2]},  # type: ignore[dict-item]
+            )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as c:
+            for endpoint in ("/trigger-none-retry", "/trigger-list-retry"):
+                with self.subTest(endpoint=endpoint):
+                    resp = await c.get(endpoint)
+                    self.assertEqual(resp.status_code, 429)
+                    self.assertEqual(
+                        resp.json(),
+                        {"code": "rate_limited", "message": "Trop de requêtes"},
+                    )
+                    self.assertNotIn("retry-after", resp.headers)
+
     async def test_non_loopback_client_rejected_by_middleware(self) -> None:
         """Défense en profondeur : une requête d'une IP distante/LAN est bloquée en 403."""
         test_app = create_app()
         transport = ASGITransport(app=test_app, client=("192.168.1.50", 54321))
         async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8443") as c:
-            response = await c.get("/health")
+            response = await c.get("/api/v1/health")
             self.assertEqual(response.status_code, 403)
             self.assertEqual(
                 response.json(),
                 {"code": "forbidden", "message": "Accès interdit"},
             )
+
+    async def test_loopback_middleware_rejects_127_0_0_2_and_non_loopback(self) -> None:
+        """Le middleware applique la même allowlist stricte que validate_host."""
+        test_app = create_app()
+        for forbidden_client in (
+            ("127.0.0.2", 54321),
+            ("192.168.1.10", 54321),
+            ("10.0.0.1", 54321),
+            ("8.8.8.8", 54321),
+        ):
+            with self.subTest(client=forbidden_client):
+                transport = ASGITransport(app=test_app, client=forbidden_client)
+                async with AsyncClient(
+                    transport=transport, base_url="http://127.0.0.1:8443"
+                ) as c:
+                    resp = await c.get("/api/v1/health")
+                    self.assertEqual(resp.status_code, 403)
+                    self.assertEqual(
+                        resp.json(),
+                        {"code": "forbidden", "message": "Accès interdit"},
+                    )
+
+    async def test_loopback_middleware_accepts_valid_loopback_clients(self) -> None:
+        """Le middleware autorise 127.0.0.1, ::1 et ::ffff:127.0.0.1."""
+        test_app = create_app()
+        for valid_client in (
+            ("127.0.0.1", 54321),
+            ("::1", 54321),
+            ("::ffff:127.0.0.1", 54321),
+        ):
+            with self.subTest(client=valid_client):
+                transport = ASGITransport(app=test_app, client=valid_client)
+                async with AsyncClient(
+                    transport=transport, base_url="http://127.0.0.1:8443"
+                ) as c:
+                    resp = await c.get("/api/v1/health")
+                    self.assertEqual(resp.status_code, 200)
+                    self.assertEqual(resp.json(), {"status": "ok"})
 
     async def test_middleware_fail_closed_when_client_missing_or_empty(self) -> None:
         """Garde fail-closed : client absent ou vide rejeté en 403."""
@@ -256,7 +326,7 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
                 async with AsyncClient(
                     transport=transport, base_url="http://127.0.0.1:8443"
                 ) as c:
-                    response = await c.get("/health")
+                    response = await c.get("/api/v1/health")
                     self.assertEqual(response.status_code, 403)
 
     async def test_spoofed_x_forwarded_for_is_ignored(self) -> None:
@@ -266,7 +336,7 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
         transport = ASGITransport(app=test_app, client=("192.168.1.50", 54321))
         async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8443") as c:
             response = await c.get(
-                "/health",
+                "/api/v1/health",
                 headers={"X-Forwarded-For": "127.0.0.1", "Forwarded": "for=127.0.0.1"},
             )
             self.assertEqual(response.status_code, 403)
@@ -370,6 +440,22 @@ class VaultSettingsTests(unittest.TestCase):
     def test_run_server_is_callable(self) -> None:
         """run_server est défini et appelable comme point d'entrée."""
         self.assertTrue(callable(run_server))
+
+    @patch("uvicorn.run")
+    def test_run_server_passes_hardened_uvicorn_arguments(
+        self, mock_uvicorn_run: unittest.mock.MagicMock
+    ) -> None:
+        """run_server configure uvicorn avec anti-spoofing et sans fingerprinting."""
+        run_server()
+        mock_uvicorn_run.assert_called_once_with(
+            "heimdall.vault.app:app",
+            host="127.0.0.1",
+            port=8443,
+            proxy_headers=False,
+            forwarded_allow_ips="",
+            server_header=False,
+            date_header=False,
+        )
 
 
 if __name__ == "__main__":

@@ -46,8 +46,8 @@ Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) :
 # Lancement sécurisé via le lanceur dédié (recommandé) :
 python -m heimdall.vault.app
 
-# Ou via uvicorn (boucle locale impérative, désactivation explicite des proxy headers) :
-uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 --proxy-headers=false
+# Ou via uvicorn (boucle locale impérative, désactivation des proxy headers et du fingerprinting transport) :
+uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 --proxy-headers=false --no-server-header --no-date-header
 ```
 
 > **Note sécurité & dette technique (contrat OpenAPI #15)** :
@@ -59,7 +59,7 @@ uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 --proxy-headers=fals
 > - **En-tête `Cache-Control: no-store`** : ticket #63.
 > - **Rate-limit par bucket avec `Retry-After`** : ticket #64.
 
-Vérifier la santé minimale (`/api/v1/health` contractuel, `/health` alias local) :
+Vérifier la santé minimale (`/api/v1/health` contractuel) :
 
 ```sh
 curl http://127.0.0.1:8443/api/v1/health
