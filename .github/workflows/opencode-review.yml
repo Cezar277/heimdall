@@ -33,13 +33,13 @@ jobs:
       # L'action opencode n'est JAMAIS consommée via `uses: owner/repo` : le
       # tarball du monorepo dépasse les 100s du HttpClient interne du runner
       # (timeout non configurable, codé en dur côté runner). Les étapes
-      # ci-dessous sont recopiées de `github/action.yml` au SHA
-      # OPENCODE_ACTION_PIN=77fc88c8ade8e5a620ebbe1197f3a572d29ae91a
-      # (opencode v1.19.0) : pour monter de version, relire le diff amont,
-      # bumper OPENCODE_VERSION ci-dessus puis re-recopier si l'amont a
-      # changé. Le binaire est épinglé via `--version` (pas d'appel
-      # `latest`, pas de clé de cache flottante). AUCUN fichier de l'action
-      # n'est copié dans le worktree : une copie sous `./...` casse le
+      # ci-dessous sont recopiées de l'amont :
+      # https://github.com/anomalyco/opencode/blob/77fc88c8ade8e5a620ebbe1197f3a572d29ae91a/github/action.yml
+      # (OPENCODE_ACTION_PIN=77fc88c8, opencode v1.19.0).
+      # Procédure de bump : 1) relire le diff amont vers le nouveau SHA,
+      # 2) bumper OPENCODE_VERSION ci-dessus, 3) re-recopier les étapes si
+      # l'amont a changé, 4) mettre à jour ce permalien + le SHA.
+      # AUCUN fichier de l'action n'est copié dans le worktree : une copie
       # `git checkout <PR>` interne de `opencode github run` (« untracked
       # working tree files would be overwritten ») et son `git add .`
       # interne la committe ensuite dans la PR relue (constaté sur la
