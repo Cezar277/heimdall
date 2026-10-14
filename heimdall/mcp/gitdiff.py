@@ -140,6 +140,17 @@ _COMBINED_HUNK_HEADER: Final[re.Pattern[str]] = re.compile(
 # pas — donc une information perdue.
 _HUNK_PREFIX: Final[str] = "@@"
 
+# Longueur maximale d'un en-tête de hunk combiné AVANT toute regex : un vrai
+# en-tête tient en ~100 caractères (positions + `@@@`). Au-delà, `truncated`
+# sans faire passer la regex dessus. Le motif est mesuré linéaire (la
+# partition est déterministe, ~6 ms pour 100 Ko) : cette borne n'est pas la
+# preuve, c'en est le garde-fou structurel — le temps d'analyse ne dépend
+# plus du contenu, même si le motif est un jour remanié. Coût nul en
+# production : notre argv figé n'émet jamais de hunk combiné, et au pire un
+# en-tête valide à longue remorque serait signalé incomplet (fail-closed).
+# Les en-têtes simples (`@@ `) sont linéaires sans imbrication : pas de borne.
+_MAX_HUNK_HEADER_CHARS: Final[int] = 512
+
 # `* Unmerged path x` : résumé que `git diff --cached` produit pour un chemin
 # de l'index non résolu (merge en cours). Aucune ligne n'est montrée pour ce
 # chemin, donc le parseur doit signaler l'incomplétude.
@@ -590,13 +601,11 @@ class _DiffParser:
             match = _HUNK_HEADER.match(raw)
             parents = 1
         elif raw.startswith("@@@ "):
-            # `_COMBINED_HUNK_HEADER` porte des quantificateurs imbriqués
-            # (`(?:-\d+(?:,\d+)? )+`), mais reste linéaire : l'espace exigé
-            # en fin de chaque itération rend la partition déterministe
-            # (mesuré : ~6 ms pour 100 Ko hostiles, voir
-            # `test_hostile_combined_hunk_header_is_fast_and_flagged`).
-            # Pas de pré-borne : elle signalerait `truncated` sur des
-            # en-têtes valides à longue remorque, pour un risque inexistant.
+            if len(raw) > _MAX_HUNK_HEADER_CHARS:
+                # Trop long pour un en-tête : pas de regex dessus
+                # (fail-closed, comme un en-tête illisible).
+                self.truncated = True
+                return
             match = _COMBINED_HUNK_HEADER.match(raw)
             # Un couple de plages par parent, chacune `-début[,nb] ` : compter
             # les tirets du préfixe donne donc le nombre de parents, celui

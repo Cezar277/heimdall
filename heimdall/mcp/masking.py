@@ -365,6 +365,21 @@ def _url_userinfo_looks_secret(value: str) -> bool:
     return len(value) >= MIN_URL_USERINFO_LENGTH and shannon_entropy(value) >= MIN_URL_USERINFO_BITS
 
 
+def _url_credential_spans(match: re.Match[str]) -> list[_Match]:
+    """Spans d'une URL `user:password@` : mot de passe toujours, user si jeton.
+
+    Sans le second span, un secret en position user (`https://<jeton>:pwd@h`,
+    contenu scanné piégé) partait en clair : `_URL_USERINFO` (userinfo seul)
+    était ensuite écarté par `_overlaps`, la règle mot-de-passe ayant gagné
+    la fusion. Le `user` seul (`alice`, `admin`) reste lisible : c'est lui
+    qui sert au tri, et le seuil est le même que pour l'userinfo seul.
+    """
+    spans = [_span_match(match, "value", "url_password")]
+    if _url_userinfo_looks_secret(match.group("user")):
+        spans.append(_span_match(match, "user", "url_userinfo"))
+    return spans
+
+
 def _short_evocative_looks_secret(key: str, value: str) -> bool:
     """Valeur de 1 à 5 caractères sous un nom évocateur : secret ou code ?
 
@@ -459,7 +474,11 @@ def _iter_matches(text: str) -> list[_Match]:
             for match in _AUTH_HEADER.finditer(text)
             if _looks_like_secret(match.group("key"), match.group("value"))
         ],
-        [_span_match(match, "value", "url_password") for match in _URL_CREDENTIALS.finditer(text)],
+        [
+            span
+            for match in _URL_CREDENTIALS.finditer(text)
+            for span in _url_credential_spans(match)
+        ],
         [
             _span_match(match, "value", "url_userinfo")
             for match in _URL_USERINFO.finditer(text)

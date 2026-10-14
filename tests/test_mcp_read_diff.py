@@ -227,6 +227,23 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.assertIn("<REDACTED:generic_secret:len=5000>", content)
         self.assertEqual(mcp_contract.errors("ReadDiffResult", json.loads(content)), [])
 
+    def test_url_with_secret_user_is_masked_end_to_end(self) -> None:
+        """`https://<jeton>:pwd@h` stagé : aucun fragment du user en clair.
+
+        Dépôt git réel + vrai client MCP : c'est la réponse sérialisée qui est
+        vérifiée. Le mot de passe seul était déjà masqué ; le user secret
+        partait en clair (règle userinfo seul écartée par fusion).
+        """
+        self.write("deploy.env", "REMOTE=https://mysecretuser123:longpassword123@host\n")
+        self.stage("deploy.env")
+        payload = self.call_read_diff()
+        content = json.dumps(payload)
+        self.assertNotIn("mysecretuser123", content)
+        self.assertNotIn("longpassword123", content)
+        self.assertIn("<REDACTED:url_userinfo:", content)
+        self.assertIn("<REDACTED:url_password:", content)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
     def test_long_quoted_value_is_masked_not_windowed(self) -> None:
         """Régression de revue : plus de fenêtre AVANT le masquage.
 

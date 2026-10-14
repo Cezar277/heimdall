@@ -797,6 +797,38 @@ class MaskingRulesTests(unittest.TestCase):
         self.assertIn("url_password", masked)
         self.assertIn("db.internal", masked)
 
+    def test_url_user_with_password_is_masked_when_it_looks_like_a_token(self) -> None:
+        """Secret en position user (`https://<jeton>:pwd@h`) : masqué aussi.
+
+        `_URL_CREDENTIALS` ne masquait que le mot de passe, et `_URL_USERINFO`
+        (userinfo seul) était ensuite écarté par `_overlaps` : le user
+        restait en clair vers le LLM. Le `user` seul (`alice`, `admin`)
+        reste lisible — même seuil que l'userinfo seul.
+        """
+        for line, secret in (
+            ("x=https://mysecretuser123:longpassword123@host", "mysecretuser123"),
+            ("x=https://ghp_court1:motdepasse@host", "ghp_court1"),
+        ):
+            with self.subTest(line=line):
+                masked, count = masking.mask_text(line)
+                self.assertEqual(count, 2)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:url_userinfo:", masked)
+                self.assertIn("<REDACTED:url_password:", masked)
+                self.assertIn("host", masked)
+
+    def test_url_plain_user_with_password_stays_readable(self) -> None:
+        """Un nom d'utilisateur simple devant un mot de passe n'est pas un jeton."""
+        for line, user in (
+            ("postgres://admin:sup3rsecret@db.internal/app", "admin"),
+            ('url = "https://alice:motdepasse@host"', "alice"),
+        ):
+            with self.subTest(line=line):
+                masked, count = masking.mask_text(line)
+                self.assertEqual(count, 1)
+                self.assertIn(user, masked)
+                self.assertNotIn("url_userinfo", masked)
+
     def test_quoted_assignment_is_masked(self) -> None:
         masked, count = masking.mask_text('token = "hunter2-long-value-xyz"')
         self.assertEqual(count, 1)

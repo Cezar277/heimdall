@@ -76,7 +76,8 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 | réponse bornée par `max_bytes` | budget vérifié **après** sérialisation, fichiers retirés en dernier (une seule sérialisation par fichier) | `test_response_never_exceeds_max_bytes` |
 | limite atteinte = information incomplète | `truncated: true`, jamais « diff vide » | tests de troncature |
 | format de diff non compris → rien n'est jeté en silence | hunk combiné `@@@ ` décodé, en-tête illisible ou `* Unmerged path` → `truncated: true` | `test_unmerged_path_is_never_a_silent_empty_diff` |
-| en-tête combiné hostile sans ReDoS | motif imbriqué mais linéaire (partition déterministe, ~6 ms pour 100 Ko), épinglé en temps borné | `test_hostile_combined_hunk_header_is_fast_and_flagged` |
+| en-tête combiné hostile sans ReDoS | garde-fou 512 car. avant regex + motif mesuré linéaire, les deux chemins épinglés en temps borné | `test_hostile_combined_hunk_header_is_fast_and_flagged` |
+| nom irreprésentable → tout `read_diff` en `INTERNAL` | pas de partiel : réponse exactement l'enveloppe d'échec (disponibilité assumée) | `test_newline_path_fails_closed_without_partial_files` |
 | compteur `redactions` toujours vrai | recompté sur les lignes finales : une coupe n'y laisse jamais un compteur sans marqueur | `TruncationInvariantTests` |
 | coupe `max_bytes` sur lignes complètes | la ligne à cheval est abandonnée (aucun préfixe en clair) | `test_secret_never_straddles_any_budget` |
 | FIFO/socket/device refusés, `O_NONBLOCK` | pas de blocage infini (DoS), revérifié après ouverture | `test_fifo_does_not_hang_the_server` |
@@ -109,6 +110,7 @@ Le chemin vient du LLM : il est traité comme une entrée piégée
 | noms génériques masqués | `KEY=hunter2`, `PASS=abc12345`, `AWS_KEY=`, `MYKEY=` (second rang : nom faible + valeur alphanumérique), `keyboard`/`key: "name"` laissés lisibles | `test_generic_key_names_are_masked_end_to_end` |
 | valeur non citée masquée en entier | `SECRET=` + 5000 caractères : plus de queue en clair après le marqueur (borne `{6,}` sans borne haute) | `test_long_unquoted_value_is_masked_whole_end_to_end` |
 | jeton dans un userinfo sans mot de passe masqué | `https://<jeton>@hôte`, type `url_userinfo`, seuil ≥ 8 car. et ≥ 3,0 bits | `test_url_token_without_password_is_masked` |
+| secret en position user d'une URL à deux champs masqué | `https://<jeton>:pwd@h` : user (`url_userinfo`) + password, `admin`/`alice` restant lisibles | `test_url_with_secret_user_is_masked_end_to_end` |
 | paramètre `path` manquant refusé | enveloppe `INVALID_INPUT`, pas « Field required » du SDK | `RequiredParametersTests` |
 | réponse conforme au contrat #16 | validée contre `SanitizeFileResult` | `test_response_conforms_to_the_contract` |
 

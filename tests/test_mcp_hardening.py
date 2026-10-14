@@ -169,6 +169,22 @@ class AmbiguousBinaryNameTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "INTERNAL")
         self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
+    def test_newline_path_fails_closed_without_partial_files(self) -> None:
+        """Nom à `\\n` stagé : TOUT le `read_diff` est `INTERNAL`, sans partiel.
+
+        Décision actée en ADR-003 §10 : un dépôt piégé avec un seul fichier
+        au nom à octet de contrôle fait perdre le tri des autres fichiers
+        (disponibilité), mais jamais un partiel présenté comme complet — la
+        réponse est EXACTEMENT l'enveloppe d'échec, aucun fichier montré.
+        """
+        self.repo.write("sain.py", "x = 1\n")
+        self.repo.write("a\nb.py", "SECRET=hunter2\n")
+        self.repo.stage("sain.py", "a\nb.py")
+        payload = tool_payload(call_tool("read_diff", {}, root=self.repo.root))
+        self.assertEqual(set(payload), {"error"})
+        self.assertEqual(payload["error"]["code"], "INTERNAL")
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
 
 class CaseInsensitiveForbiddenTests(unittest.TestCase):
     """`.GIT` ouvre le même dossier que `.git` sur FS insensible à la casse."""
@@ -296,13 +312,10 @@ class MaskingPerformanceTests(unittest.TestCase):
     def test_hostile_combined_hunk_header_is_fast_and_flagged(self) -> None:
         """Ligne `@@@ ` hostile de ~100 Ko : temps borné, `truncated`, pas de ReDoS.
 
-        `_COMBINED_HUNK_HEADER` porte des quantificateurs imbriqués, mais
-        l'espace exigé en fin de chaque itération rend la partition
-        déterministe : mesuré linéaire (~6 ms pour 100 Ko), pas de
-        backtracking exponentiel — donc pas de pré-borne (qui signalerait
-        `truncated` sur des en-têtes valides à longue remorque pour un risque
-        inexistant). Ce test l'épingle : s'il devient lent, c'est qu'une
-        imbrication ambiguë a été introduite.
+        Au-delà de 512 caractères, la regex imbriquée ne tourne même pas
+        (garde-fou structurel `_MAX_HUNK_HEADER_CHARS`, fail-closed) ; en
+        dessous, le motif est mesuré linéaire (partition déterministe).
+        Les deux chemins sont épinglés en temps borné.
         """
         for tail in ("X", ""):
             with self.subTest(tail=tail or "vide"):
@@ -315,6 +328,23 @@ class MaskingPerformanceTests(unittest.TestCase):
                 self.assertLess(elapsed, 5.0, f"parse trop lent : {elapsed:.1f}s")
                 self.assertEqual(entries, [])
                 self.assertTrue(truncated)
+
+    def test_sub_bound_hostile_combined_header_runs_the_regex_fast(self) -> None:
+        """Sous la borne (400 car.), c'est la regex imbriquée qui tourne : rapide aussi.
+
+        Sans ce test, la borne masquerait une imbrication ambiguë introduite
+        par un remaniement du motif — le garde-fou deviendrait le cache-misère.
+        """
+        hostile = "@@@ " + "-1,1 " * 65 + "X"
+        self.assertLessEqual(len(hostile), gitdiff._MAX_HUNK_HEADER_CHARS)
+        started = time.monotonic()
+        entries, truncated = gitdiff.parse_diff(
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n" + hostile + "\n+y\n"
+        )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0, f"parse trop lent : {elapsed:.1f}s")
+        self.assertEqual(entries, [])
+        self.assertTrue(truncated)
 
     def test_quoted_assignment_above_20k_chars_is_masked_whole(self) -> None:
         """Plus de borne haute : `SECRET="` + 50000 car + `"` est masqué en entier.

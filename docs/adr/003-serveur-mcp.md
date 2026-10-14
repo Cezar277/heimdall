@@ -205,6 +205,13 @@ lui-même, 0 ligne précédemment masquée devenue lisible ;
 préfixe connu, ou ≥ 8 caractères à ≥ 3,0 bits — seuil mesuré entre les
 secrets (≥ 3,09) et les identités (≤ 2,91), donc `https://alice@hôte` reste
 lisible ;
+**dans une URL à deux champs, le user est masqué lui aussi s'il a l'air
+d'un jeton** (`https://<jeton>:pwd@h` — `_URL_CREDENTIALS` ne masquait que
+le mot de passe, et la règle userinfo seul était ensuite écartée par la
+fusion `_overlaps`, donc le user partait en clair ; le cas préexistait à la
+règle userinfo) : même seuil, type `url_userinfo`, l'hôte restant lisible —
+tandis que `postgres://admin:…` et `https://alice:…` gardent leur user
+lisible ;
 **les noms GÉNÉRIQUES qui finissent par `key`/`pass`/`passphrase` sont un
 second rang** (`KEY=`, `PASS=`, `AWS_KEY=`, `DB_PASS=`, `MYKEY=` — ils
 n'étaient pas dans le vocabulaire, donc `KEY=hunter2` partait en clair) :
@@ -313,15 +320,20 @@ Règle unique : **ce que le parseur ne comprend pas, il le signale**
   `truncated: false`, sur un dépôt en cours de fusion. Drapeau posé,
   les autres fichiers du diff restant montrés.
 
-**Pas de ReDoS sur l'en-tête combiné** : `_COMBINED_HUNK_HEADER` porte des
-quantificateurs imbriqués, mais l'espace exigé en fin de chaque itération
-rend la partition déterministe — mesuré linéaire (~6 ms pour une ligne
-hostile `@@@ ` de ~100 Ko), donc pas de pré-borne (qui signalerait à tort
-`truncated` sur des en-têtes valides à longue remorque pour un risque
-inexistant). Épinglé en temps borné par
+**Garde-fou structurel sur l'en-tête combiné** : `_COMBINED_HUNK_HEADER`
+porte des quantificateurs imbriqués, mais l'espace exigé en fin de chaque
+itération rend la partition déterministe — mesuré linéaire (~6 ms pour une
+ligne hostile `@@@ ` de ~100 Ko). La mesure n'est pas la protection :
+au-delà de 512 caractères (`_MAX_HUNK_HEADER_CHARS`, un vrai en-tête tient
+en ~100), la regex ne tourne même pas (`truncated`, fail-closed) — le temps
+d'analyse ne dépend plus du contenu, même si le motif est un jour remanié.
+Coût nul en production (notre argv n'émet jamais de hunk combiné ; au pire
+un en-tête valide à longue remorque serait signalé incomplet). Les deux
+chemins sont épinglés en temps borné par
 `tests/test_mcp_hardening.py::MaskingPerformanceTests`
-(`test_hostile_combined_hunk_header_is_fast_and_flagged`) : s'il devient
-lent, c'est qu'une imbrication ambiguë a été introduite.
+(`test_hostile_combined_hunk_header_is_fast_and_flagged`,
+`test_sub_bound_hostile_combined_header_runs_the_regex_fast`) : si le
+second devient lent, c'est qu'une imbrication ambiguë a été introduite.
 
 Preuve : `heimdall/mcp/gitdiff.py` (`_COMBINED_HUNK_HEADER`, `_DiffParser._hunk_header`,
 `_DiffParser._hunk_line`), `tests/test_mcp_units.py::ParserStateTests`,
@@ -355,8 +367,13 @@ caractère produisait du mojibake : `café.py` → `cafÃ©.py`, aller-retour
 préfixes `a/`/`b/` ne sont retirés que si le reste reste valide, `Binary
 files … and …` traite `/dev/null` en priorité (nom avec `and` dedans
 correct). Un nom non représentable dans le contrat (contrôle, `..`,
-UTF-8 invalide) est une **panne** (`INTERNAL`), pas un fichier sauté en
-silence : mieux vaut refuser que cacher des lignes au LLM (fail-closed
+UTF-8 invalide) est une **panne** (`INTERNAL`) **de tout le `read_diff`**,
+pas un fichier sauté en silence : un dépôt piégé avec un seul fichier au
+nom à octet de contrôle fait perdre le tri des autres fichiers
+(disponibilité assumée — le scanner #22, hors PR, reste la porte), mais
+jamais un partiel présenté comme complet : la réponse est exactement
+l'enveloppe d'échec, aucun fichier montré (épinglé y compris au nom à
+`\n`). Mieux vaut refuser que cacher des lignes au LLM (fail-closed
 délibéré, épinglé par test). Pour un binaire **modifié** dont le nom
 contient `" and "`, l'ancien et le nouveau côté nommant le MÊME fichier,
 la découpe retenue est celle où les deux côtés concordent (`f and g.bin`
