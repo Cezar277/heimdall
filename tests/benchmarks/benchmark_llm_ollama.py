@@ -87,13 +87,12 @@ def get_ollama_memory_mb() -> float:
         try:
             command_line = " ".join(process.info["cmdline"] or []).lower()
             process_name = (process.info["name"] or "").lower()
-            
             if any(keyword in command_line or keyword in process_name for keyword in ("ollama", "llama-server")):
                 memory_info = process.memory_info()
                 total_rss_bytes += memory_info.rss
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
-            
+
     return total_rss_bytes / (1024 * 1024)
 
 
@@ -337,7 +336,7 @@ def main() -> int:
     """
     Point d'entrée principal du script d'évaluation.
     Traite les arguments de la ligne de commande et orchestre le benchmark.
-    
+
     Returns:
         int: Code de retour d'exécution (0 pour succès).
     """
@@ -401,4 +400,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-    

@@ -20,7 +20,7 @@ Un benchmark exhaustif a été réalisé sur 20 candidats pièges (faux positifs
 | phi3.5         | 20/20  | 5.22 s    | 104.3 s   | 4,759.7 Mo       | 36.1 Mo    |
 
 **Justification :**
-Le modèle **Qwen2.5:0.5b** s'impose comme le leader incontesté de ce comparatif pour notre cas d'usage. 
+Le modèle **Qwen2.5:0.5b** s'impose comme le leader incontesté de ce comparatif pour notre cas d'usage.
 
 1. **Vélocité extrême :** Avec un temps moyen de 0,51 seconde par requête, il est presque deux fois plus rapide que son concurrent direct (`smollm2:360m`) et garantit une validation quasi-instantanée dans le terminal, évitant toute friction pour le développeur.
 2. **Efficacité mémoire :** Son empreinte mémoire culmine à environ 2 Go. Bien que `llama3.2:1b` soit légèrement plus économe (1,5 Go), `Qwen2.5:0.5b` évite l'explosion de RAM observée sur d'autres micro-modèles (comme `smollm2` ou `tinyllama` qui font gonfler le processus serveur d'Ollama à plus de 6 Go).
