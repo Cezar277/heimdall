@@ -262,7 +262,10 @@ précision appartient au scanner #22 mesuré en #21. Preuve :
 jamais une promesse : une coupe à 2000 caractères (ligne dans `read_diff` et `sanitize_file`) ou 100 000
 (caractères, `sanitize_file`) qui emporterait le seul marqueur violerait
 sinon l'invariant structurel du schéma — faille réelle trouvée par audit
-et corrigée, avec tests. Dans `sanitize_file`, chaque ligne est bornée à 2 000 caractères
+et corrigée, avec tests. La coupe à 100 000 est elle aussi nettoyée
+(`_clean_trailing_marker`) : un marqueur à cheval sur la borne partait
+tronqué tout en étant compté — même famille, même correctif, épinglé par
+`test_redaction_marker_straddling_100000_char_boundary_is_cleaned`. Dans `sanitize_file`, chaque ligne est bornée à 2 000 caractères
 (`MAX_LINE_CHARS`) après masquage (`truncated: true`), immunisant le canal contre le DoS CPU
 face à des fichiers piégés à ligne unique géante (jusqu'à 1 Mo). Le budget `max_bytes` est vérifié sur la réponse
 sérialisée (fichiers retirés en dernier, `truncated: true`). **Coût de
@@ -367,14 +370,12 @@ caractère produisait du mojibake : `café.py` → `cafÃ©.py`, aller-retour
 préfixes `a/`/`b/` ne sont retirés que si le reste reste valide, `Binary
 files … and …` traite `/dev/null` en priorité (nom avec `and` dedans
 correct). Un nom non représentable dans le contrat (contrôle, `..`,
-UTF-8 invalide) est une **panne** (`INTERNAL`) **de tout le `read_diff`**,
-pas un fichier sauté en silence : un dépôt piégé avec un seul fichier au
-nom à octet de contrôle fait perdre le tri des autres fichiers
-(disponibilité assumée — le scanner #22, hors PR, reste la porte), mais
-jamais un partiel présenté comme complet : la réponse est exactement
-l'enveloppe d'échec, aucun fichier montré (épinglé y compris au nom à
-`\n`). Mieux vaut refuser que cacher des lignes au LLM (fail-closed
-délibéré, épinglé par test). Pour un binaire **modifié** dont le nom
+UTF-8 invalide) fait abandonner le **fichier** (`truncated=True`), jamais
+la réponse : comme pour tout plafond (`MAX_FILES`, budget, binaire
+innommable), l'incomplet est signalé et les autres fichiers restent triés —
+un seul nom piégé n'aveugle plus le tri. Le nom à octet de contrôle ne peut
+pas être montré (le contrat l'interdit), et ses lignes partent avec lui :
+jamais de partiel silencieux (épinglé y compris au nom à `\n`). Pour un binaire **modifié** dont le nom
 contient `" and "`, l'ancien et le nouveau côté nommant le MÊME fichier,
 la découpe retenue est celle où les deux côtés concordent (`f and g.bin`
 entier, plus `g.bin` tronqué qui cassait l'aller-retour vers

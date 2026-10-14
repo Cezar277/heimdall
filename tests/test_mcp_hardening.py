@@ -155,34 +155,37 @@ class AmbiguousBinaryNameTests(unittest.TestCase):
         self.assertEqual([item["file"] for item in payload["files"]], ["café.py"])
         self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
-    def test_unrepresentable_path_fails_closed(self) -> None:
-        """Un nom non représentable dans le contrat refuse la réponse.
+    def test_unrepresentable_path_is_skipped_never_silent(self) -> None:
+        """Nom non représentable : le FICHIER est sauté, `truncated` le dit.
 
-        Choix délibéré (fail-closed) : plutôt INTERNAL que des lignes
-        cachées au LLM sans le dire. Le développeur voit l'erreur et
-        regarde le diff lui-même.
+        Cohérence avec tous les plafonds (`MAX_FILES`, budget, binaire
+        innommable) : l'incomplet est signalé, et un seul nom piégé
+        n'aveugle plus le tri des autres fichiers. Le nom (à octet de
+        contrôle) ne peut pas être montré : le contrat l'interdit.
         """
-        name = "ta\tb.txt"
-        self.repo.write(name, "q\n")
-        self.repo.stage(name)
+        self.repo.write("sain.py", "x = 1\n")
+        self.repo.write("ta\tb.txt", "q\n")
+        self.repo.stage("sain.py", "ta\tb.txt")
         payload = tool_payload(call_tool("read_diff", {}, root=self.repo.root))
-        self.assertEqual(payload["error"]["code"], "INTERNAL")
+        self.assertEqual([item["file"] for item in payload["files"]], ["sain.py"])
+        self.assertTrue(payload["truncated"])
+        self.assertNotIn("ta\tb", str(payload))
         self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
-    def test_newline_path_fails_closed_without_partial_files(self) -> None:
-        """Nom à `\\n` stagé : TOUT le `read_diff` est `INTERNAL`, sans partiel.
+    def test_newline_path_is_skipped_without_partial_silence(self) -> None:
+        """Nom à `\n` stagé : sauté + `truncated`, jamais de partiel silencieux.
 
-        Décision actée en ADR-003 §10 : un dépôt piégé avec un seul fichier
-        au nom à octet de contrôle fait perdre le tri des autres fichiers
-        (disponibilité), mais jamais un partiel présenté comme complet — la
-        réponse est EXACTEMENT l'enveloppe d'échec, aucun fichier montré.
+        Décision actée en ADR-003 §10 : comme pour tout plafond, l'incomplet
+        est signalé et la réponse survit — les autres fichiers restent triés,
+        et le secret du fichier sauté ne fuit pas.
         """
         self.repo.write("sain.py", "x = 1\n")
         self.repo.write("a\nb.py", "SECRET=hunter2\n")
         self.repo.stage("sain.py", "a\nb.py")
         payload = tool_payload(call_tool("read_diff", {}, root=self.repo.root))
-        self.assertEqual(set(payload), {"error"})
-        self.assertEqual(payload["error"]["code"], "INTERNAL")
+        self.assertEqual([item["file"] for item in payload["files"]], ["sain.py"])
+        self.assertTrue(payload["truncated"])
+        self.assertNotIn("hunter2", str(payload))
         self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
 

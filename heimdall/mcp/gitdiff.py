@@ -552,7 +552,22 @@ class _DiffParser:
         if self._in_hunk and raw[:1] not in ("+", "-", " ", "\\"):
             self._in_hunk = False
         if not self._in_hunk:
-            self._header(builder, raw)
+            try:
+                self._header(builder, raw)
+            except ToolFailure:
+                # Nom irreprésentable (contrôle, `..`, absolu…) : le FICHIER
+                # est abandonné, pas la réponse — `truncated` signale
+                # l'incomplet, comme pour tout plafond (`MAX_FILES`, budget,
+                # binaire innommable). Cohérence délibérée : tous les plafonds
+                # cachent du contenu derrière le même drapeau, et un seul nom
+                # piégé n'aveugle plus le tri des autres fichiers. Les lignes
+                # déjà lues pour ce fichier partent avec lui ; les suivantes
+                # sont ignorées jusqu'au prochain `diff --git`.
+                self._builder = None
+                self._in_hunk = False
+                self._new_line = 0
+                self._parents = 1
+                self.truncated = True
             return
         self._hunk_line(builder, raw)
 
@@ -660,8 +675,11 @@ def parse_diff(text: str) -> tuple[list[DiffEntry], bool]:
     Renvoie les fichiers avec leurs lignes ajoutées (brutes : le masquage est
     appliqué plus haut, avant sérialisation) et un drapeau signalant qu'une
     limite du contrat a été atteinte. Un chemin que la grammaire ``RelPath``
-    refuse est une panne (``INTERNAL``) : mieux vaut refuser de répondre que
-    renvoyer une réponse non conforme au contrat.
+    refuse fait abandonner le FICHIER (`truncated=True`), jamais la réponse :
+    comme pour tout plafond, l'incomplet est signalé, la réponse survit. Un nom
+    irreprésentable ne peut pas être montré (ni ses lignes cachées en
+    silence), et `INTERNAL` pour un seul nom piégé aveuglerait le tri des
+    autres fichiers.
     """
     return _DiffParser().feed(text)
 

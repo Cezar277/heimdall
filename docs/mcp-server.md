@@ -77,7 +77,7 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 | limite atteinte = information incomplète | `truncated: true`, jamais « diff vide » | tests de troncature |
 | format de diff non compris → rien n'est jeté en silence | hunk combiné `@@@ ` décodé, en-tête illisible ou `* Unmerged path` → `truncated: true` | `test_unmerged_path_is_never_a_silent_empty_diff` |
 | en-tête combiné hostile sans ReDoS | garde-fou 512 car. avant regex + motif mesuré linéaire, les deux chemins épinglés en temps borné | `test_hostile_combined_hunk_header_is_fast_and_flagged` |
-| nom irreprésentable → tout `read_diff` en `INTERNAL` | pas de partiel : réponse exactement l'enveloppe d'échec (disponibilité assumée) | `test_newline_path_fails_closed_without_partial_files` |
+| nom irreprésentable → fichier sauté + `truncated` | comme tout plafond : autres fichiers triés, nom à octet de contrôle non montrable | `test_newline_path_is_skipped_without_partial_silence` |
 | compteur `redactions` toujours vrai | recompté sur les lignes finales : une coupe n'y laisse jamais un compteur sans marqueur | `TruncationInvariantTests` |
 | coupe `max_bytes` sur lignes complètes | la ligne à cheval est abandonnée (aucun préfixe en clair) | `test_secret_never_straddles_any_budget` |
 | FIFO/socket/device refusés, `O_NONBLOCK` | pas de blocage infini (DoS), revérifié après ouverture | `test_fifo_does_not_hang_the_server` |
@@ -104,6 +104,7 @@ Le chemin vient du LLM : il est traité comme une entrée piégée
 | codes stables, liens jugés par leur cible | FIFO avant garde `BINARY_FILE` / après garde `INTERNAL` ; lien sortant `PATH_ESCAPE` | `test_non_regular_files_keep_a_stable_code` |
 | ouverture sans suivre un lien | `O_NOFOLLOW` + comparaison dev/ino (TOCTOU) | `GuardWiringTests` |
 | extrait masqué avant sérialisation | `masking.mask_text` sur la ligne entière, puis borne 100 000 caractères | `test_no_clear_value_ever_reaches_the_llm` |
+| coupe à 100 000 sans fragment de marqueur | `_clean_trailing_marker` après la coupe, compteur recompté : jamais `<REDACTED:` sans `>` | `test_redaction_marker_straddling_100000_char_boundary_is_cleaned` |
 | valeur citée > 2,5 Ko jamais sectionnée avant masquage | masquage avant troncature, sans fenêtre préalable | `test_long_quoted_value_is_masked_not_windowed` |
 | jetons nus et corps PEM masqués | préfixe connu ou ≥ 32 caractères denses, fusion par spécificité | `BareTokenMaskingTests` |
 | valeur courte sous un nom évocateur masquée | `SECRET=abc12`, `PASSWORD=1234` — règle à fenêtre séparée (sinon ombrage), filtres anti-bruit mesurés | `test_short_evocative_value_is_masked` |

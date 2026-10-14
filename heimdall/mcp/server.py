@@ -398,10 +398,13 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
             truncated = truncated or cut
             pieces.append(masked)
         # Borne de contenu du contrat (100 000 caractères) : elle s'applique
-        # APRÈS masquage, pour les mêmes raisons que read_diff.
+        # APRÈS masquage, pour les mêmes raisons que read_diff — et la coupe
+        # est nettoyée comme les lignes : sans cela, un marqueur à cheval
+        # sur la borne partirait tronqué (`<REDACTED:` sans `>` fermant)
+        # tout en étant compté, violant `redactions >= 1 ⇒ marqueur présent`.
         joined = "\n".join(pieces)
         if len(joined) > MAX_CONTENT_CHARS:
-            joined = joined[:MAX_CONTENT_CHARS]
+            joined = _clean_trailing_marker(joined[:MAX_CONTENT_CHARS])
             truncated = True
         # Même invariant que read_diff : le compteur est recompté sur le
         # contenu final, pour qu'une coupe ne laisse jamais un compteur

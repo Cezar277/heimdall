@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+from support import mcp_contract
 from support.fake_secrets import FAKE_GITHUB_TOKEN, fake_token
 from support.git_repo import GitRepo
 
@@ -1095,6 +1096,25 @@ class DirectToolErrorTests(unittest.TestCase):
         self.assertNotIn("<REDACTED:", content)
         self.assertEqual(payload["redactions"], 0)
 
+    def test_redaction_marker_straddling_100000_char_boundary_is_cleaned(self) -> None:
+        """Marqueur à cheval sur la borne 100 000 : nettoyé, pas compté en l'air.
+
+        Sans nettoyage, la coupe `joined[:MAX_CONTENT_CHARS]` laissait
+        `<REDACTED:` sans `>` fermant tout en comptant `redactions=1` —
+        violant `redactions >= 1 ⇒ marqueur présent`, pilotable par
+        remplissage plaçant le secret à cheval sur la borne.
+        """
+        start = server.MAX_CONTENT_CHARS - 10 - len("TOKEN = '")
+        self.repo.write("chevauche.txt", "x" * start + f"\nTOKEN = '{FAKE_GITHUB_TOKEN}'\n")
+        payload = json.loads(self.tools["sanitize_file"](path="chevauche.txt"))
+        content = payload["content"]
+        self.assertTrue(payload["truncated"])
+        self.assertNotIn(FAKE_GITHUB_TOKEN, content)
+        for piece in content.split("<REDACTED:")[1:]:
+            self.assertIn(">", piece.split("\n")[0], "fragment de marqueur sans fermant")
+        self.assertEqual(payload["redactions"], content.count(masking.REDACTION_MARKER))
+        self.assertEqual(mcp_contract.errors("SanitizeFileResult", payload), [])
+
     def test_sanitize_too_large_precheck(self) -> None:
         big = self.repo.root / "gros.bin"
         big.write_bytes(b"x" * (server.MAX_FILE_BYTES + 1))
@@ -1299,38 +1319,48 @@ class UnquoteTests(unittest.TestCase):
         )
         self.assertEqual([entry.path for entry in entries], ["café.py"])
 
-    def test_bel_escape_is_refused_fail_closed(self) -> None:
-        # BEL (0x07) décodé puis interdit par la grammaire : refus, pas de nom faux.
-        with self.assertRaises(ToolFailure):
-            self.parse(
-                'diff --git "a/b\\007c" "b/b\\007c"',
-                "--- /dev/null",
-                '+++ "b/b\\007c"',
-                "@@ -0,0 +1 @@",
-                "+x",
-            )
+    def test_bel_escape_is_skipped_fail_closed(self) -> None:
+        # BEL (0x07) décodé puis interdit par la grammaire : fichier sauté,
+        # pas de nom faux, `truncated` posé — comme pour tout plafond.
+        entries, truncated = self.parse(
+            'diff --git "a/b\\007c" "b/b\\007c"',
+            "--- /dev/null",
+            '+++ "b/b\\007c"',
+            "@@ -0,0 +1 @@",
+            "+x",
+        )
+        self.assertEqual(entries, [])
+        self.assertTrue(truncated)
 
-    def test_truncated_or_bad_escape_is_internal(self) -> None:
+    def test_truncated_or_bad_escape_is_skipped_not_shown(self) -> None:
+        """Échappement tronqué ou invalide : fichier sauté + `truncated`, jamais montré.
+
+        Même sémantique que tout nom irreprésentable : l'incomplet est
+        signalé et la réponse survit, aucun nom faux ni partiel silencieux.
+        """
         for quoted in ('"b/abc\\"', '"b/ab\\x4"', '"b/ab\\xZZ"', '"b/a\\777c"', '"b/a\\db"'):
             with self.subTest(quoted=quoted):
-                with self.assertRaises(ToolFailure):
-                    self.parse(
-                        "diff --git a/x b/x",
-                        "--- /dev/null",
-                        f"+++ {quoted}",
-                        "@@ -0,0 +1 @@",
-                        "+x",
-                    )
+                entries, truncated = self.parse(
+                    "diff --git a/x b/x",
+                    "--- /dev/null",
+                    f"+++ {quoted}",
+                    "@@ -0,0 +1 @@",
+                    "+x",
+                )
+                self.assertEqual(entries, [])
+                self.assertTrue(truncated)
 
-    def test_invalid_utf8_bytes_are_internal(self) -> None:
-        with self.assertRaises(ToolFailure):
-            self.parse(
-                "diff --git a/x b/x",
-                "--- /dev/null",
-                '+++ "b/bad\\xffc"',
-                "@@ -0,0 +1 @@",
-                "+x",
-            )
+    def test_invalid_utf8_bytes_are_skipped_not_shown(self) -> None:
+        """Octets non-UTF-8 : fichier sauté + `truncated`, jamais de nom faux."""
+        entries, truncated = self.parse(
+            "diff --git a/x b/x",
+            "--- /dev/null",
+            '+++ "b/bad\\xffc"',
+            "@@ -0,0 +1 @@",
+            "+x",
+        )
+        self.assertEqual(entries, [])
+        self.assertTrue(truncated)
 
     def test_tab_suffixed_header_keeps_first_field(self) -> None:
         """Git suffixe d'une tabulation les chemins à espace (horodatage)."""
@@ -1343,16 +1373,17 @@ class UnquoteTests(unittest.TestCase):
         )
         self.assertEqual([entry.path for entry in entries], ["sp ace.txt"])
 
-    def test_simple_escape_decodes_then_fails_closed(self) -> None:
-        """`\\t` décodé en vraie tabulation, refusée par la grammaire."""
-        with self.assertRaises(ToolFailure):
-            self.parse(
-                "diff --git a/x b/x",
-                "--- /dev/null",
-                '+++ "b/a\\tb"',
-                "@@ -0,0 +1 @@",
-                "+x",
-            )
+    def test_simple_escape_decodes_then_skips_fail_closed(self) -> None:
+        """`\\t` décodé en vraie tabulation, refusée par la grammaire : sauté + `truncated`."""
+        entries, truncated = self.parse(
+            "diff --git a/x b/x",
+            "--- /dev/null",
+            '+++ "b/a\\tb"',
+            "@@ -0,0 +1 @@",
+            "+x",
+        )
+        self.assertEqual(entries, [])
+        self.assertTrue(truncated)
 
     def test_line_overflow_flags_truncation(self) -> None:
         """5000 lignes par fichier : au-delà, drapeau, pas de plantage."""
@@ -1604,6 +1635,40 @@ class ParserStateTests(unittest.TestCase):
         )
         self.assertEqual([entry.path for entry in entries], ["nouveau.py"])
         self.assertTrue(truncated)
+
+    def test_unrepresentable_path_drops_the_file_not_the_response(self) -> None:
+        """Nom irreprésentable entre deux sains : eux montrés, lui sauté + `truncated`.
+
+        Comme pour tout plafond, l'incomplet est signalé et la réponse
+        survit — un seul nom piégé n'aveugle plus le tri. Le nom à octet de
+        contrôle ne peut pas être montré : le contrat l'interdit.
+        """
+        entries, truncated = gitdiff.parse_diff(
+            "diff --git a/sain1.py b/sain1.py\n"
+            "new file mode 100644\n"
+            "index 0000000..1111111\n"
+            "--- /dev/null\n"
+            "+++ b/sain1.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+x = 1\n"
+            "diff --git \"a/a\\nb.py\" \"b/a\\nb.py\"\n"
+            "new file mode 100644\n"
+            "index 0000000..2222222\n"
+            "--- /dev/null\n"
+            "+++ \"b/a\\nb.py\"\n"
+            "@@ -0,0 +1 @@\n"
+            "+SECRET=hunter2\n"
+            "diff --git a/sain2.py b/sain2.py\n"
+            "new file mode 100644\n"
+            "index 0000000..3333333\n"
+            "--- /dev/null\n"
+            "+++ b/sain2.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+y = 2\n"
+        )
+        self.assertEqual([entry.path for entry in entries], ["sain1.py", "sain2.py"])
+        self.assertTrue(truncated)
+        self.assertNotIn("\n", "".join(entry.path for entry in entries))
 
 
 class ConfineDirectTests(unittest.TestCase):
