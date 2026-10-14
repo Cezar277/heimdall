@@ -40,3 +40,11 @@ node_modules/
 .idea/
 .DS_Store
 Thumbs.db
+
+# --- CI opencode : copie locale de l'action (ne jamais committer) ---
+# Le workflow recopie l'action sous .github/actions/opencode/ sur le runner ;
+# si ces fichiers arrivent dans une PR (via le `git add .` interne du bot),
+# le `git checkout` suivant échoue (« untracked working tree files would be
+# overwritten »). Cette entrée ceinture le workflow corrigé qui ne crée plus
+# aucun fichier dans le dépôt.
+.github/actions/opencode/
