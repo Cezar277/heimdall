@@ -12,6 +12,7 @@ X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import FastAPI, HTTPException
@@ -19,6 +20,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ValidationError
 
 from heimdall.vault.app import (
+    ForbiddenError,
     HealthResponse,
     Settings,
     VaultSettings,
@@ -89,8 +91,9 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
             # La route /api/v1/health est présente et conforme
             self.assertIn("/api/v1/health", schema["paths"])
             responses = schema["paths"]["/api/v1/health"]["get"]["responses"]
-            for expected_code in ("200", "405", "429", "500", "503", "default"):
+            for expected_code in ("200", "403", "405", "429", "500", "503", "default"):
                 self.assertIn(expected_code, responses)
+            self.assertEqual(responses["403"]["description"], "Accès interdit")
 
             # Retry-After est obligatoire sur 429 et 503
             for code in ("429", "503"):
@@ -217,11 +220,11 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-        @test_app.get("/trigger-bad-retry")
-        async def trigger_bad_retry() -> None:
+        @test_app.get("/trigger-bad-retry/{val}")
+        async def trigger_bad_retry(val: str) -> None:
             raise HTTPException(
                 status_code=429,
-                headers={"Retry-After": "9999"},  # Hors borne 1-3600
+                headers={"Retry-After": val},  # Hors borne 1-3600 (ex: 9999, 0, -5)
             )
 
         async with AsyncClient(
@@ -232,8 +235,11 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp.headers.get("retry-after"), "60")
             self.assertNotIn("x-injected-header", resp.headers)
 
-            resp_bad = await c.get("/trigger-bad-retry")
-            self.assertNotIn("retry-after", resp_bad.headers)
+            for bad_retry_val in ("9999", "0", "-5"):
+                with self.subTest(bad_retry=bad_retry_val):
+                    resp_bad = await c.get(f"/trigger-bad-retry/{bad_retry_val}")
+                    self.assertEqual(resp_bad.status_code, 429)
+                    self.assertNotIn("retry-after", resp_bad.headers)
 
     async def test_exception_headers_retry_after_non_integer_types(self) -> None:
         """Garde-fou : un Retry-After non convertible (None, liste, etc.) ne lève pas 500."""
@@ -392,6 +398,13 @@ class VaultSettingsTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     VaultSettings(host=invalid_host)
 
+        # Invariant anti-reflet : l'entrée opérateur ne doit pas fuiter dans le message d'erreur
+        for canary in ("192.168.1.10", "CANARY_SECRET_HOST", "localhost.evil.com"):
+            with self.subTest(canary=canary):
+                with self.assertRaises(ValidationError) as ctx:
+                    VaultSettings(host=canary)
+                self.assertNotIn(canary, ctx.exception.errors()[0]["msg"])
+
     def test_port_validation_bounds(self) -> None:
         """Ports valides : 1 à 65535."""
         for invalid_port in (0, -1, 65536, 99999):
@@ -437,6 +450,14 @@ class VaultSettingsTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             HealthResponse(status="ok", extra="unauthorized")  # type: ignore[call-arg]
 
+    def test_forbidden_error_model(self) -> None:
+        """Le modèle ForbiddenError est conforme au contrat d'erreur."""
+        err = ForbiddenError()
+        self.assertEqual(err.code, "forbidden")
+        self.assertEqual(err.message, "Accès interdit")
+        with self.assertRaises(ValidationError):
+            ForbiddenError(extra="unauthorized")  # type: ignore[call-arg]
+
     def test_run_server_is_callable(self) -> None:
         """run_server est défini et appelable comme point d'entrée."""
         self.assertTrue(callable(run_server))
@@ -456,6 +477,17 @@ class VaultSettingsTests(unittest.TestCase):
             server_header=False,
             date_header=False,
         )
+
+    def test_documented_uvicorn_command_uses_no_proxy_headers(self) -> None:
+        """La documentation doit recommander --no-proxy-headers et bannir --proxy-headers=false."""
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn("--no-proxy-headers", readme)
+        self.assertNotIn("--proxy-headers=false", readme)
+
+        app_code = (root / "heimdall" / "vault" / "app.py").read_text(encoding="utf-8")
+        self.assertIn("--no-proxy-headers", app_code)
+        self.assertNotIn("--proxy-headers=false", app_code)
 
 
 if __name__ == "__main__":

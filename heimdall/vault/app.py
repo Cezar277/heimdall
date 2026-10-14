@@ -7,7 +7,7 @@ Lancement du serveur :
     python -m heimdall.vault.app
     # ou :
     uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 \
-        --proxy-headers=false --no-server-header --no-date-header
+        --no-proxy-headers --no-server-header --no-date-header
 
 RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 - Allowlist boucle locale : écoute EXCLUSIVEMENT sur la boucle locale (127.0.0.1, ::1, localhost),
@@ -22,9 +22,10 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   (anti-spoofing et anti-fingerprinting).
 - Documentation désactivée par défaut : docs_url, redoc_url et openapi_url sont désactivés
   pour interdire la reconnaissance d'empreinte (fingerprinting) et l'exposition de version/schéma.
-- Schéma OpenAPI conforme : /api/v1/health déclare l'ensemble des réponses contractuelles (200, 405,
-  429, 500, 503, default) avec header Retry-After obligatoire sur 429 et 503. Seul /api/v1/health
-  est exposé (aucun alias racine non contractuel).
+- Schéma OpenAPI conforme : /api/v1/health déclare l'ensemble des réponses contractuelles (200, 403,
+  405, 429, 500, 503, default) avec header Retry-After obligatoire sur 429 et 503. Le 403
+  documente le rejet fail-closed du middleware de boucle locale en défense en profondeur. Seul
+  /api/v1/health est exposé (aucun alias racine non contractuel).
 - Allowlist sur les en-têtes d'exception : seuls Allow et Retry-After (1-3600) sont retransmis.
 - Confinement crypto (ticket #17) : ce module n'importe JAMAIS cryptography ou
   argon2 (réservés exclusivement à heimdall/vault/crypto.py).
@@ -62,6 +63,14 @@ _ERROR_PAYLOADS: dict[int, dict[str, str]] = {
     500: {"code": "internal_error", "message": "Erreur interne"},
     503: {"code": "unavailable", "message": "Service indisponible"},
 }
+
+
+class ForbiddenError(BaseModel):
+    """Erreur 403 contractuelle."""
+
+    model_config = ConfigDict(extra="forbid")
+    code: Literal["forbidden"] = "forbidden"
+    message: Literal["Accès interdit"] = "Accès interdit"
 
 
 class MethodNotAllowedError(BaseModel):
@@ -107,6 +116,7 @@ _RETRY_AFTER_HEADER = {
 }
 
 _HEALTH_RESPONSES: dict[int | str, dict[str, Any]] = {
+    403: {"model": ForbiddenError, "description": "Accès interdit"},
     405: {"model": MethodNotAllowedError, "description": "Méthode non autorisée"},
     429: {
         "model": RateLimitedError,
@@ -156,7 +166,7 @@ class VaultSettings(BaseSettings):
             raise ValueError("L'adresse d'hôte ne peut pas être vide ou blanche.")
         if cleaned not in _ALLOWED_LOOPBACK_HOSTS:
             raise ValueError(
-                f"Adresse d'hôte non autorisée : {value!r}. "
+                "Adresse d'hôte non autorisée. "
                 "Le Vault doit écouter sur la boucle locale (127.0.0.1, ::1, localhost)."
             )
         return cleaned
@@ -313,6 +323,7 @@ def run_server() -> None:
 
 
 __all__ = [
+    "ForbiddenError",
     "HealthResponse",
     "InternalError",
     "MethodNotAllowedError",
