@@ -43,6 +43,9 @@ heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) via son lanceur dédié, seul point d'entrée supporté garantissant l'application de l'allowlist d'hôte et le durcissement du transport :
 
 ```sh
+# Initialisation à froid de la base de données SQLite (#62) :
+python -m heimdall.vault.init_db
+
 # Lancement du serveur Vault (point d'entrée unique, boucle locale vérifiée) :
 python -m heimdall.vault.app
 ```

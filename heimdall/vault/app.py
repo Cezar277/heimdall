@@ -155,6 +155,10 @@ class VaultSettings(BaseSettings):
         default=False,
         description="Activer la documentation OpenAPI/Swagger (/docs). Faux par défaut.",
     )
+    db_path: str = Field(
+        default="vault.db",
+        description="Chemin du fichier de base de données SQLite.",
+    )
 
     @field_validator("host")
     @classmethod
@@ -242,13 +246,9 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
         )
 
     @app.exception_handler(StarletteHTTPException)
-    async def router_error_handler(
-        request: Request, exc: StarletteHTTPException
-    ) -> JSONResponse:
+    async def router_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         """Garde-fou : préserve le code contractuel sans fuite d'enveloppe framework."""
-        status_code = (
-            exc.status_code if exc.status_code in _ERROR_PAYLOADS else 500
-        )
+        status_code = exc.status_code if exc.status_code in _ERROR_PAYLOADS else 500
         content = _ERROR_PAYLOADS.get(
             exc.status_code,
             _ERROR_PAYLOADS[500],
