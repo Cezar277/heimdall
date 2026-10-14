@@ -454,6 +454,45 @@ class GitAccessDirectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="heimdall-nogit-") as tmp:
             self.assertFalse(gitdiff.GitAccess(_Path(tmp)).is_repository())
 
+    def test_git_binary_under_the_root_is_refused_never_executed(self) -> None:
+        """Binaire piégé SOUS la racine : refusé avant tout usage.
+
+        Sur win32, `shutil.which` préfixe le répertoire courant d'office
+        (même avec un `path` explicite) : lancé depuis la racine, un
+        `git.exe` piégé dans le dépôt scanné serait exécuté à chaque outil.
+        `subprocess` est verrouillé pour prouver la non-exécution.
+        """
+        planted = self.repo.root / "git.exe"
+        planted.write_text("factice, jamais exécutable", encoding="utf-8")
+        with mock.patch.object(gitdiff.shutil, "which", return_value=str(planted)):
+            with mock.patch.object(
+                gitdiff.subprocess, "run", side_effect=AssertionError("exécuté !")
+            ):
+                with mock.patch.object(
+                    gitdiff.subprocess, "Popen", side_effect=AssertionError("exécuté !")
+                ):
+                    with self.assertRaises(ToolFailure) as ctx:
+                        gitdiff.GitAccess(self.repo.root)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+
+    def test_git_binary_under_the_cwd_is_refused(self) -> None:
+        """Binaire piégé sous le répertoire courant (hors racine) : refusé aussi."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-fakebin-") as bindir:
+            fake = _Path(bindir) / "git"
+            fake.write_text("factice", encoding="utf-8")
+            with mock.patch.object(gitdiff.shutil, "which", return_value=str(fake)):
+                with mock.patch.object(gitdiff.Path, "cwd", return_value=_Path(bindir)):
+                    with self.assertRaises(ToolFailure) as ctx:
+                        gitdiff.GitAccess(self.repo.root)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+
+    def test_git_binary_beside_the_root_is_accepted(self) -> None:
+        """Garde étroite : un binaire frère de la racine (ni dessous, ni cwd) passe."""
+        sibling = self.repo.root.parent / "git-frere"
+        sibling.write_text("factice", encoding="utf-8")
+        with mock.patch.object(gitdiff.shutil, "which", return_value=str(sibling)):
+            self.assertEqual(gitdiff.GitAccess(self.repo.root)._git, str(sibling))
+
     def test_ignored_detection_and_unexpected_codes(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
         self.repo.write(".gitignore", "ign.txt\n")

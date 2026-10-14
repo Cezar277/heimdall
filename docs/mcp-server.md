@@ -62,6 +62,7 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 | Garantie | Comment | Preuve |
 |---|---|---|
 | commande git figée, `shell=True` proscrit | argv constant, binaire résolu hors PATH hérité (`os.defpath`) | `tests/test_mcp_read_diff.py` |
+| binaire git jamais sous la racine ni sous le cwd | sur win32 `shutil.which` préfixe le cwd d'office : un `git.exe` piégé serait exécuté (RCE) → refus `INTERNAL` avant usage | `test_git_binary_under_the_root_is_refused_never_executed` |
 | config locale neutralisée | `-c core.fsmonitor=false` sur chaque appel (hook prouvé exécuté sans) | `test_fsmonitor_hook_is_never_executed` |
 | pager hostile inopérant | sorties toujours pipées, prouvé sans override | `test_hostile_pager_is_never_executed` |
 | `diff.external` / `textconv` inopérants (interdit I5) | `--no-ext-diff --no-textconv` imposés | `GitEnvironmentTests` |
@@ -75,6 +76,7 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 | réponse bornée par `max_bytes` | budget vérifié **après** sérialisation, fichiers retirés en dernier (une seule sérialisation par fichier) | `test_response_never_exceeds_max_bytes` |
 | limite atteinte = information incomplète | `truncated: true`, jamais « diff vide » | tests de troncature |
 | format de diff non compris → rien n'est jeté en silence | hunk combiné `@@@ ` décodé, en-tête illisible ou `* Unmerged path` → `truncated: true` | `test_unmerged_path_is_never_a_silent_empty_diff` |
+| en-tête combiné hostile sans ReDoS | motif imbriqué mais linéaire (partition déterministe, ~6 ms pour 100 Ko), épinglé en temps borné | `test_hostile_combined_hunk_header_is_fast_and_flagged` |
 | compteur `redactions` toujours vrai | recompté sur les lignes finales : une coupe n'y laisse jamais un compteur sans marqueur | `TruncationInvariantTests` |
 | coupe `max_bytes` sur lignes complètes | la ligne à cheval est abandonnée (aucun préfixe en clair) | `test_secret_never_straddles_any_budget` |
 | FIFO/socket/device refusés, `O_NONBLOCK` | pas de blocage infini (DoS), revérifié après ouverture | `test_fifo_does_not_hang_the_server` |

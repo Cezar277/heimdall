@@ -293,6 +293,29 @@ class MaskingPerformanceTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertLessEqual(len(entries), 200)
 
+    def test_hostile_combined_hunk_header_is_fast_and_flagged(self) -> None:
+        """Ligne `@@@ ` hostile de ~100 Ko : temps borné, `truncated`, pas de ReDoS.
+
+        `_COMBINED_HUNK_HEADER` porte des quantificateurs imbriqués, mais
+        l'espace exigé en fin de chaque itération rend la partition
+        déterministe : mesuré linéaire (~6 ms pour 100 Ko), pas de
+        backtracking exponentiel — donc pas de pré-borne (qui signalerait
+        `truncated` sur des en-têtes valides à longue remorque pour un risque
+        inexistant). Ce test l'épingle : s'il devient lent, c'est qu'une
+        imbrication ambiguë a été introduite.
+        """
+        for tail in ("X", ""):
+            with self.subTest(tail=tail or "vide"):
+                hostile = "@@@ " + "-1,1 " * 20_000 + tail
+                started = time.monotonic()
+                entries, truncated = gitdiff.parse_diff(
+                    "diff --git a/x b/x\n--- a/x\n+++ b/x\n" + hostile + "\n+y\n"
+                )
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 5.0, f"parse trop lent : {elapsed:.1f}s")
+                self.assertEqual(entries, [])
+                self.assertTrue(truncated)
+
     def test_quoted_assignment_above_20k_chars_is_masked_whole(self) -> None:
         """Plus de borne haute : `SECRET="` + 50000 car + `"` est masqué en entier.
 

@@ -179,6 +179,17 @@ class GitAccess:
             # Panne d'outillage : message statique, jamais de chemin ni de
             # contenu reflété (invariant 8).
             raise ToolFailure("INTERNAL")
+        resolved = Path(binary).resolve()
+        # Jamais un binaire sous la racine ni sous le répertoire courant :
+        # sur win32, `shutil.which` préfixe le répertoire courant d'office
+        # (`path.insert(0, curdir)` dans la stdlib, même avec un `path`
+        # explicite) — lancé depuis la racine, un `git.exe`/`git.bat` piégé
+        # dans le dépôt scanné serait exécuté à chaque outil (RCE). Sur POSIX
+        # `os.defpath` est absolu donc ce refus est un filet dormant, mais il
+        # couvre aussi un `defpath` vide ou relatif. Refus fail-closed,
+        # avant tout usage du binaire : il n'est jamais exécuté.
+        if resolved.is_relative_to(root.resolve()) or resolved.parent == Path.cwd().resolve():
+            raise ToolFailure("INTERNAL")
         self._git = binary
 
     def execute(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
@@ -579,6 +590,13 @@ class _DiffParser:
             match = _HUNK_HEADER.match(raw)
             parents = 1
         elif raw.startswith("@@@ "):
+            # `_COMBINED_HUNK_HEADER` porte des quantificateurs imbriqués
+            # (`(?:-\d+(?:,\d+)? )+`), mais reste linéaire : l'espace exigé
+            # en fin de chaque itération rend la partition déterministe
+            # (mesuré : ~6 ms pour 100 Ko hostiles, voir
+            # `test_hostile_combined_hunk_header_is_fast_and_flagged`).
+            # Pas de pré-borne : elle signalerait `truncated` sur des
+            # en-têtes valides à longue remorque, pour un risque inexistant.
             match = _COMBINED_HUNK_HEADER.match(raw)
             # Un couple de plages par parent, chacune `-début[,nb] ` : compter
             # les tirets du préfixe donne donc le nombre de parents, celui

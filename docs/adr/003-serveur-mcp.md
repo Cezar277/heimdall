@@ -99,7 +99,17 @@ construction, pas par vigilance. Preuve : `heimdall/mcp/server.py` (`_tools`, cl
 --no-textconv`, sans `shell=True`, binaire résolu hors PATH hérité
 (`shutil.which("git", path=os.defpath)` : un PATH compromis ne détourne
 pas l'exécutable ; absent du défaut système = panne, jamais de repli),
-délai 30 s. L'environnement est **reconstruit** (`PATH` vide, `HOME` =
+délai 30 s. Le binaire est en outre **refusé sous la racine et sous le
+répertoire courant** : sur win32, `shutil.which` préfixe le répertoire
+courant d'office (`path.insert(0, curdir)` dans la stdlib, vérifié en
+source, même avec un `path` explicite) — lancé depuis la racine, un
+`git.exe`/`git.bat` piégé dans le dépôt scanné serait exécuté à chaque
+outil (RCE). Sur POSIX `os.defpath` est absolu donc ce refus est un filet
+dormant. Refus fail-closed (`INTERNAL`) avant tout usage : le binaire
+n'est jamais exécuté. Preuve :
+`tests/test_mcp_units.py::GitAccessDirectTests`
+(`test_git_binary_under_the_root_is_refused_never_executed`).
+L'environnement est **reconstruit** (`PATH` vide, `HOME` =
 racine, `GIT_CONFIG_*` neutralisées) : `GIT_DIR`/`GIT_INDEX_FILE` hérités
 ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
 --no-textconv` rendent inopérants `diff.external` et les filtres `textconv`
@@ -303,6 +313,16 @@ Règle unique : **ce que le parseur ne comprend pas, il le signale**
   `truncated: false`, sur un dépôt en cours de fusion. Drapeau posé,
   les autres fichiers du diff restant montrés.
 
+**Pas de ReDoS sur l'en-tête combiné** : `_COMBINED_HUNK_HEADER` porte des
+quantificateurs imbriqués, mais l'espace exigé en fin de chaque itération
+rend la partition déterministe — mesuré linéaire (~6 ms pour une ligne
+hostile `@@@ ` de ~100 Ko), donc pas de pré-borne (qui signalerait à tort
+`truncated` sur des en-têtes valides à longue remorque pour un risque
+inexistant). Épinglé en temps borné par
+`tests/test_mcp_hardening.py::MaskingPerformanceTests`
+(`test_hostile_combined_hunk_header_is_fast_and_flagged`) : s'il devient
+lent, c'est qu'une imbrication ambiguë a été introduite.
+
 Preuve : `heimdall/mcp/gitdiff.py` (`_COMBINED_HUNK_HEADER`, `_DiffParser._hunk_header`,
 `_DiffParser._hunk_line`), `tests/test_mcp_units.py::ParserStateTests`,
 `tests/test_mcp_read_diff.py::GitEnvironmentTests` (merge conflictuel réel).
@@ -411,7 +431,7 @@ renseigner la feuille SAMM avec liens permanents au SHA :
 |---|---|
 | stdio, racine fixée, registre fermé | `heimdall/mcp/server.py` (`run_stdio`, `build_server`, `SERVER_TOOLS`) |
 | entrées refusées, échecs en enveloppe (outil inconnu inclus) | `heimdall/mcp/server.py` (`_ToolBoundary`, `tool_handler`), `heimdall/mcp/errors.py` |
-| git confiné, diff typé | `heimdall/mcp/gitdiff.py` (`DIFF_ARGUMENTS`, `confined_environment`, `parse_diff`) |
+| git confiné, diff typé, binaire hors racine/cwd | `heimdall/mcp/gitdiff.py` (`DIFF_ARGUMENTS`, `confined_environment`, `parse_diff`, `GitAccess.__init__`) |
 | canal stdio jamais hérité par git, plafond de découverte | `heimdall/mcp/gitdiff.py` (`GitAccess.execute`, `GitAccess.staged_diff`, `confined_environment`), `tests/security/test_prompt_injection.py` (`_fixed_argv_violations`) |
 | masquage avant sérialisation, compteurs vrais, quotée sans borne haute | `heimdall/mcp/masking.py` (`mask_text`, `_KNOWN_PREFIXES`, `_QUOTED_ASSIGNMENT`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`) |
 | garde unique, TOCTOU réduite, FIFO refusés, `NOT_FOUND` réservé à l'absence | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |

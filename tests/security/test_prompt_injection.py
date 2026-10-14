@@ -143,7 +143,11 @@ _OS_ALLOWED_ATTRS = frozenset(
         "devnull",
     }
 )
-_PATHLIB_ALLOWED_NAMES = frozenset({"Path", "PurePath", "PurePosixPath", "PureWindowsPath"})
+# `cwd` : lecture seule du répertoire courant, utilisée comme ENTRÉE d'un
+# contrôle de confinement (la garde anti-hijack du binaire git refuse un
+# binaire sous le cwd). Ni exécution, ni écriture, ni réseau, ni chargement
+# dynamique : l'ajouter ne rouvre aucune des voies que cette garde ferme.
+_PATHLIB_ALLOWED_NAMES = frozenset({"Path", "PurePath", "PurePosixPath", "PureWindowsPath", "cwd"})
 
 
 def _fixed_argv_violations(path: Path) -> list[str]:
