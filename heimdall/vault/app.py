@@ -292,7 +292,14 @@ app = create_app()
 
 
 def run_server() -> None:
-    """Démarre le serveur Vault avec les paramètres validés (localhost uniquement)."""
+    """Démarre le serveur Vault avec les paramètres validés (localhost uniquement).
+
+    NOTE DE SÉCURITÉ (ticket #25) :
+    Ce montage HTTP en clair est strictement réservé au squelette minimal et à la
+    route /api/v1/health sur la boucle locale. Ne jamais réutiliser ce montage HTTP
+    au-delà du squelette : les tickets #64 et #65 implémentent le TLS obligatoire avec
+    SAN-IP (https://127.0.0.1:8443) et l'authentification X-Heimdall-API-Key.
+    """
     server_settings = get_settings()
     uvicorn.run(
         "heimdall.vault.app:app",

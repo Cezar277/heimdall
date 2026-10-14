@@ -52,7 +52,7 @@ uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 --proxy-headers=fals
 
 > **Note sécurité & dette technique (contrat OpenAPI #15)** :
 > Ce squelette minimal (#25) est strictement confiné à la boucle locale (`127.0.0.1`, `::1`, `localhost`).
-> Ne jamais exposer ce serveur en clair hors de localhost. Les exigences runtime suivantes sont tracées et attribuées aux tickets du Vault :
+> Ne jamais exposer ce serveur en clair hors de localhost ni réutiliser ce montage HTTP au-delà du squelette minimal (#25). Les exigences runtime suivantes sont tracées et attribuées aux tickets du Vault :
 > - **TLS avec SAN IP obligatoire (`https://127.0.0.1:8443`)** : tickets #64 / #65.
 > - **Authentification par clé API de projet (`X-Heimdall-API-Key`)** : ticket #64.
 > - **Rejet HTTP 400 avant parsing au-delà de 1 Mio (1 048 576 octets)** : ticket #63.
