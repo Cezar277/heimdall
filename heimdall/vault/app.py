@@ -5,9 +5,8 @@ lue dans les variables d'environnement (via pydantic-settings) et la route de sa
 
 Lancement du serveur :
     python -m heimdall.vault.app
-    # ou :
-    uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 \
-        --no-proxy-headers --no-server-header --no-date-header
+    (Point d'entrée unique supporté et documenté : garantit la validation de l'hôte
+    et le durcissement du transport uvicorn).
 
 RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 - Allowlist boucle locale : écoute EXCLUSIVEMENT sur la boucle locale (127.0.0.1, ::1, localhost),
@@ -22,9 +21,10 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   (anti-spoofing et anti-fingerprinting).
 - Documentation désactivée par défaut : docs_url, redoc_url et openapi_url sont désactivés
   pour interdire la reconnaissance d'empreinte (fingerprinting) et l'exposition de version/schéma.
-- Schéma OpenAPI conforme : /api/v1/health déclare l'ensemble des réponses contractuelles (200, 403,
-  405, 429, 500, 503, default) avec header Retry-After obligatoire sur 429 et 503. Le 403
-  documente le rejet fail-closed du middleware de boucle locale en défense en profondeur. Seul
+- Schéma OpenAPI conforme : /api/v1/health déclare fidèlement les réponses du contrat openapi.yaml
+  (200, 405, 429, 500, 503, default) avec header Retry-After obligatoire sur 429 et 503. Le rejet
+  fail-closed HTTP 403 du middleware loopback est une défense en profondeur au niveau transport
+  (socket/peer), volontairement maintenue hors du contrat OpenAPI applicatif (route publique). Seul
   /api/v1/health est exposé (aucun alias racine non contractuel).
 - Allowlist sur les en-têtes d'exception : seuls Allow et Retry-After (1-3600) sont retransmis.
 - Confinement crypto (ticket #17) : ce module n'importe JAMAIS cryptography ou
@@ -116,7 +116,6 @@ _RETRY_AFTER_HEADER = {
 }
 
 _HEALTH_RESPONSES: dict[int | str, dict[str, Any]] = {
-    403: {"model": ForbiddenError, "description": "Accès interdit"},
     405: {"model": MethodNotAllowedError, "description": "Méthode non autorisée"},
     429: {
         "model": RateLimitedError,

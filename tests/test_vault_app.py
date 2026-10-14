@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml  # type: ignore[import-untyped]
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ValidationError
@@ -88,12 +89,13 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(openapi_resp.status_code, 200)
             schema = openapi_resp.json()
 
-            # La route /api/v1/health est présente et conforme
+            # La route /api/v1/health est présente et conforme au contrat openapi.yaml
             self.assertIn("/api/v1/health", schema["paths"])
             responses = schema["paths"]["/api/v1/health"]["get"]["responses"]
-            for expected_code in ("200", "403", "405", "429", "500", "503", "default"):
+            for expected_code in ("200", "405", "429", "500", "503", "default"):
                 self.assertIn(expected_code, responses)
-            self.assertEqual(responses["403"]["description"], "Accès interdit")
+            # 403 est un rejet fail-closed de niveau transport, maintenu hors du contrat applicatif
+            self.assertNotIn("403", responses)
 
             # Retry-After est obligatoire sur 429 et 503
             for code in ("429", "503"):
@@ -478,16 +480,28 @@ class VaultSettingsTests(unittest.TestCase):
             date_header=False,
         )
 
-    def test_documented_uvicorn_command_uses_no_proxy_headers(self) -> None:
-        """La documentation doit recommander --no-proxy-headers et bannir --proxy-headers=false."""
+    def test_documented_launch_command_uses_dedicated_runner(self) -> None:
+        """La documentation doit recommander exclusivement python -m heimdall.vault.app."""
         root = Path(__file__).resolve().parents[1]
         readme = (root / "README.md").read_text(encoding="utf-8")
-        self.assertIn("--no-proxy-headers", readme)
-        self.assertNotIn("--proxy-headers=false", readme)
+        self.assertIn("python -m heimdall.vault.app", readme)
+        self.assertNotIn("uvicorn heimdall.vault.app:app", readme)
 
         app_code = (root / "heimdall" / "vault" / "app.py").read_text(encoding="utf-8")
-        self.assertIn("--no-proxy-headers", app_code)
-        self.assertNotIn("--proxy-headers=false", app_code)
+        self.assertIn("python -m heimdall.vault.app", app_code)
+        self.assertNotIn("uvicorn heimdall.vault.app:app", app_code)
+
+    def test_health_schema_response_codes_match_openapi_yaml(self) -> None:
+        """Le schéma OpenAPI runtime de /api/v1/health correspond au contrat openapi.yaml."""
+        spec_file = Path(__file__).resolve().parents[1] / "openapi.yaml"
+        spec = yaml.safe_load(spec_file.read_text(encoding="utf-8"))
+        expected_responses = set(spec["paths"]["/api/v1/health"]["get"]["responses"].keys())
+
+        dev_app = create_app(VaultSettings(enable_docs=True))
+        actual_responses = set(
+            dev_app.openapi()["paths"]["/api/v1/health"]["get"]["responses"].keys()
+        )
+        self.assertEqual(actual_responses, expected_responses)
 
 
 if __name__ == "__main__":

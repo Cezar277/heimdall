@@ -40,20 +40,17 @@ heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 
 ### Serveur Vault
 
-Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) :
+Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) via son lanceur dédié, seul point d'entrée supporté garantissant l'application de l'allowlist d'hôte et le durcissement du transport :
 
 ```sh
-# Lancement sécurisé via le lanceur dédié (recommandé) :
+# Lancement du serveur Vault (point d'entrée unique, boucle locale vérifiée) :
 python -m heimdall.vault.app
-
-# Ou via uvicorn (boucle locale impérative, désactivation des proxy headers et du fingerprinting transport) :
-uvicorn heimdall.vault.app:app --host 127.0.0.1 --port 8443 --no-proxy-headers --no-server-header --no-date-header
 ```
 
 > **Note sécurité & dette technique (contrat OpenAPI #15)** :
 > Ce squelette minimal (#25) est strictement confiné à la boucle locale (`127.0.0.1`, `::1`, `localhost`).
 > Ne jamais exposer ce serveur en clair hors de localhost ni réutiliser ce montage HTTP au-delà du squelette minimal (#25). Les exigences runtime suivantes sont tracées et attribuées aux tickets du Vault :
-> - **Rejet fail-closed HTTP 403 sur IP non-loopback** : garde middleware en défense en profondeur, déclarée dans le schéma OpenAPI runtime.
+> - **Rejet fail-closed HTTP 403 sur IP non-loopback** : garde middleware en défense en profondeur (niveau transport/socket), volontairement maintenue hors du contrat OpenAPI applicatif (`/api/v1/health` étant publique sans clé).
 > - **TLS avec SAN IP obligatoire (`https://127.0.0.1:8443`)** : tickets #64 / #65.
 > - **Authentification par clé API de projet (`X-Heimdall-API-Key`)** : ticket #64.
 > - **Rejet HTTP 400 avant parsing au-delà de 1 Mio (1 048 576 octets)** : ticket #63.
