@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 SecretStatus = Literal["vaulte", "rote"]
+_ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
 
 DEFAULT_DB_PATH: Path = Path("vault.db")
 
@@ -90,32 +91,35 @@ def get_iso_timestamp() -> str:
 def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
     """Résout le chemin de la base de données (argument, variable d'environnement ou défaut)."""
     if db_path is not None:
-        if str(db_path) == ":memory:":
+        stripped = str(db_path).strip()
+        if stripped == ":memory:":
             return ":memory:"
-        return Path(db_path)
+        return Path(stripped)
     env_path = os.environ.get("HEIMDALL_VAULT_DB_PATH")
     if env_path:
-        if env_path == ":memory:":
+        stripped = env_path.strip()
+        if stripped == ":memory:":
             return ":memory:"
-        return Path(env_path)
+        return Path(stripped)
     return DEFAULT_DB_PATH
 
 
 def _assert_not_symlink(path: Path) -> None:
-    """Refuse tout chemin symbolique : protection TOCTOU (lstat, pas de suivi du lien).
+    """Refuse tout chemin dont le fichier ou l'un des ancêtres est un lien symbolique.
 
-    Lève PermissionError si le chemin ou l'un de ses parents connus est un symlink.
+    Protection TOCTOU stricte via lstat (pas de déréférencement).
+    Vérifie le chemin relatif/absolu ainsi que TOUS ses répertoires ancêtres.
     """
-    # Vérifie le fichier lui-même (s'il existe)
-    if path.is_symlink():
-        raise PermissionError(
-            f"Chemin de base de données refusé : lien symbolique interdit ({path})"
-        )
-    # Vérifie aussi le répertoire parent s'il existe
-    if path.parent.exists() and path.parent.is_symlink():
-        raise PermissionError(
-            f"Répertoire parent refusé : lien symbolique interdit ({path.parent})"
-        )
+    candidates: list[Path] = [path, *path.parents]
+    # Vérifie également sous forme absolue pour couvrir les symlinks ancêtres non relatifs
+    abs_path = path.absolute()
+    candidates.extend([abs_path, *abs_path.parents])
+
+    for p in candidates:
+        if os.path.islink(p):
+            raise PermissionError(
+                f"Chemin de base de données refusé : lien symbolique interdit ({p})"
+            )
 
 
 def _apply_secure_permissions(path: Path) -> None:
@@ -144,20 +148,31 @@ def _apply_secure_permissions(path: Path) -> None:
 def _open_db_file(path: Path) -> sqlite3.Connection:
     """Ouvre une connexion SQLite vers un fichier en appliquant les gardes de sécurité.
 
-    - Refuse les symlinks (TOCTOU).
+    - Refuse les symlinks (TOCTOU) sur le fichier et tous ses répertoires ancêtres.
+    - Refuse les chemins pointant vers des répertoires existants.
     - Crée le répertoire parent avec umask 0o077 (droits 0o700).
+    - Re-vérifie les symlinks après mkdir (fermeture de la fenêtre TOCTOU).
     - Crée le fichier avec mode 0o600 si inexistant.
     - Vérifie et confirme les permissions après création (fail-closed).
     - Positionne journal_mode=DELETE (pas de sidecar -wal/-shm).
     """
     _assert_not_symlink(path)
+    if path.is_dir():
+        raise IsADirectoryError(
+            f"Chemin de base de données invalide : pointe vers un répertoire existant ({path})"
+        )
+
     old_umask = os.umask(0o077)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-vérification après mkdir (fermeture de la fenêtre TOCTOU)
+        _assert_not_symlink(path)
         if not path.exists():
-            path.touch(mode=0o600, exist_ok=True)
+            path.touch(mode=_SECURE_FILE_MODE, exist_ok=True)
     finally:
         os.umask(old_umask)
+
+    _assert_not_symlink(path)
     _apply_secure_permissions(path)
     conn = sqlite3.connect(str(path))
     # journal_mode=DELETE : empêche la création de fichiers sidecar en permissions larges.
@@ -351,6 +366,9 @@ def create_secret(  # noqa: PLR0913
     Lève sqlite3.IntegrityError si la contrainte d'unicité (project_id, env, name)
     ou la clé étrangère est enfreinte.
     """
+    if status not in _ALLOWED_STATUSES:
+        allowed = sorted(_ALLOWED_STATUSES)
+        raise ValueError(f"Statut de secret invalide: {status!r}. Valeurs autorisées: {allowed}")
     ts = created_at or get_iso_timestamp()
     up_ts = updated_at or ts
     query = (
@@ -448,6 +466,9 @@ def update_secret(  # noqa: PLR0913
     Le paramètre `status` est typé `Literal["vaulte", "rote"]` pour une validation
     applicative avant toute requête SQL.
     """
+    if status not in _ALLOWED_STATUSES:
+        allowed = sorted(_ALLOWED_STATUSES)
+        raise ValueError(f"Statut de secret invalide: {status!r}. Valeurs autorisées: {allowed}")
     up_ts = updated_at or get_iso_timestamp()
     query = (
         "UPDATE secrets SET "

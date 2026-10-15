@@ -25,13 +25,21 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=f"Chemin du fichier SQLite (défaut : {DEFAULT_DB_PATH} ou $HEIMDALL_VAULT_DB_PATH).",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Affiche le détail technique de l'erreur en cas d'échec.",
+    )
     args = parser.parse_args(argv)
     try:
         init_db(args.db_path)
         print("Base de données SQLite du Vault initialisée avec succès.")
         return 0
     except Exception as exc:
-        print(f"Erreur lors de l'initialisation de la base : {exc}", file=sys.stderr)
+        print("Erreur : échec de l'initialisation de la base de données SQLite.", file=sys.stderr)
+        if args.verbose:
+            print(f"Détail : {exc}", file=sys.stderr)
         return 1
 
 

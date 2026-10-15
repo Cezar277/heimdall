@@ -19,6 +19,7 @@ Vérifie :
 16. La validation de `VaultSettings.db_path` (vide, caractères de contrôle).
 """
 
+import io
 import os
 import shutil
 import sqlite3
@@ -27,6 +28,7 @@ import subprocess
 import tempfile
 import typing
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -167,8 +169,28 @@ class VaultDatabaseTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             get_connection(db_via_symlink)
 
+    def test_symlink_on_grandparent_dir_is_refused(self) -> None:
+        """M1 — Un lien symbolique sur un répertoire ancêtre (grand-parent) est refusé."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        real_root = Path(self.temp_dir.name) / "real_root"
+        real_root.mkdir()
+        symlink_root = Path(self.temp_dir.name) / "symlink_root"
+        symlink_root.symlink_to(real_root)
+        deep_db_path = symlink_root / "sub1" / "sub2" / "vault.db"
+
+        with self.assertRaises(PermissionError):
+            get_connection(deep_db_path)
+
+    def test_db_path_pointing_to_existing_directory_is_refused(self) -> None:
+        """Un db_path pointant vers un répertoire existant lève IsADirectoryError."""
+        existing_dir = Path(self.temp_dir.name) / "some_dir"
+        existing_dir.mkdir()
+        with self.assertRaises(IsADirectoryError):
+            get_connection(existing_dir)
+
     # -----------------------------------------------------------------------
-    # 13. Absence de fichiers sidecar SQLite (M3 corrigé)
+    # 13. Absence de fichiers sidecar SQLite & permissions journal (M3 corrigé)
     # -----------------------------------------------------------------------
 
     def test_no_sidecar_files_after_write(self) -> None:
@@ -187,6 +209,27 @@ class VaultDatabaseTests(unittest.TestCase):
                 sidecar.exists(),
                 f"Fichier sidecar inattendu après écriture : {sidecar.name}",
             )
+
+    def test_transient_journal_permissions_during_transaction(self) -> None:
+        """M3 — Le fichier -journal transitoire pendant une transaction possède les droits 0o600."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        init_db(self.db_path)
+        conn = get_connection(self.db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            create_project(conn, "proj_tx_journal")
+            journal_path = self.db_path.parent / (self.db_path.name + "-journal")
+            if journal_path.exists():
+                mode = journal_path.stat().st_mode & 0o777
+                self.assertEqual(
+                    mode,
+                    0o600,
+                    f"Permissions du fichier -journal permissives : {oct(mode)}, attendu 0o600",
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
     # -----------------------------------------------------------------------
     # 2. Foreign keys
@@ -280,18 +323,18 @@ class VaultDatabaseTests(unittest.TestCase):
             create_secret(conn, "proj_stat", "dev", "SEC_V", "b", status="vaulte")
             create_secret(conn, "proj_stat", "dev", "SEC_R", "b", status="rote")
 
-            with self.assertRaises(sqlite3.IntegrityError):
-                # mypy le signale via Literal, le CHECK SQL le bloque à l'exécution
+            # Validation applicative runtime en tête de fonction : lève ValueError
+            with self.assertRaises(ValueError):
                 create_secret(conn, "proj_stat", "dev", "SEC_BAD", "b", status="invalid_status")  # type: ignore[arg-type]
 
     def test_status_check_constraint_on_update(self) -> None:
-        """14 — update_secret avec un statut invalide est rejeté par le CHECK SQL."""
+        """14 — update_secret avec un statut invalide lève ValueError applicativement."""
         init_db(self.db_path)
         with db_session(self.db_path) as conn:
             create_project(conn, "proj_upd")
             create_secret(conn, "proj_upd", "dev", "MY_KEY", "enc_v1")
 
-            with self.assertRaises(sqlite3.IntegrityError):
+            with self.assertRaises(ValueError):
                 update_secret(
                     conn,
                     project_id="proj_upd",
@@ -299,6 +342,27 @@ class VaultDatabaseTests(unittest.TestCase):
                     name="MY_KEY",
                     encrypted_value="enc_v2",
                     status="invalid_status",  # type: ignore[arg-type]
+                )
+
+    def test_status_raw_sql_check_constraint(self) -> None:
+        """Le CHECK SQLite DDL rejette les statuts invalides en cas d'insertion SQL directe."""
+        init_db(self.db_path)
+        with db_session(self.db_path) as conn:
+            create_project(conn, "proj_raw")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO secrets (project_id, env, name, encrypted_value, status, "
+                    "fingerprint, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "proj_raw",
+                        "dev",
+                        "RAW_SEC",
+                        "enc",
+                        "invalid_status",
+                        "fp",
+                        "2026-01-01",
+                        "2026-01-01",
+                    ),
                 )
 
     # -----------------------------------------------------------------------
@@ -486,17 +550,24 @@ class VaultDatabaseTests(unittest.TestCase):
             self.assertIsNone(get_project(conn, "proj_rollback"))
 
     # -----------------------------------------------------------------------
-    # 15. .gitignore couvre vault.db
+    # 15. .gitignore couvre vault.db et tous ses sidecars (-wal, -shm, etc.)
     # -----------------------------------------------------------------------
 
     def test_gitignore_covers_vault_db(self) -> None:
-        """15 — Le fichier .gitignore exclut vault.db et *.db (commit accidentel)."""
+        """15 — Le .gitignore exclut vault.db, *.db et les sidecars (-wal/-shm/-journal)."""
         git_bin = shutil.which("git")
         if git_bin is None:
             self.skipTest("git non disponible dans le PATH")
         root = Path(__file__).resolve().parents[1]
         # git check-ignore retourne code 0 si le fichier est ignoré
-        for filename in ("vault.db", "vault.db-journal", "other.db"):
+        sidecar_files = (
+            "vault.db",
+            "vault.db-journal",
+            "vault.db-wal",
+            "vault.db-shm",
+            "other.db",
+        )
+        for filename in sidecar_files:
             result = subprocess.run(  # noqa: S603
                 [git_bin, "check-ignore", "-q", filename],
                 cwd=root,
@@ -528,9 +599,9 @@ class VaultDatabaseTests(unittest.TestCase):
             VaultSettings(db_path="vault\x1f.db")
 
     def test_vault_settings_db_path_accepts_valid_path(self) -> None:
-        """L4 — VaultSettings accepte un chemin valide."""
+        """L4 — VaultSettings accepte un chemin valide et normalise les espaces."""
         valid_path = str(Path(self.temp_dir.name) / "valid_vault.db")
-        s = VaultSettings(db_path=valid_path)
+        s = VaultSettings(db_path=f"  {valid_path}  ")
         self.assertEqual(s.db_path, valid_path)
 
     # -----------------------------------------------------------------------
@@ -545,11 +616,51 @@ class VaultDatabaseTests(unittest.TestCase):
         with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": ":memory:"}):
             self.assertEqual(resolve_db_path(), ":memory:")
 
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "  :memory:  "}):
+            self.assertEqual(resolve_db_path(), ":memory:")
+
         with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "/custom/path/vault.db"}):
             self.assertEqual(resolve_db_path("/override/path.db"), Path("/override/path.db"))
 
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(resolve_db_path(), DEFAULT_DB_PATH)
+
+    def test_resolve_db_path_memory_as_path_object(self) -> None:
+        """resolve_db_path avec Path(':memory:') retourne la chaîne ':memory:'."""
+        self.assertEqual(resolve_db_path(Path(":memory:")), ":memory:")
+
+    # -----------------------------------------------------------------------
+    # CLI init_db (--verbose vs sans verbose)
+    # -----------------------------------------------------------------------
+
+    def test_init_db_cli_error_output_sanitized_unless_verbose(self) -> None:
+        """Le script CLI init_db n'affiche pas le chemin d'erreur par défaut, sauf avec -v."""
+        # On cible un symlink interdit pour déclencher une erreur
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        real_f = Path(self.temp_dir.name) / "cli_real.db"
+        real_f.touch()
+        sym_f = Path(self.temp_dir.name) / "cli_sym.db"
+        sym_f.symlink_to(real_f)
+
+        # Sans -v : message générique uniquement
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            code = init_db_main(["--db-path", str(sym_f)])
+        self.assertEqual(code, 1)
+        output = stderr_buf.getvalue()
+        self.assertIn("Erreur : échec de l'initialisation", output)
+        self.assertNotIn("Détail :", output)
+        self.assertNotIn(str(sym_f), output)
+
+        # Avec -v : détail technique présent
+        stderr_buf_v = io.StringIO()
+        with redirect_stderr(stderr_buf_v):
+            code_v = init_db_main(["--db-path", str(sym_f), "-v"])
+        self.assertEqual(code_v, 1)
+        output_v = stderr_buf_v.getvalue()
+        self.assertIn("Erreur : échec de l'initialisation", output_v)
+        self.assertIn("Détail :", output_v)
 
     # -----------------------------------------------------------------------
     # SecretStatus type alias

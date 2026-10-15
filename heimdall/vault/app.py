@@ -38,6 +38,7 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 """
 
 import ipaddress
+import logging
 from functools import lru_cache
 from typing import Any, Literal
 
@@ -51,6 +52,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+
+logger = logging.getLogger("heimdall.vault.app")
 
 # Seuil ASCII en dessous duquel un caractère est un caractère de contrôle (hors \t).
 _CONTROL_CHAR_THRESHOLD: int = 0x20
@@ -171,11 +174,11 @@ class VaultSettings(BaseSettings):
         if not stripped:
             raise ValueError("Le chemin de la base de données SQLite ne peut pas être vide.")
         # Caractères de contrôle (hors \t ordinaire) : protection injection de chemin.
-        if any(ord(c) < _CONTROL_CHAR_THRESHOLD and c != "\t" for c in value):
+        if any(ord(c) < _CONTROL_CHAR_THRESHOLD and c != "\t" for c in stripped):
             raise ValueError(
                 "Le chemin de la base de données SQLite contient des caractères de contrôle."
             )
-        return value
+        return stripped
 
     @field_validator("host")
     @classmethod
@@ -224,6 +227,8 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
         openapi_url=openapi_url,
     )
     app.state.settings = effective_settings
+    app.state.db_path = effective_settings.db_path
+    logger.info("Base de données SQLite configurée : %s", effective_settings.db_path)
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:

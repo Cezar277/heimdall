@@ -34,9 +34,11 @@ secrets/
 secrets.local.json
 # Base SQLite du Vault : contient ciphertext + key_hash + fingerprints
 # Ne jamais versionner, même sur une machine de développement (#62).
-vault.db
-vault.db-journal
+vault.db*
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 
 # --- Outils / OS / IDE ---
 bandit-report.json
