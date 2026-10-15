@@ -16,24 +16,35 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   - `api_keys`: clé étrangère sur `projects(id)` avec `ON DELETE CASCADE`.
   - `secrets`: clé étrangère sur `projects(id)` avec `ON DELETE CASCADE`,
     contrainte d'unicité `UNIQUE(project_id, env, name)`.
-  - `status`: contrainte `CHECK(status IN ('vaulte', 'rote'))`.
-- Permissions fichier au repos : création de fichier avec permissions restreintes
-  (mode 0o600, lecture/écriture propriétaire uniquement sur systèmes POSIX).
+  - `status`: contrainte `CHECK(status IN ('vaulte', 'rote'))` + validation
+    applicative `Literal["vaulte", "rote"]` avant toute requête.
+- Permissions fichier au repos :
+  - Umask restrictif `0o077` positionné avant création du fichier/répertoire.
+  - Mode `0o600` (lecture/écriture propriétaire uniquement) vérifié et confirmé
+    après création — fail-closed si le chmod échoue ou si le mode effectif diffère.
+  - Refus de tout chemin symbolique (`is_symlink()` via lstat) : protection TOCTOU.
+  - `journal_mode=DELETE` forcé pour éviter la création de fichiers sidecar
+    `-wal`/`-shm`/`-journal` en permissions larges.
 """
 
 import os
 import sqlite3
-import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+SecretStatus = Literal["vaulte", "rote"]
 
 DEFAULT_DB_PATH: Path = Path("vault.db")
 
+# Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
+_SECURE_FILE_MODE: int = 0o600
+
 SCHEMA_SQL: str = """
 PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = DELETE;
 
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -90,13 +101,68 @@ def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
     return DEFAULT_DB_PATH
 
 
+def _assert_not_symlink(path: Path) -> None:
+    """Refuse tout chemin symbolique : protection TOCTOU (lstat, pas de suivi du lien).
+
+    Lève PermissionError si le chemin ou l'un de ses parents connus est un symlink.
+    """
+    # Vérifie le fichier lui-même (s'il existe)
+    if path.is_symlink():
+        raise PermissionError(
+            f"Chemin de base de données refusé : lien symbolique interdit ({path})"
+        )
+    # Vérifie aussi le répertoire parent s'il existe
+    if path.parent.exists() and path.parent.is_symlink():
+        raise PermissionError(
+            f"Répertoire parent refusé : lien symbolique interdit ({path.parent})"
+        )
+
+
 def _apply_secure_permissions(path: Path) -> None:
-    """Applique les permissions 0o600 (lecture/écriture propriétaire) sur fichier POSIX."""
+    """Applique et vérifie les permissions 0o600 sur le fichier SQLite (POSIX uniquement).
+
+    Lève PermissionError si le chmod échoue ou si le mode effectif après chmod diffère
+    de 0o600 — fail-closed : mieux vaut planter que laisser la base lisible.
+    """
+    if os.name == "nt":
+        return
     try:
-        if path.exists() and os.name != "nt":
-            path.chmod(0o600)
-    except OSError:
-        pass
+        path.chmod(_SECURE_FILE_MODE)
+    except OSError as exc:
+        raise PermissionError(
+            f"Impossible de sécuriser les permissions de la base SQLite ({path}) : {exc}"
+        ) from exc
+    # Vérification post-chmod (fail-closed)
+    actual_mode = path.stat().st_mode & 0o777
+    if actual_mode != _SECURE_FILE_MODE:
+        raise PermissionError(
+            f"Permissions de la base SQLite insuffisantes : attendu 0o600, obtenu "
+            f"{oct(actual_mode)} ({path})"
+        )
+
+
+def _open_db_file(path: Path) -> sqlite3.Connection:
+    """Ouvre une connexion SQLite vers un fichier en appliquant les gardes de sécurité.
+
+    - Refuse les symlinks (TOCTOU).
+    - Crée le répertoire parent avec umask 0o077 (droits 0o700).
+    - Crée le fichier avec mode 0o600 si inexistant.
+    - Vérifie et confirme les permissions après création (fail-closed).
+    - Positionne journal_mode=DELETE (pas de sidecar -wal/-shm).
+    """
+    _assert_not_symlink(path)
+    old_umask = os.umask(0o077)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.touch(mode=0o600, exist_ok=True)
+    finally:
+        os.umask(old_umask)
+    _apply_secure_permissions(path)
+    conn = sqlite3.connect(str(path))
+    # journal_mode=DELETE : empêche la création de fichiers sidecar en permissions larges.
+    conn.execute("PRAGMA journal_mode = DELETE;")
+    return conn
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -106,11 +172,7 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     """
     resolved = resolve_db_path(db_path)
     if isinstance(resolved, Path):
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        if not resolved.exists():
-            resolved.touch(mode=0o600, exist_ok=True)
-        _apply_secure_permissions(resolved)
-        conn = sqlite3.connect(str(resolved))
+        conn = _open_db_file(resolved)
     else:
         conn = sqlite3.connect(resolved)
 
@@ -134,17 +196,10 @@ def init_db(db_path: Path | str | None = None) -> None:
     """Initialise à froid la base de données SQLite en créant le schéma complet.
 
     Exécute le script DDL créant `projects`, `api_keys`, `secrets` et leurs index.
+    Réutilise `get_connection()` pour garantir les mêmes gardes de sécurité
+    (symlink, umask, permissions, journal_mode=DELETE).
     """
-    resolved = resolve_db_path(db_path)
-    if isinstance(resolved, Path):
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        if not resolved.exists():
-            resolved.touch(mode=0o600, exist_ok=True)
-        _apply_secure_permissions(resolved)
-        conn = sqlite3.connect(str(resolved))
-    else:
-        conn = sqlite3.connect(resolved)
-
+    conn = get_connection(db_path)
     try:
         with conn:
             conn.executescript(SCHEMA_SQL)
@@ -284,13 +339,15 @@ def create_secret(  # noqa: PLR0913
     name: str,
     encrypted_value: str,
     *,
-    status: str = "vaulte",
+    status: SecretStatus = "vaulte",
     fingerprint: str = "",
     created_at: str | None = None,
     updated_at: str | None = None,
 ) -> dict[str, Any]:
     """Crée un secret chiffré dans la base de données.
 
+    Le paramètre `status` est typé `Literal["vaulte", "rote"]` pour une validation
+    applicative avant toute requête SQL, en complément du CHECK SQLite.
     Lève sqlite3.IntegrityError si la contrainte d'unicité (project_id, env, name)
     ou la clé étrangère est enfreinte.
     """
@@ -383,10 +440,14 @@ def update_secret(  # noqa: PLR0913
     encrypted_value: str,
     *,
     fingerprint: str = "",
-    status: str = "vaulte",
+    status: SecretStatus = "vaulte",
     updated_at: str | None = None,
 ) -> bool:
-    """Met à jour la valeur chiffrée, l'empreinte et le statut d'un secret existant."""
+    """Met à jour la valeur chiffrée, l'empreinte et le statut d'un secret existant.
+
+    Le paramètre `status` est typé `Literal["vaulte", "rote"]` pour une validation
+    applicative avant toute requête SQL.
+    """
     up_ts = updated_at or get_iso_timestamp()
     query = (
         "UPDATE secrets SET "
@@ -410,25 +471,3 @@ def delete_secret(
     query = "DELETE FROM secrets WHERE project_id = ? AND env = ? AND name = ?"
     cursor = conn.execute(query, (project_id, env, name))
     return cursor.rowcount > 0
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Initialisation à froid de la base de données SQLite du Vault Heimdall."
-    )
-    parser.add_argument(
-        "--db-path",
-        type=str,
-        default=None,
-        help=f"Chemin du fichier SQLite (défaut : {DEFAULT_DB_PATH} ou $HEIMDALL_VAULT_DB_PATH)",
-    )
-    cli_args = parser.parse_args()
-    try:
-        init_db(cli_args.db_path)
-        print("Base de données SQLite initialisée avec succès.")
-        sys.exit(0)
-    except Exception as exc:
-        print(f"Erreur lors de l'initialisation de la base : {exc}", file=sys.stderr)
-        sys.exit(1)

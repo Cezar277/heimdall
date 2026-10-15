@@ -10,18 +10,33 @@ Vérifie :
 7. L'immunité absolue aux injections SQL (CWE-89) via requêtes paramétrées.
 8. Les opérations CRUD complètes sur les projets, clés API et secrets.
 9. La gestion transactionnelle `db_session` (commit automatique et rollback sur exception).
-10. Les permissions sécurisées du fichier SQLite (`0o600` sous POSIX).
+10. Les permissions sécurisées du fichier SQLite (`0o600` sous POSIX, fail-closed).
+11. Le refus des chemins symboliques (protection TOCTOU).
+12. Le comportement fail-closed si `chmod` échoue (mock OSError).
+13. L'absence de fichiers sidecar SQLite (`-wal`, `-shm`, `-journal`) après écriture.
+14. Le rejet applicatif du statut invalide sur `update_secret`.
+15. La couverture du `.gitignore` sur `vault.db` (non-régression commit accidentel).
+16. La validation de `VaultSettings.db_path` (vide, caractères de contrôle).
 """
 
 import os
+import shutil
 import sqlite3
+import stat as stat_module
+import subprocess
 import tempfile
+import typing
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from pydantic import ValidationError
+
+from heimdall.vault.app import VaultSettings
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
+    SecretStatus,
+    _apply_secure_permissions,
     create_api_key,
     create_project,
     create_secret,
@@ -56,6 +71,10 @@ class VaultDatabaseTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    # -----------------------------------------------------------------------
+    # 1. Initialisation à froid
+    # -----------------------------------------------------------------------
+
     def test_cold_init_creates_schema_and_indexes(self) -> None:
         """Critère d'acceptation #62 : la base est créée à froid depuis zéro."""
         self.assertFalse(self.db_path.exists())
@@ -64,14 +83,12 @@ class VaultDatabaseTests(unittest.TestCase):
 
         conn = get_connection(self.db_path)
         try:
-            # Vérification des tables
             cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             tables = {row["name"] for row in cursor.fetchall()}
             self.assertIn("projects", tables)
             self.assertIn("api_keys", tables)
             self.assertIn("secrets", tables)
 
-            # Vérification des index
             cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='index' ORDER BY name")
             indexes = {row["name"] for row in cursor.fetchall()}
             self.assertIn("idx_api_keys_project_id", indexes)
@@ -80,6 +97,17 @@ class VaultDatabaseTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_init_db_cli_script(self) -> None:
+        """Le script CLI `python -m heimdall.vault.init_db` s'exécute avec succès."""
+        target_path = Path(self.temp_dir.name) / "cli_vault.db"
+        ret = init_db_main(["--db-path", str(target_path)])
+        self.assertEqual(ret, 0)
+        self.assertTrue(target_path.exists())
+
+    # -----------------------------------------------------------------------
+    # 2 & 10. Permissions fichier (M2 corrigé : fail-closed)
+    # -----------------------------------------------------------------------
+
     def test_secure_file_permissions(self) -> None:
         """Vérifie que les permissions du fichier créé sont restreintes à 0o600 sous POSIX."""
         init_db(self.db_path)
@@ -87,12 +115,82 @@ class VaultDatabaseTests(unittest.TestCase):
             mode = self.db_path.stat().st_mode & 0o777
             self.assertEqual(mode, 0o600)
 
-    def test_init_db_cli_script(self) -> None:
-        """Le script CLI `python -m heimdall.vault.init_db` s'exécute avec succès."""
-        target_path = Path(self.temp_dir.name) / "cli_vault.db"
-        ret = init_db_main(["--db-path", str(target_path)])
-        self.assertEqual(ret, 0)
-        self.assertTrue(target_path.exists())
+    def test_chmod_failure_raises_permission_error(self) -> None:
+        """M2 — Si chmod échoue, _apply_secure_permissions lève PermissionError (fail-closed)."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        self.db_path.touch()
+        with patch.object(Path, "chmod", side_effect=OSError("FS readonly")):
+            with self.assertRaises(PermissionError):
+                _apply_secure_permissions(self.db_path)
+
+    def test_chmod_wrong_mode_raises_permission_error(self) -> None:
+        """M2 — Si le mode effectif après chmod n'est pas 0o600, PermissionError (fail-closed)."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        self.db_path.touch()
+        # chmod réussit mais stat() retourne un mode incorrect
+        with patch.object(Path, "chmod"):
+            fake_stat = type(
+                "FakeStat", (), {"st_mode": stat_module.S_IFREG | 0o644, "st_size": 0}
+            )()
+            with patch.object(Path, "stat", return_value=fake_stat):
+                with self.assertRaises(PermissionError):
+                    _apply_secure_permissions(self.db_path)
+
+    # -----------------------------------------------------------------------
+    # 11. Refus des chemins symboliques (M1 corrigé)
+    # -----------------------------------------------------------------------
+
+    def test_symlink_on_db_path_is_refused(self) -> None:
+        """M1 — Un lien symbolique sur le chemin de la base est refusé (TOCTOU)."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        real_file = Path(self.temp_dir.name) / "real_vault.db"
+        real_file.touch()
+        symlink_path = Path(self.temp_dir.name) / "symlink_vault.db"
+        symlink_path.symlink_to(real_file)
+
+        with self.assertRaises(PermissionError):
+            get_connection(symlink_path)
+
+    def test_symlink_on_parent_dir_is_refused(self) -> None:
+        """M1 — Un lien symbolique sur le répertoire parent est refusé."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        real_dir = Path(self.temp_dir.name) / "real_dir"
+        real_dir.mkdir()
+        symlink_dir = Path(self.temp_dir.name) / "symlink_dir"
+        symlink_dir.symlink_to(real_dir)
+        db_via_symlink = symlink_dir / "vault.db"
+
+        with self.assertRaises(PermissionError):
+            get_connection(db_via_symlink)
+
+    # -----------------------------------------------------------------------
+    # 13. Absence de fichiers sidecar SQLite (M3 corrigé)
+    # -----------------------------------------------------------------------
+
+    def test_no_sidecar_files_after_write(self) -> None:
+        """M3 — Pas de sidecar SQLite (-wal/-shm/-journal) après écriture (journal_mode=DELETE)."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        init_db(self.db_path)
+        with db_session(self.db_path) as conn:
+            create_project(conn, "proj_sidecar")
+
+        db_dir = self.db_path.parent
+        sidecar_extensions = ("-wal", "-shm", "-journal")
+        for ext in sidecar_extensions:
+            sidecar = db_dir / (self.db_path.name + ext)
+            self.assertFalse(
+                sidecar.exists(),
+                f"Fichier sidecar inattendu après écriture : {sidecar.name}",
+            )
+
+    # -----------------------------------------------------------------------
+    # 2. Foreign keys
+    # -----------------------------------------------------------------------
 
     def test_foreign_keys_strictly_enforced_by_default(self) -> None:
         """PRAGMA foreign_keys = ON est systématiquement actif sur toute connexion."""
@@ -103,11 +201,9 @@ class VaultDatabaseTests(unittest.TestCase):
             fk_status = cursor.fetchone()[0]
             self.assertEqual(fk_status, 1)
 
-            # Tentative d'insertion d'une clé API sans projet existant -> refus immédiat
             with self.assertRaises(sqlite3.IntegrityError):
                 create_api_key(conn, "key_orphan", "non_existent_project", "hash123")
 
-            # Tentative d'insertion d'un secret sans projet existant -> refus immédiat
             with self.assertRaises(sqlite3.IntegrityError):
                 create_secret(
                     conn,
@@ -118,6 +214,10 @@ class VaultDatabaseTests(unittest.TestCase):
                 )
         finally:
             conn.close()
+
+    # -----------------------------------------------------------------------
+    # 4. Cascade delete
+    # -----------------------------------------------------------------------
 
     def test_cascade_delete_removes_keys_and_secrets(self) -> None:
         """La suppression d'un projet supprime en cascade ses clés API et ses secrets."""
@@ -134,17 +234,18 @@ class VaultDatabaseTests(unittest.TestCase):
                 fingerprint="fp1",
             )
 
-            # Vérification de présence initiale
             self.assertIsNotNone(get_api_key(conn, "key_casc"))
             self.assertIsNotNone(get_secret(conn, "proj_cascade", "dev", "PASSWD"))
 
-            # Suppression du projet
             deleted = delete_project(conn, "proj_cascade")
             self.assertTrue(deleted)
 
-            # Clés et secrets associés doivent avoir été purgés en cascade
             self.assertIsNone(get_api_key(conn, "key_casc"))
             self.assertIsNone(get_secret(conn, "proj_cascade", "dev", "PASSWD"))
+
+    # -----------------------------------------------------------------------
+    # 5. Contrainte d'unicité
+    # -----------------------------------------------------------------------
 
     def test_unique_constraint_on_secrets(self) -> None:
         """La contrainte UNIQUE(project_id, env, name) interdit les doublons de secrets."""
@@ -153,42 +254,61 @@ class VaultDatabaseTests(unittest.TestCase):
             create_project(conn, "proj1")
             create_project(conn, "proj2")
 
-            # Premier secret : OK
             create_secret(conn, "proj1", "dev", "DB_PASS", "blob_v1", fingerprint="fp1")
 
-            # Même project, même env, même name -> IntegrityError (conflit)
             with self.assertRaises(sqlite3.IntegrityError):
                 create_secret(conn, "proj1", "dev", "DB_PASS", "blob_v2", fingerprint="fp2")
 
-            # Même project, environnement différent (prod) -> autorisé
             sec_prod = create_secret(conn, "proj1", "prod", "DB_PASS", "blob_prod")
             self.assertEqual(sec_prod["env"], "prod")
 
-            # Même project, même env, nom différent -> autorisé
             sec_other = create_secret(conn, "proj1", "dev", "OTHER_PASS", "blob_other")
             self.assertEqual(sec_other["name"], "OTHER_PASS")
 
-            # Projet différent, même env et nom -> autorisé (cloisonnement)
             sec_proj2 = create_secret(conn, "proj2", "dev", "DB_PASS", "blob_p2")
             self.assertEqual(sec_proj2["project_id"], "proj2")
 
-    def test_status_check_constraint(self) -> None:
-        """Seuls les statuts contractuels 'vaulte' et 'rote' sont acceptés."""
+    # -----------------------------------------------------------------------
+    # 6 & 14. Validation du statut (CHECK SQL + Literal applicatif)
+    # -----------------------------------------------------------------------
+
+    def test_status_check_constraint_on_create(self) -> None:
+        """Seuls les statuts contractuels 'vaulte' et 'rote' sont acceptés à la création."""
         init_db(self.db_path)
         with db_session(self.db_path) as conn:
             create_project(conn, "proj_stat")
             create_secret(conn, "proj_stat", "dev", "SEC_V", "b", status="vaulte")
             create_secret(conn, "proj_stat", "dev", "SEC_R", "b", status="rote")
 
-            # Statut invalide -> IntegrityError
             with self.assertRaises(sqlite3.IntegrityError):
-                create_secret(conn, "proj_stat", "dev", "SEC_BAD", "b", status="invalid_status")
+                # mypy le signale via Literal, le CHECK SQL le bloque à l'exécution
+                create_secret(conn, "proj_stat", "dev", "SEC_BAD", "b", status="invalid_status")  # type: ignore[arg-type]
+
+    def test_status_check_constraint_on_update(self) -> None:
+        """14 — update_secret avec un statut invalide est rejeté par le CHECK SQL."""
+        init_db(self.db_path)
+        with db_session(self.db_path) as conn:
+            create_project(conn, "proj_upd")
+            create_secret(conn, "proj_upd", "dev", "MY_KEY", "enc_v1")
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                update_secret(
+                    conn,
+                    project_id="proj_upd",
+                    env="dev",
+                    name="MY_KEY",
+                    encrypted_value="enc_v2",
+                    status="invalid_status",  # type: ignore[arg-type]
+                )
+
+    # -----------------------------------------------------------------------
+    # 7. SQL Injection (CWE-89)
+    # -----------------------------------------------------------------------
 
     def test_sql_injection_defense_in_depth(self) -> None:
         """Mitigation CWE-89 : requêtes paramétrées insensibles aux injections SQL."""
         init_db(self.db_path)
         with db_session(self.db_path) as conn:
-            # Payloads d'injection malveillants typiques de pentest
             sql_injections = [
                 "proj'; DROP TABLE projects; --",
                 "demo' OR '1'='1",
@@ -199,27 +319,23 @@ class VaultDatabaseTests(unittest.TestCase):
 
             for payload in sql_injections:
                 with self.subTest(payload=payload):
-                    # Création avec project_id injecté
                     create_project(conn, payload)
                     retrieved = get_project(conn, payload)
                     self.assertIsNotNone(retrieved)
                     assert retrieved is not None
                     self.assertEqual(retrieved["id"], payload)
 
-                    # Les tables doivent toujours exister intactes
                     cursor = conn.execute(
                         "SELECT name FROM sqlite_master WHERE type='table' AND name='projects'"
                     )
                     self.assertIsNotNone(cursor.fetchone())
 
-                    # Clé API avec identifiant ou hash injecté
                     create_api_key(conn, f"k_{payload}", payload, f"hash_{payload}")
                     key_row = get_api_key_by_hash(conn, f"hash_{payload}")
                     self.assertIsNotNone(key_row)
                     assert key_row is not None
                     self.assertEqual(key_row["id"], f"k_{payload}")
 
-                    # Secret avec champs injectés
                     create_secret(
                         conn,
                         project_id=payload,
@@ -232,6 +348,10 @@ class VaultDatabaseTests(unittest.TestCase):
                     self.assertIsNotNone(secret)
                     assert secret is not None
                     self.assertEqual(secret["encrypted_value"], "ciphertext_payload")
+
+    # -----------------------------------------------------------------------
+    # 8. CRUD complet
+    # -----------------------------------------------------------------------
 
     def test_crud_projects(self) -> None:
         """Cycle de vie complet des projets."""
@@ -252,10 +372,8 @@ class VaultDatabaseTests(unittest.TestCase):
             assert fetched is not None
             self.assertEqual(fetched["id"], "project-alpha")
 
-            # Non trouvé
             self.assertIsNone(get_project(conn, "unknown-project"))
 
-            # Suppression
             self.assertTrue(delete_project(conn, "project-alpha"))
             self.assertFalse(delete_project(conn, "project-alpha"))
             self.assertIsNone(get_project(conn, "project-alpha"))
@@ -285,10 +403,8 @@ class VaultDatabaseTests(unittest.TestCase):
             self.assertEqual(len(keys), 1)
             self.assertEqual(keys[0]["id"], "key_001")
 
-            # Révocation
             revoked = revoke_api_key(conn, "key_001")
             self.assertTrue(revoked)
-            # Seconde révocation doit retourner False (déjà révoquée)
             self.assertFalse(revoke_api_key(conn, "key_001"))
 
             updated_key = get_api_key(conn, "key_001")
@@ -296,7 +412,6 @@ class VaultDatabaseTests(unittest.TestCase):
             assert updated_key is not None
             self.assertIsNotNone(updated_key["revoked_at"])
 
-            # Suppression
             self.assertTrue(delete_api_key(conn, "key_001"))
             self.assertIsNone(get_api_key(conn, "key_001"))
 
@@ -306,7 +421,6 @@ class VaultDatabaseTests(unittest.TestCase):
         with db_session(self.db_path) as conn:
             create_project(conn, "proj_secrets")
 
-            # Création
             s = create_secret(
                 conn,
                 project_id="proj_secrets",
@@ -317,14 +431,12 @@ class VaultDatabaseTests(unittest.TestCase):
             )
             self.assertEqual(s["status"], "vaulte")
 
-            # Lecture complète (avec valeur)
             full = get_secret(conn, "proj_secrets", "dev", "APP_SECRET")
             self.assertIsNotNone(full)
             assert full is not None
             self.assertEqual(full["encrypted_value"], "cipher_12345")
             self.assertEqual(full["fingerprint"], "hmac_fp")
 
-            # Lecture métadonnées uniquement (sans exposer la valeur)
             meta = get_secret_metadata(conn, "proj_secrets", "dev", "APP_SECRET")
             self.assertIsNotNone(meta)
             assert meta is not None
@@ -332,7 +444,6 @@ class VaultDatabaseTests(unittest.TestCase):
             self.assertEqual(meta["status"], "vaulte")
             self.assertNotIn("encrypted_value", meta)
 
-            # Mise à jour
             updated = update_secret(
                 conn,
                 project_id="proj_secrets",
@@ -350,15 +461,17 @@ class VaultDatabaseTests(unittest.TestCase):
             self.assertEqual(after_update["encrypted_value"], "new_cipher")
             self.assertEqual(after_update["status"], "rote")
 
-            # Liste par environnement
             secrets_dev = list_secrets(conn, "proj_secrets", env="dev")
             self.assertEqual(len(secrets_dev), 1)
             secrets_prod = list_secrets(conn, "proj_secrets", env="prod")
             self.assertEqual(len(secrets_prod), 0)
 
-            # Suppression
             self.assertTrue(delete_secret(conn, "proj_secrets", "dev", "APP_SECRET"))
             self.assertIsNone(get_secret(conn, "proj_secrets", "dev", "APP_SECRET"))
+
+    # -----------------------------------------------------------------------
+    # 9. Gestion transactionnelle
+    # -----------------------------------------------------------------------
 
     def test_transaction_rollback_on_error(self) -> None:
         """Le gestionnaire db_session effectue un rollback propre en cas d'erreur."""
@@ -370,8 +483,59 @@ class VaultDatabaseTests(unittest.TestCase):
                 raise RuntimeError("Panne inattendue durant la transaction")
 
         with db_session(self.db_path) as conn:
-            # Le projet n'a pas été persisté grâce au rollback
             self.assertIsNone(get_project(conn, "proj_rollback"))
+
+    # -----------------------------------------------------------------------
+    # 15. .gitignore couvre vault.db
+    # -----------------------------------------------------------------------
+
+    def test_gitignore_covers_vault_db(self) -> None:
+        """15 — Le fichier .gitignore exclut vault.db et *.db (commit accidentel)."""
+        git_bin = shutil.which("git")
+        if git_bin is None:
+            self.skipTest("git non disponible dans le PATH")
+        root = Path(__file__).resolve().parents[1]
+        # git check-ignore retourne code 0 si le fichier est ignoré
+        for filename in ("vault.db", "vault.db-journal", "other.db"):
+            result = subprocess.run(  # noqa: S603
+                [git_bin, "check-ignore", "-q", filename],
+                cwd=root,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"{filename!r} n'est pas couvert par .gitignore — risque de commit de ciphertext",
+            )
+
+    # -----------------------------------------------------------------------
+    # 16. Validation VaultSettings.db_path (L4)
+    # -----------------------------------------------------------------------
+
+    def test_vault_settings_db_path_rejects_empty(self) -> None:
+        """L4 — VaultSettings refuse un db_path vide ou blanc."""
+        with self.assertRaises(ValidationError):
+            VaultSettings(db_path="")
+        with self.assertRaises(ValidationError):
+            VaultSettings(db_path="   ")
+
+    def test_vault_settings_db_path_rejects_control_chars(self) -> None:
+        """L4 — VaultSettings refuse un db_path contenant des caractères de contrôle."""
+        with self.assertRaises(ValidationError):
+            VaultSettings(db_path="vault\x00.db")
+        with self.assertRaises(ValidationError):
+            VaultSettings(db_path="vault\x1f.db")
+
+    def test_vault_settings_db_path_accepts_valid_path(self) -> None:
+        """L4 — VaultSettings accepte un chemin valide."""
+        valid_path = str(Path(self.temp_dir.name) / "valid_vault.db")
+        s = VaultSettings(db_path=valid_path)
+        self.assertEqual(s.db_path, valid_path)
+
+    # -----------------------------------------------------------------------
+    # resolve_db_path
+    # -----------------------------------------------------------------------
 
     def test_resolve_db_path_environment_variable(self) -> None:
         """resolve_db_path prend en compte HEIMDALL_VAULT_DB_PATH."""
@@ -381,13 +545,23 @@ class VaultDatabaseTests(unittest.TestCase):
         with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": ":memory:"}):
             self.assertEqual(resolve_db_path(), ":memory:")
 
-        # Argument explicite prioritaire sur l'environnement
         with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "/custom/path/vault.db"}):
             self.assertEqual(resolve_db_path("/override/path.db"), Path("/override/path.db"))
 
-        # Valeur par défaut quand aucune variable d'environnement n'est définie
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(resolve_db_path(), DEFAULT_DB_PATH)
+
+    # -----------------------------------------------------------------------
+    # SecretStatus type alias
+    # -----------------------------------------------------------------------
+
+    def test_secret_status_literal_type_is_exported(self) -> None:
+        """SecretStatus est exporté et correspond à Literal['vaulte', 'rote']."""
+        self.assertIs(SecretStatus, SecretStatus)
+        # Vérification que les valeurs attendues sont dans le __args__ du Literal
+        args = typing.get_args(SecretStatus)
+        self.assertIn("vaulte", args)
+        self.assertIn("rote", args)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,9 @@ from starlette.requests import Request
 
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
 
+# Seuil ASCII en dessous duquel un caractère est un caractère de contrôle (hors \t).
+_CONTROL_CHAR_THRESHOLD: int = 0x20
+
 _ERROR_PAYLOADS: dict[int, dict[str, str]] = {
     400: {"code": "bad_request", "message": "Requête invalide"},
     401: {"code": "unauthorized", "message": "Authentification requise"},
@@ -159,6 +162,20 @@ class VaultSettings(BaseSettings):
         default="vault.db",
         description="Chemin du fichier de base de données SQLite.",
     )
+
+    @field_validator("db_path")
+    @classmethod
+    def validate_db_path(cls, value: str) -> str:
+        """Refuse les chemins vides ou contenant des caractères de contrôle."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Le chemin de la base de données SQLite ne peut pas être vide.")
+        # Caractères de contrôle (hors \t ordinaire) : protection injection de chemin.
+        if any(ord(c) < _CONTROL_CHAR_THRESHOLD and c != "\t" for c in value):
+            raise ValueError(
+                "Le chemin de la base de données SQLite contient des caractères de contrôle."
+            )
+        return value
 
     @field_validator("host")
     @classmethod

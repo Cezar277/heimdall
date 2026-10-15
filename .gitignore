@@ -32,6 +32,11 @@ id_ed25519*
 *.keystore
 secrets/
 secrets.local.json
+# Base SQLite du Vault : contient ciphertext + key_hash + fingerprints
+# Ne jamais versionner, même sur une machine de développement (#62).
+vault.db
+vault.db-journal
+*.db
 
 # --- Outils / OS / IDE ---
 bandit-report.json
