@@ -98,10 +98,17 @@ choix.
 ## Installation d'Ollama (résumé opposable)
 
 ```sh
-# 1. Télécharger le script officiel et contrôler son intégrité avant exécution :
+# 1. Télécharger le script officiel dans un fichier imprévisible et contrôler
+#    son intégrité avant exécution (mktemp : pas de chemin fixe dans /tmp,
+#    donc pas de pré-positionnement de symlink par un attaquant local) :
 #    Source de référence : script install.sh officiel Ollama (https://raw.githubusercontent.com/ollama/ollama/v0.40.4/scripts/install.sh)
-curl -fsSL -o /tmp/ollama-install.sh https://ollama.com/install.sh
-echo "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f  /tmp/ollama-install.sh" | sha256sum -c && sh /tmp/ollama-install.sh
+TMP_INSTALL="$(mktemp -t ollama-install.XXXXXX)" \
+  && curl -fsSL -o "$TMP_INSTALL" https://ollama.com/install.sh \
+  && echo "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f  $TMP_INSTALL" | sha256sum -c - \
+  && sh "$TMP_INSTALL"
+STATUS=$?
+[ -n "${TMP_INSTALL:-}" ] && rm -f "$TMP_INSTALL"
+test "$STATUS" -eq 0
 # Alternative durcie (recommandée) : paquet distribution épinglé ou binaire autonome vérifié (cosign/sbom).
 # Note : Procédure d'installation hôte hors périmètre direct pentest applicatif, durcissement et confinement en T28.4.
 
@@ -149,9 +156,9 @@ La preuve « zéro trafic sortant » (fixture `socket.connect` loopback-only +
 
 ## Preuve pour le rapport
 
-- Preuves de sécurité et permaliens code (revendicables pour la feuille SAMM avec SHA de commit `672fa2e`) :
-  - **Local-only (Invariant 12)** : [`benchmark_llm_ollama.py:35-39`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L35-L39) (`import urllib.request` ligne 35 et `ENDPOINT` ligne 39, zéro dépendance réseau externe).
-  - **Fail-closed mesuré (Invariant 1)** : [`benchmark_llm_ollama.py:298-303`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L298-L303) (fonction `score()`) et gestion stricte des erreurs réseau/parse avec `ok=False` ([`benchmark_llm_ollama.py:344-356`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L344-L356)), compteur de régression `fn_dangereux` calculé ligne 364/372.
-  - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` (ligne 256) et candidat isolé hors prompt système ([`benchmark_llm_ollama.py:254-273`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L254-L273)), évalué sur le panel d'injections (4 cas dans `CASES_20` (lignes 109-188) + 30 cas dans `gen_full()` (lignes 237-246, bloc `weird`)).
-  - **Confinement Invariant 3 & 10** : validation stricte du chemin de sortie `--out` sous le répertoire courant interdisant tout chemin absolu ou segment traversant `..` ([`benchmark_llm_ollama.py:60-76`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L60-L76)) et écriture atomique avec `fsync` + `os.replace` ([`benchmark_llm_ollama.py:79-94`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L79-L94)).
+- Preuves de sécurité et permaliens code (revendicables pour la feuille SAMM avec SHA de commit `8ff66ff` — au moment du merge, régénérer ces liens avec le SHA de merge, pas avec ce SHA intermédiaire) :
+  - **Local-only (Invariant 12)** : [`benchmark_llm_ollama.py:35-39`](https://github.com/Cezar277/heimdall/blob/8ff66fff5e812b12f187ec735f136d589e1ecc49/tests/benchmarks/benchmark_llm_ollama.py#L35-L39) (`import urllib.request` ligne 35 et `ENDPOINT` ligne 39, zéro dépendance réseau externe).
+  - **Fail-closed mesuré (Invariant 1)** : [`benchmark_llm_ollama.py:298-303`](https://github.com/Cezar277/heimdall/blob/8ff66fff5e812b12f187ec735f136d589e1ecc49/tests/benchmarks/benchmark_llm_ollama.py#L298-L303) (fonction `score()`) et gestion stricte des erreurs réseau/parse avec `ok=False` ([`benchmark_llm_ollama.py:344-356`](https://github.com/Cezar277/heimdall/blob/8ff66fff5e812b12f187ec735f136d589e1ecc49/tests/benchmarks/benchmark_llm_ollama.py#L344-L356)), compteur de régression `fn_dangereux` calculé ligne 364/372.
+  - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` (ligne 256) et candidat isolé hors prompt système ([`benchmark_llm_ollama.py:254-273`](https://github.com/Cezar277/heimdall/blob/8ff66fff5e812b12f187ec735f136d589e1ecc49/tests/benchmarks/benchmark_llm_ollama.py#L254-L273)), évalué sur le panel d'injections (4 cas dans `CASES_20` (lignes 109-188) + 30 cas dans `gen_full()` (lignes 237-246, bloc `weird`)).
+  - **Confinement Invariant 3 & 10** : validation stricte du chemin de sortie `--out` sous le répertoire courant interdisant tout chemin absolu ou segment traversant `..` ([`benchmark_llm_ollama.py:60-76`](https://github.com/Cezar277/heimdall/blob/8ff66fff5e812b12f187ec735f136d589e1ecc49/tests/benchmarks/benchmark_llm_ollama.py#L60-L76)) et écriture atomique avec `fsync` + `os.replace` ([`benchmark_llm_ollama.py:79-88`](https://github.com/Cezar277/heimdall/blob/8ff66fff5e812b12f187ec735f136d589e1ecc49/tests/benchmarks/benchmark_llm_ollama.py#L79-L88)).
 - **Reproductibilité des mesures** : 152 cas réels (graine 281), commande `python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --out bench.json`, fichier de sortie `bench.json` archivé dans le ticket #79 pour opposabilité.

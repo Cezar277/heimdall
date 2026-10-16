@@ -273,6 +273,23 @@ class TestValidationAndHardening:
         with pytest.raises(ValueError, match=r"\.\."):
             validate_output_path("subdir/../../escape.json", base_dir=base)
 
+    def test_validate_output_path_rejects_symlink_escape(self, tmp_path: Path) -> None:
+        base = tmp_path.resolve()
+        # Cible HORS du socle (voisine de tmp_path, pas dedans).
+        outside = tmp_path.parent / (tmp_path.name + "-outside")
+        outside.mkdir(exist_ok=True)
+
+        # Un symlink interne qui pointe hors du socle doit être rejeté
+        # une fois résolu (resolve + is_relative_to).
+        (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(ValueError, match="confiné"):
+            validate_output_path("link/escape.json", base_dir=base)
+
+        (outside / "evil.txt").write_text("x", encoding="utf-8")
+        (tmp_path / "linkfile").symlink_to(outside / "evil.txt")
+        with pytest.raises(ValueError, match="confiné"):
+            validate_output_path("linkfile", base_dir=base)
+
     def test_atomic_write_json(self, tmp_path: Path) -> None:
         target = tmp_path / "subdir" / "summary.json"
         data = [{"model": "gemma3:270m", "score": 100}]
