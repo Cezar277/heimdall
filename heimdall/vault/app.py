@@ -51,6 +51,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
+from heimdall.vault.database import resolve_db_path, validate_db_path
+
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
 
 logger = logging.getLogger("heimdall.vault.app")
@@ -169,16 +171,11 @@ class VaultSettings(BaseSettings):
     @field_validator("db_path")
     @classmethod
     def validate_db_path(cls, value: str) -> str:
-        """Refuse les chemins vides ou contenant des caractères de contrôle."""
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("Le chemin de la base de données SQLite ne peut pas être vide.")
-        # Caractères de contrôle (hors \t ordinaire) : protection injection de chemin.
-        if any(ord(c) < _CONTROL_CHAR_THRESHOLD and c != "\t" for c in stripped):
-            raise ValueError(
-                "Le chemin de la base de données SQLite contient des caractères de contrôle."
-            )
-        return stripped
+        """Refuse les chemins invalides en réutilisant le validateur factorisé."""
+        try:
+            return validate_db_path(value)
+        except IsADirectoryError as exc:
+            raise ValueError(str(exc)) from exc
 
     @field_validator("host")
     @classmethod
@@ -227,8 +224,9 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
         openapi_url=openapi_url,
     )
     app.state.settings = effective_settings
-    app.state.db_path = effective_settings.db_path
-    logger.info("Base de données SQLite configurée : %s", effective_settings.db_path)
+    resolved_db = resolve_db_path(effective_settings.db_path)
+    app.state.db_path = resolved_db
+    logger.info("Base de données SQLite configurée : %s", resolved_db)
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:

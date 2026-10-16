@@ -439,11 +439,12 @@ class VaultSettingsTests(unittest.TestCase):
 
     def test_create_app_factory_applies_settings_parameter(self) -> None:
         """create_app applique les paramètres transmis et ne les ignore pas."""
-        custom_settings = VaultSettings(host="::1", port=8445, enable_docs=True)
+        custom_settings = VaultSettings(host="::1", port=8445, enable_docs=True, db_path=":memory:")
         custom_app = create_app(custom_settings)
         self.assertIsInstance(custom_app, FastAPI)
         self.assertEqual(custom_app.title, "Heimdall Vault API")
         self.assertIs(custom_app.state.settings, custom_settings)
+        self.assertEqual(custom_app.state.db_path, ":memory:")
         self.assertEqual(custom_app.docs_url, "/docs")
         self.assertEqual(custom_app.openapi_url, "/openapi.json")
 

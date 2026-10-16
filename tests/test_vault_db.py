@@ -28,6 +28,7 @@ import subprocess
 import tempfile
 import typing
 import unittest
+import warnings
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
@@ -59,6 +60,7 @@ from heimdall.vault.database import (
     resolve_db_path,
     revoke_api_key,
     update_secret,
+    validate_db_path,
 )
 from heimdall.vault.init_db import main as init_db_main
 
@@ -598,6 +600,11 @@ class VaultDatabaseTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             VaultSettings(db_path="vault\x1f.db")
 
+    def test_vault_settings_db_path_rejects_directory(self) -> None:
+        """VaultSettings refuse un db_path pointant vers un répertoire existant."""
+        with self.assertRaises(ValidationError):
+            VaultSettings(db_path=self.temp_dir.name)
+
     def test_vault_settings_db_path_accepts_valid_path(self) -> None:
         """L4 — VaultSettings accepte un chemin valide et normalise les espaces."""
         valid_path = str(Path(self.temp_dir.name) / "valid_vault.db")
@@ -605,8 +612,40 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertEqual(s.db_path, valid_path)
 
     # -----------------------------------------------------------------------
-    # resolve_db_path
+    # resolve_db_path & validate_db_path
     # -----------------------------------------------------------------------
+
+    def test_validate_db_path_direct(self) -> None:
+        """validate_db_path valide les entrées valides et refuse les entrées invalides."""
+        self.assertEqual(validate_db_path(":memory:"), ":memory:")
+        self.assertEqual(validate_db_path("  :memory:  "), ":memory:")
+        self.assertEqual(validate_db_path("path/to/vault.db"), "path/to/vault.db")
+        with self.assertRaises(ValueError):
+            validate_db_path("")
+        with self.assertRaises(ValueError):
+            validate_db_path("   ")
+        with self.assertRaises(ValueError):
+            validate_db_path("vault\x00.db")
+        with self.assertRaises(ValueError):
+            validate_db_path("vault\n.db")
+        with self.assertRaises(IsADirectoryError):
+            validate_db_path(self.temp_dir.name)
+
+    def test_resolve_db_path_rejects_empty_and_whitespace(self) -> None:
+        """resolve_db_path avec chaîne vide ou blanche lève ValueError."""
+        with self.assertRaises(ValueError):
+            resolve_db_path("")
+        with self.assertRaises(ValueError):
+            resolve_db_path("   ")
+
+    def test_resolve_db_path_rejects_control_characters(self) -> None:
+        """resolve_db_path refuse les caractères de contrôle dans le chemin."""
+        with self.assertRaises(ValueError):
+            resolve_db_path("vault\x00.db")
+        with self.assertRaises(ValueError):
+            resolve_db_path("vault\n.db")
+        with self.assertRaises(ValueError):
+            resolve_db_path("vault\x1f.db")
 
     def test_resolve_db_path_environment_variable(self) -> None:
         """resolve_db_path prend en compte HEIMDALL_VAULT_DB_PATH."""
@@ -624,6 +663,87 @@ class VaultDatabaseTests(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(resolve_db_path(), DEFAULT_DB_PATH)
+
+    def test_resolve_db_path_env_rejects_empty_and_control_chars(self) -> None:
+        """resolve_db_path valide la variable HEIMDALL_VAULT_DB_PATH (vide, espaces, ctrl)."""
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": ""}):
+            with self.assertRaises(ValueError):
+                resolve_db_path()
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "   "}):
+            with self.assertRaises(ValueError):
+                resolve_db_path()
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "vault\n.db"}):
+            with self.assertRaises(ValueError):
+                resolve_db_path()
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "vault\x1f.db"}):
+            with self.assertRaises(ValueError):
+                resolve_db_path()
+        with patch.object(os.environ, "get", return_value="vault\x00.db"):
+            with self.assertRaises(ValueError):
+                resolve_db_path()
+
+    def test_relative_db_path_resolved_against_cwd(self) -> None:
+        """Pinnage CWD (remarque 1) : un chemin relatif résolu dépend du CWD courant."""
+        cwd1 = Path(self.temp_dir.name) / "cwd1"
+        cwd2 = Path(self.temp_dir.name) / "cwd2"
+        cwd1.mkdir()
+        cwd2.mkdir()
+        rel_path = "relative_vault.db"
+        resolved = resolve_db_path(rel_path)
+        self.assertIsInstance(resolved, Path)
+        assert isinstance(resolved, Path)
+        self.assertFalse(resolved.is_absolute())
+        # La résolution absolue dans deux CWD distincts donne deux chemins différents
+        abs_cwd1 = (cwd1 / resolved).resolve()
+        abs_cwd2 = (cwd2 / resolved).resolve()
+        self.assertNotEqual(abs_cwd1, abs_cwd2)
+        self.assertEqual(abs_cwd1.name, abs_cwd2.name)
+
+    def test_windows_warning_on_apply_secure_permissions(self) -> None:
+        """_apply_secure_permissions émet un RuntimeWarning sous Windows (remarque 4)."""
+        with patch("os.name", "nt"):
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                _apply_secure_permissions(self.db_path)
+                self.assertEqual(len(recorded), 1)
+                self.assertTrue(issubclass(recorded[0].category, RuntimeWarning))
+                self.assertIn("POSIX", str(recorded[0].message))
+
+    def test_exception_messages_do_not_leak_absolute_path(self) -> None:
+        """Sanitization : les exceptions ne contiennent aucun chemin FS absolu (remarque 2)."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        real_file = Path(self.temp_dir.name) / "real.db"
+        real_file.touch()
+        symlink = Path(self.temp_dir.name) / "sym.db"
+        symlink.symlink_to(real_file)
+
+        # 1. Symlink
+        with self.assertRaises(PermissionError) as ctx_sym:
+            get_connection(symlink)
+        self.assertNotIn(str(symlink), str(ctx_sym.exception))
+        self.assertNotIn(str(real_file), str(ctx_sym.exception))
+
+        # 2. Répertoire existant
+        existing_dir = Path(self.temp_dir.name) / "dir_test"
+        existing_dir.mkdir()
+        with self.assertRaises(IsADirectoryError) as ctx_dir:
+            get_connection(existing_dir)
+        self.assertNotIn(str(existing_dir), str(ctx_dir.exception))
+
+        # 3. Chmod failure
+        with patch.object(Path, "chmod", side_effect=OSError("Read-only")):
+            with self.assertRaises(PermissionError) as ctx_chmod:
+                _apply_secure_permissions(real_file)
+            self.assertNotIn(str(real_file), str(ctx_chmod.exception))
+
+        # 4. Mode mismatch
+        fake_stat = type("FakeStat", (), {"st_mode": stat_module.S_IFREG | 0o644, "st_size": 0})()
+        with patch.object(Path, "chmod"):
+            with patch.object(Path, "stat", return_value=fake_stat):
+                with self.assertRaises(PermissionError) as ctx_mode:
+                    _apply_secure_permissions(real_file)
+                self.assertNotIn(str(real_file), str(ctx_mode.exception))
 
     def test_resolve_db_path_memory_as_path_object(self) -> None:
         """resolve_db_path avec Path(':memory:') retourne la chaîne ':memory:'."""

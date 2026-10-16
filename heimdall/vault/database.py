@@ -27,13 +27,17 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
     `-wal`/`-shm`/`-journal` en permissions larges.
 """
 
+import logging
 import os
 import sqlite3
+import warnings
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 SecretStatus = Literal["vaulte", "rote"]
 _ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
@@ -42,6 +46,7 @@ DEFAULT_DB_PATH: Path = Path("vault.db")
 
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
+_CONTROL_CHAR_THRESHOLD: int = 0x20
 
 SCHEMA_SQL: str = """
 PRAGMA foreign_keys = ON;
@@ -88,19 +93,58 @@ def get_iso_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def validate_db_path(db_path: Path | str) -> str:
+    """Valide et normalise une chaîne ou un objet Path représentant un chemin SQLite.
+
+    Règles de validation :
+    - Refuse les chemins vides ou composés uniquement d'espaces.
+    - Refuse les caractères de contrôle (< 0x20 hors tabulation).
+    - Refuse les chemins pointant vers un répertoire existant.
+    - Autorise le mode spécial SQLite ':memory:'.
+
+    Lève ValueError si vide ou avec caractères de contrôle.
+    Lève IsADirectoryError si le chemin pointe vers un répertoire existant.
+    """
+    stripped = str(db_path).strip()
+    if not stripped:
+        raise ValueError("Le chemin de la base de données SQLite ne peut pas être vide.")
+    if any(ord(c) < _CONTROL_CHAR_THRESHOLD and c != "\t" for c in stripped):
+        raise ValueError(
+            "Le chemin de la base de données SQLite contient des caractères de contrôle."
+        )
+    if stripped != ":memory:" and Path(stripped).is_dir():
+        logger.debug("Chemin de base de données pointe vers un répertoire existant : %s", stripped)
+        raise IsADirectoryError(
+            "Chemin de base de données invalide : pointe vers un répertoire existant"
+        )
+    return stripped
+
+
 def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
-    """Résout le chemin de la base de données (argument, variable d'environnement ou défaut)."""
+    """Résout et valide le chemin SQLite (argument, variable d'environnement ou défaut).
+
+    Ordre de priorité :
+    1. Argument explicite `db_path`
+    2. Variable d'environnement `HEIMDALL_VAULT_DB_PATH`
+    3. `DEFAULT_DB_PATH`
+
+    Comportement CWD (remarque 1 de revue) :
+    Les chemins relatifs passés en argument ou via variable d'environnement sont
+    interprétés relativement au répertoire de travail courant (CWD / `Path.cwd()`).
+    Pour éviter tout cloisonnement silencieux entre deux processus ayant des CWD
+    distincts, privilégier des chemins absolus (ou ':memory:' en test).
+    """
     if db_path is not None:
-        stripped = str(db_path).strip()
-        if stripped == ":memory:":
+        validated = validate_db_path(db_path)
+        if validated == ":memory:":
             return ":memory:"
-        return Path(stripped)
+        return Path(validated)
     env_path = os.environ.get("HEIMDALL_VAULT_DB_PATH")
-    if env_path:
-        stripped = env_path.strip()
-        if stripped == ":memory:":
+    if env_path is not None:
+        validated = validate_db_path(env_path)
+        if validated == ":memory:":
             return ":memory:"
-        return Path(stripped)
+        return Path(validated)
     return DEFAULT_DB_PATH
 
 
@@ -117,8 +161,9 @@ def _assert_not_symlink(path: Path) -> None:
 
     for p in candidates:
         if os.path.islink(p):
+            logger.debug("Chemin de base de données refusé (symlink détecté) : %s", p)
             raise PermissionError(
-                f"Chemin de base de données refusé : lien symbolique interdit ({p})"
+                "Chemin de base de données refusé : lien symbolique interdit"
             )
 
 
@@ -127,21 +172,38 @@ def _apply_secure_permissions(path: Path) -> None:
 
     Lève PermissionError si le chmod échoue ou si le mode effectif après chmod diffère
     de 0o600 — fail-closed : mieux vaut planter que laisser la base lisible.
+
+    Plateformes non-POSIX (Windows / nt) :
+    Le Vault Heimdall requiert un environnement POSIX pour garantir le confinement
+    des permissions fichier (0o600). Sous Windows, les ACL ne sont pas restreintes
+    nativement via os.chmod ; cette fonction émet un RuntimeWarning explicite.
     """
     if os.name == "nt":
+        warnings.warn(
+            "Le Vault Heimdall requiert un environnement POSIX pour garantir le confinement "
+            "des permissions fichier (0o600). Sous Windows, les ACL ne sont pas restreintes.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return
     try:
         path.chmod(_SECURE_FILE_MODE)
     except OSError as exc:
+        logger.debug("Échec du chmod 0o600 sur %s : %s", path, exc)
         raise PermissionError(
-            f"Impossible de sécuriser les permissions de la base SQLite ({path}) : {exc}"
+            "Impossible de sécuriser les permissions de la base SQLite"
         ) from exc
     # Vérification post-chmod (fail-closed)
     actual_mode = path.stat().st_mode & 0o777
     if actual_mode != _SECURE_FILE_MODE:
+        logger.debug(
+            "Permissions insuffisantes sur %s : attendu 0o600, obtenu %s",
+            path,
+            oct(actual_mode),
+        )
         raise PermissionError(
-            f"Permissions de la base SQLite insuffisantes : attendu 0o600, obtenu "
-            f"{oct(actual_mode)} ({path})"
+            "Permissions de la base SQLite insuffisantes : attendu 0o600, "
+            f"obtenu {oct(actual_mode)}"
         )
 
 
@@ -158,8 +220,9 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
     """
     _assert_not_symlink(path)
     if path.is_dir():
+        logger.debug("Chemin de base de données pointe vers un répertoire : %s", path)
         raise IsADirectoryError(
-            f"Chemin de base de données invalide : pointe vers un répertoire existant ({path})"
+            "Chemin de base de données invalide : pointe vers un répertoire existant"
         )
 
     old_umask = os.umask(0o077)
