@@ -429,6 +429,7 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
         "parse_constant",
         "QualifyVerdict",
         'extra="forbid"',
+        "isinstance(model, str)",
     ):
         assert token in client_src, token
     # Le prompt versionné est embarqué dans le wheel (sinon toute install

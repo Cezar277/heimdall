@@ -442,6 +442,17 @@ class TestFailClosed:
             qualify(MASKED_CANDIDATE, model=model, chat=RecordingChat())
         assert excinfo.value.code == "model"
 
+    @pytest.mark.parametrize("model", [None, b"xyl", 123, ["gemma3:270m"]])
+    def test_non_str_model_is_refused_without_call(self, model: Any) -> None:
+        # fullmatch() lèverait une TypeError brute : la garde de type
+        # convertit en code fermé "model", sans aucun envoi.
+        chat = RecordingChat()
+        with pytest.raises(QualifyError) as excinfo:
+            qualify(MASKED_CANDIDATE, model=model, chat=chat)
+        assert excinfo.value.code == "model"
+        assert str(excinfo.value) == qualify_module.ERROR_MESSAGES["model"]
+        assert chat.calls == []
+
 
 class TestStrictValidation:
     """Le dict renvoyé a passé QualifyVerdict : enum, bornes, aucun bonus.

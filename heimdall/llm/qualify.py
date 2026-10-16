@@ -196,7 +196,10 @@ def qualify(
     compris) ni d'envoi tronquable. Une entrée non-``str`` est un vide par
     erreur de programmation : ``QualifyError("empty")``.
     """
-    if not _MODEL_PATTERN.fullmatch(model):
+    if not isinstance(model, str) or not _MODEL_PATTERN.fullmatch(model):
+        # Garde de type d'abord : fullmatch(None/bytes/objet) lèverait une
+        # TypeError brute — même code fermé "model", jamais d'exception
+        # avec traceback (symétrique du candidat non-str → "empty").
         raise QualifyError("model")
     if isinstance(candidate, str) and len(candidate) > MAX_CANDIDATE_CHARS:
         raise QualifyError("too_large")
