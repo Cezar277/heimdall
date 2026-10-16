@@ -183,9 +183,13 @@ Le protocole de mesure ci-dessus (``SYSTEM_PROMPT`` du benchmark) n'est
   copies des messages) — une mutation côté Ollama ne corrompt pas le contrat
   des appels suivants ; embarquement du prompt dans le wheel prouvé
   (``package-data`` + lecture ``importlib.resources`` depuis un wheel
-  installé en venv propre, même SHA-256 que le fichier du dépôt). La
-  validation pydantic stricte du retour (enum, bornes, champs bonus)
-  reste #81.
+  installé en venv propre, même SHA-256 que le fichier du dépôt) ;
+- validation stricte du retour livrée ici par anticipation du cœur de #81
+  (T28.3, à rescoper côté ticket) : ``QualifyVerdict`` (pydantic,
+  ``extra="forbid"``) — enum exact, confiance 0..1 (``StrictFloat |
+  StrictInt`` : l'entier ``1`` du modèle passe, le booléen non), aucun
+  champ bonus — tout écart vaut ``QualifyError("invalid")``, jamais réparé.
+  Seul le dict validé est renvoyé et journalisé.
 
 Preuve « 20 candidats → sortie JSON valide » : ``tests/test_llm_qualify_ollama.py``
 (20 cas T21 synthétiques masqués puis qualifiés avec le vrai Ollama local ;
@@ -199,8 +203,9 @@ de ``{secret, incertain}`` : ``temperature 0`` ne fige pas la graine
 d'échantillonnage d'Ollama, la sûreté (jamais de blanchiment d'un vrai
 candidat) est stable, la seule stabilité exigée par le critère étant le
 format. La calibration de la justesse (rappel, injections) reste le périmètre
-de #38/#28.4 ; la validation pydantic stricte (``extra="forbid"``) de #81
-(T28.3), hors de ce ticket.
+de #38/#28.4 ; la validation pydantic stricte (``extra="forbid"``) est
+livrée dans ce ticket par anticipation du cœur de #81 (T28.3, à rescoper),
+ne reste à #81/#32 que l'intégration/orchestration.
 
 ## Conséquences
 
@@ -235,5 +240,5 @@ de #38/#28.4 ; la validation pydantic stricte (``extra="forbid"``) de #81
   - **Fail-closed mesuré (Invariant 1)** : `tests/benchmarks/benchmark_llm_ollama.py:310-315` (fonction `score()`) et gestion stricte des erreurs réseau/parse avec `ok=False` (`:356-368`), compteur de régression `fn_dangereux` calculé lignes 376/384.
   - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` (ligne 265) et candidat isolé hors prompt système (`:263-282`), évalué sur le panel d'injections (4 cas dans `CASES_20` lignes 118-197 + 30 cas dans `gen_full()` lignes 246-255, bloc `weird`).
   - **Confinement Invariant 3 & 10** : `--out` confiné au sous-dossier `bench-results/` avec extension `.json` imposée, validation stricte interdisant tout chemin absolu ou segment traversant `..` (`:69-85`, couvert par le test symlink-escape) et écriture atomique avec `fsync` + `os.replace` (`:88-97`).
-  - **Prompt produit & sortie contrainte (T28.2/#80, REQ-SEC-01)** : prompt système versionné sans donnée scannée et schéma JSON fermé (`heimdall/mcp/prompts/__init__.py:56-64`) ; candidat isolé entre délimiteurs aléatoires par requête (`heimdall/mcp/prompts/__init__.py:121`, `build_messages` `:103-132`), plafonné fail-closed (`:72`, type dédié `:75-82`) ; schéma transmis à `ollama.chat(format=…)` avec `temperature 0` et `think=False`, par copie défensive (`heimdall/llm/qualify.py:202-212`) ; réponse bornée avant parsing (`:84`, `:224-229`), `RecursionError` et constantes non-JSON (`NaN`/`Infinity`, helper `:141-149`, `parse_constant` `:231`) vers le refus fermé ; client épinglé loopback (`trust_env=False`, redirections refusées, `:133-138`) ; prompt illisible converti en erreur fermée (`:178-193`) ; version du prompt journalisée (nom + SHA-256 : `:194-199`) ; nom de modèle validé avant appel (`:174`) ; verdict journalisé par liste blanche (`:241-245`). Preuve « 20/20 JSON valide » : `tests/test_llm_qualify_ollama.py` (mesures ci-dessus).
+  - **Prompt produit & sortie contrainte (T28.2/#80, REQ-SEC-01)** : prompt système versionné sans donnée scannée et schéma JSON fermé (`heimdall/mcp/prompts/__init__.py:56-64`) ; candidat isolé entre délimiteurs aléatoires par requête (`heimdall/mcp/prompts/__init__.py:121`, `build_messages` `:103-132`), plafonné fail-closed (`:72`, type dédié `:75-82`) ; schéma transmis à `ollama.chat(format=…)` avec `temperature 0` et `think=False`, par copie défensive (`heimdall/llm/qualify.py:227-237`) ; réponse bornée avant parsing (`:84`, `:249-254`), `RecursionError` et constantes non-JSON (`NaN`/`Infinity`, helper `:162-170`, `parse_constant` `:256`) vers le refus fermé ; retour revalidé par pydantic strict (`QualifyVerdict` `:108-125`, validation `:266-271`, seul le dict validé est renvoyé `:277`) ; client épinglé loopback (`trust_env=False`, redirections refusées, `:154-159`) ; prompt illisible converti en erreur fermée (`:203-218`) ; version du prompt journalisée (nom + SHA-256 : `:219-224`) ; nom de modèle validé avant appel (`:199`) ; verdict validé journalisé (`:272-276`). Preuve « 20/20 JSON valide » : `tests/test_llm_qualify_ollama.py` (mesures ci-dessus).
 - **Reproductibilité des mesures** : 152 cas réels (graine 281), commande `python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --out bench.json` (un nom simple est rangé sous `bench-results/`), fichier de sortie `bench-results/bench.json` archivé dans le ticket #79 pour opposabilité.

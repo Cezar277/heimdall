@@ -28,11 +28,12 @@ Client épinglé boucle locale : hôte figé ``http://127.0.0.1:11434``
 l'environnement), redirections refusées — l'aller-retour Ollama ne peut pas
 sortir de la machine (invariant 12).
 
-Périmètre : « JSON objet exploitable ». La validation stricte du verdict
-(pydantic ``extra="forbid"``, rejet sans effet) appartient à T28.3 (#81) ;
-l'affichage et la journalisation du rejet par la CLI à #32. Le LLM reste
-consultatif : ce module ne modifie aucun Finding et ne décide jamais seul
-(REQ-SEC-01).
+Périmètre : « verdict validé ». La validation stricte du verdict (pydantic
+``extra="forbid"``, rejet sans effet) est livrée ici par anticipation du
+cœur de T28.3 (#81, à rescoper côté ticket : fermeture ou reliquat
+d'intégration) ; l'affichage et la journalisation du rejet par la CLI
+restent à #32. Le LLM reste consultatif : ce module ne modifie aucun
+Finding et ne décide jamais seul (REQ-SEC-01).
 """
 
 import copy
@@ -40,15 +41,15 @@ import json
 import logging
 import re
 from collections.abc import Callable
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 
 import ollama
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError
 
 from heimdall.mcp.prompts import (
     MAX_CANDIDATE_CHARS,
     PROMPT_NAME,
     QUALIFY_FORMAT_V1,
-    VERDICTS,
     CandidateTooLargeError,
     build_messages,
     prompt_digest,
@@ -104,6 +105,26 @@ ERROR_MESSAGES: Final[dict[ErrorCode, str]] = {
 logger = logging.getLogger(__name__)
 
 
+class QualifyVerdict(BaseModel):
+    """Verdict strict du trieur — le seul objet que ``qualify()`` renvoie.
+
+    Anticipe le cœur de T28.3 (#81) : la grammaire ``format`` d'Ollama ne
+    contraint qu'un serveur honnête — ici, ``extra="forbid"`` rejette tout
+    champ bonus (``reason``, ``__proto__``… porteurs de consignes),
+    ``verdict`` est l'enum exact (miroir de ``VERDICTS``, sensible à la
+    casse) et ``confidence`` un nombre 0..1 (``StrictFloat | StrictInt`` :
+    l'entier ``1`` du modèle passe, le booléen ``True`` ne passe pas).
+    Tout écart → ``ValidationError`` → ``QualifyError("invalid")``,
+    jamais réparé ni complété. Un changement de verdicts ou de bornes =
+    qualify_v2 (comme le schéma ``QUALIFY_FORMAT_V1``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: Literal["secret", "faux_positif", "incertain"]
+    confidence: Annotated[StrictFloat | StrictInt, Field(ge=0, le=1)]
+
+
 class QualifyError(Exception):
     """Échec fail-closed de la qualification, à message statique.
 
@@ -155,7 +176,11 @@ def qualify(
     model: str = DEFAULT_MODEL,
     chat: ChatFn | None = None,
 ) -> dict[str, Any]:
-    """Qualifie un candidat masqué ; renvoie l'objet JSON du modèle.
+    """Qualifie un candidat masqué ; renvoie le verdict strictement validé.
+
+    Le dict renvoyé n'est jamais l'objet brut du modèle : il a passé
+    ``QualifyVerdict`` (enum exact, confiance 0..1, aucun champ bonus) —
+    un retour non conforme lève ``QualifyError("invalid")``.
 
     ``chat`` s'injecte en test (aucun appel réel) ; par défaut, l'appel
     part vers le client Ollama épinglé boucle locale. Toute panne du
@@ -237,10 +262,16 @@ def qualify(
     if not isinstance(result, dict):
         logger.warning("qualification: reponse non conforme (prompt=%s)", PROMPT_NAME)
         raise QualifyError("invalid")
-    verdict = result.get("verdict")
+    try:
+        validated = QualifyVerdict.model_validate(result)
+    except ValidationError:
+        # Verdict hors enum, confiance hors bornes / mauvais type, champ
+        # bonus : refusé sans effet — jamais réparé (invariant 1/2).
+        logger.warning("qualification: verdict non conforme (prompt=%s)", PROMPT_NAME)
+        raise QualifyError("invalid") from None
     logger.info(
         "qualification: verdict=%s (prompt=%s)",
-        verdict if verdict in VERDICTS else "invalide",
+        validated.verdict,
         PROMPT_NAME,
     )
-    return result
+    return validated.model_dump()

@@ -371,8 +371,9 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
     Contrôles obligatoires de REQ-SEC-01 livrés par #80 : le contenu scanné
     n'est jamais concaténé au prompt système, chaque requête isole le
     candidat par un délimiteur aléatoire, la sortie est contrainte par un
-    schéma JSON strict transmis à Ollama, et le client ne peut pas être
-    redirigé hors de la boucle locale.
+    schéma JSON strict transmis à Ollama ET revalidée par pydantic strict
+    côté client (cœur de #81 livré ici par anticipation), et le client ne
+    peut pas être redirigé hors de la boucle locale.
     """
     prompts = _load_qualify_prompts()
     prompt = prompts.load_qualify_prompt()
@@ -412,7 +413,7 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
 
     # 5. Client épinglé boucle locale, sans environnement ni redirection,
     #    température nulle, schéma effectivement transmis à `format` ;
-    #    verdict journalisé par whitelist (jamais la chaîne du modèle) ;
+    #    retour validé par pydantic strict (jamais l'objet brut du modèle) ;
     #    réponse bornée avant parsing, copies défensives, codes dédiés.
     client_src = QUALIFY_CLIENT.read_text(encoding="utf-8")
     for token in (
@@ -426,8 +427,8 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
         "CandidateTooLargeError",
         "RecursionError",
         "parse_constant",
-        "deepcopy",
-        "verdict in VERDICTS",
+        "QualifyVerdict",
+        'extra="forbid"',
     ):
         assert token in client_src, token
     # Le prompt versionné est embarqué dans le wheel (sinon toute install
