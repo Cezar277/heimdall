@@ -77,8 +77,13 @@ rôle que lui assignent T28.3 (sortie invalide = candidat conservé) et T34.
 ## Installation d'Ollama (résumé opposable)
 
 ```sh
-# 1. Installer le SERVEUR (version pinnée, vérifier le checksum publié) :
-curl -fsSL https://ollama.com/install.sh | sh
+# 1. Télécharger le script officiel et contrôler son intégrité avant exécution :
+curl -fsSL -o /tmp/ollama-install.sh https://ollama.com/install.sh
+sha256sum /tmp/ollama-install.sh  # Vérifier l'intégrité / hash avant exécution (ex. audit d'installation)
+sh /tmp/ollama-install.sh
+# Alternative durcie (recommandée) : paquet distribution épinglé ou binaire autonome vérifié.
+# Note : Procédure d'installation hôte hors périmètre direct pentest applicatif, durcissement et confinement en T28.4.
+
 ollama --version  # attendu : 0.40.4 (qwen3.5:0.8b exigeait déjà > 0.17)
 
 # 2. Le serveur n'écoute que la boucle locale (défaut systemd) :
@@ -126,3 +131,7 @@ La preuve « zéro trafic sortant » (fixture `socket.connect` loopback-only +
 - Ce fichier (tableaux + machine + protocole), le script (module + lignes :
   `tests/benchmarks/benchmark_llm_ollama.py`), sorties `--out` archivées côté
   ticket. Feuille SAMM : lien permanent avec SHA du commit, pas la branche.
+- Local-only : `ENDPOINT = "http://127.0.0.1:11434/api/chat"` et 100 % stdlib `urllib`.
+- Mesure fail-closed : fonction `score()` et gestion des erreurs avec `ok=False` sans faux-négatif dangereux.
+- Résistance injection & Invariant 2 : délimiteur aléatoire `secrets.token_hex(8)` par appel et données non fiables isolées.
+- Confinement Invariant 3 & 10 : validation de chemin `--out` sous le répertoire courant et écriture atomique (`fsync` + `os.replace`).
