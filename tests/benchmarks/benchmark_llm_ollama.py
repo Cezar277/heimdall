@@ -18,6 +18,12 @@ positifs, 34 injections, rien de statique ne touche le depot).
 Usage :
   python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m
   python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full
+
+Note de sécurité : outil de développement à usage manuel uniquement
+(mesures locales T28.1, aucun appelant automatique ni LLM). --out est
+confiné au sous-dossier bench-results/ avec extension .json imposée ;
+la validation du chemin précède mkdir + écriture atomique (fenêtre
+TOCTOU résiduelle négligeable sur poste dev).
 """
 
 from __future__ import annotations
@@ -39,6 +45,9 @@ from typing import Any
 ENDPOINT = "http://127.0.0.1:11434/api/chat"
 SEED = 281
 MODEL_PATTERN = re.compile(r"^[a-zA-Z0-9._:/-]{1,64}$")
+# --out est confiné à ce sous-dossier (Invariant 3) : jamais d'écrasement
+# hors bench-results/, extension .json imposée dans parse_args().
+BENCH_RESULTS_DIR = Path("bench-results")
 
 
 def validate_model_name(model: str) -> str:
@@ -405,7 +414,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--timeout", type=float, default=90.0, help="Timeout par requête en secondes"
     )
     parser.add_argument(
-        "--out", default="", help="Fichier JSON relatif pour archiver les résultats"
+        "--out",
+        default="",
+        help="Fichier .json sous bench-results/ pour archiver les résultats",
     )
     args = parser.parse_args(argv)
 
@@ -421,8 +432,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(str(err))
 
     if args.out:
+        if Path(args.out).suffix != ".json":
+            parser.error("--out doit finir en .json")
         try:
-            validate_output_path(args.out)
+            validate_output_path(args.out, base_dir=Path.cwd() / BENCH_RESULTS_DIR)
         except ValueError as err:
             parser.error(str(err))
 
@@ -434,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     dataset = list(CASES_20) + (gen_full() if args.full else [])
     summaries = [bench(model, dataset, args.timeout) for model in args.models]
     if args.out:
-        out_path = validate_output_path(args.out)
+        out_path = validate_output_path(args.out, base_dir=Path.cwd() / BENCH_RESULTS_DIR)
         atomic_write_json(out_path, summaries)
         print(f"\nResultats : {out_path}")
     return 0

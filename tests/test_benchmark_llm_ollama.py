@@ -4,7 +4,7 @@ Vérifie :
 - score() : cas None, incertain_ou_secret, secret, faux_positif, et sévérité fail-closed
 - bench() : chemin nominal, chemin d'erreur (query lève -> ok=False, fn_dangereux non incrémenté)
 - gen_full() : déterminisme strict (graine 281)
-- Validation des entrées CLI : --models, --timeout, --out (refus absolu, .., hors cwd)
+- Validation CLI : --models, --timeout, --out (.json sous bench-results/ exigé)
 - Délimiteurs aléatoires uniques par requête (Invariant 2)
 - Écriture atomique confinée (Invariants 3 et 10)
 """
@@ -357,9 +357,14 @@ class TestValidationAndHardening:
         assert files == [target]
 
     def test_parse_args_valid(self) -> None:
-        args = parse_args(["--models", "gemma3:270m", "--timeout", "45", "--out", "results.json"])
+        args = parse_args(
+            ["--models", "gemma3:270m", "--timeout", "45", "--out", "bench-results/results.json"]
+        )
         assert args.models == ["gemma3:270m"]
         assert args.timeout == 45.0
+        assert args.out == "bench-results/results.json"
+        # Nom simple : résolu sous bench-results/
+        args = parse_args(["--models", "gemma3:270m", "--out", "results.json"])
         assert args.out == "results.json"
 
     def test_parse_args_invalid_timeout(self) -> None:
@@ -375,3 +380,14 @@ class TestValidationAndHardening:
             parse_args(["--models", "gemma3:270m", "--out", "/etc/evil.json"])
         with pytest.raises(SystemExit):
             parse_args(["--models", "gemma3:270m", "--out", "../escape.json"])
+        # Sans suffixe .json
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "bench-results/notes.txt"])
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "notes.txt"])
+        # .json mais hors sous-dossier dédié (écrasement arbitraire refusé)
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "bench-results/../escape.json"])
+        # Le dossier lui-même n'est pas un .json
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "bench-results"])

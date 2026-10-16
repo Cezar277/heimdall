@@ -77,7 +77,7 @@ Conclusion et analyse sécurité :
 Le jeu de mesure a été rejoué sur cette machine (même CPU, même protocole,
 même `gemma3:270m` ; les mesures initiales ont été faites avec l'ancien
 build du modèle en cache). Résultat de `benchmark_llm_ollama.py --full`
-(archivé dans `bench.json` de ce ticket) :
+(archivé dans `bench-results/bench.json` de ce ticket) :
 
 | Bloc | Score |
 |---|---|
@@ -158,8 +158,8 @@ La preuve « zéro trafic sortant » (fixture `socket.connect` loopback-only +
 ## Preuve pour le rapport
 
 - Preuves de sécurité (références `module:ligne`, volontairement sans SHA : un SHA épinglé dans la branche pourrit à chaque push ; les permaliens avec SHA de commit pour la feuille SAMM sont figés au moment du merge à partir de ces ancres) :
-  - **Local-only (Invariant 12)** : `tests/benchmarks/benchmark_llm_ollama.py:35-39` (`import urllib.request` ligne 35 et `ENDPOINT` ligne 39, zéro dépendance réseau externe) ; `query()` ouvre sans proxy (`opener` ligne 281, `opener.open` ligne 289 — couvert par `test_query_ignores_proxy_env`).
-  - **Fail-closed mesuré (Invariant 1)** : `tests/benchmarks/benchmark_llm_ollama.py:301-306` (fonction `score()`) et gestion stricte des erreurs réseau/parse avec `ok=False` (`:347-359`), compteur de régression `fn_dangereux` calculé lignes 367/375.
-  - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` (ligne 256) et candidat isolé hors prompt système (`:254-273`), évalué sur le panel d'injections (4 cas dans `CASES_20` lignes 109-188 + 30 cas dans `gen_full()` lignes 237-246, bloc `weird`).
-  - **Confinement Invariant 3 & 10** : validation stricte du chemin de sortie `--out` sous le répertoire courant interdisant tout chemin absolu ou segment traversant `..` (`:60-76`, couvert par le test symlink-escape) et écriture atomique avec `fsync` + `os.replace` (`:79-88`).
-- **Reproductibilité des mesures** : 152 cas réels (graine 281), commande `python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --out bench.json`, fichier de sortie `bench.json` archivé dans le ticket #79 pour opposabilité.
+  - **Local-only (Invariant 12)** : `tests/benchmarks/benchmark_llm_ollama.py:41-45` (`import urllib.request` ligne 41 et `ENDPOINT` ligne 45, zéro dépendance réseau externe) ; `query()` ouvre sans proxy (`opener` ligne 290, `opener.open` ligne 298 — couvert par `test_query_ignores_proxy_env`).
+  - **Fail-closed mesuré (Invariant 1)** : `tests/benchmarks/benchmark_llm_ollama.py:310-315` (fonction `score()`) et gestion stricte des erreurs réseau/parse avec `ok=False` (`:356-368`), compteur de régression `fn_dangereux` calculé lignes 376/384.
+  - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` (ligne 265) et candidat isolé hors prompt système (`:263-282`), évalué sur le panel d'injections (4 cas dans `CASES_20` lignes 118-197 + 30 cas dans `gen_full()` lignes 246-255, bloc `weird`).
+  - **Confinement Invariant 3 & 10** : `--out` confiné au sous-dossier `bench-results/` avec extension `.json` imposée, validation stricte interdisant tout chemin absolu ou segment traversant `..` (`:69-85`, couvert par le test symlink-escape) et écriture atomique avec `fsync` + `os.replace` (`:88-97`).
+- **Reproductibilité des mesures** : 152 cas réels (graine 281), commande `python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --out bench.json` (un nom simple est rangé sous `bench-results/`), fichier de sortie `bench-results/bench.json` archivé dans le ticket #79 pour opposabilité.
