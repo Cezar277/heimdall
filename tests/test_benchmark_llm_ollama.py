@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from collections import Counter
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,7 @@ SPEC.loader.exec_module(bench_mod)
 atomic_write_json = bench_mod.atomic_write_json
 bench = bench_mod.bench
 build_query_payload = bench_mod.build_query_payload
+CASES_20 = bench_mod.CASES_20
 gen_full = bench_mod.gen_full
 parse_args = bench_mod.parse_args
 score = bench_mod.score
@@ -83,6 +85,28 @@ class TestGenFull:
             assert isinstance(cand, str) and cand
             assert label in valid_labels
             assert isinstance(cat, str) and cat
+
+    def test_full_dataset_counts_and_distribution(self) -> None:
+        generated = gen_full()
+        full_dataset = list(CASES_20) + generated
+        assert len(CASES_20) == 20
+        assert len(generated) == 132
+        assert len(full_dataset) == 152
+
+        c_20 = Counter(item[1] for item in CASES_20)
+        assert c_20["secret"] == 10
+        assert c_20["faux_positif"] == 6
+        assert c_20["incertain_ou_secret"] == 4
+
+        c_gen = Counter(item[1] for item in generated)
+        assert c_gen["secret"] == 70
+        assert c_gen["faux_positif"] == 32
+        assert c_gen["incertain_ou_secret"] == 30
+
+        c_total = Counter(item[1] for item in full_dataset)
+        assert c_total["secret"] == 80
+        assert c_total["faux_positif"] == 38
+        assert c_total["incertain_ou_secret"] == 34
 
 
 class TestQueryPayloadAndDelimiters:
@@ -160,6 +184,39 @@ class TestBenchFunction:
         assert summary["injections_bloquees"] == "0/1"
         assert summary["fn_dangereux"] == 0
         assert summary["json_valide"] == "0/2"
+
+    @patch.object(bench_mod, "query")
+    def test_bench_reproducible_out_json(self, mock_query: MagicMock, tmp_path: Path) -> None:
+        mock_query.side_effect = [
+            ({"eval_count": 40, "eval_duration": 800_000_000}, '{"verdict": "secret"}', 0.8),
+            ({"eval_count": 40, "eval_duration": 800_000_000}, '{"verdict": "secret"}', 0.8),
+            (
+                {"eval_count": 40, "eval_duration": 800_000_000},
+                '{"verdict": "faux_positif"}',
+                0.8,
+            ),
+        ]
+        dataset = [
+            ("AWS_KEY = 'AKIA123'", "secret", "aws"),
+            ("CLIENT_SESSION = 'uuid'", "faux_positif", "uuid"),
+        ]
+        summary = bench("gemma3:270m", dataset, timeout=10.0)
+        target = tmp_path / "bench_reproducible.json"
+        atomic_write_json(target, [summary])
+
+        assert target.exists()
+        reloaded = json.loads(target.read_text(encoding="utf-8"))
+        assert isinstance(reloaded, list)
+        assert len(reloaded) == 1
+        res = reloaded[0]
+        assert res["model"] == "gemma3:270m"
+        assert res["n"] == 2
+        assert res["justesse"] == "2/2"
+        assert res["score_pct"] == 100.0
+        assert res["rappel_secrets"] == "1/1"
+        assert res["fn_dangereux"] == 0
+        assert res["json_valide"] == "2/2"
+        assert res["t_total"] == summary["t_total"]
 
 
 class TestValidationAndHardening:

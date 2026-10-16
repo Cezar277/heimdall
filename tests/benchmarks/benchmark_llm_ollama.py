@@ -11,8 +11,9 @@ Categories labellisees :
   incertain_ou_secret  -> tout sauf 'faux_positif' (resistance aux injections)
 
 Aucun vrai secret : les 20 cas statiques sont les factices synthetiques du
-jeu piege T21 ; le mode --full genere ~510 variantes a l'execution (graine
-fixee, rien de statique ne touche le depot).
+jeu piege T21 ; le mode --full genere 132 variantes a l'execution (graine
+fixee 281, soit 152 cas au total avec les 20 cas de base : 80 secrets, 38 faux
+positifs, 34 injections, rien de statique ne touche le depot).
 
 Usage :
   python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m
@@ -188,7 +189,10 @@ CASES_20: list[tuple[str, str, str]] = [
 
 
 def gen_full() -> list[tuple[str, str, str]]:
-    """~510 variantes generees a l'execution (graine fixee)."""
+    """132 variantes generees a l'execution (graine fixee 281).
+
+    Repartition : 70 secrets, 32 faux positifs, 30 injections.
+    """
     rng = random.Random(SEED)  # noqa: S311 — graine fixee, donnees de test
     # synthetiques (jamais de secret), pas d'usage cryptographique.
     alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -307,7 +311,7 @@ def bench(model: str, dataset: list[tuple[str, str, str]], timeout: float) -> di
         print(f" warmup echec: {error}")
     rows: list[dict[str, Any]] = []
     for index, (cand, expected, cat) in enumerate(dataset, 1):
-        snippet = cand.replace("\n", " ")[:40]
+        cand_meta = f"len={len(cand)} cat={cat}"
         try:
             data, content, elapsed = query(model, cand, timeout)
             eval_count = data.get("eval_count", 0) or 0
@@ -335,7 +339,7 @@ def bench(model: str, dataset: list[tuple[str, str, str]], timeout: float) -> di
                 f" [{index:03d}/{len(dataset):03d}] {elapsed:5.2f}s "
                 f"tok/s={tok_s:5.1f} json={'OK' if json_ok else 'KO'} "
                 f"{str(verdict):12s} attendu={expected:18s} "
-                f"{'PASS' if ok else 'FAIL'} | {snippet}"
+                f"{'PASS' if ok else 'FAIL'} | {cand_meta}"
             )
         except Exception as error:
             rows.append(
@@ -387,7 +391,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--models", nargs="+", required=True, help="Noms des modèles Ollama à tester"
     )
     parser.add_argument(
-        "--full", action="store_true", help="20 cas T21 + ~510 variantes generees (graine 281)"
+        "--full",
+        action="store_true",
+        help=(
+            "20 cas T21 + 132 variantes generees (graine 281, "
+            "soit 152 cas au total : 80 secrets, 38 FP, 34 inj)"
+        ),
     )
     parser.add_argument(
         "--timeout", type=float, default=90.0, help="Timeout par requête en secondes"
