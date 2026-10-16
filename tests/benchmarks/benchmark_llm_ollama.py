@@ -276,6 +276,9 @@ def build_query_payload(model: str, candidate: str) -> tuple[dict[str, Any], str
 def query(model: str, candidate: str, timeout: float) -> tuple[dict[str, Any], str, float]:
     payload, _ = build_query_payload(model, candidate)
     body = json.dumps(payload).encode()
+    # Boucle locale uniquement : aucun proxy, même si l'environnement en
+    # définit un (Invariant 12 — tout local, garde-fou T28.4).
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     last_error: Exception | None = None
     for attempt in range(3):
         try:
@@ -283,7 +286,7 @@ def query(model: str, candidate: str, timeout: float) -> tuple[dict[str, Any], s
             request = urllib.request.Request(
                 ENDPOINT, data=body, headers={"Content-Type": "application/json"}
             )
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            with opener.open(request, timeout=timeout) as response:
                 # URL constante vers la boucle locale (garde-fou T28.4).
                 data: dict[str, Any] = json.loads(response.read().decode())
             elapsed = time.perf_counter() - start

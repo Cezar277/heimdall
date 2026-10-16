@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
 from collections import Counter
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -217,6 +219,56 @@ class TestBenchFunction:
         assert res["fn_dangereux"] == 0
         assert res["json_valide"] == "2/2"
         assert res["t_total"] == summary["t_total"]
+
+
+class TestQueryNoProxy:
+    """query() ne doit jamais passer par un proxy (Invariant 12)."""
+
+    def test_query_ignores_proxy_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        body = json.dumps(
+            {
+                "message": {"content": '{"verdict": "secret", "confidence": 0.99}'},
+                "eval_count": 10,
+                "eval_duration": 1_000_000_000,
+            }
+        ).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # Proxy injoignable + pas d'exception NO_PROXY : avec l'ancien
+            # code (urlopen sensible à l'environnement), la requête partirait
+            # vers le proxy et échouerait après retries.
+            monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9/")
+            monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9/")
+            monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9/")
+            monkeypatch.setenv("http_proxy", "http://127.0.0.1:9/")
+            monkeypatch.setenv("https_proxy", "http://127.0.0.1:9/")
+            monkeypatch.delenv("NO_PROXY", raising=False)
+            monkeypatch.delenv("no_proxy", raising=False)
+            monkeypatch.setattr(bench_mod, "ENDPOINT", f"http://127.0.0.1:{port}/api/chat")
+
+            _, content, elapsed = bench_mod.query("gemma3:270m", "CANDIDAT = 'x'", 10.0)
+            assert json.loads(content)["verdict"] == "secret"
+            assert elapsed >= 0
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
 
 
 class TestValidationAndHardening:
