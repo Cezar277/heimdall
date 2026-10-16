@@ -76,9 +76,9 @@ Conclusion et analyse sécurité :
 
 ```sh
 # 1. Télécharger le script officiel et contrôler son intégrité avant exécution :
+#    Source de référence : script install.sh officiel Ollama (https://raw.githubusercontent.com/ollama/ollama/v0.4.4/scripts/install.sh)
 curl -fsSL -o /tmp/ollama-install.sh https://ollama.com/install.sh
-echo "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f  /tmp/ollama-install.sh" | sha256sum -c
-sh /tmp/ollama-install.sh
+echo "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f  /tmp/ollama-install.sh" | sha256sum -c && sh /tmp/ollama-install.sh
 # Alternative durcie (recommandée) : paquet distribution épinglé ou binaire autonome vérifié (cosign/sbom).
 # Note : Procédure d'installation hôte hors périmètre direct pentest applicatif, durcissement et confinement en T28.4.
 
@@ -126,9 +126,9 @@ La preuve « zéro trafic sortant » (fixture `socket.connect` loopback-only +
 
 ## Preuve pour le rapport
 
-- Preuves de sécurité et permaliens code (revendicables pour la feuille SAMM avec SHA de commit de la PR) :
-  - **Local-only (Invariant 12)** : `tests/benchmarks/benchmark_llm_ollama.py:38` (`ENDPOINT = "http://127.0.0.1:11434/api/chat"`) et `urllib.request` stdlib ligne 34, zéro dépendance réseau externe.
-  - **Fail-closed mesuré (Invariant 1)** : fonction `score()` (`tests/benchmarks/benchmark_llm_ollama.py:294-300`) et gestion stricte des erreurs réseau/parse avec `ok=False` (`tests/benchmarks/benchmark_llm_ollama.py:341-353`), compteur de régression `fn_dangereux` calculé ligne 360.
-  - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` et candidat isolé hors prompt système (`tests/benchmarks/benchmark_llm_ollama.py:250-269`), évalué sur le panel d'injections (4 cas dans `CASES_20:108-187` + 30 cas dans `gen_full:233-245`).
-  - **Confinement Invariant 3 & 10** : validation stricte du chemin de sortie `--out` sous le répertoire courant interdisant tout chemin absolu ou segment traversant `..` (`tests/benchmarks/benchmark_llm_ollama.py:59-75`) et écriture atomique avec `fsync` + `os.replace` (`tests/benchmarks/benchmark_llm_ollama.py:78-93`).
+- Preuves de sécurité et permaliens code (revendicables pour la feuille SAMM avec SHA de commit `672fa2e`) :
+  - **Local-only (Invariant 12)** : [`benchmark_llm_ollama.py:35-39`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L35-L39) (`ENDPOINT = "http://127.0.0.1:11434/api/chat"` et `urllib.request` stdlib ligne 35, zéro dépendance réseau externe).
+  - **Fail-closed mesuré (Invariant 1)** : [`benchmark_llm_ollama.py:298-303`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L298-L303) (fonction `score()`) et gestion stricte des erreurs réseau/parse avec `ok=False` ([`L344-L356`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L344-L356)), compteur de régression `fn_dangereux` calculé ligne 364/372.
+  - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` et candidat isolé hors prompt système ([`benchmark_llm_ollama.py:254-273`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L254-L273)), évalué sur le panel d'injections (4 cas dans `CASES_20:108-187` + 30 cas dans `gen_full:233-245`).
+  - **Confinement Invariant 3 & 10** : validation stricte du chemin de sortie `--out` sous le répertoire courant interdisant tout chemin absolu ou segment traversant `..` ([`benchmark_llm_ollama.py:60-76`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L60-L76)) et écriture atomique avec `fsync` + `os.replace` ([`benchmark_llm_ollama.py:79-95`](https://github.com/Cezar277/heimdall/blob/672fa2ef2e490fd9f2e964888a0e8c3b787c7cd0/tests/benchmarks/benchmark_llm_ollama.py#L79-L95)).
 - **Reproductibilité des mesures** : 152 cas réels (graine 281), commande `python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --out bench.json`, fichier de sortie `bench.json` archivé dans le ticket #79 pour opposabilité.
