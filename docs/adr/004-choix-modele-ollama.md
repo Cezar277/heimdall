@@ -129,6 +129,51 @@ python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --o
 La preuve « zéro trafic sortant » (fixture `socket.connect` loopback-only +
 `ss -tunp`) est portée par T28.4, pas par ce ticket.
 
+## Prompt produit (T28.2, #80)
+
+Le protocole de mesure ci-dessus (``SYSTEM_PROMPT`` du benchmark) n'est
+**pas** le prompt produit. Le prompt de qualification livré est
+``heimdall/mcp/prompts/qualify_v1.md``, versionné avec le schéma de sortie
+``QUALIFY_FORMAT_V1`` (constante de ``heimdall/mcp/prompts/``) :
+
+- chargé depuis le fichier à chaque appel, jamais interpolé ; sa version est
+  journalisée à chaque qualification (``prompt=qualify_v1
+  sha256=<empreinte>``, ```heimdall/llm/qualify.py```) : un verdict reste
+  corrélable à l'instruction qui l'a produit, sans secret ni prompt brut ;
+- il ne contient **aucun code scanné** : le candidat (déjà masqué par le
+  serveur MCP, ``<REDACTED:type:len=N>``) n'est placé que dans le message
+  utilisateur, entre deux délimiteurs ``secrets.token_hex(8)`` tirés au
+  hasard par requête (REQ-SEC-01) ;
+- la sortie est **contrainte techniquement** : le schéma JSON strict (enum
+  ``secret|faux_positif|incertain``, ``confidence`` 0..1,
+  ``additionalProperties: false``) est passé au paramètre ``format`` de
+  ``ollama.chat``, avec ``temperature 0``, ``think`` désactivé, ``num_ctx``
+  1024 et ``num_predict`` 120 — le prompt décrit le format en plus, jamais à
+  la place ;
+- client épinglé boucle locale : ``http://127.0.0.1:11434``, ``OLLAMA_HOST``
+  ignoré, ``trust_env=False`` (aucun proxy de l'environnement),
+  ``follow_redirects=False`` — l'aller-retour Ollama ne peut pas sortir de
+  la machine (invariant 12, garde-fou repris par T28.4) ;
+- le masquage n'est **pas** rejoué côté client (``mask_text`` n'est pas
+  idempotent, un second passage corromprait ``type:len``) : l'entrée est la
+  sortie du serveur MCP, dont le masquage avant sérialisation est
+  l'obligation #27.
+
+Preuve « 20 candidats → sortie JSON valide » : ``tests/test_llm_qualify_ollama.py``
+(20 cas T21 synthétiques masqués puis qualifiés avec le vrai Ollama local ;
+skippée sans Ollama). Mesures du 2026-10-16 sur ``gemma3:270m`` : **20/20
+réponses JSON valides** à chaque exécution (10,4 s et 11,8 s) ; verdicts 7
+``secret`` / 13 ``incertain`` puis 4 ``secret`` / 16 ``incertain``, **0
+``faux_positif``** dans les deux cas — aucun faux-négatif dangereux (le
+protocole bench sur les mêmes entrées masquées sur-signale ``secret`` 20/20 :
+sens sûr, comme en 4). La répartition des verdicts ne varie qu'à l'intérieur
+de ``{secret, incertain}`` : ``temperature 0`` ne fige pas la graine
+d'échantillonnage d'Ollama, la sûreté (jamais de blanchiment d'un vrai
+candidat) est stable, la seule stabilité exigée par le critère étant le
+format. La calibration de la justesse (rappel, injections) reste le périmètre
+de #38/#28.4 ; la validation pydantic stricte (``extra="forbid"``) de #81
+(T28.3), hors de ce ticket.
+
 ## Conséquences
 
 - Modèle défaut `gemma3:270m` : ~291 Mo disque, pic < 1 Go RAM, < 1,5 s/candidat
@@ -162,4 +207,5 @@ La preuve « zéro trafic sortant » (fixture `socket.connect` loopback-only +
   - **Fail-closed mesuré (Invariant 1)** : `tests/benchmarks/benchmark_llm_ollama.py:310-315` (fonction `score()`) et gestion stricte des erreurs réseau/parse avec `ok=False` (`:356-368`), compteur de régression `fn_dangereux` calculé lignes 376/384.
   - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` (ligne 265) et candidat isolé hors prompt système (`:263-282`), évalué sur le panel d'injections (4 cas dans `CASES_20` lignes 118-197 + 30 cas dans `gen_full()` lignes 246-255, bloc `weird`).
   - **Confinement Invariant 3 & 10** : `--out` confiné au sous-dossier `bench-results/` avec extension `.json` imposée, validation stricte interdisant tout chemin absolu ou segment traversant `..` (`:69-85`, couvert par le test symlink-escape) et écriture atomique avec `fsync` + `os.replace` (`:88-97`).
+  - **Prompt produit & sortie contrainte (T28.2/#80, REQ-SEC-01)** : prompt système versionné sans donnée scannée et schéma JSON fermé (`heimdall/mcp/prompts/__init__.py:49-57`) ; candidat isolé entre délimiteurs aléatoires par requête (`heimdall/mcp/prompts/__init__.py:90`, `build_messages` `:78-101`) ; schéma transmis à `ollama.chat(format=…)` avec `temperature 0` et `think=False` (`heimdall/llm/qualify.py:149-156`) ; client épinglé loopback (`trust_env=False`, redirections refusées, `:111-116`) ; version du prompt journalisée (nom + SHA-256 : `:141-146`) ; nom de modèle validé avant appel (`:135`). Preuve « 20/20 JSON valide » : `tests/test_llm_qualify_ollama.py` (mesures ci-dessus).
 - **Reproductibilité des mesures** : 152 cas réels (graine 281), commande `python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --out bench.json` (un nom simple est rangé sous `bench-results/`), fichier de sortie `bench-results/bench.json` archivé dans le ticket #79 pour opposabilité.

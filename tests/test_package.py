@@ -11,7 +11,10 @@ from typer.testing import CliRunner
 
 import heimdall
 import heimdall.cli.main
+import heimdall.llm
+import heimdall.llm.qualify
 import heimdall.mcp
+import heimdall.mcp.prompts
 import heimdall.mcp.server
 import heimdall.scanner
 import heimdall.scanner.detect
@@ -29,7 +32,10 @@ class PackageSmokeTests(unittest.TestCase):
             heimdall.scanner,
             heimdall.scanner.detect,
             heimdall.mcp,
+            heimdall.mcp.prompts,
             heimdall.mcp.server,
+            heimdall.llm,
+            heimdall.llm.qualify,
             heimdall.vault,
             heimdall.vault.client,
             heimdall.vault.crypto,

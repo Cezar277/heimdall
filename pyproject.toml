@@ -56,6 +56,11 @@ Homepage = "https://github.com/Cezar277/heimdall"
 [tool.setuptools.packages.find]
 include = ["heimdall*"]
 
+# Prompt versionné livré avec le paquet (T28.2) : sans cette ligne, le wheel
+# ne l'embarquerait pas et l'installation serait cassée hors dépôt.
+[tool.setuptools.package-data]
+"heimdall.mcp" = ["prompts/*.md"]
+
 # --- pytest: `pytest` seul doit découvrir tests/ (dont les TestCase unittest des contrats) ---
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -70,6 +70,8 @@ curl http://127.0.0.1:8443/api/v1/health
 heimdall/            paquet unique (#17)
   scanner/           détection déterministe regex + entropie (#22, contrat #14)
   mcp/               serveur MCP stdio, 4 outils lecture seule (#27, contrat #16)
+    prompts/         prompt système versionné du trieur (qualify_v1, #80)
+  llm/               client Ollama local, sortie JSON contrainte (#80, T28.2)
   vault/             Vault chiffré ; crypto CONFINÉE à vault/crypto.py (#25, contrat #15)
   cli/               entrée `heimdall` (Typer)
 tests/               fumée paquet + confinement crypto + tests/contracts/
@@ -87,6 +89,7 @@ openapi.yaml         contrat Vault API v1 (#15)
 - [ADR-001 : Finding et faux positifs](docs/adr/001-finding-et-etats.md)
 - [ADR-002 : Stack Python et structure du dépôt](docs/adr/002-stack-python.md)
 - [ADR-003 : Serveur MCP, décisions et limites (#27)](docs/adr/003-serveur-mcp.md)
+- [ADR-004 : Choix du modèle LLM local Ollama, prompt du trieur (#79/#80)](docs/adr/004-choix-modele-ollama.md)
 - [Modèle de menaces : DFD, actifs, STRIDE et risques prioritaires (T18)](docs/security/README.md)
 
 ## Vérifier

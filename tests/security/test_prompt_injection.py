@@ -14,6 +14,7 @@ l'observation `Retry-After`) reste due par les tests runtime de #28.
 """
 
 import ast
+import importlib.util
 import json
 import re
 from pathlib import Path
@@ -26,6 +27,14 @@ MCP_SERVER = REPO / "heimdall" / "mcp" / "server.py"
 MCP_GITDIFF = REPO / "heimdall" / "mcp" / "gitdiff.py"
 CLI_MAIN = REPO / "heimdall" / "cli" / "main.py"
 REQUIREMENTS = REPO / "docs" / "security" / "requirements.md"
+
+# Contrat T28.2 (#80) : partie pure (prompt, schéma, isolation du candidat)
+# et client Ollama. Le premier est chargé par fichier (stdlib seule) car le
+# venv de ce job n'installe pas le SDK mcp du paquet parent ; le second est
+# contrôlé statiquement (texte + AST), jamais importé ici.
+QUALIFY_PROMPTS = REPO / "heimdall" / "mcp" / "prompts" / "__init__.py"
+QUALIFY_PROMPT_FILE = REPO / "heimdall" / "mcp" / "prompts" / "qualify_v1.md"
+QUALIFY_CLIENT = REPO / "heimdall" / "llm" / "qualify.py"
 
 # Garde AST statique : aucun import reseau/subprocess ni appel shell/exec dans
 # le chemin CLI/MCP actuel. Une denylist par chaines ("httpx" not in src) est
@@ -335,6 +344,95 @@ def test_llm_rejection_never_silent() -> None:
     server_src = MCP_SERVER.read_text(encoding="utf-8")
     for token in ("ToolFailure", "errors.failure", '"isError"', "PATH_ESCAPE"):
         assert token in server_src, token
+
+
+def _load_qualify_prompts():
+    """Charge ``heimdall/mcp/prompts`` par fichier, sans son paquet parent.
+
+    ``heimdall.mcp`` importe le SDK MCP, absent de
+    ``tests/security/requirements.txt`` : ce module du contrat T28.2 est
+    100 % stdlib et sans import relatif, donc chargeable directement. Le
+    client Ollama (``heimdall/llm/qualify.py``) est couvert par les tests du
+    venv principal (``tests/test_llm_qualify*.py``) et contrôlé ci-dessous
+    statiquement.
+    """
+    spec = importlib.util.spec_from_file_location("qualify_prompt_contract", QUALIFY_PROMPTS)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_qualify_prompt_isolated_and_output_constrained() -> None:
+    """T28.2/REQ-SEC-01 : données isolées, délimiteurs aléatoires, sortie contrainte, boucle locale.
+
+    Contrôles obligatoires de REQ-SEC-01 livrés par #80 : le contenu scanné
+    n'est jamais concaténé au prompt système, chaque requête isole le
+    candidat par un délimiteur aléatoire, la sortie est contrainte par un
+    schéma JSON strict transmis à Ollama, et le client ne peut pas être
+    redirigé hors de la boucle locale.
+    """
+    prompts = _load_qualify_prompts()
+    prompt = prompts.load_qualify_prompt()
+    sentinel = "SYNTHETIC_QUALIFY_DATA_01"
+
+    # 1. Le prompt système est le fichier versionné, sans le candidat.
+    messages = prompts.build_messages(sentinel)
+    assert messages[0] == {"role": "system", "content": prompt}
+    assert sentinel not in messages[0]["content"]
+
+    # 2. Délimiteur aléatoire par requête ; le candidat n'existe que dedans.
+    def _delimiter(built: list[dict[str, str]]) -> str:
+        match = re.search(r"<data_([0-9a-f]{16})>", built[1]["content"])
+        assert match is not None, "délimiteur aléatoire absent du message utilisateur"
+        return match.group(1)
+
+    sep_first = _delimiter(messages)
+    sep_second = _delimiter(prompts.build_messages(sentinel))
+    assert sep_first != sep_second, "délimiteur réutilisé entre deux requêtes"
+    assert f"<data_{sep_first}>\n{sentinel}\n</data_{sep_first}>" in messages[1]["content"]
+
+    # 3. Le prompt décrit les données comme non fiables et impose le JSON.
+    for token in ("donnée non fiable", "incertain", "JSON"):
+        assert token in prompt, token
+
+    # 4. Sortie contrainte techniquement : enum fermé, champs requis, aucun champ bonus.
+    schema = prompts.QUALIFY_FORMAT_V1
+    assert schema["properties"]["verdict"]["enum"] == ["secret", "faux_positif", "incertain"]
+    assert set(schema["required"]) == {"verdict", "confidence"}
+    assert schema["additionalProperties"] is False
+
+    # 5. Client épinglé boucle locale, sans environnement ni redirection,
+    #    température nulle, schéma effectivement transmis à `format`.
+    client_src = QUALIFY_CLIENT.read_text(encoding="utf-8")
+    for token in (
+        "127.0.0.1",
+        "trust_env=False",
+        "follow_redirects=False",
+        '"temperature": 0',
+        "format=QUALIFY_FORMAT_V1",
+    ):
+        assert token in client_src, token
+    client_tree = ast.parse(client_src)
+    imported: set[str] = set()
+    for node in ast.walk(client_tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    # Aucun accès à l'environnement (OLLAMA_HOST/proxies) ni à un socket brut :
+    # l'hôte est une constante, le transport reste celui d'Ollama.
+    assert "os" not in imported
+    assert "socket" not in imported
+
+    # 6. Ni le prompt ni le schéma ne contiennent de secret réaliste (même factice).
+    for pattern in (
+        r"AKIA[0-9A-Z]{16}",
+        r"ghp_[0-9A-Za-z]{20,}",
+        r"sk_live_[0-9A-Za-z]{20,}",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    ):
+        assert re.search(pattern, prompt) is None, pattern
 
 
 def test_no_llm_in_ci() -> None:
