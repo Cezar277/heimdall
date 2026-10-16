@@ -14,6 +14,7 @@ valide » avec le vrai Ollama local vit dans ``tests/test_llm_qualify_ollama.py`
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import importlib.resources
 import json
@@ -24,6 +25,11 @@ from types import SimpleNamespace
 from typing import Any, get_args
 
 import pytest
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 : backport explicite (extra [dev]).
+    import tomli as tomllib
 
 from heimdall.llm import qualify as qualify_module
 from heimdall.llm.qualify import (
@@ -158,11 +164,34 @@ class TestPromptContract:
         )
         assert text == prompts_module.load_qualify_prompt()
 
-    def test_pyproject_embarque_le_prompt_dans_le_wheel(self) -> None:
-        # Sans cette déclaration, le wheel n'embarquerait pas le .md et toute
-        # installation hors dépôt tomberait en QualifyError("prompt").
-        pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        assert '"heimdall.mcp" = ["prompts/*.md"]' in pyproject
+    def test_pyproject_package_data_resolves_to_the_prompt_file(self) -> None:
+        # Preuve rejouable (stdlib seule, sans construire de wheel : un test
+        # qui builderait exigerait setuptools + isolation/réseau, donc une
+        # suite non hermétique) que la déclaration package-data embarque
+        # qualify_v1.md : les motifs sont résolus comme setuptools (relatifs
+        # au dossier du paquet) et doivent attraper le fichier, dont le
+        # paquet doit être couvert par packages.find. La preuve bout-en-bout
+        # (wheel construit, SHA-256 identique au dépôt, lecture via
+        # importlib.resources depuis site-packages en venv propre) est
+        # archivée dans la description de PR.
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        setuptools_cfg = pyproject["tool"]["setuptools"]
+        includes = setuptools_cfg["packages"]["find"].get("include", [])
+        package_data = setuptools_cfg.get("package-data", {})
+        # 1. heimdall.mcp.prompts est un vrai paquet couvert par packages.find.
+        assert (REPO_ROOT / "heimdall" / "mcp" / "prompts" / "__init__.py").is_file()
+        assert any(
+            fnmatch.fnmatchcase("heimdall.mcp.prompts", pattern) for pattern in includes
+        ), includes
+        # 2. Les motifs package-data attrapent qualify_v1.md.
+        prompt_path = REPO_ROOT / "heimdall" / "mcp" / "prompts" / "qualify_v1.md"
+        hits = [
+            hit
+            for package, patterns in package_data.items()
+            for pattern in patterns
+            for hit in (REPO_ROOT / package.replace(".", "/")).glob(pattern)
+        ]
+        assert prompt_path in hits, package_data
 
     def test_format_schema_is_strict(self) -> None:
         schema = QUALIFY_FORMAT_V1
