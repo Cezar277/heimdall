@@ -313,12 +313,23 @@ class TestFailClosed:
         # charge ≤ borne ne lève RecursionError sur CPython 3.14), mais le
         # repli pur-Python si : on force la branche pour prouver le code
         # fermé au lieu d'une exception brute.
-        def _raise_recursion(_content: str) -> Any:
+        def _raise_recursion(_content: str, **_kwargs: Any) -> Any:
             raise RecursionError("profondeur maximale depassee")
 
         monkeypatch.setattr(json, "loads", _raise_recursion)
         with pytest.raises(QualifyError) as excinfo:
             qualify(MASKED_CANDIDATE, chat=RecordingChat("[" * 5000))
+        assert excinfo.value.code == "invalid"
+        assert str(excinfo.value) == qualify_module.ERROR_MESSAGES["invalid"]
+
+    @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+    def test_non_json_constants_are_refused(self, constant: str) -> None:
+        # Extension Python acceptée par json.loads (allow_nan) : hors JSON
+        # strict. Un NaN passerait tout isinstance(x, float) futur tout en
+        # rendant fausse toute comparaison de confiance — tri indéfini.
+        content = '{"verdict": "secret", "confidence": ' + constant + "}"
+        with pytest.raises(QualifyError) as excinfo:
+            qualify(MASKED_CANDIDATE, chat=RecordingChat(content))
         assert excinfo.value.code == "invalid"
         assert str(excinfo.value) == qualify_module.ERROR_MESSAGES["invalid"]
 

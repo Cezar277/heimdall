@@ -138,6 +138,17 @@ def _loopback_client() -> ollama.Client:
     )
 
 
+def _reject_non_json_constant(value: str) -> Any:
+    """Refuse ``NaN``/``Infinity`` (extension Python, hors JSON strict).
+
+    ``json.loads`` les accepte par défaut (``allow_nan``) : un ``nan``
+    passerait tout ``isinstance(x, float)`` futur tout en rendant fausse
+    toute comparaison de confiance — tri indéfini chez l'appelant. Levée
+    en ``ValueError`` pour retomber dans le refus fermé ``invalid``.
+    """
+    raise ValueError(f"constante non-JSON refusee : {value}")
+
+
 def qualify(
     candidate: str,
     *,
@@ -150,10 +161,11 @@ def qualify(
     part vers le client Ollama épinglé boucle locale. Toute panne du
     transport ou du modèle devient ``QualifyError("unavailable")`` à
     message statique (jamais l'exception d'origine, qui peut recopier la
-    requête). Une réponse non-JSON, vide, surdimensionnée ou qui n'est pas
-    un objet JSON est refusée en ``QualifyError("invalid")`` — jamais
-    réparée ni complétée, y compris une réponse entourée de balises
-    Markdown. Un prompt de qualification illisible devient
+    requête). Une réponse non-JSON, vide, surdimensionnée, à constante
+    non-JSON (``NaN``/``Infinity``) ou qui n'est pas un objet JSON est
+    refusée en ``QualifyError("invalid")`` — jamais réparée ni complétée,
+    y compris une réponse entourée de balises Markdown. Un prompt de
+    qualification illisible devient
     ``QualifyError("prompt")`` et un candidat au-delà du plafond du contrat
     ``QualifyError("too_large")`` : jamais d'exception brute (chemin
     compris) ni d'envoi tronquable. Une entrée non-``str`` est un vide par
@@ -216,7 +228,7 @@ def qualify(
         logger.warning("qualification: reponse surdimensionnee (prompt=%s)", PROMPT_NAME)
         raise QualifyError("invalid")
     try:
-        result = json.loads(content)
+        result = json.loads(content, parse_constant=_reject_non_json_constant)
     except (ValueError, RecursionError):
         # Imbrication profonde (borne de récursion : le scanneur C ne
         # récursionne plus par niveau, mais le repli pur-Python si) : même
