@@ -157,7 +157,16 @@ Le protocole de mesure ci-dessus (``SYSTEM_PROMPT`` du benchmark) n'est
 - le masquage n'est **pas** rejoué côté client (``mask_text`` n'est pas
   idempotent, un second passage corromprait ``type:len``) : l'entrée est la
   sortie du serveur MCP, dont le masquage avant sérialisation est
-  l'obligation #27.
+  l'obligation #27 ;
+- durcissements de revue : un prompt de qualification illisible (fichier
+  absent, encodage invalide) et un candidat au-delà du plafond
+  ``MAX_CANDIDATE_CHARS`` (2000, aligné sur la ligne masquée du serveur
+  MCP) sont refusés fail-closed (``QualifyError`` à code dédié, jamais
+  d'exception brute avec chemin ni d'envoi tronquable par ``num_ctx``) ; le
+  verdict journalisé passe par la liste blanche ``VERDICTS`` (hors enum :
+  ``invalide`` tracé, jamais la chaîne du modèle — anti-log-forging). La
+  validation pydantic stricte du retour (enum, bornes, champs bonus)
+  reste #81.
 
 Preuve « 20 candidats → sortie JSON valide » : ``tests/test_llm_qualify_ollama.py``
 (20 cas T21 synthétiques masqués puis qualifiés avec le vrai Ollama local ;
@@ -207,5 +216,5 @@ de #38/#28.4 ; la validation pydantic stricte (``extra="forbid"``) de #81
   - **Fail-closed mesuré (Invariant 1)** : `tests/benchmarks/benchmark_llm_ollama.py:310-315` (fonction `score()`) et gestion stricte des erreurs réseau/parse avec `ok=False` (`:356-368`), compteur de régression `fn_dangereux` calculé lignes 376/384.
   - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` (ligne 265) et candidat isolé hors prompt système (`:263-282`), évalué sur le panel d'injections (4 cas dans `CASES_20` lignes 118-197 + 30 cas dans `gen_full()` lignes 246-255, bloc `weird`).
   - **Confinement Invariant 3 & 10** : `--out` confiné au sous-dossier `bench-results/` avec extension `.json` imposée, validation stricte interdisant tout chemin absolu ou segment traversant `..` (`:69-85`, couvert par le test symlink-escape) et écriture atomique avec `fsync` + `os.replace` (`:88-97`).
-  - **Prompt produit & sortie contrainte (T28.2/#80, REQ-SEC-01)** : prompt système versionné sans donnée scannée et schéma JSON fermé (`heimdall/mcp/prompts/__init__.py:49-57`) ; candidat isolé entre délimiteurs aléatoires par requête (`heimdall/mcp/prompts/__init__.py:90`, `build_messages` `:78-101`) ; schéma transmis à `ollama.chat(format=…)` avec `temperature 0` et `think=False` (`heimdall/llm/qualify.py:149-156`) ; client épinglé loopback (`trust_env=False`, redirections refusées, `:111-116`) ; version du prompt journalisée (nom + SHA-256 : `:141-146`) ; nom de modèle validé avant appel (`:135`). Preuve « 20/20 JSON valide » : `tests/test_llm_qualify_ollama.py` (mesures ci-dessus).
+  - **Prompt produit & sortie contrainte (T28.2/#80, REQ-SEC-01)** : prompt système versionné sans donnée scannée et schéma JSON fermé (`heimdall/mcp/prompts/__init__.py:55-63`) ; candidat isolé entre délimiteurs aléatoires par requête (`heimdall/mcp/prompts/__init__.py:106`, `build_messages` `:92-117`) et plafonné fail-closed (`:71`) ; schéma transmis à `ollama.chat(format=…)` avec `temperature 0` et `think=False` (`heimdall/llm/qualify.py:170-176`) ; client épinglé loopback (`trust_env=False`, redirections refusées, `:120-125`) ; prompt illisible converti en erreur fermée (`:151-161`) ; version du prompt journalisée (nom + SHA-256 : `:162-167`) ; nom de modèle validé avant appel (`:147`) ; verdict journalisé par liste blanche (`:195-200`). Preuve « 20/20 JSON valide » : `tests/test_llm_qualify_ollama.py` (mesures ci-dessus).
 - **Reproductibilité des mesures** : 152 cas réels (graine 281), commande `python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --out bench.json` (un nom simple est rangé sous `bench-results/`), fichier de sortie `bench-results/bench.json` archivé dans le ticket #79 pour opposabilité.

@@ -13,7 +13,12 @@ force une réponse vérifiable automatiquement :
   pas seulement décrite au modèle ; ``temperature`` vaut 0 ;
 - la version du prompt (nom + SHA-256 du fichier) est journalisée à chaque
   appel, et le verdict retenu à chaque succès : une décision reste
-  corrélable à l'instruction qui l'a produite, sans secret ni prompt brut.
+  corrélable à l'instruction qui l'a produite, sans secret ni prompt brut —
+  un verdict hors enum n'est jamais recopié, seul ``invalide`` est tracé ;
+- tout échec local est fermé : prompt de qualification illisible (fichier
+  absent, encodage invalide) et candidat au-delà du plafond lèvent une
+  ``QualifyError`` à code dédié, jamais une exception brute (un chemin
+  dans un message d'erreur) ni un envoi tronquable.
 
 Client épinglé boucle locale : hôte figé ``http://127.0.0.1:11434``
 (``OLLAMA_HOST`` ignoré), ``trust_env=False`` (aucun proxy de
@@ -36,8 +41,10 @@ from typing import Any, Final, Literal
 import ollama
 
 from heimdall.mcp.prompts import (
+    MAX_CANDIDATE_CHARS,
     PROMPT_NAME,
     QUALIFY_FORMAT_V1,
+    VERDICTS,
     build_messages,
     prompt_digest,
 )
@@ -67,7 +74,7 @@ _CHAT_OPTIONS: Final[dict[str, int]] = {"temperature": 0, "num_ctx": 1024, "num_
 # ``ollama.Client.chat``, seul canal vers le modèle.
 ChatFn = Callable[..., Any]
 
-ErrorCode = Literal["empty", "model", "unavailable", "invalid"]
+ErrorCode = Literal["empty", "model", "unavailable", "invalid", "prompt", "too_large"]
 
 # Messages statiques, un par code : aucune donnée reflétée (ni extrait, ni
 # réponse du modèle, ni entrée) — un texte d'exception peut être relu et
@@ -77,6 +84,8 @@ ERROR_MESSAGES: Final[dict[ErrorCode, str]] = {
     "model": "nom de modele hors contrat",
     "unavailable": "LLM local indisponible : verifier Ollama sur la boucle locale",
     "invalid": "reponse du LLM invalide : JSON objet attendu",
+    "prompt": "prompt de qualification illisible : installation incomplete",
+    "too_large": "candidat trop long : plafond du contrat de qualification depasse",
 }
 
 logger = logging.getLogger(__name__)
@@ -130,18 +139,30 @@ def qualify(
     message statique (jamais l'exception d'origine, qui peut recopier la
     requête). Une réponse non-JSON, vide ou qui n'est pas un objet JSON est
     refusée en ``QualifyError("invalid")`` — jamais réparée ni complétée,
-    y compris une réponse entourée de balises Markdown.
+    y compris une réponse entourée de balises Markdown. Un prompt de
+    qualification illisible devient ``QualifyError("prompt")`` et un
+    candidat au-delà du plafond du contrat ``QualifyError("too_large")`` :
+    jamais d'exception brute (chemin compris) ni d'envoi tronquable.
     """
     if not _MODEL_PATTERN.fullmatch(model):
         raise QualifyError("model")
+    if isinstance(candidate, str) and len(candidate) > MAX_CANDIDATE_CHARS:
+        raise QualifyError("too_large")
     try:
         messages = build_messages(candidate)
+        digest = prompt_digest()
+    except UnicodeDecodeError:
+        # Prompt produit non décodable : installation cassée, même code
+        # fermé que fichier absent (jamais d'exception brute avec chemin).
+        raise QualifyError("prompt") from None
+    except OSError:
+        raise QualifyError("prompt") from None
     except ValueError:
         raise QualifyError("empty") from None
     logger.info(
         "qualification: prompt=%s sha256=%s modele=%s",
         PROMPT_NAME,
-        prompt_digest(),
+        digest,
         model,
     )
     sender = chat if chat is not None else _loopback_client().chat
@@ -174,7 +195,7 @@ def qualify(
     verdict = result.get("verdict")
     logger.info(
         "qualification: verdict=%s (prompt=%s)",
-        verdict if isinstance(verdict, str) else "invalide",
+        verdict if verdict in VERDICTS else "invalide",
         PROMPT_NAME,
     )
     return result

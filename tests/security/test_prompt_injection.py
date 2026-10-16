@@ -19,6 +19,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 MCP_SCHEMA = REPO / "schemas" / "mcp-tools.schema.json"
 MCP_DOC = REPO / "docs" / "contracts" / "mcp-tools.md"
@@ -402,8 +404,15 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
     assert set(schema["required"]) == {"verdict", "confidence"}
     assert schema["additionalProperties"] is False
 
+    # 4 bis. Candidat borné fail-closed : plafond strict, jamais d'envoi
+    # tronquable par la fenêtre du modèle.
+    assert prompts.MAX_CANDIDATE_CHARS > 0
+    with pytest.raises(ValueError):
+        prompts.build_messages("A" * (prompts.MAX_CANDIDATE_CHARS + 1))
+
     # 5. Client épinglé boucle locale, sans environnement ni redirection,
-    #    température nulle, schéma effectivement transmis à `format`.
+    #    température nulle, schéma effectivement transmis à `format` ;
+    #    verdict journalisé par whitelist (jamais la chaîne du modèle).
     client_src = QUALIFY_CLIENT.read_text(encoding="utf-8")
     for token in (
         "127.0.0.1",
@@ -411,6 +420,8 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
         "follow_redirects=False",
         '"temperature": 0',
         "format=QUALIFY_FORMAT_V1",
+        "MAX_CANDIDATE_CHARS",
+        "verdict in VERDICTS",
     ):
         assert token in client_src, token
     client_tree = ast.parse(client_src)

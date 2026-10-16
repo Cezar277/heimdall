@@ -10,9 +10,12 @@ du fichier sont journalisés à chaque appel par ``heimdall.llm.qualify``.
 Ce module ne fait AUCUN appel réseau et n'importe que la stdlib : il porte
 la partie pure du contrat (prompt, schéma, isolation du candidat) ; le
 client Ollama vit dans ``heimdall.llm.qualify``. Pas d'import relatif et
-chargement par ``__file__`` : le module reste vérifiable depuis
-l'environnement isolé des tests de sécurité (où le SDK ``mcp`` n'est pas
-installé).
+chargement par ``__file__`` : le test de sécurité (où le SDK ``mcp`` n'est
+pas installé) le charge directement par chemin. En revanche, un import
+paquet (``heimdall.mcp.prompts``, ce que fait le client) exécute
+``heimdall/mcp/__init__.py``, qui ré-exporte le serveur et exige donc le
+SDK ``mcp`` (dépendance déclarée du paquet) : seul le chargement par
+fichier est standalone.
 
 Invariants portés ici (REQ-SEC-01) :
 
@@ -23,6 +26,9 @@ Invariants portés ici (REQ-SEC-01) :
   requis, ``additionalProperties: false``), transmis à Ollama via le
   paramètre ``format`` : décrite dans le prompt **et** imposée
   techniquement, jamais l'un sans l'autre ;
+- le candidat est borné (``MAX_CANDIDATE_CHARS``, aligné sur la ligne
+  masquée du serveur MCP #27) : au-delà, refus fail-closed — jamais une
+  entrée tronquée silencieusement par la fenêtre ``num_ctx`` du modèle ;
 - l'entrée attendue est **déjà masquée** (obligation du serveur MCP #27 :
   ``<REDACTED:type:len=N>`` avant sérialisation). Le masquage n'est pas
   rejoué ici : ``masking.mask_text`` n'est pas idempotent (un second passage
@@ -56,6 +62,14 @@ QUALIFY_FORMAT_V1: Final[dict[str, Any]] = {
     "additionalProperties": False,
 }
 
+# Plafond du candidat : le serveur MCP #27 borne déjà chaque ligne masquée
+# (``gitdiff.MAX_LINE_CHARS`` = 2000) ; un extrait plus grand ne peut pas
+# tenir dans la fenêtre du modèle (``num_ctx`` 1024) sans troncature
+# silencieuse, donc il est refusé fail-closed plutôt qu'envoyé. Le plafond
+# suit ``num_ctx`` et devra être réévalué avec lui si #81 qualifie des
+# extraits multi-lignes plus grands.
+MAX_CANDIDATE_CHARS: Final[int] = 2000
+
 
 @lru_cache(maxsize=1)
 def _prompt_path() -> Path:
@@ -82,11 +96,13 @@ def build_messages(candidate: str) -> list[dict[str, str]]:
     SEUL message utilisateur, entre deux délimiteurs tirés au hasard par
     requête (``secrets.token_hex``) : le prompt système, lui, est le fichier
     versionné sans aucune interpolation, donc aucun extrait scanné ne peut
-    s'y retrouver. Un candidat vide est refusé (fail-closed) plutôt
-    qu'envoyé au modèle.
+    s'y retrouver. Refus fail-closed (``ValueError``) d'un candidat vide ou
+    au-delà de ``MAX_CANDIDATE_CHARS``, plutôt qu'un envoi tronquable.
     """
     if not isinstance(candidate, str) or not candidate.strip():
         raise ValueError("candidat vide : rien a qualifier")
+    if len(candidate) > MAX_CANDIDATE_CHARS:
+        raise ValueError("candidat trop long : plafond du contrat de qualification depasse")
     delimiter = secrets.token_hex(8)
     return [
         {"role": "system", "content": load_qualify_prompt()},
