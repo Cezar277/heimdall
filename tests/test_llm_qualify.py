@@ -306,6 +306,22 @@ class TestFailClosed:
         assert excinfo.value.code == "invalid"
         assert str(excinfo.value) == qualify_module.ERROR_MESSAGES["invalid"]
 
+    def test_deeply_nested_response_recursion_is_fail_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Le scanneur C ne récursionne plus par niveau (vérifié : aucune
+        # charge ≤ borne ne lève RecursionError sur CPython 3.14), mais le
+        # repli pur-Python si : on force la branche pour prouver le code
+        # fermé au lieu d'une exception brute.
+        def _raise_recursion(_content: str) -> Any:
+            raise RecursionError("profondeur maximale depassee")
+
+        monkeypatch.setattr(json, "loads", _raise_recursion)
+        with pytest.raises(QualifyError) as excinfo:
+            qualify(MASKED_CANDIDATE, chat=RecordingChat("[" * 5000))
+        assert excinfo.value.code == "invalid"
+        assert str(excinfo.value) == qualify_module.ERROR_MESSAGES["invalid"]
+
     def test_llm_failure_is_static_and_never_chained(self) -> None:
         marker = "SYNTHETIC_TRANSPORT_DETAIL"
         with pytest.raises(QualifyError) as excinfo:

@@ -217,7 +217,10 @@ def qualify(
         raise QualifyError("invalid")
     try:
         result = json.loads(content)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Imbrication profonde (borne de récursion : le scanneur C ne
+        # récursionne plus par niveau, mais le repli pur-Python si) : même
+        # refus fermé que JSON invalide — jamais d'exception brute.
         result = None
     if not isinstance(result, dict):
         logger.warning("qualification: reponse non conforme (prompt=%s)", PROMPT_NAME)

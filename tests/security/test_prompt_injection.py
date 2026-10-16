@@ -424,6 +424,7 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
         "MAX_CANDIDATE_CHARS",
         "MAX_RESPONSE_CHARS",
         "CandidateTooLargeError",
+        "RecursionError",
         "deepcopy",
         "verdict in VERDICTS",
     ):
