@@ -15,6 +15,7 @@ valide » avec le vrai Ollama local vit dans ``tests/test_llm_qualify_ollama.py`
 from __future__ import annotations
 
 import hashlib
+import importlib.resources
 import json
 import logging
 import re
@@ -27,6 +28,7 @@ import pytest
 from heimdall.llm import qualify as qualify_module
 from heimdall.llm.qualify import (
     DEFAULT_MODEL,
+    MAX_RESPONSE_CHARS,
     OLLAMA_HOST,
     QUALIFY_FORMAT_V1,
     REQUEST_TIMEOUT,
@@ -65,6 +67,20 @@ class WithoutMessage:
 
     def __call__(self, **kwargs: Any) -> Any:
         return SimpleNamespace()
+
+
+class TamperingChat(RecordingChat):
+    """SDK hostile : mute le schéma et les messages reçus avant de répondre.
+
+    Prouve les copies défensives de ``qualify()`` : une mutation côté appel
+    (bug ou version compromise d'Ollama) ne corrompt pas le contrat global
+    des appels suivants dans le même processus.
+    """
+
+    def __call__(self, **kwargs: Any) -> Any:
+        kwargs["format"]["properties"]["verdict"]["enum"].append("maybe")
+        kwargs["messages"][0]["content"] = "PROMPT_CORROMPU"
+        return super().__call__(**kwargs)
 
 
 class TestPromptContract:
@@ -117,6 +133,35 @@ class TestPromptContract:
         assert len(prompts_module.build_messages(payload)) == 2  # plafond inclus
         with pytest.raises(ValueError):
             prompts_module.build_messages(payload + "A")  # un caractère de trop
+
+    def test_too_large_has_its_own_error_type_distinct_from_empty(self) -> None:
+        cap = prompts_module.MAX_CANDIDATE_CHARS
+        with pytest.raises(prompts_module.CandidateTooLargeError):
+            prompts_module.build_messages("A" * (cap + 1))
+        # Sous-classe de ValueError : tout refus de construction reste une
+        # ValueError, mais le trop-long ne se confond plus avec le vide.
+        assert issubclass(prompts_module.CandidateTooLargeError, ValueError)
+
+    def test_non_str_candidate_is_empty_by_programming_error(self) -> None:
+        for bad in (None, b"octets", 123):
+            with pytest.raises(ValueError):
+                prompts_module.build_messages(bad)  # type: ignore[arg-type]
+
+    def test_prompt_resource_loadable_via_importlib_resources(self) -> None:
+        # Même API que l'installé (wheel) : la ressource est lue sans chemin
+        # en dur, preuve que le paquet l'expose comme donnée livrée.
+        text = (
+            importlib.resources.files("heimdall.mcp.prompts")
+            .joinpath("qualify_v1.md")
+            .read_text(encoding="utf-8")
+        )
+        assert text == prompts_module.load_qualify_prompt()
+
+    def test_pyproject_embarque_le_prompt_dans_le_wheel(self) -> None:
+        # Sans cette déclaration, le wheel n'embarquerait pas le .md et toute
+        # installation hors dépôt tomberait en QualifyError("prompt").
+        pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        assert '"heimdall.mcp" = ["prompts/*.md"]' in pyproject
 
     def test_format_schema_is_strict(self) -> None:
         schema = QUALIFY_FORMAT_V1
@@ -177,6 +222,27 @@ class TestQualifyRequest:
             "verdict=secret" in record.getMessage() for record in caplog.records
         )
 
+    def test_sdk_mutation_cannot_corrupt_the_global_contract(self) -> None:
+        tampering = TamperingChat()
+        assert qualify(MASKED_CANDIDATE, chat=tampering) == {
+            "verdict": "secret",
+            "confidence": 0.9,
+        }
+        # Le contrat global est intact malgré la mutation côté appel.
+        assert QUALIFY_FORMAT_V1["properties"]["verdict"]["enum"] == [
+            "secret",
+            "faux_positif",
+            "incertain",
+        ]
+        # L'appel suivant repart du contrat pristine, pas du mutant.
+        following = RecordingChat()
+        qualify(MASKED_CANDIDATE, chat=following)
+        assert following.calls[0]["format"] == QUALIFY_FORMAT_V1
+        assert (
+            following.calls[0]["messages"][0]["content"]
+            == prompts_module.load_qualify_prompt()
+        )
+
     def test_out_of_enum_verdict_is_logged_as_invalide_never_copied(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -223,6 +289,23 @@ class TestFailClosed:
             qualify(MASKED_CANDIDATE, chat=WithoutMessage())
         assert excinfo.value.code == "invalid"
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "x" * (MAX_RESPONSE_CHARS + 1),  # déchet surdimensionné
+            # JSON parsable mais surdimensionné : la borne frappe avant le
+            # parsing, pas après (DoS mémoire/CPU d'un serveur compromis).
+            '{"verdict": "secret", "confidence": 0.9, "pad": "'
+            + "x" * MAX_RESPONSE_CHARS
+            + '"}',
+        ],
+    )
+    def test_oversized_response_is_refused_before_parsing(self, content: str) -> None:
+        with pytest.raises(QualifyError) as excinfo:
+            qualify(MASKED_CANDIDATE, chat=RecordingChat(content))
+        assert excinfo.value.code == "invalid"
+        assert str(excinfo.value) == qualify_module.ERROR_MESSAGES["invalid"]
+
     def test_llm_failure_is_static_and_never_chained(self) -> None:
         marker = "SYNTHETIC_TRANSPORT_DETAIL"
         with pytest.raises(QualifyError) as excinfo:
@@ -237,6 +320,16 @@ class TestFailClosed:
                 qualify(empty, chat=RecordingChat())
             assert excinfo.value.code == "empty"
 
+    @pytest.mark.parametrize("candidate", [None, b"octets", 123])
+    def test_non_str_candidate_is_empty_never_sent(self, candidate: Any) -> None:
+        # Erreur de programmation de l'appelant, pas une donnée : code
+        # "empty" documenté, aucun envoi au modèle.
+        chat = RecordingChat()
+        with pytest.raises(QualifyError) as excinfo:
+            qualify(candidate, chat=chat)
+        assert excinfo.value.code == "empty"
+        assert chat.calls == []
+
     def test_too_long_candidate_is_refused_before_any_request(self) -> None:
         chat = RecordingChat()
         with pytest.raises(QualifyError) as excinfo:
@@ -244,6 +337,19 @@ class TestFailClosed:
         assert excinfo.value.code == "too_large"
         assert str(excinfo.value) == qualify_module.ERROR_MESSAGES["too_large"]
         assert chat.calls == []  # le plafond est vérifié avant tout envoi
+
+    def test_direct_build_messages_too_large_maps_too_large(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Voie des appelants directs de build_messages : l'exception dédiée
+        # se mappe vers "too_large", jamais vers "empty".
+        def _raise_too_large(candidate: str) -> list[dict[str, str]]:
+            raise prompts_module.CandidateTooLargeError("trop long")
+
+        monkeypatch.setattr(qualify_module, "build_messages", _raise_too_large)
+        with pytest.raises(QualifyError) as excinfo:
+            qualify(MASKED_CANDIDATE, chat=RecordingChat())
+        assert excinfo.value.code == "too_large"
 
     def test_prompt_file_failure_is_fail_closed(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

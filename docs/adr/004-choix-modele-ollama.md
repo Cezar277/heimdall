@@ -158,13 +158,26 @@ Le protocole de mesure ci-dessus (``SYSTEM_PROMPT`` du benchmark) n'est
   idempotent, un second passage corromprait ``type:len``) : l'entrée est la
   sortie du serveur MCP, dont le masquage avant sérialisation est
   l'obligation #27 ;
-- durcissements de revue : un prompt de qualification illisible (fichier
-  absent, encodage invalide) et un candidat au-delà du plafond
-  ``MAX_CANDIDATE_CHARS`` (2000, aligné sur la ligne masquée du serveur
-  MCP) sont refusés fail-closed (``QualifyError`` à code dédié, jamais
-  d'exception brute avec chemin ni d'envoi tronquable par ``num_ctx``) ; le
-  verdict journalisé passe par la liste blanche ``VERDICTS`` (hors enum :
-  ``invalide`` tracé, jamais la chaîne du modèle — anti-log-forging). La
+- durcissements de revue (commit round 2) : un prompt de qualification
+  illisible (fichier absent, encodage invalide) et un candidat au-delà du
+  plafond ``MAX_CANDIDATE_CHARS`` (2000, aligné sur la ligne masquée du
+  serveur MCP) sont refusés fail-closed (``QualifyError`` à code dédié,
+  jamais d'exception brute avec chemin ni d'envoi tronquable par
+  ``num_ctx``) ; le trop-long a son type propre
+  (``CandidateTooLargeError``, sous-classe de ``ValueError``) pour ne plus
+  se confondre avec le vide, et une entrée non-``str`` est un ``empty``
+  documenté ; le verdict journalisé passe par la liste blanche ``VERDICTS``
+  (hors enum : ``invalide`` tracé, jamais la chaîne du modèle —
+  anti-log-forging) ;
+- durcissements de revue (commit round 3) : réponse du modèle bornée à
+  ``MAX_RESPONSE_CHARS`` (8192, ~60× une réponse réelle < 150 caractères)
+  **avant** ``json.loads`` — un serveur compromis ne fait pas exploser la
+  CLI en mémoire/CPU (``num_predict`` ne borne qu'un serveur honnête) ;
+  schéma et messages passés au SDK **par copie** (``deepcopy`` du schéma,
+  copies des messages) — une mutation côté Ollama ne corrompt pas le contrat
+  des appels suivants ; embarquement du prompt dans le wheel prouvé
+  (``package-data`` + lecture ``importlib.resources`` depuis un wheel
+  installé en venv propre, même SHA-256 que le fichier du dépôt). La
   validation pydantic stricte du retour (enum, bornes, champs bonus)
   reste #81.
 
@@ -216,5 +229,5 @@ de #38/#28.4 ; la validation pydantic stricte (``extra="forbid"``) de #81
   - **Fail-closed mesuré (Invariant 1)** : `tests/benchmarks/benchmark_llm_ollama.py:310-315` (fonction `score()`) et gestion stricte des erreurs réseau/parse avec `ok=False` (`:356-368`), compteur de régression `fn_dangereux` calculé lignes 376/384.
   - **Résistance injection & Invariant 2** : délimiteur aléatoire unique par requête `secrets.token_hex(8)` (ligne 265) et candidat isolé hors prompt système (`:263-282`), évalué sur le panel d'injections (4 cas dans `CASES_20` lignes 118-197 + 30 cas dans `gen_full()` lignes 246-255, bloc `weird`).
   - **Confinement Invariant 3 & 10** : `--out` confiné au sous-dossier `bench-results/` avec extension `.json` imposée, validation stricte interdisant tout chemin absolu ou segment traversant `..` (`:69-85`, couvert par le test symlink-escape) et écriture atomique avec `fsync` + `os.replace` (`:88-97`).
-  - **Prompt produit & sortie contrainte (T28.2/#80, REQ-SEC-01)** : prompt système versionné sans donnée scannée et schéma JSON fermé (`heimdall/mcp/prompts/__init__.py:55-63`) ; candidat isolé entre délimiteurs aléatoires par requête (`heimdall/mcp/prompts/__init__.py:106`, `build_messages` `:92-117`) et plafonné fail-closed (`:71`) ; schéma transmis à `ollama.chat(format=…)` avec `temperature 0` et `think=False` (`heimdall/llm/qualify.py:170-176`) ; client épinglé loopback (`trust_env=False`, redirections refusées, `:120-125`) ; prompt illisible converti en erreur fermée (`:151-161`) ; version du prompt journalisée (nom + SHA-256 : `:162-167`) ; nom de modèle validé avant appel (`:147`) ; verdict journalisé par liste blanche (`:195-200`). Preuve « 20/20 JSON valide » : `tests/test_llm_qualify_ollama.py` (mesures ci-dessus).
+  - **Prompt produit & sortie contrainte (T28.2/#80, REQ-SEC-01)** : prompt système versionné sans donnée scannée et schéma JSON fermé (`heimdall/mcp/prompts/__init__.py:56-64`) ; candidat isolé entre délimiteurs aléatoires par requête (`heimdall/mcp/prompts/__init__.py:121`, `build_messages` `:103-132`), plafonné fail-closed (`:72`, type dédié `:75-81`) ; schéma transmis à `ollama.chat(format=…)` avec `temperature 0` et `think=False`, par copie défensive (`heimdall/llm/qualify.py:190-201`) ; réponse bornée avant parsing (`:84`, `:212-218`) ; client épinglé loopback (`trust_env=False`, redirections refusées, `:133-138`) ; prompt illisible converti en erreur fermée (`:166-181`) ; version du prompt journalisée (nom + SHA-256 : `:182-187`) ; nom de modèle validé avant appel (`:162`) ; verdict journalisé par liste blanche (`:225-230`). Preuve « 20/20 JSON valide » : `tests/test_llm_qualify_ollama.py` (mesures ci-dessus).
 - **Reproductibilité des mesures** : 152 cas réels (graine 281), commande `python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --out bench.json` (un nom simple est rangé sous `bench-results/`), fichier de sortie `bench-results/bench.json` archivé dans le ticket #79 pour opposabilité.

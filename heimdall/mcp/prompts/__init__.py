@@ -27,7 +27,8 @@ Invariants portés ici (REQ-SEC-01) :
   paramètre ``format`` : décrite dans le prompt **et** imposée
   techniquement, jamais l'un sans l'autre ;
 - le candidat est borné (``MAX_CANDIDATE_CHARS``, aligné sur la ligne
-  masquée du serveur MCP #27) : au-delà, refus fail-closed — jamais une
+  masquée du serveur MCP #27) : au-delà, refus fail-closed
+  (``CandidateTooLargeError``, distincte du vide) — jamais une
   entrée tronquée silencieusement par la fenêtre ``num_ctx`` du modèle ;
 - l'entrée attendue est **déjà masquée** (obligation du serveur MCP #27 :
   ``<REDACTED:type:len=N>`` avant sérialisation). Le masquage n'est pas
@@ -71,6 +72,16 @@ QUALIFY_FORMAT_V1: Final[dict[str, Any]] = {
 MAX_CANDIDATE_CHARS: Final[int] = 2000
 
 
+class CandidateTooLargeError(ValueError):
+    """Candidat au-delà de ``MAX_CANDIDATE_CHARS``.
+
+    Sous-classe de ``ValueError`` (compatibilité : tout refus de construction
+    reste une ``ValueError``), mais type distinct du candidat vide : l'appelant
+    (``heimdall.llm.qualify``) mappe chaque cas vers son propre code fermé
+    (``too_large`` vs ``empty``) au lieu d'un fourre-tout.
+    """
+
+
 @lru_cache(maxsize=1)
 def _prompt_path() -> Path:
     """Chemin du prompt, à côté de ce module (résolu une seule fois)."""
@@ -96,13 +107,17 @@ def build_messages(candidate: str) -> list[dict[str, str]]:
     SEUL message utilisateur, entre deux délimiteurs tirés au hasard par
     requête (``secrets.token_hex``) : le prompt système, lui, est le fichier
     versionné sans aucune interpolation, donc aucun extrait scanné ne peut
-    s'y retrouver. Refus fail-closed (``ValueError``) d'un candidat vide ou
-    au-delà de ``MAX_CANDIDATE_CHARS``, plutôt qu'un envoi tronquable.
+    s'y retrouver. Refus fail-closed d'un candidat vide (``ValueError``) ou
+    au-delà de ``MAX_CANDIDATE_CHARS`` (``CandidateTooLargeError``), plutôt
+    qu'un envoi tronquable. Une entrée non-``str`` (``None``, ``bytes``…)
+    est un vide par erreur de programmation : ``ValueError``.
     """
     if not isinstance(candidate, str) or not candidate.strip():
         raise ValueError("candidat vide : rien a qualifier")
     if len(candidate) > MAX_CANDIDATE_CHARS:
-        raise ValueError("candidat trop long : plafond du contrat de qualification depasse")
+        raise CandidateTooLargeError(
+            "candidat trop long : plafond du contrat de qualification depasse"
+        )
     delimiter = secrets.token_hex(8)
     return [
         {"role": "system", "content": load_qualify_prompt()},

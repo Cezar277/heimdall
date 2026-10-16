@@ -18,7 +18,10 @@ force une réponse vérifiable automatiquement :
 - tout échec local est fermé : prompt de qualification illisible (fichier
   absent, encodage invalide) et candidat au-delà du plafond lèvent une
   ``QualifyError`` à code dédié, jamais une exception brute (un chemin
-  dans un message d'erreur) ni un envoi tronquable.
+  dans un message d'erreur) ni un envoi tronquable ;
+- la réponse du modèle est bornée (``MAX_RESPONSE_CHARS``) avant parsing :
+  un serveur Ollama compromis ne peut pas faire exploser la CLI avec des
+  Mo de JSON — refus ``QualifyError("invalid")`` fail-closed.
 
 Client épinglé boucle locale : hôte figé ``http://127.0.0.1:11434``
 (``OLLAMA_HOST`` ignoré), ``trust_env=False`` (aucun proxy de
@@ -32,6 +35,7 @@ consultatif : ce module ne modifie aucun Finding et ne décide jamais seul
 (REQ-SEC-01).
 """
 
+import copy
 import json
 import logging
 import re
@@ -45,6 +49,7 @@ from heimdall.mcp.prompts import (
     PROMPT_NAME,
     QUALIFY_FORMAT_V1,
     VERDICTS,
+    CandidateTooLargeError,
     build_messages,
     prompt_digest,
 )
@@ -69,6 +74,14 @@ _MODEL_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9._:/-]{1,64}$")
 # (reproductibilité), contexte et génération bornés. ``think`` désactivé et
 # ``format`` contraint sont passés séparément dans l'appel.
 _CHAT_OPTIONS: Final[dict[str, int]] = {"temperature": 0, "num_ctx": 1024, "num_predict": 120}
+
+# Plafond de la réponse du modèle avant parsing : ``num_predict`` 120 ne
+# borne qu'un serveur honnête — un serveur compromis (seul interlocuteur,
+# mais non fiable selon l'invariant 2) renverrait des Mo de JSON et ferait
+# exploser la CLI en mémoire/CPU. 8192 caractères couvrent ~60× une réponse
+# réelle (objet ``{"verdict", "confidence"}`` < 150 caractères) : au-delà,
+# refus ``invalid`` fail-closed, jamais de ``json.loads`` sans borne.
+MAX_RESPONSE_CHARS: Final[int] = 8192
 
 # Fonction de chat injectable (tests hors ligne) : signature de
 # ``ollama.Client.chat``, seul canal vers le modèle.
@@ -137,12 +150,14 @@ def qualify(
     part vers le client Ollama épinglé boucle locale. Toute panne du
     transport ou du modèle devient ``QualifyError("unavailable")`` à
     message statique (jamais l'exception d'origine, qui peut recopier la
-    requête). Une réponse non-JSON, vide ou qui n'est pas un objet JSON est
-    refusée en ``QualifyError("invalid")`` — jamais réparée ni complétée,
-    y compris une réponse entourée de balises Markdown. Un prompt de
-    qualification illisible devient ``QualifyError("prompt")`` et un
-    candidat au-delà du plafond du contrat ``QualifyError("too_large")`` :
-    jamais d'exception brute (chemin compris) ni d'envoi tronquable.
+    requête). Une réponse non-JSON, vide, surdimensionnée ou qui n'est pas
+    un objet JSON est refusée en ``QualifyError("invalid")`` — jamais
+    réparée ni complétée, y compris une réponse entourée de balises
+    Markdown. Un prompt de qualification illisible devient
+    ``QualifyError("prompt")`` et un candidat au-delà du plafond du contrat
+    ``QualifyError("too_large")`` : jamais d'exception brute (chemin
+    compris) ni d'envoi tronquable. Une entrée non-``str`` est un vide par
+    erreur de programmation : ``QualifyError("empty")``.
     """
     if not _MODEL_PATTERN.fullmatch(model):
         raise QualifyError("model")
@@ -157,6 +172,11 @@ def qualify(
         raise QualifyError("prompt") from None
     except OSError:
         raise QualifyError("prompt") from None
+    except CandidateTooLargeError:
+        # Type distinct du vide (cf. prompts) : le pré-contrôle ci-dessus
+        # couvre déjà ce cas, ce rattrapage ferme la voie aux appelants
+        # directs de ``build_messages`` sans ambiguïté de code.
+        raise QualifyError("too_large") from None
     except ValueError:
         raise QualifyError("empty") from None
     logger.info(
@@ -169,8 +189,12 @@ def qualify(
     try:
         response = sender(
             model=model,
-            messages=messages,
-            format=QUALIFY_FORMAT_V1,
+            # Copies défensives : le schéma et les messages sont des objets
+            # globaux/mutables — une mutation côté SDK (bug ou version
+            # compromise) ne doit pas corrompre le contrat des appels
+            # suivants dans le même processus.
+            messages=[dict(message) for message in messages],
+            format=copy.deepcopy(QUALIFY_FORMAT_V1),
             think=False,
             stream=False,
             options=dict(_CHAT_OPTIONS),
@@ -184,6 +208,12 @@ def qualify(
     content = getattr(getattr(response, "message", None), "content", None)
     if not isinstance(content, str):
         logger.warning("qualification: reponse sans contenu (prompt=%s)", PROMPT_NAME)
+        raise QualifyError("invalid")
+    if len(content) > MAX_RESPONSE_CHARS:
+        # Borne anti-DoS avant parsing : ``num_predict`` ne contraint qu'un
+        # serveur honnête ; un contenu surdimensionné est refusé sans être
+        # ni parsé ni reflété (même code fermé qu'un JSON invalide).
+        logger.warning("qualification: reponse surdimensionnee (prompt=%s)", PROMPT_NAME)
         raise QualifyError("invalid")
     try:
         result = json.loads(content)

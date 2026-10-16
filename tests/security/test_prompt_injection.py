@@ -412,18 +412,26 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
 
     # 5. Client épinglé boucle locale, sans environnement ni redirection,
     #    température nulle, schéma effectivement transmis à `format` ;
-    #    verdict journalisé par whitelist (jamais la chaîne du modèle).
+    #    verdict journalisé par whitelist (jamais la chaîne du modèle) ;
+    #    réponse bornée avant parsing, copies défensives, codes dédiés.
     client_src = QUALIFY_CLIENT.read_text(encoding="utf-8")
     for token in (
         "127.0.0.1",
         "trust_env=False",
         "follow_redirects=False",
         '"temperature": 0',
-        "format=QUALIFY_FORMAT_V1",
+        "deepcopy(QUALIFY_FORMAT_V1)",
         "MAX_CANDIDATE_CHARS",
+        "MAX_RESPONSE_CHARS",
+        "CandidateTooLargeError",
+        "deepcopy",
         "verdict in VERDICTS",
     ):
         assert token in client_src, token
+    # Le prompt versionné est embarqué dans le wheel (sinon toute install
+    # hors dépôt tomberait en erreur systématique).
+    pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"heimdall.mcp" = ["prompts/*.md"]' in pyproject
     client_tree = ast.parse(client_src)
     imported: set[str] = set()
     for node in ast.walk(client_tree):
