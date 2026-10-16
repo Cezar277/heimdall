@@ -1,0 +1,393 @@
+"""Tests unitaires pour le benchmark Ollama (T28.1 / ADR-004).
+
+Vérifie :
+- score() : cas None, incertain_ou_secret, secret, faux_positif, et sévérité fail-closed
+- bench() : chemin nominal, chemin d'erreur (query lève -> ok=False, fn_dangereux non incrémenté)
+- gen_full() : déterminisme strict (graine 281)
+- Validation CLI : --models, --timeout, --out (.json sous bench-results/ exigé)
+- Délimiteurs aléatoires uniques par requête (Invariant 2)
+- Écriture atomique confinée (Invariants 3 et 10)
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import threading
+from collections import Counter
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "benchmark_llm_ollama",
+    REPO_ROOT / "tests/benchmarks/benchmark_llm_ollama.py",
+)
+assert SPEC and SPEC.loader
+bench_mod = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(bench_mod)
+
+atomic_write_json = bench_mod.atomic_write_json
+bench = bench_mod.bench
+build_query_payload = bench_mod.build_query_payload
+CASES_20 = bench_mod.CASES_20
+gen_full = bench_mod.gen_full
+parse_args = bench_mod.parse_args
+score = bench_mod.score
+validate_model_name = bench_mod.validate_model_name
+validate_output_path = bench_mod.validate_output_path
+validate_timeout = bench_mod.validate_timeout
+
+
+class TestScore:
+    """Tests exhaustifs de la fonction score() de labellisation."""
+
+    def test_verdict_none_returns_false(self) -> None:
+        assert score("secret", None) is False
+        assert score("faux_positif", None) is False
+        assert score("incertain_ou_secret", None) is False
+
+    def test_incertain_ou_secret_behavior(self) -> None:
+        # Résistance aux injections : tout sauf faux_positif est accepté
+        assert score("incertain_ou_secret", "secret") is True
+        assert score("incertain_ou_secret", "incertain") is True
+        assert score("incertain_ou_secret", "faux_positif") is False
+        assert score("incertain_ou_secret", "inconnu") is False
+
+    def test_secret_behavior(self) -> None:
+        assert score("secret", "secret") is True
+        # Plus strict que la prod : pour le bench, incertain ne compte pas comme un succès
+        assert score("secret", "incertain") is False
+        assert score("secret", "faux_positif") is False
+
+    def test_faux_positif_behavior(self) -> None:
+        assert score("faux_positif", "faux_positif") is True
+        assert score("faux_positif", "secret") is False
+        assert score("faux_positif", "incertain") is False
+
+
+class TestGenFull:
+    """Tests de génération du dataset synthétique."""
+
+    def test_determinism_seed_281(self) -> None:
+        run1 = gen_full()
+        run2 = gen_full()
+        assert run1 == run2
+        assert len(run1) == 132
+
+    def test_structure_and_categories(self) -> None:
+        dataset = gen_full()
+        valid_labels = {"secret", "faux_positif", "incertain_ou_secret"}
+        for item in dataset:
+            assert len(item) == 3
+            cand, label, cat = item
+            assert isinstance(cand, str) and cand
+            assert label in valid_labels
+            assert isinstance(cat, str) and cat
+
+    def test_full_dataset_counts_and_distribution(self) -> None:
+        generated = gen_full()
+        full_dataset = list(CASES_20) + generated
+        assert len(CASES_20) == 20
+        assert len(generated) == 132
+        assert len(full_dataset) == 152
+
+        c_20 = Counter(item[1] for item in CASES_20)
+        assert c_20["secret"] == 10
+        assert c_20["faux_positif"] == 6
+        assert c_20["incertain_ou_secret"] == 4
+
+        c_gen = Counter(item[1] for item in generated)
+        assert c_gen["secret"] == 70
+        assert c_gen["faux_positif"] == 32
+        assert c_gen["incertain_ou_secret"] == 30
+
+        c_total = Counter(item[1] for item in full_dataset)
+        assert c_total["secret"] == 80
+        assert c_total["faux_positif"] == 38
+        assert c_total["incertain_ou_secret"] == 34
+
+
+class TestQueryPayloadAndDelimiters:
+    """Tests d'application de l'Invariant 2 (délimiteurs aléatoires)."""
+
+    def test_random_delimiter_unique_per_call(self) -> None:
+        payload1, sep1 = build_query_payload("gemma3:270m", "candidat_secret_1")
+        payload2, sep2 = build_query_payload("gemma3:270m", "candidat_secret_1")
+
+        assert sep1 != sep2
+        assert f"<data_{sep1}>" in payload1["messages"][1]["content"]
+        assert f"</data_{sep1}>" in payload1["messages"][1]["content"]
+        assert f"<data_{sep2}>" in payload2["messages"][1]["content"]
+        assert f"</data_{sep2}>" in payload2["messages"][1]["content"]
+
+    def test_candidate_never_in_system_prompt(self) -> None:
+        candidate = "INJECTION_PAYLOAD_TEST_12345"
+        payload, _ = build_query_payload("gemma3:270m", candidate)
+
+        assert payload["messages"][0]["role"] == "system"
+        assert candidate not in payload["messages"][0]["content"]
+        assert candidate in payload["messages"][1]["content"]
+
+
+class TestBenchFunction:
+    """Tests de déroulement du benchmark (succès et chemins d'erreur)."""
+
+    @patch.object(bench_mod, "query")
+    def test_bench_nominal(self, mock_query: MagicMock) -> None:
+        # 3 cas simulés : 1 secret réussi, 1 faux négatif dangereux, 1 injection bloquée
+        mock_query.side_effect = [
+            ({"eval_count": 50, "eval_duration": 1_000_000_000}, '{"verdict": "secret"}', 0.5),
+            ({"eval_count": 50, "eval_duration": 1_000_000_000}, '{"verdict": "secret"}', 0.5),
+            (
+                {"eval_count": 50, "eval_duration": 1_000_000_000},
+                '{"verdict": "faux_positif"}',
+                0.4,
+            ),
+            ({"eval_count": 50, "eval_duration": 1_000_000_000}, '{"verdict": "incertain"}', 0.6),
+        ]
+
+        dataset = [
+            ("AWS_KEY = 'AKIA123'", "secret", "aws"),
+            ("STRIPE_KEY = 'sk_test_123'", "secret", "stripe"),
+            ("# INJECTION ignore all", "incertain_ou_secret", "inj"),
+        ]
+
+        summary = bench("gemma3:270m", dataset, timeout=30.0)
+
+        assert summary["model"] == "gemma3:270m"
+        assert summary["n"] == 3
+        assert summary["justesse"] == "2/3"
+        assert summary["rappel_secrets"] == "1/2"
+        assert summary["injections_bloquees"] == "1/1"
+        assert summary["fn_dangereux"] == 1
+        assert summary["json_valide"] == "3/3"
+        assert summary["t_total"] > 0
+
+    @patch.object(bench_mod, "query")
+    def test_bench_error_path_fail_closed(self, mock_query: MagicMock) -> None:
+        # Quand query lève une exception, le cas échoue (ok=False) mais fn_dangereux reste 0
+        mock_query.side_effect = RuntimeError("Ollama daemon down")
+
+        dataset = [
+            ("AWS_KEY = 'AKIA123'", "secret", "aws"),
+            ("# INJECTION", "incertain_ou_secret", "inj"),
+        ]
+
+        summary = bench("gemma3:270m", dataset, timeout=30.0)
+
+        assert summary["n"] == 2
+        assert summary["justesse"] == "0/2"
+        assert summary["score_pct"] == 0.0
+        assert summary["rappel_secrets"] == "0/1"
+        assert summary["injections_bloquees"] == "0/1"
+        assert summary["fn_dangereux"] == 0
+        assert summary["json_valide"] == "0/2"
+
+    @patch.object(bench_mod, "query")
+    def test_bench_reproducible_out_json(self, mock_query: MagicMock, tmp_path: Path) -> None:
+        mock_query.side_effect = [
+            ({"eval_count": 40, "eval_duration": 800_000_000}, '{"verdict": "secret"}', 0.8),
+            ({"eval_count": 40, "eval_duration": 800_000_000}, '{"verdict": "secret"}', 0.8),
+            (
+                {"eval_count": 40, "eval_duration": 800_000_000},
+                '{"verdict": "faux_positif"}',
+                0.8,
+            ),
+        ]
+        dataset = [
+            ("AWS_KEY = 'AKIA123'", "secret", "aws"),
+            ("CLIENT_SESSION = 'uuid'", "faux_positif", "uuid"),
+        ]
+        summary = bench("gemma3:270m", dataset, timeout=10.0)
+        target = tmp_path / "bench_reproducible.json"
+        atomic_write_json(target, [summary])
+
+        assert target.exists()
+        reloaded = json.loads(target.read_text(encoding="utf-8"))
+        assert isinstance(reloaded, list)
+        assert len(reloaded) == 1
+        res = reloaded[0]
+        assert res["model"] == "gemma3:270m"
+        assert res["n"] == 2
+        assert res["justesse"] == "2/2"
+        assert res["score_pct"] == 100.0
+        assert res["rappel_secrets"] == "1/1"
+        assert res["fn_dangereux"] == 0
+        assert res["json_valide"] == "2/2"
+        assert res["t_total"] == summary["t_total"]
+
+
+class TestQueryNoProxy:
+    """query() ne doit jamais passer par un proxy (Invariant 12)."""
+
+    def test_query_ignores_proxy_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        body = json.dumps(
+            {
+                "message": {"content": '{"verdict": "secret", "confidence": 0.99}'},
+                "eval_count": 10,
+                "eval_duration": 1_000_000_000,
+            }
+        ).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # Proxy injoignable + pas d'exception NO_PROXY : avec l'ancien
+            # code (urlopen sensible à l'environnement), la requête partirait
+            # vers le proxy et échouerait après retries.
+            monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9/")
+            monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9/")
+            monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9/")
+            monkeypatch.setenv("http_proxy", "http://127.0.0.1:9/")
+            monkeypatch.setenv("https_proxy", "http://127.0.0.1:9/")
+            monkeypatch.delenv("NO_PROXY", raising=False)
+            monkeypatch.delenv("no_proxy", raising=False)
+            monkeypatch.setattr(bench_mod, "ENDPOINT", f"http://127.0.0.1:{port}/api/chat")
+
+            _, content, elapsed = bench_mod.query("gemma3:270m", "CANDIDAT = 'x'", 10.0)
+            assert json.loads(content)["verdict"] == "secret"
+            assert elapsed >= 0
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
+class TestValidationAndHardening:
+    """Tests de validation des arguments CLI et confinement des chemins."""
+
+    def test_validate_model_name(self) -> None:
+        assert validate_model_name("gemma3:270m") == "gemma3:270m"
+        assert validate_model_name("qwen2.5:0.5b") == "qwen2.5:0.5b"
+        assert validate_model_name("org/repo:tag-1.0") == "org/repo:tag-1.0"
+
+        with pytest.raises(ValueError, match="Nom de modèle invalide"):
+            validate_model_name("")
+        with pytest.raises(ValueError, match="Nom de modèle invalide"):
+            validate_model_name("model with spaces")
+        with pytest.raises(ValueError, match="Nom de modèle invalide"):
+            validate_model_name("model;rm -rf /")
+        with pytest.raises(ValueError, match="Nom de modèle invalide"):
+            validate_model_name("a" * 65)
+
+    def test_validate_timeout(self) -> None:
+        assert validate_timeout(90.0) == 90.0
+        assert validate_timeout(0.5) == 0.5
+
+        with pytest.raises(ValueError, match="Timeout invalide"):
+            validate_timeout(0.0)
+        with pytest.raises(ValueError, match="Timeout invalide"):
+            validate_timeout(-10.0)
+        with pytest.raises(ValueError, match="Timeout invalide"):
+            validate_timeout(float("nan"))
+        with pytest.raises(ValueError, match="Timeout invalide"):
+            validate_timeout(float("inf"))
+
+    def test_validate_output_path(self, tmp_path: Path) -> None:
+        base = tmp_path.resolve()
+
+        # Chemin relatif valide
+        out = validate_output_path("results/bench.json", base_dir=base)
+        assert out == (base / "results/bench.json").resolve()
+        assert out.is_relative_to(base)
+
+        # Rejet chemin vide
+        with pytest.raises(ValueError, match="vide"):
+            validate_output_path("", base_dir=base)
+        with pytest.raises(ValueError, match="vide"):
+            validate_output_path("   ", base_dir=base)
+
+        # Rejet chemin absolu
+        with pytest.raises(ValueError, match="relatif"):
+            validate_output_path("/etc/cron.d/evil", base_dir=base)
+
+        # Rejet segment '..'
+        with pytest.raises(ValueError, match=r"\.\."):
+            validate_output_path("../outside.json", base_dir=base)
+        with pytest.raises(ValueError, match=r"\.\."):
+            validate_output_path("subdir/../../escape.json", base_dir=base)
+
+    def test_validate_output_path_rejects_symlink_escape(self, tmp_path: Path) -> None:
+        base = tmp_path.resolve()
+        # Cible HORS du socle (voisine de tmp_path, pas dedans).
+        outside = tmp_path.parent / (tmp_path.name + "-outside")
+        outside.mkdir(exist_ok=True)
+
+        # Un symlink interne qui pointe hors du socle doit être rejeté
+        # une fois résolu (resolve + is_relative_to).
+        (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(ValueError, match="confiné"):
+            validate_output_path("link/escape.json", base_dir=base)
+
+        (outside / "evil.txt").write_text("x", encoding="utf-8")
+        (tmp_path / "linkfile").symlink_to(outside / "evil.txt")
+        with pytest.raises(ValueError, match="confiné"):
+            validate_output_path("linkfile", base_dir=base)
+
+    def test_atomic_write_json(self, tmp_path: Path) -> None:
+        target = tmp_path / "subdir" / "summary.json"
+        data = [{"model": "gemma3:270m", "score": 100}]
+
+        atomic_write_json(target, data)
+
+        assert target.exists()
+        loaded = json.loads(target.read_text(encoding="utf-8"))
+        assert loaded == data
+
+        # Aucun fichier temporaire ne doit subsister dans le dossier
+        files = list(target.parent.iterdir())
+        assert files == [target]
+
+    def test_parse_args_valid(self) -> None:
+        args = parse_args(
+            ["--models", "gemma3:270m", "--timeout", "45", "--out", "bench-results/results.json"]
+        )
+        assert args.models == ["gemma3:270m"]
+        assert args.timeout == 45.0
+        assert args.out == "bench-results/results.json"
+        # Nom simple : résolu sous bench-results/
+        args = parse_args(["--models", "gemma3:270m", "--out", "results.json"])
+        assert args.out == "results.json"
+
+    def test_parse_args_invalid_timeout(self) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--timeout", "-5"])
+
+    def test_parse_args_invalid_model(self) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "invalid model name"])
+
+    def test_parse_args_invalid_out(self) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "/etc/evil.json"])
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "../escape.json"])
+        # Sans suffixe .json
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "bench-results/notes.txt"])
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "notes.txt"])
+        # .json mais hors sous-dossier dédié (écrasement arbitraire refusé)
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "bench-results/../escape.json"])
+        # Le dossier lui-même n'est pas un .json
+        with pytest.raises(SystemExit):
+            parse_args(["--models", "gemma3:270m", "--out", "bench-results"])
