@@ -9,10 +9,11 @@
 méthodes que `ssl.SSLSocket` surcharge (`send`, `sendall`, `write`, `sendto`,
 `sendmsg`, `sendfile` — elles n'appellent pas celles de `socket.socket`), puis
 `getaddrinfo`, `gethostbyname`, `gethostbyname_ex`, `gethostbyaddr` et
-`getnameinfo`. Le lancement de processus enfants par les wrappers Python
-(`subprocess.Popen`, `os.system`, `os.fork`/`forkpty`, `os.posix_spawn(p)`,
-`os.exec*`) est refusé et journalisé : un enfant échapperait aux patchs de
-sockets. Le journal du garde enregistre aussi les tentatives refusées : les
+`getnameinfo`. Le lancement de processus enfants est refusé et journalisé
+pour `subprocess.Popen` **par accès d'attribut** (donc `run`/`call`/`check_*`
+qui le résolvent dans le module) et pour `os.system`, `os.fork`/`forkpty`,
+`os.posix_spawn(p)`, `os.exec*` : un enfant échapperait aux patchs de sockets.
+Le journal du garde enregistre aussi les tentatives refusées : les
 avaler dans une exception n'empêche pas le test de les détecter. Le test lance
 `heimdall scan --ci` dans le processus pytest et vérifie l'absence de tentative
 Internet.
@@ -32,16 +33,20 @@ assumée et verrouillée par
 descripteur (`os.write`/`os.writev`/`os.sendfile`) vers un fd `AF_UNIX` est
 refusée (fd jamais épinglé). Toute
 **référence capturée avant le patch** (`orig = socket.getaddrinfo`,
-`from os import write`, `from os import sendfile`, valeur par défaut liée à
-l'import) garde l'original — trou connu, verrouillé pour DNS par
-`test_early_bound_dns_alias_runs_unguarded_and_is_documented` et pour `os.*`
-par `test_early_bound_os_write_runs_unguarded_and_is_documented` ; les
-extensions natives qui appellent directement les syscalls réseau (sans passer
-par les méthodes Python) ne sont pas couvertes. Un processus enfant lancé
-**hors wrappers Python** (extension native ou binaire appelant directement
-`fork(2)`/`execve(2)`) reste hors garde : un enfant émet ses propres
-connexions, non patchées ; le filet est `strace -f`, qui suit les forks — d'où
-`execve` dans le filtre du rejeu. Piège vérifié : `strace -e
+`from os import write`, `from os import sendfile`,
+`from subprocess import Popen`, valeur par défaut liée à l'import) garde
+l'original — trou connu, verrouillé par les trois tests miroirs
+`test_early_bound_dns_alias_runs_unguarded_and_is_documented` (DNS),
+`test_early_bound_os_write_runs_unguarded_and_is_documented` (`os.*`) et
+`test_early_bound_subprocess_popen_runs_unguarded_and_is_documented`
+(`subprocess`). Les extensions natives qui appellent directement les syscalls
+réseau (sans passer par les méthodes Python) ne sont pas couvertes. Un
+processus enfant lancé **hors wrappers Python** — extension native, binaire
+appelant `fork(2)`/`execve(2)`, alias `Popen` précoce, méthode de démarrage
+`spawn`/`forkserver` de `multiprocessing` (chemin C `_posixsubprocess`) —
+reste hors garde : un enfant émet ses propres connexions, non patchées ; le
+filet est `strace -f`, qui suit les forks — d'où `execve` dans le filtre du
+rejeu. Piège vérifié : `strace -e
 trace=%network` ne trace **pas** `write`/`writev` génériques — une écriture
 directe sur un descripteur de socket déjà connecté n'y apparaîtrait pas ; le
 rejeu OS utilise donc `-e trace=execve,%network,write,writev,sendfile`, ce qui
@@ -59,10 +64,10 @@ Commande :
 Résultat observé le 17/10/2026 :
 
 ```text
-..............................................                           [100%]
+................................................                         [100%]
 ```
 
-Suite complète avec la couverture CI : **729 passed**, 3 831 sous-tests,
+Suite complète avec la couverture CI : **731 passed**, 3 831 sous-tests,
 couverture Heimdall **99,48 %** (seuil CI : 85 %).
 
 ## Observation système

@@ -4,11 +4,12 @@ Les sockets Python sont interceptées avant l'appel système. Ce garde teste des
 chemins applicatifs courants **côté Python**, mais ne remplace pas le contrôle
 OS ``strace`` ; les sockets AF_UNIX restent une exception locale documentée
 (autorisées en ``send``, refusées en écriture par descripteur — asymétrie
-verrouillée par test). Le lancement de processus enfants par les wrappers
-Python (``subprocess.Popen``, ``os.system``/``fork``/``posix_spawn``/``exec*``)
-est refusé et journalisé ; un lancement hors wrappers (extension native,
-binaire) reste hors garde et n'est visible que par ``strace -f``, qui suit les
-forks. Les six méthodes
+verrouillée par test). Le lancement de processus enfants est refusé et
+journalisé pour ``subprocess.Popen`` par accès d'attribut et pour
+``os.system``/``fork``/``posix_spawn``/``exec*`` ; un lancement hors wrappers
+(alias précoce ``from subprocess import Popen``, chemin C
+``_posixsubprocess``, extension native, binaire) reste hors garde et n'est
+visible que par ``strace -f``, qui suit les forks. Les six méthodes
 que ``ssl.SSLSocket`` surcharge (``send``, ``sendall``, ``write``, ``sendto``,
 ``sendmsg``, ``sendfile``) sont patchées séparément : elles ne passent pas par
 celles de ``socket.socket``. Les écritures par descripteur (``os.write``,
@@ -35,6 +36,7 @@ import socket
 import ssl
 import stat
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,6 +80,7 @@ class NetworkLedger:
     # Références capturées avant le patch (preuve d'un trou connu du garde).
     original_getaddrinfo: Callable[..., object] | None = None
     original_os_write: Callable[..., int] | None = None
+    original_popen: Callable[..., Any] | None = None
 
     @property
     def blocked(self) -> list[NetworkAttempt]:
@@ -87,7 +90,11 @@ class NetworkLedger:
 @pytest.fixture
 def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PLR0915
     """Refuse les destinations externes et trace aussi les refus interceptés."""
-    ledger = NetworkLedger(original_getaddrinfo=socket.getaddrinfo, original_os_write=os.write)
+    ledger = NetworkLedger(
+        original_getaddrinfo=socket.getaddrinfo,
+        original_os_write=os.write,
+        original_popen=subprocess.Popen,
+    )
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
     original_send = socket.socket.send
@@ -648,6 +655,26 @@ def test_early_bound_os_write_runs_unguarded_and_is_documented(
     assert loopback_only.attempts == []  # hors garde : rien n'est journalisé
 
 
+def test_early_bound_subprocess_popen_runs_unguarded_and_is_documented(
+    loopback_only: NetworkLedger,
+) -> None:
+    """Miroir `from subprocess import Popen` : trou connu, verrouillé-documenté.
+
+    L'alias précoce garde la classe d'origine. Avec ``start_new_session=True``,
+    CPython passe par le chemin C ``_posixsubprocess.fork_exec``, hors patchs :
+    le processus enfant démarre sans alimenter le journal (chemin par défaut
+    ``os.posix_spawn``, lui, serait rattrapé indirectement). Le processus du
+    test est inoffensif (``sys.executable -c pass``) ; le filet réel de ce cas
+    est ``strace -f``.
+    """
+    original = loopback_only.original_popen
+    assert original is not None
+    assert original is not subprocess.Popen  # référence d'origine, non patchée
+    process = original([sys.executable, "-c", "pass"], start_new_session=True)
+    assert process.wait() == 0
+    assert loopback_only.attempts == []  # hors garde : rien n'est journalisé
+
+
 def test_guard_blocks_os_sendfile_on_unpinned_fd(
     loopback_only: NetworkLedger, tmp_path: Path
 ) -> None:
@@ -724,10 +751,11 @@ def test_guard_patches_dangerous_child_process_vectors(
     ("vector", "call"),
     [
         ("subprocess.Popen", lambda: subprocess.Popen(["/bin/true"])),  # noqa: S603
+        ("subprocess.run", lambda: subprocess.run(["/bin/true"], check=False)),  # noqa: S603
         ("os.system", lambda: os.system("/bin/true")),  # noqa: S605
         ("os.posix_spawn", lambda: os.posix_spawn("/bin/true", ["/bin/true"], {})),  # noqa: S606
     ],
-    ids=["subprocess.Popen", "os.system", "os.posix_spawn"],
+    ids=["subprocess.Popen", "subprocess.run", "os.system", "os.posix_spawn"],
 )
 def test_guard_blocks_child_process_spawn(
     loopback_only: NetworkLedger, vector: str, call: Callable[[], object]
