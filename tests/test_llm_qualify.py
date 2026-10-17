@@ -94,6 +94,22 @@ class TamperingChat(RecordingChat):
         return super().__call__(**kwargs)
 
 
+class HostileItem:
+    """Objet non-dict dont ``__getitem__`` lève : retour de ``qualify()`` cassé.
+
+    Simule un mock, une régression ou une évolution du SDK qui rendrait un
+    objet inhabituel au lieu de ``validated.model_dump()`` : l'extraction
+    de ``verdict`` échoue par une classe d'exception que le filet
+    fail-closed doit toutes absorber.
+    """
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def __getitem__(self, key: str) -> Any:
+        raise self._error
+
+
 class TestPromptContract:
     """Le prompt et le schéma forment la version qualify_v1, chargée du dépôt."""
 
@@ -585,6 +601,9 @@ class TestCandidateStaysDetected:
 
     Le LLM ne fait jamais transiter un Finding : ni une sortie cassée, ni un
     verdict valide ``faux_positif`` ne retirent le candidat (REQ-SEC-01).
+    ``qualify_candidate()`` est totale : aucune exception hors
+    ``BaseException`` ne traverse l'appelant, quel que soit le retour de
+    ``qualify()``.
     """
 
     def test_status_type_admits_only_detecte(self) -> None:
@@ -621,17 +640,68 @@ class TestCandidateStaysDetected:
         result = qualify_candidate(MASKED_CANDIDATE, chat=chat)
         assert result == Qualification(status="detecte", verdict=None, reason="unavailable")
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(AttributeError, id="attribut"),
+            pytest.param(ValueError, id="valeur"),
+            pytest.param(KeyError, id="cle"),
+            pytest.param(TypeError, id="type"),
+            pytest.param(RuntimeError, id="runtime"),
+        ],
+    )
     def test_unexpected_exception_is_fail_closed_without_reflection(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self,
+        error: type[Exception],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        # Filet final : une exception hors QualifyError (évolution du SDK,
-        # propriété hostile, ``verdict["verdict"]`` manquant) ne traverse
-        # jamais l'appelant. Note : une panne de transport reste
-        # ``unavailable`` (convertie par ``qualify`` lui-même), pas ce filet.
+        # Filet total : une exception hors ``QualifyError`` (évolution du
+        # SDK, propriété hostile, mock, bug — les ``ValueError``/``KeyError``
+        # de construction comprises) ne traverse jamais l'appelant. Une
+        # panne de transport, elle, reste ``unavailable`` : ``qualify`` la
+        # convertit AVANT ce filet.
         def _raise_unexpected(*_args: Any, **_kwargs: Any) -> Any:
-            raise AttributeError("SYNTHETIC")
+            raise error("SYNTHETIC")
 
         monkeypatch.setattr(qualify_module, "qualify", _raise_unexpected)
+        caplog.set_level(logging.INFO, logger="heimdall.llm.qualify")
+        result = qualify_candidate(MASKED_CANDIDATE, chat=RecordingChat())
+        assert result == Qualification(status="detecte", verdict=None, reason="invalid")
+        logged = "\n".join(
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "heimdall.llm.qualify"
+        )
+        assert "erreur inattendue du trieur" in logged
+        assert "candidat conserve (raison=invalid" in logged
+        assert "SYNTHETIC" not in logged
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            pytest.param({}, id="dict-sans-cle"),
+            pytest.param({"confidence": 0.9}, id="dict-sans-verdict"),
+            pytest.param(["secret"], id="liste"),
+            pytest.param(None, id="none"),
+            pytest.param("secret", id="chaine"),
+            pytest.param(42, id="entier"),
+            pytest.param(HostileItem(AttributeError("SYNTHETIC")), id="getitem-attribut"),
+            pytest.param(HostileItem(IndexError("SYNTHETIC")), id="getitem-index"),
+            pytest.param(HostileItem(ValueError("SYNTHETIC")), id="getitem-valeur"),
+        ],
+    )
+    def test_malformed_qualify_return_is_fail_closed_without_reflection(
+        self,
+        malformed: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Retour malformé de ``qualify()`` (mock, régression, évolution) :
+        # la construction étant DANS le bloc fail-closed, toute extraction
+        # en échec (KeyError/TypeError/AttributeError/IndexError/ValueError,
+        # ``__getitem__`` hostile) devient ``invalid`` au lieu de traverser.
+        monkeypatch.setattr(qualify_module, "qualify", lambda *_a, **_k: malformed)
         caplog.set_level(logging.INFO, logger="heimdall.llm.qualify")
         result = qualify_candidate(MASKED_CANDIDATE, chat=RecordingChat())
         assert result == Qualification(status="detecte", verdict=None, reason="invalid")
@@ -643,25 +713,24 @@ class TestCandidateStaysDetected:
         assert "candidat conserve (raison=invalid" in logged
         assert "SYNTHETIC" not in logged
 
-    @pytest.mark.parametrize(
-        "malformed",
-        [
-            pytest.param({}, id="dict-sans-cle"),
-            pytest.param({"confidence": 0.9}, id="dict-sans-verdict"),
-            pytest.param(["secret"], id="liste"),
-            pytest.param(None, id="none"),
-        ],
-    )
-    def test_malformed_qualify_return_is_fail_closed_without_reflection(
-        self,
-        malformed: Any,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+    def test_verdict_alias_mirrors_verdicts(self) -> None:
+        # Source unique du contrat : une divergence entre l'alias ``Verdict``
+        # (validation de type) et ``VERDICTS`` (schéma + __post_init__) doit
+        # casser ici, pas à l'exécution (qualify_v2).
+        assert set(get_args(Verdict)) == set(prompts_module.VERDICTS)
+
+    def test_inconsistent_state_from_broken_qualify_is_fail_closed(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # Retour malformé de ``qualify()`` (mock, régression, évolution) :
-        # la construction étant dans le bloc fail-closed, ``KeyError``/
-        # ``TypeError`` deviennent ``invalid`` au lieu de traverser.
-        monkeypatch.setattr(qualify_module, "qualify", lambda *_a, **_k: malformed)
+        # Bug de programme : ``qualify()`` (mocké, régressé) rend un verdict
+        # hors liste blanche que ``Qualification`` refuse (``ValueError``).
+        # La fonction reste totale : refus fermé ``invalid`` + trace
+        # statique distincte, jamais un crash — un candidat ne disparaît
+        # pas parce qu'une vérification a explosé (invariant 1) — et le
+        # verdict aberrant n'apparaît pas dans le journal.
+        monkeypatch.setattr(
+            qualify_module, "qualify", lambda *_a, **_k: {"verdict": "MAYBE", "confidence": 0.5}
+        )
         caplog.set_level(logging.INFO, logger="heimdall.llm.qualify")
         result = qualify_candidate(MASKED_CANDIDATE, chat=RecordingChat())
         assert result == Qualification(status="detecte", verdict=None, reason="invalid")
@@ -670,26 +739,41 @@ class TestCandidateStaysDetected:
             for record in caplog.records
             if record.name == "heimdall.llm.qualify"
         )
+        assert "erreur inattendue du trieur" in logged
         assert "candidat conserve (raison=invalid" in logged
+        assert "MAYBE" not in logged
 
-    def test_verdict_alias_mirrors_verdicts(self) -> None:
-        # Source unique du contrat : une divergence entre l'alias ``Verdict``
-        # (validation de type) et ``VERDICTS`` (schéma + __post_init__) doit
-        # casser ici, pas à l'exécution (qualify_v2).
-        assert set(get_args(Verdict)) == set(prompts_module.VERDICTS)
+    def test_base_exception_is_not_captured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Frontière du filet : ``except Exception`` ne capture jamais
+        # ``BaseException``. Une interruption utilisateur (Ctrl-C) n'est pas
+        # une sortie du modèle : elle traverse, jamais convertie en verdict.
+        def _interrupt(*_args: Any, **_kwargs: Any) -> Any:
+            raise KeyboardInterrupt
 
-    def test_inconsistent_state_from_broken_qualify_traverses_loudly(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Traversée VOULUE : si ``qualify()`` rendait un verdict hors liste
-        # blanche (bug du programme — le schéma pydantic l'interdit), c'est
-        # une erreur de programmation qui doit être bruyante, pas un refus
-        # silencieux. Épingle le contrat documenté dans la docstring.
-        monkeypatch.setattr(
-            qualify_module, "qualify", lambda *_a, **_k: {"verdict": "MAYBE", "confidence": 0.5}
-        )
-        with pytest.raises(ValueError, match="verdict hors liste blanche"):
+        monkeypatch.setattr(qualify_module, "qualify", _interrupt)
+        with pytest.raises(KeyboardInterrupt):
             qualify_candidate(MASKED_CANDIDATE, chat=RecordingChat())
+
+    @pytest.mark.parametrize(
+        "tampered",
+        [pytest.param("garbage", id="hors-registre"), pytest.param([], id="non-chaine")],
+    )
+    def test_tampered_qualify_error_code_falls_back_to_invalid(
+        self, tampered: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Instance de ``QualifyError`` trafiquée (mock, régression) : un code
+        # hors registre (ou non-chaîne) ne doit ni lever depuis le
+        # gestionnaire ni apparaître au journal — ``_fail_closed`` retombe
+        # sur ``invalid``, refus fermé sans code hors contrat.
+        error = QualifyError("empty")
+        error.code = tampered
+
+        def _raise_tampered(*_args: Any, **_kwargs: Any) -> Any:
+            raise error
+
+        monkeypatch.setattr(qualify_module, "qualify", _raise_tampered)
+        result = qualify_candidate(MASKED_CANDIDATE, chat=RecordingChat())
+        assert result == Qualification(status="detecte", verdict=None, reason="invalid")
 
     @pytest.mark.parametrize(
         ("candidate", "model", "reason"),
