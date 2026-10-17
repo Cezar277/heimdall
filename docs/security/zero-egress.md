@@ -9,10 +9,13 @@
 méthodes que `ssl.SSLSocket` surcharge (`send`, `sendall`, `write`, `sendto`,
 `sendmsg`, `sendfile` — elles n'appellent pas celles de `socket.socket`), puis
 `getaddrinfo`, `gethostbyname`, `gethostbyname_ex`, `gethostbyaddr` et
-`getnameinfo`. Le journal du garde enregistre aussi les tentatives refusées :
-les avaler dans une exception n'empêche pas le test de les détecter. Le test
-lance `heimdall scan --ci` dans le processus pytest et vérifie l'absence de
-tentative Internet.
+`getnameinfo`. Le lancement de processus enfants par les wrappers Python
+(`subprocess.Popen`, `os.system`, `os.fork`/`forkpty`, `os.posix_spawn(p)`,
+`os.exec*`) est refusé et journalisé : un enfant échapperait aux patchs de
+sockets. Le journal du garde enregistre aussi les tentatives refusées : les
+avaler dans une exception n'empêche pas le test de les détecter. Le test lance
+`heimdall scan --ci` dans le processus pytest et vérifie l'absence de tentative
+Internet.
 
 Les alias `from socket import getaddrinfo` sont couverts lorsqu'ils sont
 importés **après** le patch : le nom est relu sur le module `socket` à chaque
@@ -34,7 +37,11 @@ l'import) garde l'original — trou connu, verrouillé pour DNS par
 `test_early_bound_dns_alias_runs_unguarded_and_is_documented` et pour `os.*`
 par `test_early_bound_os_write_runs_unguarded_and_is_documented` ; les
 extensions natives qui appellent directement les syscalls réseau (sans passer
-par les méthodes Python) ne sont pas couvertes. Piège vérifié : `strace -e
+par les méthodes Python) ne sont pas couvertes. Un processus enfant lancé
+**hors wrappers Python** (extension native ou binaire appelant directement
+`fork(2)`/`execve(2)`) reste hors garde : un enfant émet ses propres
+connexions, non patchées ; le filet est `strace -f`, qui suit les forks — d'où
+`execve` dans le filtre du rejeu. Piège vérifié : `strace -e
 trace=%network` ne trace **pas** `write`/`writev` génériques — une écriture
 directe sur un descripteur de socket déjà connecté n'y apparaîtrait pas ; le
 rejeu OS utilise donc `-e trace=execve,%network,write,writev,sendfile`, ce qui
@@ -52,10 +59,10 @@ Commande :
 Résultat observé le 17/10/2026 :
 
 ```text
-..............................                                           [100%]
+..............................................                           [100%]
 ```
 
-Suite complète avec la couverture CI : **713 passed**, 3 831 sous-tests,
+Suite complète avec la couverture CI : **729 passed**, 3 831 sous-tests,
 couverture Heimdall **99,48 %** (seuil CI : 85 %).
 
 ## Observation système

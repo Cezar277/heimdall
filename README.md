@@ -148,7 +148,10 @@ La preuve et sa limite actuelle sont archivées dans
 [`docs/security/zero-egress.md`](docs/security/zero-egress.md) : le test CI
 interdit les connexions Python hors loopback et n'autorise, comme exception
 journalisée, que l'IPC local `AF_UNIX` (réserve : un relais inter-processus
-reste hors du garde et n'apparaît dans la trace que s'il ressort en IP). Le
+reste hors du garde et n'apparaît dans la trace que s'il ressort en IP). Il
+refuse aussi le lancement de processus enfants par les wrappers Python
+(`subprocess`, `os.*`) ; un binaire ou une extension native appelant
+directement `fork(2)`/`execve(2)` relève de la trace `strace -f`. Le
 scan réel reste bloqué par le squelette du scanner #22 ; la trace disponible
 prouve uniquement l'absence de connexion sur ce chemin fail-closed, pas encore
 sur un scan opérationnel.

@@ -1,10 +1,14 @@
 """Garde réseau runtime pour ``heimdall scan --ci``.
 
-Les sockets Python sont interceptées avant l'appel système. Ce garde teste les
-chemins applicatifs courants, mais ne remplace pas le contrôle OS ``strace`` ;
-les sockets AF_UNIX restent une exception locale documentée (autorisées en
-``send``, refusées en écriture par descripteur — asymétrie verrouillée par
-test). Les six méthodes
+Les sockets Python sont interceptées avant l'appel système. Ce garde teste des
+chemins applicatifs courants **côté Python**, mais ne remplace pas le contrôle
+OS ``strace`` ; les sockets AF_UNIX restent une exception locale documentée
+(autorisées en ``send``, refusées en écriture par descripteur — asymétrie
+verrouillée par test). Le lancement de processus enfants par les wrappers
+Python (``subprocess.Popen``, ``os.system``/``fork``/``posix_spawn``/``exec*``)
+est refusé et journalisé ; un lancement hors wrappers (extension native,
+binaire) reste hors garde et n'est visible que par ``strace -f``, qui suit les
+forks. Les six méthodes
 que ``ssl.SSLSocket`` surcharge (``send``, ``sendall``, ``write``, ``sendto``,
 ``sendmsg``, ``sendfile``) sont patchées séparément : elles ne passent pas par
 celles de ``socket.socket``. Les écritures par descripteur (``os.write``,
@@ -30,6 +34,7 @@ import os
 import socket
 import ssl
 import stat
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -352,6 +357,39 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
             return cast(int, original_os_writev(fd, buffers))
 
         monkeypatch.setattr(os, "writev", guarded_os_writev)
+
+    def make_child_process_guard(name: str) -> Callable[..., Any]:
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            # Un processus enfant peut sortir sur le réseau sans passer par nos
+            # patchs : on le refuse et on le journalise au lieu d'espérer.
+            ledger.attempts.append(
+                NetworkAttempt(socket.AF_INET, f"<processus enfant : {name}>", True)
+            )
+            raise AssertionError("processus enfant interdit : hors périmètre du garde réseau")
+
+        guarded.__name__ = f"guarded_{name}"
+        return guarded
+
+    monkeypatch.setattr(subprocess, "Popen", make_child_process_guard("subprocess.Popen"))
+    for child_process_name in (
+        "system",
+        "fork",
+        "forkpty",
+        "posix_spawn",
+        "posix_spawnp",
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+    ):
+        if hasattr(os, child_process_name):
+            monkeypatch.setattr(
+                os, child_process_name, make_child_process_guard(child_process_name)
+            )
     return ledger
 
 
@@ -653,6 +691,53 @@ def test_guard_allows_os_write_to_regular_file(
         os.close(fd)
     assert target.read_bytes() == b"synthetic"
     assert loopback_only.blocked == []
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [
+        "system",
+        "fork",
+        "forkpty",
+        "posix_spawn",
+        "posix_spawnp",
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+    ],
+)
+def test_guard_patches_dangerous_child_process_vectors(
+    loopback_only: NetworkLedger, vector: str
+) -> None:
+    """`fork`/`exec*` sont patchés — vérifié sans les invoquer (destructeurs)."""
+    if not hasattr(os, vector):
+        pytest.skip(f"os.{vector} indisponible sur cette plateforme")
+    assert getattr(os, vector).__name__ == f"guarded_{vector}"
+
+
+@pytest.mark.parametrize(
+    ("vector", "call"),
+    [
+        ("subprocess.Popen", lambda: subprocess.Popen(["/bin/true"])),  # noqa: S603
+        ("os.system", lambda: os.system("/bin/true")),  # noqa: S605
+        ("os.posix_spawn", lambda: os.posix_spawn("/bin/true", ["/bin/true"], {})),  # noqa: S606
+    ],
+    ids=["subprocess.Popen", "os.system", "os.posix_spawn"],
+)
+def test_guard_blocks_child_process_spawn(
+    loopback_only: NetworkLedger, vector: str, call: Callable[[], object]
+) -> None:
+    """Un enfant pourrait sortir sur le réseau : le garde le refuse et le journalise."""
+    if vector == "os.posix_spawn" and not hasattr(os, "posix_spawn"):
+        pytest.skip("os.posix_spawn indisponible sur cette plateforme")
+    with pytest.raises(AssertionError, match="processus enfant interdit"):
+        call()
+    assert len(loopback_only.blocked) == 1
 
 
 def test_guard_allows_only_loopback_ip_literals_and_notes_unix_exception() -> None:
