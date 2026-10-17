@@ -1,1 +1,2 @@
-303358 1792261725.646307 +++ exited with 2 +++
+326853 1792265191.622802 write(2<UNIX-STREAM:[1261377->1261376]>, "heimdall scan: scanner non impl\303\251ment\303\251 (voir #22) \342\200\224 refus par d\303\251faut.\n", 74) = 74
+326853 1792265191.727635 +++ exited with 2 +++
