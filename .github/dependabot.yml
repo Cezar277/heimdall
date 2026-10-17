@@ -3,7 +3,8 @@
 # Settings > Code security (non versionnable).
 # Un bump pip modifie les `==` de pyproject.toml et exige de régénérer
 # requirements.lock (ADR-002) : la PR Dependabot ne le fait pas, la relecture
-# doit le vérifier.
+# doit le vérifier (pas de contrôle automatique en CI : régénérer le lock
+# exige Python 3.10 + un accès PyPI, la CI n'installe que le lock).
 version: 2
 updates:
   - package-ecosystem: "pip"

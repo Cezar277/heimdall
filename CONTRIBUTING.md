@@ -70,15 +70,16 @@ Dans Settings > Branches, la règle sur `main` impose:
 - pas de force-push.
 
 La CI lourde (`.github/workflows/ci.yml`, #20) ne se déclenche **pas** à chaque
-push : elle démarre quand un collaborateur de confiance commente **`/ci`** sur
-la PR (le plus simple, modèle de `/oc review`) ou approuve la review. Le check
-exigé par la protection de `main` est `CI (/ci)` (publié sur la PR par ces deux
-déclencheurs). Après un nouveau commit sur la branche (y compris « Update
+push : elle démarre quand un collaborateur de confiance commente **`/ci`** (en
+début de commentaire) sur la PR (le plus simple, modèle de `/oc review`) ou
+approuve la review. Le check exigé par la protection de `main` est `CI (/ci)`
+(publié sur la PR par ces deux déclencheurs). Après un nouveau commit sur la branche (y compris « Update
 branch »), relancer `/ci` (ou ré-approuver) : le check doit être re-signalé.
 
 ## 8. Règles de sécurité (non négociables)
 
 - Jamais de vrai secret dans le dépôt, même expiré. Les jeux de test utilisent des faux secrets clairement factices.
+- Le runner CI est jetable : il exécute du code de PR (après `/ci` ou approbation), ne porte aucun secret ni donnée personnelle, et est considéré comme compromis après chaque run.
 - Les tests d'attaque (pentest, exploits) se font uniquement sur nos propres VMs.
 - Heimdall est 100 % local: aucun appel vers Internet depuis le code de l'outil.
 - Le LLM ne décide jamais seul. En CI, il n'a aucun pouvoir.

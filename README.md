@@ -103,8 +103,9 @@ Il ne tourne volontairement **pas** à chaque push de branche (quota GitHub et
 bruit contenus) : sur une PR, deux déclencheurs équivalents, réservés aux
 collaborateurs de confiance (garde `author_association`) :
 
-1. **Commande `/ci`** : commenter `/ci` sur la PR (modèle de `/oc review`)
-   lance la CI complète ; la réaction 👀 accuse réception et le check
+1. **Commande `/ci`** : commenter **`/ci` en début de commentaire** sur la PR
+   (modèle de `/oc review` ; une simple mention au fil du texte ne déclenche
+   rien) lance la CI complète ; la réaction 👀 accuse réception et le check
    `CI (/ci)` apparaît sur la PR.
 2. **Approbation d'un relecteur** : approuver la PR (`pull_request_review`,
    état `approved`) la lance aussi.
@@ -116,6 +117,10 @@ GitHub n'évalue pour une PR que les checks des runs déclenchés par `push` /
 `pull_request*` / `deployment*` : les checks des jobs d'un run déclenché par un
 commentaire ne comptent pas (docs *Troubleshooting required status checks*) —
 sans publication explicite, `/ci` ne bloquerait ni ne débloquerait rien.
+La publication du check est faite par deux jobs dédiés (`resolve`, `report`)
+qui n'exécutent **jamais** le code de la PR ; le job de test n'a que
+`contents: read` — un test malveillant ne peut donc ni lire un token
+privilégié ni forger `CI (/ci)` (séparation des privilèges).
 
 Conséquence voulue : **sans `/ci` ni approbation, le check est absent et la PR
 reste bloquée** (« Waiting for status to be reported ») ; après un nouveau
@@ -153,9 +158,11 @@ réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
   chemins le laisseraient « en attente » sur les PR sans fichiers de contrat.
 - **Actions** (Settings > Actions > General) : garder l'approbation requise
   pour les workflows déclenchés depuis un fork (« Require approval for all
-  outside collaborators »). Le runner `self-hosted` exécute le code de la PR
-  **après `/ci` ou approbation** : il doit rester une VM d'équipe dédiée
-  (jamais une machine perso), idéalement isolée ou jetable.
+  outside collaborators »). **Exigence bloquante** — le runner `self-hosted`
+  exécute le code de la PR (après `/ci` ou approbation) : VM d'équipe
+  **dédiée et jetable** (ou restaurée par snapshot avant chaque run),
+  utilisateur dédié non-root, aucun secret ni donnée personnelle dessus ;
+  considérée comme compromise après chaque run. Jamais une machine perso.
 - **Option** : « Require branches to be up to date before merging » augmente
   les re-runs — chaque « Update branch » exige de relancer `/ci` (ou
   ré-approuver) pour re-signaler le check. À n'activer que si nécessaire.
