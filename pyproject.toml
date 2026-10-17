@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==83.0.0"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -40,7 +40,7 @@ dev = [
   "ruff==0.16.10",
   "mypy==2.4.0",
   "bandit==1.9.4",
-  "setuptools==83.0.0",     # backend de build, installé depuis le lock en CI
+  "setuptools==84.0.0",     # backend de build, installé depuis le lock en CI
   "pytest-cov==7.0.0",      # couverture + seuil CI (#20), aligné sur tests/security
   "pip-audit==2.10.1",      # audit CVE des dépendances en CI (#20), réseau documenté README
   "tomli==2.5.0; python_version < '3.11'",  # lecture TOML des tests d'acceptation sur 3.10
