@@ -103,17 +103,20 @@ Il ne tourne volontairement **pas** à chaque push de branche (quota GitHub et
 bruit contenus) :
 
 1. **Approbation d'un relecteur** : déclenchement par `pull_request_review`
-   (état `approved`), sur la ref de merge `refs/pull/<n>/merge` — le statut
-   s'attache donc à la PR et peut être exigé par la protection de `main`
-   (voir les réglages ci-dessous).
+   (état `approved` ; une approbation d'un compte externe ne déclenche rien),
+   sur la ref de merge `refs/pull/<n>/merge` — le statut s'attache donc à la
+   PR et peut être exigé par la protection de `main` (voir les réglages
+   ci-dessous).
 2. **Push sur `main`** : preuve « pipeline vert sur main » après merge.
 3. **Commande spéciale** : Actions → « CI Security & Quality » →
-   *Run workflow* (`workflow_dispatch`).
+   *Run workflow* (`workflow_dispatch` ; disponible une fois le workflow sur
+   `main`).
 
 Les autres workflows (`Vault contract`, `Security model`, `OpenCode review`)
 gardent leurs propres déclencheurs. Après un nouveau commit sur une PR déjà
-approuvée, la CI ne se relance qu'avec une nouvelle approbation (ou un
-dispatch manuel).
+approuvée (y compris « Update branch »), le check requis doit être re-signalé
+par une nouvelle approbation ; `workflow_dispatch` permet de lancer la CI à
+la demande (débogage, hors protection de branche).
 
 ### Exception réseau documentée : `pip-audit`
 
@@ -136,6 +139,14 @@ réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
   n'apparaît dans la liste qu'après une première approbation de PR) ; pas de
   force-push. Ne pas exiger `Vault contract` : ses filtres de chemins le
   laisseraient « en attente » sur les PR sans fichiers de contrat.
+- **Actions** (Settings > Actions > General) : garder l'approbation requise
+  pour les workflows déclenchés depuis un fork (« Require approval for all
+  outside collaborators »). Le runner `self-hosted` exécute le code de la PR
+  **après approbation** : il doit rester une VM d'équipe dédiée (jamais une
+  machine perso), idéalement isolée ou jetable.
+- **Option** : « Require branches to be up to date before merging » augmente
+  les re-runs — chaque « Update branch » exige une nouvelle approbation pour
+  re-signaler le check. À n'activer que si nécessaire.
 
 ## Vérifier
 
