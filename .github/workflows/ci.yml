@@ -1,21 +1,28 @@
 name: CI Security & Quality
 
 # Ce workflow ne tourne volontairement PAS à chaque push de branche (#20) :
-# quota GitHub contenu et bruit évité. Trois déclencheurs seulement :
-#   1. pull_request_review : la CI démarre quand un relecteur approuve la PR
-#      (`review.state == 'approved'`) et qu'il est collaborateur de confiance
-#      (garde author_association plus bas, même liste qu'opencode-review).
-#      GitHub exécute alors le workflow sur la ref de merge
-#      `refs/pull/<n>/merge` : le statut s'attache à la PR et la protection
-#      de `main` peut l'exiger.
-#   2. push sur `main` : preuve « pipeline vert sur main » (le merge est déjà
-#      conditionné à une approbation).
-#   3. workflow_dispatch : commande spéciale (Actions > Run workflow ; le
-#      bouton n'apparaît qu'une fois le workflow présent sur `main`).
-# Un nouveau commit poussé après approbation (y compris « Update branch »)
-# exige une nouvelle approbation : comportement voulu (le dispatch manuel
-# relance la CI à la demande, par exemple pour déboguer).
+# quota GitHub et bruit contenus. Les déclencheurs, tous explicites :
+#   1. issue_comment : commenter `/ci` sur une PR (auteur collaborateur de
+#      confiance) lance la CI complète — « commande spéciale », modèle /oc.
+#   2. pull_request_review : une approbation (`review.state == 'approved'`,
+#      collaborateur de confiance) la lance aussi.
+#   3. push sur `main` : preuve « pipeline vert sur main » après merge.
+#      (`workflow_dispatch` reste dispo pour le débogage : il ne publie PAS
+#      le check `CI (/ci)`, donc ne débloque pas une PR.)
+#
+# Pourquoi un check publié à la main (`CI (/ci)`) et pas le check des jobs ?
+# GitHub n'évalue pour une PR que les checks des runs déclenchés par push /
+# pull_request* / deployment* : les checks des jobs d'un run `issue_comment`
+# ne comptent pas, même s'ils passent (docs « Troubleshooting required
+# status checks »). Ce workflow publie donc lui-même, via l'API Checks, le
+# check `CI (/ci)` sur le commit de merge (refs/pull/<n>/merge) — c'est lui
+# que la protection de `main` doit exiger (voir README).
+# Un nouveau commit poussé après /ci (ou une approbation) exige de relancer
+# /ci (ou une nouvelle approbation) : comportement voulu.
+
 on:
+  issue_comment:
+    types: [created]
   pull_request_review:
     types: [submitted]
   push:
@@ -27,7 +34,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # issue_comment n'expose pas pull_request : on retombe sur le numéro de
+  # l'issue (= la PR) pour garder un groupe par PR.
+  group: ci-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -36,19 +45,108 @@ jobs:
     # Runner self-hosted, comme les autres workflows : 0 minute GitHub.
     runs-on: self-hosted
     timeout-minutes: 20
-    # Seules les approbations d'un collaborateur de confiance déclenchent la
-    # CI (garde author_association, même liste que le workflow opencode-review) :
-    # un compte externe ne peut pas faire tourner du code sur le runner.
+    permissions:
+      contents: read   # checkout du code à tester
+      checks: write    # publication du check « CI (/ci) » qui débloque la PR
+      issues: write    # réaction 👀 sur le commentaire /ci
+    # Uniquement des déclencheurs humains de confiance : les commandes /ci et
+    # approbations sont filtrées par author_association (même liste que
+    # opencode-review) — un compte externe ne peut pas faire tourner du code
+    # sur le runner.
     if: >-
-      github.event_name != 'pull_request_review' ||
-      (github.event.review.state == 'approved' &&
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association))
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.state == 'open' &&
+      contains(github.event.comment.body, '/ci') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
+      - name: Contexte PR + publication du check « CI (/ci) » (en attente)
+        id: ctx
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            let prNumber;
+            if (context.eventName === 'issue_comment') {
+              if (!context.payload.issue.pull_request) {
+                core.setFailed('La commande /ci ne fonctionne que sur une pull request.');
+                return;
+              }
+              // Accusé de réception (non bloquant).
+              try {
+                await github.rest.reactions.createForIssueComment({
+                  owner, repo,
+                  comment_id: context.payload.comment.id,
+                  content: 'eyes',
+                });
+              } catch (error) {
+                core.warning(`Réaction 👀 impossible : ${error.message}`);
+              }
+              prNumber = context.payload.issue.number;
+            } else if (context.eventName === 'pull_request_review') {
+              prNumber = context.payload.pull_request.number;
+            } else {
+              // push sur main ou dispatch : pas de PR, pas de check publié.
+              core.setOutput('has_pr', 'false');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber,
+            });
+            if (!pr.merge_commit_sha) {
+              core.setFailed('Commit de merge indisponible (conflits ou calcul en cours) : résolvez les conflits, puis relancez /ci.');
+              return;
+            }
+            const mergeSha = pr.merge_commit_sha;
+            const checkName = 'CI (/ci)';
+
+            // Un run coupé en plein vol (runner) peut laisser un check
+            // « in_progress » : on l'annule pour ne jamais bloquer la PR.
+            const { data: stale } = await github.rest.checks.listForRef({
+              owner, repo, ref: mergeSha, check_name: checkName,
+              status: 'in_progress', filter: 'all',
+            });
+            for (const run of stale.check_runs) {
+              await github.rest.checks.update({
+                owner, repo, check_run_id: run.id, conclusion: 'cancelled',
+              });
+            }
+
+            const { data: check } = await github.rest.checks.create({
+              owner, repo,
+              name: checkName,
+              head_sha: mergeSha,
+              status: 'in_progress',
+              details_url: `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+            core.setOutput('has_pr', 'true');
+            core.setOutput('checkout_ref', `refs/pull/${prNumber}/merge`);
+            core.setOutput('check_sha', mergeSha);
+            core.setOutput('check_id', String(check.id));
+
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          # Pour une PR : le commit de merge exact dont le check porte le
+          # statut. Sinon (push main, dispatch) : la ref du run.
+          ref: ${{ steps.ctx.outputs.checkout_ref || github.ref }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Vérifier que le code testé est bien le commit de merge du check
+        if: steps.ctx.outputs.has_pr == 'true'
+        run: |
+          tested="$(git rev-parse HEAD)"
+          expected="${{ steps.ctx.outputs.check_sha }}"
+          if [ "$tested" != "$expected" ]; then
+            echo "::error::La PR a bougé pendant le lancement (HEAD=$tested, check=$expected). Relancez /ci."
+            exit 1
+          fi
 
       - name: Install (requirements.lock, hashes SHA-256)
         run: |
@@ -74,3 +172,21 @@ jobs:
 
       - name: Audit dépendances (pip-audit, exception réseau documentée README)
         run: .venv-ci/bin/pip-audit --skip-editable
+
+      - name: Clôture du check « CI (/ci) » (succès/échec du run)
+        if: ${{ always() && steps.ctx.outputs.has_pr == 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          JOB_STATUS: ${{ job.status }}
+          CHECK_ID: ${{ steps.ctx.outputs.check_id }}
+        with:
+          script: |
+            const conclusion =
+              process.env.JOB_STATUS === 'success' ? 'success' :
+              process.env.JOB_STATUS === 'cancelled' ? 'cancelled' : 'failure';
+            await github.rest.checks.update({
+              ...context.repo,
+              check_run_id: Number(process.env.CHECK_ID),
+              conclusion,
+              details_url: `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
