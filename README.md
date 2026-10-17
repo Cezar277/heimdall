@@ -13,9 +13,8 @@ Python 3.10 ou supérieur. Voie vérifiée **en premier** (hashes SHA-256) :
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install --require-hashes -r requirements.lock
-.venv/bin/python -m pip install -e . --no-deps
+.venv/bin/python -m pip install -e . --no-deps --no-build-isolation
 ```
 
 Windows / PowerShell : remplacer `.venv/bin/python` par `.venv\Scripts\python.exe`.

@@ -56,10 +56,12 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
 
 - Toutes les dépendances sont en `==` dans `pyproject.toml` (+ `[dev]`).
 - `requirements.lock` est compilé avec
-  `pip-compile --generate-hashes --extra dev -o requirements.lock pyproject.toml`
+  `pip-compile --allow-unsafe --generate-hashes --extra dev -o requirements.lock pyproject.toml`
   (hashes SHA-256) et s'installe avec
   `pip install --require-hashes -r requirements.lock` puis
-  `pip install -e . --no-deps`. L'en-tête du lock donne les commandes exactes.
+  `pip install -e . --no-deps --no-build-isolation`. `pip` et `setuptools`
+  sont inclus avec hashes (génération `--allow-unsafe`) ; l'en-tête du lock
+  donne les commandes exactes.
 - `tests/contracts/requirements.txt` garde ses `==` + **hashes SHA-256**
   (`--require-hashes` en CI) ; Spectral est figé via `package.json` +
   `package-lock.json` + `npm ci` (voir correctif LOW-4 dans la PR).
@@ -70,8 +72,8 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
 - La crypto est testable en isolement (`vault/crypto.py`) ; tout import
   crypto hors `vault/` casse `test_crypto_confinement.py` et la revue.
 - Risque : épinglage strict → mises à jour manuelles (dépendances de #20 :
-  `pip install --upgrade` + régénération du lock + CI verte, dans un ticket
-  dédié, jamais en passant).
+  mise à jour des pins, régénération hashée du lock avec
+  `pip-compile --allow-unsafe`, CI verte, dans un ticket dédié, jamais en passant).
 - 100 % local vérifiable : aucune dépendance cloud ; le seul HTTP du socle
   est le Vault privé en TLS vérifié (voir `VaultClient`, `verify` non
   désactivable, #25 prouvera le rejet des certificats non approuvés).
@@ -86,12 +88,12 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
 
 ## Suivi review (correctifs post-relecture)
 
-- **Build reproductible de bout en bout** : `setuptools==80.9.0` épinglé
+- **Build reproductible de bout en bout** : `setuptools==83.0.0` épinglé
   dans `[build-system]` (un `>=` laissait le backend se résoudre
   différemment demain) ; `requirements.lock` est compilé avec
-  `pip-compile --generate-hashes` depuis les extras `[dev]` et s'installe
+  `pip-compile --allow-unsafe --generate-hashes` depuis les extras `[dev]` et s'installe
   avec `pip install --require-hashes -r requirements.lock` puis
-  `pip install -e . --no-deps` (l'editable local n'est pas hachable).
+  `pip install -e . --no-deps --no-build-isolation` (l'editable local n'est pas hachable).
 - **Codes de sortie CLI** (invariant 11 : 0 propre, 1 secrets, 2 erreur) :
   `scan` non implémenté sort en **2** (panne d'outillage), jamais 1 réservé
   aux secrets avérés ; testé (`test_scan_is_fail_closed_until_22`,

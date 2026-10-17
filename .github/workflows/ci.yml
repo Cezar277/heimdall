@@ -184,7 +184,7 @@ jobs:
           rm -rf .venv-ci
           python3 -m venv .venv-ci
           .venv-ci/bin/pip install --require-hashes -r requirements.lock
-          .venv-ci/bin/pip install -e . --no-deps
+          .venv-ci/bin/pip install -e . --no-deps --no-build-isolation
 
       - name: Lint (ruff)
         run: .venv-ci/bin/ruff check heimdall tests

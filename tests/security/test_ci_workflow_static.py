@@ -91,9 +91,12 @@ def test_integrite_du_check_publie() -> None:
 
 def test_installation_verrouillee() -> None:
     assert "--require-hashes" in ACTIVE
+    assert "--no-build-isolation" in ACTIVE
     assert "persist-credentials: false" in ACTIVE
     # Pas de mise à jour de pip hors verrou : casserait la chaîne de hashes.
     assert "--upgrade pip" not in ACTIVE
+    lock_text = (REPO / "requirements.lock").read_text(encoding="utf-8")
+    assert re.search(r"^pip==[^\n]+\\\n\s+--hash=sha256:[0-9a-f]{64}", lock_text, re.MULTILINE)
 
 
 def test_seuils_de_couverture() -> None:
@@ -105,10 +108,10 @@ def test_seuils_de_couverture() -> None:
 
 def test_pins_directs_pyproject_synchronises_avec_le_lock() -> None:
     """Toute dépendance directe `==` doit avoir la même version dans le lock."""
-    project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))[
-        "project"
-    ]
-    requirements = list(project["dependencies"])
+    document = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    project = document["project"]
+    requirements = list(document["build-system"]["requires"])
+    requirements.extend(project["dependencies"])
     for group in project["optional-dependencies"].values():
         requirements.extend(group)
 
@@ -117,6 +120,9 @@ def test_pins_directs_pyproject_synchronises_avec_le_lock() -> None:
         match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^;\s]+)", requirement)
         assert match, f"dépendance directe non épinglée par == : {requirement}"
         name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+        assert name not in declared or declared[name] == match.group(2), (
+            f"épinglages contradictoires pour {name}"
+        )
         declared[name] = match.group(2)
 
     lock_text = (REPO / "requirements.lock").read_text(encoding="utf-8")
