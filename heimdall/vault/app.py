@@ -51,13 +51,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
-from heimdall.vault.database import resolve_db_path, validate_db_path
+from heimdall.vault.database import DEFAULT_DB_PATH, resolve_db_path, validate_db_path
 
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
 
 logger = logging.getLogger("heimdall.vault.app")
 
-# Seuil ASCII en dessous duquel un caractère est un caractère de contrôle (hors \t).
+# Seuil ASCII en dessous duquel un caractère est un caractère de contrôle.
 _CONTROL_CHAR_THRESHOLD: int = 0x20
 
 _ERROR_PAYLOADS: dict[int, dict[str, str]] = {
@@ -164,7 +164,7 @@ class VaultSettings(BaseSettings):
         description="Activer la documentation OpenAPI/Swagger (/docs). Faux par défaut.",
     )
     db_path: str = Field(
-        default="vault.db",
+        default=str(DEFAULT_DB_PATH),
         description="Chemin du fichier de base de données SQLite.",
     )
 
@@ -226,7 +226,7 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
     app.state.settings = effective_settings
     resolved_db = resolve_db_path(effective_settings.db_path)
     app.state.db_path = resolved_db
-    logger.info("Base de données SQLite configurée : %s", resolved_db)
+    logger.debug("Base de données SQLite configurée : %s", resolved_db)
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:

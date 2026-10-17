@@ -25,6 +25,9 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   - Refus de tout chemin symbolique (`is_symlink()` via lstat) : protection TOCTOU.
   - `journal_mode=DELETE` forcé pour éviter la création de fichiers sidecar
     `-wal`/`-shm`/`-journal` en permissions larges.
+- Confinement d'environnement : POSIX uniquement (Linux, macOS, BSD). Sous Windows (nt),
+  les permissions 0o600 ne sont pas applicables nativement via os.chmod
+  (avertissement RuntimeWarning émis).
 """
 
 import logging
@@ -98,7 +101,7 @@ def validate_db_path(db_path: Path | str) -> str:
 
     Règles de validation :
     - Refuse les chemins vides ou composés uniquement d'espaces.
-    - Refuse les caractères de contrôle (< 0x20 hors tabulation).
+    - Refuse tout caractère de contrôle ASCII (< 0x20, tabulation incluse).
     - Refuse les chemins pointant vers un répertoire existant.
     - Autorise le mode spécial SQLite ':memory:'.
 
@@ -108,7 +111,7 @@ def validate_db_path(db_path: Path | str) -> str:
     stripped = str(db_path).strip()
     if not stripped:
         raise ValueError("Le chemin de la base de données SQLite ne peut pas être vide.")
-    if any(ord(c) < _CONTROL_CHAR_THRESHOLD and c != "\t" for c in stripped):
+    if any(ord(c) < _CONTROL_CHAR_THRESHOLD for c in stripped):
         raise ValueError(
             "Le chemin de la base de données SQLite contient des caractères de contrôle."
         )
@@ -213,10 +216,14 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
     - Refuse les symlinks (TOCTOU) sur le fichier et tous ses répertoires ancêtres.
     - Refuse les chemins pointant vers des répertoires existants.
     - Crée le répertoire parent avec umask 0o077 (droits 0o700).
+    - Durcit à 0o700 un répertoire parent pré-existant (POSIX uniquement).
     - Re-vérifie les symlinks après mkdir (fermeture de la fenêtre TOCTOU).
     - Crée le fichier avec mode 0o600 si inexistant.
     - Vérifie et confirme les permissions après création (fail-closed).
     - Positionne journal_mode=DELETE (pas de sidecar -wal/-shm).
+    - Maintient umask 0o077 autour de sqlite3.connect() pour réduire la fenêtre
+      TOCTOU résiduelle (le dernier _assert_not_symlink() et connect() ne sont
+      pas atomiques sans O_NOFOLLOW, acceptable en config opérateur).
     """
     _assert_not_symlink(path)
     if path.is_dir():
@@ -228,19 +235,37 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
     old_umask = os.umask(0o077)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Durcir le répertoire parent s'il était pré-existant en mode permissif (POSIX).
+        if os.name != "nt":
+            parent_mode = path.parent.stat().st_mode & 0o777
+            if parent_mode & 0o077:
+                logger.debug(
+                    "Répertoire parent pré-existant trop permissif (%s) : resserrement à 0o700",
+                    oct(parent_mode),
+                )
+                try:
+                    path.parent.chmod(0o700)
+                except OSError as exc:
+                    logger.debug(
+                        "Impossible de resserrer les permissions du répertoire parent %s : %s",
+                        path.parent,
+                        exc,
+                    )
         # Re-vérification après mkdir (fermeture de la fenêtre TOCTOU)
         _assert_not_symlink(path)
         if not path.exists():
             path.touch(mode=_SECURE_FILE_MODE, exist_ok=True)
+
+        _assert_not_symlink(path)
+        _apply_secure_permissions(path)
+        # umask 0o077 reste actif autour de connect() pour réduire la fenêtre TOCTOU
+        # résiduelle entre le dernier _assert_not_symlink() et l'ouverture réelle du fd.
+        conn = sqlite3.connect(str(path))
+        # journal_mode=DELETE : empêche la création de fichiers sidecar en permissions larges.
+        conn.execute("PRAGMA journal_mode = DELETE;")
+        return conn
     finally:
         os.umask(old_umask)
-
-    _assert_not_symlink(path)
-    _apply_secure_permissions(path)
-    conn = sqlite3.connect(str(path))
-    # journal_mode=DELETE : empêche la création de fichiers sidecar en permissions larges.
-    conn.execute("PRAGMA journal_mode = DELETE;")
-    return conn
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -430,8 +455,8 @@ def create_secret(  # noqa: PLR0913
     ou la clé étrangère est enfreinte.
     """
     if status not in _ALLOWED_STATUSES:
-        allowed = sorted(_ALLOWED_STATUSES)
-        raise ValueError(f"Statut de secret invalide: {status!r}. Valeurs autorisées: {allowed}")
+        logger.debug("Statut de secret invalide reçu : %r", status)
+        raise ValueError("Statut de secret invalide.")
     ts = created_at or get_iso_timestamp()
     up_ts = updated_at or ts
     query = (
@@ -530,8 +555,8 @@ def update_secret(  # noqa: PLR0913
     applicative avant toute requête SQL.
     """
     if status not in _ALLOWED_STATUSES:
-        allowed = sorted(_ALLOWED_STATUSES)
-        raise ValueError(f"Statut de secret invalide: {status!r}. Valeurs autorisées: {allowed}")
+        logger.debug("Statut de secret invalide reçu : %r", status)
+        raise ValueError("Statut de secret invalide.")
     up_ts = updated_at or get_iso_timestamp()
     query = (
         "UPDATE secrets SET "

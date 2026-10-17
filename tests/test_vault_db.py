@@ -19,6 +19,7 @@ Vérifie :
 16. La validation de `VaultSettings.db_path` (vide, caractères de contrôle).
 """
 
+import fnmatch
 import io
 import os
 import shutil
@@ -191,6 +192,60 @@ class VaultDatabaseTests(unittest.TestCase):
         with self.assertRaises(IsADirectoryError):
             get_connection(existing_dir)
 
+    def test_preexisting_permissive_parent_dir_is_hardened(self) -> None:
+        """Remarque 2 — Un répertoire parent pré-existant en 0755 est resserré à 0o700."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        parent_dir = Path(self.temp_dir.name) / "shared_parent"
+        parent_dir.mkdir(mode=0o755)
+        db_in_permissive_parent = parent_dir / "vault.db"
+        init_db(db_in_permissive_parent)
+        parent_mode = parent_dir.stat().st_mode & 0o777
+        self.assertEqual(
+            parent_mode,
+            0o700,
+            f"Répertoire parent doit être 0o700 après durcissement, obtenu {oct(parent_mode)}",
+        )
+
+    def test_umask_restored_after_exception_in_open_db_file(self) -> None:
+        """Remarque 3 — L'umask est restauré même si _open_db_file lève une exception."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        initial_umask = os.umask(0o022)
+        os.umask(initial_umask)  # restaure immédiatement
+        symlink_target = Path(self.temp_dir.name) / "target.db"
+        symlink_target.touch()
+        symlink_path = Path(self.temp_dir.name) / "link.db"
+        symlink_path.symlink_to(symlink_target)
+        with self.assertRaises(PermissionError):
+            get_connection(symlink_path)
+        restored_umask = os.umask(0o022)
+        os.umask(restored_umask)
+        self.assertEqual(
+            restored_umask,
+            initial_umask,
+            f"umask non restauré : attendu {oct(initial_umask)}, obtenu {oct(restored_umask)}",
+        )
+
+        # Vérifie également la restauration lorsque l'exception survient dans le bloc try
+        target_path = Path(self.temp_dir.name) / "fail_in_try.db"
+        with patch(
+            "heimdall.vault.database._apply_secure_permissions",
+            side_effect=PermissionError("Simulated failure"),
+        ):
+            with self.assertRaises(PermissionError):
+                get_connection(target_path)
+        restored_umask_try = os.umask(0o022)
+        os.umask(restored_umask_try)
+        self.assertEqual(
+            restored_umask_try,
+            initial_umask,
+            (
+                "umask non restauré après exception interne : "
+                f"attendu {oct(initial_umask)}, obtenu {oct(restored_umask_try)}"
+            ),
+        )
+
     # -----------------------------------------------------------------------
     # 13. Absence de fichiers sidecar SQLite & permissions journal (M3 corrigé)
     # -----------------------------------------------------------------------
@@ -222,13 +277,16 @@ class VaultDatabaseTests(unittest.TestCase):
             conn.execute("BEGIN IMMEDIATE;")
             create_project(conn, "proj_tx_journal")
             journal_path = self.db_path.parent / (self.db_path.name + "-journal")
-            if journal_path.exists():
-                mode = journal_path.stat().st_mode & 0o777
-                self.assertEqual(
-                    mode,
-                    0o600,
-                    f"Permissions du fichier -journal permissives : {oct(mode)}, attendu 0o600",
-                )
+            self.assertTrue(
+                journal_path.exists(),
+                "Le fichier -journal doit exister pendant une transaction active non commitée",
+            )
+            mode = journal_path.stat().st_mode & 0o777
+            self.assertEqual(
+                mode,
+                0o600,
+                f"Permissions du fichier -journal permissives : {oct(mode)}, attendu 0o600",
+            )
             conn.commit()
         finally:
             conn.close()
@@ -366,6 +424,38 @@ class VaultDatabaseTests(unittest.TestCase):
                         "2026-01-01",
                     ),
                 )
+
+    def test_status_value_error_does_not_reflect_input(self) -> None:
+        """Remarque 1 — Le message ValueError ne répercute pas le statut fourni par l'appelant."""
+        init_db(self.db_path)
+        injection_payload = "x\n[INJECTION]"
+        with db_session(self.db_path) as conn:
+            create_project(conn, "proj_reflect")
+            # create_secret
+            with self.assertRaises(ValueError) as ctx_create:
+                create_secret(
+                    conn,
+                    "proj_reflect",
+                    "dev",
+                    "SEC_LOG_INJ",
+                    "enc",
+                    status=injection_payload,  # type: ignore[arg-type]
+                )
+            self.assertNotIn(injection_payload, str(ctx_create.exception))
+            self.assertNotIn("\\n", str(ctx_create.exception))
+
+            create_secret(conn, "proj_reflect", "dev", "SEC_OK", "enc")
+            # update_secret
+            with self.assertRaises(ValueError) as ctx_update:
+                update_secret(
+                    conn,
+                    project_id="proj_reflect",
+                    env="dev",
+                    name="SEC_OK",
+                    encrypted_value="enc_v2",
+                    status=injection_payload,  # type: ignore[arg-type]
+                )
+            self.assertNotIn(injection_payload, str(ctx_update.exception))
 
     # -----------------------------------------------------------------------
     # 7. SQL Injection (CWE-89)
@@ -557,11 +647,24 @@ class VaultDatabaseTests(unittest.TestCase):
 
     def test_gitignore_covers_vault_db(self) -> None:
         """15 — Le .gitignore exclut vault.db, *.db et les sidecars (-wal/-shm/-journal)."""
-        git_bin = shutil.which("git")
-        if git_bin is None:
-            self.skipTest("git non disponible dans le PATH")
         root = Path(__file__).resolve().parents[1]
-        # git check-ignore retourne code 0 si le fichier est ignoré
+        gitignore_path = root / ".gitignore"
+        self.assertTrue(gitignore_path.exists(), ".gitignore doit exister à la racine du dépôt")
+        patterns = [
+            line.strip()
+            for line in gitignore_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        # Assertions statiques des motifs obligatoires
+        required_patterns = ("vault.db*", "*.db", "*.db-wal", "*.db-shm", "*.db-journal")
+        for req in required_patterns:
+            self.assertIn(
+                req,
+                patterns,
+                f"Motif obligatoire manquant dans .gitignore : {req}",
+            )
+
+        # Test de filtrage fnmatch indépendant de git
         sidecar_files = (
             "vault.db",
             "vault.db-journal",
@@ -570,17 +673,27 @@ class VaultDatabaseTests(unittest.TestCase):
             "other.db",
         )
         for filename in sidecar_files:
-            result = subprocess.run(  # noqa: S603
-                [git_bin, "check-ignore", "-q", filename],
-                cwd=root,
-                capture_output=True,
-                check=False,
+            matched = any(fnmatch.fnmatch(filename, pat) for pat in patterns)
+            self.assertTrue(
+                matched,
+                f"{filename!r} n'est pas couvert par les motifs du .gitignore (test fnmatch)",
             )
-            self.assertEqual(
-                result.returncode,
-                0,
-                f"{filename!r} n'est pas couvert par .gitignore — risque de commit de ciphertext",
-            )
+
+        # Vérification optionnelle avec git check-ignore si git est installé
+        git_bin = shutil.which("git")
+        if git_bin is not None:
+            for filename in sidecar_files:
+                result = subprocess.run(  # noqa: S603
+                    [git_bin, "check-ignore", "-q", filename],
+                    cwd=root,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"{filename!r} n'est pas couvert par .gitignore (git check-ignore)",
+                )
 
     # -----------------------------------------------------------------------
     # 16. Validation VaultSettings.db_path (L4)
@@ -599,6 +712,8 @@ class VaultDatabaseTests(unittest.TestCase):
             VaultSettings(db_path="vault\x00.db")
         with self.assertRaises(ValidationError):
             VaultSettings(db_path="vault\x1f.db")
+        with self.assertRaises(ValidationError):
+            VaultSettings(db_path="vault\t.db")
 
     def test_vault_settings_db_path_rejects_directory(self) -> None:
         """VaultSettings refuse un db_path pointant vers un répertoire existant."""
@@ -628,6 +743,8 @@ class VaultDatabaseTests(unittest.TestCase):
             validate_db_path("vault\x00.db")
         with self.assertRaises(ValueError):
             validate_db_path("vault\n.db")
+        with self.assertRaises(ValueError):
+            validate_db_path("vault\t.db")
         with self.assertRaises(IsADirectoryError):
             validate_db_path(self.temp_dir.name)
 
@@ -646,6 +763,8 @@ class VaultDatabaseTests(unittest.TestCase):
             resolve_db_path("vault\n.db")
         with self.assertRaises(ValueError):
             resolve_db_path("vault\x1f.db")
+        with self.assertRaises(ValueError):
+            resolve_db_path("vault\t.db")
 
     def test_resolve_db_path_environment_variable(self) -> None:
         """resolve_db_path prend en compte HEIMDALL_VAULT_DB_PATH."""
@@ -676,6 +795,9 @@ class VaultDatabaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_db_path()
         with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "vault\x1f.db"}):
+            with self.assertRaises(ValueError):
+                resolve_db_path()
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "vault\t.db"}):
             with self.assertRaises(ValueError):
                 resolve_db_path()
         with patch.object(os.environ, "get", return_value="vault\x00.db"):
