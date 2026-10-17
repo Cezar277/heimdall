@@ -70,7 +70,7 @@ jobs:
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MODEL: opencode/muse-spark-1.3-contributor
+          MODEL: opencode-go/muse-spark-1.3-contributor
           PROMPT: |
             Tu es un ingénieur sécurité applicative senior. Tu relis une pull request du projet
             Heimdall, un outil DevSecOps 100 % local qui empêche les secrets d'arriver dans Git.
