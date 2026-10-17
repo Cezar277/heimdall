@@ -146,9 +146,12 @@ réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
 
 La preuve et sa limite actuelle sont archivées dans
 [`docs/security/zero-egress.md`](docs/security/zero-egress.md) : le test CI
-interdit les connexions Python hors loopback. Le scan réel reste bloqué par le
-squelette du scanner #22 ; la trace disponible prouve uniquement l'absence de
-connexion sur ce chemin fail-closed, pas encore sur un scan opérationnel.
+interdit les connexions Python hors loopback et n'autorise, comme exception
+journalisée, que l'IPC local `AF_UNIX` (réserve : un relais inter-processus
+reste hors du garde et n'apparaît dans la trace que s'il ressort en IP). Le
+scan réel reste bloqué par le squelette du scanner #22 ; la trace disponible
+prouve uniquement l'absence de connexion sur ce chemin fail-closed, pas encore
+sur un scan opérationnel.
 
 ### Réglages GitHub du dépôt (une fois, non versionnables)
 
