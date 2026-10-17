@@ -8,6 +8,8 @@ meta : pas d'exigence vague, pas de vrai secret dans les fixtures.
 import re
 from pathlib import Path
 
+from heimdall.vault.client import VaultClient
+
 REPO = Path(__file__).resolve().parents[2]
 REQUIREMENTS = REPO / "docs" / "security" / "requirements.md"
 SECURITY_DIR = REPO / "docs" / "security"
@@ -85,8 +87,6 @@ def test_h1_h4_loopback_engagement() -> None:
     assert "verify=False" in req
     assert "F09" in req and "F14" in req
     # Le client applique deja l'allowlist : preuve executable de l'engagement.
-    from heimdall.vault.client import VaultClient
-
     VaultClient("https://localhost:8443", "SYNTHETIC_API_KEY_09")
     VaultClient("https://[::1]:8443", "SYNTHETIC_API_KEY_09")
     for bad in (
