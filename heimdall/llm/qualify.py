@@ -156,6 +156,14 @@ class Qualification:
     verdict: Verdict | None
     reason: ErrorCode | None
 
+    def __post_init__(self) -> None:
+        # Corrélation imposée par le type, pas seulement promise par le
+        # docstring : soit un avis retenu (verdict seul), soit un refus
+        # motivé (raison seule). Un état ambigu (les deux ou aucun)
+        # lèverait chez l'appelant une interprétation « retirer le finding ».
+        if (self.verdict is None) == (self.reason is None):
+            raise ValueError("etat incoherent : verdict xor reason")
+
 
 def _loopback_client() -> ollama.Client:
     """Client Ollama verrouillé sur la boucle locale.
@@ -319,7 +327,10 @@ def qualify_candidate(
     code est journalisé : le candidat reste un finding, avec sa raison. Un
     verdict valide, même ``faux_positif``, ne change pas ``status`` non plus :
     le LLM propose, le développeur décide (#32). Aucun texte du modèle
-    n'est renvoyé ni journalisé.
+    n'est renvoyé ni journalisé. Un filet final convertit toute exception
+    inattendue (évolution du SDK, propriété hostile) en refus ``invalid`` —
+    jamais de traversée vers l'appelant. ``BaseException``
+    (``KeyboardInterrupt``/``SystemExit``) n'est pas capturée.
     """
     try:
         verdict = qualify(candidate, model=model, chat=chat)
@@ -330,4 +341,10 @@ def qualify_candidate(
             PROMPT_NAME,
         )
         return Qualification(status="detecte", verdict=None, reason=error.code)
+    except Exception:
+        logger.warning(
+            "qualification: candidat conserve (raison=invalid, prompt=%s)",
+            PROMPT_NAME,
+        )
+        return Qualification(status="detecte", verdict=None, reason="invalid")
     return Qualification(status="detecte", verdict=verdict["verdict"], reason=None)

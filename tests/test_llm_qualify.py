@@ -619,6 +619,28 @@ class TestCandidateStaysDetected:
         result = qualify_candidate(MASKED_CANDIDATE, chat=chat)
         assert result == Qualification(status="detecte", verdict=None, reason="unavailable")
 
+    def test_unexpected_exception_is_fail_closed_without_reflection(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Filet final : une exception hors QualifyError (évolution du SDK,
+        # propriété hostile, ``verdict["verdict"]`` manquant) ne traverse
+        # jamais l'appelant. Note : une panne de transport reste
+        # ``unavailable`` (convertie par ``qualify`` lui-même), pas ce filet.
+        def _raise_unexpected(*_args: Any, **_kwargs: Any) -> Any:
+            raise AttributeError("SYNTHETIC")
+
+        monkeypatch.setattr(qualify_module, "qualify", _raise_unexpected)
+        caplog.set_level(logging.INFO, logger="heimdall.llm.qualify")
+        result = qualify_candidate(MASKED_CANDIDATE, chat=RecordingChat())
+        assert result == Qualification(status="detecte", verdict=None, reason="invalid")
+        logged = "\n".join(
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "heimdall.llm.qualify"
+        )
+        assert "candidat conserve (raison=invalid" in logged
+        assert "SYNTHETIC" not in logged
+
     @pytest.mark.parametrize(
         ("candidate", "model", "reason"),
         [
@@ -641,6 +663,25 @@ class TestCandidateStaysDetected:
         result = qualify_candidate(candidate, model=model, chat=chat)
         assert result == Qualification(status="detecte", verdict=None, reason=reason)
         assert chat.calls == []
+
+    @pytest.mark.parametrize("candidate", [None, b"SYNTHETIC_BYTES"], ids=["none", "bytes"])
+    def test_non_str_candidate_is_empty_without_calling_llm(self, candidate: Any) -> None:
+        chat = RecordingChat()
+        result = qualify_candidate(candidate, chat=chat)
+        assert result == Qualification(status="detecte", verdict=None, reason="empty")
+        assert chat.calls == []
+
+    @pytest.mark.parametrize(
+        "qualification",
+        [
+            {"status": "detecte", "verdict": "secret", "reason": "invalid"},
+            {"status": "detecte", "verdict": None, "reason": None},
+        ],
+        ids=["verdict-et-raison", "ni-verdict-ni-raison"],
+    )
+    def test_incoherent_qualification_is_rejected(self, qualification: dict[str, Any]) -> None:
+        with pytest.raises(ValueError, match="etat incoherent"):
+            Qualification(**qualification)  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("verdict", ["secret", "faux_positif", "incertain"])
     def test_valid_verdict_never_removes_candidate(self, verdict: str) -> None:
