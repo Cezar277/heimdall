@@ -14,7 +14,7 @@ Closes #<!-- numéro. Pour un ticket récurrent (ex. #13), écris "Refs #13" -->
 
 - [ ] Tests ajoutés ou modifiés
 - [ ] Tests verts en local
-- [ ] CI verte (si en place)
+- [ ] CI verte : commenter `/ci` en début de commentaire sur la PR puis attendre le check `CI (/ci)`
 - Résultat / capture:
 
 ## Impact sécurité

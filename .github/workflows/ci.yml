@@ -1,0 +1,276 @@
+name: CI Security & Quality
+
+# Ce workflow ne tourne volontairement PAS à chaque push de branche (#20) :
+# quota GitHub et bruit contenus. Les déclencheurs, tous explicites :
+#   1. issue_comment : commenter `/ci` (commande seule ou suivie d'un espace /
+#      saut de ligne) sur une PR non issue d'un fork, par un collaborateur de
+#      confiance, lance la CI complète — modèle /oc.
+#   2. pull_request_review : une approbation (`review.state == 'approved'`,
+#      collaborateur de confiance) la lance aussi.
+#   3. push sur `main` : preuve « pipeline vert sur main » après merge.
+#      (`workflow_dispatch` reste dispo pour le débogage : il ne publie PAS
+#      le check `CI (/ci)`, donc ne débloque pas une PR ; il est limité à main.)
+# Les PR de forks ne sont jamais exécutées sur le runner self-hosted. Le dispatch
+# de debug est limité à main.
+#
+# Pourquoi un check publié à la main (`CI (/ci)`) et pas le check des jobs ?
+# GitHub n'évalue pour une PR que les checks des runs déclenchés par push /
+# pull_request* / deployment* : les checks des jobs d'un run `issue_comment`
+# ne comptent pas, même s'ils passent (docs « Troubleshooting required
+# status checks »). Ce workflow publie donc lui-même, via l'API Checks, le
+# check `CI (/ci)` sur le commit de merge (refs/pull/<n>/merge) — c'est lui
+# que la protection de `main` doit exiger (voir README).
+# Un nouveau commit poussé après /ci (ou une approbation) exige de relancer
+# /ci (ou une nouvelle approbation) : comportement voulu.
+#
+# Séparation des privilèges (revue) : `checks: write` / `issues: write`
+# n'existent que dans `resolve` et `report`, deux jobs courts qui n'exécutent
+# JAMAIS de code issu de la PR. Le job `test`, qui lui exécute le code de la
+# PR (checkout, install, tests), n'a que `contents: read` : un test ou un
+# conftest malveillant ne peut ni lire un token privilégié ni forger le check
+# `CI (/ci)` qui protège `main`.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Moindre privilège (#20) ; jamais de pull_request_target.
+permissions:
+  contents: read
+
+concurrency:
+  # issue_comment n'expose pas pull_request : on retombe sur le numéro de
+  # l'issue (= la PR) pour garder un groupe par PR.
+  group: ci-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Contexte PR (check « CI (/ci) »)
+    # Job de confiance : résout la PR et publie le check « en attente ». Il ne
+    # touche jamais au code de la PR — avec `report`, c'est le seul endroit
+    # autorisé à écrire des checks.
+    runs-on: self-hosted
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read  # pulls.get : numéro de commit de merge
+      checks: write        # publication du check « CI (/ci) »
+      issues: write        # réaction 👀 sur le commentaire /ci
+    # Uniquement des déclencheurs humains de confiance : les commandes /ci et
+    # approbations sont filtrées par author_association (même liste que
+    # opencode-review) — un compte externe ne peut pas faire tourner du code
+    # sur le runner.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved' &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.state == 'open' &&
+      contains(github.event.comment.body, '/ci') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    outputs:
+      has_pr: ${{ steps.ctx.outputs.has_pr }}
+      run_tests: ${{ steps.ctx.outputs.run_tests }}
+      checkout_ref: ${{ steps.ctx.outputs.checkout_ref }}
+      check_sha: ${{ steps.ctx.outputs.check_sha }}
+      check_id: ${{ steps.ctx.outputs.check_id }}
+    steps:
+      - name: Contexte PR + publication du check « CI (/ci) » (en attente)
+        id: ctx
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            let prNumber;
+            if (context.eventName === 'issue_comment') {
+              if (!context.payload.issue.pull_request) {
+                core.setFailed('La commande /ci ne fonctionne que sur une pull request.');
+                return;
+              }
+              // L'expression de job ne sait pas trim : ce filtre grossier ne
+              // fait démarrer que ce job léger; seule la commande stricte ci-dessous
+              // peut autoriser le job `test`.
+              const command = context.payload.comment.body.trim();
+              if (!/^\/ci(?:$|\s)/.test(command)) {
+                core.notice('Commentaire ignoré : utiliser /ci seul ou suivi d’un espace/retour à la ligne.');
+                core.setOutput('has_pr', 'false');
+                core.setOutput('run_tests', 'false');
+                return;
+              }
+              prNumber = context.payload.issue.number;
+            } else if (context.eventName === 'pull_request_review') {
+              prNumber = context.payload.pull_request.number;
+            } else {
+              // push sur main ou dispatch : pas de PR, pas de check publié.
+              core.setOutput('has_pr', 'false');
+              core.setOutput('run_tests', 'true');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber,
+            });
+            if (!pr.head.repo || pr.head.repo.fork) {
+              core.notice('PR de fork ignorée : le runner self-hosted n’exécute pas de code de fork.');
+              core.setOutput('has_pr', 'false');
+              core.setOutput('run_tests', 'false');
+              return;
+            }
+            // Accusé de réception non bloquant, seulement après validation de
+            // la commande et confirmation que la PR provient du dépôt.
+            if (context.eventName === 'issue_comment') {
+              try {
+                await github.rest.reactions.createForIssueComment({
+                  owner, repo,
+                  comment_id: context.payload.comment.id,
+                  content: 'eyes',
+                });
+              } catch (error) {
+                core.warning(`Réaction 👀 impossible : ${error.message}`);
+              }
+            }
+            if (!pr.merge_commit_sha) {
+              core.setFailed('Commit de merge indisponible (conflits ou calcul en cours) : résolvez les conflits, puis relancez /ci.');
+              return;
+            }
+            const mergeSha = pr.merge_commit_sha;
+            const checkName = 'CI (/ci)';
+
+            // Un run coupé en plein vol (runner) peut laisser un check
+            // « in_progress » : on l'annule pour ne jamais bloquer la PR.
+            const stale = await github.paginate(
+              github.rest.checks.listForRef,
+              {
+                owner, repo, ref: mergeSha, check_name: checkName,
+                status: 'in_progress', filter: 'all', per_page: 100,
+              },
+              response => response.data.check_runs,
+            );
+            for (const run of stale) {
+              await github.rest.checks.update({
+                owner, repo, check_run_id: run.id, conclusion: 'cancelled',
+              });
+            }
+
+            const { data: check } = await github.rest.checks.create({
+              owner, repo,
+              name: checkName,
+              head_sha: mergeSha,
+              status: 'in_progress',
+              details_url: `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+            core.setOutput('has_pr', 'true');
+            core.setOutput('run_tests', 'true');
+            core.setOutput('checkout_ref', `refs/pull/${prNumber}/merge`);
+            core.setOutput('check_sha', mergeSha);
+            core.setOutput('check_id', String(check.id));
+
+  test:
+    name: Lint, Typecheck, Audit & Test
+    # Job « non fiable » : il exécute le code de la PR (hérite de la garde de
+    # confiance de `resolve` via needs). Aucun droit d'écriture ici, et aucun
+    # token privilégié n'est injecté dans ses steps.
+    needs: resolve
+    if: needs.resolve.outputs.run_tests == 'true'
+    runs-on: self-hosted
+    timeout-minutes: 20
+    permissions:
+      contents: read   # checkout uniquement
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Pour une PR : le commit de merge exact dont le check porte le
+          # statut. Sinon (push main, dispatch) : la ref du run.
+          ref: ${{ needs.resolve.outputs.checkout_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Vérifier que le code testé est bien le commit de merge du check
+        if: needs.resolve.outputs.has_pr == 'true'
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.check_sha }}
+        run: |
+          tested="$(git rev-parse HEAD)"
+          if [ "$tested" != "$EXPECTED_SHA" ]; then
+            echo "::error::La PR a bougé pendant le lancement (HEAD=$tested, check=$EXPECTED_SHA). Relancez /ci."
+            exit 1
+          fi
+
+      - name: Install (requirements.lock, hashes SHA-256)
+        run: |
+          rm -rf .venv-ci
+          python3 -m venv .venv-ci
+          .venv-ci/bin/pip install --require-hashes -r requirements.lock
+          .venv-ci/bin/pip install -e . --no-deps --no-build-isolation
+
+      - name: Lint (ruff)
+        run: .venv-ci/bin/ruff check heimdall tests
+
+      - name: Types (mypy strict)
+        run: .venv-ci/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
+
+      - name: SAST (bandit)
+        run: .venv-ci/bin/bandit -r heimdall -q
+
+      - name: Tests + couverture >= 85 %
+        run: >-
+          .venv-ci/bin/python -m pytest
+          --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85
+
+      - name: Couverture du Vault >= 70 %
+        run: >-
+          .venv-ci/bin/python -m coverage report
+          --include="heimdall/vault/*"
+          --fail-under=70
+
+      - name: Couverture du scanner >= 70 %
+        run: >-
+          .venv-ci/bin/python -m coverage report
+          --include="heimdall/scanner/*"
+          --fail-under=70
+
+      - name: Couverture du MCP >= 70 %
+        run: >-
+          .venv-ci/bin/python -m coverage report
+          --include="heimdall/mcp/*"
+          --fail-under=70
+
+      - name: Audit dépendances (pip-audit, exception réseau documentée README)
+        run: .venv-ci/bin/pip-audit --skip-editable
+
+  report:
+    name: Clôture du check « CI (/ci) »
+    # Job de confiance, après coup : clôt le check selon le verdict réel du
+    # job `test`. Aucun checkout — il ne voit jamais le code de la PR.
+    needs: [resolve, test]
+    if: ${{ always() && needs.resolve.outputs.has_pr == 'true' }}
+    runs-on: self-hosted
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    steps:
+      - name: Clôture du check « CI (/ci) » (verdict du job de test)
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          JOB_RESULT: ${{ needs.test.result }}
+          CHECK_ID: ${{ needs.resolve.outputs.check_id }}
+        with:
+          script: |
+            const conclusion =
+              process.env.JOB_RESULT === 'success' ? 'success' :
+              process.env.JOB_RESULT === 'cancelled' ? 'cancelled' : 'failure';
+            await github.rest.checks.update({
+              ...context.repo,
+              check_run_id: Number(process.env.CHECK_ID),
+              conclusion,
+              details_url: `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
