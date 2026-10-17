@@ -124,8 +124,20 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   d'état sans validation humaine.
 - Preuve attendue : `tests/security/test_prompt_injection.py::test_llm_rejection_never_silent`
   (surface MCP fermée, masquage avant sérialisation, messages sans caractères
-  de contrôle, machine d'états Finding exigeant l'humain).
-- Statut : exigence acceptée par #19 ; implémentation #28/#32/#33/#34 à prouver.
+  de contrôle, machine d'états Finding exigeant l'humain). Livraison partielle
+  par #80 (T28.2) : `tests/security/test_prompt_injection.py::test_qualify_prompt_isolated_and_output_constrained`
+  prouve le prompt système versionné (`heimdall/mcp/prompts/qualify_v1.md`,
+  sans donnée scannée), le délimiteur aléatoire par requête, le schéma JSON
+  strict transmis au paramètre `format` d'Ollama (`additionalProperties: false`,
+  enum fermé) et revalidé côté client par pydantic strict (`QualifyVerdict`,
+  `extra="forbid"`, enum exact, confiance 0..1 — cœur de #81 livré ici par
+  anticipation, #81 à rescoper) et le client épinglé à la boucle locale ;
+  l'orchestration interactive (#32) reste à prouver.
+- Statut : exigence acceptée par #19 ; implémentation #28/#32/#33/#34 à
+  prouver ; #80 (T28.2) livre l'isolation des données, la contrainte de
+  sortie JSON côté requête ET la validation stricte du retour (preuve
+  réelle : 20/20 candidats au format attendu, voir
+  [ADR-004](../adr/004-choix-modele-ollama.md)).
 
 ### REQ-SEC-02 — Aucun LLM en CI
 
