@@ -100,23 +100,33 @@ couverture de 85 % (`pytest-cov`) et `pip-audit`, sur un runner **self-hosted**
 (comme les autres workflows) : zéro minute GitHub consommée.
 
 Il ne tourne volontairement **pas** à chaque push de branche (quota GitHub et
-bruit contenus) :
+bruit contenus) : sur une PR, deux déclencheurs équivalents, réservés aux
+collaborateurs de confiance (garde `author_association`) :
 
-1. **Approbation d'un relecteur** : déclenchement par `pull_request_review`
-   (état `approved` ; une approbation d'un compte externe ne déclenche rien),
-   sur la ref de merge `refs/pull/<n>/merge` — le statut s'attache donc à la
-   PR et peut être exigé par la protection de `main` (voir les réglages
-   ci-dessous).
-2. **Push sur `main`** : preuve « pipeline vert sur main » après merge.
-3. **Commande spéciale** : Actions → « CI Security & Quality » →
-   *Run workflow* (`workflow_dispatch` ; disponible une fois le workflow sur
-   `main`).
+1. **Commande `/ci`** : commenter `/ci` sur la PR (modèle de `/oc review`)
+   lance la CI complète ; la réaction 👀 accuse réception et le check
+   `CI (/ci)` apparaît sur la PR.
+2. **Approbation d'un relecteur** : approuver la PR (`pull_request_review`,
+   état `approved`) la lance aussi.
 
-Les autres workflows (`Vault contract`, `Security model`, `OpenCode review`)
-gardent leurs propres déclencheurs. Après un nouveau commit sur une PR déjà
-approuvée (y compris « Update branch »), le check requis doit être re-signalé
-par une nouvelle approbation ; `workflow_dispatch` permet de lancer la CI à
-la demande (débogage, hors protection de branche).
+Dans les deux cas, le workflow publie lui-même le check **`CI (/ci)`** sur le
+commit de merge (`refs/pull/<n>/merge`) : c'est **ce nom** que la protection
+de `main` doit exiger. Pourquoi publié via l'API plutôt que le check du job ?
+GitHub n'évalue pour une PR que les checks des runs déclenchés par `push` /
+`pull_request*` / `deployment*` : les checks des jobs d'un run déclenché par un
+commentaire ne comptent pas (docs *Troubleshooting required status checks*) —
+sans publication explicite, `/ci` ne bloquerait ni ne débloquerait rien.
+
+Conséquence voulue : **sans `/ci` ni approbation, le check est absent et la PR
+reste bloquée** (« Waiting for status to be reported ») ; après un nouveau
+commit (y compris « Update branch »), relancer `/ci` (ou ré-approuver) — le
+check repart « en attente » puis passe au vert si tout passe.
+
+En dehors des PR : `push` sur `main` (preuve « pipeline vert sur main ») et
+`workflow_dispatch` (bouton *Run workflow*, pour déboguer — il ne publie pas
+le check, donc ne débloque pas une PR ; disponible une fois le workflow sur
+`main`). Les autres workflows (`Vault contract`, `Security model`,
+`OpenCode review`) gardent leurs propres déclencheurs.
 
 ### Exception réseau documentée : `pip-audit`
 
@@ -135,18 +145,20 @@ réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
   privé (GitHub Advanced Security / Secret Protection) — à activer si le plan
   le permet.
 - **Protection de `main`** : PR obligatoire + 1 approbation ; exiger les
-  checks `Security model` et `Lint, Typecheck, Audit & Test` (ce dernier
-  n'apparaît dans la liste qu'après une première approbation de PR) ; pas de
-  force-push. Ne pas exiger `Vault contract` : ses filtres de chemins le
-  laisseraient « en attente » sur les PR sans fichiers de contrat.
+  checks `Security model` et **`CI (/ci)`** — ⚠️ **pas** `Lint, Typecheck,
+  Audit & Test` (le nom du job) : sur un run déclenché par commentaire il
+  n'est pas rattaché à la PR et bloquerait à vie. `CI (/ci)` devient
+  sélectionnable après le premier run qui le publie (une approbation ou un
+  `/ci`). Pas de force-push. Ne pas exiger `Vault contract` : ses filtres de
+  chemins le laisseraient « en attente » sur les PR sans fichiers de contrat.
 - **Actions** (Settings > Actions > General) : garder l'approbation requise
   pour les workflows déclenchés depuis un fork (« Require approval for all
   outside collaborators »). Le runner `self-hosted` exécute le code de la PR
-  **après approbation** : il doit rester une VM d'équipe dédiée (jamais une
-  machine perso), idéalement isolée ou jetable.
+  **après `/ci` ou approbation** : il doit rester une VM d'équipe dédiée
+  (jamais une machine perso), idéalement isolée ou jetable.
 - **Option** : « Require branches to be up to date before merging » augmente
-  les re-runs — chaque « Update branch » exige une nouvelle approbation pour
-  re-signaler le check. À n'activer que si nécessaire.
+  les re-runs — chaque « Update branch » exige de relancer `/ci` (ou
+  ré-approuver) pour re-signaler le check. À n'activer que si nécessaire.
 
 ## Vérifier
 

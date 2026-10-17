@@ -70,10 +70,11 @@ Dans Settings > Branches, la règle sur `main` impose:
 - pas de force-push.
 
 La CI lourde (`.github/workflows/ci.yml`, #20) ne se déclenche **pas** à chaque
-push : elle démarre à l'approbation d'une review d'un collaborateur de confiance
-(ou via Actions > *Run workflow*). Approuver une PR lance donc aussi les tests.
-Après un nouveau commit sur la branche (y compris « Update branch »), une
-nouvelle approbation est nécessaire pour relancer la CI.
+push : elle démarre quand un collaborateur de confiance commente **`/ci`** sur
+la PR (le plus simple, modèle de `/oc review`) ou approuve la review. Le check
+exigé par la protection de `main` est `CI (/ci)` (publié sur la PR par ces deux
+déclencheurs). Après un nouveau commit sur la branche (y compris « Update
+branch »), relancer `/ci` (ou ré-approuver) : le check doit être re-signalé.
 
 ## 8. Règles de sécurité (non négociables)
 
