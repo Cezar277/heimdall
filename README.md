@@ -106,7 +106,7 @@ collaborateurs de confiance (garde `author_association`) :
    retour à la ligne sur une PR du dépôt (espaces initiaux retirés ; `/ciX`
    est refusé).
    Le job de contexte vérifie la commande exactement avant de lancer les tests ;
-   la réaction 👀 accuse réception et le check `CI (/ci)` apparaît sur la PR.
+   le check `CI (/ci)` apparaît sur la PR.
 2. **Approbation d'un relecteur** : approuver la PR (`pull_request_review`,
    état `approved`) la lance aussi.
 
@@ -143,6 +143,20 @@ workflow interroge l'API publique PyPI pour confronter nos dépendances aux CVE
 connues. Seuls les **noms et versions des paquets** installés sont transmis —
 aucun code source, aucun secret, aucune métadonnée du projet. Aucun appel
 réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
+
+La preuve et sa limite actuelle sont archivées dans
+[`docs/security/zero-egress.md`](docs/security/zero-egress.md) : le test CI
+interdit les connexions Python hors loopback et n'autorise, comme exception
+journalisée, que l'IPC local `AF_UNIX` (réserve : un relais inter-processus
+reste hors du garde et n'apparaît dans la trace que s'il ressort en IP). Il
+refuse aussi le lancement de processus enfants par les wrappers Python
+(`subprocess.Popen` par attribut, `os.*`) ; les alias précoces
+(`from subprocess import Popen`), les chemins C (`_posixsubprocess`) et un
+binaire ou une extension native appelant directement `fork(2)`/`execve(2)`
+relèvent de la trace `strace -f`. Le
+scan réel reste bloqué par le squelette du scanner #22 ; la trace disponible
+prouve uniquement l'absence de connexion sur ce chemin fail-closed, pas encore
+sur un scan opérationnel.
 
 ### Réglages GitHub du dépôt (une fois, non versionnables)
 

@@ -87,6 +87,13 @@ def test_integrite_du_check_publie() -> None:
     assert "github.paginate(" in ACTIVE
     assert "response.data.check_runs" in ACTIVE
     assert "per_page: 100" in ACTIVE
+    assert "external_id: externalId" in ACTIVE
+    assert "matchingChecks.find(run => run?.external_id === externalId)?.id" in ACTIVE
+    assert "let checkId = created?.data?.id" in ACTIVE
+    assert "if (!checkId)" in ACTIVE
+    assert "String(checkId)" in ACTIVE
+    assert "issues: write" not in ACTIVE
+    assert "createForIssueComment" not in ACTIVE
 
 
 def test_installation_verrouillee() -> None:

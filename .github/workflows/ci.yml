@@ -23,8 +23,8 @@ name: CI Security & Quality
 # Un nouveau commit poussé après /ci (ou une approbation) exige de relancer
 # /ci (ou une nouvelle approbation) : comportement voulu.
 #
-# Séparation des privilèges (revue) : `checks: write` / `issues: write`
-# n'existent que dans `resolve` et `report`, deux jobs courts qui n'exécutent
+# Séparation des privilèges (revue) : `checks: write` n'existe que dans
+# `resolve` et `report`, deux jobs courts qui n'exécutent
 # JAMAIS de code issu de la PR. Le job `test`, qui lui exécute le code de la
 # PR (checkout, install, tests), n'a que `contents: read` : un test ou un
 # conftest malveillant ne peut ni lire un token privilégié ni forger le check
@@ -60,7 +60,6 @@ jobs:
     permissions:
       pull-requests: read  # pulls.get : numéro de commit de merge
       checks: write        # publication du check « CI (/ci) »
-      issues: write        # réaction 👀 sur le commentaire /ci
     # Uniquement des déclencheurs humains de confiance : les commandes /ci et
     # approbations sont filtrées par author_association (même liste que
     # opencode-review) — un compte externe ne peut pas faire tourner du code
@@ -124,19 +123,6 @@ jobs:
               core.setOutput('run_tests', 'false');
               return;
             }
-            // Accusé de réception non bloquant, seulement après validation de
-            // la commande et confirmation que la PR provient du dépôt.
-            if (context.eventName === 'issue_comment') {
-              try {
-                await github.rest.reactions.createForIssueComment({
-                  owner, repo,
-                  comment_id: context.payload.comment.id,
-                  content: 'eyes',
-                });
-              } catch (error) {
-                core.warning(`Réaction 👀 impossible : ${error.message}`);
-              }
-            }
             if (!pr.merge_commit_sha) {
               core.setFailed('Commit de merge indisponible (conflits ou calcul en cours) : résolvez les conflits, puis relancez /ci.');
               return;
@@ -155,23 +141,45 @@ jobs:
               response => response.data.check_runs,
             );
             for (const run of stale) {
+              if (!run?.id) {
+                core.warning('Ancien check sans identifiant ignoré.');
+                continue;
+              }
               await github.rest.checks.update({
                 owner, repo, check_run_id: run.id, conclusion: 'cancelled',
               });
             }
 
-            const { data: check } = await github.rest.checks.create({
+            // external_id permet de retrouver le check si la réponse de
+            // checks.create ne contient pas son objet (défense contre une
+            // réponse vide de l'API, plutôt qu'une TypeError sur check.id).
+            const externalId = `ci-${context.runId}-${context.runAttempt}`;
+            const created = await github.rest.checks.create({
               owner, repo,
               name: checkName,
               head_sha: mergeSha,
               status: 'in_progress',
+              external_id: externalId,
               details_url: `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`,
             });
+            let checkId = created?.data?.id;
+            if (!checkId) {
+              const matchingChecks = await github.paginate(
+                github.rest.checks.listForRef,
+                { owner, repo, ref: mergeSha, check_name: checkName, filter: 'all', per_page: 100 },
+                response => response.data.check_runs,
+              );
+              checkId = matchingChecks.find(run => run?.external_id === externalId)?.id;
+            }
+            if (!checkId) {
+              core.setFailed('GitHub n’a pas retourné l’identifiant du check CI (/ci).');
+              return;
+            }
             core.setOutput('has_pr', 'true');
             core.setOutput('run_tests', 'true');
             core.setOutput('checkout_ref', `refs/pull/${prNumber}/merge`);
             core.setOutput('check_sha', mergeSha);
-            core.setOutput('check_id', String(check.id));
+            core.setOutput('check_id', String(checkId));
 
   test:
     name: Lint, Typecheck, Audit & Test
