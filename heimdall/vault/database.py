@@ -160,19 +160,29 @@ def _assert_not_symlink(path: Path) -> None:
     """Refuse tout chemin dont le fichier ou l'un des ancêtres est un lien symbolique.
 
     Protection TOCTOU stricte via lstat (pas de déréférencement).
-    Vérifie le chemin relatif/absolu ainsi que TOUS ses répertoires ancêtres.
+    Vérifie le chemin relatif/absolu, ses ancêtres, ainsi que leurs formes normalisées
+    lexicalement (os.path.normpath sans suivi de symlink pour neutraliser les '..').
     """
     candidates: list[Path] = [path, *path.parents]
     # Vérifie également sous forme absolue pour couvrir les symlinks ancêtres non relatifs
     abs_path = path.absolute()
     candidates.extend([abs_path, *abs_path.parents])
 
+    # Normalisation lexicale pour couvrir les chemins contenant des '..'
+    norm_path = Path(os.path.normpath(str(path)))
+    candidates.extend([norm_path, *norm_path.parents])
+    norm_abs = Path(os.path.normpath(str(abs_path)))
+    candidates.extend([norm_abs, *norm_abs.parents])
+
+    seen: set[Path] = set()
     for p in candidates:
-        if os.path.islink(p):
-            logger.debug("Chemin de base de données refusé (symlink détecté) : %s", p)
-            raise PermissionError(
-                "Chemin de base de données refusé : lien symbolique interdit"
-            )
+        if p not in seen:
+            seen.add(p)
+            if os.path.islink(p):
+                logger.debug("Chemin de base de données refusé (symlink détecté) : %s", p)
+                raise PermissionError(
+                    "Chemin de base de données refusé : lien symbolique interdit"
+                )
 
 
 def _apply_secure_permissions(path: Path) -> None:
@@ -183,8 +193,9 @@ def _apply_secure_permissions(path: Path) -> None:
 
     Plateformes non-POSIX (Windows / nt) :
     Le Vault Heimdall requiert un environnement POSIX pour garantir le confinement
-    des permissions fichier (0o600). Sous Windows, les ACL ne sont pas restreintes
-    nativement via os.chmod ; cette fonction émet un RuntimeWarning explicite.
+    des permissions fichier (0o600). Windows est strictement hors cible de déploiement
+    en production. Sous Windows, les ACL ne sont pas restreintes nativement via os.chmod ;
+    cette fonction émet un RuntimeWarning explicite.
     """
     if os.name == "nt":
         warnings.warn(

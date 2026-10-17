@@ -11,7 +11,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from heimdall.vault.database import DEFAULT_DB_PATH, init_db
+from heimdall.vault.database import DEFAULT_DB_PATH, init_db, resolve_db_path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -33,7 +33,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        init_db(args.db_path)
+        resolved = resolve_db_path(args.db_path)
+        if resolved == ":memory:":
+            print(
+                "Erreur : le mode ':memory:' est réservé aux tests via API et est interdit en CLI.",
+                file=sys.stderr,
+            )
+            return 2
+        init_db(resolved)
         print("Base de données SQLite du Vault initialisée avec succès.")
         return 0
     except Exception as exc:

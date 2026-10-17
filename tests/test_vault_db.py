@@ -428,7 +428,14 @@ class VaultDatabaseTests(unittest.TestCase):
 
             # Validation applicative runtime en tête de fonction : lève ValueError
             with self.assertRaises(ValueError):
-                create_secret(conn, "proj_stat", "dev", "SEC_BAD", "b", status="invalid_status")  # type: ignore[arg-type]
+                create_secret(
+                    conn,
+                    "proj_stat",
+                    "dev",
+                    "SEC_BAD",
+                    "b",
+                    status="invalid_status",  # type: ignore[arg-type]
+                )
 
     def test_status_check_constraint_on_update(self) -> None:
         """14 — update_secret avec un statut invalide lève ValueError applicativement."""
@@ -960,6 +967,48 @@ class VaultDatabaseTests(unittest.TestCase):
         output_v = stderr_buf_v.getvalue()
         self.assertIn("Erreur : échec de l'initialisation", output_v)
         self.assertIn("Détail :", output_v)
+
+    def test_init_db_cli_rejects_memory_mode(self) -> None:
+        """CLI — init_db refuse le mode ':memory:' et retourne un code de sortie non nul (2)."""
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            code = init_db_main(["--db-path", ":memory:"])
+        self.assertEqual(code, 2)
+        self.assertIn("Erreur : le mode ':memory:' est réservé aux tests", stderr_buf.getvalue())
+
+        stderr_buf_env = io.StringIO()
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": ":memory:"}):
+            with redirect_stderr(stderr_buf_env):
+                code_env = init_db_main([])
+        self.assertEqual(code_env, 2)
+        self.assertIn(
+            "Erreur : le mode ':memory:' est réservé aux tests",
+            stderr_buf_env.getvalue(),
+        )
+
+    def test_symlink_defense_with_dotdot_normalization(self) -> None:
+        """TOCTOU — Normalisation lexicale et rejet de symlink sur chemin avec '..'."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        base = Path(self.temp_dir.name)
+        real_dir = base / "real_dir"
+        real_dir.mkdir()
+        symlink_dir = base / "sym_dir"
+        symlink_dir.symlink_to(real_dir)
+
+        # 1. Chemin contenant '..' traversant un lien symbolique
+        traversed_symlink = symlink_dir / ".." / "real_dir" / "vault.db"
+        with self.assertRaises(PermissionError):
+            get_connection(traversed_symlink)
+
+        # 2. Chemin contenant '..' valide sans aucun lien symbolique
+        valid_dotdot = real_dir / ".." / "real_dir" / "valid_vault.db"
+        conn = get_connection(valid_dotdot)
+        try:
+            cursor = conn.execute("SELECT 1;")
+            self.assertEqual(cursor.fetchone()[0], 1)
+        finally:
+            conn.close()
 
     # -----------------------------------------------------------------------
     # SecretStatus type alias
