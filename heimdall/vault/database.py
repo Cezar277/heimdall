@@ -136,6 +136,11 @@ def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
     interprétés relativement au répertoire de travail courant (CWD / `Path.cwd()`).
     Pour éviter tout cloisonnement silencieux entre deux processus ayant des CWD
     distincts, privilégier des chemins absolus (ou ':memory:' en test).
+
+    Mode en mémoire ':memory:' :
+    Le mode ':memory:' est réservé aux tests unitaires. Chaque appel à
+    get_connection(':memory:') ouvre une base de données en mémoire vierge et isolée.
+    Initialiser le schéma via init_db(':memory:') sur la connexion avant toute requête.
     """
     if db_path is not None:
         validated = validate_db_path(db_path)
@@ -215,8 +220,9 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
 
     - Refuse les symlinks (TOCTOU) sur le fichier et tous ses répertoires ancêtres.
     - Refuse les chemins pointant vers des répertoires existants.
-    - Crée le répertoire parent avec umask 0o077 (droits 0o700).
-    - Durcit à 0o700 un répertoire parent pré-existant (POSIX uniquement).
+    - Crée les répertoires ancêtres manquants avec umask 0o077 (droits 0o700).
+    - Préserve intacts les répertoires pré-existants (ex: CWD '.', /tmp) sans les modifier
+      (confiance opérateur, évite tout effet de bord destructeur ou DoS).
     - Re-vérifie les symlinks après mkdir (fermeture de la fenêtre TOCTOU).
     - Crée le fichier avec mode 0o600 si inexistant.
     - Vérifie et confirme les permissions après création (fail-closed).
@@ -232,25 +238,22 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
             "Chemin de base de données invalide : pointe vers un répertoire existant"
         )
 
+    # Identifier les répertoires ancêtres inexistants avant mkdir
+    missing_parents = [parent for parent in path.parents if not parent.exists()]
+
     old_umask = os.umask(0o077)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Durcir le répertoire parent s'il était pré-existant en mode permissif (POSIX).
+        # Durcir uniquement les répertoires effectivement créés par mkdir (POSIX).
+        # Les répertoires pré-existants (ex: CWD '.', /tmp) relèvent de la confiance
+        # opérateur et ne sont jamais modifiés pour éviter tout effet de bord destructeur.
         if os.name != "nt":
-            parent_mode = path.parent.stat().st_mode & 0o777
-            if parent_mode & 0o077:
-                logger.debug(
-                    "Répertoire parent pré-existant trop permissif (%s) : resserrement à 0o700",
-                    oct(parent_mode),
-                )
-                try:
-                    path.parent.chmod(0o700)
-                except OSError as exc:
-                    logger.debug(
-                        "Impossible de resserrer les permissions du répertoire parent %s : %s",
-                        path.parent,
-                        exc,
-                    )
+            for new_dir in missing_parents:
+                if new_dir.exists():
+                    try:
+                        new_dir.chmod(0o700)
+                    except OSError as exc:
+                        logger.debug("Échec du chmod 0o700 sur %s : %s", new_dir, exc)
         # Re-vérification après mkdir (fermeture de la fenêtre TOCTOU)
         _assert_not_symlink(path)
         if not path.exists():
@@ -272,6 +275,11 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     """Ouvre une connexion SQLite sécurisée avec foreign keys activées et row_factory.
 
     Active systématiquement `PRAGMA foreign_keys = ON;` (invariant de sécurité).
+
+    Mode en mémoire ':memory:' :
+    Lorsque db_path=':memory:', une nouvelle base SQLite vierge en mémoire est ouverte.
+    Chaque appel produit une base isolée sans tables ; appeler init_db() sur la connexion
+    ou privilégier une base sur fichier temporaire en test d'intégration.
     """
     resolved = resolve_db_path(db_path)
     if isinstance(resolved, Path):

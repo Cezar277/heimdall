@@ -192,19 +192,58 @@ class VaultDatabaseTests(unittest.TestCase):
         with self.assertRaises(IsADirectoryError):
             get_connection(existing_dir)
 
-    def test_preexisting_permissive_parent_dir_is_hardened(self) -> None:
-        """Remarque 2 — Un répertoire parent pré-existant en 0755 est resserré à 0o700."""
+    def test_preexisting_parent_dir_is_never_modified(self) -> None:
+        """Remarque 1 (MEDIUM) — Un répertoire parent pré-existant (0755, CWD, /tmp)
+        n'est jamais chmod par init_db / _open_db_file."""
         if os.name == "nt":
             self.skipTest("Test POSIX uniquement")
-        parent_dir = Path(self.temp_dir.name) / "shared_parent"
+        # 1. Parent pré-existant en 0755
+        parent_dir = Path(self.temp_dir.name) / "preexisting_parent"
         parent_dir.mkdir(mode=0o755)
-        db_in_permissive_parent = parent_dir / "vault.db"
-        init_db(db_in_permissive_parent)
-        parent_mode = parent_dir.stat().st_mode & 0o777
+        parent_dir.chmod(0o755)
+        initial_mode = parent_dir.stat().st_mode & 0o777
+
+        db_path = parent_dir / "vault.db"
+        init_db(db_path)
+        after_mode = parent_dir.stat().st_mode & 0o777
         self.assertEqual(
-            parent_mode,
+            after_mode,
+            initial_mode,
+            "Le parent pré-existant ne doit jamais voir ses permissions altérées par init_db",
+        )
+
+        # 2. Cas du CWD (parent == Path("."))
+        current_cwd = Path.cwd()
+        cwd_dir = Path(self.temp_dir.name) / "test_cwd"
+        cwd_dir.mkdir(mode=0o755)
+        cwd_dir.chmod(0o755)
+        initial_cwd_mode = cwd_dir.stat().st_mode & 0o777
+        try:
+            os.chdir(cwd_dir)
+            init_db(Path("vault.db"))
+            after_cwd_mode = cwd_dir.stat().st_mode & 0o777
+            self.assertEqual(
+                after_cwd_mode,
+                initial_cwd_mode,
+                "Le CWD (Path('.')) ne doit jamais être altéré",
+            )
+        finally:
+            os.chdir(current_cwd)
+
+        # 3. Répertoire ancêtre effectivement créé par _open_db_file
+        nested_dir = Path(self.temp_dir.name) / "created_parent"
+        nested_db = nested_dir / "vault.db"
+        self.assertFalse(nested_dir.exists())
+        init_db(nested_db)
+        self.assertTrue(nested_dir.exists())
+        created_mode = nested_dir.stat().st_mode & 0o777
+        self.assertEqual(
+            created_mode,
             0o700,
-            f"Répertoire parent doit être 0o700 après durcissement, obtenu {oct(parent_mode)}",
+            (
+                "Les répertoires créés par l'application doivent être 0o700, "
+                f"obtenu {oct(created_mode)}"
+            ),
         )
 
     def test_umask_restored_after_exception_in_open_db_file(self) -> None:
@@ -288,6 +327,10 @@ class VaultDatabaseTests(unittest.TestCase):
                 f"Permissions du fichier -journal permissives : {oct(mode)}, attendu 0o600",
             )
             conn.commit()
+            self.assertFalse(
+                journal_path.exists(),
+                "Le fichier -journal doit être supprimé après commit (journal_mode=DELETE)",
+            )
         finally:
             conn.close()
 
@@ -820,6 +863,20 @@ class VaultDatabaseTests(unittest.TestCase):
         abs_cwd2 = (cwd2 / resolved).resolve()
         self.assertNotEqual(abs_cwd1, abs_cwd2)
         self.assertEqual(abs_cwd1.name, abs_cwd2.name)
+
+        # Vérification opérationnelle : initialisation relative dans deux CWD distincts
+        current_cwd = Path.cwd()
+        try:
+            os.chdir(cwd1)
+            init_db(rel_path)
+            self.assertTrue((cwd1 / rel_path).exists())
+            self.assertFalse((cwd2 / rel_path).exists())
+
+            os.chdir(cwd2)
+            init_db(rel_path)
+            self.assertTrue((cwd2 / rel_path).exists())
+        finally:
+            os.chdir(current_cwd)
 
     def test_windows_warning_on_apply_secure_permissions(self) -> None:
         """_apply_secure_permissions émet un RuntimeWarning sous Windows (remarque 4)."""
