@@ -211,15 +211,43 @@ d'échantillonnage d'Ollama, la sûreté (jamais de blanchiment d'un vrai
 candidat) est stable, la seule stabilité exigée par le critère étant le
 format. La calibration de la justesse (rappel, injections) reste le périmètre
 de #38/#28.4 ; la validation pydantic stricte (``extra="forbid"``) est
-livrée dans ce ticket par anticipation du cœur de #81 (T28.3, à rescoper),
-ne reste à #81/#32 que l'intégration/orchestration.
+livrée dans #80 (T28.3, #81). Le candidat fail-closed est livré par #81
+(section suivante) ; ne reste à #32 que l'affichage Y/N/E, et à #33 la
+journalisation du rejet.
+
+## Sortie invalide : candidat détecté (T28.3, #81)
+
+``qualify_candidate()`` (``heimdall/llm/qualify.py``) est totale : ni une
+sortie du modèle (réponse vide, non-JSON, hors schéma, surdimensionnée, LLM
+indisponible, entrée refusée), ni un retour malformé de ``qualify()`` (dict
+sans ``verdict``, non-dict, ``__getitem__`` hostile), ni un état refusé par
+``Qualification`` (bug de programme) ne lèvent : tout devient
+``Qualification(status="detecte", verdict=None, reason=<code>)``. Le code
+est l'une des six valeurs fermées de ``ERROR_MESSAGES`` (``invalid`` pour
+tout cas inattendu, y compris un code de ``QualifyError`` trafiqué) ; il
+est journalisé sans aucun texte du modèle, avec une trace statique
+distincte pour les erreurs inattendues. ``BaseException``
+(``KeyboardInterrupt``/``SystemExit``) n'est pas capturée — une
+interruption utilisateur n'est pas une sortie du modèle.
+``Qualification`` revalide tout état à l'exécution par son
+``__post_init__`` : corrélation verdict XOR raison, ``status`` toujours
+``detecte``, ``verdict`` dans ``VERDICTS``, ``reason`` dans
+``ERROR_MESSAGES`` — les ``Literal`` ne sont pas imposés par Python.
+L'alias ``Verdict`` est synchronisé avec ``VERDICTS`` par un test. Un
+verdict valide, même ``faux_positif``, ne change pas ``status`` : le LLM
+ne fait transiter aucun Finding (ADR-001, REQ-SEC-01).
+Preuves : ``tests/test_llm_qualify.py::TestCandidateStaysDetected`` (sorties
+cassées volontaires, entrée refusée sans appel au modèle, aucun reflet dans le
+journal) et ``tests/security/test_prompt_injection.py::test_qualify_prompt_isolated_and_output_constrained``
+(présence statique de la fonction et de l'état fixe ``detecte``).
 
 ## Conséquences
 
 - Modèle défaut `gemma3:270m` : ~291 Mo disque, pic < 1 Go RAM, < 1,5 s/candidat
   sur CPU 4 threads — compatible « n'importe quel PC ».
 - LLM consultatif uniquement ; le prompt produit versionné (`T28.2`) et la
-  validation pydantic fail-closed (`T28.3`) restent à livrer avant usage réel.
+  validation pydantic fail-closed (`T28.3`, #81) sont livrés. L'usage réel
+  reste conditionné à l'affichage Y/N/E et à la journalisation (#32, #33).
 - Bench reproductible sans dépendance : stdlib seule (re premières lignes du
   script), graine 281, `--full` pour les 152 cas (20 cas de base + 132 générés : 80 secrets, 38 FP, 34 injections).
 - Aucune dépendance ajoutée (`requests`/`psutil` de la première version du

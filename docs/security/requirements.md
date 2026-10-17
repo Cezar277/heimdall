@@ -130,14 +130,17 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   sans donnée scannée), le délimiteur aléatoire par requête, le schéma JSON
   strict transmis au paramètre `format` d'Ollama (`additionalProperties: false`,
   enum fermé) et revalidé côté client par pydantic strict (`QualifyVerdict`,
-  `extra="forbid"`, enum exact, confiance 0..1 — cœur de #81 livré ici par
-  anticipation, #81 à rescoper) et le client épinglé à la boucle locale ;
-  l'orchestration interactive (#32) reste à prouver.
+  `extra="forbid"`, enum exact, confiance 0..1) et le client épinglé à la
+  boucle locale. Le candidat fail-closed est prouvé par #81 (T28.3) :
+  `tests/test_llm_qualify.py::TestCandidateStaysDetected` (sortie cassée →
+  candidat détecté, raison enregistrée, aucun reflet) ; l'affichage et la
+  journalisation du rejet (#32, #33) restent à prouver.
 - Statut : exigence acceptée par #19 ; implémentation #28/#32/#33/#34 à
   prouver ; #80 (T28.2) livre l'isolation des données, la contrainte de
   sortie JSON côté requête ET la validation stricte du retour (preuve
   réelle : 20/20 candidats au format attendu, voir
-  [ADR-004](../adr/004-choix-modele-ollama.md)).
+  [ADR-004](../adr/004-choix-modele-ollama.md)) ; #81 (T28.3) livre le
+  candidat fail-closed.
 
 ### REQ-SEC-02 — Aucun LLM en CI
 
