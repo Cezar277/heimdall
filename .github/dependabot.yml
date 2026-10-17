@@ -1,0 +1,19 @@
+# Dependabot (#20) : suivi hebdomadaire des dépendances Python et des actions.
+# Les alertes et correctifs de sécurité s'activent en plus dans
+# Settings > Code security (non versionnable).
+# Un bump pip modifie les `==` de pyproject.toml et exige de régénérer
+# requirements.lock (ADR-002) : la PR Dependabot ne le fait pas, la relecture
+# doit le vérifier.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
