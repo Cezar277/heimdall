@@ -3,15 +3,22 @@
 Les sockets Python sont interceptées avant l'appel système. Ce garde teste les
 chemins applicatifs courants, mais ne remplace pas le contrôle OS ``strace`` ;
 les sockets AF_UNIX restent une exception locale documentée.
+
+Les alias ``from socket import getaddrinfo`` restent patchés : un import lie le
+nom au **module** `socket`, et le nom est relu à chaque appel — vérifié par
+``test_guard_blocks_dns_through_import_alias``. Les extensions natives ou les
+appels syscalls directs hors wrappers Python restent couverts par la trace OS.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import socket
+import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
+from unittest import mock
 
 import pytest
 from typer.testing import CliRunner
@@ -63,6 +70,9 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
     original_sendall = socket.socket.sendall
     original_sendto = socket.socket.sendto
     original_sendmsg = getattr(socket.socket, "sendmsg", None)
+    original_sendfile = getattr(socket.socket, "sendfile", None)
+    original_ssl_send = ssl.SSLSocket.send
+    original_ssl_sendall = ssl.SSLSocket.sendall
     original_getaddrinfo = socket.getaddrinfo
     original_gethostbyname = socket.gethostbyname
     original_gethostbyname_ex = socket.gethostbyname_ex
@@ -99,11 +109,20 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
             ledger.attempts.append(NetworkAttempt(sock.family, "<IPC AF_UNIX>", False))
             return
         allowed = sock in ledger.connected_loopback
-        ledger.attempts.append(
-            NetworkAttempt(sock.family, "<socket connectée>", not allowed)
-        )
+        ledger.attempts.append(NetworkAttempt(sock.family, "<socket connectée>", not allowed))
         if not allowed:
             raise AssertionError("envoi réseau interdit : socket non épinglée au loopback")
+
+    def check_sendfile_file(sock: socket.socket, file: object) -> None:
+        """Vérifie la socket puis exige un vrai fichier source.
+
+        `sendfile` n'exporte que le contenu d'un fichier : un objet sans
+        ``fileno`` est une erreur locale, pas une tentative réseau — on ne
+        journalise pas de faux refus.
+        """
+        check_connected_socket(sock)
+        if not hasattr(file, "fileno"):
+            raise TypeError("sendfile attend un fichier")
 
     def guarded_connect(sock: socket.socket, address: Any) -> None:
         check_destination(sock, address)
@@ -147,6 +166,23 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
             raise AssertionError("sendmsg indisponible sur cette plateforme")
         return cast(int, original_sendmsg(sock, *args, **kwargs))
 
+    def guarded_sendfile(sock: socket.socket, file: Any, *args: Any, **kwargs: Any) -> int:
+        # Zéro-copie (os.sendfile) : ne passe ni par send ni par sendall.
+        check_sendfile_file(sock, file)
+        if original_sendfile is None:
+            raise AssertionError("sendfile indisponible sur cette plateforme")
+        return cast(int, original_sendfile(sock, file, *args, **kwargs))
+
+    def guarded_ssl_send(sock: ssl.SSLSocket, *args: Any, **kwargs: Any) -> int:
+        # SSLSocket.write passe par _sslobj : sans ce patch, un send TLS ne
+        # traverserait pas socket.socket.send gardé.
+        check_connected_socket(sock)
+        return original_ssl_send(sock, *args, **kwargs)
+
+    def guarded_ssl_sendall(sock: ssl.SSLSocket, *args: Any, **kwargs: Any) -> None:
+        check_connected_socket(sock)
+        original_ssl_sendall(sock, *args, **kwargs)
+
     def guarded_getaddrinfo(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
         if host is not None:
             check_resolver_host(host)
@@ -182,6 +218,10 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
     monkeypatch.setattr(socket.socket, "sendto", guarded_sendto)
     if original_sendmsg is not None:
         monkeypatch.setattr(socket.socket, "sendmsg", guarded_sendmsg)
+    if original_sendfile is not None:
+        monkeypatch.setattr(socket.socket, "sendfile", guarded_sendfile)
+    monkeypatch.setattr(ssl.SSLSocket, "send", guarded_ssl_send)
+    monkeypatch.setattr(ssl.SSLSocket, "sendall", guarded_ssl_sendall)
     monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
     monkeypatch.setattr(socket, "gethostbyname", guarded_gethostbyname)
     monkeypatch.setattr(socket, "gethostbyname_ex", guarded_gethostbyname_ex)
@@ -226,9 +266,7 @@ def test_guard_records_and_blocks_external_connect(
 
 
 @pytest.mark.parametrize("method", ["send", "sendall", "sendto", "sendmsg"])
-def test_guard_blocks_payload_on_unpinned_socket(
-    loopback_only: NetworkLedger, method: str
-) -> None:
+def test_guard_blocks_payload_on_unpinned_socket(loopback_only: NetworkLedger, method: str) -> None:
     if method == "sendmsg" and not hasattr(socket.socket, "sendmsg"):
         pytest.skip("sendmsg indisponible sur cette plateforme")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -252,14 +290,8 @@ def test_guard_allows_and_tracks_loopback_tcp(loopback_only: NetworkLedger) -> N
                 client.sendall(b"loopback")
                 assert peer.recv(8) == b"loopback"
     assert loopback_only.blocked == []
-    assert all(
-        not attempt.blocked
-        for attempt in loopback_only.attempts
-    )
     destinations = [
-        attempt
-        for attempt in loopback_only.attempts
-        if isinstance(attempt.destination, tuple)
+        attempt for attempt in loopback_only.attempts if isinstance(attempt.destination, tuple)
     ]
     assert destinations
     assert all(
@@ -298,6 +330,46 @@ def test_guard_blocks_and_records_dns_attempts(
 def test_guard_blocks_reverse_name_lookup(loopback_only: NetworkLedger) -> None:
     with pytest.raises(AssertionError, match="résolution DNS inverse interdite"):
         socket.getnameinfo(("203.0.113.7", 443), 0)
+    assert len(loopback_only.blocked) == 1
+
+
+def test_guard_blocks_sendfile_on_unpinned_socket(
+    loopback_only: NetworkLedger, tmp_path: Path
+) -> None:
+    """Le chemin zéro-copie (os.sendfile) est gardé comme send/sendall."""
+    if not hasattr(socket.socket, "sendfile"):
+        pytest.skip("sendfile indisponible sur cette plateforme")
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"synthetic payload")
+    with source.open("rb") as handle, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        with pytest.raises(AssertionError, match="socket non épinglée"):
+            sock.sendfile(handle)
+    assert len(loopback_only.blocked) == 1
+
+
+def test_guard_blocks_ssl_send_on_unpinned_socket(loopback_only: NetworkLedger) -> None:
+    """SSLSocket.send ne peut pas contourner le garde par _sslobj.
+
+    Un vrai SSLSocket exige une poignée de main TLS : on le simule par un mock
+    marqué ``spec=socket.socket``, qui passe le contrôle de type du garde et
+    échouerait ensuite sur ``_sslobj`` — l'``AssertionError`` du garde arrive
+    donc bien avant tout écrit TLS.
+    """
+    fake = mock.Mock(spec=socket.socket)
+    fake.family = socket.AF_INET
+    with pytest.raises(AssertionError, match="socket non épinglée"):
+        ssl.SSLSocket.send(fake, b"synthetic probe")
+    with pytest.raises(AssertionError, match="socket non épinglée"):
+        ssl.SSLSocket.sendall(fake, b"synthetic probe")
+    assert len(loopback_only.blocked) == 2
+
+
+def test_guard_blocks_dns_through_import_alias(loopback_only: NetworkLedger) -> None:
+    """Un alias importé reste patché : l'import lie le module, pas la valeur."""
+    from socket import getaddrinfo  # noqa: PLC0415 - l'alias est le sujet du test
+
+    with pytest.raises(AssertionError, match="résolution réseau interdite"):
+        getaddrinfo("evil.example", 443)
     assert len(loopback_only.blocked) == 1
 
 

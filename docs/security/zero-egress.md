@@ -3,19 +3,27 @@
 ## Contrôle automatisé
 
 `tests/test_network_isolation.py` intercepte `connect`, `connect_ex`,
-`send`, `sendall`, `sendto`, `sendmsg`, `getaddrinfo`, `gethostbyname`,
-`gethostbyname_ex`, `gethostbyaddr` et `getnameinfo`. Le journal du garde
-enregistre aussi les tentatives refusées : les avaler dans une exception
-n'empêche pas le test de les détecter. Le test lance `heimdall scan --ci` dans
-le processus pytest et vérifie l'absence de tentative Internet. L'API Python
-standard n'expose pas `sendmmsg` ; les extensions natives qui appelleraient
-directement des syscalls contournent les wrappers et relèvent de la trace OS.
+`send`, `sendall`, `sendto`, `sendmsg`, `sendfile` (zéro-copie `os.sendfile`),
+`ssl.SSLSocket.send` / `sendall` (qui écrivent via `_sslobj` sans passer par
+`socket.socket.send`), `getaddrinfo`, `gethostbyname`, `gethostbyname_ex`,
+`gethostbyaddr` et `getnameinfo`. Le journal du garde enregistre aussi les
+tentatives refusées : les avaler dans une exception n'empêche pas le test de
+les détecter. Le test lance `heimdall scan --ci` dans le processus pytest et
+vérifie l'absence de tentative Internet.
+
+Les alias `from socket import getaddrinfo` restent patchés : l'import lie le nom
+au module `socket`, et le nom est relu à chaque appel — verrouillé par
+`test_guard_blocks_dns_through_import_alias`. L'API Python standard n'expose pas
+`sendmmsg` ; les extensions natives qui appelleraient directement des syscalls
+contournent les wrappers et relèvent de la trace OS.
 
 Limites explicites : les sockets `AF_UNIX` sont permises comme IPC local et
-pourraient théoriquement servir de relais via un autre processus ; les appels
-réseau effectués directement par une extension native contournent les wrappers
-Python. Ce garde n'est donc pas un pare-feu. La trace système ci-dessous est
-nécessaire en complément.
+pourraient théoriquement servir de relais via un autre processus ; les
+extensions natives qui appellent directement les syscalls réseau (sans passer
+par les méthodes Python) contournent les wrappers ; un module qui capture la
+**valeur** d'une fonction avant le patch (par ex. une valeur par défaut liée à
+l'import) n'est pas couvert. Ce garde n'est donc pas un pare-feu : la trace
+système ci-dessous est nécessaire en complément.
 
 Commande :
 
@@ -26,36 +34,46 @@ Commande :
 Résultat observé le 17/10/2026 :
 
 ```text
-.................                                                        [100%]
+....................                                                     [100%]
 ```
 
-Suite complète avec la couverture CI : **700 passed**, 3 831 sous-tests,
+Suite complète avec la couverture CI : **703 passed**, 3 831 sous-tests,
 couverture Heimdall **99,48 %** (seuil CI : 85 %).
 
 ## Observation système
 
-Commande exécutée depuis la racine du dépôt (trace des syscalls réseau, y
-compris `sendto`/`sendmsg`, et pas seulement `connect`) :
+Commande exécutée depuis la racine du dépôt le **2026-10-17 à 20:28:45 +02:00**
+(trace des syscalls réseau, y compris `sendto`/`sendmsg`, et pas seulement
+`connect` ; `-yy` affiche les chemins de binaires, `-ttt` les horodatages,
+`-s 256` la taille des chaînes) :
 
 ```sh
-strace -f -e trace=%network -o docs/security/zero-egress.strace \
+strace -f -yy -ttt -s 256 -e trace=%network -o docs/security/zero-egress.strace \
   .venv/bin/heimdall scan --ci .
 ```
 
-Sortie observée :
+Sortie observée (stdout du scan, code de sortie 2) :
 
 ```text
 heimdall scan: scanner non implémenté (voir #22) — refus par défaut.
-+++ exited with 2 +++
+exit=2
 ```
 
 La trace complète archivée est
-[`zero-egress.strace`](zero-egress.strace) : elle ne contient aucun syscall
-réseau, uniquement la terminaison `exited with 2`. La sortie standard est
-`heimdall scan: scanner non implémenté (voir #22) — refus par défaut.` Le code 2
-est le refus fail-closed attendu, pas un scan réussi. `unshare --net` a aussi
-été essayé pour couper le réseau au niveau du namespace, mais l'environnement
-refuse cette opération (`Operation not permitted`).
+[`zero-egress.strace`](zero-egress.strace) — SHA-256
+`b2a1790bac7f31584beaed89ef4288f5141145bd2c828d3adff2ae30666634c5`.
+Son unique ligne est `303358 1792261725.646307 +++ exited with 2 +++` : PID
+`303358`, horodatage Unix `1792261725.646307` (= 2026-10-17 20:28:45 +02:00)
+et terminaison du scan. **Aucun syscall réseau n'est tracé** entre le `execve`
+du processus et cette sortie (un seul processus, pas de fork). L'empreinte
+permet de vérifier que le fichier n'a pas été modifié après coup ; elle ne
+remplace pas un artefact CI signé (piste de durcissement hors périmètre #82).
+
+La sortie standard du scan est `heimdall scan: scanner non implémenté (voir
+#22) — refus par défaut.` Le code 2 est le refus fail-closed attendu, pas un
+scan réussi. `unshare --net` a aussi été essayé pour couper le réseau au niveau
+du namespace, mais l'environnement refuse cette opération (`Operation not
+permitted`).
 
 ## Limite de la preuve et suite requise
 
