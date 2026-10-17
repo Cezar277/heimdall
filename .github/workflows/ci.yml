@@ -3,14 +3,18 @@ name: CI Security & Quality
 # Ce workflow ne tourne volontairement PAS à chaque push de branche (#20) :
 # quota GitHub contenu et bruit évité. Trois déclencheurs seulement :
 #   1. pull_request_review : la CI démarre quand un relecteur approuve la PR
-#      (`review.state == 'approved'`). GitHub exécute alors le workflow sur la
-#      ref de merge `refs/pull/<n>/merge` : le statut s'attache à la PR et la
-#      protection de `main` peut l'exiger.
+#      (`review.state == 'approved'`) et qu'il est collaborateur de confiance
+#      (garde author_association plus bas, même liste qu'opencode-review).
+#      GitHub exécute alors le workflow sur la ref de merge
+#      `refs/pull/<n>/merge` : le statut s'attache à la PR et la protection
+#      de `main` peut l'exiger.
 #   2. push sur `main` : preuve « pipeline vert sur main » (le merge est déjà
 #      conditionné à une approbation).
-#   3. workflow_dispatch : commande spéciale (Actions > Run workflow).
-# Un nouveau commit poussé après approbation exige une nouvelle approbation
-# (ou un dispatch manuel) pour relancer la CI : comportement voulu.
+#   3. workflow_dispatch : commande spéciale (Actions > Run workflow ; le
+#      bouton n'apparaît qu'une fois le workflow présent sur `main`).
+# Un nouveau commit poussé après approbation (y compris « Update branch »)
+# exige une nouvelle approbation : comportement voulu (le dispatch manuel
+# relance la CI à la demande, par exemple pour déboguer).
 on:
   pull_request_review:
     types: [submitted]
@@ -32,7 +36,13 @@ jobs:
     # Runner self-hosted, comme les autres workflows : 0 minute GitHub.
     runs-on: self-hosted
     timeout-minutes: 20
-    if: ${{ github.event_name != 'pull_request_review' || github.event.review.state == 'approved' }}
+    # Seules les approbations d'un collaborateur de confiance déclenchent la
+    # CI (garde author_association, même liste que le workflow opencode-review) :
+    # un compte externe ne peut pas faire tourner du code sur le runner.
+    if: >-
+      github.event_name != 'pull_request_review' ||
+      (github.event.review.state == 'approved' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association))
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
