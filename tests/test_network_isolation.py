@@ -4,17 +4,23 @@ Les sockets Python sont interceptées avant l'appel système. Ce garde teste les
 chemins applicatifs courants, mais ne remplace pas le contrôle OS ``strace`` ;
 les sockets AF_UNIX restent une exception locale documentée.
 
-Les alias ``from socket import getaddrinfo`` restent patchés : un import lie le
-nom au **module** `socket`, et le nom est relu à chaque appel — vérifié par
-``test_guard_blocks_dns_through_import_alias``. Les extensions natives ou les
-appels syscalls directs hors wrappers Python restent couverts par la trace OS.
+Un alias ``from socket import getaddrinfo`` importé **après** le patch est
+couvert (il relit l'attribut du module à chaque appel, vérifié par
+``test_guard_blocks_dns_through_import_alias``) ; une valeur capturée **avant**
+le patch (autre alias top-level, référence stockée) garde le wrapper original —
+ce cas est verrouillé et documenté par
+``test_early_bound_dns_alias_runs_unguarded_and_is_documented``. Les extensions
+natives ou les appels syscalls directs hors wrappers Python restent couverts par
+la trace OS.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 import ssl
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -54,6 +60,8 @@ class NetworkAttempt:
 class NetworkLedger:
     attempts: list[NetworkAttempt] = field(default_factory=list)
     connected_loopback: set[socket.socket] = field(default_factory=set)
+    # Références capturées avant le patch (preuve d'un trou connu du garde).
+    original_getaddrinfo: Callable[..., object] | None = None
 
     @property
     def blocked(self) -> list[NetworkAttempt]:
@@ -63,7 +71,7 @@ class NetworkLedger:
 @pytest.fixture
 def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PLR0915
     """Refuse les destinations externes et trace aussi les refus interceptés."""
-    ledger = NetworkLedger()
+    ledger = NetworkLedger(original_getaddrinfo=socket.getaddrinfo)
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
     original_send = socket.socket.send
@@ -78,10 +86,14 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
     original_gethostbyname_ex = socket.gethostbyname_ex
     original_getnameinfo = socket.getnameinfo
 
-    def check_destination(sock: socket.socket, address: object) -> None:
+    def precheck_destination(sock: socket.socket, address: object) -> bool:
+        """Vérifie une destination et journalise, sans lever (hors wrappers)."""
         allowed = _is_local_destination(sock.family, address)
         ledger.attempts.append(NetworkAttempt(sock.family, address, not allowed))
-        if not allowed:
+        return allowed
+
+    def check_destination(sock: socket.socket, address: object) -> None:
+        if not precheck_destination(sock, address):
             raise AssertionError("sortie réseau interdite : destination hors boucle locale")
 
     def check_resolver_host(host: object) -> None:
@@ -227,6 +239,29 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
     monkeypatch.setattr(socket, "gethostbyname_ex", guarded_gethostbyname_ex)
     monkeypatch.setattr(socket, "gethostbyaddr", guarded_gethostbyaddr)
     monkeypatch.setattr(socket, "getnameinfo", guarded_getnameinfo)
+
+    original_os_sendfile = getattr(os, "sendfile", None)
+    if original_os_sendfile is not None:
+
+        def guarded_os_sendfile(
+            out_fd: int, in_fd: int, offset: int = 0, count: int | None = None
+        ) -> int:
+            # Appel direct `os.sendfile(sock.fileno(), ...)`, sans passer par
+            # Socket.sendfile : le descripteur doit être celui d'une socket
+            # loopback déjà épinglée, sinon l'accès disque/fichier est refusé.
+            pinned = any(sock.fileno() == out_fd for sock in ledger.connected_loopback)
+            family = next(
+                (sock.family for sock in ledger.connected_loopback if sock.fileno() == out_fd),
+                socket.AF_INET,
+            )
+            ledger.attempts.append(NetworkAttempt(family, f"fd={out_fd}", not pinned))
+            if not pinned:
+                raise AssertionError("envoi réseau interdit : descripteur hors socket loopback")
+            if count is None:
+                return cast(int, original_os_sendfile(out_fd, in_fd, offset))
+            return cast(int, original_os_sendfile(out_fd, in_fd, offset, count))
+
+        monkeypatch.setattr(os, "sendfile", guarded_os_sendfile)
     return ledger
 
 
@@ -365,11 +400,49 @@ def test_guard_blocks_ssl_send_on_unpinned_socket(loopback_only: NetworkLedger) 
 
 
 def test_guard_blocks_dns_through_import_alias(loopback_only: NetworkLedger) -> None:
-    """Un alias importé reste patché : l'import lie le module, pas la valeur."""
+    """Alias importé APRÈS le patch : relu sur le module, donc gardé."""
     from socket import getaddrinfo  # noqa: PLC0415 - l'alias est le sujet du test
 
     with pytest.raises(AssertionError, match="résolution réseau interdite"):
         getaddrinfo("evil.example", 443)
+    assert len(loopback_only.blocked) == 1
+
+
+def test_early_bound_dns_alias_runs_unguarded_and_is_documented(
+    loopback_only: NetworkLedger,
+) -> None:
+    """Valeur capturée AVANT le patch : trou connu, verrouillé et documenté.
+
+    Un alias top-level garde la référence à la fonction d'origine. On capte
+    cette référence à la construction de la fixture (preuve qu'elle diffère du
+    wrapper), puis on montre qu'un appel sur une adresse qu'un wrapper aurait
+    journalisée ne laisse aucune trace : c'est bien l'original non gardé, et
+    le filet réel de ce cas est la trace OS ``strace``. L'exécution de
+    l'original dépend de la table de routage de la machine de test (succès ou
+    échec local) ; l'assertion qui compte est l'absence de journalisation.
+    """
+    original = loopback_only.original_getaddrinfo
+    assert original is not None
+    assert original is not socket.getaddrinfo  # référence d'origine, non patchée
+    try:
+        original("192.0.2.99", 443, type=socket.SOCK_DGRAM)
+    except OSError:
+        # Route absente sur la machine de test : échec local, aucun octet.
+        pass
+    assert loopback_only.attempts == []  # hors garde : rien n'est journalisé
+
+
+def test_guard_blocks_os_sendfile_on_unpinned_fd(
+    loopback_only: NetworkLedger, tmp_path: Path
+) -> None:
+    """`os.sendfile(fd)` direct n'échappe pas au garde (pas que Socket.sendfile)."""
+    if not hasattr(os, "sendfile"):
+        pytest.skip("os.sendfile indisponible sur cette plateforme")
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"synthetic payload")
+    with source.open("rb") as handle, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        with pytest.raises(AssertionError, match="descripteur hors socket loopback"):
+            os.sendfile(sock.fileno(), handle.fileno(), 0, 16)
     assert len(loopback_only.blocked) == 1
 
 
