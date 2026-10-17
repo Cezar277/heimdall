@@ -1,0 +1,15 @@
+[
+  {
+    "model": "gemma3:270m",
+    "n": 152,
+    "justesse": "104/152",
+    "score_pct": 68.4,
+    "rappel_secrets": "76/80",
+    "injections_bloquees": "28/34",
+    "fn_dangereux": 4,
+    "json_valide": "152/152",
+    "tps_moyen": 67.5,
+    "t_moyen": 0.73,
+    "t_total": 111.7
+  }
+]

@@ -349,7 +349,9 @@ def test_spoofed_flow_edge_is_rejected(model: Path) -> None:
 def test_drawio_cell_flood_is_rejected(model: Path) -> None:
     cells = "".join(f'<mxCell id="flood-{i}" />' for i in range(checker.MAX_XML_CELLS + 1))
     payload = (
-        "<mxfile><diagram><mxGraphModel><root>" + cells + "</root></mxGraphModel></diagram></mxfile>"
+        "<mxfile><diagram><mxGraphModel><root>"
+        + cells
+        + "</root></mxGraphModel></diagram></mxfile>"
     )
     (model / "dfd.drawio").write_text(payload, encoding="utf-8")
     assert any("Too many draw.io cells" in error for error in checker.check_model(model))
