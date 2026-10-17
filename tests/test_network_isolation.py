@@ -1,16 +1,17 @@
-"""Garde réseau runtime : Heimdall ne se connecte qu'à la boucle locale.
+"""Garde réseau runtime pour ``heimdall scan --ci``.
 
-Ce garde intercepte les sockets Python avant l'appel système. Il complète,
-mais ne remplace pas, une observation OS avec ``strace`` (voir
-``docs/security/zero-egress.md``).
+Les sockets Python sont interceptées avant l'appel système. Ce garde teste les
+chemins applicatifs courants, mais ne remplace pas le contrôle OS ``strace`` ;
+les sockets AF_UNIX restent une exception locale documentée.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import socket
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -19,7 +20,7 @@ from heimdall.cli.main import app
 
 
 def _is_local_destination(family: int, address: object) -> bool:
-    """Autorise les sockets locales et les adresses IP loopback littérales."""
+    """Autorise les sockets AF_UNIX et les adresses IP loopback littérales."""
     if family == socket.AF_UNIX:
         return True
     if family not in (socket.AF_INET, socket.AF_INET6):
@@ -29,80 +30,182 @@ def _is_local_destination(family: int, address: object) -> bool:
     try:
         ip = ipaddress.ip_address(address[0])
     except ValueError:
-        # Refuse les noms d'hôte : leur résolution pourrait sortir sur DNS.
         return False
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         return ip.ipv4_mapped.is_loopback
     return ip.is_loopback
 
 
+@dataclass(frozen=True)
+class NetworkAttempt:
+    family: int
+    destination: object
+    blocked: bool
+
+
+@dataclass
+class NetworkLedger:
+    attempts: list[NetworkAttempt] = field(default_factory=list)
+    connected_loopback: set[socket.socket] = field(default_factory=set)
+
+    @property
+    def blocked(self) -> list[NetworkAttempt]:
+        return [attempt for attempt in self.attempts if attempt.blocked]
+
+
 @pytest.fixture
-def loopback_only(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, object]]:
-    """Interdit les destinations externes avant résolution ou syscall réseau."""
-    attempted: list[tuple[int, object]] = []
+def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PLR0915
+    """Refuse les destinations externes et trace aussi les refus interceptés."""
+    ledger = NetworkLedger()
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
+    original_send = socket.socket.send
+    original_sendall = socket.socket.sendall
     original_sendto = socket.socket.sendto
+    original_sendmsg = getattr(socket.socket, "sendmsg", None)
     original_getaddrinfo = socket.getaddrinfo
+    original_gethostbyname = socket.gethostbyname
+    original_gethostbyname_ex = socket.gethostbyname_ex
+    original_getnameinfo = socket.getnameinfo
 
     def check_destination(sock: socket.socket, address: object) -> None:
-        if not _is_local_destination(sock.family, address):
+        allowed = _is_local_destination(sock.family, address)
+        ledger.attempts.append(NetworkAttempt(sock.family, address, not allowed))
+        if not allowed:
             raise AssertionError("sortie réseau interdite : destination hors boucle locale")
-        if sock.family in (socket.AF_INET, socket.AF_INET6):
-            attempted.append((sock.family, address))
+
+    def check_resolver_host(host: object) -> None:
+        if isinstance(host, str):
+            try:
+                ip = ipaddress.ip_address(host)
+            except ValueError:
+                ledger.attempts.append(NetworkAttempt(socket.AF_INET, host, True))
+                raise AssertionError("résolution réseau interdite : nom d'hôte") from None
+            local = ip.is_loopback or (
+                isinstance(ip, ipaddress.IPv6Address)
+                and ip.ipv4_mapped is not None
+                and ip.ipv4_mapped.is_loopback
+            )
+            family = socket.AF_INET6 if isinstance(ip, ipaddress.IPv6Address) else socket.AF_INET
+            ledger.attempts.append(NetworkAttempt(family, host, not local))
+            if not local:
+                raise AssertionError("résolution réseau interdite : IP hors boucle locale")
+            return
+        ledger.attempts.append(NetworkAttempt(socket.AF_INET, repr(host), True))
+        raise AssertionError("résolution réseau interdite : hôte non textuel")
+
+    def check_connected_socket(sock: socket.socket) -> None:
+        if sock.family == socket.AF_UNIX:
+            ledger.attempts.append(NetworkAttempt(sock.family, "<IPC AF_UNIX>", False))
+            return
+        allowed = sock in ledger.connected_loopback
+        ledger.attempts.append(
+            NetworkAttempt(sock.family, "<socket connectée>", not allowed)
+        )
+        if not allowed:
+            raise AssertionError("envoi réseau interdit : socket non épinglée au loopback")
 
     def guarded_connect(sock: socket.socket, address: Any) -> None:
         check_destination(sock, address)
         original_connect(sock, address)
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            ledger.connected_loopback.add(sock)
 
     def guarded_connect_ex(sock: socket.socket, address: Any) -> int:
         check_destination(sock, address)
-        return original_connect_ex(sock, address)
+        result = original_connect_ex(sock, address)
+        if result == 0 and sock.family in (socket.AF_INET, socket.AF_INET6):
+            ledger.connected_loopback.add(sock)
+        return result
+
+    def guarded_send(sock: socket.socket, *args: Any, **kwargs: Any) -> int:
+        check_connected_socket(sock)
+        return original_send(sock, *args, **kwargs)
+
+    def guarded_sendall(sock: socket.socket, *args: Any, **kwargs: Any) -> None:
+        check_connected_socket(sock)
+        original_sendall(sock, *args, **kwargs)
 
     def guarded_sendto(sock: socket.socket, data: bytes, *args: Any) -> int:
-        # Formes admises : sendto(data, address) et sendto(data, flags, address).
-        if len(args) >= 1 and isinstance(args[-1], (tuple, str, bytes)):
-            check_destination(sock, args[-1])
+        # sendto(data, address), sendto(data, flags, address), ou sans adresse.
+        address = args[-1] if args and isinstance(args[-1], (tuple, str, bytes)) else None
+        if address is None:
+            check_connected_socket(sock)
+        else:
+            check_destination(sock, address)
         return original_sendto(sock, data, *args)
 
+    def guarded_sendmsg(sock: socket.socket, *args: Any, **kwargs: Any) -> int:
+        address = kwargs.get("address")
+        if address is None and len(args) >= 4:
+            address = args[3]
+        if address is None:
+            check_connected_socket(sock)
+        else:
+            check_destination(sock, address)
+        if original_sendmsg is None:
+            raise AssertionError("sendmsg indisponible sur cette plateforme")
+        return cast(int, original_sendmsg(sock, *args, **kwargs))
+
     def guarded_getaddrinfo(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
-        # Refuser les noms avant NSS/DNS : connect() seul arrive trop tard si
-        # un client a déjà résolu le nom via getaddrinfo().
-        if host is None:
-            return original_getaddrinfo(host, port, *args, **kwargs)
-        if not isinstance(host, str):
-            raise AssertionError("résolution réseau interdite : hôte non textuel")
-        try:
-            ip = ipaddress.ip_address(host)
-        except ValueError:
-            raise AssertionError("résolution réseau interdite : nom d'hôte") from None
-        if not ip.is_loopback and not (
-            isinstance(ip, ipaddress.IPv6Address)
-            and ip.ipv4_mapped is not None
-            and ip.ipv4_mapped.is_loopback
-        ):
-            raise AssertionError("résolution réseau interdite : IP hors boucle locale")
+        if host is not None:
+            check_resolver_host(host)
         return original_getaddrinfo(host, port, *args, **kwargs)
+
+    def guarded_gethostbyname(host: Any) -> str:
+        check_resolver_host(host)
+        return original_gethostbyname(host)
+
+    def guarded_gethostbyname_ex(host: Any) -> tuple[str, list[str], list[str]]:
+        check_resolver_host(host)
+        return original_gethostbyname_ex(host)
+
+    def guarded_gethostbyaddr(host: Any) -> tuple[str, list[str], list[str]]:
+        # Même une adresse loopback pourrait déclencher une requête PTR.
+        ledger.attempts.append(NetworkAttempt(socket.AF_INET, repr(host), True))
+        raise AssertionError("résolution DNS inverse interdite")
+
+    def guarded_getnameinfo(sockaddr: Any, flags: int) -> tuple[str, str]:
+        if not flags & socket.NI_NUMERICHOST:
+            ledger.attempts.append(NetworkAttempt(socket.AF_INET, repr(sockaddr), True))
+            raise AssertionError("résolution DNS inverse interdite")
+        if not isinstance(sockaddr, tuple) or not sockaddr:
+            ledger.attempts.append(NetworkAttempt(socket.AF_INET, repr(sockaddr), True))
+            raise AssertionError("adresse de résolution invalide")
+        check_resolver_host(sockaddr[0])
+        return original_getnameinfo(sockaddr, flags)
 
     monkeypatch.setattr(socket.socket, "connect", guarded_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    monkeypatch.setattr(socket.socket, "send", guarded_send)
+    monkeypatch.setattr(socket.socket, "sendall", guarded_sendall)
     monkeypatch.setattr(socket.socket, "sendto", guarded_sendto)
+    if original_sendmsg is not None:
+        monkeypatch.setattr(socket.socket, "sendmsg", guarded_sendmsg)
     monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
-    return attempted
+    monkeypatch.setattr(socket, "gethostbyname", guarded_gethostbyname)
+    monkeypatch.setattr(socket, "gethostbyname_ex", guarded_gethostbyname_ex)
+    monkeypatch.setattr(socket, "gethostbyaddr", guarded_gethostbyaddr)
+    monkeypatch.setattr(socket, "getnameinfo", guarded_getnameinfo)
+    return ledger
 
 
-def test_scan_ci_never_connects_outside_loopback(
-    loopback_only: list[tuple[int, object]], tmp_path: Path
+def test_scan_ci_never_attempts_external_traffic(
+    loopback_only: NetworkLedger, tmp_path: Path
 ) -> None:
-    """La commande scan reste locale, même lorsqu'elle échoue fail-closed."""
+    """Une tentative externe reste visible même si la CLI la capture."""
     result = CliRunner().invoke(app, ["scan", "--ci", str(tmp_path)])
 
-    # Le scanner #22 n'est pas encore livré : son refus code 2 est attendu.
-    # Quand il le sera, un dépôt vide pourra aussi terminer proprement (code 0).
+    # Le scanner #22 n'est pas livré : son refus code 2 est attendu.
     assert result.exit_code in (0, 2), result.output
     if result.exit_code == 2:
         assert "scanner non implémenté (voir #22)" in result.stderr
-    assert all(_is_local_destination(family, address) for family, address in loopback_only)
+    assert loopback_only.blocked == []
+    assert all(
+        not attempt.blocked
+        for attempt in loopback_only.attempts
+        if attempt.family in (socket.AF_INET, socket.AF_INET6)
+    )
 
 
 @pytest.mark.parametrize(
@@ -113,43 +216,94 @@ def test_scan_ci_never_connects_outside_loopback(
         (socket.AF_INET, ("evil.example", 443)),
     ],
 )
-def test_guard_blocks_external_connect(
-    loopback_only: list[tuple[int, object]], family: int, address: object
+def test_guard_records_and_blocks_external_connect(
+    loopback_only: NetworkLedger, family: int, address: object
 ) -> None:
-    """Vérifie que le garde échoue avant tout appel réseau réel."""
     with socket.socket(family, socket.SOCK_STREAM) as sock:
         with pytest.raises(AssertionError, match="destination hors boucle locale"):
             sock.connect(address)  # type: ignore[arg-type]
-    assert loopback_only == []
+    assert len(loopback_only.blocked) == 1
 
 
-def test_guard_blocks_external_udp_send(loopback_only: list[tuple[int, object]]) -> None:
-    """Les datagrammes non connectés sont aussi refusés avant l'appel système."""
+@pytest.mark.parametrize("method", ["send", "sendall", "sendto", "sendmsg"])
+def test_guard_blocks_payload_on_unpinned_socket(
+    loopback_only: NetworkLedger, method: str
+) -> None:
+    if method == "sendmsg" and not hasattr(socket.socket, "sendmsg"):
+        pytest.skip("sendmsg indisponible sur cette plateforme")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        with pytest.raises(AssertionError, match="socket non épinglée"):
+            if method == "sendto":
+                getattr(sock, method)(b"synthetic probe", 0)
+            else:
+                getattr(sock, method)(b"synthetic probe")
+    assert len(loopback_only.blocked) == 1
+
+
+def test_guard_allows_and_tracks_loopback_tcp(loopback_only: NetworkLedger) -> None:
+    """L'Ollama local reste accessible et les envois suivent le connect autorisé."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            client.connect(listener.getsockname())
+            peer, _address = listener.accept()
+            with peer:
+                client.sendall(b"loopback")
+                assert peer.recv(8) == b"loopback"
+    assert loopback_only.blocked == []
+    assert all(
+        not attempt.blocked
+        for attempt in loopback_only.attempts
+    )
+    destinations = [
+        attempt
+        for attempt in loopback_only.attempts
+        if isinstance(attempt.destination, tuple)
+    ]
+    assert destinations
+    assert all(
+        _is_local_destination(attempt.family, attempt.destination) for attempt in destinations
+    )
+
+
+def test_guard_blocks_external_udp_destination(loopback_only: NetworkLedger) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         with pytest.raises(AssertionError, match="destination hors boucle locale"):
             sock.sendto(b"synthetic probe", ("203.0.113.9", 53))
-    assert loopback_only == []
+    assert len(loopback_only.blocked) == 1
 
 
-def test_guard_blocks_external_connect_ex(loopback_only: list[tuple[int, object]]) -> None:
-    """La variante connect_ex est gardée avant l'appel système également."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        with pytest.raises(AssertionError, match="destination hors boucle locale"):
-            sock.connect_ex(("198.51.100.5", 443))
-    assert loopback_only == []
+@pytest.mark.parametrize(
+    ("resolver", "host"),
+    [
+        ("getaddrinfo", "evil.example"),
+        ("getaddrinfo", b"evil.example"),
+        ("gethostbyname", "evil.example"),
+        ("gethostbyname_ex", "evil.example"),
+        ("gethostbyaddr", "203.0.113.7"),
+    ],
+)
+def test_guard_blocks_and_records_dns_attempts(
+    loopback_only: NetworkLedger, resolver: str, host: object
+) -> None:
+    with pytest.raises(AssertionError, match="résolution"):
+        if resolver in ("getaddrinfo",):
+            getattr(socket, resolver)(host, 443)
+        else:
+            getattr(socket, resolver)(host)
+    assert len(loopback_only.blocked) == 1
 
 
-def test_guard_blocks_dns_before_resolution(loopback_only: list[tuple[int, object]]) -> None:
-    """Un nom externe est refusé avant que le resolver système soit appelé."""
-    with pytest.raises(AssertionError, match="résolution réseau interdite"):
-        socket.getaddrinfo("evil.example", 443)
-    with pytest.raises(AssertionError, match="résolution réseau interdite"):
-        socket.getaddrinfo(b"evil.example", 443)
-    assert loopback_only == []
+def test_guard_blocks_reverse_name_lookup(loopback_only: NetworkLedger) -> None:
+    with pytest.raises(AssertionError, match="résolution DNS inverse interdite"):
+        socket.getnameinfo(("203.0.113.7", 443), 0)
+    assert len(loopback_only.blocked) == 1
 
 
-def test_guard_accepts_loopback_ip_literals() -> None:
+def test_guard_allows_only_loopback_ip_literals_and_notes_unix_exception() -> None:
     assert _is_local_destination(socket.AF_INET, ("127.0.0.1", 11434))
     assert _is_local_destination(socket.AF_INET6, ("::1", 11434, 0, 0))
     assert _is_local_destination(socket.AF_INET6, ("::ffff:127.0.0.1", 11434, 0, 0))
     assert not _is_local_destination(socket.AF_INET, ("192.0.2.1", 443))
+    assert _is_local_destination(socket.AF_UNIX, "/run/local-service.sock")

@@ -2,13 +2,20 @@
 
 ## Contrôle automatisé
 
-`tests/test_network_isolation.py` remplace `socket.socket.connect`,
-`connect_ex`, `sendto` et `socket.getaddrinfo`. Le garde refuse toute
-destination IP non-loopback et tout nom d'hôte avant l'appel système ou le
-résolveur DNS. Il lance `heimdall scan --ci` dans le processus pytest et
-vérifie que la commande ne tente aucune connexion externe. Des tests vérifient
-également que le garde bloque TCP, UDP, IPv6 et la résolution DNS, et laisse
-les adresses loopback littérales admises.
+`tests/test_network_isolation.py` intercepte `connect`, `connect_ex`,
+`send`, `sendall`, `sendto`, `sendmsg`, `getaddrinfo`, `gethostbyname`,
+`gethostbyname_ex`, `gethostbyaddr` et `getnameinfo`. Le journal du garde
+enregistre aussi les tentatives refusées : les avaler dans une exception
+n'empêche pas le test de les détecter. Le test lance `heimdall scan --ci` dans
+le processus pytest et vérifie l'absence de tentative Internet. L'API Python
+standard n'expose pas `sendmmsg` ; les extensions natives qui appelleraient
+directement des syscalls contournent les wrappers et relèvent de la trace OS.
+
+Limites explicites : les sockets `AF_UNIX` sont permises comme IPC local et
+pourraient théoriquement servir de relais via un autre processus ; les appels
+réseau effectués directement par une extension native contournent les wrappers
+Python. Ce garde n'est donc pas un pare-feu. La trace système ci-dessous est
+nécessaire en complément.
 
 Commande :
 
@@ -19,18 +26,20 @@ Commande :
 Résultat observé le 17/10/2026 :
 
 ```text
-........                                                                 [100%]
+.................                                                        [100%]
 ```
 
-Suite complète avec la couverture CI : **691 passed**, 3 831 sous-tests,
+Suite complète avec la couverture CI : **700 passed**, 3 831 sous-tests,
 couverture Heimdall **99,48 %** (seuil CI : 85 %).
 
 ## Observation système
 
-Commande exécutée depuis la racine du dépôt :
+Commande exécutée depuis la racine du dépôt (trace des syscalls réseau, y
+compris `sendto`/`sendmsg`, et pas seulement `connect`) :
 
 ```sh
-strace -f -e trace=connect .venv/bin/heimdall scan --ci .
+strace -f -e trace=%network -o docs/security/zero-egress.strace \
+  .venv/bin/heimdall scan --ci .
 ```
 
 Sortie observée :
@@ -40,10 +49,13 @@ heimdall scan: scanner non implémenté (voir #22) — refus par défaut.
 +++ exited with 2 +++
 ```
 
-Aucun syscall `connect` n'apparaît dans la trace. Le code 2 est le refus
-fail-closed attendu, pas un scan réussi. `unshare --net` a aussi été essayé
-pour couper le réseau au niveau du namespace, mais l'environnement refuse
-cette opération (`Operation not permitted`).
+La trace complète archivée est
+[`zero-egress.strace`](zero-egress.strace) : elle ne contient aucun syscall
+réseau, uniquement la terminaison `exited with 2`. La sortie standard est
+`heimdall scan: scanner non implémenté (voir #22) — refus par défaut.` Le code 2
+est le refus fail-closed attendu, pas un scan réussi. `unshare --net` a aussi
+été essayé pour couper le réseau au niveau du namespace, mais l'environnement
+refuse cette opération (`Operation not permitted`).
 
 ## Limite de la preuve et suite requise
 
@@ -52,8 +64,8 @@ tout scan réel. Cette preuve établit donc que le chemin CLI actuel (bloqué) n
 crée pas de connexion, et que le garde CI bloque les destinations externes ;
 elle **ne prouve pas** qu'un scan opérationnel complet fonctionne hors ligne.
 Après livraison du scanner et de son orchestration, rejouer le test sur un dépôt
-de test, puis capturer une trace `strace -f -e trace=connect` sous réseau
-effectivement coupé. Le client Ollama est déjà épinglé à
+de test, puis capturer la sortie complète de `strace -f -e trace=%network` sous
+réseau effectivement coupé. Le client Ollama est déjà épinglé à
 `127.0.0.1:11434`, sans proxy d'environnement ni redirections
 (`heimdall/llm/qualify.py::_loopback_client`).
 

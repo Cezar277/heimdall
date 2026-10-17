@@ -106,7 +106,7 @@ collaborateurs de confiance (garde `author_association`) :
    retour à la ligne sur une PR du dépôt (espaces initiaux retirés ; `/ciX`
    est refusé).
    Le job de contexte vérifie la commande exactement avant de lancer les tests ;
-   la réaction 👀 accuse réception et le check `CI (/ci)` apparaît sur la PR.
+   le check `CI (/ci)` apparaît sur la PR.
 2. **Approbation d'un relecteur** : approuver la PR (`pull_request_review`,
    état `approved`) la lance aussi.
 
