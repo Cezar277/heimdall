@@ -100,6 +100,15 @@ class TestPromptContract:
         expected = hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest()
         assert prompts_module.prompt_digest() == expected
 
+    def test_digest_is_the_exact_sent_system_content_single_read(self) -> None:
+        # Le digest journalisé est calculé sur la chaîne exacte envoyée
+        # comme prompt système — pas une seconde lecture fichier qui
+        # pourrait diverger (remplacement entre deux lectures).
+        prompt = prompts_module.load_qualify_prompt()
+        assert prompts_module.prompt_digest() == hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        messages = prompts_module.build_messages("SYNTHETIC_QUALIFY_DATA_02")
+        assert messages[0]["content"] == prompt
+
     def test_candidate_only_in_user_message_between_random_delimiters(self) -> None:
         sentinel = "SYNTHETIC_QUALIFY_CANDIDATE_01"
         first = prompts_module.build_messages(sentinel)
@@ -373,6 +382,26 @@ class TestFailClosed:
         assert excinfo.value.code == "unavailable"
         assert marker not in str(excinfo.value)
         assert excinfo.value.__cause__ is None  # `from None` : pas de chaîne d'origine
+
+    def test_loopback_client_construction_failure_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Construction du client dans le bloc fail-closed : si
+        # _loopback_client() lève (API ollama changée, config httpx
+        # invalide), le code fermé "unavailable" sort — jamais l'exception
+        # brute, jamais de reflet.
+        marker = "SYNTHETIC_LOOPBACK_DETAIL"
+
+        def _raise_client() -> Any:
+            raise RuntimeError(marker)
+
+        monkeypatch.setattr(qualify_module, "_loopback_client", _raise_client)
+        with pytest.raises(QualifyError) as excinfo:
+            qualify(MASKED_CANDIDATE)  # sans chat injecté : voie _loopback_client
+        assert excinfo.value.code == "unavailable"
+        assert str(excinfo.value) == qualify_module.ERROR_MESSAGES["unavailable"]
+        assert marker not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None
 
     def test_empty_candidate_is_refused(self) -> None:
         for empty in ("", "  \n"):

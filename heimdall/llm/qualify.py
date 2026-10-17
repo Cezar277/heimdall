@@ -11,8 +11,9 @@ force une réponse vérifiable automatiquement :
 - le paramètre ``format`` d'``ollama.chat`` reçoit le schéma JSON
   (``QUALIFY_FORMAT_V1``) : la sortie est structurée par le serveur Ollama,
   pas seulement décrite au modèle ; ``temperature`` vaut 0 ;
-- la version du prompt (nom + SHA-256 du fichier) est journalisée à chaque
-  appel, et le verdict retenu à chaque succès : une décision reste
+- la version du prompt (nom + SHA-256 de la chaîne exacte envoyée comme
+  prompt système, lecture unique sans relecture fichier) est journalisée à
+  chaque appel, et le verdict retenu à chaque succès : une décision reste
   corrélable à l'instruction qui l'a produite, sans secret ni prompt brut —
   un verdict hors enum n'est jamais recopié, seul ``invalide`` est tracé ;
 - tout échec local est fermé : prompt de qualification illisible (fichier
@@ -37,6 +38,7 @@ Finding et ne décide jamais seul (REQ-SEC-01).
 """
 
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -52,7 +54,6 @@ from heimdall.mcp.prompts import (
     QUALIFY_FORMAT_V1,
     CandidateTooLargeError,
     build_messages,
-    prompt_digest,
 )
 
 # Modèle par défaut : ADR-004 (292 Mo, seul panel à 10/10 secrets et 4/4
@@ -205,7 +206,10 @@ def qualify(
         raise QualifyError("too_large")
     try:
         messages = build_messages(candidate)
-        digest = prompt_digest()
+        # Lecture unique : le digest est calculé sur la chaîne exacte
+        # envoyée comme prompt système — jamais une seconde lecture
+        # fichier qui pourrait diverger (remplacement entre deux lectures).
+        digest = hashlib.sha256(messages[0]["content"].encode("utf-8")).hexdigest()
     except UnicodeDecodeError:
         # Prompt produit non décodable : installation cassée, même code
         # fermé que fichier absent (jamais d'exception brute avec chemin).
@@ -225,8 +229,11 @@ def qualify(
         digest,
         model,
     )
-    sender = chat if chat is not None else _loopback_client().chat
     try:
+        # Construction dans le bloc fail-closed : si _loopback_client()
+        # levait (API ollama changée, config httpx invalide, .chat absent),
+        # l'erreur devient "unavailable", jamais une exception brute.
+        sender = chat if chat is not None else _loopback_client().chat
         response = sender(
             model=model,
             # Copies défensives : le schéma et les messages sont des objets

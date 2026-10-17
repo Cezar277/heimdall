@@ -96,8 +96,14 @@ def load_qualify_prompt() -> str:
 
 @lru_cache(maxsize=1)
 def prompt_digest() -> str:
-    """Empreinte SHA-256 du fichier de prompt, à journaliser à chaque appel."""
-    return hashlib.sha256(_prompt_path().read_bytes()).hexdigest()
+    """Empreinte SHA-256 du prompt versionné, dérivée de la chaîne chargée.
+
+    Calculée sur ``load_qualify_prompt()`` (même cache), jamais par une
+    seconde lecture fichier : le digest journalisé ne peut pas diverger
+    du prompt utilisé, même en cas de remplacement du fichier entre deux
+    lectures (installation en cours de mise à jour).
+    """
+    return hashlib.sha256(load_qualify_prompt().encode("utf-8")).hexdigest()
 
 
 def build_messages(candidate: str) -> list[dict[str, str]]:

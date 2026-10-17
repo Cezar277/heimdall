@@ -430,6 +430,8 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
         "QualifyVerdict",
         'extra="forbid"',
         "isinstance(model, str)",
+        "_loopback_client().chat",
+        'messages[0]["content"]',
     ):
         assert token in client_src, token
     # Le prompt versionné est embarqué dans le wheel (sinon toute install
