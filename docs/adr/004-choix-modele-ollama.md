@@ -222,14 +222,18 @@ sortie du modèle : réponse vide, non-JSON, hors schéma, surdimensionnée, LLM
 indisponible ou entrée refusée renvoient
 ``Qualification(status="detecte", verdict=None, reason=<code>)``. Le code est
 l'une des six valeurs fermées de ``ERROR_MESSAGES`` ; il est journalisé sans
-aucun texte du modèle. Un filet final convertit toute exception inattendue
-(``except Exception``, jamais ``BaseException``) en refus ``invalid``.
+aucun texte du modèle. Deux filets : toute exception inattendue de l'appel
+modèle (``except Exception``, jamais ``BaseException``) et tout retour
+malformé de ``qualify()`` (``except (KeyError, TypeError)`` — dict sans
+``verdict``, non-dict) valent refus ``invalid``, jamais une traversée.
 ``Qualification`` revalide tout état à l'exécution par son ``__post_init__`` :
 corrélation verdict XOR raison, ``status`` toujours ``detecte``, ``verdict``
 dans ``VERDICTS``, ``reason`` dans ``ERROR_MESSAGES`` — les ``Literal`` ne
-sont pas imposés par Python. Un verdict valide, même
-``faux_positif``, ne change pas ``status`` : le LLM ne fait transiter aucun
-Finding (ADR-001, REQ-SEC-01).
+sont pas imposés par Python ; un ``ValueError`` de ``__post_init__`` traverse
+volontairement (bug de programmation, pas sortie du modèle). L'alias
+``Verdict`` est synchronisé avec ``VERDICTS`` par un test. Un verdict valide,
+même ``faux_positif``, ne change pas ``status`` : le LLM ne fait transiter
+aucun Finding (ADR-001, REQ-SEC-01).
 Preuves : ``tests/test_llm_qualify.py::TestCandidateStaysDetected`` (sorties
 cassées volontaires, entrée refusée sans appel au modèle, aucun reflet dans le
 journal) et ``tests/security/test_prompt_injection.py::test_qualify_prompt_isolated_and_output_constrained``

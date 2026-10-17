@@ -433,6 +433,7 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
         "def qualify_candidate(",
         'status="detecte"',
         "except Exception:",
+        "except (KeyError, TypeError):",
         "__post_init__",
         "isinstance(model, str)",
         "_loopback_client().chat",

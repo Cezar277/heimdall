@@ -644,6 +644,54 @@ class TestCandidateStaysDetected:
         assert "SYNTHETIC" not in logged
 
     @pytest.mark.parametrize(
+        "malformed",
+        [
+            pytest.param({}, id="dict-sans-cle"),
+            pytest.param({"confidence": 0.9}, id="dict-sans-verdict"),
+            pytest.param(["secret"], id="liste"),
+            pytest.param(None, id="none"),
+        ],
+    )
+    def test_malformed_qualify_return_is_fail_closed_without_reflection(
+        self,
+        malformed: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Retour malformé de ``qualify()`` (mock, régression, évolution) :
+        # la construction étant dans le bloc fail-closed, ``KeyError``/
+        # ``TypeError`` deviennent ``invalid`` au lieu de traverser.
+        monkeypatch.setattr(qualify_module, "qualify", lambda *_a, **_k: malformed)
+        caplog.set_level(logging.INFO, logger="heimdall.llm.qualify")
+        result = qualify_candidate(MASKED_CANDIDATE, chat=RecordingChat())
+        assert result == Qualification(status="detecte", verdict=None, reason="invalid")
+        logged = "\n".join(
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "heimdall.llm.qualify"
+        )
+        assert "candidat conserve (raison=invalid" in logged
+
+    def test_verdict_alias_mirrors_verdicts(self) -> None:
+        # Source unique du contrat : une divergence entre l'alias ``Verdict``
+        # (validation de type) et ``VERDICTS`` (schéma + __post_init__) doit
+        # casser ici, pas à l'exécution (qualify_v2).
+        assert set(get_args(Verdict)) == set(prompts_module.VERDICTS)
+
+    def test_inconsistent_state_from_broken_qualify_traverses_loudly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Traversée VOULUE : si ``qualify()`` rendait un verdict hors liste
+        # blanche (bug du programme — le schéma pydantic l'interdit), c'est
+        # une erreur de programmation qui doit être bruyante, pas un refus
+        # silencieux. Épingle le contrat documenté dans la docstring.
+        monkeypatch.setattr(
+            qualify_module, "qualify", lambda *_a, **_k: {"verdict": "MAYBE", "confidence": 0.5}
+        )
+        with pytest.raises(ValueError, match="verdict hors liste blanche"):
+            qualify_candidate(MASKED_CANDIDATE, chat=RecordingChat())
+
+    @pytest.mark.parametrize(
         ("candidate", "model", "reason"),
         [
             pytest.param("", DEFAULT_MODEL, "empty", id="candidat-vide"),

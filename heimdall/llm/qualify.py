@@ -331,6 +331,20 @@ def qualify(
     return validated.model_dump()
 
 
+def _fail_closed(reason: ErrorCode) -> Qualification:
+    """Refus fermé journalisé : le candidat reste détecté, avec sa raison.
+
+    Seuls le code fermé et le nom du prompt sont journalisés — jamais la
+    réponse du modèle ni l'entrée (message statique, anti-log-forging).
+    """
+    logger.warning(
+        "qualification: candidat conserve (raison=%s, prompt=%s)",
+        reason,
+        PROMPT_NAME,
+    )
+    return Qualification(status="detecte", verdict=None, reason=reason)
+
+
 def qualify_candidate(
     candidate: str,
     *,
@@ -345,24 +359,28 @@ def qualify_candidate(
     code est journalisé : le candidat reste un finding, avec sa raison. Un
     verdict valide, même ``faux_positif``, ne change pas ``status`` non plus :
     le LLM propose, le développeur décide (#32). Aucun texte du modèle
-    n'est renvoyé ni journalisé. Un filet final convertit toute exception
-    inattendue (évolution du SDK, propriété hostile) en refus ``invalid`` —
-    jamais de traversée vers l'appelant. ``BaseException``
-    (``KeyboardInterrupt``/``SystemExit``) n'est pas capturée.
+    n'est renvoyé ni journalisé.
+
+    Deux filets, pour que rien du retour ne traverse. Toute exception
+    inattendue de l'appel modèle (évolution du SDK, propriété hostile) et
+    tout retour malformé de ``qualify()`` (dict sans « verdict »,
+    non-dict — évolution, mock, régression) valent ``invalid`` sans reflet.
+    ``BaseException`` (``KeyboardInterrupt``/``SystemExit``) n'est pas
+    capturée ; un ``ValueError`` de ``__post_init__`` (verdict hors liste
+    blanche : ``qualify()`` garantit le schéma, le rompre est un bug)
+    traverse volontairement, en erreur de programmation bruyante.
     """
     try:
         verdict = qualify(candidate, model=model, chat=chat)
     except QualifyError as error:
-        logger.warning(
-            "qualification: candidat conserve (raison=%s, prompt=%s)",
-            error.code,
-            PROMPT_NAME,
-        )
-        return Qualification(status="detecte", verdict=None, reason=error.code)
+        return _fail_closed(error.code)
     except Exception:
-        logger.warning(
-            "qualification: candidat conserve (raison=invalid, prompt=%s)",
-            PROMPT_NAME,
-        )
-        return Qualification(status="detecte", verdict=None, reason="invalid")
-    return Qualification(status="detecte", verdict=verdict["verdict"], reason=None)
+        return _fail_closed("invalid")
+    try:
+        # Construction DANS le bloc fail-closed : un retour malformé devient
+        # un refus fermé au lieu de traverser. Le ValueError de
+        # ``__post_init__`` n'est pas capturé ici : contrat rompu côté
+        # programme, pas sortie du modèle — il traverse, bruyamment.
+        return Qualification(status="detecte", verdict=verdict["verdict"], reason=None)
+    except (KeyError, TypeError):
+        return _fail_closed("invalid")
