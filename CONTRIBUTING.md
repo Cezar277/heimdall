@@ -72,9 +72,11 @@ Dans Settings > Branches, la règle sur `main` impose:
 La CI lourde (`.github/workflows/ci.yml`, #20) ne se déclenche **pas** à chaque
 push : elle démarre quand un collaborateur de confiance commente **`/ci`** (en
 début de commentaire) sur la PR (le plus simple, modèle de `/oc review`) ou
-approuve la review. Le check exigé par la protection de `main` est `CI (/ci)`
-(publié sur la PR par ces deux déclencheurs). Après un nouveau commit sur la branche (y compris « Update
-branch »), relancer `/ci` (ou ré-approuver) : le check doit être re-signalé.
+approuve la review. Les PR de forks sont refusées par la CI self-hosted ;
+`workflow_dispatch` est limité à `main`. Le check exigé par la protection de
+`main` est `CI (/ci)` (publié sur la PR par ces deux déclencheurs). Après un
+nouveau commit sur la branche (y compris « Update branch »), relancer `/ci`
+(ou ré-approuver) : le check doit être re-signalé.
 
 ## 8. Règles de sécurité (non négociables)
 

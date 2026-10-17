@@ -102,10 +102,11 @@ Il ne tourne volontairement **pas** à chaque push de branche (quota GitHub et
 bruit contenus) : sur une PR, deux déclencheurs équivalents, réservés aux
 collaborateurs de confiance (garde `author_association`) :
 
-1. **Commande `/ci`** : commenter **`/ci` en début de commentaire** sur la PR
-   (modèle de `/oc review` ; une simple mention au fil du texte ne déclenche
-   rien) lance la CI complète ; la réaction 👀 accuse réception et le check
-   `CI (/ci)` apparaît sur la PR.
+1. **Commande `/ci`** : commenter `/ci` seul ou suivi d'un espace ou d'un
+   retour à la ligne sur une PR du dépôt (espaces initiaux retirés ; `/ciX`
+   est refusé).
+   Le job de contexte vérifie la commande exactement avant de lancer les tests ;
+   la réaction 👀 accuse réception et le check `CI (/ci)` apparaît sur la PR.
 2. **Approbation d'un relecteur** : approuver la PR (`pull_request_review`,
    état `approved`) la lance aussi.
 
@@ -122,14 +123,16 @@ qui n'exécutent **jamais** le code de la PR ; le job de test n'a que
 privilégié ni forger `CI (/ci)` (séparation des privilèges).
 
 Conséquence voulue : **sans `/ci` ni approbation, le check est absent et la PR
-reste bloquée** (« Waiting for status to be reported ») ; après un nouveau
+reste bloquée** (« Waiting for status to be reported »). Les PR provenant d'un
+fork ne sont jamais exécutées sur le runner self-hosted ; elles doivent être
+proposées depuis une branche du dépôt pour passer cette CI. Après un nouveau
 commit (y compris « Update branch »), relancer `/ci` (ou ré-approuver) — le
 check repart « en attente » puis passe au vert si tout passe.
 
 En dehors des PR : `push` sur `main` (preuve « pipeline vert sur main ») et
-`workflow_dispatch` (bouton *Run workflow*, pour déboguer — il ne publie pas
-le check, donc ne débloque pas une PR ; disponible une fois le workflow sur
-`main`). Les autres workflows (`Vault contract`, `Security model`,
+`workflow_dispatch` sur `main` uniquement (bouton *Run workflow*, pour
+déboguer — il ne publie pas le check, donc ne débloque pas une PR ; disponible
+une fois le workflow sur `main`). Les autres workflows (`Vault contract`, `Security model`,
 `OpenCode review`) gardent leurs propres déclencheurs.
 
 ### Exception réseau documentée : `pip-audit`
@@ -161,7 +164,8 @@ réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
   exécute le code de la PR (après `/ci` ou approbation) : VM d'équipe
   **dédiée et jetable** (ou restaurée par snapshot avant chaque run),
   utilisateur dédié non-root, aucun secret ni donnée personnelle dessus ;
-  considérée comme compromise après chaque run. Jamais une machine perso.
+  considérée comme compromise après chaque run. Les PR de forks ne tournent
+  pas sur ce runner. Jamais une machine perso.
   **Avant merge**, joindre à la preuve SAMM la configuration attestant le
   mode éphémère (par ex. runner enregistré avec `--ephemeral` ou snapshot
   restauré/nettoyage post-job) ; le label `self-hosted` seul ne le prouve pas.

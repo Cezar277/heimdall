@@ -2,14 +2,16 @@ name: CI Security & Quality
 
 # Ce workflow ne tourne volontairement PAS à chaque push de branche (#20) :
 # quota GitHub et bruit contenus. Les déclencheurs, tous explicites :
-#   1. issue_comment : commenter `/ci` en début de commentaire sur une PR
-#      (auteur collaborateur de confiance) lance la CI complète — « commande
-#      spéciale », modèle /oc.
+#   1. issue_comment : commenter `/ci` (commande seule ou suivie d'un espace /
+#      saut de ligne) sur une PR non issue d'un fork, par un collaborateur de
+#      confiance, lance la CI complète — modèle /oc.
 #   2. pull_request_review : une approbation (`review.state == 'approved'`,
 #      collaborateur de confiance) la lance aussi.
 #   3. push sur `main` : preuve « pipeline vert sur main » après merge.
 #      (`workflow_dispatch` reste dispo pour le débogage : il ne publie PAS
-#      le check `CI (/ci)`, donc ne débloque pas une PR.)
+#      le check `CI (/ci)`, donc ne débloque pas une PR ; il est limité à main.)
+# Les PR de forks ne sont jamais exécutées sur le runner self-hosted. Le dispatch
+# de debug est limité à main.
 #
 # Pourquoi un check publié à la main (`CI (/ci)`) et pas le check des jobs ?
 # GitHub n'évalue pour une PR que les checks des runs déclenchés par push /
@@ -65,16 +67,18 @@ jobs:
     # sur le runner.
     if: >-
       github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'pull_request_review' &&
       github.event.review.state == 'approved' &&
+      github.event.pull_request.head.repo.fork == false &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
       (github.event_name == 'issue_comment' &&
       github.event.issue.state == 'open' &&
-      startsWith(github.event.comment.body, '/ci') &&
+      contains(github.event.comment.body, '/ci') &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     outputs:
       has_pr: ${{ steps.ctx.outputs.has_pr }}
+      run_tests: ${{ steps.ctx.outputs.run_tests }}
       checkout_ref: ${{ steps.ctx.outputs.checkout_ref }}
       check_sha: ${{ steps.ctx.outputs.check_sha }}
       check_id: ${{ steps.ctx.outputs.check_id }}
@@ -91,7 +95,38 @@ jobs:
                 core.setFailed('La commande /ci ne fonctionne que sur une pull request.');
                 return;
               }
-              // Accusé de réception (non bloquant).
+              // L'expression de job ne sait pas trim : ce filtre grossier ne
+              // fait démarrer que ce job léger; seule la commande stricte ci-dessous
+              // peut autoriser le job `test`.
+              const command = context.payload.comment.body.trim();
+              if (!/^\/ci(?:$|\s)/.test(command)) {
+                core.notice('Commentaire ignoré : utiliser /ci seul ou suivi d’un espace/retour à la ligne.');
+                core.setOutput('has_pr', 'false');
+                core.setOutput('run_tests', 'false');
+                return;
+              }
+              prNumber = context.payload.issue.number;
+            } else if (context.eventName === 'pull_request_review') {
+              prNumber = context.payload.pull_request.number;
+            } else {
+              // push sur main ou dispatch : pas de PR, pas de check publié.
+              core.setOutput('has_pr', 'false');
+              core.setOutput('run_tests', 'true');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber,
+            });
+            if (!pr.head.repo || pr.head.repo.fork) {
+              core.notice('PR de fork ignorée : le runner self-hosted n’exécute pas de code de fork.');
+              core.setOutput('has_pr', 'false');
+              core.setOutput('run_tests', 'false');
+              return;
+            }
+            // Accusé de réception non bloquant, seulement après validation de
+            // la commande et confirmation que la PR provient du dépôt.
+            if (context.eventName === 'issue_comment') {
               try {
                 await github.rest.reactions.createForIssueComment({
                   owner, repo,
@@ -101,18 +136,7 @@ jobs:
               } catch (error) {
                 core.warning(`Réaction 👀 impossible : ${error.message}`);
               }
-              prNumber = context.payload.issue.number;
-            } else if (context.eventName === 'pull_request_review') {
-              prNumber = context.payload.pull_request.number;
-            } else {
-              // push sur main ou dispatch : pas de PR, pas de check publié.
-              core.setOutput('has_pr', 'false');
-              return;
             }
-
-            const { data: pr } = await github.rest.pulls.get({
-              owner, repo, pull_number: prNumber,
-            });
             if (!pr.merge_commit_sha) {
               core.setFailed('Commit de merge indisponible (conflits ou calcul en cours) : résolvez les conflits, puis relancez /ci.');
               return;
@@ -144,6 +168,7 @@ jobs:
               details_url: `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`,
             });
             core.setOutput('has_pr', 'true');
+            core.setOutput('run_tests', 'true');
             core.setOutput('checkout_ref', `refs/pull/${prNumber}/merge`);
             core.setOutput('check_sha', mergeSha);
             core.setOutput('check_id', String(check.id));
@@ -154,6 +179,7 @@ jobs:
     # confiance de `resolve` via needs). Aucun droit d'écriture ici, et aucun
     # token privilégié n'est injecté dans ses steps.
     needs: resolve
+    if: needs.resolve.outputs.run_tests == 'true'
     runs-on: self-hosted
     timeout-minutes: 20
     permissions:
@@ -200,10 +226,22 @@ jobs:
           .venv-ci/bin/python -m pytest
           --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85
 
-      - name: Couverture des modules critiques (vault, scanner, mcp) >= 70 %
+      - name: Couverture du Vault >= 70 %
         run: >-
           .venv-ci/bin/python -m coverage report
-          --include="heimdall/vault/*,heimdall/scanner/*,heimdall/mcp/*"
+          --include="heimdall/vault/*"
+          --fail-under=70
+
+      - name: Couverture du scanner >= 70 %
+        run: >-
+          .venv-ci/bin/python -m coverage report
+          --include="heimdall/scanner/*"
+          --fail-under=70
+
+      - name: Couverture du MCP >= 70 %
+        run: >-
+          .venv-ci/bin/python -m coverage report
+          --include="heimdall/mcp/*"
           --fail-under=70
 
       - name: Audit dépendances (pip-audit, exception réseau documentée README)

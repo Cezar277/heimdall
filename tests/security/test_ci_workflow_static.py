@@ -101,9 +101,11 @@ def test_installation_verrouillee() -> None:
 
 def test_seuils_de_couverture() -> None:
     assert "--cov-fail-under=85" in ACTIVE
-    assert "--fail-under=70" in ACTIVE
-    for module in ("vault", "scanner", "mcp"):
-        assert f"heimdall/{module}/*" in ACTIVE
+    includes = re.findall(r'--include="([^"]+)"', ACTIVE)
+    assert sorted(includes) == sorted(
+        ["heimdall/vault/*", "heimdall/scanner/*", "heimdall/mcp/*"]
+    )
+    assert ACTIVE.count("--fail-under=70") == 3
 
 
 def test_pins_directs_pyproject_synchronises_avec_le_lock() -> None:
@@ -143,13 +145,29 @@ def test_pins_directs_pyproject_synchronises_avec_le_lock() -> None:
 
 
 def test_commande_ci_en_debut_de_commentaire() -> None:
-    assert "startsWith(github.event.comment.body, '/ci')" in ACTIVE
-    assert "contains(github.event.comment.body, '/ci')" not in ACTIVE
-    # Le corps du commentaire n'est exploité que dans la garde d'expression
-    # (startsWith) — jamais interpolé dans un step shell.
-    for line in ACTIVE.splitlines():
-        if "github.event.comment.body" in line:
-            assert "startsWith" in line, line
+    valid = ("/ci", "/ci extra", "  /ci", "/ci\nextra")
+    invalid = ("/ciX", "/ci-malveillant", "texte /ci", " /cix")
+    command = re.compile(r"^/ci(?:$|\s)")
+    assert all(command.match(body.strip()) for body in valid)
+    assert not any(command.match(body.strip()) for body in invalid)
+    # Les expressions GitHub n'ont pas trim : le job de contexte filtre le
+    # résultat exact après trim avant d'autoriser `test`.
+    assert "context.payload.comment.body.trim()" in ACTIVE
+    assert r"if (!/^\/ci(?:$|\s)/.test(command))" in ACTIVE
+    assert "run_tests: ${{ steps.ctx.outputs.run_tests }}" in ACTIVE
+    assert "if: needs.resolve.outputs.run_tests == 'true'" in ACTIVE
+
+
+def test_forks_et_dispatch_ne_lancent_pas_de_code_non_revu() -> None:
+    # Les reviews de forks sont filtrées avant d'allouer un runner ; le chemin
+    # /ci vérifie aussi head.repo via l'API (l'event issue_comment ne l'expose pas).
+    assert "github.event.pull_request.head.repo.fork == false" in ACTIVE
+    assert "if (!pr.head.repo || pr.head.repo.fork)" in ACTIVE
+    assert "core.setOutput('run_tests', 'false')" in ACTIVE
+    # Dispatch de debug uniquement sur main, sans PR/check publié.
+    assert "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'" in ACTIVE
+    assert "core.setOutput('run_tests', 'true')" in ACTIVE
+    assert "core.setOutput('has_pr', 'false')" in ACTIVE
 
 
 def test_gardes_abus_du_declencheur() -> None:
@@ -160,6 +178,7 @@ def test_gardes_abus_du_declencheur() -> None:
     assert '"NONE"' not in ACTIVE
     assert "CONTRIBUTOR" not in ACTIVE
     assert "github.event.review.state == 'approved'" in ACTIVE
+    assert "github.event.pull_request.head.repo.fork == false" in ACTIVE
     # merge_commit_sha absent (conflits) : échec fail-closed, pas de check.
     assert "if (!pr.merge_commit_sha)" in ACTIVE
     assert "Commit de merge indisponible" in ACTIVE
