@@ -10,6 +10,11 @@ privilège, séparation des privilèges entre le job qui exécute le code de PR
 import re
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
 REPO = Path(__file__).resolve().parents[2]
 CI = REPO / ".github" / "workflows" / "ci.yml"
 TEXT = CI.read_text(encoding="utf-8")
@@ -39,6 +44,12 @@ def test_actions_epinglees_par_sha() -> None:
     assert uses, "le workflow n'utilise aucune action ?"
     for action in uses:
         assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", action), action
+    expected = [
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
+        "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
+    ]
+    assert sorted(uses) == sorted(expected)
 
 
 def test_pas_de_pull_request_target_ni_pull_request() -> None:
@@ -55,14 +66,13 @@ def test_separation_des_privileges_entre_check_et_code_de_pr() -> None:
     jobs = _jobs()
     assert {"resolve", "test", "report"} <= set(jobs)
     # Le job qui exécute le code de la PR n'a aucun droit d'écriture.
-    ecritures = ("checks: write", "issues: write", "pull-requests: write", "contents: write")
-    for privilege in ecritures:
-        assert privilege not in jobs["test"], privilege
+    assert "write" not in jobs["test"]
     assert "contents: read" in jobs["test"]
     # Les jobs qui écrivent le check ne checkout jamais le code de la PR.
     for trusted in ("resolve", "report"):
         assert "checks: write" in jobs[trusted]
         assert "actions/checkout" not in jobs[trusted]
+        assert not re.search(r"^\s*run\s*:", jobs[trusted], re.MULTILINE)
 
 
 def test_integrite_du_check_publie() -> None:
@@ -71,6 +81,12 @@ def test_integrite_du_check_publie() -> None:
     assert "checks.create" in ACTIVE
     assert "rev-parse HEAD" in ACTIVE
     assert "needs.resolve.outputs.check_sha" in ACTIVE
+    assert "EXPECTED_SHA: ${{ needs.resolve.outputs.check_sha }}" in ACTIVE
+    assert '[ "$tested" != "$EXPECTED_SHA" ]' in ACTIVE
+    assert '"${{ needs.resolve.outputs.check_sha }}"' not in ACTIVE
+    assert "github.paginate(" in ACTIVE
+    assert "response.data.check_runs" in ACTIVE
+    assert "per_page: 100" in ACTIVE
 
 
 def test_installation_verrouillee() -> None:
@@ -83,7 +99,41 @@ def test_installation_verrouillee() -> None:
 def test_seuils_de_couverture() -> None:
     assert "--cov-fail-under=85" in ACTIVE
     assert "--fail-under=70" in ACTIVE
-    assert "heimdall/vault/*" in ACTIVE
+    for module in ("vault", "scanner", "mcp"):
+        assert f"heimdall/{module}/*" in ACTIVE
+
+
+def test_pins_directs_pyproject_synchronises_avec_le_lock() -> None:
+    """Toute dépendance directe `==` doit avoir la même version dans le lock."""
+    project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ]
+    requirements = list(project["dependencies"])
+    for group in project["optional-dependencies"].values():
+        requirements.extend(group)
+
+    declared: dict[str, str] = {}
+    for requirement in requirements:
+        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^;\s]+)", requirement)
+        assert match, f"dépendance directe non épinglée par == : {requirement}"
+        name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+        declared[name] = match.group(2)
+
+    lock_text = (REPO / "requirements.lock").read_text(encoding="utf-8")
+    locked = {
+        re.sub(r"[-_.]+", "-", name).lower(): version
+        for name, version in re.findall(
+            r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\;]+)",
+            lock_text,
+            re.MULTILINE,
+        )
+    }
+    drift = {
+        name: {"pyproject.toml": version, "requirements.lock": locked.get(name)}
+        for name, version in declared.items()
+        if locked.get(name) != version
+    }
+    assert not drift, f"pyproject.toml et requirements.lock divergent : {drift}"
 
 
 def test_commande_ci_en_debut_de_commentaire() -> None:

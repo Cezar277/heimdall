@@ -122,11 +122,15 @@ jobs:
 
             // Un run coupé en plein vol (runner) peut laisser un check
             // « in_progress » : on l'annule pour ne jamais bloquer la PR.
-            const { data: stale } = await github.rest.checks.listForRef({
-              owner, repo, ref: mergeSha, check_name: checkName,
-              status: 'in_progress', filter: 'all',
-            });
-            for (const run of stale.check_runs) {
+            const stale = await github.paginate(
+              github.rest.checks.listForRef,
+              {
+                owner, repo, ref: mergeSha, check_name: checkName,
+                status: 'in_progress', filter: 'all', per_page: 100,
+              },
+              response => response.data.check_runs,
+            );
+            for (const run of stale) {
               await github.rest.checks.update({
                 owner, repo, check_run_id: run.id, conclusion: 'cancelled',
               });
@@ -166,11 +170,12 @@ jobs:
 
       - name: Vérifier que le code testé est bien le commit de merge du check
         if: needs.resolve.outputs.has_pr == 'true'
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.check_sha }}
         run: |
           tested="$(git rev-parse HEAD)"
-          expected="${{ needs.resolve.outputs.check_sha }}"
-          if [ "$tested" != "$expected" ]; then
-            echo "::error::La PR a bougé pendant le lancement (HEAD=$tested, check=$expected). Relancez /ci."
+          if [ "$tested" != "$EXPECTED_SHA" ]; then
+            echo "::error::La PR a bougé pendant le lancement (HEAD=$tested, check=$EXPECTED_SHA). Relancez /ci."
             exit 1
           fi
 

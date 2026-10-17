@@ -163,6 +163,9 @@ réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
   **dédiée et jetable** (ou restaurée par snapshot avant chaque run),
   utilisateur dédié non-root, aucun secret ni donnée personnelle dessus ;
   considérée comme compromise après chaque run. Jamais une machine perso.
+  **Avant merge**, joindre à la preuve SAMM la configuration attestant le
+  mode éphémère (par ex. runner enregistré avec `--ephemeral` ou snapshot
+  restauré/nettoyage post-job) ; le label `self-hosted` seul ne le prouve pas.
 - **Option** : « Require branches to be up to date before merging » augmente
   les re-runs — chaque « Update branch » exige de relancer `/ci` (ou
   ré-approuver) pour re-signaler le check. À n'activer que si nécessaire.
