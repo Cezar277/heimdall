@@ -2,8 +2,9 @@ name: CI Security & Quality
 
 # Ce workflow ne tourne volontairement PAS à chaque push de branche (#20) :
 # quota GitHub et bruit contenus. Les déclencheurs, tous explicites :
-#   1. issue_comment : commenter `/ci` sur une PR (auteur collaborateur de
-#      confiance) lance la CI complète — « commande spéciale », modèle /oc.
+#   1. issue_comment : commenter `/ci` en début de commentaire sur une PR
+#      (auteur collaborateur de confiance) lance la CI complète — « commande
+#      spéciale », modèle /oc.
 #   2. pull_request_review : une approbation (`review.state == 'approved'`,
 #      collaborateur de confiance) la lance aussi.
 #   3. push sur `main` : preuve « pipeline vert sur main » après merge.
@@ -19,6 +20,13 @@ name: CI Security & Quality
 # que la protection de `main` doit exiger (voir README).
 # Un nouveau commit poussé après /ci (ou une approbation) exige de relancer
 # /ci (ou une nouvelle approbation) : comportement voulu.
+#
+# Séparation des privilèges (revue) : `checks: write` / `issues: write`
+# n'existent que dans `resolve` et `report`, deux jobs courts qui n'exécutent
+# JAMAIS de code issu de la PR. Le job `test`, qui lui exécute le code de la
+# PR (checkout, install, tests), n'a que `contents: read` : un test ou un
+# conftest malveillant ne peut ni lire un token privilégié ni forger le check
+# `CI (/ci)` qui protège `main`.
 
 on:
   issue_comment:
@@ -40,15 +48,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  quality-and-security:
-    name: Lint, Typecheck, Audit & Test
-    # Runner self-hosted, comme les autres workflows : 0 minute GitHub.
+  resolve:
+    name: Contexte PR (check « CI (/ci) »)
+    # Job de confiance : résout la PR et publie le check « en attente ». Il ne
+    # touche jamais au code de la PR — avec `report`, c'est le seul endroit
+    # autorisé à écrire des checks.
     runs-on: self-hosted
-    timeout-minutes: 20
+    timeout-minutes: 5
     permissions:
-      contents: read   # checkout du code à tester
-      checks: write    # publication du check « CI (/ci) » qui débloque la PR
-      issues: write    # réaction 👀 sur le commentaire /ci
+      pull-requests: read  # pulls.get : numéro de commit de merge
+      checks: write        # publication du check « CI (/ci) »
+      issues: write        # réaction 👀 sur le commentaire /ci
     # Uniquement des déclencheurs humains de confiance : les commandes /ci et
     # approbations sont filtrées par author_association (même liste que
     # opencode-review) — un compte externe ne peut pas faire tourner du code
@@ -61,8 +71,13 @@ jobs:
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
       (github.event_name == 'issue_comment' &&
       github.event.issue.state == 'open' &&
-      contains(github.event.comment.body, '/ci') &&
+      startsWith(github.event.comment.body, '/ci') &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    outputs:
+      has_pr: ${{ steps.ctx.outputs.has_pr }}
+      checkout_ref: ${{ steps.ctx.outputs.checkout_ref }}
+      check_sha: ${{ steps.ctx.outputs.check_sha }}
+      check_id: ${{ steps.ctx.outputs.check_id }}
     steps:
       - name: Contexte PR + publication du check « CI (/ci) » (en attente)
         id: ctx
@@ -129,20 +144,31 @@ jobs:
             core.setOutput('check_sha', mergeSha);
             core.setOutput('check_id', String(check.id));
 
+  test:
+    name: Lint, Typecheck, Audit & Test
+    # Job « non fiable » : il exécute le code de la PR (hérite de la garde de
+    # confiance de `resolve` via needs). Aucun droit d'écriture ici, et aucun
+    # token privilégié n'est injecté dans ses steps.
+    needs: resolve
+    runs-on: self-hosted
+    timeout-minutes: 20
+    permissions:
+      contents: read   # checkout uniquement
+    steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # Pour une PR : le commit de merge exact dont le check porte le
           # statut. Sinon (push main, dispatch) : la ref du run.
-          ref: ${{ steps.ctx.outputs.checkout_ref || github.ref }}
+          ref: ${{ needs.resolve.outputs.checkout_ref || github.ref }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Vérifier que le code testé est bien le commit de merge du check
-        if: steps.ctx.outputs.has_pr == 'true'
+        if: needs.resolve.outputs.has_pr == 'true'
         run: |
           tested="$(git rev-parse HEAD)"
-          expected="${{ steps.ctx.outputs.check_sha }}"
+          expected="${{ needs.resolve.outputs.check_sha }}"
           if [ "$tested" != "$expected" ]; then
             echo "::error::La PR a bougé pendant le lancement (HEAD=$tested, check=$expected). Relancez /ci."
             exit 1
@@ -152,7 +178,6 @@ jobs:
         run: |
           rm -rf .venv-ci
           python3 -m venv .venv-ci
-          .venv-ci/bin/pip install --upgrade pip
           .venv-ci/bin/pip install --require-hashes -r requirements.lock
           .venv-ci/bin/pip install -e . --no-deps
 
@@ -170,20 +195,36 @@ jobs:
           .venv-ci/bin/python -m pytest
           --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85
 
+      - name: Couverture des modules critiques (vault, scanner, mcp) >= 70 %
+        run: >-
+          .venv-ci/bin/python -m coverage report
+          --include="heimdall/vault/*,heimdall/scanner/*,heimdall/mcp/*"
+          --fail-under=70
+
       - name: Audit dépendances (pip-audit, exception réseau documentée README)
         run: .venv-ci/bin/pip-audit --skip-editable
 
-      - name: Clôture du check « CI (/ci) » (succès/échec du run)
-        if: ${{ always() && steps.ctx.outputs.has_pr == 'true' }}
+  report:
+    name: Clôture du check « CI (/ci) »
+    # Job de confiance, après coup : clôt le check selon le verdict réel du
+    # job `test`. Aucun checkout — il ne voit jamais le code de la PR.
+    needs: [resolve, test]
+    if: ${{ always() && needs.resolve.outputs.has_pr == 'true' }}
+    runs-on: self-hosted
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    steps:
+      - name: Clôture du check « CI (/ci) » (verdict du job de test)
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          JOB_STATUS: ${{ job.status }}
-          CHECK_ID: ${{ steps.ctx.outputs.check_id }}
+          JOB_RESULT: ${{ needs.test.result }}
+          CHECK_ID: ${{ needs.resolve.outputs.check_id }}
         with:
           script: |
             const conclusion =
-              process.env.JOB_STATUS === 'success' ? 'success' :
-              process.env.JOB_STATUS === 'cancelled' ? 'cancelled' : 'failure';
+              process.env.JOB_RESULT === 'success' ? 'success' :
+              process.env.JOB_RESULT === 'cancelled' ? 'cancelled' : 'failure';
             await github.rest.checks.update({
               ...context.repo,
               check_run_id: Number(process.env.CHECK_ID),
