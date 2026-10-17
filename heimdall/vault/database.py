@@ -50,6 +50,8 @@ DEFAULT_DB_PATH: Path = Path("vault.db")
 
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
+_SECURE_DIR_MODE: int = 0o700
+_DIR_PERM_MASK: int = 0o777
 _CONTROL_CHAR_THRESHOLD: int = 0x20
 
 SCHEMA_SQL: str = """
@@ -117,7 +119,10 @@ def validate_db_path(db_path: Path | str) -> str:
             "Le chemin de la base de données SQLite contient des caractères de contrôle."
         )
     if stripped != ":memory:" and Path(stripped).is_dir():
-        logger.debug("Chemin de base de données pointe vers un répertoire existant : %s", stripped)
+        logger.debug(
+            "Chemin de base de données pointe vers un répertoire existant : %s",
+            Path(stripped).name,
+        )
         raise IsADirectoryError(
             "Chemin de base de données invalide : pointe vers un répertoire existant"
         )
@@ -180,10 +185,8 @@ def _assert_not_symlink(path: Path) -> None:
         if p not in seen:
             seen.add(p)
             if os.path.islink(p):
-                logger.debug("Chemin de base de données refusé (symlink détecté) : %s", p)
-                raise PermissionError(
-                    "Chemin de base de données refusé : lien symbolique interdit"
-                )
+                logger.debug("Chemin de base de données refusé (symlink détecté) : %s", p.name)
+                raise PermissionError("Chemin de base de données refusé : lien symbolique interdit")
 
 
 def _apply_secure_permissions(path: Path) -> None:
@@ -209,22 +212,65 @@ def _apply_secure_permissions(path: Path) -> None:
     try:
         path.chmod(_SECURE_FILE_MODE)
     except OSError as exc:
-        logger.debug("Échec du chmod 0o600 sur %s : %s", path, exc)
-        raise PermissionError(
-            "Impossible de sécuriser les permissions de la base SQLite"
-        ) from exc
+        logger.debug("Échec du chmod 0o600 sur %s : %s", path.name, exc.__class__.__name__)
+        raise PermissionError("Impossible de sécuriser les permissions de la base SQLite") from exc
     # Vérification post-chmod (fail-closed)
     actual_mode = path.stat().st_mode & 0o777
     if actual_mode != _SECURE_FILE_MODE:
         logger.debug(
             "Permissions insuffisantes sur %s : attendu 0o600, obtenu %s",
-            path,
+            path.name,
             oct(actual_mode),
         )
         raise PermissionError(
             "Permissions de la base SQLite insuffisantes : attendu 0o600, "
             f"obtenu {oct(actual_mode)}"
         )
+
+
+def _check_regular_file(path: Path) -> None:
+    """Vérifie que le chemin correspond à un fichier régulier (refus FIFO/socket/device)."""
+    if not path.exists():
+        return
+    try:
+        mode = os.stat(path, follow_symlinks=False).st_mode
+    except OSError as exc:
+        logger.debug("Impossible de stat le chemin %s : %s", path.name, exc.__class__.__name__)
+        raise PermissionError("Chemin de base de données refusé : accès impossible") from exc
+    if not stat_module.S_ISREG(mode):
+        logger.debug("Chemin de base de données non régulier : %s", path.name)
+        raise PermissionError("Chemin de base de données refusé : fichier non régulier interdit")
+
+
+def _harden_created_parents(missing_parents: list[Path]) -> None:
+    """Durcit uniquement les répertoires effectivement créés par mkdir (POSIX).
+
+    Les répertoires pré-existants (ex: CWD '.', /tmp) relèvent de la confiance
+    opérateur et ne sont jamais modifiés pour éviter tout effet de bord destructeur.
+    """
+    if os.name == "nt":
+        return
+    for new_dir in missing_parents:
+        if not new_dir.exists():
+            continue
+        try:
+            new_dir.chmod(_SECURE_DIR_MODE)
+        except OSError as exc:
+            logger.debug(
+                "Échec du chmod 0o700 sur %s : %s",
+                new_dir.name,
+                exc.__class__.__name__,
+            )
+            raise PermissionError(
+                "Impossible de sécuriser les permissions du répertoire parent"
+            ) from exc
+        mode = new_dir.stat().st_mode & _DIR_PERM_MASK
+        if mode != _SECURE_DIR_MODE:
+            logger.debug(
+                "Permissions du répertoire parent insuffisantes sur %s",
+                new_dir.name,
+            )
+            raise PermissionError("Permissions du répertoire parent insuffisantes")
 
 
 def _open_db_file(path: Path) -> sqlite3.Connection:
@@ -245,21 +291,11 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
     """
     _assert_not_symlink(path)
     if path.is_dir():
-        logger.debug("Chemin de base de données pointe vers un répertoire : %s", path)
+        logger.debug("Chemin de base de données pointe vers un répertoire : %s", path.name)
         raise IsADirectoryError(
             "Chemin de base de données invalide : pointe vers un répertoire existant"
         )
-    if path.exists():
-        try:
-            mode = os.stat(path, follow_symlinks=False).st_mode
-        except OSError as exc:
-            logger.debug("Impossible de stat le chemin %s : %s", path, exc)
-            raise PermissionError("Chemin de base de données refusé : accès impossible") from exc
-        if not stat_module.S_ISREG(mode):
-            logger.debug("Chemin de base de données non régulier : %s", path)
-            raise PermissionError(
-                "Chemin de base de données refusé : fichier non régulier interdit"
-            )
+    _check_regular_file(path)
 
     # Identifier les répertoires ancêtres inexistants avant mkdir
     missing_parents = [parent for parent in path.parents if not parent.exists()]
@@ -267,34 +303,16 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
     old_umask = os.umask(0o077)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Durcir uniquement les répertoires effectivement créés par mkdir (POSIX).
-        # Les répertoires pré-existants (ex: CWD '.', /tmp) relèvent de la confiance
-        # opérateur et ne sont jamais modifiés pour éviter tout effet de bord destructeur.
-        if os.name != "nt":
-            for new_dir in missing_parents:
-                if new_dir.exists():
-                    try:
-                        new_dir.chmod(0o700)
-                    except OSError as exc:
-                        logger.debug("Échec du chmod 0o700 sur %s : %s", new_dir, exc)
-        # Re-vérification après mkdir (fermeture de la fenêtre TOCTOU)
+        _harden_created_parents(missing_parents)
         _assert_not_symlink(path)
         if not path.exists():
             path.touch(mode=_SECURE_FILE_MODE, exist_ok=True)
         else:
-            mode = os.stat(path, follow_symlinks=False).st_mode
-            if not stat_module.S_ISREG(mode):
-                logger.debug("Chemin de base de données non régulier : %s", path)
-                raise PermissionError(
-                    "Chemin de base de données refusé : fichier non régulier interdit"
-                )
+            _check_regular_file(path)
 
         _assert_not_symlink(path)
         _apply_secure_permissions(path)
-        # umask 0o077 reste actif autour de connect() pour réduire la fenêtre TOCTOU
-        # résiduelle entre le dernier _assert_not_symlink() et l'ouverture réelle du fd.
         conn = sqlite3.connect(str(path))
-        # journal_mode=DELETE : empêche la création de fichiers sidecar en permissions larges.
         conn.execute("PRAGMA journal_mode = DELETE;")
         return conn
     finally:
@@ -336,16 +354,15 @@ def db_session(db_path: Path | str | None = None) -> Generator[sqlite3.Connectio
 def _verify_schema(conn: sqlite3.Connection) -> None:
     """Vérifie l'intégrité et la conformité du schéma de la base SQLite.
 
-    Valide la présence des tables obligatoires (projects, api_keys, secrets),
-    des clauses ON DELETE CASCADE sur les clés étrangères, de la contrainte d'unicité
-    UNIQUE(project_id, env, name) et de la contrainte CHECK sur le statut.
+    Valide structurellement et comportementalement la présence des tables obligatoires,
+    des contraintes ON DELETE CASCADE, de la contrainte UNIQUE(project_id, env, name)
+    et de la contrainte CHECK(status IN ('vaulte', 'rote')).
     Lève RuntimeError si le schéma est manquant ou dégradé (fail-closed).
     """
     cursor = conn.cursor()
     # 1. Tables obligatoires
     tables = {
-        row[0]
-        for row in cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        row[0] for row in cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
     }
     required_tables = {"projects", "api_keys", "secrets"}
     if not required_tables.issubset(tables):
@@ -354,9 +371,7 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
     # 2. Clés étrangères ON DELETE CASCADE
     for tbl in ("api_keys", "secrets"):
         fk_rows = cursor.execute(f"PRAGMA foreign_key_list({tbl});").fetchall()
-        has_cascade = any(
-            row[2] == "projects" and row[6].upper() == "CASCADE" for row in fk_rows
-        )
+        has_cascade = any(row[2] == "projects" and row[6].upper() == "CASCADE" for row in fk_rows)
         if not has_cascade:
             raise RuntimeError(
                 f"Schéma de base de données non conforme : ON DELETE CASCADE manquant sur {tbl}."
@@ -368,9 +383,12 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
     for idx in secrets_indexes:
         if idx[2] == 1:
             idx_name = idx[1]
+            if not isinstance(idx_name, str) or not idx_name.isidentifier():
+                raise RuntimeError("Schéma de base de données non conforme : nom d'index invalide.")
+            escaped_idx = idx_name.replace('"', '""')
             cols = [
                 info[2]
-                for info in cursor.execute(f"PRAGMA index_info('{idx_name}');").fetchall()
+                for info in cursor.execute(f'PRAGMA index_info("{escaped_idx}");').fetchall()
             ]
             if cols == ["project_id", "env", "name"]:
                 has_unique = True
@@ -380,22 +398,100 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
             "Schéma de base de données non conforme : UNIQUE(project_id, env, name) manquant."
         )
 
-    # 4. Contrainte CHECK sur le statut dans secrets
-    secrets_sql_row = cursor.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='secrets';"
-    ).fetchone()
-    if not secrets_sql_row or not secrets_sql_row[0]:
-        raise RuntimeError(
-            "Schéma de base de données non conforme : DDL secrets introuvable."
+    # 4. Vérification comportementale des contraintes (CHECK, UNIQUE, CASCADE)
+    _verify_schema_behavior(conn)
+
+
+def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
+    """Vérifie comportementalement les contraintes d'intégrité (CHECK, UNIQUE, CASCADE).
+
+    Exécutée au sein d'un SAVEPOINT systématiquement annulé (non destructeur).
+    """
+    conn.execute("SAVEPOINT schema_behavioral_verify_sp;")
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO projects (id, created_at) "
+            "VALUES ('__schema_probe_proj__', '2026-01-01');"
         )
-    secrets_ddl = secrets_sql_row[0].lower()
-    if (
-        "status in ('vaulte', 'rote')" not in secrets_ddl
-        and 'status in ("vaulte", "rote")' not in secrets_ddl
-    ):
-        raise RuntimeError(
-            "Schéma de base de données non conforme : contrainte CHECK de statut manquante."
+
+        # Test comportemental du CHECK sur status
+        chk_enforced = False
+        try:
+            conn.execute(
+                "INSERT INTO secrets ("
+                "project_id, env, name, encrypted_value, status, fingerprint, "
+                "created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "__schema_probe_proj__",
+                    "dev",
+                    "PROBE_CHK",
+                    "val",
+                    "invalid_probe_status",
+                    "fp",
+                    "2026-01-01",
+                    "2026-01-01",
+                ),
+            )
+        except sqlite3.IntegrityError:
+            chk_enforced = True
+        if not chk_enforced:
+            raise RuntimeError(
+                "Schéma de base de données non conforme : contrainte CHECK de statut inopérante."
+            )
+
+        # Test comportemental de la contrainte UNIQUE(project_id, env, name)
+        conn.execute(
+            "INSERT INTO secrets ("
+            "project_id, env, name, encrypted_value, status, fingerprint, "
+            "created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "__schema_probe_proj__",
+                "dev",
+                "PROBE_UQ",
+                "val1",
+                "vaulte",
+                "fp1",
+                "2026-01-01",
+                "2026-01-01",
+            ),
         )
+        uq_enforced = False
+        try:
+            conn.execute(
+                "INSERT INTO secrets ("
+                "project_id, env, name, encrypted_value, status, fingerprint, "
+                "created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "__schema_probe_proj__",
+                    "dev",
+                    "PROBE_UQ",
+                    "val2",
+                    "vaulte",
+                    "fp2",
+                    "2026-01-01",
+                    "2026-01-01",
+                ),
+            )
+        except sqlite3.IntegrityError:
+            uq_enforced = True
+        if not uq_enforced:
+            raise RuntimeError(
+                "Schéma de base de données non conforme : contrainte UNIQUE inopérante."
+            )
+
+        # Test comportemental de ON DELETE CASCADE
+        conn.execute("DELETE FROM projects WHERE id='__schema_probe_proj__';")
+        cur = conn.execute("SELECT COUNT(*) FROM secrets WHERE project_id='__schema_probe_proj__';")
+        if cur.fetchone()[0] != 0:
+            raise RuntimeError(
+                "Schéma de base de données non conforme : ON DELETE CASCADE inopérant."
+            )
+    finally:
+        conn.execute("ROLLBACK TO schema_behavioral_verify_sp;")
+        conn.execute("RELEASE schema_behavioral_verify_sp;")
 
 
 def init_db(db_path: Path | str | None = None) -> None:

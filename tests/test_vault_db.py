@@ -1049,6 +1049,108 @@ class VaultDatabaseTests(unittest.TestCase):
             init_db(degraded_db)
         self.assertIn("Schéma de base de données non conforme", str(ctx.exception))
 
+    def test_init_db_rejects_malicious_index_name(self) -> None:
+        """init_db lève RuntimeError si le nom d'un index contient des caractères invalides."""
+        malicious_db = Path(self.temp_dir.name) / "malicious_idx.db"
+        conn = sqlite3.connect(str(malicious_db))
+        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);")
+        conn.execute(
+            "CREATE TABLE api_keys ("
+            "id TEXT PRIMARY KEY, project_id TEXT NOT NULL, key_hash TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, revoked_at TEXT, "
+            "FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE);"
+        )
+        conn.execute(
+            "CREATE TABLE secrets ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, env TEXT NOT NULL, "
+            "name TEXT NOT NULL, encrypted_value TEXT NOT NULL, status TEXT NOT NULL, "
+            "fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+            "FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE, "
+            "CHECK (status IN ('vaulte', 'rote')));"
+        )
+        # Nom d'index malveillant contenant des guillemets simples/espaces
+        conn.execute('CREATE UNIQUE INDEX "idx\'injection" ON secrets(project_id, env, name);')
+        conn.commit()
+        conn.close()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            init_db(malicious_db)
+        self.assertIn("nom d'index invalide", str(ctx.exception))
+
+    def test_init_db_behavioral_check_rejects_comment_bypass(self) -> None:
+        """init_db vérifie le comportement du CHECK et refuse le contournement par commentaire."""
+        bypass_db = Path(self.temp_dir.name) / "bypass_comment.db"
+        conn = sqlite3.connect(str(bypass_db))
+        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);")
+        conn.execute(
+            "CREATE TABLE api_keys ("
+            "id TEXT PRIMARY KEY, project_id TEXT NOT NULL, key_hash TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, revoked_at TEXT, "
+            "FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE);"
+        )
+        # Table secrets sans vraie contrainte CHECK, mais avec le motif textuel en commentaire
+        conn.execute(
+            "CREATE TABLE secrets ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, env TEXT NOT NULL, "
+            "name TEXT NOT NULL, encrypted_value TEXT NOT NULL, "
+            "status TEXT DEFAULT 'status in (''vaulte'', ''rote'')', "
+            "fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+            "FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE, "
+            "UNIQUE (project_id, env, name)); -- status in ('vaulte', 'rote')"
+        )
+        conn.commit()
+        conn.close()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            init_db(bypass_db)
+        self.assertIn("contrainte CHECK de statut inopérante", str(ctx.exception))
+
+    def test_parent_dir_chmod_failure_raises_fail_closed(self) -> None:
+        """L'échec de sécurisation d'un répertoire créé lève PermissionError (fail-closed)."""
+        if os.name == "nt":
+            self.skipTest("chmod 0o700 testé sous POSIX uniquement")
+        target_db = Path(self.temp_dir.name) / "new_parent_fail" / "vault.db"
+
+        with patch.object(Path, "chmod", side_effect=OSError("Simulated chmod failure")):
+            with self.assertRaises(PermissionError) as ctx:
+                get_connection(target_db)
+            self.assertIn("sécuriser les permissions du répertoire parent", str(ctx.exception))
+
+    def test_parent_dir_insufficient_permissions_raises_fail_closed(self) -> None:
+        """Un répertoire créé dont le mode effectif != 0o700 lève PermissionError."""
+        if os.name == "nt":
+            self.skipTest("chmod 0o700 testé sous POSIX uniquement")
+        target_db = Path(self.temp_dir.name) / "new_parent_mode" / "vault.db"
+        orig_stat = Path.stat
+
+        def fake_stat(path_obj: Path, **kwargs: typing.Any) -> os.stat_result:
+            st = orig_stat(path_obj, **kwargs)
+            if "new_parent_mode" in str(path_obj):
+                fake_mode = (st.st_mode & ~0o777) | 0o755
+                return os.stat_result(
+                    (
+                        fake_mode,
+                        st.st_ino,
+                        st.st_dev,
+                        st.st_nlink,
+                        st.st_uid,
+                        st.st_gid,
+                        st.st_size,
+                        st.st_atime,
+                        st.st_mtime,
+                        st.st_ctime,
+                    )
+                )
+            return st
+
+        with patch.object(Path, "stat", autospec=True, side_effect=fake_stat):
+            with self.assertRaises(PermissionError) as ctx:
+                get_connection(target_db)
+            self.assertIn(
+                "Permissions du répertoire parent insuffisantes",
+                str(ctx.exception),
+            )
+
     # -----------------------------------------------------------------------
     # SecretStatus type alias
     # -----------------------------------------------------------------------
