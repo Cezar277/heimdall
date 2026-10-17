@@ -94,3 +94,16 @@ def test_commande_ci_en_debut_de_commentaire() -> None:
     for line in ACTIVE.splitlines():
         if "github.event.comment.body" in line:
             assert "startsWith" in line, line
+
+
+def test_gardes_abus_du_declencheur() -> None:
+    # Seuls OWNER/MEMBER/COLLABORATOR passent, et la garde est présente sur
+    # les deux chemins (approbation et commentaire /ci).
+    assert ACTIVE.count("author_association") == 2
+    assert '"OWNER","MEMBER","COLLABORATOR"' in ACTIVE
+    assert '"NONE"' not in ACTIVE
+    assert "CONTRIBUTOR" not in ACTIVE
+    assert "github.event.review.state == 'approved'" in ACTIVE
+    # merge_commit_sha absent (conflits) : échec fail-closed, pas de check.
+    assert "if (!pr.merge_commit_sha)" in ACTIVE
+    assert "Commit de merge indisponible" in ACTIVE
