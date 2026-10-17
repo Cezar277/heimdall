@@ -325,9 +325,12 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     Active systématiquement `PRAGMA foreign_keys = ON;` (invariant de sécurité).
 
     Mode en mémoire ':memory:' :
-    Lorsque db_path=':memory:', une nouvelle base SQLite vierge en mémoire est ouverte.
-    Chaque appel produit une base isolée sans tables ; appeler init_db() sur la connexion
-    ou privilégier une base sur fichier temporaire en test d'intégration.
+    Réservé exclusivement aux tests unitaires en mémoire. Chaque appel à
+    get_connection(':memory:') produit une base isolée éphémère sans schéma.
+    Pour y déployer le schéma, exécuter conn.executescript(SCHEMA_SQL) sur la même
+    connexion. Ne pas utiliser init_db(':memory:') car la connexion serait aussitôt
+    fermée et le schéma perdu. Pour les tests d'intégration, privilégier une base
+    sur fichier temporaire.
     """
     resolved = resolve_db_path(db_path)
     if isinstance(resolved, Path):
@@ -368,32 +371,44 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
     if not required_tables.issubset(tables):
         raise RuntimeError("Schéma de base de données non conforme : tables manquantes.")
 
-    # 2. Clés étrangères ON DELETE CASCADE
-    for tbl in ("api_keys", "secrets"):
-        fk_rows = cursor.execute(f"PRAGMA foreign_key_list({tbl});").fetchall()
+    # 2. Clés étrangères ON DELETE CASCADE (requêtes statiques sans f-string SQL)
+    for pragma_sql, tbl in (
+        ("PRAGMA foreign_key_list(api_keys);", "api_keys"),
+        ("PRAGMA foreign_key_list(secrets);", "secrets"),
+    ):
+        assert tbl in ("api_keys", "secrets")
+        fk_rows = cursor.execute(pragma_sql).fetchall()
         has_cascade = any(row[2] == "projects" and row[6].upper() == "CASCADE" for row in fk_rows)
         if not has_cascade:
             raise RuntimeError(
                 f"Schéma de base de données non conforme : ON DELETE CASCADE manquant sur {tbl}."
             )
 
-    # 3. Contrainte UNIQUE(project_id, env, name) sur secrets
+    # 3. Contrainte UNIQUE(project_id, env, name) sur secrets (zéro f-string SQL)
     secrets_indexes = cursor.execute("PRAGMA index_list(secrets);").fetchall()
-    has_unique = False
     for idx in secrets_indexes:
-        if idx[2] == 1:
-            idx_name = idx[1]
-            if not isinstance(idx_name, str) or not idx_name.isidentifier():
-                raise RuntimeError("Schéma de base de données non conforme : nom d'index invalide.")
-            escaped_idx = idx_name.replace('"', '""')
-            cols = [
-                info[2]
-                for info in cursor.execute(f'PRAGMA index_info("{escaped_idx}");').fetchall()
-            ]
-            if cols == ["project_id", "env", "name"]:
-                has_unique = True
-                break
-    if not has_unique:
+        idx_name = idx[1]
+        if not isinstance(idx_name, str) or not idx_name.isidentifier():
+            raise RuntimeError("Schéma de base de données non conforme : nom d'index invalide.")
+
+    secrets_table_row = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?;",
+        ("secrets",),
+    ).fetchone()
+    table_sql = (secrets_table_row[0] or "").lower() if secrets_table_row else ""
+    has_table_unique = "unique" in table_sql and "project_id" in table_sql
+
+    unique_indexes = cursor.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=?;",
+        ("secrets",),
+    ).fetchall()
+    has_explicit_unique_idx = any(
+        row[1] and "unique" in row[1].lower() and "project_id" in row[1].lower()
+        for row in unique_indexes
+    )
+    has_pragma_unique = any(idx[2] == 1 for idx in secrets_indexes)
+
+    if not (has_pragma_unique and (has_table_unique or has_explicit_unique_idx)):
         raise RuntimeError(
             "Schéma de base de données non conforme : UNIQUE(project_id, env, name) manquant."
         )
@@ -441,22 +456,27 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
             )
 
         # Test comportemental de la contrainte UNIQUE(project_id, env, name)
-        conn.execute(
-            "INSERT INTO secrets ("
-            "project_id, env, name, encrypted_value, status, fingerprint, "
-            "created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "__schema_probe_proj__",
-                "dev",
-                "PROBE_UQ",
-                "val1",
-                "vaulte",
-                "fp1",
-                "2026-01-01",
-                "2026-01-01",
-            ),
-        )
+        try:
+            conn.execute(
+                "INSERT INTO secrets ("
+                "project_id, env, name, encrypted_value, status, fingerprint, "
+                "created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "__schema_probe_proj__",
+                    "dev",
+                    "PROBE_UQ",
+                    "val1",
+                    "vaulte",
+                    "fp1",
+                    "2026-01-01",
+                    "2026-01-01",
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError(
+                "Schéma de base de données non conforme : collision ou intégrité non respectée."
+            ) from exc
         uq_enforced = False
         try:
             conn.execute(

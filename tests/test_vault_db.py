@@ -39,6 +39,7 @@ from pydantic import ValidationError
 from heimdall.vault.app import VaultSettings
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
+    SCHEMA_SQL,
     SecretStatus,
     _apply_secure_permissions,
     create_api_key,
@@ -1150,6 +1151,119 @@ class VaultDatabaseTests(unittest.TestCase):
                 "Permissions du répertoire parent insuffisantes",
                 str(ctx.exception),
             )
+
+    def test_probe_collision_raises_normalized_runtime_error(self) -> None:
+        """Remarque 4 — Sonde en collision lève RuntimeError normalisée sans toucher aux données."""
+        collision_db = Path(self.temp_dir.name) / "collision.db"
+        conn = sqlite3.connect(str(collision_db))
+        conn.executescript(SCHEMA_SQL)
+        # Pré-plante la ligne en collision avec la sonde (__schema_probe_proj__/dev/PROBE_UQ)
+        conn.execute(
+            "INSERT INTO projects (id, created_at) VALUES ('__schema_probe_proj__', '2026-01-01');"
+        )
+        conn.execute(
+            "INSERT INTO secrets ("
+            "project_id, env, name, encrypted_value, status, fingerprint, "
+            "created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "__schema_probe_proj__",
+                "dev",
+                "PROBE_UQ",
+                "real_user_val",
+                "vaulte",
+                "fp_user",
+                "2026-01-01",
+                "2026-01-01",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        # init_db sur cette base doit lever RuntimeError (et JAMAIS sqlite3.IntegrityError)
+        with self.assertRaises(RuntimeError) as ctx:
+            init_db(collision_db)
+        self.assertIn("collision", str(ctx.exception).lower())
+
+        # Vérifie que la donnée utilisateur pré-existante n'a pas été altérée ni supprimée
+        verify_conn = sqlite3.connect(str(collision_db))
+        try:
+            row = verify_conn.execute(
+                "SELECT encrypted_value FROM secrets "
+                "WHERE project_id='__schema_probe_proj__' AND env='dev' AND name='PROBE_UQ';"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row[0], "real_user_val")
+        finally:
+            verify_conn.close()
+
+    def test_memory_db_behavior_pinned(self) -> None:
+        """Remarque 5 — Pinnage du comportement de :memory: (isolée, schéma perdu si init_db)."""
+        # 1. get_connection(':memory:') rend une base isolée vierge
+        conn1 = get_connection(":memory:")
+        try:
+            tables1 = conn1.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
+            self.assertEqual(tables1, [])
+
+            # 2. init_db(':memory:') crée le schéma sur une connexion éphémère aussitôt fermée
+            init_db(":memory:")
+
+            # 3. Une nouvelle connexion :memory: reste vierge (isolation par connexion)
+            conn2 = get_connection(":memory:")
+            try:
+                tables2 = conn2.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table';"
+                ).fetchall()
+                self.assertEqual(tables2, [])
+            finally:
+                conn2.close()
+
+            # 4. Le schéma en mémoire s'instancie directement via executescript(SCHEMA_SQL)
+            conn1.executescript(SCHEMA_SQL)
+            create_project(conn1, "proj_mem")
+            proj = get_project(conn1, "proj_mem")
+            self.assertIsNotNone(proj)
+            assert proj is not None
+            self.assertEqual(proj["id"], "proj_mem")
+        finally:
+            conn1.close()
+
+    def test_umask_restored_on_chmod_failure(self) -> None:
+        """Section 3 — L'umask est restauré après _open_db_file même sur chmod mocké en OSError."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        initial_umask = os.umask(0o022)
+        os.umask(initial_umask)
+
+        fail_path = Path(self.temp_dir.name) / "umask_chmod_fail" / "vault.db"
+        with patch.object(Path, "chmod", side_effect=OSError("chmod error")):
+            with self.assertRaises(PermissionError):
+                get_connection(fail_path)
+
+        restored_umask = os.umask(0o022)
+        os.umask(restored_umask)
+        self.assertEqual(
+            restored_umask,
+            initial_umask,
+            f"umask non restauré après échec chmod : attendu {oct(initial_umask)}, "
+            f"obtenu {oct(restored_umask)}",
+        )
+
+    def test_get_connection_rejects_existing_directory_and_path_memory(self) -> None:
+        """Section 3 — get_connection refuse un répertoire existant et gère Path(':memory:')."""
+        existing_dir = Path(self.temp_dir.name) / "some_dir"
+        existing_dir.mkdir(exist_ok=True)
+        with self.assertRaises(IsADirectoryError):
+            get_connection(existing_dir)
+
+        # Path(':memory:') littéral est normalisé en mode en mémoire ':memory:'
+        conn_mem = get_connection(Path(":memory:"))
+        try:
+            cur = conn_mem.execute("SELECT 1;")
+            self.assertEqual(cur.fetchone()[0], 1)
+        finally:
+            conn_mem.close()
 
     # -----------------------------------------------------------------------
     # SecretStatus type alias
