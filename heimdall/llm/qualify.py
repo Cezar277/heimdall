@@ -52,6 +52,7 @@ from heimdall.mcp.prompts import (
     MAX_CANDIDATE_CHARS,
     PROMPT_NAME,
     QUALIFY_FORMAT_V1,
+    VERDICTS,
     CandidateTooLargeError,
     build_messages,
 )
@@ -150,6 +151,14 @@ class Qualification:
     Finding (contrat #14, ADR-001). ``verdict`` est l'avis validé ;
     ``reason`` est le code fermé du refus, renseigné si et seulement si la
     sortie n'est pas retenue (``verdict`` vaut alors ``None``).
+
+    Les annotations ne sont pas imposées à l'exécution (les ``Literal``
+    Python ne le sont jamais) : ``__post_init__`` revalide donc aussi les
+    valeurs — ``status`` ``detecte``, ``verdict`` dans ``VERDICTS``,
+    ``reason`` dans ``ERROR_MESSAGES`` — pour que la robustesse ne dépende
+    pas de la discipline de l'appelant (#32). Un état incohérent lève une
+    ``ValueError`` vers l'appelant : erreur de programmation, jamais un
+    refus silencieux.
     """
 
     status: Literal["detecte"]
@@ -157,12 +166,21 @@ class Qualification:
     reason: ErrorCode | None
 
     def __post_init__(self) -> None:
-        # Corrélation imposée par le type, pas seulement promise par le
+        # Corrélation imposée à l'exécution, pas seulement promise par le
         # docstring : soit un avis retenu (verdict seul), soit un refus
         # motivé (raison seule). Un état ambigu (les deux ou aucun)
         # lèverait chez l'appelant une interprétation « retirer le finding ».
         if (self.verdict is None) == (self.reason is None):
             raise ValueError("etat incoherent : verdict xor reason")
+        # Listes blanches revalidées : un statut qui blanchirait un candidat
+        # (« faux_positif », « vaulte »…) ou une raison hors registre ne
+        # peuvent pas exister, même construits hors du chemin nominal.
+        if self.status != "detecte":
+            raise ValueError("etat incoherent : status detecte attendu")
+        if self.verdict is not None and self.verdict not in VERDICTS:
+            raise ValueError("etat incoherent : verdict hors liste blanche")
+        if self.reason is not None and self.reason not in ERROR_MESSAGES:
+            raise ValueError("etat incoherent : raison hors registre ferme")
 
 
 def _loopback_client() -> ollama.Client:

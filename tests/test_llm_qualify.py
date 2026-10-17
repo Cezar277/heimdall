@@ -38,9 +38,11 @@ from heimdall.llm.qualify import (
     OLLAMA_HOST,
     QUALIFY_FORMAT_V1,
     REQUEST_TIMEOUT,
+    ErrorCode,
     Qualification,
     QualifyError,
     QualifyVerdict,
+    Verdict,
     _loopback_client,
     qualify,
     qualify_candidate,
@@ -657,7 +659,7 @@ class TestCandidateStaysDetected:
         ],
     )
     def test_refused_input_keeps_candidate_detected_without_calling_llm(
-        self, candidate: str, model: str, reason: str
+        self, candidate: str, model: str, reason: ErrorCode
     ) -> None:
         chat = RecordingChat()
         result = qualify_candidate(candidate, model=model, chat=chat)
@@ -676,15 +678,24 @@ class TestCandidateStaysDetected:
         [
             {"status": "detecte", "verdict": "secret", "reason": "invalid"},
             {"status": "detecte", "verdict": None, "reason": None},
+            {"status": "blanchi", "verdict": None, "reason": "invalid"},
+            {"status": "detecte", "verdict": "MAYBE", "reason": None},
+            {"status": "detecte", "verdict": None, "reason": "hors_registre"},
         ],
-        ids=["verdict-et-raison", "ni-verdict-ni-raison"],
+        ids=[
+            "verdict-et-raison",
+            "ni-verdict-ni-raison",
+            "status-hors-liste-blanche",
+            "verdict-hors-liste-blanche",
+            "raison-hors-registre",
+        ],
     )
     def test_incoherent_qualification_is_rejected(self, qualification: dict[str, Any]) -> None:
         with pytest.raises(ValueError, match="etat incoherent"):
-            Qualification(**qualification)  # type: ignore[arg-type]
+            Qualification(**qualification)
 
     @pytest.mark.parametrize("verdict", ["secret", "faux_positif", "incertain"])
-    def test_valid_verdict_never_removes_candidate(self, verdict: str) -> None:
+    def test_valid_verdict_never_removes_candidate(self, verdict: Verdict) -> None:
         content = json.dumps({"verdict": verdict, "confidence": 0.99})
         result = qualify_candidate(MASKED_CANDIDATE, chat=RecordingChat(content))
         assert result == Qualification(status="detecte", verdict=verdict, reason=None)
