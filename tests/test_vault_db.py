@@ -26,6 +26,7 @@ import shutil
 import sqlite3
 import stat as stat_module
 import subprocess
+import sys
 import tempfile
 import typing
 import unittest
@@ -483,30 +484,34 @@ class VaultDatabaseTests(unittest.TestCase):
         with db_session(self.db_path) as conn:
             create_project(conn, "proj_reflect")
             # create_secret
-            with self.assertRaises(ValueError) as ctx_create:
-                create_secret(
-                    conn,
-                    "proj_reflect",
-                    "dev",
-                    "SEC_LOG_INJ",
-                    "enc",
-                    status=injection_payload,  # type: ignore[arg-type]
-                )
+            with self.assertLogs("heimdall.vault.database", level="DEBUG") as log_ctx:
+                with self.assertRaises(ValueError) as ctx_create:
+                    create_secret(
+                        conn,
+                        "proj_reflect",
+                        "dev",
+                        "SEC_LOG_INJ",
+                        "enc",
+                        status=injection_payload,  # type: ignore[arg-type]
+                    )
             self.assertNotIn(injection_payload, str(ctx_create.exception))
             self.assertNotIn("\\n", str(ctx_create.exception))
+            self.assertFalse(any(injection_payload in msg for msg in log_ctx.output))
 
             create_secret(conn, "proj_reflect", "dev", "SEC_OK", "enc")
             # update_secret
-            with self.assertRaises(ValueError) as ctx_update:
-                update_secret(
-                    conn,
-                    project_id="proj_reflect",
-                    env="dev",
-                    name="SEC_OK",
-                    encrypted_value="enc_v2",
-                    status=injection_payload,  # type: ignore[arg-type]
-                )
+            with self.assertLogs("heimdall.vault.database", level="DEBUG") as log_ctx_up:
+                with self.assertRaises(ValueError) as ctx_update:
+                    update_secret(
+                        conn,
+                        project_id="proj_reflect",
+                        env="dev",
+                        name="SEC_OK",
+                        encrypted_value="enc_v2",
+                        status=injection_payload,  # type: ignore[arg-type]
+                    )
             self.assertNotIn(injection_payload, str(ctx_update.exception))
+            self.assertFalse(any(injection_payload in msg for msg in log_ctx_up.output))
 
     # -----------------------------------------------------------------------
     # 7. SQL Injection (CWE-89)
@@ -1157,9 +1162,15 @@ class VaultDatabaseTests(unittest.TestCase):
         collision_db = Path(self.temp_dir.name) / "collision.db"
         conn = sqlite3.connect(str(collision_db))
         conn.executescript(SCHEMA_SQL)
-        # Pré-plante la ligne en collision avec la sonde (__schema_probe_proj__/dev/PROBE_UQ)
+
+        fake_uuid = type("FakeUUID", (), {"hex": "fixed_collision_hex"})()
+        target_proj = "__schema_probe_fixed_collision_hex__"
+        target_uq = "PROBE_UQ_fixed_collision_hex"
+
+        # Pré-plante la ligne en collision avec la sonde
         conn.execute(
-            "INSERT INTO projects (id, created_at) VALUES ('__schema_probe_proj__', '2026-01-01');"
+            "INSERT INTO projects (id, created_at) VALUES (?, ?);",
+            (target_proj, "2026-01-01"),
         )
         conn.execute(
             "INSERT INTO secrets ("
@@ -1167,9 +1178,9 @@ class VaultDatabaseTests(unittest.TestCase):
             "created_at, updated_at"
             ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                "__schema_probe_proj__",
+                target_proj,
                 "dev",
-                "PROBE_UQ",
+                target_uq,
                 "real_user_val",
                 "vaulte",
                 "fp_user",
@@ -1181,16 +1192,25 @@ class VaultDatabaseTests(unittest.TestCase):
         conn.close()
 
         # init_db sur cette base doit lever RuntimeError (et JAMAIS sqlite3.IntegrityError)
-        with self.assertRaises(RuntimeError) as ctx:
-            init_db(collision_db)
+        with patch("heimdall.vault.database.uuid4", return_value=fake_uuid):
+            with self.assertRaises(RuntimeError) as ctx:
+                init_db(collision_db)
         self.assertIn("collision", str(ctx.exception).lower())
 
         # Vérifie que la donnée utilisateur pré-existante n'a pas été altérée ni supprimée
         verify_conn = sqlite3.connect(str(collision_db))
         try:
+            proj_row = verify_conn.execute(
+                "SELECT id FROM projects WHERE id=?;",
+                (target_proj,),
+            ).fetchone()
+            self.assertIsNotNone(proj_row)
+            assert proj_row is not None
+            self.assertEqual(proj_row[0], target_proj)
+
             row = verify_conn.execute(
-                "SELECT encrypted_value FROM secrets "
-                "WHERE project_id='__schema_probe_proj__' AND env='dev' AND name='PROBE_UQ';"
+                "SELECT encrypted_value FROM secrets WHERE project_id=? AND env='dev' AND name=?;",
+                (target_proj, target_uq),
             ).fetchone()
             self.assertIsNotNone(row)
             assert row is not None
@@ -1264,6 +1284,45 @@ class VaultDatabaseTests(unittest.TestCase):
             self.assertEqual(cur.fetchone()[0], 1)
         finally:
             conn_mem.close()
+
+    def test_init_db_cli_help_documents_exit_codes(self) -> None:
+        """Pinnage des codes de sortie 0, 1 et 2 dans l'aide de la CLI init_db."""
+        result = subprocess.run(
+            [sys.executable, "-m", "heimdall.vault.init_db", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Codes de retour", result.stdout)
+        self.assertIn("0", result.stdout)
+        self.assertIn("1", result.stdout)
+        self.assertIn("2", result.stdout)
+
+    def test_oversized_inputs_behavior_pinned(self) -> None:
+        """Pinnage du comportement face à des entrées surdimensionnées (bloat DoS)."""
+        init_db(self.db_path)
+        with db_session(self.db_path) as conn:
+            huge_id = "proj_" + "a" * (2 * 1024 * 1024)
+            huge_name = "VAR_" + "b" * (2 * 1024 * 1024)
+            create_project(conn, huge_id)
+            p = get_project(conn, huge_id)
+            self.assertIsNotNone(p)
+            assert p is not None
+            self.assertEqual(p["id"], huge_id)
+
+            create_secret(
+                conn,
+                project_id=huge_id,
+                env="dev",
+                name=huge_name,
+                encrypted_value="ciphertext",
+                fingerprint="fp_huge",
+            )
+            s = get_secret(conn, huge_id, "dev", huge_name)
+            self.assertIsNotNone(s)
+            assert s is not None
+            self.assertEqual(s["name"], huge_name)
 
     # -----------------------------------------------------------------------
     # SecretStatus type alias

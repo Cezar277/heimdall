@@ -40,6 +40,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -422,11 +423,15 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
 
     Exécutée au sein d'un SAVEPOINT systématiquement annulé (non destructeur).
     """
+    probe_proj = f"__schema_probe_{uuid4().hex}__"
+    probe_chk = f"PROBE_CHK_{uuid4().hex}"
+    probe_uq = f"PROBE_UQ_{uuid4().hex}"
+
     conn.execute("SAVEPOINT schema_behavioral_verify_sp;")
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO projects (id, created_at) "
-            "VALUES ('__schema_probe_proj__', '2026-01-01');"
+            "INSERT OR IGNORE INTO projects (id, created_at) VALUES (?, ?);",
+            (probe_proj, "2026-01-01"),
         )
 
         # Test comportemental du CHECK sur status
@@ -438,9 +443,9 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
                 "created_at, updated_at"
                 ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    "__schema_probe_proj__",
+                    probe_proj,
                     "dev",
-                    "PROBE_CHK",
+                    probe_chk,
                     "val",
                     "invalid_probe_status",
                     "fp",
@@ -463,9 +468,9 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
                 "created_at, updated_at"
                 ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    "__schema_probe_proj__",
+                    probe_proj,
                     "dev",
-                    "PROBE_UQ",
+                    probe_uq,
                     "val1",
                     "vaulte",
                     "fp1",
@@ -485,9 +490,9 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
                 "created_at, updated_at"
                 ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    "__schema_probe_proj__",
+                    probe_proj,
                     "dev",
-                    "PROBE_UQ",
+                    probe_uq,
                     "val2",
                     "vaulte",
                     "fp2",
@@ -502,9 +507,12 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
                 "Schéma de base de données non conforme : contrainte UNIQUE inopérante."
             )
 
-        # Test comportemental de ON DELETE CASCADE
-        conn.execute("DELETE FROM projects WHERE id='__schema_probe_proj__';")
-        cur = conn.execute("SELECT COUNT(*) FROM secrets WHERE project_id='__schema_probe_proj__';")
+        # Test comportemental de ON DELETE CASCADE (paramétré en '?')
+        conn.execute("DELETE FROM projects WHERE id=?;", (probe_proj,))
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM secrets WHERE project_id=?;",
+            (probe_proj,),
+        )
         if cur.fetchone()[0] != 0:
             raise RuntimeError(
                 "Schéma de base de données non conforme : ON DELETE CASCADE inopérant."
@@ -677,7 +685,7 @@ def create_secret(  # noqa: PLR0913
     ou la clé étrangère est enfreinte.
     """
     if status not in _ALLOWED_STATUSES:
-        logger.debug("Statut de secret invalide reçu : %r", status)
+        logger.debug("Statut de secret invalide rejeté applicativement.")
         raise ValueError("Statut de secret invalide.")
     ts = created_at or get_iso_timestamp()
     up_ts = updated_at or ts
@@ -777,7 +785,7 @@ def update_secret(  # noqa: PLR0913
     applicative avant toute requête SQL.
     """
     if status not in _ALLOWED_STATUSES:
-        logger.debug("Statut de secret invalide reçu : %r", status)
+        logger.debug("Statut de secret invalide rejeté applicativement.")
         raise ValueError("Statut de secret invalide.")
     up_ts = updated_at or get_iso_timestamp()
     query = (

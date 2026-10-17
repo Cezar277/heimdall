@@ -40,6 +40,7 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 import ipaddress
 import logging
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
@@ -226,7 +227,8 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
     app.state.settings = effective_settings
     resolved_db = resolve_db_path(effective_settings.db_path)
     app.state.db_path = resolved_db
-    logger.debug("Base de données SQLite configurée : %s", resolved_db)
+    db_repr = resolved_db.name if isinstance(resolved_db, Path) else resolved_db
+    logger.debug("Base de données SQLite configurée : %s", db_repr)
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:

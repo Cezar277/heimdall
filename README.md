@@ -43,6 +43,7 @@ Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) vi
 
 ```sh
 # Initialisation à froid de la base de données SQLite (#62) :
+# Codes de retour : 0 (succès), 1 (erreur d'initialisation), 2 (refus ':memory:' en CLI)
 python -m heimdall.vault.init_db
 
 # Lancement du serveur Vault (point d'entrée unique, boucle locale vérifiée) :

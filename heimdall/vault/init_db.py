@@ -17,7 +17,11 @@ from heimdall.vault.database import DEFAULT_DB_PATH, init_db, resolve_db_path
 def main(argv: list[str] | None = None) -> int:
     """Point d'entrée CLI pour initialiser à froid la base SQLite."""
     parser = argparse.ArgumentParser(
-        description="Initialisation à froid de la base de données SQLite du Vault Heimdall (#62)."
+        description="Initialisation à froid de la base de données SQLite du Vault Heimdall (#62).",
+        epilog=(
+            "Codes de retour : 0 (succès), 1 (erreur d'initialisation ou permissions), "
+            "2 (mode ':memory:' interdit en CLI)."
+        ),
     )
     parser.add_argument(
         "--db-path",
