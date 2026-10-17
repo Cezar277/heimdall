@@ -69,6 +69,12 @@ Dans Settings > Branches, la règle sur `main` impose:
 - les status checks requis (une fois la CI en place),
 - pas de force-push.
 
+La CI lourde (`.github/workflows/ci.yml`, #20) ne se déclenche **pas** à chaque
+push : elle démarre à l'approbation d'une review (ou via Actions >
+*Run workflow*). Approuver une PR lance donc aussi les tests. Après un nouveau
+commit sur la branche, une nouvelle approbation est nécessaire pour relancer
+la CI.
+
 ## 8. Règles de sécurité (non négociables)
 
 - Jamais de vrai secret dans le dépôt, même expiré. Les jeux de test utilisent des faux secrets clairement factices.

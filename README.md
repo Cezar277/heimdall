@@ -92,6 +92,51 @@ openapi.yaml         contrat Vault API v1 (#15)
 - [ADR-004 : Choix du modèle LLM local Ollama, prompt du trieur (#79/#80)](docs/adr/004-choix-modele-ollama.md)
 - [Modèle de menaces : DFD, actifs, STRIDE et risques prioritaires (T18)](docs/security/README.md)
 
+## Intégration continue (CI)
+
+Le workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (« CI Security
+& Quality ») exécute ruff, mypy (strict), bandit, les tests avec un seuil de
+couverture de 85 % (`pytest-cov`) et `pip-audit`, sur un runner **self-hosted**
+(comme les autres workflows) : zéro minute GitHub consommée.
+
+Il ne tourne volontairement **pas** à chaque push de branche (quota GitHub et
+bruit contenus) :
+
+1. **Approbation d'un relecteur** : déclenchement par `pull_request_review`
+   (état `approved`), sur la ref de merge `refs/pull/<n>/merge` — le statut
+   s'attache donc à la PR et peut être exigé par la protection de `main`
+   (voir les réglages ci-dessous).
+2. **Push sur `main`** : preuve « pipeline vert sur main » après merge.
+3. **Commande spéciale** : Actions → « CI Security & Quality » →
+   *Run workflow* (`workflow_dispatch`).
+
+Les autres workflows (`Vault contract`, `Security model`, `OpenCode review`)
+gardent leurs propres déclencheurs. Après un nouveau commit sur une PR déjà
+approuvée, la CI ne se relance qu'avec une nouvelle approbation (ou un
+dispatch manuel).
+
+### Exception réseau documentée : `pip-audit`
+
+Heimdall est 100 % local : ni l'outil ni le serveur MCP ne font d'appel réseau.
+Seule exception, **en CI uniquement** (build-time) : l'étape `pip-audit` du
+workflow interroge l'API publique PyPI pour confronter nos dépendances aux CVE
+connues. Seuls les **noms et versions des paquets** installés sont transmis —
+aucun code source, aucun secret, aucune métadonnée du projet. Aucun appel
+réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
+
+### Réglages GitHub du dépôt (une fois, non versionnables)
+
+- **Code security** : activer *Dependabot alerts* et *Dependabot security
+  updates* (gratuits, dépôts privés inclus). *Secret scanning* et *push
+  protection* sont gratuits sur un dépôt public mais payants sur un dépôt
+  privé (GitHub Advanced Security / Secret Protection) — à activer si le plan
+  le permet.
+- **Protection de `main`** : PR obligatoire + 1 approbation ; exiger les
+  checks `Security model` et `Lint, Typecheck, Audit & Test` (ce dernier
+  n'apparaît dans la liste qu'après une première approbation de PR) ; pas de
+  force-push. Ne pas exiger `Vault contract` : ses filtres de chemins le
+  laisseraient « en attente » sur les PR sans fichiers de contrat.
+
 ## Vérifier
 
 ```sh
@@ -100,6 +145,9 @@ openapi.yaml         contrat Vault API v1 (#15)
 .venv/bin/ruff check heimdall tests
 .venv/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
 .venv/bin/bandit -r heimdall -q
+.venv/bin/python -m pytest --cov=heimdall --cov-branch \
+    --cov-report=term-missing --cov-fail-under=85   # idem CI (#20)
+.venv/bin/pip-audit --skip-editable             # comme la CI : requête réseau (PyPI)
 git diff --check
 ```
 
