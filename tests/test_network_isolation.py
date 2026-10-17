@@ -2,7 +2,9 @@
 
 Les sockets Python sont interceptées avant l'appel système. Ce garde teste les
 chemins applicatifs courants, mais ne remplace pas le contrôle OS ``strace`` ;
-les sockets AF_UNIX restent une exception locale documentée. Les six méthodes
+les sockets AF_UNIX restent une exception locale documentée (autorisées en
+``send``, refusées en écriture par descripteur — asymétrie verrouillée par
+test). Les six méthodes
 que ``ssl.SSLSocket`` surcharge (``send``, ``sendall``, ``write``, ``sendto``,
 ``sendmsg``, ``sendfile``) sont patchées séparément : elles ne passent pas par
 celles de ``socket.socket``. Les écritures par descripteur (``os.write``,
@@ -434,6 +436,31 @@ def test_guard_allows_and_tracks_loopback_tcp(loopback_only: NetworkLedger) -> N
     assert all(
         _is_local_destination(attempt.family, attempt.destination) for attempt in destinations
     )
+
+
+def test_guard_allows_af_unix_send_but_refuses_fd_write(loopback_only: NetworkLedger) -> None:
+    """Asymétrie AF_UNIX assumée et documentée : `send` OK, écriture par fd non.
+
+    Un socketpair AF_UNIX est de l'IPC local : `send` est autorisé et journalisé
+    comme exception. Une écriture par descripteur (`os.write`) vers ce même fd
+    est en revanche refusée, car un fd AF_UNIX n'est jamais épinglé au loopback
+    — plus strict côté descripteur (fail-closed).
+    """
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        left.send(b"ipc")
+        assert right.recv(3) == b"ipc"
+        unix_attempts = [
+            attempt for attempt in loopback_only.attempts if attempt.family == socket.AF_UNIX
+        ]
+        assert len(unix_attempts) == 1
+        assert not unix_attempts[0].blocked
+        with pytest.raises(AssertionError, match="descripteur hors socket loopback"):
+            os.write(left.fileno(), b"ipc")
+    finally:
+        left.close()
+        right.close()
+    assert len(loopback_only.blocked) == 1
 
 
 def test_guard_blocks_external_udp_destination(loopback_only: NetworkLedger) -> None:

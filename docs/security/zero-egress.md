@@ -22,7 +22,12 @@ appelleraient directement des syscalls contournent les wrappers et relèvent de
 la trace OS.
 
 Limites explicites : les sockets `AF_UNIX` sont permises comme IPC local et
-pourraient théoriquement servir de relais via un autre processus ; toute
+pourraient théoriquement servir de relais via un autre processus — asymétrie
+assumée et verrouillée par
+`test_guard_allows_af_unix_send_but_refuses_fd_write` : `socket.send` sur
+`AF_UNIX` est autorisé (journalisé comme exception), tandis qu'une écriture par
+descripteur (`os.write`/`os.writev`/`os.sendfile`) vers un fd `AF_UNIX` est
+refusée (fd jamais épinglé). Toute
 **référence capturée avant le patch** (`orig = socket.getaddrinfo`,
 `from os import write`, `from os import sendfile`, valeur par défaut liée à
 l'import) garde l'original — trou connu, verrouillé pour DNS par
@@ -32,12 +37,11 @@ extensions natives qui appellent directement les syscalls réseau (sans passer
 par les méthodes Python) ne sont pas couvertes. Piège vérifié : `strace -e
 trace=%network` ne trace **pas** `write`/`writev` génériques — une écriture
 directe sur un descripteur de socket déjà connecté n'y apparaîtrait pas ; le
-rejeu OS utilise donc `-e trace=%network,write,writev,sendfile`, ce qui couvre
-aussi les alias `os.*` précoces. Les écritures par descripteur (`os.write`,
-`os.writev`, `os.sendfile`) sont refusées sauf si le descripteur appartient à
-une socket loopback épinglée (un descripteur `AF_UNIX` y est donc refusé : plus
-strict que le chemin socket, fail-closed). Ce garde n'est donc pas un pare-feu :
-la trace système ci-dessous est nécessaire en complément.
+rejeu OS utilise donc `-e trace=execve,%network,write,writev,sendfile`, ce qui
+couvre aussi les alias `os.*` précoces. Un relais inter-processus via socket
+Unix reste hors du garde et n'apparaît dans la trace que s'il ressort en IP.
+Ce garde n'est donc pas un pare-feu : la trace système ci-dessous est
+nécessaire en complément.
 
 Commande :
 
@@ -48,21 +52,21 @@ Commande :
 Résultat observé le 17/10/2026 :
 
 ```text
-.............................                                            [100%]
+..............................                                           [100%]
 ```
 
-Suite complète avec la couverture CI : **712 passed**, 3 831 sous-tests,
+Suite complète avec la couverture CI : **713 passed**, 3 831 sous-tests,
 couverture Heimdall **99,48 %** (seuil CI : 85 %).
 
 ## Observation système
 
-Commande exécutée depuis la racine du dépôt le **2026-10-17 à 21:26:31 +02:00**
-(trace des syscalls réseau **et** des écritures — `%network` seul ne couvre pas
-`write`/`writev` ; `-yy` affiche les objets associés aux descripteurs, `-ttt`
-les horodatages, `-s 256` la taille des chaînes) :
+Commande exécutée depuis la racine du dépôt le **2026-10-17 à 21:48:51 +02:00**
+(trace de l'`execve`, des syscalls réseau **et** des écritures — `%network` seul
+ne couvre pas `write`/`writev` ; `-yy` affiche les objets associés aux
+descripteurs, `-ttt` les horodatages, `-s 256` la taille des chaînes) :
 
 ```sh
-strace -f -yy -ttt -s 256 -e trace=%network,write,writev,sendfile \
+strace -f -yy -ttt -s 256 -e trace=execve,%network,write,writev,sendfile \
   -o docs/security/zero-egress.strace .venv/bin/heimdall scan --ci .
 ```
 
@@ -75,24 +79,26 @@ exit=2
 
 La trace complète archivée est
 [`zero-egress.strace`](zero-egress.strace) — SHA-256
-`e8394de48de71a6e8a8662613757166723e44de2f1179d9216fa365286987fd2`. Ses deux
+`5f1177a5c091045a5a370014ca62c72c86d063222f39b217583c35c07ab7bb8d`. Ses trois
 lignes :
 
 ```text
-326853 1792265191.622802 write(2<UNIX-STREAM:[1261377->1261376]>, "heimdall scan: scanner non implémenté (voir #22) — refus par défaut.\n", 74) = 74
-326853 1792265191.727635 +++ exited with 2 +++
+342078 1792266531.746354 execve(".venv/bin/heimdall", [".venv/bin/heimdall", "scan", "--ci", "."], 0x7fff87da5d60 /* 75 vars */) = 0
+342078 1792266532.223944 write(2<UNIX-STREAM:[1286795->1286794]>, "heimdall scan: scanner non impl\303\251ment\303\251 (voir #22) \342\200\224 refus par d\303\251faut.\n", 74) = 74
+342078 1792266532.332271 +++ exited with 2 +++
 ```
 
-Même PID `326853` sur les deux lignes (pas de fork), horodatage Unix
-`1792265191.622802` = 2026-10-17 21:26:31 +02:00. La **seule** écriture tracée
-est le message d'erreur attendu vers le descripteur 2, que `-yy` résout en
-socketpair UNIX local (`UNIX-STREAM:[…]`, capture du terminal) — pas une socket
-IP. **Aucun `connect`, `sendto`, `sendmsg`, `sendfile` ni résolution DNS n'est
-tracé** ; le message observé est inclus dans le syscall, ce qui rattache la
-sortie au processus du scan. L'empreinte permet de vérifier que la trace n'a
-pas été modifiée après coup, mais elle n'est **pas signée** : elle ne doit pas
-être comptabilisée comme preuve runtime avant un artefact CI signé (trace et
-stdout/stderr attachés au job, piste de durcissement hors périmètre #82).
+Même PID `342078` sur les trois lignes (pas de fork) : l'`execve` montre la
+commande exacte et son argv complet, le `write` porte le message d'erreur
+attendu (UTF-8 échappé en octal dans le fichier) vers le descripteur 2, que
+`-yy` résout en socketpair UNIX local (`UNIX-STREAM:[…]`, capture du terminal)
+— pas une socket IP — et la dernière ligne donne la sortie code 2, horodatage
+Unix `1792266531.746354` = 2026-10-17 21:48:51 +02:00. **Aucun `connect`,
+`sendto`, `sendmsg`, `sendfile` ni résolution DNS n'est tracé.** L'empreinte
+permet de vérifier que la trace n'a pas été modifiée après coup, mais elle
+n'est **pas signée** : elle ne doit pas être comptabilisée comme preuve runtime
+avant un artefact CI signé (trace et stdout/stderr attachés au job, piste de
+durcissement hors périmètre #82).
 
 La sortie d'erreur du scan (fd 2) est `heimdall scan: scanner non implémenté
 (voir #22) — refus par défaut.` Le code 2 est le refus fail-closed attendu, pas
@@ -108,8 +114,8 @@ crée pas de connexion, et que le garde CI bloque les destinations externes ;
 elle **ne prouve pas** qu'un scan opérationnel complet fonctionne hors ligne.
 Après livraison du scanner et de son orchestration, rejouer le test sur un dépôt
 de test, puis capturer la sortie complète de
-`strace -f -e trace=%network,write,writev,sendfile` sous réseau effectivement
-coupé. Le client Ollama est déjà épinglé à
+`strace -f -e trace=execve,%network,write,writev,sendfile` sous réseau
+effectivement coupé. Le client Ollama est déjà épinglé à
 `127.0.0.1:11434`, sans proxy d'environnement ni redirections
 (`heimdall/llm/qualify.py::_loopback_client`).
 
