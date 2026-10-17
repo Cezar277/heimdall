@@ -29,12 +29,11 @@ Client épinglé boucle locale : hôte figé ``http://127.0.0.1:11434``
 l'environnement), redirections refusées — l'aller-retour Ollama ne peut pas
 sortir de la machine (invariant 12).
 
-Périmètre : « verdict validé ». La validation stricte du verdict (pydantic
-``extra="forbid"``, rejet sans effet) est livrée ici par anticipation du
-cœur de T28.3 (#81, à rescoper côté ticket : fermeture ou reliquat
-d'intégration) ; l'affichage et la journalisation du rejet par la CLI
-restent à #32. Le LLM reste consultatif : ce module ne modifie aucun
-Finding et ne décide jamais seul (REQ-SEC-01).
+Périmètre : « verdict validé » (``qualify``) puis « candidat fail-closed »
+(``qualify_candidate``, T28.3 #81) : une sortie cassée laisse le candidat
+détecté, avec son code de raison. L'affichage Y/N/E et la journalisation
+du rejet par la CLI restent à #32 et #33. Le LLM reste consultatif : ce
+module ne modifie aucun Finding et ne décide jamais seul (REQ-SEC-01).
 """
 
 import copy
@@ -43,6 +42,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Annotated, Any, Final, Literal
 
 import ollama
@@ -91,6 +91,8 @@ ChatFn = Callable[..., Any]
 
 ErrorCode = Literal["empty", "model", "unavailable", "invalid", "prompt", "too_large"]
 
+Verdict = Literal["secret", "faux_positif", "incertain"]
+
 # Messages statiques, un par code : aucune donnée reflétée (ni extrait, ni
 # réponse du modèle, ni entrée) — un texte d'exception peut être relu et
 # recopié, il ne doit jamais transporter de contenu non fiable.
@@ -109,20 +111,21 @@ logger = logging.getLogger(__name__)
 class QualifyVerdict(BaseModel):
     """Verdict strict du trieur — le seul objet que ``qualify()`` renvoie.
 
-    Anticipe le cœur de T28.3 (#81) : la grammaire ``format`` d'Ollama ne
-    contraint qu'un serveur honnête — ici, ``extra="forbid"`` rejette tout
-    champ bonus (``reason``, ``__proto__``… porteurs de consignes),
-    ``verdict`` est l'enum exact (miroir de ``VERDICTS``, sensible à la
-    casse) et ``confidence`` un nombre 0..1 (``StrictFloat | StrictInt`` :
-    l'entier ``1`` du modèle passe, le booléen ``True`` ne passe pas).
-    Tout écart → ``ValidationError`` → ``QualifyError("invalid")``,
-    jamais réparé ni complété. Un changement de verdicts ou de bornes =
-    qualify_v2 (comme le schéma ``QUALIFY_FORMAT_V1``).
+    Validation stricte du retour (T28.3, #81) : la grammaire ``format``
+    d'Ollama ne contraint qu'un serveur honnête — ici, ``extra="forbid"``
+    rejette tout champ bonus (``reason``, ``__proto__``… porteurs de
+    consignes), ``verdict`` est l'enum exact (miroir de ``VERDICTS``,
+    sensible à la casse) et ``confidence`` un nombre 0..1
+    (``StrictFloat | StrictInt`` : l'entier ``1`` du modèle passe, le
+    booléen ``True`` ne passe pas). Tout écart → ``ValidationError`` →
+    ``QualifyError("invalid")``, jamais réparé ni complété. Un changement
+    de verdicts ou de bornes = qualify_v2 (comme le schéma
+    ``QUALIFY_FORMAT_V1``).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    verdict: Literal["secret", "faux_positif", "incertain"]
+    verdict: Verdict
     confidence: Annotated[StrictFloat | StrictInt, Field(ge=0, le=1)]
 
 
@@ -137,6 +140,21 @@ class QualifyError(Exception):
         super().__init__(ERROR_MESSAGES[code])
         self.code: ErrorCode = code
         self.message: str = ERROR_MESSAGES[code]
+
+
+@dataclass(frozen=True)
+class Qualification:
+    """Avis du LLM sur un candidat : un signal, jamais une décision.
+
+    ``status`` vaut toujours ``detecte`` : le LLM ne fait transiter aucun
+    Finding (contrat #14, ADR-001). ``verdict`` est l'avis validé ;
+    ``reason`` est le code fermé du refus, renseigné si et seulement si la
+    sortie n'est pas retenue (``verdict`` vaut alors ``None``).
+    """
+
+    status: Literal["detecte"]
+    verdict: Verdict | None
+    reason: ErrorCode | None
 
 
 def _loopback_client() -> ollama.Client:
@@ -285,3 +303,31 @@ def qualify(
         PROMPT_NAME,
     )
     return validated.model_dump()
+
+
+def qualify_candidate(
+    candidate: str,
+    *,
+    model: str = DEFAULT_MODEL,
+    chat: ChatFn | None = None,
+) -> Qualification:
+    """Avis du LLM sur un candidat, sans qu'une sortie cassée le fasse disparaître.
+
+    Fail-closed (REQ-SEC-01, invariant 2) : toute ``QualifyError`` de
+    ``qualify()`` (réponse vide, invalide ou hors schéma, LLM indisponible,
+    entrée refusée) renvoie ``Qualification("detecte", None, code)`` et le
+    code est journalisé : le candidat reste un finding, avec sa raison. Un
+    verdict valide, même ``faux_positif``, ne change pas ``status`` non plus :
+    le LLM propose, le développeur décide (#32). Aucun texte du modèle
+    n'est renvoyé ni journalisé.
+    """
+    try:
+        verdict = qualify(candidate, model=model, chat=chat)
+    except QualifyError as error:
+        logger.warning(
+            "qualification: candidat conserve (raison=%s, prompt=%s)",
+            error.code,
+            PROMPT_NAME,
+        )
+        return Qualification(status="detecte", verdict=None, reason=error.code)
+    return Qualification(status="detecte", verdict=verdict["verdict"], reason=None)

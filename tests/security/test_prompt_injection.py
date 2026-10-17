@@ -372,8 +372,9 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
     n'est jamais concaténé au prompt système, chaque requête isole le
     candidat par un délimiteur aléatoire, la sortie est contrainte par un
     schéma JSON strict transmis à Ollama ET revalidée par pydantic strict
-    côté client (cœur de #81 livré ici par anticipation), et le client ne
-    peut pas être redirigé hors de la boucle locale.
+    côté client (T28.3), qu'une sortie cassée laisse le candidat détecté
+    (``qualify_candidate``, #81), et le client ne peut pas être redirigé
+    hors de la boucle locale.
     """
     prompts = _load_qualify_prompts()
     prompt = prompts.load_qualify_prompt()
@@ -429,6 +430,8 @@ def test_qualify_prompt_isolated_and_output_constrained() -> None:
         "parse_constant",
         "QualifyVerdict",
         'extra="forbid"',
+        "def qualify_candidate(",
+        'status="detecte"',
         "isinstance(model, str)",
         "_loopback_client().chat",
         'messages[0]["content"]',

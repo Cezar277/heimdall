@@ -71,7 +71,7 @@ heimdall/            paquet unique (#17)
   scanner/           détection déterministe regex + entropie (#22, contrat #14)
   mcp/               serveur MCP stdio, 4 outils lecture seule (#27, contrat #16)
     prompts/         prompt système versionné du trieur (qualify_v1, #80)
-  llm/               client Ollama local, sortie JSON contrainte (#80, T28.2)
+  llm/               client Ollama local, sortie JSON contrainte (#80, T28.2), candidat fail-closed (#81)
   vault/             Vault chiffré ; crypto CONFINÉE à vault/crypto.py (#25, contrat #15)
   cli/               entrée `heimdall` (Typer)
 tests/               fumée paquet + confinement crypto + tests/contracts/
