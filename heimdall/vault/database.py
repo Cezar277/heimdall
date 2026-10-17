@@ -33,6 +33,7 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 import logging
 import os
 import sqlite3
+import stat as stat_module
 import warnings
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -248,6 +249,17 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
         raise IsADirectoryError(
             "Chemin de base de données invalide : pointe vers un répertoire existant"
         )
+    if path.exists():
+        try:
+            mode = os.stat(path, follow_symlinks=False).st_mode
+        except OSError as exc:
+            logger.debug("Impossible de stat le chemin %s : %s", path, exc)
+            raise PermissionError("Chemin de base de données refusé : accès impossible") from exc
+        if not stat_module.S_ISREG(mode):
+            logger.debug("Chemin de base de données non régulier : %s", path)
+            raise PermissionError(
+                "Chemin de base de données refusé : fichier non régulier interdit"
+            )
 
     # Identifier les répertoires ancêtres inexistants avant mkdir
     missing_parents = [parent for parent in path.parents if not parent.exists()]
@@ -269,6 +281,13 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
         _assert_not_symlink(path)
         if not path.exists():
             path.touch(mode=_SECURE_FILE_MODE, exist_ok=True)
+        else:
+            mode = os.stat(path, follow_symlinks=False).st_mode
+            if not stat_module.S_ISREG(mode):
+                logger.debug("Chemin de base de données non régulier : %s", path)
+                raise PermissionError(
+                    "Chemin de base de données refusé : fichier non régulier interdit"
+                )
 
         _assert_not_symlink(path)
         _apply_secure_permissions(path)
@@ -314,17 +333,85 @@ def db_session(db_path: Path | str | None = None) -> Generator[sqlite3.Connectio
         conn.close()
 
 
+def _verify_schema(conn: sqlite3.Connection) -> None:
+    """Vérifie l'intégrité et la conformité du schéma de la base SQLite.
+
+    Valide la présence des tables obligatoires (projects, api_keys, secrets),
+    des clauses ON DELETE CASCADE sur les clés étrangères, de la contrainte d'unicité
+    UNIQUE(project_id, env, name) et de la contrainte CHECK sur le statut.
+    Lève RuntimeError si le schéma est manquant ou dégradé (fail-closed).
+    """
+    cursor = conn.cursor()
+    # 1. Tables obligatoires
+    tables = {
+        row[0]
+        for row in cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    }
+    required_tables = {"projects", "api_keys", "secrets"}
+    if not required_tables.issubset(tables):
+        raise RuntimeError("Schéma de base de données non conforme : tables manquantes.")
+
+    # 2. Clés étrangères ON DELETE CASCADE
+    for tbl in ("api_keys", "secrets"):
+        fk_rows = cursor.execute(f"PRAGMA foreign_key_list({tbl});").fetchall()
+        has_cascade = any(
+            row[2] == "projects" and row[6].upper() == "CASCADE" for row in fk_rows
+        )
+        if not has_cascade:
+            raise RuntimeError(
+                f"Schéma de base de données non conforme : ON DELETE CASCADE manquant sur {tbl}."
+            )
+
+    # 3. Contrainte UNIQUE(project_id, env, name) sur secrets
+    secrets_indexes = cursor.execute("PRAGMA index_list(secrets);").fetchall()
+    has_unique = False
+    for idx in secrets_indexes:
+        if idx[2] == 1:
+            idx_name = idx[1]
+            cols = [
+                info[2]
+                for info in cursor.execute(f"PRAGMA index_info('{idx_name}');").fetchall()
+            ]
+            if cols == ["project_id", "env", "name"]:
+                has_unique = True
+                break
+    if not has_unique:
+        raise RuntimeError(
+            "Schéma de base de données non conforme : UNIQUE(project_id, env, name) manquant."
+        )
+
+    # 4. Contrainte CHECK sur le statut dans secrets
+    secrets_sql_row = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='secrets';"
+    ).fetchone()
+    if not secrets_sql_row or not secrets_sql_row[0]:
+        raise RuntimeError(
+            "Schéma de base de données non conforme : DDL secrets introuvable."
+        )
+    secrets_ddl = secrets_sql_row[0].lower()
+    if (
+        "status in ('vaulte', 'rote')" not in secrets_ddl
+        and 'status in ("vaulte", "rote")' not in secrets_ddl
+    ):
+        raise RuntimeError(
+            "Schéma de base de données non conforme : contrainte CHECK de statut manquante."
+        )
+
+
 def init_db(db_path: Path | str | None = None) -> None:
     """Initialise à froid la base de données SQLite en créant le schéma complet.
 
-    Exécute le script DDL créant `projects`, `api_keys`, `secrets` et leurs index.
+    Exécute le script DDL créant `projects`, `api_keys`, `secrets` et leurs index,
+    puis vérifie la conformité et l'intégrité du schéma via `_verify_schema()`.
     Réutilise `get_connection()` pour garantir les mêmes gardes de sécurité
     (symlink, umask, permissions, journal_mode=DELETE).
+    Lève RuntimeError si le schéma résultant est incomplet ou dégradé.
     """
     conn = get_connection(db_path)
     try:
         with conn:
             conn.executescript(SCHEMA_SQL)
+            _verify_schema(conn)
     finally:
         conn.close()
 

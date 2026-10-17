@@ -1010,6 +1010,45 @@ class VaultDatabaseTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_non_regular_file_rejected_without_blocking(self) -> None:
+        """Remarque 1 (LOW) — get_connection refuse un FIFO/fichier non régulier sans bloquer."""
+        if os.name == "nt" or not hasattr(os, "mkfifo"):
+            self.skipTest("Test POSIX avec support FIFO requis")
+        fifo_path = Path(self.temp_dir.name) / "test_fifo.db"
+        os.mkfifo(fifo_path)
+        with self.assertRaises(PermissionError) as ctx:
+            get_connection(fifo_path)
+        self.assertIn("fichier non régulier", str(ctx.exception).lower())
+        self.assertNotIn(str(fifo_path), str(ctx.exception))
+
+    def test_init_db_rejects_degraded_schema(self) -> None:
+        """Remarque 2 (LOW) — init_db lève RuntimeError sur une base au schéma dégradé."""
+        degraded_db = Path(self.temp_dir.name) / "degraded.db"
+
+        # Base pré-existante avec table secrets sans contrainte CHECK ni UNIQUE
+        conn = sqlite3.connect(str(degraded_db))
+        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);")
+        conn.execute(
+            "CREATE TABLE api_keys ("
+            "id TEXT PRIMARY KEY, project_id TEXT NOT NULL, key_hash TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, revoked_at TEXT, "
+            "FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE);"
+        )
+        # Table secrets dégradée (sans UNIQUE, sans CHECK, sans CASCADE)
+        conn.execute(
+            "CREATE TABLE secrets ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, env TEXT NOT NULL, "
+            "name TEXT NOT NULL, encrypted_value TEXT NOT NULL, status TEXT NOT NULL, "
+            "fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);"
+        )
+        conn.commit()
+        conn.close()
+
+        # init_db sur cette base doit détecter le schéma non conforme et lever RuntimeError
+        with self.assertRaises(RuntimeError) as ctx:
+            init_db(degraded_db)
+        self.assertIn("Schéma de base de données non conforme", str(ctx.exception))
+
     # -----------------------------------------------------------------------
     # SecretStatus type alias
     # -----------------------------------------------------------------------
