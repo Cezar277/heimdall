@@ -10,14 +10,15 @@ celles de ``socket.socket``. Les écritures par descripteur (``os.write``,
 wrappers Python ; ``strace -e trace=%network`` ne traçant pas ``write``, le
 rejeu OS utilise un filtre étendu (voir ``docs/security/zero-egress.md``).
 
-Un alias ``from socket import getaddrinfo`` importé **après** le patch est
-couvert (il relit l'attribut du module à chaque appel, vérifié par
-``test_guard_blocks_dns_through_import_alias``) ; une valeur capturée **avant**
-le patch (autre alias top-level, référence stockée) garde le wrapper original —
-ce cas est verrouillé et documenté par
-``test_early_bound_dns_alias_runs_unguarded_and_is_documented``. Les extensions
-natives ou les appels syscalls directs hors wrappers Python restent couverts par
-la trace OS.
+Un alias ``from socket import getaddrinfo`` (ou ``from os import write``)
+importé **après** le patch est couvert (il relit l'attribut du module à chaque
+appel, vérifié par ``test_guard_blocks_dns_through_import_alias``) ; une valeur
+capturée **avant** le patch (autre alias top-level, référence stockée) garde
+l'original — verrouillé par
+``test_early_bound_dns_alias_runs_unguarded_and_is_documented`` (DNS) et
+``test_early_bound_os_write_runs_unguarded_and_is_documented`` (``os.*``). Le
+filet OS de ces cas est le filtre ``strace`` étendu
+(``%network,write,writev,sendfile``).
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ class NetworkLedger:
     connected_loopback: set[socket.socket] = field(default_factory=set)
     # Références capturées avant le patch (preuve d'un trou connu du garde).
     original_getaddrinfo: Callable[..., object] | None = None
+    original_os_write: Callable[..., int] | None = None
 
     @property
     def blocked(self) -> list[NetworkAttempt]:
@@ -78,7 +80,7 @@ class NetworkLedger:
 @pytest.fixture
 def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PLR0915
     """Refuse les destinations externes et trace aussi les refus interceptés."""
-    ledger = NetworkLedger(original_getaddrinfo=socket.getaddrinfo)
+    ledger = NetworkLedger(original_getaddrinfo=socket.getaddrinfo, original_os_write=os.write)
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
     original_send = socket.socket.send
@@ -196,14 +198,18 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
         check_connected_socket(sock)
         original_sendall(sock, *args, **kwargs)
 
-    def guarded_sendto(sock: socket.socket, data: bytes, *args: Any) -> int:
-        # sendto(data, address), sendto(data, flags, address), ou sans adresse.
-        address = args[-1] if args and isinstance(args[-1], (tuple, str, bytes)) else None
+    def guarded_sendto(sock: socket.socket, data: bytes, *args: Any, **kwargs: Any) -> int:
+        # sendto(data, address), sendto(data, flags, address) ; l'adresse peut
+        # arriver en mot-clé : on la contrôle aussi (fail-closed) même si
+        # CPython refuse ensuite les arguments nommés.
+        address = kwargs.get("address")
+        if address is None and args and isinstance(args[-1], (tuple, str, bytes)):
+            address = args[-1]
         if address is None:
             check_connected_socket(sock)
         else:
             check_destination(sock, address)
-        return original_sendto(sock, data, *args)
+        return original_sendto(sock, data, *args, **kwargs)
 
     def guarded_sendmsg(sock: socket.socket, *args: Any, **kwargs: Any) -> int:
         address = kwargs.get("address")
@@ -395,6 +401,17 @@ def test_guard_blocks_payload_on_unpinned_socket(loopback_only: NetworkLedger, m
     assert len(loopback_only.blocked) == 1
 
 
+def test_guard_blocks_sendto_with_keyword_address(loopback_only: NetworkLedger) -> None:
+    """Une adresse en mot-clé doit être bloquée avant le TypeError de CPython."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        # typeshed marque `sendto` positionnel-only ; le cast permet de vérifier
+        # que le garde bloque quand même l'appel par mot-clé.
+        sendto = cast(Any, sock.sendto)
+        with pytest.raises(AssertionError, match="destination hors boucle locale"):
+            sendto(b"synthetic probe", address=("203.0.113.7", 443))
+    assert len(loopback_only.blocked) == 1
+
+
 def test_guard_allows_and_tracks_loopback_tcp(loopback_only: NetworkLedger) -> None:
     """L'Ollama local reste accessible et les envois suivent le connect autorisé."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -544,6 +561,25 @@ def test_early_bound_dns_alias_runs_unguarded_and_is_documented(
     except OSError:
         # Route absente sur la machine de test : échec local, aucun octet.
         pass
+    assert loopback_only.attempts == []  # hors garde : rien n'est journalisé
+
+
+def test_early_bound_os_write_runs_unguarded_and_is_documented(
+    loopback_only: NetworkLedger,
+) -> None:
+    """Miroir du cas DNS pour `from os import write` capturé avant le patch.
+
+    La référence d'origine contourne le garde et n'est journalisée nulle part.
+    Sur une socket TCP non connectée, l'écriture échoue localement
+    (``BrokenPipeError``/``ENOTCONN``) sans qu'aucun octet ne parte ; le filet
+    réel de ce cas reste la trace OS ``strace`` (filtre étendu).
+    """
+    original = loopback_only.original_os_write
+    assert original is not None
+    assert original is not os.write  # référence d'origine, non patchée
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        with pytest.raises(OSError):  # échec local, aucun octet émis
+            original(sock.fileno(), b"synthetic probe")
     assert loopback_only.attempts == []  # hors garde : rien n'est journalisé
 
 

@@ -3,16 +3,16 @@
 ## Contrôle automatisé
 
 `tests/test_network_isolation.py` intercepte `connect`, `connect_ex`,
-`send`, `sendall`, `sendto`, `sendmsg`, `sendfile` (méthode `Socket.sendfile`
-et `os.sendfile` direct par descripteur), `os.write` / `os.writev` sur un
-descripteur de socket, ainsi que les **six** méthodes que `ssl.SSLSocket`
-surcharge (`send`, `sendall`, `write`, `sendto`, `sendmsg`, `sendfile` — elles
-n'appellent pas celles de `socket.socket`), puis `getaddrinfo`,
-`gethostbyname`, `gethostbyname_ex`, `gethostbyaddr` et `getnameinfo`. Le
-journal du garde enregistre aussi les tentatives refusées : les avaler dans une
-exception n'empêche pas le test de les détecter. Le test lance
-`heimdall scan --ci` dans le processus pytest et vérifie l'absence de tentative
-Internet.
+`send`, `sendall`, `sendto` (adresse positionnelle ou en mot-clé), `sendmsg`,
+`sendfile` (méthode `Socket.sendfile` et `os.sendfile` direct par descripteur),
+`os.write` / `os.writev` sur un descripteur de socket, ainsi que les **six**
+méthodes que `ssl.SSLSocket` surcharge (`send`, `sendall`, `write`, `sendto`,
+`sendmsg`, `sendfile` — elles n'appellent pas celles de `socket.socket`), puis
+`getaddrinfo`, `gethostbyname`, `gethostbyname_ex`, `gethostbyaddr` et
+`getnameinfo`. Le journal du garde enregistre aussi les tentatives refusées :
+les avaler dans une exception n'empêche pas le test de les détecter. Le test
+lance `heimdall scan --ci` dans le processus pytest et vérifie l'absence de
+tentative Internet.
 
 Les alias `from socket import getaddrinfo` sont couverts lorsqu'ils sont
 importés **après** le patch : le nom est relu sur le module `socket` à chaque
@@ -22,21 +22,22 @@ appelleraient directement des syscalls contournent les wrappers et relèvent de
 la trace OS.
 
 Limites explicites : les sockets `AF_UNIX` sont permises comme IPC local et
-pourraient théoriquement servir de relais via un autre processus ; une
-**valeur capturée avant le patch** (`orig = socket.getaddrinfo` en portée
-top-level, valeur par défaut liée à l'import) garde le wrapper d'origine —
-trou connu, verrouillé par
-`test_early_bound_dns_alias_runs_unguarded_and_is_documented` ; les extensions
-natives qui appellent directement les syscalls réseau (sans passer par les
-méthodes Python) ne sont pas couvertes. Piège vérifié : `strace -e
+pourraient théoriquement servir de relais via un autre processus ; toute
+**référence capturée avant le patch** (`orig = socket.getaddrinfo`,
+`from os import write`, `from os import sendfile`, valeur par défaut liée à
+l'import) garde l'original — trou connu, verrouillé pour DNS par
+`test_early_bound_dns_alias_runs_unguarded_and_is_documented` et pour `os.*`
+par `test_early_bound_os_write_runs_unguarded_and_is_documented` ; les
+extensions natives qui appellent directement les syscalls réseau (sans passer
+par les méthodes Python) ne sont pas couvertes. Piège vérifié : `strace -e
 trace=%network` ne trace **pas** `write`/`writev` génériques — une écriture
 directe sur un descripteur de socket déjà connecté n'y apparaîtrait pas ; le
-rejeu OS utilise donc `-e trace=%network,write,writev,sendfile`. Les écritures
-par descripteur (`os.write`, `os.writev`, `os.sendfile`) sont refusées sauf si
-le descripteur appartient à une socket loopback épinglée (un descripteur
-`AF_UNIX` y est donc refusé : plus strict que le chemin socket, fail-closed).
-Ce garde n'est donc pas un pare-feu : la trace système ci-dessous est
-nécessaire en complément.
+rejeu OS utilise donc `-e trace=%network,write,writev,sendfile`, ce qui couvre
+aussi les alias `os.*` précoces. Les écritures par descripteur (`os.write`,
+`os.writev`, `os.sendfile`) sont refusées sauf si le descripteur appartient à
+une socket loopback épinglée (un descripteur `AF_UNIX` y est donc refusé : plus
+strict que le chemin socket, fail-closed). Ce garde n'est donc pas un pare-feu :
+la trace système ci-dessous est nécessaire en complément.
 
 Commande :
 
@@ -47,10 +48,10 @@ Commande :
 Résultat observé le 17/10/2026 :
 
 ```text
-...........................                                              [100%]
+.............................                                            [100%]
 ```
 
-Suite complète avec la couverture CI : **710 passed**, 3 831 sous-tests,
+Suite complète avec la couverture CI : **712 passed**, 3 831 sous-tests,
 couverture Heimdall **99,48 %** (seuil CI : 85 %).
 
 ## Observation système
