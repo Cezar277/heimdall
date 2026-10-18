@@ -40,12 +40,15 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 import ipaddress
 import logging
 import os
+import re
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import uvicorn
-from fastapi import FastAPI, Path as FastApiPath, Response
+from fastapi import FastAPI, Response
+from fastapi import Path as FastApiPath
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import (
@@ -154,12 +157,16 @@ class InternalError(BaseModel):
     message: Literal["Erreur interne"] = "Erreur interne"
 
 
+PROJECT_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_-]{0,63}(?![\s\S])")
+ENV_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_-]{0,31}(?![\s\S])")
+NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Z][A-Z0-9_]{1,63}(?![\s\S])")
+
 ProjectId = Annotated[
     str,
     StringConstraints(
         min_length=1,
         max_length=64,
-        pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+        pattern=PROJECT_PATTERN,
     ),
 ]
 EnvironmentId = Annotated[
@@ -167,7 +174,7 @@ EnvironmentId = Annotated[
     StringConstraints(
         min_length=1,
         max_length=32,
-        pattern=r"^[a-z][a-z0-9_-]{0,31}$",
+        pattern=ENV_PATTERN,
     ),
 ]
 SecretName = Annotated[
@@ -175,7 +182,7 @@ SecretName = Annotated[
     StringConstraints(
         min_length=2,
         max_length=64,
-        pattern=r"^[A-Z][A-Z0-9_]{1,63}$",
+        pattern=NAME_PATTERN,
     ),
 ]
 SecretValue = Annotated[
@@ -197,6 +204,14 @@ class SecretCreate(BaseModel):
     name: SecretName
     value: SecretValue
 
+    @field_validator("value")
+    @classmethod
+    def validate_value_no_null(cls, v: str) -> str:
+        """Refuse les octets NUL dans la valeur du secret (défense en profondeur)."""
+        if "\x00" in v:
+            raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
+        return v
+
 
 class SecretMetadata(BaseModel):
     """Métadonnées d'un secret retournées lors de sa création (201 Created)."""
@@ -217,33 +232,43 @@ class SecretRead(SecretMetadata):
 class InMemorySecretStore:
     """Stockage mémoire des secrets pour le squelette fonctionnel (ticket #63).
 
-    Les secrets sont indexés par le tuple (project, env, name).
-    Le chiffrement au repos et la persistance SQLite (#62 / #26) se brancheront
-    sur cette même interface.
+    NOTE DE SÉCURITÉ :
+    Squelette mémoire temporaire non chiffré, strictement réservé aux tests et
+    au développement. Ne jamais déployer en production.
+    TODO(#26, #62) : Remplacer par le chiffrement au repos (AES-256-GCM / DEK) et
+    la persistance SQLite avec contrainte d'unicité UNIQUE(project_id, env, name)
+    et PRAGMA foreign_keys=ON. Ce stockage en mémoire est mono-processus.
     """
 
     def __init__(self) -> None:
         self._secrets: dict[tuple[str, str, str], dict[str, str]] = {}
+        self._lock = threading.Lock()
 
     def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
-        return self._secrets.get((project, env, name))
+        with self._lock:
+            record = self._secrets.get((project, env, name))
+            if record is None:
+                return None
+            return dict(record)
 
     def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         key = (project, env, name)
-        if key in self._secrets:
-            raise KeyError("Secret déjà existant")
-        record = {
-            "project": project,
-            "env": env,
-            "name": name,
-            "status": "vaulte",
-            "value": value,
-        }
-        self._secrets[key] = record
-        return record
+        with self._lock:
+            if key in self._secrets:
+                raise KeyError("Secret déjà existant")
+            record = {
+                "project": project,
+                "env": env,
+                "name": name,
+                "status": "vaulte",
+                "value": value,
+            }
+            self._secrets[key] = record
+            return dict(record)
 
     def clear(self) -> None:
-        self._secrets.clear()
+        with self._lock:
+            self._secrets.clear()
 
 
 _MAX_RETRY_AFTER_SECONDS: int = 3600
@@ -283,17 +308,17 @@ _NO_STORE_HEADER = {
 _SECRETS_POST_RESPONSES: dict[int | str, dict[str, Any]] = {
     201: {
         "model": SecretMetadata,
-        "description": "Secret créé et persisté sous forme chiffrée.",
+        "description": "Secret créé (squelette mémoire non chiffré, persistance chiffrée #26/#62).",
         "headers": _NO_STORE_HEADER,
     },
     400: {"model": BadRequestError, "description": "Requête invalide"},
-    401: {"model": UnauthorizedError, "description": "Authentification requise"},
-    403: {"model": ForbiddenError, "description": "Accès interdit"},
+    401: {"model": UnauthorizedError, "description": "Authentification requise (ticket #64)"},
+    403: {"model": ForbiddenError, "description": "Accès interdit (ticket #64)"},
     405: {"model": MethodNotAllowedError, "description": "Méthode non autorisée"},
     409: {"model": ConflictError, "description": "Secret déjà existant"},
     429: {
         "model": RateLimitedError,
-        "description": "Trop de requêtes",
+        "description": "Trop de requêtes — rate-limiting par clé API (ticket #65)",
         "headers": _RETRY_AFTER_HEADER,
     },
     500: {"model": InternalError, "description": "Erreur interne"},
@@ -307,13 +332,13 @@ _SECRETS_GET_RESPONSES: dict[int | str, dict[str, Any]] = {
         "headers": _NO_STORE_HEADER,
     },
     400: {"model": BadRequestError, "description": "Paramètre de chemin invalide"},
-    401: {"model": UnauthorizedError, "description": "Authentification requise"},
-    403: {"model": ForbiddenError, "description": "Accès interdit"},
+    401: {"model": UnauthorizedError, "description": "Authentification requise (ticket #64)"},
+    403: {"model": ForbiddenError, "description": "Accès interdit (ticket #64)"},
     404: {"model": NotFoundError, "description": "Ressource introuvable"},
     405: {"model": MethodNotAllowedError, "description": "Méthode non autorisée"},
     429: {
         "model": RateLimitedError,
-        "description": "Trop de requêtes",
+        "description": "Trop de requêtes — rate-limiting par clé API (ticket #65)",
         "headers": _RETRY_AFTER_HEADER,
     },
     500: {"model": InternalError, "description": "Erreur interne"},
@@ -427,35 +452,70 @@ def _pin_db_path(settings: VaultSettings) -> Path:
     return Path(os.path.normpath(str(resolved)))
 
 
-def _register_middleware(app: FastAPI) -> None:
-    """Enregistre les middlewares du serveur Vault."""
+class _PayloadTooLargeError(Exception):
+    """Exception interne levée dès que le flux reçu dépasse la limite de 1 Mio."""
 
-    @app.middleware("http")
-    async def body_size_limit_middleware(request: Request, call_next: Any) -> Any:
-        """Rejette HTTP 400 bad_request tout corps supérieur à 1 Mio (1 048 576 octets)."""
-        content_length = request.headers.get("content-length")
-        if content_length is not None:
-            try:
-                if int(content_length) > _MAX_BODY_SIZE:
-                    return JSONResponse(
+
+class BodySizeLimitMiddleware:
+    """Interrompt immédiatement la lecture du flux dès que la taille dépasse 1 Mio.
+
+    Conforme à openapi.yaml:33-37 : compte le flux effectivement reçu, même sans
+    Content-Length ou en transfert segmenté, et interrompt la lecture dès dépassement
+    sans accumulation en mémoire (protection anti-OOM).
+    """
+
+    def __init__(self, app: Any, max_body_size: int = _MAX_BODY_SIZE) -> None:
+        self.app = app
+        self.max_body_size = max_body_size
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        for key, val in scope.get("headers", []):
+            if key.lower() == b"content-length":
+                try:
+                    if int(val) > self.max_body_size:
+                        response = JSONResponse(
+                            status_code=400,
+                            content=_ERROR_PAYLOADS[400],
+                        )
+                        await response(scope, receive, send)
+                        return
+                except (ValueError, TypeError):
+                    response = JSONResponse(
                         status_code=400,
                         content=_ERROR_PAYLOADS[400],
                     )
-            except (ValueError, TypeError):
-                return JSONResponse(
-                    status_code=400,
-                    content=_ERROR_PAYLOADS[400],
-                )
+                    await response(scope, receive, send)
+                    return
 
-        if request.method in ("POST", "PUT", "PATCH"):
-            body = await request.body()
-            if len(body) > _MAX_BODY_SIZE:
-                return JSONResponse(
-                    status_code=400,
-                    content=_ERROR_PAYLOADS[400],
-                )
+        total_bytes = 0
 
-        return await call_next(request)
+        async def limited_receive() -> Any:
+            nonlocal total_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                body = message.get("body", b"")
+                total_bytes += len(body)
+                if total_bytes > self.max_body_size:
+                    raise _PayloadTooLargeError()
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _PayloadTooLargeError:
+            response = JSONResponse(
+                status_code=400,
+                content=_ERROR_PAYLOADS[400],
+            )
+            await response(scope, receive, send)
+
+
+def _register_middleware(app: FastAPI) -> None:
+    """Enregistre les middlewares du serveur Vault."""
+    app.add_middleware(BodySizeLimitMiddleware, max_body_size=_MAX_BODY_SIZE)
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:
@@ -597,31 +657,16 @@ def _register_routes(app: FastAPI) -> None:
     )
     async def get_secret(
         project: Annotated[
-            str,
-            FastApiPath(
-                min_length=1,
-                max_length=64,
-                pattern=r"^[a-z][a-z0-9_-]{0,63}$",
-                description="Identifiant public du projet ; aucune valeur secrète.",
-            ),
+            ProjectId,
+            FastApiPath(description="Identifiant public du projet ; aucune valeur secrète."),
         ],
         env: Annotated[
-            str,
-            FastApiPath(
-                min_length=1,
-                max_length=32,
-                pattern=r"^[a-z][a-z0-9_-]{0,31}$",
-                description="Environnement autorisé ; aucune valeur secrète.",
-            ),
+            EnvironmentId,
+            FastApiPath(description="Environnement autorisé ; aucune valeur secrète."),
         ],
         name: Annotated[
-            str,
-            FastApiPath(
-                min_length=2,
-                max_length=64,
-                pattern=r"^[A-Z][A-Z0-9_]{1,63}$",
-                description="Nom de variable ; aucune valeur secrète.",
-            ),
+            SecretName,
+            FastApiPath(description="Nom de variable ; aucune valeur secrète."),
         ],
         response: Response,
     ) -> SecretRead:
@@ -701,6 +746,7 @@ def run_server() -> None:
 
 __all__ = [
     "BadRequestError",
+    "BodySizeLimitMiddleware",
     "ConflictError",
     "ForbiddenError",
     "HealthResponse",

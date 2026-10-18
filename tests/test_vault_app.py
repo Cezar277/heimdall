@@ -10,6 +10,8 @@ sans enveloppe framework, l'allowlist d'en-têtes d'erreurs, l'immunité au spoo
 X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 """
 
+import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -811,6 +813,206 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             openapi_paths["/api/v1/secrets/{project}/{env}/{name}"]["get"]["responses"].keys()
         )
         self.assertEqual(actual_get, expected_get)
+
+    async def test_identifiers_reject_newlines_and_carriage_returns(self) -> None:
+        """Les identifiants avec saut de ligne ou retour chariot sont rejetés avec HTTP 400."""
+        valid_base = {
+            "project": "demo",
+            "env": "dev",
+            "name": "MY_KEY",
+            "value": "secret_val",
+        }
+        invalid_posts = [
+            ({**valid_base, "project": "demo\n"}, "saut de ligne dans project"),
+            ({**valid_base, "project": "demo\r"}, "retour chariot dans project"),
+            ({**valid_base, "env": "dev\n"}, "saut de ligne dans env"),
+            ({**valid_base, "env": "dev\r"}, "retour chariot dans env"),
+            ({**valid_base, "name": "MY_KEY\n"}, "saut de ligne dans name"),
+            ({**valid_base, "name": "MY_KEY\r"}, "retour chariot dans name"),
+        ]
+        for payload, description in invalid_posts:
+            with self.subTest(post_case=description):
+                res = await self.client.post("/api/v1/secrets", json=payload)
+                self.assertEqual(res.status_code, 400)
+                self.assertEqual(
+                    res.json(),
+                    {"code": "bad_request", "message": "Requête invalide"},
+                )
+
+        invalid_gets = [
+            "/api/v1/secrets/demo%0A/dev/MY_KEY",
+            "/api/v1/secrets/demo%0D/dev/MY_KEY",
+            "/api/v1/secrets/demo/dev%0A/MY_KEY",
+            "/api/v1/secrets/demo/dev%0D/MY_KEY",
+            "/api/v1/secrets/demo/dev/MY_KEY%0A",
+            "/api/v1/secrets/demo/dev/MY_KEY%0D",
+        ]
+        for path in invalid_gets:
+            with self.subTest(get_case=path):
+                res = await self.client.get(path)
+                self.assertEqual(res.status_code, 400)
+                self.assertEqual(
+                    res.json(),
+                    {"code": "bad_request", "message": "Requête invalide"},
+                )
+
+    async def test_post_secret_rejects_nul_bytes_in_value(self) -> None:
+        """La valeur secrète ne doit pas contenir d'octet NUL (\\x00)."""
+        payload = {
+            "project": "demo",
+            "env": "dev",
+            "name": "NUL_KEY",
+            "value": "valeur\x00corrompue",
+        }
+        res = await self.client.post("/api/v1/secrets", json=payload)
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(
+            res.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+
+    async def test_post_secret_body_size_limit_exact_boundaries(self) -> None:
+        """Exactement 1 Mio (1 048 576 octets) est accepté (201), 1 048 577 octets rejeté (400)."""
+        base_doc = {
+            "project": "demo",
+            "env": "dev",
+            "name": "BOUNDARY_TEST",
+            "value": "val",
+        }
+        raw_json = json.dumps(base_doc).encode("utf-8")
+        padding_len = 1_048_576 - len(raw_json)
+        self.assertGreater(padding_len, 0)
+        exact_1mb = raw_json + (b" " * padding_len)
+        self.assertEqual(len(exact_1mb), 1_048_576)
+
+        # 1 048 576 octets : accepté
+        res_exact = await self.client.post(
+            "/api/v1/secrets",
+            content=exact_1mb,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(res_exact.status_code, 201)
+
+        # 1 048 577 octets : rejeté
+        oversized_1byte = exact_1mb + b" "
+        self.assertEqual(len(oversized_1byte), 1_048_577)
+        res_over = await self.client.post(
+            "/api/v1/secrets",
+            content=oversized_1byte,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(res_over.status_code, 400)
+        self.assertEqual(
+            res_over.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+
+    async def test_post_secret_chunked_stream_interruption_verifies_aborted_read(self) -> None:
+        """L'interruption de flux s'arrête net dès dépassement sans lire les tronçons suivants."""
+        third_chunk_read = False
+
+        async def chunk_generator():
+            nonlocal third_chunk_read
+            yield b"x" * 600_000
+            yield b"x" * 600_000
+            third_chunk_read = True
+            yield b"x" * 600_000
+
+        res = await self.client.post(
+            "/api/v1/secrets",
+            content=chunk_generator(),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(
+            res.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+        self.assertFalse(third_chunk_read)
+
+    async def test_post_secret_concurrent_race_condition(self) -> None:
+        """Des dépôts concurrents identiques aboutissent à exactement 1x 201 et Nx 409."""
+        payload = {
+            "project": "demo",
+            "env": "dev",
+            "name": "CONCURRENT_KEY",
+            "value": "initial_concurrent_secret",
+        }
+
+        async def send_post() -> int:
+            res = await self.client.post("/api/v1/secrets", json=payload)
+            return res.status_code
+
+        statuses = await asyncio.gather(*[send_post() for _ in range(5)])
+        self.assertEqual(statuses.count(201), 1)
+        self.assertEqual(statuses.count(409), 4)
+
+        get_res = await self.client.get("/api/v1/secrets/demo/dev/CONCURRENT_KEY")
+        self.assertEqual(get_res.status_code, 200)
+        self.assertEqual(get_res.json()["value"], "initial_concurrent_secret")
+
+    async def test_canary_secret_never_reflected_in_error_responses(self) -> None:
+        """Aucune chaîne secrète ne doit transparaître dans les erreurs (400, 404, 409)."""
+        canary = "canary_sk_live_SECRET_VALUE_12345"
+
+        # 400 : champ invalide dans le payload
+        res_400 = await self.client.post(
+            "/api/v1/secrets",
+            json={"project": "InvalidProject", "env": "dev", "name": "KEY", "value": canary},
+        )
+        self.assertEqual(res_400.status_code, 400)
+        self.assertNotIn(canary, res_400.text)
+
+        # 400 : octet NUL dans la valeur
+        res_nul = await self.client.post(
+            "/api/v1/secrets",
+            json={"project": "demo", "env": "dev", "name": "KEY", "value": f"{canary}\x00leak"},
+        )
+        self.assertEqual(res_nul.status_code, 400)
+        self.assertNotIn(canary, res_nul.text)
+
+        # 201 puis 409 conflict
+        await self.client.post(
+            "/api/v1/secrets",
+            json={"project": "demo", "env": "dev", "name": "CANARY_KEY", "value": canary},
+        )
+        conflict_canary = "second_canary_attempt_99999"
+        res_409 = await self.client.post(
+            "/api/v1/secrets",
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "CANARY_KEY",
+                "value": conflict_canary,
+            },
+        )
+        self.assertEqual(res_409.status_code, 409)
+        self.assertNotIn(canary, res_409.text)
+        self.assertNotIn(conflict_canary, res_409.text)
+
+        # 404 GET
+        res_404 = await self.client.get("/api/v1/secrets/demo/dev/CANARY_NOT_FOUND")
+        self.assertEqual(res_404.status_code, 404)
+        self.assertNotIn(canary, res_404.text)
+
+    def test_secrets_schema_headers_match_openapi_yaml(self) -> None:
+        """Les en-têtes déclarés dans OpenAPI runtime incluent Cache-Control et Retry-After."""
+        dev_app = create_app(VaultSettings(enable_docs=True))
+        openapi_paths = dev_app.openapi()["paths"]
+
+        post_responses = openapi_paths["/api/v1/secrets"]["post"]["responses"]
+        self.assertIn("headers", post_responses["201"])
+        self.assertIn("Cache-Control", post_responses["201"]["headers"])
+        self.assertIn("headers", post_responses["429"])
+        self.assertIn("Retry-After", post_responses["429"]["headers"])
+
+        get_responses = (
+            openapi_paths["/api/v1/secrets/{project}/{env}/{name}"]["get"]["responses"]
+        )
+        self.assertIn("headers", get_responses["200"])
+        self.assertIn("Cache-Control", get_responses["200"]["headers"])
+        self.assertIn("headers", get_responses["429"])
+        self.assertIn("Retry-After", get_responses["429"]["headers"])
 
 
 if __name__ == "__main__":
