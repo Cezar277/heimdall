@@ -218,6 +218,8 @@ def _pin_db_path(settings: VaultSettings) -> Path | str:
     chemin est résolu UNE fois, à la création de l'application, pour que les
     futures routes DB injectent `app.state.db_path` dans `get_connection()`
     sans jamais dépendre du CWD courant (deux CWD = deux bases silencieuses).
+    Le défaut de `resolve_db_path` étant désormais hors dépôt (XDG), seuls les
+    chemins relatifs explicites sont figés contre le CWD ici.
 
     `os.path.abspath` normalise lexicalement les segments `..` (ce que
     `Path.absolute()` ne fait pas) sans jamais suivre les symlinks : les

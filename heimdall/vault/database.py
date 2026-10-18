@@ -23,9 +23,13 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   - Mode `0o600` (lecture/écriture propriétaire uniquement) vérifié et confirmé
     après création — fail-closed si le chmod échoue ou si le mode effectif diffère.
   - Refus de tout chemin symbolique (`is_symlink()` via lstat) : protection TOCTOU.
+  - Linux : ouverture par descripteur épinglé `O_NOFOLLOW|O_CREAT` et connexion
+    SQLite via `/dev/fd/N` — SQLite ouvre l'inode exact déjà validé (fstat/fchmod),
+    la fenêtre TOCTOU de `sqlite3.connect()` est fermée. POSIX sans `/dev/fd`
+    fiable : repli par chemin + re-vérification post-ouverture.
   - Re-vérification APRÈS l'ouverture SQLite (symlink, fichier régulier, identité
-    `st_dev`/`st_ino`) : toute substitution persistante du chemin dans la fenêtre
-    non atomique de `sqlite3.connect()` ferme la connexion (fail-closed).
+    `st_dev`/`st_ino`) : toute substitution persistante du chemin ferme la
+    connexion (fail-closed).
   - `journal_mode=DELETE` forcé pour éviter la création de fichiers sidecar
     `-wal`/`-shm`/`-journal` en permissions larges.
 - Confinement d'environnement : POSIX uniquement (Linux, macOS, BSD). Sous Windows (nt),
@@ -33,10 +37,12 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   (refus fail-closed via RuntimeError, invariants 1/10).
 """
 
+import errno
 import logging
 import os
 import sqlite3
 import stat as stat_module
+import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -49,13 +55,40 @@ logger = logging.getLogger(__name__)
 SecretStatus = Literal["vaulte", "rote"]
 _ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
 
-DEFAULT_DB_PATH: Path = Path("vault.db")
+
+def default_db_path() -> Path:
+    """Retourne le chemin de base par défaut, hors dépôt (remarque 3 de revue).
+
+    - `$XDG_DATA_HOME` est utilisé s'il est défini et absolu (spec XDG Base
+      Directory : un chemin relatif est invalide et ignoré).
+    - Sinon `~/.local/share/heimdall/vault.db`.
+
+    Le défaut n'est plus CWD-relatif : deux répertoires de travail convergent
+    vers la même base, plus de cloisonnement silencieux entre processus.
+    """
+    xdg_data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    if xdg_data_home and Path(xdg_data_home).is_absolute():
+        base_dir = Path(xdg_data_home)
+    else:
+        base_dir = Path.home() / ".local" / "share"
+    return base_dir / "heimdall" / "vault.db"
+
+
+# Résolu une fois à l'import (changer XDG_DATA_HOME requiert un redémarrage du processus).
+DEFAULT_DB_PATH: Path = default_db_path()
 
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
 _SECURE_DIR_MODE: int = 0o700
 _DIR_PERM_MASK: int = 0o777
 _CONTROL_CHAR_THRESHOLD: int = 0x20
+
+# `/dev/fd/N` (procfs Linux) permet à SQLite d'ouvrir l'inode EXACT déjà validé
+# par un descripteur épinglé `O_NOFOLLOW`, fermant la fenêtre TOCTOU de
+# `sqlite3.connect()`. Sur les autres POSIX (macOS/BSD), la sémantique de
+# `/dev/fd` n'est pas garantie pour une base SQLite (journal adjacent) : repli
+# par chemin + re-vérification d'identité.
+_FD_DB_CONNECT_SUPPORTED: bool = sys.platform.startswith("linux") and os.path.isdir("/dev/fd")
 
 SCHEMA_SQL: str = """
 PRAGMA foreign_keys = ON;
@@ -138,13 +171,15 @@ def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
     Ordre de priorité :
     1. Argument explicite `db_path`
     2. Variable d'environnement `HEIMDALL_VAULT_DB_PATH`
-    3. `DEFAULT_DB_PATH`
+    3. `DEFAULT_DB_PATH` (hors dépôt : `$XDG_DATA_HOME/heimdall/vault.db`,
+       sinon `~/.local/share/heimdall/vault.db`)
 
     Comportement CWD (remarque 1 de revue) :
     Les chemins relatifs passés en argument ou via variable d'environnement sont
     interprétés relativement au répertoire de travail courant (CWD / `Path.cwd()`).
     Pour éviter tout cloisonnement silencieux entre deux processus ayant des CWD
-    distincts, privilégier des chemins absolus (ou ':memory:' en test).
+    distincts, privilégier des chemins absolus (ou ':memory:' en test). Le défaut
+    lui-même n'est plus CWD-relatif (remarque 3 : hors dépôt, XDG).
 
     Mode en mémoire ':memory:' :
     Le mode ':memory:' est réservé aux tests unitaires. Chaque appel à
@@ -236,10 +271,20 @@ def _stat_no_follow(path: Path) -> os.stat_result:
 
 
 def _check_regular_file(path: Path) -> None:
-    """Vérifie que le chemin est un fichier régulier non lié (refus FIFO/socket/device/hardlink)."""
-    if not path.exists():
+    """Vérifie que le chemin est un fichier régulier non lié (refus FIFO/socket/device/hardlink).
+
+    Absence tolérée (création à suivre). S'appuie exclusivement sur `lstat`
+    (`follow_symlinks=False`) : plus de `path.exists()` préalable qui suivrait un
+    symlink avant la vérification (remarque 2 de revue) — un lien symbolique
+    pendant n'est donc plus considéré comme un fichier absent.
+    """
+    try:
+        stat_res = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
         return
-    stat_res = _stat_no_follow(path)
+    except OSError as exc:
+        logger.debug("Impossible de stat le chemin %s : %s", path.name, exc.__class__.__name__)
+        raise PermissionError("Chemin de base de données refusé : accès impossible") from exc
     if not stat_module.S_ISREG(stat_res.st_mode):
         logger.debug("Chemin de base de données non régulier : %s", path.name)
         raise PermissionError("Chemin de base de données refusé : fichier non régulier interdit")
@@ -295,17 +340,28 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
     - Crée le fichier avec mode 0o600 si inexistant.
     - Vérifie et confirme les permissions après création (fail-closed).
     - Positionne journal_mode=DELETE (pas de sidecar -wal/-shm).
-    - Maintient umask 0o077 autour de sqlite3.connect() : couvre les répertoires
+    - Maintient umask 0o077 autour de l'ouverture : couvre les répertoires
       intermédiaires créés par mkdir(parents=True) et les sidecars SQLite écrits
       pendant l'initialisation. Umask global au processus (course possible avec
       des threads, uniquement dans le sens restrictif → fail-safe), restaurée
       en `finally`.
-    - Re-vérifie APRÈS l'ouverture SQLite (défense en profondeur TOCTOU) : symlink,
-      fichier régulier puis identité (st_dev, st_ino) du chemin. sqlite3 n'expose
-      ni O_NOFOLLOW ni le descripteur sous-jacent : une substitution persistante
-      du chemin dans la fenêtre d'ouverture est détectée, la connexion est
-      fermée puis l'erreur remontée (fail-closed).
+    - Linux : ouverture par descripteur épinglé (`_connect_pinned_fd`) — le
+      chemin est ouvert en `O_NOFOLLOW|O_CREAT` puis SQLite ouvre ce même
+      descripteur via `/dev/fd/N`, donc l'inode EXACT déjà validé. La fenêtre
+      TOCTOU de `sqlite3.connect()` (qui n'expose ni O_NOFOLLOW ni le fd) est
+      fermée. POSIX sans `/dev/fd` fiable : repli `_connect_by_path`.
+    - Re-vérification APRÈS l'ouverture SQLite (défense en profondeur TOCTOU) :
+      symlink, fichier régulier puis identité (st_dev, st_ino) avec l'inode
+      réellement ouvert. Une substitution persistante du chemin dans la fenêtre
+      d'ouverture est détectée, la connexion est fermée puis l'erreur remontée
+      (fail-closed).
     """
+    if os.name == "nt":
+        # Windows strictement hors cible de déploiement en production (invariants 1/10) :
+        # refus fail-closed immédiat, avant toute création de fichier ou de répertoire.
+        raise RuntimeError(
+            "Environnement non supporté : système POSIX requis pour sécuriser les permissions."
+        )
     _assert_not_symlink(path)
     if path.is_dir():
         logger.debug("Chemin de base de données pointe vers un répertoire : %s", path.name)
@@ -322,37 +378,124 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
         path.parent.mkdir(parents=True, exist_ok=True)
         _harden_created_parents(missing_parents)
         _assert_not_symlink(path)
-        if not path.exists():
-            path.touch(mode=_SECURE_FILE_MODE, exist_ok=True)
+        if _FD_DB_CONNECT_SUPPORTED:
+            conn, opened_identity = _connect_pinned_fd(path)
         else:
-            _check_regular_file(path)
+            conn, opened_identity = _connect_by_path(path)
 
-        _assert_not_symlink(path)
-        _apply_secure_permissions(path)
-        # Empreinte (st_dev, st_ino) immédiatement avant l'ouverture : comparée à
-        # l'empreinte post-ouverture pour détecter une substitution non couverte
-        # par O_NOFOLLOW (indisponible via sqlite3).
-        pre_open_stat = _stat_no_follow(path)
-
-        conn = sqlite3.connect(str(path))
         try:
-            conn.execute("PRAGMA journal_mode = DELETE;")
-            _assert_not_symlink(path)
-            _check_regular_file(path)
-            post_open_stat = _stat_no_follow(path)
-            if (post_open_stat.st_dev, post_open_stat.st_ino) != (
-                pre_open_stat.st_dev,
-                pre_open_stat.st_ino,
-            ):
-                raise PermissionError(
-                    "Chemin de base de données refusé : substitution détectée pendant l'ouverture"
-                )
+            _verify_opened_connection(path, conn, opened_identity)
         except BaseException:
             conn.close()
             raise
         return conn
     finally:
         os.umask(old_umask)
+
+
+def _connect_pinned_fd(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]:
+    """Ouvre la base par descripteur épinglé puis `sqlite3.connect("/dev/fd/N")` (Linux).
+
+    `os.open(O_RDWR|O_CREAT|O_NOFOLLOW|O_NONBLOCK)` est atomique vis-à-vis des
+    symlinks et ne bloque pas sur un FIFO. Toutes les gardes (fichier régulier,
+    `st_nlink == 1`, fchmod 0o600 vérifié) s'appliquent via `fstat`/`fchmod` au
+    descripteur, et SQLite ouvre ce MÊME inode : validation et usage portent sur
+    le même objet noyau, sans fenêtre TOCTOU.
+
+    Retourne la connexion et l'identité (st_dev, st_ino) du descripteur épinglé
+    pour la re-vérification post-ouverture du chemin.
+    """
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags, _SECURE_FILE_MODE)
+    except OSError as exc:
+        logger.debug(
+            "Ouverture sécurisée impossible pour %s : %s", path.name, exc.__class__.__name__
+        )
+        if exc.errno == errno.ELOOP:
+            raise PermissionError(
+                "Chemin de base de données refusé : lien symbolique interdit"
+            ) from exc
+        raise PermissionError("Chemin de base de données refusé : accès impossible") from exc
+    try:
+        fd_stat = os.fstat(fd)
+        if not stat_module.S_ISREG(fd_stat.st_mode):
+            logger.debug("Chemin de base de données non régulier : %s", path.name)
+            raise PermissionError(
+                "Chemin de base de données refusé : fichier non régulier interdit"
+            )
+        if fd_stat.st_nlink != 1:
+            logger.debug("Chemin de base de données avec liens physiques multiples : %s", path.name)
+            raise PermissionError("Chemin de base de données refusé : lien physique interdit")
+        try:
+            os.fchmod(fd, _SECURE_FILE_MODE)
+        except OSError as exc:
+            logger.debug("Échec du fchmod 0o600 sur %s : %s", path.name, exc.__class__.__name__)
+            raise PermissionError(
+                "Impossible de sécuriser les permissions de la base SQLite"
+            ) from exc
+        applied_mode = os.fstat(fd).st_mode & _DIR_PERM_MASK
+        if applied_mode != _SECURE_FILE_MODE:
+            logger.debug(
+                "Permissions insuffisantes sur %s : attendu 0o600, obtenu %s",
+                path.name,
+                oct(applied_mode),
+            )
+            raise PermissionError(
+                "Permissions de la base SQLite insuffisantes : attendu 0o600, "
+                f"obtenu {oct(applied_mode)}"
+            )
+        conn = sqlite3.connect(f"/dev/fd/{fd}")
+        opened_identity = (fd_stat.st_dev, fd_stat.st_ino)
+    except BaseException:
+        os.close(fd)
+        raise
+    os.close(fd)
+    return conn, opened_identity
+
+
+def _connect_by_path(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]:
+    """Repli POSIX (sans `/dev/fd` fiable) : gardes chemin, chmod, `connect()`, identité.
+
+    `sqlite3` n'expose ni O_NOFOLLOW ni le descripteur sous-jacent : la fenêtre
+    entre la dernière vérification et `connect()` n'est pas atomique. L'empreinte
+    (st_dev, st_ino) relevée juste avant l'ouverture est comparée après
+    (`_verify_opened_connection`) pour détecter une substitution persistante.
+    """
+    _assert_not_symlink(path)
+    if not path.exists():
+        path.touch(mode=_SECURE_FILE_MODE, exist_ok=True)
+    else:
+        _check_regular_file(path)
+
+    _assert_not_symlink(path)
+    _apply_secure_permissions(path)
+    pre_open_stat = _stat_no_follow(path)
+    conn = sqlite3.connect(str(path))
+    return conn, (pre_open_stat.st_dev, pre_open_stat.st_ino)
+
+
+def _verify_opened_connection(
+    path: Path,
+    conn: sqlite3.Connection,
+    opened_identity: tuple[int, int],
+) -> None:
+    """Vérifie après ouverture que le chemin est sain et pointe l'inode attendu (TOCTOU).
+
+    - `journal_mode=DELETE` positionné (pas de sidecar -wal/-shm).
+    - Symlink et type de fichier re-vérifiés via lstat (aucun suivi de lien).
+    - Identité (st_dev, st_ino) du chemin comparée à l'inode réellement ouvert.
+
+    Lève PermissionError générique (sans chemin) ; la connexion est fermée par l'appelant.
+    """
+    conn.execute("PRAGMA journal_mode = DELETE;")
+    _assert_not_symlink(path)
+    _check_regular_file(path)
+    post_open_stat = _stat_no_follow(path)
+    if (post_open_stat.st_dev, post_open_stat.st_ino) != opened_identity:
+        raise PermissionError(
+            "Chemin de base de données refusé : substitution détectée pendant l'ouverture"
+        )
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:

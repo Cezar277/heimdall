@@ -11,14 +11,17 @@ Vérifie :
 8. Les opérations CRUD complètes sur les projets, clés API et secrets.
 9. La gestion transactionnelle `db_session` (commit automatique et rollback sur exception).
 10. Les permissions sécurisées du fichier SQLite (`0o600` sous POSIX, fail-closed).
-11. Le refus des chemins symboliques (protection TOCTOU).
-12. Le comportement fail-closed si `chmod` échoue (mock OSError).
+11. Le refus des chemins symboliques (protection TOCTOU) et la fermeture de la
+    fenêtre d'ouverture : descripteur épinglé `/dev/fd` sous Linux, repli POSIX.
+12. Le comportement fail-closed si `chmod`/`fchmod` échoue (mock OSError).
 13. L'absence de fichiers sidecar SQLite (`-wal`, `-shm`, `-journal`) après écriture.
 14. Le rejet applicatif du statut invalide sur `update_secret`.
 15. La couverture du `.gitignore` sur `vault.db` (non-régression commit accidentel).
 16. La validation de `VaultSettings.db_path` (vide, caractères de contrôle).
+17. Le défaut hors dépôt (`$XDG_DATA_HOME` ou `~/.local/share/heimdall/vault.db`).
 """
 
+import errno
 import fnmatch
 import io
 import os
@@ -275,7 +278,7 @@ class VaultDatabaseTests(unittest.TestCase):
         # Vérifie également la restauration lorsque l'exception survient dans le bloc try
         target_path = Path(self.temp_dir.name) / "fail_in_try.db"
         with patch(
-            "heimdall.vault.database._apply_secure_permissions",
+            "heimdall.vault.database._verify_opened_connection",
             side_effect=PermissionError("Simulated failure"),
         ):
             with self.assertRaises(PermissionError):
@@ -915,6 +918,40 @@ class VaultDatabaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_db_path()
 
+    def test_default_db_path_is_absolute_and_outside_repo(self) -> None:
+        """Remarque 3 (LOW) — le défaut est absolu et hors dépôt (plus de CWD-relatif).
+
+        Deux répertoires de travail convergent désormais vers la même base
+        (~/.local/share/heimdall/vault.db ou XDG_DATA_HOME), plus de cloisonnement
+        silencieux.
+        """
+        default = vault_database.default_db_path()
+        self.assertTrue(default.is_absolute(), f"défaut non absolu : {default}")
+        self.assertEqual(default.name, "vault.db")
+        self.assertEqual(default.parent.name, "heimdall")
+        self.assertEqual(DEFAULT_DB_PATH, default)
+        repo_root = Path(__file__).resolve().parent.parent
+        self.assertFalse(
+            default.is_relative_to(repo_root),
+            f"le défaut ne doit pas être dans le dépôt : {default}",
+        )
+
+    def test_default_db_path_respects_xdg_data_home(self) -> None:
+        """XDG — $XDG_DATA_HOME absolu respecté ; vide, blanc ou relatif ignoré (spec XDG)."""
+        with patch.dict(os.environ, {"XDG_DATA_HOME": "/custom/xdg-data"}):
+            self.assertEqual(
+                vault_database.default_db_path(),
+                Path("/custom/xdg-data/heimdall/vault.db"),
+            )
+        expected_home_default = Path.home() / ".local" / "share" / "heimdall" / "vault.db"
+        for ignored in ("relative/xdg", "   ", ""):
+            with patch.dict(os.environ, {"XDG_DATA_HOME": ignored}):
+                self.assertEqual(
+                    vault_database.default_db_path(),
+                    expected_home_default,
+                    f"XDG_DATA_HOME={ignored!r} doit être ignoré (non absolu ou vide)",
+                )
+
     def test_relative_db_path_resolved_against_cwd(self) -> None:
         """Pinnage CWD : un chemin relatif produit une base isolée par répertoire de travail.
 
@@ -1091,27 +1128,19 @@ class VaultDatabaseTests(unittest.TestCase):
         """
         if os.name == "nt":
             self.skipTest("Test POSIX uniquement")
-        cwd = Path(self.temp_dir.name)
-        absolute_default = cwd / "vault.db"
-        error = sqlite3.OperationalError(
-            f"unable to open database file: {absolute_default} (code 14)"
-        )
-        current_cwd = Path.cwd()
-        try:
-            os.chdir(cwd)
-            with patch.dict(os.environ, {}, clear=True):
-                with patch("heimdall.vault.init_db.init_db", side_effect=error):
-                    stderr_buf = io.StringIO()
-                    with redirect_stderr(stderr_buf):
-                        code = init_db_main(["-v"])
-        finally:
-            os.chdir(current_cwd)
+        default_path = DEFAULT_DB_PATH
+        error = sqlite3.OperationalError(f"unable to open database file: {default_path} (code 14)")
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("heimdall.vault.init_db.init_db", side_effect=error):
+                stderr_buf = io.StringIO()
+                with redirect_stderr(stderr_buf):
+                    code = init_db_main(["-v"])
         self.assertEqual(code, 1)
         output = stderr_buf.getvalue()
         self.assertIn("Erreur : échec de l'initialisation", output)
         self.assertIn("Détail [OperationalError] :", output)
-        self.assertNotIn(str(cwd), output)
-        self.assertNotIn(str(absolute_default), output)
+        self.assertNotIn(str(default_path), output)
+        self.assertNotIn(str(default_path.parent), output)
         # Le basename reste visible pour le diagnostic opérateur
         self.assertIn("vault.db", output)
 
@@ -1180,6 +1209,43 @@ class VaultDatabaseTests(unittest.TestCase):
             self.assertEqual(cursor.fetchone()[0], 1)
         finally:
             conn.close()
+
+    def test_dotdot_traversing_symlink_ancestor_is_refused(self) -> None:
+        """Tests manquants revue — `sub/../cible` où `sub` est un symlink : refus fail-closed.
+
+        La normalisation lexicale seule (`sub/..` → parent) ne suffit pas : c'est la
+        vérification `lstat` de tous les ancêtres bruts (dont `sub`, lié) qui refuse,
+        sans jamais créer de fichier ni modifier un répertoire.
+        """
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        base = Path(self.temp_dir.name)
+        real_dir = base / "real_sub"
+        real_dir.mkdir()
+        link_dir = base / "sub"
+        link_dir.symlink_to(real_dir)
+
+        combined = link_dir / ".." / "cible_vault.db"
+        with self.assertRaises(PermissionError) as ctx:
+            get_connection(combined)
+        self.assertIn("lien symbolique interdit", str(ctx.exception).lower())
+        self.assertNotIn(str(combined), str(ctx.exception))
+        self.assertFalse((base / "cible_vault.db").exists())
+        self.assertFalse((real_dir / "cible_vault.db").exists())
+
+    def test_dangling_symlink_refused_without_exists_follow(self) -> None:
+        """Remarque 2 (LOW) — un symlink pendant est refusé : plus de `path.exists()` suivi."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        dangling = Path(self.temp_dir.name) / "dangling.db"
+        dangling.symlink_to(Path(self.temp_dir.name) / "absent.db")
+        with self.assertRaises(PermissionError) as ctx:
+            get_connection(dangling)
+        self.assertIn("lien symbolique interdit", str(ctx.exception).lower())
+        # `_check_regular_file` seul (lstat) ne traite jamais un symlink pendant comme absent
+        with self.assertRaises(PermissionError) as ctx_regular:
+            vault_database._check_regular_file(dangling)
+        self.assertIn("fichier non régulier interdit", str(ctx_regular.exception).lower())
 
     def test_non_regular_file_rejected_without_blocking(self) -> None:
         """Remarque 1 (LOW) — get_connection refuse FIFO, socket et device POSIX sans bloquer."""
@@ -1291,6 +1357,134 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         with self.assertRaises(sqlite3.ProgrammingError):
             opened[0].execute("SELECT 1;")
+
+    def test_linux_pinned_fd_connect_uses_dev_fd(self) -> None:
+        """Remarque 1 (LOW) — Linux : SQLite ouvre /dev/fd/N (inode épinglé), pas le chemin."""
+        if not vault_database._FD_DB_CONNECT_SUPPORTED:
+            self.skipTest("Repli POSIX actif (pas de /dev/fd fiable)")
+        captured: list[str] = []
+        real_connect = sqlite3.connect
+
+        def capturing_connect(
+            database: str, *args: typing.Any, **kwargs: typing.Any
+        ) -> sqlite3.Connection:
+            captured.append(database)
+            return real_connect(database, *args, **kwargs)
+
+        with patch("heimdall.vault.database.sqlite3.connect", side_effect=capturing_connect):
+            conn = get_connection(self.db_path)
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(
+            captured[0].startswith("/dev/fd/"),
+            f"connect() doit ouvrir le descripteur épinglé, obtenu {captured[0]}",
+        )
+        conn.close()
+
+        # La base reste pleinement utilisable (journal adjacent au chemin réel, pas /dev/fd)
+        init_db(self.db_path)
+        with db_session(self.db_path) as session:
+            create_project(session, "proj_pinned")
+            self.assertIsNotNone(get_project(session, "proj_pinned"))
+        self.assertEqual(self.db_path.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((self.db_path.parent / f"{self.db_path.name}-journal").exists())
+
+    def test_posix_fallback_path_open_without_dev_fd(self) -> None:
+        """Remarque 1 (LOW) — repli POSIX sans /dev/fd : ouverture par chemin + identité."""
+        fallback_path = Path(self.temp_dir.name) / "fallback_vault.db"
+        with patch.object(vault_database, "_FD_DB_CONNECT_SUPPORTED", False):
+            init_db(fallback_path)
+            with db_session(fallback_path) as conn:
+                create_project(conn, "proj_fallback")
+                self.assertIsNotNone(get_project(conn, "proj_fallback"))
+            # Réouverture d'un fichier existant (branche « déjà présent » du repli)
+            with db_session(fallback_path) as conn_existing:
+                self.assertIsNotNone(get_project(conn_existing, "proj_fallback"))
+        self.assertEqual(fallback_path.stat().st_mode & 0o777, 0o600)
+
+    def test_pinned_fd_open_errors_map_to_generic_refusals(self) -> None:
+        """Défense en profondeur — ELOOP (course symlink) et OSError divers → refus génériques."""
+        if not vault_database._FD_DB_CONNECT_SUPPORTED:
+            self.skipTest("Repli POSIX actif (pas de /dev/fd fiable)")
+        # 1. Symlink présent au moment exact de os.open(O_NOFOLLOW) → ELOOP → refus symlink
+        real_target = Path(self.temp_dir.name) / "race_real.db"
+        real_target.touch()
+        race_symlink = Path(self.temp_dir.name) / "race_symlink.db"
+        race_symlink.symlink_to(real_target)
+        with self.assertRaises(PermissionError) as ctx_loop:
+            vault_database._connect_pinned_fd(race_symlink)
+        self.assertIn("lien symbolique interdit", str(ctx_loop.exception).lower())
+        # 2. Toute autre OSError → message générique sans chemin
+        with patch.object(vault_database.os, "open", side_effect=OSError(errno.EACCES, "denied")):
+            with self.assertRaises(PermissionError) as ctx_os:
+                vault_database._connect_pinned_fd(real_target)
+        self.assertIn("accès impossible", str(ctx_os.exception).lower())
+        self.assertNotIn(str(real_target), str(ctx_os.exception))
+
+    def test_check_regular_file_stat_failure_is_generic_refusal(self) -> None:
+        """Anti-fuite — un lstat refusé dans _check_regular_file lève PermissionError générique."""
+        secret_path = Path(self.temp_dir.name) / "stat_fail" / "vault.db"
+        with patch.object(os, "stat", side_effect=OSError("boom " + str(secret_path))):
+            with self.assertRaises(PermissionError) as ctx:
+                vault_database._check_regular_file(secret_path)
+        self.assertEqual(
+            str(ctx.exception),
+            "Chemin de base de données refusé : accès impossible",
+        )
+        self.assertNotIn(str(secret_path), str(ctx.exception))
+
+    def test_pinned_fd_guards_fifo_and_hardlink(self) -> None:
+        """Défense en profondeur — les gardes fd (non régulier, nlink > 1) refusent sur l'inode."""
+        if not vault_database._FD_DB_CONNECT_SUPPORTED:
+            self.skipTest("Repli POSIX actif (pas de /dev/fd fiable)")
+        # 1. FIFO : os.open(O_RDWR|O_NONBLOCK) réussit sans bloquer, le fstat fd refuse
+        if hasattr(os, "mkfifo"):
+            fifo_path = Path(self.temp_dir.name) / "fd_fifo.db"
+            os.mkfifo(fifo_path)
+            with self.assertRaises(PermissionError) as ctx_fifo:
+                vault_database._connect_pinned_fd(fifo_path)
+            self.assertIn("fichier non régulier interdit", str(ctx_fifo.exception).lower())
+        # 2. Hardlink : nlink > 1 refusé via le descripteur épinglé
+        hardlink_target = Path(self.temp_dir.name) / "fd_hardlink.db"
+        hardlink_target.touch()
+        os.link(hardlink_target, Path(self.temp_dir.name) / "fd_hardlink_2.db")
+        with self.assertRaises(PermissionError) as ctx_link:
+            vault_database._connect_pinned_fd(hardlink_target)
+        self.assertIn("lien physique interdit", str(ctx_link.exception).lower())
+
+    def test_pinned_fd_permission_mismatch_fails_closed(self) -> None:
+        """Fail-closed — mode effectif != 0o600 constaté sur le fd après fchmod → refus."""
+        if not vault_database._FD_DB_CONNECT_SUPPORTED:
+            self.skipTest("Repli POSIX actif (pas de /dev/fd fiable)")
+        target = Path(self.temp_dir.name) / "fd_mode_mismatch.db"
+        real_fstat = os.fstat
+        call_count = {"n": 0}
+
+        def fake_fstat(fd: int) -> os.stat_result:
+            call_count["n"] += 1
+            st = real_fstat(fd)
+            if call_count["n"] >= 2:
+                fake_mode = (st.st_mode & ~0o777) | 0o644
+                return os.stat_result(
+                    (
+                        fake_mode,
+                        st.st_ino,
+                        st.st_dev,
+                        st.st_nlink,
+                        st.st_uid,
+                        st.st_gid,
+                        st.st_size,
+                        st.st_atime,
+                        st.st_mtime,
+                        st.st_ctime,
+                    )
+                )
+            return st
+
+        with patch.object(vault_database.os, "fstat", side_effect=fake_fstat):
+            with self.assertRaises(PermissionError) as ctx:
+                vault_database._connect_pinned_fd(target)
+        self.assertIn("insuffisantes", str(ctx.exception).lower())
+        self.assertNotIn(str(target), str(ctx.exception))
 
     def test_init_db_rejects_degraded_schema(self) -> None:
         """Remarque 2 (LOW) — init_db lève RuntimeError sur une base au schéma dégradé."""
@@ -1557,7 +1751,14 @@ class VaultDatabaseTests(unittest.TestCase):
         os.umask(initial_umask)
 
         fail_path = Path(self.temp_dir.name) / "umask_chmod_fail" / "vault.db"
-        with patch.object(Path, "chmod", side_effect=OSError("chmod error")):
+        if vault_database._FD_DB_CONNECT_SUPPORTED:
+            # Linux : le chemin épinglé sécurise via os.fchmod sur le descripteur
+            fail_patcher = patch.object(
+                vault_database.os, "fchmod", side_effect=OSError("chmod error")
+            )
+        else:
+            fail_patcher = patch.object(Path, "chmod", side_effect=OSError("chmod error"))
+        with fail_patcher:
             with self.assertRaises(PermissionError):
                 get_connection(fail_path)
 
@@ -1569,6 +1770,17 @@ class VaultDatabaseTests(unittest.TestCase):
             f"umask non restauré après échec chmod : attendu {oct(initial_umask)}, "
             f"obtenu {oct(restored_umask)}",
         )
+
+    def test_linux_fchmod_failure_fails_closed(self) -> None:
+        """Remarque 1 (LOW) — Linux : échec de fchmod → PermissionError générique, sans chemin."""
+        if not vault_database._FD_DB_CONNECT_SUPPORTED:
+            self.skipTest("Repli POSIX actif (pas de /dev/fd fiable)")
+        target = Path(self.temp_dir.name) / "fchmod_fail.db"
+        with patch.object(vault_database.os, "fchmod", side_effect=OSError("read-only fs")):
+            with self.assertRaises(PermissionError) as ctx:
+                get_connection(target)
+        self.assertIn("permissions", str(ctx.exception).lower())
+        self.assertNotIn(str(target), str(ctx.exception))
 
     def test_get_connection_rejects_existing_directory_and_path_memory(self) -> None:
         """Section 3 — get_connection refuse un répertoire existant et gère Path(':memory:')."""
