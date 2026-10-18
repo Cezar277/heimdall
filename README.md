@@ -42,9 +42,23 @@ heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) via son lanceur dédié, seul point d'entrée supporté garantissant l'application de l'allowlist d'hôte et le durcissement du transport :
 
 ```sh
+# Initialisation à froid de la base de données SQLite (#62) :
+# Chemin par défaut hors dépôt : $XDG_DATA_HOME/heimdall/vault.db
+# (sinon ~/.local/share/heimdall/vault.db) ; surcharge par argument
+# ou via $HEIMDALL_VAULT_DB_PATH.
+# Chemin ABSOLU exigé (CLI et serveur) : un chemin relatif dépend du répertoire
+# courant et ferait diverger la CLI et le serveur sans erreur.
+# Codes de retour : 0 (succès), 1 (erreur d'initialisation ou permissions),
+# 2 (chemin relatif, ou ':memory:' : réservé aux tests via API, interdit en CLI,
+#   via $HEIMDALL_VAULT_DB_PATH et côté serveur — fail-closed)
+python -m heimdall.vault.init_db
+
 # Lancement du serveur Vault (point d'entrée unique, boucle locale vérifiée) :
 python -m heimdall.vault.app
 ```
+
+> **Environnement cible (POSIX requis)** :
+> Heimdall Vault requiert un système POSIX (Linux, macOS, BSD) pour garantir le durcissement fail-closed des permissions (`0600` pour la base, `0700` pour les répertoires). Sous Windows, ces permissions ne sont pas applicables nativement : l'ouverture de la base refuse fail-closed (`RuntimeError`, aucun avertissement suivi de poursuite) — Windows est strictement hors cible de déploiement en production.
 
 > **Note sécurité & dette technique (contrat OpenAPI #15)** :
 > Ce squelette minimal (#25) est strictement confiné à la boucle locale (`127.0.0.1`, `::1`, `localhost`).

@@ -11,6 +11,7 @@ X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 """
 
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -439,13 +440,58 @@ class VaultSettingsTests(unittest.TestCase):
 
     def test_create_app_factory_applies_settings_parameter(self) -> None:
         """create_app applique les paramètres transmis et ne les ignore pas."""
-        custom_settings = VaultSettings(host="::1", port=8445, enable_docs=True)
+        pinned_target = Path(tempfile.gettempdir()) / "heimdall_factory_test_vault.db"
+        custom_settings = VaultSettings(
+            host="::1", port=8445, enable_docs=True, db_path=str(pinned_target)
+        )
         custom_app = create_app(custom_settings)
         self.assertIsInstance(custom_app, FastAPI)
         self.assertEqual(custom_app.title, "Heimdall Vault API")
         self.assertIs(custom_app.state.settings, custom_settings)
+        self.assertEqual(custom_app.state.db_path, pinned_target)
         self.assertEqual(custom_app.docs_url, "/docs")
         self.assertEqual(custom_app.openapi_url, "/openapi.json")
+
+    def test_create_app_refuses_memory_db_path(self) -> None:
+        """Remarque 2 (v4) — create_app refuse ':memory:' (base éphémère, fail-closed).
+
+        Couvre le vecteur `HEIMDALL_VAULT_DB_PATH=:memory:` : pydantic-settings le
+        mappe sur `settings.db_path`, le refus intervient au figeage du chemin.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            create_app(VaultSettings(db_path=":memory:"))
+        self.assertIn(":memory:", str(ctx.exception))
+        self.assertIn("fail-closed", str(ctx.exception))
+
+    def test_create_app_refuses_relative_db_path(self) -> None:
+        """Revue v5 (double source) — create_app refuse un chemin relatif (fail-closed).
+
+        Un chemin relatif dépend du CWD : le serveur et la CLI lancés depuis deux
+        répertoires ouvriraient deux bases différentes sans erreur. Le message reste
+        générique : il ne reflète jamais le chemin fourni.
+        """
+        for relative in ("relative_app_vault.db", "subdir/../pinned_vault.db"):
+            with self.subTest(relative=relative):
+                with self.assertRaises(ValueError) as ctx:
+                    create_app(VaultSettings(db_path=relative))
+                self.assertIn("absolu", str(ctx.exception))
+                self.assertNotIn(relative, str(ctx.exception))
+
+    def test_create_app_normalizes_dotdot_segments_lexically(self) -> None:
+        """`..` absolu normalisé lexicalement avant figeage (sans suivre de symlink).
+
+        Les gardes `lstat` de la couche DB continuent de refuser tout ancêtre lié à
+        l'ouverture (`database._assert_not_symlink`).
+        """
+        base = Path(tempfile.gettempdir())
+        custom_settings = VaultSettings(db_path=str(base / "subdir" / ".." / "pinned_vault.db"))
+        custom_app = create_app(custom_settings)
+        pinned = custom_app.state.db_path
+        self.assertIsInstance(pinned, Path)
+        assert isinstance(pinned, Path)
+        self.assertTrue(pinned.is_absolute())
+        self.assertNotIn("..", pinned.parts)
+        self.assertEqual(pinned, base / "pinned_vault.db")
 
     def test_health_response_model_rejects_extra_fields(self) -> None:
         """Le modèle de santé interdit tout champ supplémentaire."""

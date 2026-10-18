@@ -38,7 +38,10 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 """
 
 import ipaddress
+import logging
+import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
@@ -50,7 +53,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
+from heimdall.vault.database import DEFAULT_DB_PATH, resolve_db_path, validate_db_path
+
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+
+logger = logging.getLogger("heimdall.vault.app")
+
+# Seuil ASCII en dessous duquel un caractère est un caractère de contrôle.
+_CONTROL_CHAR_THRESHOLD: int = 0x20
 
 _ERROR_PAYLOADS: dict[int, dict[str, str]] = {
     400: {"code": "bad_request", "message": "Requête invalide"},
@@ -155,6 +165,19 @@ class VaultSettings(BaseSettings):
         default=False,
         description="Activer la documentation OpenAPI/Swagger (/docs). Faux par défaut.",
     )
+    db_path: str = Field(
+        default=str(DEFAULT_DB_PATH),
+        description="Chemin du fichier de base de données SQLite.",
+    )
+
+    @field_validator("db_path")
+    @classmethod
+    def validate_db_path(cls, value: str) -> str:
+        """Refuse les chemins invalides en réutilisant le validateur factorisé."""
+        try:
+            return validate_db_path(value)
+        except IsADirectoryError as exc:
+            raise ValueError(str(exc)) from exc
 
     @field_validator("host")
     @classmethod
@@ -188,6 +211,43 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
 
 
+def _pin_db_path(settings: VaultSettings) -> Path:
+    """Résout le chemin SQLite, exige un chemin absolu et le fige normalisé.
+
+    Source de vérité du chemin serveur : résolu UNE fois, à la création de
+    l'application, pour que les futures routes injectent `app.state.db_path`
+    dans `get_connection()`.
+
+    Refus fail-closed du chemin relatif (revue v5, double source) : un chemin
+    relatif dépend du répertoire courant du processus. Le serveur et la CLI
+    `init_db` pourraient alors ouvrir deux bases différentes sans erreur. Le
+    défaut XDG / `~/.local/share` étant absolu, seul un chemin explicitement
+    relatif est refusé.
+
+    `os.path.normpath` normalise lexicalement les segments `..` sans jamais suivre
+    les symlinks : les gardes `lstat` de la couche DB (`_assert_not_symlink`)
+    continuent de refuser tout ancêtre lié à l'ouverture.
+
+    Refus fail-closed du mode ':memory:' (remarque 2 de la revue v4) : une base
+    éphémère ferait échouer silencieusement chaque route (`no such table`) et
+    perdrait toute écriture au redémarrage — un serveur Vault exige un fichier
+    persistant. Le refus couvre aussi `HEIMDALL_VAULT_DB_PATH=:memory:` (mappé
+    sur `settings.db_path` par pydantic-settings).
+    """
+    resolved = resolve_db_path(settings.db_path)
+    if resolved == ":memory:":
+        raise ValueError(
+            "Le mode ':memory:' est interdit pour le serveur Vault : base éphémère "
+            "silencieuse (fail-closed). Configurer un fichier SQLite persistant."
+        )
+    if not Path(resolved).is_absolute():
+        raise ValueError(
+            "Chemin de base de données relatif interdit pour le serveur Vault : "
+            "fournir un chemin absolu (un chemin relatif dépend du répertoire courant)."
+        )
+    return Path(os.path.normpath(str(resolved)))
+
+
 def create_app(settings: VaultSettings | None = None) -> FastAPI:
     """Fabrique et configure l'application FastAPI pour le serveur Vault."""
     effective_settings = settings if settings is not None else get_settings()
@@ -203,6 +263,9 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
         openapi_url=openapi_url,
     )
     app.state.settings = effective_settings
+    resolved_db = _pin_db_path(effective_settings)
+    app.state.db_path = resolved_db
+    logger.debug("Base de données SQLite configurée : %s", resolved_db.name)
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:
@@ -242,13 +305,9 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
         )
 
     @app.exception_handler(StarletteHTTPException)
-    async def router_error_handler(
-        request: Request, exc: StarletteHTTPException
-    ) -> JSONResponse:
+    async def router_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         """Garde-fou : préserve le code contractuel sans fuite d'enveloppe framework."""
-        status_code = (
-            exc.status_code if exc.status_code in _ERROR_PAYLOADS else 500
-        )
+        status_code = exc.status_code if exc.status_code in _ERROR_PAYLOADS else 500
         content = _ERROR_PAYLOADS.get(
             exc.status_code,
             _ERROR_PAYLOADS[500],
