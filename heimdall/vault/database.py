@@ -27,14 +27,13 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
     `-wal`/`-shm`/`-journal` en permissions larges.
 - Confinement d'environnement : POSIX uniquement (Linux, macOS, BSD). Sous Windows (nt),
   les permissions 0o600 ne sont pas applicables nativement via os.chmod
-  (avertissement RuntimeWarning émis).
+  (refus fail-closed via RuntimeError, invariants 1/10).
 """
 
 import logging
 import os
 import sqlite3
 import stat as stat_module
-import warnings
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -199,17 +198,12 @@ def _apply_secure_permissions(path: Path) -> None:
     Plateformes non-POSIX (Windows / nt) :
     Le Vault Heimdall requiert un environnement POSIX pour garantir le confinement
     des permissions fichier (0o600). Windows est strictement hors cible de déploiement
-    en production. Sous Windows, les ACL ne sont pas restreintes nativement via os.chmod ;
-    cette fonction émet un RuntimeWarning explicite.
+    en production : refus fail-closed immédiat (invariants 1/10).
     """
     if os.name == "nt":
-        warnings.warn(
-            "Le Vault Heimdall requiert un environnement POSIX pour garantir le confinement "
-            "des permissions fichier (0o600). Sous Windows, les ACL ne sont pas restreintes.",
-            RuntimeWarning,
-            stacklevel=2,
+        raise RuntimeError(
+            "Environnement non supporté : système POSIX requis pour sécuriser les permissions."
         )
-        return
     try:
         path.chmod(_SECURE_FILE_MODE)
     except OSError as exc:
@@ -253,6 +247,10 @@ def _harden_created_parents(missing_parents: list[Path]) -> None:
     opérateur et ne sont jamais modifiés pour éviter tout effet de bord destructeur.
     """
     if os.name == "nt":
+        if missing_parents:
+            raise RuntimeError(
+                "Environnement non supporté : système POSIX requis pour sécuriser les répertoires."
+            )
         return
     for new_dir in missing_parents:
         if not new_dir.exists():

@@ -8,6 +8,7 @@ Usage :
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -52,8 +53,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose:
             exc_type = exc.__class__.__name__
             msg = str(exc).splitlines()[0] if str(exc) else ""
-            if args.db_path:
-                msg = msg.replace(str(args.db_path), Path(args.db_path).name)
+            raw_paths: list[str | Path | None] = [
+                args.db_path,
+                os.environ.get("HEIMDALL_VAULT_DB_PATH"),
+            ]
+            for raw_p in raw_paths:
+                if raw_p:
+                    msg = msg.replace(str(raw_p), Path(raw_p).name)
             print(f"Détail [{exc_type}] : {msg}", file=sys.stderr)
         return 1
 

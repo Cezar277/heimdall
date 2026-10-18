@@ -31,7 +31,6 @@ import sys
 import tempfile
 import typing
 import unittest
-import warnings
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
@@ -900,20 +899,17 @@ class VaultDatabaseTests(unittest.TestCase):
             os.chdir(current_cwd)
 
     def test_windows_warning_on_apply_secure_permissions(self) -> None:
-        """Windows : _apply_secure_permissions émet un RuntimeWarning et parents non durcis."""
+        """Windows : _apply_secure_permissions et _harden_created_parents lèvent RuntimeError."""
         with patch("os.name", "nt"):
-            with warnings.catch_warnings(record=True) as recorded:
-                warnings.simplefilter("always")
+            with self.assertRaises(RuntimeError) as ctx:
                 _apply_secure_permissions(self.db_path)
-                self.assertEqual(len(recorded), 1)
-                self.assertTrue(issubclass(recorded[0].category, RuntimeWarning))
-                self.assertIn("POSIX", str(recorded[0].message))
+            self.assertIn("POSIX requis", str(ctx.exception))
 
-        # Vérifie que _harden_created_parents est un no-op sur Windows sans tenter de chmod
+        # Vérifie que _harden_created_parents refuse également les répertoires sous Windows
         with patch("os.name", "nt"):
-            with patch.object(Path, "chmod") as mock_chmod:
+            with self.assertRaises(RuntimeError) as ctx_parents:
                 _harden_created_parents([self.db_path.parent])
-                mock_chmod.assert_not_called()
+            self.assertIn("POSIX requis", str(ctx_parents.exception))
 
     def test_exception_messages_do_not_leak_absolute_path(self) -> None:
         """Sanitization : les exceptions ne contiennent aucun chemin FS absolu (remarque 2)."""
@@ -988,6 +984,17 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertIn("Erreur : échec de l'initialisation", output_v)
         self.assertIn("Détail [PermissionError] :", output_v)
         self.assertNotIn(str(sym_f), output_v)
+
+        # Avec HEIMDALL_VAULT_DB_PATH et -v : détail présent mais sans chemin absolu
+        stderr_buf_env = io.StringIO()
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": str(sym_f)}):
+            with redirect_stderr(stderr_buf_env):
+                code_env = init_db_main(["-v"])
+        self.assertEqual(code_env, 1)
+        output_env = stderr_buf_env.getvalue()
+        self.assertIn("Erreur : échec de l'initialisation", output_env)
+        self.assertIn("Détail [PermissionError] :", output_env)
+        self.assertNotIn(str(sym_f), output_env)
 
     def test_init_db_cli_rejects_memory_mode(self) -> None:
         """CLI — init_db refuse le mode ':memory:' et retourne un code de sortie non nul (2)."""
