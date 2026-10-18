@@ -44,6 +44,7 @@ from heimdall.vault.database import (
     SecretStatus,
     _apply_secure_permissions,
     _harden_created_parents,
+    _stat_no_follow,
     create_api_key,
     create_project,
     create_secret,
@@ -66,6 +67,7 @@ from heimdall.vault.database import (
     update_secret,
     validate_db_path,
 )
+from heimdall.vault.init_db import _sanitize_error_message
 from heimdall.vault.init_db import main as init_db_main
 
 
@@ -736,21 +738,44 @@ class VaultDatabaseTests(unittest.TestCase):
                 f"{filename!r} n'est pas couvert par les motifs du .gitignore (test fnmatch)",
             )
 
-        # Vérification optionnelle avec git check-ignore si git est installé
+        # Vérification reproductible via git check-ignore dans un dépôt temporaire
+        # (aucune dépendance au dépôt réel ni à la config git globale de la machine).
         git_bin = shutil.which("git")
-        if git_bin is not None:
-            for filename in sidecar_files:
-                result = subprocess.run(  # noqa: S603
-                    [git_bin, "check-ignore", "-q", filename],
-                    cwd=root,
-                    capture_output=True,
-                    check=False,
-                )
-                self.assertEqual(
-                    result.returncode,
-                    0,
-                    f"{filename!r} n'est pas couvert par .gitignore (git check-ignore)",
-                )
+        if git_bin is None:
+            self.skipTest(
+                "git introuvable : vérification check-ignore non exécutée "
+                "(l'assertion fnmatch ci-dessus reste bloquante)"
+            )
+        git_repo = Path(self.temp_dir.name) / "gitignore_repo"
+        git_repo.mkdir()
+        (git_repo / ".gitignore").write_text(
+            gitignore_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        subprocess.run(  # noqa: S603
+            [git_bin, "-c", "init.defaultBranch=main", "init", "--quiet", str(git_repo)],
+            capture_output=True,
+            check=True,
+        )
+        for filename in sidecar_files:
+            result = subprocess.run(  # noqa: S603
+                [
+                    git_bin,
+                    "-c",
+                    "core.excludesFile=/dev/null",
+                    "check-ignore",
+                    "--quiet",
+                    filename,
+                ],
+                cwd=git_repo,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"{filename!r} n'est pas couvert par .gitignore (git check-ignore)",
+            )
 
     # -----------------------------------------------------------------------
     # 16. Validation VaultSettings.db_path (L4)
@@ -947,6 +972,18 @@ class VaultDatabaseTests(unittest.TestCase):
                     _apply_secure_permissions(real_file)
                 self.assertNotIn(str(real_file), str(ctx_mode.exception))
 
+    def test_stat_no_follow_failure_raises_generic_permission_error(self) -> None:
+        """Anti-fuite — un stat refusé lève PermissionError générique sans chemin FS."""
+        secret_path = Path(self.temp_dir.name) / "inaccessible" / "vault.db"
+        with patch.object(os, "stat", side_effect=OSError("boom " + str(secret_path))):
+            with self.assertRaises(PermissionError) as ctx:
+                _stat_no_follow(secret_path)
+        self.assertEqual(
+            str(ctx.exception),
+            "Chemin de base de données refusé : accès impossible",
+        )
+        self.assertNotIn(str(secret_path), str(ctx.exception))
+
     def test_resolve_db_path_memory_as_path_object(self) -> None:
         """resolve_db_path avec Path(':memory:') retourne la chaîne ':memory:'."""
         self.assertEqual(resolve_db_path(Path(":memory:")), ":memory:")
@@ -995,6 +1032,62 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertIn("Erreur : échec de l'initialisation", output_env)
         self.assertIn("Détail [PermissionError] :", output_env)
         self.assertNotIn(str(sym_f), output_env)
+
+    def test_init_db_cli_verbose_sanitizes_default_db_path(self) -> None:
+        """Remarque 1 (LOW) — `-v` avec le défaut `vault.db` n'expose aucun chemin absolu.
+
+        Couvre le trou de la remarque : `msg.replace()` ne couvrait que l'argument
+        et la variable d'environnement, pas le chemin par défaut résolu (CWD).
+        """
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        cwd = Path(self.temp_dir.name)
+        absolute_default = cwd / "vault.db"
+        error = sqlite3.OperationalError(
+            f"unable to open database file: {absolute_default} (code 14)"
+        )
+        current_cwd = Path.cwd()
+        try:
+            os.chdir(cwd)
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("heimdall.vault.init_db.init_db", side_effect=error):
+                    stderr_buf = io.StringIO()
+                    with redirect_stderr(stderr_buf):
+                        code = init_db_main(["-v"])
+        finally:
+            os.chdir(current_cwd)
+        self.assertEqual(code, 1)
+        output = stderr_buf.getvalue()
+        self.assertIn("Erreur : échec de l'initialisation", output)
+        self.assertIn("Détail [OperationalError] :", output)
+        self.assertNotIn(str(cwd), output)
+        self.assertNotIn(str(absolute_default), output)
+        # Le basename reste visible pour le diagnostic opérateur
+        self.assertIn("vault.db", output)
+
+    def test_sanitize_error_message_scrubs_paths(self) -> None:
+        """Assainissement verbose : basenames seuls, chemins à espaces et multilignes gérés."""
+        # 1. Chemin candidat avec espaces remplacé intégralement (pas de résidu)
+        candidate = "/srv/data/my vault dir/vault.db"
+        exc = sqlite3.OperationalError(f"unable to open database file: {candidate}")
+        self.assertEqual(
+            _sanitize_error_message(exc, [candidate]),
+            "unable to open database file: vault.db",
+        )
+
+        # 2. Chemin absolu non déclaré en candidat : réduit au basename par la regex
+        exc_unknown = OSError("write failed at /var/lib/other/file.db (disk full)")
+        self.assertEqual(
+            _sanitize_error_message(exc_unknown, [None, "", Path("vault.db")]),
+            "write failed at file.db (disk full)",
+        )
+
+        # 3. Quoted path + multi-lignes : première ligne seule, guillemets préservés
+        exc_multi = PermissionError("refusé '/a/b/c.db'\nseconde ligne /x/y/z.db")
+        self.assertEqual(_sanitize_error_message(exc_multi, []), "refusé 'c.db'")
+
+        # 4. Message vide : chaîne vide, jamais None
+        self.assertEqual(_sanitize_error_message(Exception(), []), "")
 
     def test_init_db_cli_rejects_memory_mode(self) -> None:
         """CLI — init_db refuse le mode ':memory:' et retourne un code de sortie non nul (2)."""
@@ -1088,6 +1181,66 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertIn("lien physique interdit", str(ctx.exception).lower())
         self.assertNotIn(str(hardlink_db), str(ctx.exception))
         self.assertEqual(victim_file.read_text(encoding="utf-8"), "victim secret content")
+
+    def test_toctou_symlink_swapped_during_connect_is_refused(self) -> None:
+        """TOCTOU — Symlink substitué pendant sqlite3.connect() : connexion fermée (fail-closed)."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        victim = Path(self.temp_dir.name) / "victim.db"
+        victim_conn = sqlite3.connect(str(victim))
+        victim_conn.execute("CREATE TABLE t (x INTEGER);")
+        victim_conn.commit()
+        victim_conn.close()
+        target = Path(self.temp_dir.name) / "swapped_symlink.db"
+        real_connect = sqlite3.connect
+        opened: list[sqlite3.Connection] = []
+
+        def swapping_connect(*args: typing.Any, **kwargs: typing.Any) -> sqlite3.Connection:
+            # Substitution dans la fenêtre non atomique précédant l'ouverture réelle.
+            target.unlink(missing_ok=True)
+            target.symlink_to(victim)
+            conn = real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        with patch("heimdall.vault.database.sqlite3.connect", side_effect=swapping_connect):
+            with self.assertRaises(PermissionError) as ctx:
+                get_connection(target)
+
+        self.assertIn("lien symbolique interdit", str(ctx.exception).lower())
+        self.assertNotIn(str(target), str(ctx.exception))
+        self.assertNotIn(str(victim), str(ctx.exception))
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1;")
+
+    def test_toctou_regular_file_swapped_during_connect_is_refused(self) -> None:
+        """TOCTOU — Fichier régulier substitué (nouvel inode) pendant connect() : refus."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        target = Path(self.temp_dir.name) / "swapped_regular.db"
+        replacement = Path(self.temp_dir.name) / "replacement.db"
+        replacement.touch()
+        real_connect = sqlite3.connect
+        opened: list[sqlite3.Connection] = []
+
+        def swapping_connect(*args: typing.Any, **kwargs: typing.Any) -> sqlite3.Connection:
+            # Remplacement par un autre fichier régulier : symlink et type passent,
+            # seule la comparaison (st_dev, st_ino) détecte la substitution.
+            os.replace(replacement, target)
+            conn = real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        with patch("heimdall.vault.database.sqlite3.connect", side_effect=swapping_connect):
+            with self.assertRaises(PermissionError) as ctx:
+                get_connection(target)
+
+        self.assertIn("substitution détectée", str(ctx.exception).lower())
+        self.assertNotIn(str(target), str(ctx.exception))
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1;")
 
     def test_init_db_rejects_degraded_schema(self) -> None:
         """Remarque 2 (LOW) — init_db lève RuntimeError sur une base au schéma dégradé."""

@@ -23,6 +23,9 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   - Mode `0o600` (lecture/écriture propriétaire uniquement) vérifié et confirmé
     après création — fail-closed si le chmod échoue ou si le mode effectif diffère.
   - Refus de tout chemin symbolique (`is_symlink()` via lstat) : protection TOCTOU.
+  - Re-vérification APRÈS l'ouverture SQLite (symlink, fichier régulier, identité
+    `st_dev`/`st_ino`) : toute substitution persistante du chemin dans la fenêtre
+    non atomique de `sqlite3.connect()` ferme la connexion (fail-closed).
   - `journal_mode=DELETE` forcé pour éviter la création de fichiers sidecar
     `-wal`/`-shm`/`-journal` en permissions larges.
 - Confinement d'environnement : POSIX uniquement (Linux, macOS, BSD). Sous Windows (nt),
@@ -223,15 +226,20 @@ def _apply_secure_permissions(path: Path) -> None:
         )
 
 
+def _stat_no_follow(path: Path) -> os.stat_result:
+    """`stat` sans suivi de lien symbolique, erreur générique sans chemin (anti-fuite)."""
+    try:
+        return os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        logger.debug("Impossible de stat le chemin %s : %s", path.name, exc.__class__.__name__)
+        raise PermissionError("Chemin de base de données refusé : accès impossible") from exc
+
+
 def _check_regular_file(path: Path) -> None:
     """Vérifie que le chemin est un fichier régulier non lié (refus FIFO/socket/device/hardlink)."""
     if not path.exists():
         return
-    try:
-        stat_res = os.stat(path, follow_symlinks=False)
-    except OSError as exc:
-        logger.debug("Impossible de stat le chemin %s : %s", path.name, exc.__class__.__name__)
-        raise PermissionError("Chemin de base de données refusé : accès impossible") from exc
+    stat_res = _stat_no_follow(path)
     if not stat_module.S_ISREG(stat_res.st_mode):
         logger.debug("Chemin de base de données non régulier : %s", path.name)
         raise PermissionError("Chemin de base de données refusé : fichier non régulier interdit")
@@ -287,9 +295,14 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
     - Crée le fichier avec mode 0o600 si inexistant.
     - Vérifie et confirme les permissions après création (fail-closed).
     - Positionne journal_mode=DELETE (pas de sidecar -wal/-shm).
-    - Maintient umask 0o077 autour de sqlite3.connect() pour réduire la fenêtre
-      TOCTOU résiduelle (le dernier _assert_not_symlink() et connect() ne sont
-      pas atomiques sans O_NOFOLLOW, acceptable en config opérateur).
+    - Maintient umask 0o077 autour de sqlite3.connect() : couvre les répertoires
+      intermédiaires créés par mkdir(parents=True) et les sidecars SQLite écrits
+      pendant l'initialisation.
+    - Re-vérifie APRÈS l'ouverture SQLite (défense en profondeur TOCTOU) : symlink,
+      fichier régulier puis identité (st_dev, st_ino) du chemin. sqlite3 n'expose
+      ni O_NOFOLLOW ni le descripteur sous-jacent : une substitution persistante
+      du chemin dans la fenêtre d'ouverture est détectée, la connexion est
+      fermée puis l'erreur remontée (fail-closed).
     """
     _assert_not_symlink(path)
     if path.is_dir():
@@ -314,8 +327,27 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
 
         _assert_not_symlink(path)
         _apply_secure_permissions(path)
+        # Empreinte (st_dev, st_ino) immédiatement avant l'ouverture : comparée à
+        # l'empreinte post-ouverture pour détecter une substitution non couverte
+        # par O_NOFOLLOW (indisponible via sqlite3).
+        pre_open_stat = _stat_no_follow(path)
+
         conn = sqlite3.connect(str(path))
-        conn.execute("PRAGMA journal_mode = DELETE;")
+        try:
+            conn.execute("PRAGMA journal_mode = DELETE;")
+            _assert_not_symlink(path)
+            _check_regular_file(path)
+            post_open_stat = _stat_no_follow(path)
+            if (post_open_stat.st_dev, post_open_stat.st_ino) != (
+                pre_open_stat.st_dev,
+                pre_open_stat.st_ino,
+            ):
+                raise PermissionError(
+                    "Chemin de base de données refusé : substitution détectée pendant l'ouverture"
+                )
+        except BaseException:
+            conn.close()
+            raise
         return conn
     finally:
         os.umask(old_umask)

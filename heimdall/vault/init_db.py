@@ -9,10 +9,56 @@ Usage :
 
 import argparse
 import os
+import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 from heimdall.vault.database import DEFAULT_DB_PATH, init_db, resolve_db_path
+
+# Chemin absolu (POSIX `/...` ou Windows `C:\...`), guillemets et parenthèses
+# exclus : capturé pour être réduit à son basename avant tout affichage verbose
+# (anti-fuite d'empreinte de l'environnement, invariant 8).
+_ABSOLUTE_PATH_TOKEN_RE: re.Pattern[str] = re.compile(r"(?:[A-Za-z]:[\\/]|/)[^\s'\"(),;]*")
+
+
+def _basename_token(token: str) -> str:
+    """Réduit un jeton de chemin à son dernier composant (gère `/` et `\\`)."""
+    trimmed = token.rstrip("/\\")
+    return re.split(r"[\\/]", trimmed)[-1] or token
+
+
+def _sanitize_error_message(
+    exc: BaseException,
+    candidates: Iterable[str | Path | None],
+) -> str:
+    """Assainit le détail d'erreur affiché par `--verbose` (aucun chemin FS en sortie).
+
+    - Seule la première ligne du message est conservée.
+    - Chaque chemin candidat connu (argument `--db-path`, variable
+      `HEIMDALL_VAULT_DB_PATH`, chemin résolu et sa forme absolue) est remplacé
+      par son basename, y compris lorsque le chemin contient des espaces.
+    - Tout chemin absolu résiduel est réduit à son basename (défense en
+      profondeur : couvre le chemin par défaut `vault.db` et les chemins non
+      déclarés remontés par une `OSError`/`sqlite3.OperationalError` native).
+    """
+    raw_message = str(exc)
+    message = raw_message.splitlines()[0] if raw_message else ""
+    known_paths = sorted(
+        (
+            str(candidate)
+            for candidate in candidates
+            if candidate is not None and str(candidate).strip()
+        ),
+        key=len,
+        reverse=True,
+    )
+    for known in known_paths:
+        message = message.replace(known, _basename_token(known))
+    return _ABSOLUTE_PATH_TOKEN_RE.sub(
+        lambda match: _basename_token(match.group(0)),
+        message,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Affiche le détail technique de l'erreur en cas d'échec.",
     )
     args = parser.parse_args(argv)
+    resolved: Path | str | None = None
     try:
         resolved = resolve_db_path(args.db_path)
         if resolved == ":memory:":
@@ -51,16 +98,18 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print("Erreur : échec de l'initialisation de la base de données SQLite.", file=sys.stderr)
         if args.verbose:
-            exc_type = exc.__class__.__name__
-            msg = str(exc).splitlines()[0] if str(exc) else ""
-            raw_paths: list[str | Path | None] = [
+            candidates: list[str | Path | None] = [
                 args.db_path,
                 os.environ.get("HEIMDALL_VAULT_DB_PATH"),
+                resolved,
             ]
-            for raw_p in raw_paths:
-                if raw_p:
-                    msg = msg.replace(str(raw_p), Path(raw_p).name)
-            print(f"Détail [{exc_type}] : {msg}", file=sys.stderr)
+            if isinstance(resolved, Path):
+                absolute_path = resolved.absolute()
+                candidates.append(absolute_path)
+                candidates.append(Path(os.path.normpath(str(resolved))))
+                candidates.append(Path(os.path.normpath(str(absolute_path))))
+            detail = _sanitize_error_message(exc, candidates)
+            print(f"Détail [{exc.__class__.__name__}] : {detail}", file=sys.stderr)
         return 1
 
 

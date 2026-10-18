@@ -210,6 +210,18 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
 
 
+def _pin_db_path(settings: VaultSettings) -> Path | str:
+    """Résout le chemin SQLite et fige tout chemin relatif en absolu.
+
+    Source unique de vérité pour l'accès disque (remarque 3 de revue) : le
+    chemin est résolu UNE fois, à la création de l'application, pour que les
+    futures routes DB injectent `app.state.db_path` dans `get_connection()`
+    sans jamais dépendre du CWD courant (deux CWD = deux bases silencieuses).
+    """
+    resolved = resolve_db_path(settings.db_path)
+    return resolved.absolute() if isinstance(resolved, Path) else resolved
+
+
 def create_app(settings: VaultSettings | None = None) -> FastAPI:
     """Fabrique et configure l'application FastAPI pour le serveur Vault."""
     effective_settings = settings if settings is not None else get_settings()
@@ -225,7 +237,7 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
         openapi_url=openapi_url,
     )
     app.state.settings = effective_settings
-    resolved_db = resolve_db_path(effective_settings.db_path)
+    resolved_db = _pin_db_path(effective_settings)
     app.state.db_path = resolved_db
     db_repr = resolved_db.name if isinstance(resolved_db, Path) else resolved_db
     logger.debug("Base de données SQLite configurée : %s", db_repr)

@@ -30,6 +30,7 @@ from heimdall.vault.app import (
     get_settings,
     run_server,
 )
+from heimdall.vault.database import resolve_db_path
 
 
 class VaultAppTests(unittest.IsolatedAsyncioTestCase):
@@ -447,6 +448,23 @@ class VaultSettingsTests(unittest.TestCase):
         self.assertEqual(custom_app.state.db_path, ":memory:")
         self.assertEqual(custom_app.docs_url, "/docs")
         self.assertEqual(custom_app.openapi_url, "/openapi.json")
+
+    def test_create_app_pins_db_path_absolute_against_cwd_changes(self) -> None:
+        """Remarque 3 (LOW) — create_app fige un chemin résolu absolu (source unique).
+
+        Les futures routes DB injectent `app.state.db_path` : figé en absolu dès la
+        création, un changement ultérieur de CWD du processus ne peut plus faire
+        basculer silencieusement la base vers un autre fichier.
+        """
+        custom_settings = VaultSettings(db_path="relative_app_vault.db")
+        custom_app = create_app(custom_settings)
+        pinned = custom_app.state.db_path
+        self.assertIsInstance(pinned, Path)
+        assert isinstance(pinned, Path)
+        self.assertTrue(pinned.is_absolute())
+        self.assertEqual(pinned.name, "relative_app_vault.db")
+        expected = Path(resolve_db_path(custom_settings.db_path))
+        self.assertEqual(pinned, expected.absolute())
 
     def test_health_response_model_rejects_extra_fields(self) -> None:
         """Le modèle de santé interdit tout champ supplémentaire."""
