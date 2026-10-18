@@ -83,15 +83,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Affiche le détail technique de l'erreur en cas d'échec.",
     )
     args = parser.parse_args(argv)
+    # Refus ':memory:' AVANT résolution : couvre l'argument `--db-path` ET la
+    # variable d'environnement (que `resolve_db_path` refuse désormais aussi).
+    raw_db_path = (
+        args.db_path if args.db_path is not None else os.environ.get("HEIMDALL_VAULT_DB_PATH")
+    )
+    if raw_db_path is not None and str(raw_db_path).strip() == ":memory:":
+        print(
+            "Erreur : le mode ':memory:' est réservé aux tests via API et est interdit en CLI.",
+            file=sys.stderr,
+        )
+        return 2
     resolved: Path | str | None = None
     try:
         resolved = resolve_db_path(args.db_path)
-        if resolved == ":memory:":
-            print(
-                "Erreur : le mode ':memory:' est réservé aux tests via API et est interdit en CLI.",
-                file=sys.stderr,
-            )
-            return 2
         init_db(resolved)
         print("Base de données SQLite du Vault initialisée avec succès.")
         return 0

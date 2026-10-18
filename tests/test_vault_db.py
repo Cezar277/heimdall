@@ -18,7 +18,9 @@ Vérifie :
 14. Le rejet applicatif du statut invalide sur `update_secret`.
 15. La couverture du `.gitignore` sur `vault.db` (non-régression commit accidentel).
 16. La validation de `VaultSettings.db_path` (vide, caractères de contrôle).
-17. Le défaut hors dépôt (`$XDG_DATA_HOME` ou `~/.local/share/heimdall/vault.db`).
+17. Le défaut hors dépôt (`$XDG_DATA_HOME` ou `~/.local/share/heimdall/vault.db`),
+    assaini (contrôles/`..`/relatif) et validé.
+18. Le refus fail-closed de ':memory:' via l'environnement (argument explicite seul).
 """
 
 import errno
@@ -881,21 +883,43 @@ class VaultDatabaseTests(unittest.TestCase):
             resolve_db_path("vault\t.db")
 
     def test_resolve_db_path_environment_variable(self) -> None:
-        """resolve_db_path prend en compte HEIMDALL_VAULT_DB_PATH."""
+        """resolve_db_path prend en compte HEIMDALL_VAULT_DB_PATH (hors ':memory:')."""
         with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "/custom/path/vault.db"}):
             self.assertEqual(resolve_db_path(), Path("/custom/path/vault.db"))
 
+        # ':memory:' via l'environnement : refus fail-closed (remarque 2 de la revue v4)
         with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": ":memory:"}):
-            self.assertEqual(resolve_db_path(), ":memory:")
+            with self.assertRaises(ValueError):
+                resolve_db_path()
 
         with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "  :memory:  "}):
-            self.assertEqual(resolve_db_path(), ":memory:")
+            with self.assertRaises(ValueError):
+                resolve_db_path()
 
         with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": "/custom/path/vault.db"}):
             self.assertEqual(resolve_db_path("/override/path.db"), Path("/override/path.db"))
 
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(resolve_db_path(), DEFAULT_DB_PATH)
+
+    def test_env_memory_mode_refused_fail_closed(self) -> None:
+        """Remarque 2 (v4) — ':memory:' refusé via env, autorisé en argument explicite.
+
+        Une base éphémère silencieuse diffère les échecs (`no such table`) et perd
+        toute écriture : fail-closed hors argument explicite (tests unitaires).
+        """
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": ":memory:"}):
+            with self.assertRaises(ValueError) as ctx:
+                get_connection()
+        self.assertIn(":memory:", str(ctx.exception))
+        self.assertIn("argument explicite", str(ctx.exception))
+        # L'argument explicite reste le canal de test supporté
+        conn = get_connection(":memory:")
+        try:
+            cursor = conn.execute("SELECT 1;")
+            self.assertEqual(cursor.fetchone()[0], 1)
+        finally:
+            conn.close()
 
     def test_resolve_db_path_env_rejects_empty_and_control_chars(self) -> None:
         """resolve_db_path valide la variable HEIMDALL_VAULT_DB_PATH (vide, espaces, ctrl)."""
@@ -937,19 +961,30 @@ class VaultDatabaseTests(unittest.TestCase):
         )
 
     def test_default_db_path_respects_xdg_data_home(self) -> None:
-        """XDG — $XDG_DATA_HOME absolu respecté ; vide, blanc ou relatif ignoré (spec XDG)."""
+        """XDG — absolu respecté, `..` normalisé, relatif/contrôles/vide ignorés (spec XDG)."""
+        tmp_root = Path(tempfile.gettempdir())
         with patch.dict(os.environ, {"XDG_DATA_HOME": "/custom/xdg-data"}):
             self.assertEqual(
                 vault_database.default_db_path(),
                 Path("/custom/xdg-data/heimdall/vault.db"),
             )
+        # `..` résolu lexicalement, sans suivi de symlink
+        with patch.dict(os.environ, {"XDG_DATA_HOME": f"{tmp_root}/dir/../xdg-data"}):
+            self.assertEqual(
+                vault_database.default_db_path(),
+                tmp_root / "xdg-data" / "heimdall" / "vault.db",
+            )
         expected_home_default = Path.home() / ".local" / "share" / "heimdall" / "vault.db"
-        for ignored in ("relative/xdg", "   ", ""):
+        # Relatif, blanc, vide ET caractères de contrôle → repli ~/.local/share
+        # (invariant 8 : pas d'injection de ligne de log par basename — remarque 1 v4)
+        bad_newline = f"{tmp_root}/bad\nname"
+        bad_control = f"{tmp_root}/bad\x1fname"
+        for ignored in ("relative/xdg", "   ", "", bad_newline, bad_control):
             with patch.dict(os.environ, {"XDG_DATA_HOME": ignored}):
                 self.assertEqual(
                     vault_database.default_db_path(),
                     expected_home_default,
-                    f"XDG_DATA_HOME={ignored!r} doit être ignoré (non absolu ou vide)",
+                    f"XDG_DATA_HOME={ignored!r} doit être ignoré (non absolu, vide ou contrôle)",
                 )
 
     def test_relative_db_path_resolved_against_cwd(self) -> None:

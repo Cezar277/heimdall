@@ -211,7 +211,7 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
 
 
-def _pin_db_path(settings: VaultSettings) -> Path | str:
+def _pin_db_path(settings: VaultSettings) -> Path:
     """Résout le chemin SQLite et fige tout chemin relatif en absolu normalisé.
 
     Source unique de vérité pour l'accès disque (remarque 3 de revue) : le
@@ -225,10 +225,19 @@ def _pin_db_path(settings: VaultSettings) -> Path | str:
     `Path.absolute()` ne fait pas) sans jamais suivre les symlinks : les
     gardes `lstat` de la couche DB (`_assert_not_symlink`) continuent de
     refuser tout ancêtre lié à l'ouverture.
+
+    Refus fail-closed du mode ':memory:' (remarque 2 de la revue v4) : une base
+    éphémère ferait échouer silencieusement chaque route (`no such table`) et
+    perdrait toute écriture au redémarrage — un serveur Vault exige un fichier
+    persistant. Le refus couvre aussi `HEIMDALL_VAULT_DB_PATH=:memory:` (mappé
+    sur `settings.db_path` par pydantic-settings).
     """
     resolved = resolve_db_path(settings.db_path)
-    if not isinstance(resolved, Path):
-        return resolved
+    if resolved == ":memory:":
+        raise ValueError(
+            "Le mode ':memory:' est interdit pour le serveur Vault : base éphémère "
+            "silencieuse (fail-closed). Configurer un fichier SQLite persistant."
+        )
     return Path(os.path.abspath(str(resolved)))
 
 
@@ -249,8 +258,7 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
     app.state.settings = effective_settings
     resolved_db = _pin_db_path(effective_settings)
     app.state.db_path = resolved_db
-    db_repr = resolved_db.name if isinstance(resolved_db, Path) else resolved_db
-    logger.debug("Base de données SQLite configurée : %s", db_repr)
+    logger.debug("Base de données SQLite configurée : %s", resolved_db.name)
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:

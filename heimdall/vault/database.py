@@ -55,28 +55,6 @@ logger = logging.getLogger(__name__)
 SecretStatus = Literal["vaulte", "rote"]
 _ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
 
-
-def default_db_path() -> Path:
-    """Retourne le chemin de base par défaut, hors dépôt (remarque 3 de revue).
-
-    - `$XDG_DATA_HOME` est utilisé s'il est défini et absolu (spec XDG Base
-      Directory : un chemin relatif est invalide et ignoré).
-    - Sinon `~/.local/share/heimdall/vault.db`.
-
-    Le défaut n'est plus CWD-relatif : deux répertoires de travail convergent
-    vers la même base, plus de cloisonnement silencieux entre processus.
-    """
-    xdg_data_home = os.environ.get("XDG_DATA_HOME", "").strip()
-    if xdg_data_home and Path(xdg_data_home).is_absolute():
-        base_dir = Path(xdg_data_home)
-    else:
-        base_dir = Path.home() / ".local" / "share"
-    return base_dir / "heimdall" / "vault.db"
-
-
-# Résolu une fois à l'import (changer XDG_DATA_HOME requiert un redémarrage du processus).
-DEFAULT_DB_PATH: Path = default_db_path()
-
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
 _SECURE_DIR_MODE: int = 0o700
@@ -135,6 +113,11 @@ def get_iso_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _has_control_characters(value: str) -> bool:
+    """Détecte tout caractère de contrôle ASCII (< 0x20) dans une chaîne."""
+    return any(ord(c) < _CONTROL_CHAR_THRESHOLD for c in value)
+
+
 def validate_db_path(db_path: Path | str) -> str:
     """Valide et normalise une chaîne ou un objet Path représentant un chemin SQLite.
 
@@ -150,7 +133,7 @@ def validate_db_path(db_path: Path | str) -> str:
     stripped = str(db_path).strip()
     if not stripped:
         raise ValueError("Le chemin de la base de données SQLite ne peut pas être vide.")
-    if any(ord(c) < _CONTROL_CHAR_THRESHOLD for c in stripped):
+    if _has_control_characters(stripped):
         raise ValueError(
             "Le chemin de la base de données SQLite contient des caractères de contrôle."
         )
@@ -165,14 +148,45 @@ def validate_db_path(db_path: Path | str) -> str:
     return stripped
 
 
+def default_db_path() -> Path:
+    """Retourne le chemin de base par défaut, hors dépôt et assaini (remarque 3 de revue).
+
+    - `$XDG_DATA_HOME` est utilisé s'il est défini, absolu et sans caractère de
+      contrôle (spec XDG Base Directory : un chemin relatif est invalide). Toute
+      valeur vide, blanche, relative ou porteuse de caractères de contrôle est
+      ignorée au profit de `~/.local/share` — refuse l'injection de ligne de log
+      par basename (invariant 8, remarque 1 de la revue v4).
+    - Le chemin final est normalisé lexicalement (`..` résolu sans suivre les
+      symlinks).
+
+    Le défaut n'est plus CWD-relatif : deux répertoires de travail convergent
+    vers la même base, plus de cloisonnement silencieux entre processus.
+    """
+    xdg_data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    if (
+        xdg_data_home
+        and Path(xdg_data_home).is_absolute()
+        and not _has_control_characters(xdg_data_home)
+    ):
+        base_dir = Path(xdg_data_home)
+    else:
+        base_dir = Path.home() / ".local" / "share"
+    return Path(os.path.normpath(str(base_dir / "heimdall" / "vault.db")))
+
+
+# Résolu une fois à l'import (changer XDG_DATA_HOME requiert un redémarrage du processus).
+DEFAULT_DB_PATH: Path = default_db_path()
+
+
 def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
     """Résout et valide le chemin SQLite (argument, variable d'environnement ou défaut).
 
     Ordre de priorité :
-    1. Argument explicite `db_path`
+    1. Argument explicite `db_path` (les tests peuvent demander ':memory:')
     2. Variable d'environnement `HEIMDALL_VAULT_DB_PATH`
     3. `DEFAULT_DB_PATH` (hors dépôt : `$XDG_DATA_HOME/heimdall/vault.db`,
-       sinon `~/.local/share/heimdall/vault.db`)
+       sinon `~/.local/share/heimdall/vault.db`), validé comme tout autre chemin
+       (vide/contrôles/répertoire refusés — remarque 1 de la revue v4).
 
     Comportement CWD (remarque 1 de revue) :
     Les chemins relatifs passés en argument ou via variable d'environnement sont
@@ -182,9 +196,12 @@ def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
     lui-même n'est plus CWD-relatif (remarque 3 : hors dépôt, XDG).
 
     Mode en mémoire ':memory:' :
-    Le mode ':memory:' est réservé aux tests unitaires. Chaque appel à
-    get_connection(':memory:') ouvre une base de données en mémoire vierge et isolée.
-    Initialiser le schéma via init_db(':memory:') sur la connexion avant toute requête.
+    Réservé aux tests unitaires, via l'ARGUMENT EXPLICITE uniquement. Chaque appel à
+    get_connection(':memory:') ouvre une base en mémoire vierge et isolée ; initialiser
+    le schéma sur la connexion avant toute requête. La variable
+    `HEIMDALL_VAULT_DB_PATH=:memory:` est REFUSÉE (ValueError, fail-closed — remarque 2
+    de la revue v4) : une base éphémère silencieuse viole l'esprit de l'invariant 11
+    et diffère les échecs en `no such table`. La CLI init_db refuse ':memory:' (code 2).
     """
     if db_path is not None:
         validated = validate_db_path(db_path)
@@ -195,9 +212,12 @@ def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
     if env_path is not None:
         validated = validate_db_path(env_path)
         if validated == ":memory:":
-            return ":memory:"
+            raise ValueError(
+                "Le mode ':memory:' est interdit via HEIMDALL_VAULT_DB_PATH : "
+                "base éphémère silencieuse, réservé aux tests via argument explicite."
+            )
         return Path(validated)
-    return DEFAULT_DB_PATH
+    return Path(validate_db_path(str(DEFAULT_DB_PATH)))
 
 
 def _assert_not_symlink(path: Path) -> None:

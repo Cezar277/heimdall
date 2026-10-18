@@ -11,6 +11,7 @@ X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 """
 
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -440,14 +441,28 @@ class VaultSettingsTests(unittest.TestCase):
 
     def test_create_app_factory_applies_settings_parameter(self) -> None:
         """create_app applique les paramètres transmis et ne les ignore pas."""
-        custom_settings = VaultSettings(host="::1", port=8445, enable_docs=True, db_path=":memory:")
+        pinned_target = Path(tempfile.gettempdir()) / "heimdall_factory_test_vault.db"
+        custom_settings = VaultSettings(
+            host="::1", port=8445, enable_docs=True, db_path=str(pinned_target)
+        )
         custom_app = create_app(custom_settings)
         self.assertIsInstance(custom_app, FastAPI)
         self.assertEqual(custom_app.title, "Heimdall Vault API")
         self.assertIs(custom_app.state.settings, custom_settings)
-        self.assertEqual(custom_app.state.db_path, ":memory:")
+        self.assertEqual(custom_app.state.db_path, pinned_target)
         self.assertEqual(custom_app.docs_url, "/docs")
         self.assertEqual(custom_app.openapi_url, "/openapi.json")
+
+    def test_create_app_refuses_memory_db_path(self) -> None:
+        """Remarque 2 (v4) — create_app refuse ':memory:' (base éphémère, fail-closed).
+
+        Couvre le vecteur `HEIMDALL_VAULT_DB_PATH=:memory:` : pydantic-settings le
+        mappe sur `settings.db_path`, le refus intervient au figeage du chemin.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            create_app(VaultSettings(db_path=":memory:"))
+        self.assertIn(":memory:", str(ctx.exception))
+        self.assertIn("fail-closed", str(ctx.exception))
 
     def test_create_app_pins_db_path_absolute_against_cwd_changes(self) -> None:
         """Remarque 3 (LOW) — create_app fige un chemin résolu absolu (source unique).
