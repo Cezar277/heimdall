@@ -118,6 +118,22 @@ def _has_control_characters(value: str) -> bool:
     return any(ord(c) < _CONTROL_CHAR_THRESHOLD for c in value)
 
 
+def _is_filesystem_root(value: str) -> bool:
+    """Détecte la racine sous toutes ses formes (`/`, `//`, `///`, `/.`, `//.`).
+
+    Ni `Path(v) == Path("/")` ni `os.path.normpath` ne suffisent : `pathlib`
+    préserve `//` (POSIX : deux slashes initiaux au sens potentiellement défini
+    par l'implémentation, `parts == ('//',)`) et `normpath("//")` renvoie
+    `"//"`. Seule l'absence de tout composant réel est fiable (revue v7).
+
+    Le `bool(parts)` écarte `""` et `"."` (`parts == ()`, où `all()` serait
+    vacuement vrai) : fonction totale, sûre en réutilisation future sans garde
+    d'appel (revue v8).
+    """
+    parts = Path(value).parts
+    return bool(parts) and all(part in ("/", "//") for part in parts)
+
+
 def validate_db_path(db_path: Path | str) -> str:
     """Valide et normalise une chaîne ou un objet Path représentant un chemin SQLite.
 
@@ -151,13 +167,18 @@ def validate_db_path(db_path: Path | str) -> str:
 def default_db_path() -> Path:
     """Retourne le chemin de base par défaut, hors dépôt et assaini (remarques 1 v4/v5).
 
-    - `$XDG_DATA_HOME` est utilisé s'il est défini, absolu, sans segment `..` et
-      sans caractère de contrôle (spec XDG Base Directory : un chemin relatif est
-      invalide). Toute valeur vide, blanche, relative, porteuse de caractères de
-      contrôle ou de `..` est ignorée au profit de `~/.local/share` :
+    - `$XDG_DATA_HOME` est utilisé s'il est défini, absolu, distinct de la
+      racine sous toutes ses formes (`/`, `//`, `///`, `/.` — `pathlib` et
+      `normpath` préservent `//`, seule l'absence de composant réel est fiable,
+      revue v7), sans segment `..` et sans caractère de contrôle (spec XDG Base
+      Directory : un chemin relatif est invalide). Toute valeur vide, blanche,
+      relative, racine, porteuse de caractères de contrôle ou de `..` est
+      ignorée au profit de `~/.local/share` :
       - contrôles → pas d'injection de ligne de log par basename (invariant 8) ;
       - `..` → le défaut reste confiné sous le répertoire annoncé, jamais
         `/tmp/a/../../etc/heimdall/vault.db` (remarque 1 de la revue v5) ;
+      - `/`, `//`, `///`, `/.` → jamais de base écrite directement sous la
+        racine (revues v6/v7) ;
       - relatif → pas de dépendance au CWD.
     - Le chemin final est normalisé lexicalement (canonicalisation sans suivi de
       symlink), sans jamais sortir de la base retenue.
@@ -169,6 +190,7 @@ def default_db_path() -> Path:
     if (
         xdg_data_home
         and Path(xdg_data_home).is_absolute()
+        and not _is_filesystem_root(xdg_data_home)
         and ".." not in Path(xdg_data_home).parts
         and not _has_control_characters(xdg_data_home)
     ):
@@ -192,13 +214,17 @@ def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
        sinon `~/.local/share/heimdall/vault.db`), validé comme tout autre chemin
        (vide/contrôles/répertoire refusés — remarque 1 de la revue v4).
 
-    Comportement CWD (remarque 1 de revue) :
+    Comportement CWD (remarque 1 de revue, garde centrale revue v6) :
     Cette fonction reste neutre : un chemin relatif est renvoyé tel quel (testé
-    comme tel). Les POINTS D'ENTRÉE — CLI `init_db` et serveur `create_app` —
-    exigent un chemin ABSOLU et refusent le relatif (fail-closed, revue v5) : un
-    chemin relatif dépend du répertoire courant, donc la CLI lancée depuis un
-    autre répertoire aurait créé une base différente de celle du serveur, sans
-    aucune erreur. Le défaut (XDG / `~/.local/share`) est toujours absolu.
+    comme tel). L'ouverture refuse ensuite tout relatif de façon centrale dans
+    `_open_db_file()` (fail-closed) : `get_connection()`, `db_session()` et
+    `init_db()` n'ouvrent donc jamais un fichier sur un chemin relatif, quel que
+    soit l'appelant. Les POINTS D'ENTRÉE — CLI `init_db` et serveur `create_app`
+    — exigent en plus un chemin ABSOLU en amont pour des messages et codes
+    dédiés (exit 2 / ValueError) : un chemin relatif dépend du répertoire
+    courant, donc la CLI lancée depuis un autre répertoire aurait créé une base
+    différente de celle du serveur, sans aucune erreur. Le défaut
+    (XDG / `~/.local/share`) est toujours absolu.
 
     Mode en mémoire ':memory:' :
     Réservé aux tests unitaires, via l'ARGUMENT EXPLICITE uniquement. Chaque appel à
@@ -384,6 +410,14 @@ def _harden_created_parents(missing_parents: list[Path]) -> None:
 def _open_db_file(path: Path) -> sqlite3.Connection:
     """Ouvre une connexion SQLite vers un fichier en appliquant les gardes de sécurité.
 
+    - Refuse les chemins relatifs (garde centrale, revue v6) : un chemin relatif
+      dépend du répertoire courant du processus, donc un appel direct tel que
+      `get_connection("relative.db")` créerait deux bases silencieuses selon le
+      CWD (perte/cloisonnement). Seul un chemin absolu est accepté ici (le mode
+      `:memory:`, réservé aux tests, est court-circuité en amont dans
+      `get_connection` et n'atteint jamais cette fonction) ; les points
+      d'entrée CLI/serveur conservent leurs propres refus explicites
+      (exit 2 / ValueError) pour des messages dédiés.
     - Refuse les symlinks (TOCTOU) sur le fichier et tous ses répertoires ancêtres.
     - Refuse les chemins pointant vers des répertoires existants.
     - Crée les répertoires ancêtres manquants avec umask 0o077 (droits 0o700).
@@ -417,6 +451,16 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
         # refus fail-closed immédiat, avant toute création de fichier ou de répertoire.
         raise RuntimeError(
             "Environnement non supporté : système POSIX requis pour sécuriser les permissions."
+        )
+    if not path.is_absolute():
+        # Garde centrale (revue v6) : `resolve_db_path()` reste neutre et renvoie
+        # un relatif tel quel, mais aucun fichier n'est jamais ouvert sur un
+        # chemin relatif — le CWD ne doit pas décider quelle base est utilisée.
+        # Message générique sans reflet du chemin (invariant anti-fuite).
+        logger.debug("Chemin de base de données relatif refusé : %s", path.name)
+        raise ValueError(
+            "Chemin de base de données relatif interdit : fournir un chemin absolu "
+            "(un chemin relatif dépend du répertoire courant)."
         )
     _assert_not_symlink(path)
     if path.is_dir():
@@ -784,6 +828,12 @@ def init_db(db_path: Path | str | None = None) -> None:
 # ---------------------------------------------------------------------------
 # Opérations CRUD — Projets
 # ---------------------------------------------------------------------------
+# Note (revue v6, hors périmètre #62) : aucune borne de longueur n'est imposée
+# ici — le stockage de valeurs volumineuses est pinné et assumé (voir
+# `test_oversized_inputs_behavior_pinned`). La protection contre le bloat
+# disque/DoS relève de la couche API (`max_length` pydantic / `CHECK` à
+# l'exposition des routes, tickets #63+) : la couche DB reste neutre et
+# réutilisable par les tests.
 
 
 def create_project(

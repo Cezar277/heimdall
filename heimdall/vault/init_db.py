@@ -21,11 +21,28 @@ from heimdall.vault.database import DEFAULT_DB_PATH, init_db, resolve_db_path
 # (anti-fuite d'empreinte de l'environnement, invariant 8).
 _ABSOLUTE_PATH_TOKEN_RE: re.Pattern[str] = re.compile(r"(?:[A-Za-z]:[\\/]|/)[^\s'\"(),;]*")
 
+# Chemin absolu cité entre quotes (format standard des `OSError` :
+# `"[Errno 17] File exists: '/tmp/my dir'"`) : la regex token ci-dessus
+# s'arrête à l'espace, donc un absolu avec espaces ne serait réduit qu'à son
+# premier segment. Cette passe traite le contenu cité en entier, quotes
+# conservées (remarque 3 de la revue v6). Classes niées uniquement : pas de
+# backtracking pathologique, pas de ReDoS.
+_QUOTED_ABSOLUTE_PATH_RE: re.Pattern[str] = re.compile(
+    r"'((?:[A-Za-z]:[\\/]|/)[^']*)'|\"((?:[A-Za-z]:[\\/]|/)[^\"]*)\""
+)
+
 
 def _basename_token(token: str) -> str:
     """Réduit un jeton de chemin à son dernier composant (gère `/` et `\\`)."""
     trimmed = token.rstrip("/\\")
     return re.split(r"[\\/]", trimmed)[-1] or token
+
+
+def _basename_quoted(match: re.Match[str]) -> str:
+    """Réduit un chemin absolu cité à son basename, quotes conservées."""
+    token = match.group(1) if match.group(1) is not None else match.group(2)
+    quote = "'" if match.group(1) is not None else '"'
+    return f"{quote}{_basename_token(token)}{quote}"
 
 
 def _sanitize_error_message(
@@ -38,6 +55,8 @@ def _sanitize_error_message(
     - Chaque chemin candidat connu (argument `--db-path`, variable
       `HEIMDALL_VAULT_DB_PATH`, chemin résolu et sa forme absolue) est remplacé
       par son basename, y compris lorsque le chemin contient des espaces.
+    - Tout chemin absolu cité entre quotes (format des `OSError`) est réduit à
+      son basename, y compris avec espaces (remarque 3 de la revue v6).
     - Tout chemin absolu résiduel est réduit à son basename (défense en
       profondeur : couvre le chemin par défaut `vault.db` et les chemins non
       déclarés remontés par une `OSError`/`sqlite3.OperationalError` native).
@@ -55,6 +74,7 @@ def _sanitize_error_message(
     )
     for known in known_paths:
         message = message.replace(known, _basename_token(known))
+    message = _QUOTED_ABSOLUTE_PATH_RE.sub(_basename_quoted, message)
     return _ABSOLUTE_PATH_TOKEN_RE.sub(
         lambda match: _basename_token(match.group(0)),
         message,
