@@ -50,7 +50,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print("Erreur : échec de l'initialisation de la base de données SQLite.", file=sys.stderr)
         if args.verbose:
-            print(f"Détail : {exc}", file=sys.stderr)
+            exc_type = exc.__class__.__name__
+            msg = str(exc).splitlines()[0] if str(exc) else ""
+            if args.db_path:
+                msg = msg.replace(str(args.db_path), Path(args.db_path).name)
+            print(f"Détail [{exc_type}] : {msg}", file=sys.stderr)
         return 1
 
 

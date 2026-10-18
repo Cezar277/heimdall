@@ -230,17 +230,20 @@ def _apply_secure_permissions(path: Path) -> None:
 
 
 def _check_regular_file(path: Path) -> None:
-    """Vérifie que le chemin correspond à un fichier régulier (refus FIFO/socket/device)."""
+    """Vérifie que le chemin est un fichier régulier non lié (refus FIFO/socket/device/hardlink)."""
     if not path.exists():
         return
     try:
-        mode = os.stat(path, follow_symlinks=False).st_mode
+        stat_res = os.stat(path, follow_symlinks=False)
     except OSError as exc:
         logger.debug("Impossible de stat le chemin %s : %s", path.name, exc.__class__.__name__)
         raise PermissionError("Chemin de base de données refusé : accès impossible") from exc
-    if not stat_module.S_ISREG(mode):
+    if not stat_module.S_ISREG(stat_res.st_mode):
         logger.debug("Chemin de base de données non régulier : %s", path.name)
         raise PermissionError("Chemin de base de données refusé : fichier non régulier interdit")
+    if stat_res.st_nlink != 1:
+        logger.debug("Chemin de base de données avec liens physiques multiples : %s", path.name)
+        raise PermissionError("Chemin de base de données refusé : lien physique interdit")
 
 
 def _harden_created_parents(missing_parents: list[Path]) -> None:
@@ -377,7 +380,8 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
         ("PRAGMA foreign_key_list(api_keys);", "api_keys"),
         ("PRAGMA foreign_key_list(secrets);", "secrets"),
     ):
-        assert tbl in ("api_keys", "secrets")
+        if tbl not in ("api_keys", "secrets"):
+            raise RuntimeError("Schéma de base de données non conforme : nom de table invalide.")
         fk_rows = cursor.execute(pragma_sql).fetchall()
         has_cascade = any(row[2] == "projects" and row[6].upper() == "CASCADE" for row in fk_rows)
         if not has_cascade:

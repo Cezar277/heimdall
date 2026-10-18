@@ -979,14 +979,15 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertNotIn("Détail :", output)
         self.assertNotIn(str(sym_f), output)
 
-        # Avec -v : détail technique présent
+        # Avec -v : détail technique présent mais assaini sans chemin absolu
         stderr_buf_v = io.StringIO()
         with redirect_stderr(stderr_buf_v):
             code_v = init_db_main(["--db-path", str(sym_f), "-v"])
         self.assertEqual(code_v, 1)
         output_v = stderr_buf_v.getvalue()
         self.assertIn("Erreur : échec de l'initialisation", output_v)
-        self.assertIn("Détail :", output_v)
+        self.assertIn("Détail [PermissionError] :", output_v)
+        self.assertNotIn(str(sym_f), output_v)
 
     def test_init_db_cli_rejects_memory_mode(self) -> None:
         """CLI — init_db refuse le mode ':memory:' et retourne un code de sortie non nul (2)."""
@@ -1066,6 +1067,21 @@ class VaultDatabaseTests(unittest.TestCase):
                 self.assertIn("fichier non régulier", str(ctx_dev.exception).lower())
                 self.assertNotIn(str(dev_path), str(ctx_dev.exception))
 
+    def test_hardlink_preplanted_rejected(self) -> None:
+        """Remarque 4 — get_connection refuse un hardlink (st_nlink != 1) sans altérer la cible."""
+        if os.name == "nt" or not hasattr(os, "link"):
+            self.skipTest("Test POSIX avec support hardlink requis")
+        victim_file = Path(self.temp_dir.name) / "victim.txt"
+        victim_file.write_text("victim secret content", encoding="utf-8")
+        hardlink_db = Path(self.temp_dir.name) / "hardlink.db"
+        os.link(victim_file, hardlink_db)
+
+        with self.assertRaises(PermissionError) as ctx:
+            get_connection(hardlink_db)
+        self.assertIn("lien physique interdit", str(ctx.exception).lower())
+        self.assertNotIn(str(hardlink_db), str(ctx.exception))
+        self.assertEqual(victim_file.read_text(encoding="utf-8"), "victim secret content")
+
     def test_init_db_rejects_degraded_schema(self) -> None:
         """Remarque 2 (LOW) — init_db lève RuntimeError sur une base au schéma dégradé."""
         degraded_db = Path(self.temp_dir.name) / "degraded.db"
@@ -1093,6 +1109,41 @@ class VaultDatabaseTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             init_db(degraded_db)
         self.assertIn("Schéma de base de données non conforme", str(ctx.exception))
+
+    def test_verify_schema_rejects_missing_cascade_under_optimized_python(self) -> None:
+        """Remarque 3 — _verify_schema refuse une base sans CASCADE même avec python -O."""
+        degraded_db = Path(self.temp_dir.name) / "no_cascade_opt.db"
+        conn = sqlite3.connect(str(degraded_db))
+        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);")
+        # api_keys sans ON DELETE CASCADE
+        conn.execute(
+            "CREATE TABLE api_keys ("
+            "id TEXT PRIMARY KEY, project_id TEXT NOT NULL, key_hash TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, revoked_at TEXT, "
+            "FOREIGN KEY (project_id) REFERENCES projects(id));"
+        )
+        conn.execute(
+            "CREATE TABLE secrets ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, env TEXT NOT NULL, "
+            "name TEXT NOT NULL, encrypted_value TEXT NOT NULL, status TEXT NOT NULL, "
+            "fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+            "FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE, "
+            "CHECK (status IN ('vaulte', 'rote')));"
+        )
+        conn.execute("CREATE UNIQUE INDEX idx_secrets_u ON secrets(project_id, env, name);")
+        conn.commit()
+        conn.close()
+
+        code = f"from heimdall.vault.database import init_db; init_db({str(degraded_db)!r})"
+        res = subprocess.run(  # noqa: S603
+            [sys.executable, "-O", "-c", code],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("RuntimeError", res.stderr)
+        self.assertIn("ON DELETE CASCADE manquant", res.stderr)
 
     def test_init_db_rejects_malicious_index_name(self) -> None:
         """init_db lève RuntimeError si le nom d'un index contient des caractères invalides."""
@@ -1326,7 +1377,7 @@ class VaultDatabaseTests(unittest.TestCase):
 
     def test_init_db_cli_help_documents_exit_codes(self) -> None:
         """Pinnage des codes de sortie 0, 1 et 2 dans l'aide de la CLI init_db."""
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S603
             [sys.executable, "-m", "heimdall.vault.init_db", "--help"],
             capture_output=True,
             text=True,
