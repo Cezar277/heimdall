@@ -23,6 +23,7 @@ import fnmatch
 import io
 import os
 import shutil
+import socket
 import sqlite3
 import stat as stat_module
 import subprocess
@@ -43,6 +44,7 @@ from heimdall.vault.database import (
     SCHEMA_SQL,
     SecretStatus,
     _apply_secure_permissions,
+    _harden_created_parents,
     create_api_key,
     create_project,
     create_secret,
@@ -861,7 +863,13 @@ class VaultDatabaseTests(unittest.TestCase):
                 resolve_db_path()
 
     def test_relative_db_path_resolved_against_cwd(self) -> None:
-        """Pinnage CWD (remarque 1) : un chemin relatif résolu dépend du CWD courant."""
+        """Pinnage CWD : un chemin relatif produit une base isolée par répertoire de travail.
+
+        Documente et pinne le comportement opérationnel :
+        Deux CWD distincts résolvent deux bases physiques différentes. Pour partager
+        une même base entre plusieurs répertoires de travail, un chemin absolu ou
+        la variable d'environnement HEIMDALL_VAULT_DB_PATH doit être utilisée.
+        """
         cwd1 = Path(self.temp_dir.name) / "cwd1"
         cwd2 = Path(self.temp_dir.name) / "cwd2"
         cwd1.mkdir()
@@ -892,7 +900,7 @@ class VaultDatabaseTests(unittest.TestCase):
             os.chdir(current_cwd)
 
     def test_windows_warning_on_apply_secure_permissions(self) -> None:
-        """_apply_secure_permissions émet un RuntimeWarning sous Windows (remarque 4)."""
+        """Windows : _apply_secure_permissions émet un RuntimeWarning et parents non durcis."""
         with patch("os.name", "nt"):
             with warnings.catch_warnings(record=True) as recorded:
                 warnings.simplefilter("always")
@@ -900,6 +908,12 @@ class VaultDatabaseTests(unittest.TestCase):
                 self.assertEqual(len(recorded), 1)
                 self.assertTrue(issubclass(recorded[0].category, RuntimeWarning))
                 self.assertIn("POSIX", str(recorded[0].message))
+
+        # Vérifie que _harden_created_parents est un no-op sur Windows sans tenter de chmod
+        with patch("os.name", "nt"):
+            with patch.object(Path, "chmod") as mock_chmod:
+                _harden_created_parents([self.db_path.parent])
+                mock_chmod.assert_not_called()
 
     def test_exception_messages_do_not_leak_absolute_path(self) -> None:
         """Sanitization : les exceptions ne contiennent aucun chemin FS absolu (remarque 2)."""
@@ -1017,15 +1031,40 @@ class VaultDatabaseTests(unittest.TestCase):
             conn.close()
 
     def test_non_regular_file_rejected_without_blocking(self) -> None:
-        """Remarque 1 (LOW) — get_connection refuse un FIFO/fichier non régulier sans bloquer."""
-        if os.name == "nt" or not hasattr(os, "mkfifo"):
-            self.skipTest("Test POSIX avec support FIFO requis")
-        fifo_path = Path(self.temp_dir.name) / "test_fifo.db"
-        os.mkfifo(fifo_path)
-        with self.assertRaises(PermissionError) as ctx:
-            get_connection(fifo_path)
-        self.assertIn("fichier non régulier", str(ctx.exception).lower())
-        self.assertNotIn(str(fifo_path), str(ctx.exception))
+        """Remarque 1 (LOW) — get_connection refuse FIFO, socket et device POSIX sans bloquer."""
+        if os.name == "nt":
+            self.skipTest("Test POSIX avec support FIFO/socket/device requis")
+
+        # 1. FIFO (named pipe)
+        if hasattr(os, "mkfifo"):
+            fifo_path = Path(self.temp_dir.name) / "test_fifo.db"
+            os.mkfifo(fifo_path)
+            with self.assertRaises(PermissionError) as ctx_fifo:
+                get_connection(fifo_path)
+            self.assertIn("fichier non régulier", str(ctx_fifo.exception).lower())
+            self.assertNotIn(str(fifo_path), str(ctx_fifo.exception))
+
+        # 2. Socket de domaine Unix (AF_UNIX)
+        if hasattr(socket, "AF_UNIX"):
+            sock_path = Path(self.temp_dir.name) / "test_sock.db"
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.bind(str(sock_path))
+                with self.assertRaises(PermissionError) as ctx_sock:
+                    get_connection(sock_path)
+                self.assertIn("fichier non régulier", str(ctx_sock.exception).lower())
+                self.assertNotIn(str(sock_path), str(ctx_sock.exception))
+            finally:
+                sock.close()
+
+        # 3. Device POSIX (character device, ex: /dev/null ou /dev/zero)
+        for dev in ("/dev/null", "/dev/zero"):
+            dev_path = Path(dev)
+            if dev_path.exists():
+                with self.assertRaises(PermissionError) as ctx_dev:
+                    get_connection(dev_path)
+                self.assertIn("fichier non régulier", str(ctx_dev.exception).lower())
+                self.assertNotIn(str(dev_path), str(ctx_dev.exception))
 
     def test_init_db_rejects_degraded_schema(self) -> None:
         """Remarque 2 (LOW) — init_db lève RuntimeError sur une base au schéma dégradé."""
