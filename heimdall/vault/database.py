@@ -193,11 +193,12 @@ def resolve_db_path(db_path: Path | str | None = None) -> Path | str:
        (vide/contrôles/répertoire refusés — remarque 1 de la revue v4).
 
     Comportement CWD (remarque 1 de revue) :
-    Les chemins relatifs passés en argument ou via variable d'environnement sont
-    interprétés relativement au répertoire de travail courant (CWD / `Path.cwd()`).
-    Pour éviter tout cloisonnement silencieux entre deux processus ayant des CWD
-    distincts, privilégier des chemins absolus (ou ':memory:' en test). Le défaut
-    lui-même n'est plus CWD-relatif (remarque 3 : hors dépôt, XDG).
+    Cette fonction reste neutre : un chemin relatif est renvoyé tel quel (testé
+    comme tel). Les POINTS D'ENTRÉE — CLI `init_db` et serveur `create_app` —
+    exigent un chemin ABSOLU et refusent le relatif (fail-closed, revue v5) : un
+    chemin relatif dépend du répertoire courant, donc la CLI lancée depuis un
+    autre répertoire aurait créé une base différente de celle du serveur, sans
+    aucune erreur. Le défaut (XDG / `~/.local/share`) est toujours absolu.
 
     Mode en mémoire ':memory:' :
     Réservé aux tests unitaires, via l'ARGUMENT EXPLICITE uniquement. Chaque appel à
@@ -516,6 +517,12 @@ def _connect_by_path(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]:
     entre la dernière vérification et `connect()` n'est pas atomique. L'empreinte
     (st_dev, st_ino) relevée juste avant l'ouverture est comparée après
     (`_verify_opened_connection`) pour détecter une substitution persistante.
+
+    RÉSIDUEL ACCEPTÉ (revue v5, option « accepter comme résiduel documenté ») :
+    une substitution transitoire, restaurée avant la re-vérification, n'est pas
+    détectable sans ouverture par descripteur. Ce repli ne sert qu'aux POSIX sans
+    `/dev/fd` fiable (macOS/BSD) ; le chemin d'entrée est opérateur (CLI/env), non
+    contrôlé par une entrée LLM. Linux utilise `_connect_pinned_fd`, sans fenêtre.
     """
     _assert_not_symlink(path)
     if not path.exists():

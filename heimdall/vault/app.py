@@ -212,19 +212,21 @@ class HealthResponse(BaseModel):
 
 
 def _pin_db_path(settings: VaultSettings) -> Path:
-    """Résout le chemin SQLite et fige tout chemin relatif en absolu normalisé.
+    """Résout le chemin SQLite, exige un chemin absolu et le fige normalisé.
 
-    Source unique de vérité pour l'accès disque (remarque 3 de revue) : le
-    chemin est résolu UNE fois, à la création de l'application, pour que les
-    futures routes DB injectent `app.state.db_path` dans `get_connection()`
-    sans jamais dépendre du CWD courant (deux CWD = deux bases silencieuses).
-    Le défaut de `resolve_db_path` étant désormais hors dépôt (XDG), seuls les
-    chemins relatifs explicites sont figés contre le CWD ici.
+    Source de vérité du chemin serveur : résolu UNE fois, à la création de
+    l'application, pour que les futures routes injectent `app.state.db_path`
+    dans `get_connection()`.
 
-    `os.path.abspath` normalise lexicalement les segments `..` (ce que
-    `Path.absolute()` ne fait pas) sans jamais suivre les symlinks : les
-    gardes `lstat` de la couche DB (`_assert_not_symlink`) continuent de
-    refuser tout ancêtre lié à l'ouverture.
+    Refus fail-closed du chemin relatif (revue v5, double source) : un chemin
+    relatif dépend du répertoire courant du processus. Le serveur et la CLI
+    `init_db` pourraient alors ouvrir deux bases différentes sans erreur. Le
+    défaut XDG / `~/.local/share` étant absolu, seul un chemin explicitement
+    relatif est refusé.
+
+    `os.path.normpath` normalise lexicalement les segments `..` sans jamais suivre
+    les symlinks : les gardes `lstat` de la couche DB (`_assert_not_symlink`)
+    continuent de refuser tout ancêtre lié à l'ouverture.
 
     Refus fail-closed du mode ':memory:' (remarque 2 de la revue v4) : une base
     éphémère ferait échouer silencieusement chaque route (`no such table`) et
@@ -238,7 +240,12 @@ def _pin_db_path(settings: VaultSettings) -> Path:
             "Le mode ':memory:' est interdit pour le serveur Vault : base éphémère "
             "silencieuse (fail-closed). Configurer un fichier SQLite persistant."
         )
-    return Path(os.path.abspath(str(resolved)))
+    if not Path(resolved).is_absolute():
+        raise ValueError(
+            "Chemin de base de données relatif interdit pour le serveur Vault : "
+            "fournir un chemin absolu (un chemin relatif dépend du répertoire courant)."
+        )
+    return Path(os.path.normpath(str(resolved)))
 
 
 def create_app(settings: VaultSettings | None = None) -> FastAPI:

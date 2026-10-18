@@ -67,14 +67,17 @@ def main(argv: list[str] | None = None) -> int:
         description="Initialisation à froid de la base de données SQLite du Vault Heimdall (#62).",
         epilog=(
             "Codes de retour : 0 (succès), 1 (erreur d'initialisation ou permissions), "
-            "2 (mode ':memory:' interdit en CLI)."
+            "2 (chemin relatif ou mode ':memory:' interdit en CLI)."
         ),
     )
     parser.add_argument(
         "--db-path",
         type=Path,
         default=None,
-        help=f"Chemin du fichier SQLite (défaut : {DEFAULT_DB_PATH} ou $HEIMDALL_VAULT_DB_PATH).",
+        help=(
+            "Chemin ABSOLU du fichier SQLite "
+            f"(défaut : {DEFAULT_DB_PATH} ou $HEIMDALL_VAULT_DB_PATH)."
+        ),
     )
     parser.add_argument(
         "-v",
@@ -97,6 +100,12 @@ def main(argv: list[str] | None = None) -> int:
     resolved: Path | str | None = None
     try:
         resolved = resolve_db_path(args.db_path)
+        if isinstance(resolved, Path) and not resolved.is_absolute():
+            print(
+                "Erreur : chemin absolu requis (un chemin relatif dépend du répertoire courant).",
+                file=sys.stderr,
+            )
+            return 2
         init_db(resolved)
         print("Base de données SQLite du Vault initialisée avec succès.")
         return 0

@@ -24,6 +24,7 @@ Vérifie :
     épinglé de bout en bout (sous-processus CLI, `create_app`).
 19. Le durcissement des répertoires créés par descripteur épinglé
     (`O_NOFOLLOW|O_DIRECTORY` + `fchmod`/`fstat`, course `mkdir` → `chmod` fermée).
+20. Le refus du chemin relatif à la CLI (argument et environnement, exit 2).
 """
 
 import errno
@@ -1226,6 +1227,29 @@ class VaultDatabaseTests(unittest.TestCase):
             "Erreur : le mode ':memory:' est réservé aux tests",
             stderr_buf_env.getvalue(),
         )
+
+    def test_init_db_cli_refuses_relative_path_exit_2(self) -> None:
+        """Revue v5 (double source) — CLI : chemin relatif refusé (exit 2), rien créé.
+
+        Argument `--db-path` ET variable d'environnement : un chemin relatif dépend du
+        répertoire courant et ferait diverger la CLI du serveur sans erreur.
+        """
+        target = "relative_cli_refused.db"
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            code = init_db_main(["--db-path", target])
+        self.assertEqual(code, 2)
+        self.assertIn("chemin absolu requis", stderr_buf.getvalue())
+        self.assertNotIn(target, stderr_buf.getvalue())
+        self.assertFalse(Path(target).exists())
+
+        stderr_env = io.StringIO()
+        with patch.dict(os.environ, {"HEIMDALL_VAULT_DB_PATH": target}):
+            with redirect_stderr(stderr_env):
+                code_env = init_db_main([])
+        self.assertEqual(code_env, 2)
+        self.assertIn("chemin absolu requis", stderr_env.getvalue())
+        self.assertFalse(Path(target).exists())
 
     def test_symlink_defense_with_dotdot_normalization(self) -> None:
         """TOCTOU — Normalisation lexicale et rejet de symlink sur chemin avec '..'."""

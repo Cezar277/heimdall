@@ -31,7 +31,6 @@ from heimdall.vault.app import (
     get_settings,
     run_server,
 )
-from heimdall.vault.database import resolve_db_path
 
 
 class VaultAppTests(unittest.IsolatedAsyncioTestCase):
@@ -464,37 +463,35 @@ class VaultSettingsTests(unittest.TestCase):
         self.assertIn(":memory:", str(ctx.exception))
         self.assertIn("fail-closed", str(ctx.exception))
 
-    def test_create_app_pins_db_path_absolute_against_cwd_changes(self) -> None:
-        """Remarque 3 (LOW) — create_app fige un chemin résolu absolu (source unique).
+    def test_create_app_refuses_relative_db_path(self) -> None:
+        """Revue v5 (double source) — create_app refuse un chemin relatif (fail-closed).
 
-        Les futures routes DB injectent `app.state.db_path` : figé en absolu dès la
-        création, un changement ultérieur de CWD du processus ne peut plus faire
-        basculer silencieusement la base vers un autre fichier.
+        Un chemin relatif dépend du CWD : le serveur et la CLI lancés depuis deux
+        répertoires ouvriraient deux bases différentes sans erreur. Le message reste
+        générique : il ne reflète jamais le chemin fourni.
         """
-        custom_settings = VaultSettings(db_path="relative_app_vault.db")
-        custom_app = create_app(custom_settings)
-        pinned = custom_app.state.db_path
-        self.assertIsInstance(pinned, Path)
-        assert isinstance(pinned, Path)
-        self.assertTrue(pinned.is_absolute())
-        self.assertEqual(pinned.name, "relative_app_vault.db")
-        expected = Path(resolve_db_path(custom_settings.db_path))
-        self.assertEqual(pinned, expected.absolute())
+        for relative in ("relative_app_vault.db", "subdir/../pinned_vault.db"):
+            with self.subTest(relative=relative):
+                with self.assertRaises(ValueError) as ctx:
+                    create_app(VaultSettings(db_path=relative))
+                self.assertIn("absolu", str(ctx.exception))
+                self.assertNotIn(relative, str(ctx.exception))
 
     def test_create_app_normalizes_dotdot_segments_lexically(self) -> None:
-        """Remarque 3 (LOW) — `..` normalisé lexicalement avant figeage absolu.
+        """`..` absolu normalisé lexicalement avant figeage (sans suivre de symlink).
 
-        Sans suivi de symlink : les gardes `lstat` de la couche DB continuent de
-        refuser tout ancêtre lié à l'ouverture (`database._assert_not_symlink`).
+        Les gardes `lstat` de la couche DB continuent de refuser tout ancêtre lié à
+        l'ouverture (`database._assert_not_symlink`).
         """
-        custom_settings = VaultSettings(db_path="subdir/../pinned_vault.db")
+        base = Path(tempfile.gettempdir())
+        custom_settings = VaultSettings(db_path=str(base / "subdir" / ".." / "pinned_vault.db"))
         custom_app = create_app(custom_settings)
         pinned = custom_app.state.db_path
         self.assertIsInstance(pinned, Path)
         assert isinstance(pinned, Path)
         self.assertTrue(pinned.is_absolute())
         self.assertNotIn("..", pinned.parts)
-        self.assertEqual(pinned, Path.cwd() / "pinned_vault.db")
+        self.assertEqual(pinned, base / "pinned_vault.db")
 
     def test_health_response_model_rejects_extra_fields(self) -> None:
         """Le modèle de santé interdit tout champ supplémentaire."""

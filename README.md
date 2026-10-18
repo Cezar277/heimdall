@@ -46,9 +46,11 @@ Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) vi
 # Chemin par défaut hors dépôt : $XDG_DATA_HOME/heimdall/vault.db
 # (sinon ~/.local/share/heimdall/vault.db) ; surcharge par argument
 # ou via $HEIMDALL_VAULT_DB_PATH.
+# Chemin ABSOLU exigé (CLI et serveur) : un chemin relatif dépend du répertoire
+# courant et ferait diverger la CLI et le serveur sans erreur.
 # Codes de retour : 0 (succès), 1 (erreur d'initialisation ou permissions),
-# 2 (refus ':memory:' : réservé aux tests via API, interdit en CLI et via
-#   $HEIMDALL_VAULT_DB_PATH — le serveur Vault le refuse aussi, fail-closed)
+# 2 (chemin relatif, ou ':memory:' : réservé aux tests via API, interdit en CLI,
+#   via $HEIMDALL_VAULT_DB_PATH et côté serveur — fail-closed)
 python -m heimdall.vault.init_db
 
 # Lancement du serveur Vault (point d'entrée unique, boucle locale vérifiée) :
