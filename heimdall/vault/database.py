@@ -118,6 +118,17 @@ def _has_control_characters(value: str) -> bool:
     return any(ord(c) < _CONTROL_CHAR_THRESHOLD for c in value)
 
 
+def _is_filesystem_root(value: str) -> bool:
+    """Détecte la racine sous toutes ses formes (`/`, `//`, `///`, `/.`, `//.`).
+
+    Ni `Path(v) == Path("/")` ni `os.path.normpath` ne suffisent : `pathlib`
+    préserve `//` (POSIX : deux slashes initiaux au sens potentiellement défini
+    par l'implémentation, `parts == ('//',)`) et `normpath("//")` renvoie
+    `"//"`. Seule l'absence de tout composant réel est fiable (revue v7).
+    """
+    return all(part in ("/", "//") for part in Path(value).parts)
+
+
 def validate_db_path(db_path: Path | str) -> str:
     """Valide et normalise une chaîne ou un objet Path représentant un chemin SQLite.
 
@@ -152,15 +163,17 @@ def default_db_path() -> Path:
     """Retourne le chemin de base par défaut, hors dépôt et assaini (remarques 1 v4/v5).
 
     - `$XDG_DATA_HOME` est utilisé s'il est défini, absolu, distinct de la
-      racine `/` (jamais un répertoire de données utilisateur), sans segment
-      `..` et sans caractère de contrôle (spec XDG Base Directory : un chemin
-      relatif est invalide). Toute valeur vide, blanche, relative, égale à
-      `/`, porteuse de caractères de contrôle ou de `..` est ignorée au profit
-      de `~/.local/share` :
+      racine sous toutes ses formes (`/`, `//`, `///`, `/.` — `pathlib` et
+      `normpath` préservent `//`, seule l'absence de composant réel est fiable,
+      revue v7), sans segment `..` et sans caractère de contrôle (spec XDG Base
+      Directory : un chemin relatif est invalide). Toute valeur vide, blanche,
+      relative, racine, porteuse de caractères de contrôle ou de `..` est
+      ignorée au profit de `~/.local/share` :
       - contrôles → pas d'injection de ligne de log par basename (invariant 8) ;
       - `..` → le défaut reste confiné sous le répertoire annoncé, jamais
         `/tmp/a/../../etc/heimdall/vault.db` (remarque 1 de la revue v5) ;
-      - `/` → jamais de base écrite directement sous la racine (revue v6) ;
+      - `/`, `//`, `///`, `/.` → jamais de base écrite directement sous la
+        racine (revues v6/v7) ;
       - relatif → pas de dépendance au CWD.
     - Le chemin final est normalisé lexicalement (canonicalisation sans suivi de
       symlink), sans jamais sortir de la base retenue.
@@ -172,7 +185,7 @@ def default_db_path() -> Path:
     if (
         xdg_data_home
         and Path(xdg_data_home).is_absolute()
-        and Path(xdg_data_home) != Path("/")
+        and not _is_filesystem_root(xdg_data_home)
         and ".." not in Path(xdg_data_home).parts
         and not _has_control_characters(xdg_data_home)
     ):

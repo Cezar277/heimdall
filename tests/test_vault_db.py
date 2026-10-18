@@ -29,7 +29,10 @@ Vérifie :
     soit l'appelant direct (revue v6) ; `XDG_DATA_HOME=/` replié (jamais de base
     sous la racine) ; bornes de longueur : responsabilité de la couche API (#63+).
 22. L'assainissement `--verbose` des chemins absolus cités avec espaces (basename
-    conservé, aucun répertoire parent en sortie — revue v6).
+    conservé, aucun répertoire parent en sortie — revue v6), y compris le casseur
+    quote + espace (revue v7 : déjà assaini via le choix de guillemet de CPython).
+23. Le repli XDG pour la racine sous toutes ses formes (`/`, `//`, `///`, `/.`,
+    `/./` — revue v7 : `pathlib`/`normpath` préservent `//`).
 """
 
 import errno
@@ -992,12 +995,25 @@ class VaultDatabaseTests(unittest.TestCase):
                     expected_home_default,
                     f"XDG_DATA_HOME={traversal!r} avec '..' doit être refusé (confinement)",
                 )
-        # Relatif, racine `/`, blanc, vide ET caractères de contrôle → repli ~/.local/share
-        # (invariant 8 : pas d'injection de ligne de log par basename — remarque 1 v4 ;
-        # `/` refusé : jamais de base écrite directement sous la racine — revue v6)
+        # Relatif, racine sous toutes ses formes, blanc, vide ET caractères de
+        # contrôle → repli ~/.local/share (invariant 8 : pas d'injection de ligne
+        # de log par basename — remarque 1 v4 ; `//`/`///`/`/.` refusés comme `/`
+        # car `pathlib`/`normpath` préservent `//` — revue v7)
         bad_newline = f"{tmp_root}/bad\nname"
         bad_control = f"{tmp_root}/bad\x1fname"
-        for ignored in ("relative/xdg", "/", "   ", "", bad_newline, bad_control):
+        ignored_values = (
+            "relative/xdg",
+            "/",
+            "///",
+            "//",
+            "/.",
+            "/./",
+            "   ",
+            "",
+            bad_newline,
+            bad_control,
+        )
+        for ignored in ignored_values:
             with patch.dict(os.environ, {"XDG_DATA_HOME": ignored}):
                 self.assertEqual(
                     vault_database.default_db_path(),
@@ -1264,6 +1280,29 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertNotIn(str(Path(spaced_target).parent), detail)
         self.assertNotIn(tempfile.gettempdir(), detail)
         self.assertIn("'vault.db'", detail)
+
+    def test_sanitize_crusher_quote_and_space_in_filename(self) -> None:
+        """À vérifier (revue v7, non bloquant) — casseur : quote + espace dans le nom.
+
+        `/tmp/a'b dir/vault.db` est légal POSIX. CPython cite le nom avec l'autre
+        type de guillemet (`"..."` si `'` dedans et inversement), donc une passe
+        citée suffit et aucun fragment absolu ne subsiste : ni chemin complet, ni
+        résidu regex, basename présent. Classes niées uniquement : pas de ReDoS
+        (invariant 14).
+        """
+        crushers = (
+            f"{tempfile.gettempdir()}/a'b dir/vault.db",
+            f'{tempfile.gettempdir()}/a"b dir/vault.db',
+        )
+        for crusher in crushers:
+            with self.subTest(crusher=crusher):
+                exc = OSError(13, "Permission denied", crusher)
+                detail = _sanitize_error_message(exc, [])
+                self.assertNotIn(crusher, detail)
+                self.assertNotIn(tempfile.gettempdir(), detail)
+                self.assertIsNone(_QUOTED_ABSOLUTE_PATH_RE.search(detail))
+                self.assertIsNone(_ABSOLUTE_PATH_TOKEN_RE.search(detail))
+                self.assertIn("vault.db", detail)
 
     def test_init_db_verbose_with_spaces_hides_absolute_path(self) -> None:
         """Remarque 3 (v6) — bout en bout : `-v` avec un chemin à espaces en échec.
