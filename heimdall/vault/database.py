@@ -149,15 +149,18 @@ def validate_db_path(db_path: Path | str) -> str:
 
 
 def default_db_path() -> Path:
-    """Retourne le chemin de base par défaut, hors dépôt et assaini (remarque 3 de revue).
+    """Retourne le chemin de base par défaut, hors dépôt et assaini (remarques 1 v4/v5).
 
-    - `$XDG_DATA_HOME` est utilisé s'il est défini, absolu et sans caractère de
-      contrôle (spec XDG Base Directory : un chemin relatif est invalide). Toute
-      valeur vide, blanche, relative ou porteuse de caractères de contrôle est
-      ignorée au profit de `~/.local/share` — refuse l'injection de ligne de log
-      par basename (invariant 8, remarque 1 de la revue v4).
-    - Le chemin final est normalisé lexicalement (`..` résolu sans suivre les
-      symlinks).
+    - `$XDG_DATA_HOME` est utilisé s'il est défini, absolu, sans segment `..` et
+      sans caractère de contrôle (spec XDG Base Directory : un chemin relatif est
+      invalide). Toute valeur vide, blanche, relative, porteuse de caractères de
+      contrôle ou de `..` est ignorée au profit de `~/.local/share` :
+      - contrôles → pas d'injection de ligne de log par basename (invariant 8) ;
+      - `..` → le défaut reste confiné sous le répertoire annoncé, jamais
+        `/tmp/a/../../etc/heimdall/vault.db` (remarque 1 de la revue v5) ;
+      - relatif → pas de dépendance au CWD.
+    - Le chemin final est normalisé lexicalement (canonicalisation sans suivi de
+      symlink), sans jamais sortir de la base retenue.
 
     Le défaut n'est plus CWD-relatif : deux répertoires de travail convergent
     vers la même base, plus de cloisonnement silencieux entre processus.
@@ -166,6 +169,7 @@ def default_db_path() -> Path:
     if (
         xdg_data_home
         and Path(xdg_data_home).is_absolute()
+        and ".." not in Path(xdg_data_home).parts
         and not _has_control_characters(xdg_data_home)
     ):
         base_dir = Path(xdg_data_home)
@@ -318,6 +322,14 @@ def _harden_created_parents(missing_parents: list[Path]) -> None:
 
     Les répertoires pré-existants (ex: CWD '.', /tmp) relèvent de la confiance
     opérateur et ne sont jamais modifiés pour éviter tout effet de bord destructeur.
+
+    Chaque répertoire est ouvert par descripteur épinglé
+    (`O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, jamais de suivi de lien) : si le chemin a
+    été échangé contre un symlink entre `mkdir` et le durcissement, l'ouverture
+    échoue (ELOOP) — refus fail-closed AVANT tout changement de permission
+    (remarque 2 de la revue v5, course `mkdir` → `chmod`). Le `fchmod 0o700` et
+    la vérification du mode s'appliquent au descripteur (`fchmod`/`fstat`),
+    jamais au chemin : aucun chmod ne peut atteindre une cible substituée.
     """
     if os.name == "nt":
         if missing_parents:
@@ -325,27 +337,47 @@ def _harden_created_parents(missing_parents: list[Path]) -> None:
                 "Environnement non supporté : système POSIX requis pour sécuriser les répertoires."
             )
         return
+    dir_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
     for new_dir in missing_parents:
-        if not new_dir.exists():
-            continue
         try:
-            new_dir.chmod(_SECURE_DIR_MODE)
+            dir_fd = os.open(new_dir, dir_flags)
+        except FileNotFoundError:
+            continue
         except OSError as exc:
             logger.debug(
-                "Échec du chmod 0o700 sur %s : %s",
+                "Répertoire parent non sûr (lien ou accès refusé) %s : %s",
                 new_dir.name,
                 exc.__class__.__name__,
             )
             raise PermissionError(
                 "Impossible de sécuriser les permissions du répertoire parent"
             ) from exc
-        mode = new_dir.stat().st_mode & _DIR_PERM_MASK
-        if mode != _SECURE_DIR_MODE:
-            logger.debug(
-                "Permissions du répertoire parent insuffisantes sur %s",
-                new_dir.name,
-            )
-            raise PermissionError("Permissions du répertoire parent insuffisantes")
+        try:
+            if not stat_module.S_ISDIR(os.fstat(dir_fd).st_mode):
+                logger.debug("Répertoire parent non régulier : %s", new_dir.name)
+                raise PermissionError(
+                    "Impossible de sécuriser les permissions du répertoire parent"
+                )
+            try:
+                os.fchmod(dir_fd, _SECURE_DIR_MODE)
+            except OSError as exc:
+                logger.debug(
+                    "Échec du fchmod 0o700 sur %s : %s",
+                    new_dir.name,
+                    exc.__class__.__name__,
+                )
+                raise PermissionError(
+                    "Impossible de sécuriser les permissions du répertoire parent"
+                ) from exc
+            mode = os.fstat(dir_fd).st_mode & _DIR_PERM_MASK
+            if mode != _SECURE_DIR_MODE:
+                logger.debug(
+                    "Permissions du répertoire parent insuffisantes sur %s",
+                    new_dir.name,
+                )
+                raise PermissionError("Permissions du répertoire parent insuffisantes")
+        finally:
+            os.close(dir_fd)
 
 
 def _open_db_file(path: Path) -> sqlite3.Connection:
@@ -356,6 +388,9 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
     - Crée les répertoires ancêtres manquants avec umask 0o077 (droits 0o700).
     - Préserve intacts les répertoires pré-existants (ex: CWD '.', /tmp) sans les modifier
       (confiance opérateur, évite tout effet de bord destructeur ou DoS).
+    - Durcit les répertoires créés via descripteur épinglé (`O_NOFOLLOW|O_DIRECTORY`
+      + `fchmod`/`fstat`) et jamais via le chemin : la course `mkdir` → `chmod` est
+      fermée (refus ELOOP avant tout changement de permission, remarque 2 v5).
     - Re-vérifie les symlinks après mkdir (fermeture de la fenêtre TOCTOU).
     - Crée le fichier avec mode 0o600 si inexistant.
     - Vérifie et confirme les permissions après création (fail-closed).

@@ -19,8 +19,11 @@ Vérifie :
 15. La couverture du `.gitignore` sur `vault.db` (non-régression commit accidentel).
 16. La validation de `VaultSettings.db_path` (vide, caractères de contrôle).
 17. Le défaut hors dépôt (`$XDG_DATA_HOME` ou `~/.local/share/heimdall/vault.db`),
-    assaini (contrôles/`..`/relatif) et validé.
-18. Le refus fail-closed de ':memory:' via l'environnement (argument explicite seul).
+    assaini (contrôles/`..`/relatif refusés → repli) et validé.
+18. Le refus fail-closed de ':memory:' via l'environnement (argument explicite seul),
+    épinglé de bout en bout (sous-processus CLI, `create_app`).
+19. Le durcissement des répertoires créés par descripteur épinglé
+    (`O_NOFOLLOW|O_DIRECTORY` + `fchmod`/`fstat`, course `mkdir` → `chmod` fermée).
 """
 
 import errno
@@ -961,20 +964,23 @@ class VaultDatabaseTests(unittest.TestCase):
         )
 
     def test_default_db_path_respects_xdg_data_home(self) -> None:
-        """XDG — absolu respecté, `..` normalisé, relatif/contrôles/vide ignorés (spec XDG)."""
+        """XDG — absolu respecté ; `..`, relatif, contrôles et vide ignorés (confinement)."""
         tmp_root = Path(tempfile.gettempdir())
         with patch.dict(os.environ, {"XDG_DATA_HOME": "/custom/xdg-data"}):
             self.assertEqual(
                 vault_database.default_db_path(),
                 Path("/custom/xdg-data/heimdall/vault.db"),
             )
-        # `..` résolu lexicalement, sans suivi de symlink
-        with patch.dict(os.environ, {"XDG_DATA_HOME": f"{tmp_root}/dir/../xdg-data"}):
-            self.assertEqual(
-                vault_database.default_db_path(),
-                tmp_root / "xdg-data" / "heimdall" / "vault.db",
-            )
         expected_home_default = Path.home() / ".local" / "share" / "heimdall" / "vault.db"
+        # `..` → repli complet : le défaut reste confiné sous la base annoncée et
+        # n'écrit jamais hors du XDG_DATA_HOME déclaré (`/tmp/a/../../etc`, remarque 1 v5)
+        for traversal in (f"{tmp_root}/dir/../xdg-data", f"{tmp_root}/a/../../etc"):
+            with patch.dict(os.environ, {"XDG_DATA_HOME": traversal}):
+                self.assertEqual(
+                    vault_database.default_db_path(),
+                    expected_home_default,
+                    f"XDG_DATA_HOME={traversal!r} avec '..' doit être refusé (confinement)",
+                )
         # Relatif, blanc, vide ET caractères de contrôle → repli ~/.local/share
         # (invariant 8 : pas d'injection de ligne de log par basename — remarque 1 v4)
         bad_newline = f"{tmp_root}/bad\nname"
@@ -1646,7 +1652,9 @@ class VaultDatabaseTests(unittest.TestCase):
             self.skipTest("chmod 0o700 testé sous POSIX uniquement")
         target_db = Path(self.temp_dir.name) / "new_parent_fail" / "vault.db"
 
-        with patch.object(Path, "chmod", side_effect=OSError("Simulated chmod failure")):
+        with patch.object(
+            vault_database.os, "fchmod", side_effect=OSError("Simulated fchmod failure")
+        ):
             with self.assertRaises(PermissionError) as ctx:
                 get_connection(target_db)
             self.assertIn("sécuriser les permissions du répertoire parent", str(ctx.exception))
@@ -1656,11 +1664,11 @@ class VaultDatabaseTests(unittest.TestCase):
         if os.name == "nt":
             self.skipTest("chmod 0o700 testé sous POSIX uniquement")
         target_db = Path(self.temp_dir.name) / "new_parent_mode" / "vault.db"
-        orig_stat = Path.stat
+        orig_fstat = os.fstat
 
-        def fake_stat(path_obj: Path, **kwargs: typing.Any) -> os.stat_result:
-            st = orig_stat(path_obj, **kwargs)
-            if "new_parent_mode" in str(path_obj):
+        def fake_fstat(fd: int) -> os.stat_result:
+            st = orig_fstat(fd)
+            if stat_module.S_ISDIR(st.st_mode):
                 fake_mode = (st.st_mode & ~0o777) | 0o755
                 return os.stat_result(
                     (
@@ -1678,13 +1686,44 @@ class VaultDatabaseTests(unittest.TestCase):
                 )
             return st
 
-        with patch.object(Path, "stat", autospec=True, side_effect=fake_stat):
+        with patch.object(vault_database.os, "fstat", side_effect=fake_fstat):
             with self.assertRaises(PermissionError) as ctx:
                 get_connection(target_db)
             self.assertIn(
                 "Permissions du répertoire parent insuffisantes",
                 str(ctx.exception),
             )
+
+    def test_parent_dir_swapped_to_symlink_refused_before_chmod(self) -> None:
+        """Remarque 2 (v5) — dir créé échangé contre un symlink : refus avant tout chmod.
+
+        Simule la course `mkdir` → `_harden_created_parents` : un attaquant local avec
+        écriture sur le parent remplace le répertoire tout juste créé par un lien vers
+        une cible hors contrôle. L'ouverture épinglée `O_NOFOLLOW|O_DIRECTORY` échoue
+        (ELOOP) et la cible ne reçoit jamais le fchmod 0o700.
+        """
+        if os.name == "nt":
+            self.skipTest("symlinks POSIX uniquement")
+        base = Path(self.temp_dir.name)
+        race_parent = base / "race_parent"
+        real_target = base / "race_target"
+        real_target.mkdir(mode=0o755)
+        real_target.chmod(0o755)
+        initial_mode = real_target.stat().st_mode & 0o777
+        real_mkdir = Path.mkdir
+
+        def racing_mkdir(path_obj: Path, *args: typing.Any, **kwargs: typing.Any) -> None:
+            real_mkdir(path_obj, *args, **kwargs)
+            if path_obj == race_parent:
+                path_obj.rmdir()
+                path_obj.symlink_to(real_target)
+
+        with patch.object(Path, "mkdir", autospec=True, side_effect=racing_mkdir):
+            with self.assertRaises(PermissionError) as ctx:
+                get_connection(race_parent / "vault.db")
+        self.assertIn("répertoire parent", str(ctx.exception))
+        # La cible du lien n'a jamais été chmodée (refus fail-closed avant fchmod)
+        self.assertEqual(real_target.stat().st_mode & 0o777, initial_mode)
 
     def test_probe_collision_raises_normalized_runtime_error(self) -> None:
         """Remarque 4 — Sonde en collision lève RuntimeError normalisée sans toucher aux données."""
@@ -1845,6 +1884,24 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertIn("0", result.stdout)
         self.assertIn("1", result.stdout)
         self.assertIn("2", result.stdout)
+
+    def test_init_db_cli_subprocess_env_memory_exit_2(self) -> None:
+        """Remarque 2 (v4/v5) — bout en bout : env ':memory:' → exit 2, message dédié.
+
+        Exécution dans un vrai sous-processus (pas seulement `main()` en mémoire) :
+        `HEIMDALL_VAULT_DB_PATH=:memory:` ne doit jamais produire une base éphémère
+        silencieuse en CLI.
+        """
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "heimdall.vault.init_db"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "HEIMDALL_VAULT_DB_PATH": ":memory:"},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("':memory:'", result.stderr)
+        self.assertIn("interdit en CLI", result.stderr)
 
     def test_oversized_inputs_behavior_pinned(self) -> None:
         """Pinnage du comportement face à des entrées surdimensionnées (bloat DoS)."""
