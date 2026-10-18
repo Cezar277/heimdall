@@ -1008,6 +1008,9 @@ class VaultDatabaseTests(unittest.TestCase):
             "//",
             "/.",
             "/./",
+            "//.",  # parts == ('//',) : fermé par `_is_filesystem_root`
+            "/..",  # parts == ('/', '..') : fermé par le garde `..`, pas la racine
+            "//..",  # parts == ('//', '..') : fermé par le garde `..`, pas la racine
             "   ",
             "",
             bad_newline,
@@ -1266,6 +1269,24 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertIn("chemin absolu requis", stderr_env.getvalue())
         self.assertFalse(Path(target).exists())
 
+    def test_is_filesystem_root_total_on_empty_and_dot(self) -> None:
+        """Remarque 2 (v8) — `_is_filesystem_root` totale : jamais « racine » sans composant.
+
+        `Path("").parts == ()` et `Path(".").parts == ()` : `all()` y serait
+        vacuement vrai. Le `bool(parts)` rend la classification exacte, sûre en
+        réutilisation future sans garde d'appel (l'appelant actuel court-circuite
+        déjà, sens fail-closed).
+        """
+        self.assertFalse(vault_database._is_filesystem_root(""))
+        self.assertFalse(vault_database._is_filesystem_root("."))
+        for root in ("/", "//", "///", "/.", "/./", "//."):
+            with self.subTest(root=root):
+                self.assertTrue(vault_database._is_filesystem_root(root))
+        tmp_root = Path(tempfile.gettempdir())
+        for real in (str(tmp_root), str(tmp_root / "x"), "relative", "relative/x"):
+            with self.subTest(real=real):
+                self.assertFalse(vault_database._is_filesystem_root(real))
+
     def test_sanitize_quoted_absolute_path_with_spaces(self) -> None:
         """Remarque 3 (v6) — unitaire : absolu cité avec espaces réduit à son basename.
 
@@ -1305,31 +1326,31 @@ class VaultDatabaseTests(unittest.TestCase):
                 self.assertIn("vault.db", detail)
 
     def test_init_db_verbose_with_spaces_hides_absolute_path(self) -> None:
-        """Remarque 3 (v6) — bout en bout : `-v` avec un chemin à espaces en échec.
+        """Remarque 3 (v6/v8) — bout en bout : `-v` avec un chemin à espaces en échec.
 
-        Le répertoire `ro base` est en lecture seule : `mkdir(parents=True)` échoue
-        avec un `EACCES` réel portant le parent à espaces (non couvert par les
-        candidats connus, qui portent le chemin complet avec `vault.db`). Le détail
-        ne doit contenir aucun chemin absolu — ni token nu, ni contenu cité — et
-        aucun secret ; le basename reste visible pour garder un message utile.
+        L'échec `EACCES` est injecté par mock de `Path.mkdir` (revue v8) : un
+        répertoire en `0o555` réel ne provoque rien sous root (conteneur CI
+        pentest — `mkdir` y réussit), ce qui rendait le test inopérant et créait
+        la base au lieu de tester le sanitizer. Le message `OSError` porte le
+        parent avec espaces (non couvert par les candidats connus, qui portent
+        le chemin complet avec `vault.db`). Le détail ne doit contenir aucun
+        chemin absolu — ni token nu, ni contenu cité — et aucun secret ; le
+        basename reste visible pour garder un message utile.
         """
         if os.name == "nt":
             self.skipTest("Test POSIX uniquement")
         base = Path(self.temp_dir.name)
-        readonly = base / "ro base"
-        readonly.mkdir(mode=0o555)
-        readonly.chmod(0o555)
-        target = readonly / "my dir" / "vault.db"
+        spaced_parent = base / "ro base" / "my dir"
+        target = spaced_parent / "vault.db"
+        mkdir_error = OSError(errno.EACCES, "Permission denied", str(spaced_parent))
         stderr_buf = io.StringIO()
-        try:
+        with patch.object(Path, "mkdir", side_effect=mkdir_error):
             with redirect_stderr(stderr_buf):
                 code = init_db_main(["--db-path", str(target), "-v"])
-        finally:
-            readonly.chmod(0o755)
         self.assertEqual(code, 1)
         detail = stderr_buf.getvalue()
         self.assertNotIn(str(target), detail)
-        self.assertNotIn(str(readonly / "my dir"), detail)
+        self.assertNotIn(str(spaced_parent), detail)
         self.assertNotIn(str(base), detail)
         self.assertIsNone(_QUOTED_ABSOLUTE_PATH_RE.search(detail))
         self.assertIsNone(_ABSOLUTE_PATH_TOKEN_RE.search(detail))

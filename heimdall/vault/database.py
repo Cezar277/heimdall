@@ -125,8 +125,13 @@ def _is_filesystem_root(value: str) -> bool:
     préserve `//` (POSIX : deux slashes initiaux au sens potentiellement défini
     par l'implémentation, `parts == ('//',)`) et `normpath("//")` renvoie
     `"//"`. Seule l'absence de tout composant réel est fiable (revue v7).
+
+    Le `bool(parts)` écarte `""` et `"."` (`parts == ()`, où `all()` serait
+    vacuement vrai) : fonction totale, sûre en réutilisation future sans garde
+    d'appel (revue v8).
     """
-    return all(part in ("/", "//") for part in Path(value).parts)
+    parts = Path(value).parts
+    return bool(parts) and all(part in ("/", "//") for part in parts)
 
 
 def validate_db_path(db_path: Path | str) -> str:
