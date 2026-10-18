@@ -297,7 +297,9 @@ def _open_db_file(path: Path) -> sqlite3.Connection:
     - Positionne journal_mode=DELETE (pas de sidecar -wal/-shm).
     - Maintient umask 0o077 autour de sqlite3.connect() : couvre les répertoires
       intermédiaires créés par mkdir(parents=True) et les sidecars SQLite écrits
-      pendant l'initialisation.
+      pendant l'initialisation. Umask global au processus (course possible avec
+      des threads, uniquement dans le sens restrictif → fail-safe), restaurée
+      en `finally`.
     - Re-vérifie APRÈS l'ouverture SQLite (défense en profondeur TOCTOU) : symlink,
       fichier régulier puis identité (st_dev, st_ino) du chemin. sqlite3 n'expose
       ni O_NOFOLLOW ni le descripteur sous-jacent : une substitution persistante

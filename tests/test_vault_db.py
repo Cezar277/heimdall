@@ -37,6 +37,7 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
+import heimdall.vault.database as vault_database
 from heimdall.vault.app import VaultSettings
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
@@ -684,6 +685,34 @@ class VaultDatabaseTests(unittest.TestCase):
             self.assertTrue(delete_secret(conn, "proj_secrets", "dev", "APP_SECRET"))
             self.assertIsNone(get_secret(conn, "proj_secrets", "dev", "APP_SECRET"))
 
+    def test_oversized_identifiers_pin_absence_of_db_level_length_validation(self) -> None:
+        """Comportement pinné : la couche DB ne valide pas la longueur (ressort de l'API future).
+
+        Des identifiants de plusieurs Mo sont stockés et relus sans troncature.
+        Le bornage/longueur relèvera des routes API (#63+) et non du modèle #62.
+        """
+        init_db(self.db_path)
+        big_project = "p" * (2 * 1024 * 1024)
+        big_env = "e" * (1024 * 1024)
+        big_name = "n" * (1024 * 1024)
+        with db_session(self.db_path) as conn:
+            create_project(conn, big_project)
+            create_secret(
+                conn,
+                project_id=big_project,
+                env=big_env,
+                name=big_name,
+                encrypted_value="cipher_12345",
+                fingerprint="fp",
+            )
+        with db_session(self.db_path) as conn:
+            secret = get_secret(conn, big_project, big_env, big_name)
+            self.assertIsNotNone(secret)
+            assert secret is not None
+            self.assertEqual(secret["name"], big_name)
+            self.assertEqual(secret["env"], big_env)
+            self.assertEqual(secret["encrypted_value"], "cipher_12345")
+
     # -----------------------------------------------------------------------
     # 9. Gestion transactionnelle
     # -----------------------------------------------------------------------
@@ -923,8 +952,8 @@ class VaultDatabaseTests(unittest.TestCase):
         finally:
             os.chdir(current_cwd)
 
-    def test_windows_warning_on_apply_secure_permissions(self) -> None:
-        """Windows : _apply_secure_permissions et _harden_created_parents lèvent RuntimeError."""
+    def test_windows_fail_closed_on_apply_secure_permissions(self) -> None:
+        """Windows (nt) — les helpers de permissions lèvent RuntimeError fail-closed."""
         with patch("os.name", "nt"):
             with self.assertRaises(RuntimeError) as ctx:
                 _apply_secure_permissions(self.db_path)
@@ -935,6 +964,27 @@ class VaultDatabaseTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx_parents:
                 _harden_created_parents([self.db_path.parent])
             self.assertIn("POSIX requis", str(ctx_parents.exception))
+
+    def test_windows_get_connection_fails_closed_with_runtime_error(self) -> None:
+        """Windows (nt) — get_connection refuse fail-closed, sans poursuite.
+
+        Patcher `os.name` globalement casserait pathlib (dispatch dynamique
+        `WindowsPath`) : on substitue l'objet `os` vu par la seule couche
+        `database`, qui délègue tout le reste au `os` réel.
+        """
+        real_os = vault_database.os
+
+        class NtOsProxy:
+            name = "nt"
+            path = real_os.path
+
+            def __getattr__(self, item: str) -> typing.Any:
+                return getattr(real_os, item)
+
+        with patch.object(vault_database, "os", NtOsProxy()):
+            with self.assertRaises(RuntimeError) as ctx:
+                get_connection(self.db_path)
+        self.assertIn("POSIX requis", str(ctx.exception))
 
     def test_exception_messages_do_not_leak_absolute_path(self) -> None:
         """Sanitization : les exceptions ne contiennent aucun chemin FS absolu (remarque 2)."""

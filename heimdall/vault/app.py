@@ -39,6 +39,7 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 
 import ipaddress
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -211,15 +212,22 @@ class HealthResponse(BaseModel):
 
 
 def _pin_db_path(settings: VaultSettings) -> Path | str:
-    """Résout le chemin SQLite et fige tout chemin relatif en absolu.
+    """Résout le chemin SQLite et fige tout chemin relatif en absolu normalisé.
 
     Source unique de vérité pour l'accès disque (remarque 3 de revue) : le
     chemin est résolu UNE fois, à la création de l'application, pour que les
     futures routes DB injectent `app.state.db_path` dans `get_connection()`
     sans jamais dépendre du CWD courant (deux CWD = deux bases silencieuses).
+
+    `os.path.abspath` normalise lexicalement les segments `..` (ce que
+    `Path.absolute()` ne fait pas) sans jamais suivre les symlinks : les
+    gardes `lstat` de la couche DB (`_assert_not_symlink`) continuent de
+    refuser tout ancêtre lié à l'ouverture.
     """
     resolved = resolve_db_path(settings.db_path)
-    return resolved.absolute() if isinstance(resolved, Path) else resolved
+    if not isinstance(resolved, Path):
+        return resolved
+    return Path(os.path.abspath(str(resolved)))
 
 
 def create_app(settings: VaultSettings | None = None) -> FastAPI:

@@ -466,6 +466,21 @@ class VaultSettingsTests(unittest.TestCase):
         expected = Path(resolve_db_path(custom_settings.db_path))
         self.assertEqual(pinned, expected.absolute())
 
+    def test_create_app_normalizes_dotdot_segments_lexically(self) -> None:
+        """Remarque 3 (LOW) — `..` normalisé lexicalement avant figeage absolu.
+
+        Sans suivi de symlink : les gardes `lstat` de la couche DB continuent de
+        refuser tout ancêtre lié à l'ouverture (`database._assert_not_symlink`).
+        """
+        custom_settings = VaultSettings(db_path="subdir/../pinned_vault.db")
+        custom_app = create_app(custom_settings)
+        pinned = custom_app.state.db_path
+        self.assertIsInstance(pinned, Path)
+        assert isinstance(pinned, Path)
+        self.assertTrue(pinned.is_absolute())
+        self.assertNotIn("..", pinned.parts)
+        self.assertEqual(pinned, Path.cwd() / "pinned_vault.db")
+
     def test_health_response_model_rejects_extra_fields(self) -> None:
         """Le modèle de santé interdit tout champ supplémentaire."""
         with self.assertRaises(ValidationError):
