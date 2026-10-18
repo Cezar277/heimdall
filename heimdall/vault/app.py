@@ -42,13 +42,19 @@ import logging
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Path as FastApiPath, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
@@ -56,6 +62,7 @@ from starlette.requests import Request
 from heimdall.vault.database import DEFAULT_DB_PATH, resolve_db_path, validate_db_path
 
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+_MAX_BODY_SIZE: int = 1_048_576  # 1 Mio (1 048 576 octets)
 
 logger = logging.getLogger("heimdall.vault.app")
 
@@ -75,6 +82,22 @@ _ERROR_PAYLOADS: dict[int, dict[str, str]] = {
 }
 
 
+class BadRequestError(BaseModel):
+    """Erreur 400 contractuelle."""
+
+    model_config = ConfigDict(extra="forbid")
+    code: Literal["bad_request"] = "bad_request"
+    message: Literal["Requête invalide"] = "Requête invalide"
+
+
+class UnauthorizedError(BaseModel):
+    """Erreur 401 contractuelle."""
+
+    model_config = ConfigDict(extra="forbid")
+    code: Literal["unauthorized"] = "unauthorized"
+    message: Literal["Authentification requise"] = "Authentification requise"
+
+
 class ForbiddenError(BaseModel):
     """Erreur 403 contractuelle."""
 
@@ -83,12 +106,28 @@ class ForbiddenError(BaseModel):
     message: Literal["Accès interdit"] = "Accès interdit"
 
 
+class NotFoundError(BaseModel):
+    """Erreur 404 contractuelle."""
+
+    model_config = ConfigDict(extra="forbid")
+    code: Literal["not_found"] = "not_found"
+    message: Literal["Ressource introuvable"] = "Ressource introuvable"
+
+
 class MethodNotAllowedError(BaseModel):
     """Erreur 405 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
     code: Literal["method_not_allowed"] = "method_not_allowed"
     message: Literal["Méthode non autorisée"] = "Méthode non autorisée"
+
+
+class ConflictError(BaseModel):
+    """Erreur 409 contractuelle."""
+
+    model_config = ConfigDict(extra="forbid")
+    code: Literal["conflict"] = "conflict"
+    message: Literal["Secret déjà existant"] = "Secret déjà existant"
 
 
 class RateLimitedError(BaseModel):
@@ -115,6 +154,98 @@ class InternalError(BaseModel):
     message: Literal["Erreur interne"] = "Erreur interne"
 
 
+ProjectId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+    ),
+]
+EnvironmentId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=32,
+        pattern=r"^[a-z][a-z0-9_-]{0,31}$",
+    ),
+]
+SecretName = Annotated[
+    str,
+    StringConstraints(
+        min_length=2,
+        max_length=64,
+        pattern=r"^[A-Z][A-Z0-9_]{1,63}$",
+    ),
+]
+SecretValue = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=65536,
+    ),
+]
+SecretStatus = Literal["vaulte", "rote"]
+
+
+class SecretCreate(BaseModel):
+    """Corps de requête pour la création d'un secret (POST /api/v1/secrets)."""
+
+    model_config = ConfigDict(extra="forbid", regex_engine="python-re")
+    project: ProjectId
+    env: EnvironmentId
+    name: SecretName
+    value: SecretValue
+
+
+class SecretMetadata(BaseModel):
+    """Métadonnées d'un secret retournées lors de sa création (201 Created)."""
+
+    model_config = ConfigDict(extra="forbid", regex_engine="python-re")
+    project: ProjectId
+    env: EnvironmentId
+    name: SecretName
+    status: SecretStatus
+
+
+class SecretRead(SecretMetadata):
+    """Représentation complète d'un secret retournée lors de sa lecture (200 OK)."""
+
+    value: SecretValue
+
+
+class InMemorySecretStore:
+    """Stockage mémoire des secrets pour le squelette fonctionnel (ticket #63).
+
+    Les secrets sont indexés par le tuple (project, env, name).
+    Le chiffrement au repos et la persistance SQLite (#62 / #26) se brancheront
+    sur cette même interface.
+    """
+
+    def __init__(self) -> None:
+        self._secrets: dict[tuple[str, str, str], dict[str, str]] = {}
+
+    def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
+        return self._secrets.get((project, env, name))
+
+    def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
+        key = (project, env, name)
+        if key in self._secrets:
+            raise KeyError("Secret déjà existant")
+        record = {
+            "project": project,
+            "env": env,
+            "name": name,
+            "status": "vaulte",
+            "value": value,
+        }
+        self._secrets[key] = record
+        return record
+
+    def clear(self) -> None:
+        self._secrets.clear()
+
+
 _MAX_RETRY_AFTER_SECONDS: int = 3600
 
 _RETRY_AFTER_HEADER = {
@@ -138,6 +269,54 @@ _HEALTH_RESPONSES: dict[int | str, dict[str, Any]] = {
         "description": "Service indisponible",
         "headers": _RETRY_AFTER_HEADER,
     },
+    "default": {"model": InternalError, "description": "Erreur inattendue"},
+}
+
+_NO_STORE_HEADER = {
+    "Cache-Control": {
+        "required": True,
+        "description": "Réponse interdite de mise en cache.",
+        "schema": {"type": "string", "const": "no-store"},
+    }
+}
+
+_SECRETS_POST_RESPONSES: dict[int | str, dict[str, Any]] = {
+    201: {
+        "model": SecretMetadata,
+        "description": "Secret créé et persisté sous forme chiffrée.",
+        "headers": _NO_STORE_HEADER,
+    },
+    400: {"model": BadRequestError, "description": "Requête invalide"},
+    401: {"model": UnauthorizedError, "description": "Authentification requise"},
+    403: {"model": ForbiddenError, "description": "Accès interdit"},
+    405: {"model": MethodNotAllowedError, "description": "Méthode non autorisée"},
+    409: {"model": ConflictError, "description": "Secret déjà existant"},
+    429: {
+        "model": RateLimitedError,
+        "description": "Trop de requêtes",
+        "headers": _RETRY_AFTER_HEADER,
+    },
+    500: {"model": InternalError, "description": "Erreur interne"},
+    "default": {"model": InternalError, "description": "Erreur inattendue"},
+}
+
+_SECRETS_GET_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "model": SecretRead,
+        "description": "Valeur courante, à ne jamais journaliser ni mettre en cache.",
+        "headers": _NO_STORE_HEADER,
+    },
+    400: {"model": BadRequestError, "description": "Paramètre de chemin invalide"},
+    401: {"model": UnauthorizedError, "description": "Authentification requise"},
+    403: {"model": ForbiddenError, "description": "Accès interdit"},
+    404: {"model": NotFoundError, "description": "Ressource introuvable"},
+    405: {"model": MethodNotAllowedError, "description": "Méthode non autorisée"},
+    429: {
+        "model": RateLimitedError,
+        "description": "Trop de requêtes",
+        "headers": _RETRY_AFTER_HEADER,
+    },
+    500: {"model": InternalError, "description": "Erreur interne"},
     "default": {"model": InternalError, "description": "Erreur inattendue"},
 }
 
@@ -248,24 +427,35 @@ def _pin_db_path(settings: VaultSettings) -> Path:
     return Path(os.path.normpath(str(resolved)))
 
 
-def create_app(settings: VaultSettings | None = None) -> FastAPI:
-    """Fabrique et configure l'application FastAPI pour le serveur Vault."""
-    effective_settings = settings if settings is not None else get_settings()
+def _register_middleware(app: FastAPI) -> None:
+    """Enregistre les middlewares du serveur Vault."""
 
-    docs_url = "/docs" if effective_settings.enable_docs else None
-    openapi_url = "/openapi.json" if effective_settings.enable_docs else None
+    @app.middleware("http")
+    async def body_size_limit_middleware(request: Request, call_next: Any) -> Any:
+        """Rejette HTTP 400 bad_request tout corps supérieur à 1 Mio (1 048 576 octets)."""
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > _MAX_BODY_SIZE:
+                    return JSONResponse(
+                        status_code=400,
+                        content=_ERROR_PAYLOADS[400],
+                    )
+            except (ValueError, TypeError):
+                return JSONResponse(
+                    status_code=400,
+                    content=_ERROR_PAYLOADS[400],
+                )
 
-    app = FastAPI(
-        title="Heimdall Vault API",
-        version="1.0.0",
-        docs_url=docs_url,
-        redoc_url=None,
-        openapi_url=openapi_url,
-    )
-    app.state.settings = effective_settings
-    resolved_db = _pin_db_path(effective_settings)
-    app.state.db_path = resolved_db
-    logger.debug("Base de données SQLite configurée : %s", resolved_db.name)
+        if request.method in ("POST", "PUT", "PATCH"):
+            body = await request.body()
+            if len(body) > _MAX_BODY_SIZE:
+                return JSONResponse(
+                    status_code=400,
+                    content=_ERROR_PAYLOADS[400],
+                )
+
+        return await call_next(request)
 
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:
@@ -293,6 +483,10 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
                 content=_ERROR_PAYLOADS[403],
             )
         return await call_next(request)
+
+
+def _register_exception_handlers(app: FastAPI) -> None:
+    """Enregistre les gestionnaires d'exceptions normalisés du Vault."""
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
@@ -341,6 +535,10 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
             content=_ERROR_PAYLOADS[500],
         )
 
+
+def _register_routes(app: FastAPI) -> None:
+    """Enregistre les routes de l'API Vault."""
+
     @app.get(
         "/api/v1/health",
         response_model=HealthResponse,
@@ -352,6 +550,127 @@ def create_app(settings: VaultSettings | None = None) -> FastAPI:
     async def health() -> dict[str, str]:
         """Santé minimale : répond 200 {'status': 'ok'} sans métadonnées sensibles."""
         return {"status": "ok"}
+
+    @app.post(
+        "/api/v1/secrets",
+        response_model=SecretMetadata,
+        status_code=201,
+        responses=_SECRETS_POST_RESPONSES,
+        tags=["Secrets"],
+        summary="Créer un secret",
+        operation_id="createSecret",
+    )
+    async def create_secret(
+        secret_in: SecretCreate,
+        response: Response,
+    ) -> SecretMetadata:
+        """Créer un secret vaulté (ticket #63)."""
+        response.headers["Cache-Control"] = "no-store"
+        store: InMemorySecretStore = app.state.secret_store
+        try:
+            record = store.create(
+                project=secret_in.project,
+                env=secret_in.env,
+                name=secret_in.name,
+                value=secret_in.value,
+            )
+        except KeyError:
+            raise StarletteHTTPException(
+                status_code=409,
+                detail="Secret déjà existant",
+            ) from None
+        return SecretMetadata(
+            project=record["project"],
+            env=record["env"],
+            name=record["name"],
+            status=record["status"],  # type: ignore[arg-type]
+        )
+
+    @app.get(
+        "/api/v1/secrets/{project}/{env}/{name}",
+        response_model=SecretRead,
+        status_code=200,
+        responses=_SECRETS_GET_RESPONSES,
+        tags=["Secrets"],
+        summary="Lire la valeur courante d'un secret",
+        operation_id="getSecret",
+    )
+    async def get_secret(
+        project: Annotated[
+            str,
+            FastApiPath(
+                min_length=1,
+                max_length=64,
+                pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+                description="Identifiant public du projet ; aucune valeur secrète.",
+            ),
+        ],
+        env: Annotated[
+            str,
+            FastApiPath(
+                min_length=1,
+                max_length=32,
+                pattern=r"^[a-z][a-z0-9_-]{0,31}$",
+                description="Environnement autorisé ; aucune valeur secrète.",
+            ),
+        ],
+        name: Annotated[
+            str,
+            FastApiPath(
+                min_length=2,
+                max_length=64,
+                pattern=r"^[A-Z][A-Z0-9_]{1,63}$",
+                description="Nom de variable ; aucune valeur secrète.",
+            ),
+        ],
+        response: Response,
+    ) -> SecretRead:
+        """Lire la valeur courante d'un secret (ticket #63)."""
+        response.headers["Cache-Control"] = "no-store"
+        store: InMemorySecretStore = app.state.secret_store
+        record = store.get(project=project, env=env, name=name)
+        if record is None:
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            )
+        return SecretRead(
+            project=record["project"],
+            env=record["env"],
+            name=record["name"],
+            status=record["status"],  # type: ignore[arg-type]
+            value=record["value"],
+        )
+
+
+def create_app(
+    settings: VaultSettings | None = None,
+    secret_store: InMemorySecretStore | None = None,
+) -> FastAPI:
+    """Fabrique et configure l'application FastAPI pour le serveur Vault."""
+    effective_settings = settings if settings is not None else get_settings()
+
+    docs_url = "/docs" if effective_settings.enable_docs else None
+    openapi_url = "/openapi.json" if effective_settings.enable_docs else None
+
+    app = FastAPI(
+        title="Heimdall Vault API",
+        version="1.0.0",
+        docs_url=docs_url,
+        redoc_url=None,
+        openapi_url=openapi_url,
+    )
+    app.state.settings = effective_settings
+    resolved_db = _pin_db_path(effective_settings)
+    app.state.db_path = resolved_db
+    logger.debug("Base de données SQLite configurée : %s", resolved_db.name)
+    app.state.secret_store = (
+        secret_store if secret_store is not None else InMemorySecretStore()
+    )
+
+    _register_middleware(app)
+    _register_exception_handlers(app)
+    _register_routes(app)
 
     return app
 
@@ -381,12 +700,20 @@ def run_server() -> None:
 
 
 __all__ = [
+    "BadRequestError",
+    "ConflictError",
     "ForbiddenError",
     "HealthResponse",
+    "InMemorySecretStore",
     "InternalError",
     "MethodNotAllowedError",
+    "NotFoundError",
     "RateLimitedError",
+    "SecretCreate",
+    "SecretMetadata",
+    "SecretRead",
     "Settings",
+    "UnauthorizedError",
     "UnavailableError",
     "VaultSettings",
     "app",

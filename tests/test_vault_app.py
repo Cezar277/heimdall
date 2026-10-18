@@ -22,8 +22,14 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ValidationError
 
 from heimdall.vault.app import (
+    BadRequestError,
+    ConflictError,
     ForbiddenError,
     HealthResponse,
+    NotFoundError,
+    SecretCreate,
+    SecretMetadata,
+    SecretRead,
     Settings,
     VaultSettings,
     app,
@@ -37,6 +43,8 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
     """Tests du comportement HTTP du serveur Vault."""
 
     async def asyncSetUp(self) -> None:
+        if hasattr(app.state, "secret_store"):
+            app.state.secret_store.clear()
         self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
         self.client = AsyncClient(transport=self.transport, base_url="http://127.0.0.1:8443")
 
@@ -548,6 +556,261 @@ class VaultSettingsTests(unittest.TestCase):
             dev_app.openapi()["paths"]["/api/v1/health"]["get"]["responses"].keys()
         )
         self.assertEqual(actual_responses, expected_responses)
+
+class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
+    """Tests contractuels des routes POST et GET secrets (ticket #63)."""
+
+    async def asyncSetUp(self) -> None:
+        if hasattr(app.state, "secret_store"):
+            app.state.secret_store.clear()
+        self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
+        self.client = AsyncClient(transport=self.transport, base_url="http://127.0.0.1:8443")
+
+    async def asyncTearDown(self) -> None:
+        await self.client.aclose()
+
+    def test_models_instantiation_and_validation(self) -> None:
+        """Les modèles Pydantic de secret et d'erreur s'instancient et valident conformément."""
+        create_m = SecretCreate(
+            project="demo", env="dev", name="KEY_NAME", value="secret_val"
+        )
+        self.assertEqual(create_m.project, "demo")
+
+        meta_m = SecretMetadata(
+            project="demo", env="dev", name="KEY_NAME", status="vaulte"
+        )
+        self.assertEqual(meta_m.status, "vaulte")
+
+        read_m = SecretRead(
+            project="demo", env="dev", name="KEY_NAME", status="vaulte", value="secret_val"
+        )
+        self.assertEqual(read_m.value, "secret_val")
+
+        err400 = BadRequestError()
+        self.assertEqual(err400.code, "bad_request")
+
+        err404 = NotFoundError()
+        self.assertEqual(err404.code, "not_found")
+
+        err409 = ConflictError()
+        self.assertEqual(err409.code, "conflict")
+
+    async def test_post_secret_success_201(self) -> None:
+        """POST /api/v1/secrets crée un secret, répond 201 avec Cache-Control: no-store."""
+        payload = {
+            "project": "demo",
+            "env": "dev",
+            "name": "DEMO_KEY",
+            "value": "super_secret_value",
+        }
+        response = await self.client.post("/api/v1/secrets", json=payload)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.headers.get("cache-control"), "no-store")
+        body = response.json()
+        self.assertEqual(body["project"], "demo")
+        self.assertEqual(body["env"], "dev")
+        self.assertEqual(body["name"], "DEMO_KEY")
+        self.assertEqual(body["status"], "vaulte")
+        self.assertNotIn("value", body)
+
+    async def test_get_secret_success_200(self) -> None:
+        """GET /api/v1/secrets/{project}/{env}/{name} répond 200 avec Cache-Control: no-store."""
+        payload = {
+            "project": "demo",
+            "env": "dev",
+            "name": "MY_SECRET",
+            "value": "secret_data_123",
+        }
+        post_res = await self.client.post("/api/v1/secrets", json=payload)
+        self.assertEqual(post_res.status_code, 201)
+
+        get_res = await self.client.get("/api/v1/secrets/demo/dev/MY_SECRET")
+        self.assertEqual(get_res.status_code, 200)
+        self.assertEqual(get_res.headers.get("cache-control"), "no-store")
+        body = get_res.json()
+        self.assertEqual(
+            body,
+            {
+                "project": "demo",
+                "env": "dev",
+                "name": "MY_SECRET",
+                "status": "vaulte",
+                "value": "secret_data_123",
+            },
+        )
+
+    async def test_post_secret_conflict_409(self) -> None:
+        """POST d'un secret déjà existant retourne 409 conflict sans écrasement."""
+        payload = {
+            "project": "demo",
+            "env": "prod",
+            "name": "API_TOKEN",
+            "value": "initial_token",
+        }
+        res1 = await self.client.post("/api/v1/secrets", json=payload)
+        self.assertEqual(res1.status_code, 201)
+
+        conflict_payload = {
+            "project": "demo",
+            "env": "prod",
+            "name": "API_TOKEN",
+            "value": "overwritten_attempt",
+        }
+        res2 = await self.client.post("/api/v1/secrets", json=conflict_payload)
+        self.assertEqual(res2.status_code, 409)
+        self.assertEqual(
+            res2.json(),
+            {"code": "conflict", "message": "Secret déjà existant"},
+        )
+
+        # Vérifie que la valeur initiale n'a pas été écrasée
+        get_res = await self.client.get("/api/v1/secrets/demo/prod/API_TOKEN")
+        self.assertEqual(get_res.json()["value"], "initial_token")
+
+    async def test_get_secret_not_found_404(self) -> None:
+        """GET d'un secret inexistant retourne 404 not_found contractuel."""
+        response = await self.client.get("/api/v1/secrets/demo/dev/NON_EXISTENT")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            response.json(),
+            {"code": "not_found", "message": "Ressource introuvable"},
+        )
+
+    async def test_post_secret_validation_errors_400(self) -> None:
+        """POST avec entrée invalide retourne 400 bad_request normalisé."""
+        valid_base = {
+            "project": "demo",
+            "env": "dev",
+            "name": "SECRET_KEY",
+            "value": "valid_value",
+        }
+        invalid_cases = [
+            ({**valid_base, "project": "Demo"}, "majuscule dans project"),
+            ({**valid_base, "project": "1demo"}, "chiffre au début de project"),
+            ({**valid_base, "project": ""}, "project vide"),
+            ({**valid_base, "project": "a" * 65}, "project trop long (> 64)"),
+            ({**valid_base, "project": "demo$"}, "caractère spécial dans project"),
+            ({**valid_base, "env": "Dev"}, "majuscule dans env"),
+            ({**valid_base, "env": "1dev"}, "chiffre au début de env"),
+            ({**valid_base, "env": ""}, "env vide"),
+            ({**valid_base, "env": "a" * 33}, "env trop long (> 32)"),
+            ({**valid_base, "name": "secret_key"}, "minuscules dans name"),
+            ({**valid_base, "name": "A"}, "name trop court (< 2)"),
+            ({**valid_base, "name": "A" * 65}, "name trop long (> 64)"),
+            ({**valid_base, "name": "_KEY"}, "name débutant par underscore"),
+            ({**valid_base, "name": "1KEY"}, "name débutant par chiffre"),
+            ({**valid_base, "value": ""}, "value vide"),
+            ({**valid_base, "value": "a" * 65537}, "value trop longue (> 65536)"),
+            ({**valid_base, "extra": "forbidden"}, "propriété supplémentaire"),
+        ]
+
+        for payload, description in invalid_cases:
+            with self.subTest(case=description):
+                res = await self.client.post("/api/v1/secrets", json=payload)
+                self.assertEqual(res.status_code, 400)
+                self.assertEqual(
+                    res.json(),
+                    {"code": "bad_request", "message": "Requête invalide"},
+                )
+
+    async def test_post_secret_invalid_json_400(self) -> None:
+        """POST avec JSON mal formé retourne 400 bad_request sans écho."""
+        res = await self.client.post(
+            "/api/v1/secrets",
+            content=b"invalid json {{{",
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(
+            res.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+
+    async def test_get_secret_path_validation_errors_400(self) -> None:
+        """GET avec paramètre d'URL non conforme au pattern retourne 400 bad_request."""
+        invalid_paths = [
+            "/api/v1/secrets/Demo/dev/KEY_NAME",
+            "/api/v1/secrets/demo/Dev/KEY_NAME",
+            "/api/v1/secrets/demo/dev/key_name",
+            "/api/v1/secrets/demo/dev/K",
+            f"/api/v1/secrets/{'a'*65}/dev/KEY",
+        ]
+        for path in invalid_paths:
+            with self.subTest(path=path):
+                res = await self.client.get(path)
+                self.assertEqual(res.status_code, 400)
+                self.assertEqual(
+                    res.json(),
+                    {"code": "bad_request", "message": "Requête invalide"},
+                )
+
+    async def test_post_secret_body_size_limit_content_length_400(self) -> None:
+        """Corps > 1 Mio (1 048 576 octets) via Content-Length est rejeté avec HTTP 400."""
+        oversized = b"x" * 1_048_577
+        res = await self.client.post(
+            "/api/v1/secrets",
+            content=oversized,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(
+            res.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+
+    async def test_post_secret_body_size_limit_stream_chunked_400(self) -> None:
+        """Corps > 1 Mio en flux/chunked est interrompu et rejeté avec HTTP 400."""
+        async def chunk_generator():
+            yield b"x" * 600_000
+            yield b"x" * 600_000
+
+        res = await self.client.post(
+            "/api/v1/secrets",
+            content=chunk_generator(),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(
+            res.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+
+    async def test_secrets_routes_method_not_allowed_405(self) -> None:
+        """Méthodes non déclarées sur /api/v1/secrets retournent 405 avec en-tête Allow."""
+        res_get = await self.client.get("/api/v1/secrets")
+        self.assertEqual(res_get.status_code, 405)
+        self.assertEqual(
+            res_get.json(),
+            {"code": "method_not_allowed", "message": "Méthode non autorisée"},
+        )
+        self.assertIn("Allow", res_get.headers)
+
+        res_delete = await self.client.delete("/api/v1/secrets")
+        self.assertEqual(res_delete.status_code, 405)
+
+        res_post_item = await self.client.post("/api/v1/secrets/demo/dev/KEY_NAME")
+        self.assertEqual(res_post_item.status_code, 405)
+        self.assertIn("Allow", res_post_item.headers)
+
+    def test_secrets_schema_response_codes_match_openapi_yaml(self) -> None:
+        """Les schémas OpenAPI runtime de POST et GET secrets correspondent à openapi.yaml."""
+        spec_file = Path(__file__).resolve().parents[1] / "openapi.yaml"
+        spec = yaml.safe_load(spec_file.read_text(encoding="utf-8"))
+
+        dev_app = create_app(VaultSettings(enable_docs=True))
+        openapi_paths = dev_app.openapi()["paths"]
+
+        expected_post = set(spec["paths"]["/api/v1/secrets"]["post"]["responses"].keys())
+        actual_post = set(openapi_paths["/api/v1/secrets"]["post"]["responses"].keys())
+        self.assertEqual(actual_post, expected_post)
+
+        expected_get = set(
+            spec["paths"]["/api/v1/secrets/{project}/{env}/{name}"]["get"]["responses"].keys()
+        )
+        actual_get = set(
+            openapi_paths["/api/v1/secrets/{project}/{env}/{name}"]["get"]["responses"].keys()
+        )
+        self.assertEqual(actual_get, expected_get)
 
 
 if __name__ == "__main__":
