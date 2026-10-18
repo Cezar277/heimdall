@@ -25,6 +25,11 @@ Vérifie :
 19. Le durcissement des répertoires créés par descripteur épinglé
     (`O_NOFOLLOW|O_DIRECTORY` + `fchmod`/`fstat`, course `mkdir` → `chmod` fermée).
 20. Le refus du chemin relatif à la CLI (argument et environnement, exit 2).
+21. Le refus central du chemin relatif à l'ouverture (`_open_db_file`), quel que
+    soit l'appelant direct (revue v6) ; `XDG_DATA_HOME=/` replié (jamais de base
+    sous la racine) ; bornes de longueur : responsabilité de la couche API (#63+).
+22. L'assainissement `--verbose` des chemins absolus cités avec espaces (basename
+    conservé, aucun répertoire parent en sortie — revue v6).
 """
 
 import errno
@@ -77,7 +82,11 @@ from heimdall.vault.database import (
     update_secret,
     validate_db_path,
 )
-from heimdall.vault.init_db import _sanitize_error_message
+from heimdall.vault.init_db import (
+    _ABSOLUTE_PATH_TOKEN_RE,
+    _QUOTED_ABSOLUTE_PATH_RE,
+    _sanitize_error_message,
+)
 from heimdall.vault.init_db import main as init_db_main
 
 
@@ -227,7 +236,8 @@ class VaultDatabaseTests(unittest.TestCase):
             "Le parent pré-existant ne doit jamais voir ses permissions altérées par init_db",
         )
 
-        # 2. Cas du CWD (parent == Path("."))
+        # 2. Cas du CWD (parent == Path(".")) : chemin absolu pointant dans le CWD —
+        # le répertoire courant lui-même ne doit jamais être altéré.
         current_cwd = Path.cwd()
         cwd_dir = Path(self.temp_dir.name) / "test_cwd"
         cwd_dir.mkdir(mode=0o755)
@@ -235,7 +245,7 @@ class VaultDatabaseTests(unittest.TestCase):
         initial_cwd_mode = cwd_dir.stat().st_mode & 0o777
         try:
             os.chdir(cwd_dir)
-            init_db(Path("vault.db"))
+            init_db(cwd_dir / "vault.db")
             after_cwd_mode = cwd_dir.stat().st_mode & 0o777
             self.assertEqual(
                 after_cwd_mode,
@@ -982,11 +992,12 @@ class VaultDatabaseTests(unittest.TestCase):
                     expected_home_default,
                     f"XDG_DATA_HOME={traversal!r} avec '..' doit être refusé (confinement)",
                 )
-        # Relatif, blanc, vide ET caractères de contrôle → repli ~/.local/share
-        # (invariant 8 : pas d'injection de ligne de log par basename — remarque 1 v4)
+        # Relatif, racine `/`, blanc, vide ET caractères de contrôle → repli ~/.local/share
+        # (invariant 8 : pas d'injection de ligne de log par basename — remarque 1 v4 ;
+        # `/` refusé : jamais de base écrite directement sous la racine — revue v6)
         bad_newline = f"{tmp_root}/bad\nname"
         bad_control = f"{tmp_root}/bad\x1fname"
-        for ignored in ("relative/xdg", "   ", "", bad_newline, bad_control):
+        for ignored in ("relative/xdg", "/", "   ", "", bad_newline, bad_control):
             with patch.dict(os.environ, {"XDG_DATA_HOME": ignored}):
                 self.assertEqual(
                     vault_database.default_db_path(),
@@ -994,42 +1005,30 @@ class VaultDatabaseTests(unittest.TestCase):
                     f"XDG_DATA_HOME={ignored!r} doit être ignoré (non absolu, vide ou contrôle)",
                 )
 
-    def test_relative_db_path_resolved_against_cwd(self) -> None:
-        """Pinnage CWD : un chemin relatif produit une base isolée par répertoire de travail.
+    def test_relative_db_path_refused_at_open_central(self) -> None:
+        """Remarque 1 (LOW, revue v6) — refus central du relatif dans `_open_db_file`.
 
-        Documente et pinne le comportement opérationnel :
-        Deux CWD distincts résolvent deux bases physiques différentes. Pour partager
-        une même base entre plusieurs répertoires de travail, un chemin absolu ou
-        la variable d'environnement HEIMDALL_VAULT_DB_PATH doit être utilisée.
+        `resolve_db_path()` reste neutre (renvoie le relatif tel quel), mais
+        `get_connection()` / `init_db()` / `db_session()` refusent tout fichier
+        relatif quel que soit l'appelant : le CWD ne décide plus jamais quelle
+        base est ouverte (plus de cloisonnement silencieux entre processus).
         """
-        cwd1 = Path(self.temp_dir.name) / "cwd1"
-        cwd2 = Path(self.temp_dir.name) / "cwd2"
-        cwd1.mkdir()
-        cwd2.mkdir()
         rel_path = "relative_vault.db"
         resolved = resolve_db_path(rel_path)
         self.assertIsInstance(resolved, Path)
         assert isinstance(resolved, Path)
         self.assertFalse(resolved.is_absolute())
-        # La résolution absolue dans deux CWD distincts donne deux chemins différents
-        abs_cwd1 = (cwd1 / resolved).resolve()
-        abs_cwd2 = (cwd2 / resolved).resolve()
-        self.assertNotEqual(abs_cwd1, abs_cwd2)
-        self.assertEqual(abs_cwd1.name, abs_cwd2.name)
 
-        # Vérification opérationnelle : initialisation relative dans deux CWD distincts
-        current_cwd = Path.cwd()
-        try:
-            os.chdir(cwd1)
-            init_db(rel_path)
-            self.assertTrue((cwd1 / rel_path).exists())
-            self.assertFalse((cwd2 / rel_path).exists())
-
-            os.chdir(cwd2)
-            init_db(rel_path)
-            self.assertTrue((cwd2 / rel_path).exists())
-        finally:
-            os.chdir(current_cwd)
+        for opener in (get_connection, init_db):
+            with self.subTest(opener=opener.__name__):
+                with self.assertRaises(ValueError) as ctx:
+                    opener(rel_path)
+                self.assertIn("absolu", str(ctx.exception))
+                self.assertNotIn(rel_path, str(ctx.exception))
+        with self.assertRaises(ValueError):
+            with db_session(rel_path):
+                pass
+        self.assertFalse(Path(rel_path).exists())
 
     def test_windows_fail_closed_on_apply_secure_permissions(self) -> None:
         """Windows (nt) — les helpers de permissions lèvent RuntimeError fail-closed."""
@@ -1250,6 +1249,52 @@ class VaultDatabaseTests(unittest.TestCase):
         self.assertEqual(code_env, 2)
         self.assertIn("chemin absolu requis", stderr_env.getvalue())
         self.assertFalse(Path(target).exists())
+
+    def test_sanitize_quoted_absolute_path_with_spaces(self) -> None:
+        """Remarque 3 (v6) — unitaire : absolu cité avec espaces réduit à son basename.
+
+        Format standard des `OSError` (`[Errno 13] ...: '/tmp/my dir/vault.db'`) :
+        la regex token s'arrête à l'espace, la passe des chemins cités traite le
+        contenu entier. Basename conservé (politique basename, invariant 8), aucun
+        répertoire parent en sortie.
+        """
+        spaced_target = f"{tempfile.gettempdir()}/my dir/vault.db"
+        exc = OSError(13, "Permission denied", spaced_target)
+        detail = _sanitize_error_message(exc, [])
+        self.assertNotIn(str(Path(spaced_target).parent), detail)
+        self.assertNotIn(tempfile.gettempdir(), detail)
+        self.assertIn("'vault.db'", detail)
+
+    def test_init_db_verbose_with_spaces_hides_absolute_path(self) -> None:
+        """Remarque 3 (v6) — bout en bout : `-v` avec un chemin à espaces en échec.
+
+        Le répertoire `ro base` est en lecture seule : `mkdir(parents=True)` échoue
+        avec un `EACCES` réel portant le parent à espaces (non couvert par les
+        candidats connus, qui portent le chemin complet avec `vault.db`). Le détail
+        ne doit contenir aucun chemin absolu — ni token nu, ni contenu cité — et
+        aucun secret ; le basename reste visible pour garder un message utile.
+        """
+        if os.name == "nt":
+            self.skipTest("Test POSIX uniquement")
+        base = Path(self.temp_dir.name)
+        readonly = base / "ro base"
+        readonly.mkdir(mode=0o555)
+        readonly.chmod(0o555)
+        target = readonly / "my dir" / "vault.db"
+        stderr_buf = io.StringIO()
+        try:
+            with redirect_stderr(stderr_buf):
+                code = init_db_main(["--db-path", str(target), "-v"])
+        finally:
+            readonly.chmod(0o755)
+        self.assertEqual(code, 1)
+        detail = stderr_buf.getvalue()
+        self.assertNotIn(str(target), detail)
+        self.assertNotIn(str(readonly / "my dir"), detail)
+        self.assertNotIn(str(base), detail)
+        self.assertIsNone(_QUOTED_ABSOLUTE_PATH_RE.search(detail))
+        self.assertIsNone(_ABSOLUTE_PATH_TOKEN_RE.search(detail))
+        self.assertIn("my dir", detail)
 
     def test_symlink_defense_with_dotdot_normalization(self) -> None:
         """TOCTOU — Normalisation lexicale et rejet de symlink sur chemin avec '..'."""
