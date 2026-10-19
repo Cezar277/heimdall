@@ -11,6 +11,7 @@ X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -30,6 +31,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ValidationError
 
+import heimdall.vault.app as vault_app_module
 from heimdall.vault.app import (
     BadRequestError,
     ConflictError,
@@ -1488,6 +1490,13 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     SqliteSecretStore(memory_path, cipher)
                 self.assertIn(":memory:", str(ctx.exception))
 
+    def test_sqlite_secret_store_documents_quota_todo_62(self) -> None:
+        """Le quota SQLite documente son caractère best-effort inter-workers (TODO(#62))."""
+        doc = SqliteSecretStore.__doc__ or ""
+        self.assertIn("TODO(#62)", doc)
+        self.assertIn("quota", doc)
+        self.assertIn("inter-workers", doc)
+
     def test_cipher_fingerprint_uses_dedicated_subkey_bound_to_triplet(self) -> None:
         """L'empreinte n'utilise jamais la KEK comme clé HMAC et lie le triplet.
 
@@ -1567,6 +1576,56 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     get_resp.json(),
                     {"code": "unauthorized", "message": "Authentification requise"},
                 )
+
+    async def test_api_key_full_scan_is_memoized_once_per_request(self) -> None:
+        """Le full-scan d'empreintes est mémoïsé par requête (anti-amplification CPU).
+
+        Le middleware de débit réalise le parcours complet pour choisir le bucket ;
+        l'authentification réutilise ce résultat au lieu de rescanner la base :
+        un seul parcours (donc un seul SELECT api_keys) par requête, que la clé
+        soit connue ou inconnue.
+        """
+        settings = VaultSettings(api_key_pepper="single_scan_pepper_" + "s" * 24)
+        scan_app = create_app(settings)
+        raw_key = generate_api_key()
+        scan_app.state.register_api_key(raw_key, "demo")
+
+        lookup_calls: list[str] = []
+        db_calls: list[str] = []
+        real_lookup = vault_app_module._find_api_key_project
+        real_db_lookup = vault_app_module._lookup_db_api_key
+
+        def counting_lookup(target_app, provided_hash):
+            lookup_calls.append(provided_hash)
+            return real_lookup(target_app, provided_hash)
+
+        def counting_db_lookup(db_path, provided_hash):
+            db_calls.append(provided_hash)
+            return real_db_lookup(db_path, provided_hash)
+
+        with patch.object(
+            vault_app_module, "_find_api_key_project", counting_lookup
+        ), patch.object(vault_app_module, "_lookup_db_api_key", counting_db_lookup):
+            transport = ASGITransport(app=scan_app, client=("127.0.0.1", 54321))
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://127.0.0.1:8443",
+                headers={"X-Heimdall-API-Key": raw_key},
+            ) as client:
+                known = await client.get("/api/v1/secrets/demo/dev/ABSENT_KEY")
+                self.assertEqual(known.status_code, 404)
+                self.assertEqual(len(lookup_calls), 1)
+                self.assertEqual(len(db_calls), 1)
+
+                lookup_calls.clear()
+                db_calls.clear()
+                unknown = await client.get(
+                    "/api/v1/secrets/demo/dev/ABSENT_KEY",
+                    headers={"X-Heimdall-API-Key": "unknown-key-value"},
+                )
+                self.assertEqual(unknown.status_code, 401)
+                self.assertEqual(len(lookup_calls), 1)
+                self.assertEqual(len(db_calls), 1)
 
     async def test_valid_api_key_allows_secret_creation_and_reading(self) -> None:
         """Une clé API valide autorise la création (201) et la lecture (200) de secrets."""
@@ -1860,6 +1919,24 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValidationError):
             VaultSettings(kek=kek, api_key_pepper=kek)
 
+    def test_vault_settings_rejects_kek_entropy_reused_as_pepper_under_another_encoding(
+        self,
+    ) -> None:
+        """Deux représentations d'une même entropie KEK/pepper sont refusées (invariant 5).
+
+        Le pepper UTF-8 dont le base64 32 octets est la KEK contournerait une garde
+        limitée à l'égalité des chaînes : la comparaison porte sur les octets décodés.
+        """
+        raw_entropy = b"Z" * 32
+        kek = base64.urlsafe_b64encode(raw_entropy).decode("ascii")
+        with self.assertRaises(ValidationError) as ctx:
+            VaultSettings(kek=kek, api_key_pepper=raw_entropy.decode("ascii"))
+        self.assertIn("distincts", str(ctx.exception))
+
+        # Deux entropies distinctes restent acceptées.
+        accepted = VaultSettings(kek=kek, api_key_pepper="distinct_pepper_" + "w" * 20)
+        self.assertEqual(accepted.kek, kek)
+
     def test_sqlite_backend_requires_explicit_kek(self) -> None:
         """Aucune KEK éphémère pour des données persistées : échec fail-closed."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1927,6 +2004,48 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"HEIMDALL_ENV": "prod"}, clear=True):
             with self.assertRaises(ValidationError):
                 VaultSettings()
+
+    def test_require_auth_false_forbidden_in_production(self) -> None:
+        """Fail-closed : require_auth=False est refusé en production (vault ouvert sinon).
+
+        `HEIMDALL_VAULT_REQUIRE_AUTH=false` ne doit jamais démarrer sous
+        `HEIMDALL_ENV=production/prod` ; la valeur par défaut True reste acceptée
+        et le mode test isolé reste disponible hors production.
+        """
+        for env_mode in ("production", "prod"):
+            with self.subTest(env_mode=env_mode), patch.dict(
+                os.environ,
+                {
+                    "HEIMDALL_ENV": env_mode,
+                    "HEIMDALL_VAULT_API_KEY_PEPPER": "production_pepper_" + "r" * 20,
+                },
+                clear=True,
+            ):
+                # Le défaut fail-closed (True) reste accepté en production.
+                self.assertTrue(VaultSettings().require_auth)
+                # La désactivation explicite via l'environnement est refusée.
+                with patch.dict(os.environ, {"HEIMDALL_VAULT_REQUIRE_AUTH": "false"}):
+                    with self.assertRaises(ValidationError) as ctx:
+                        VaultSettings()
+                self.assertIn("REQUIRE_AUTH", str(ctx.exception))
+
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "test"}, clear=True):
+            self.assertFalse(VaultSettings(require_auth=False).require_auth)
+
+    def test_enable_docs_policy_pinned_in_production(self) -> None:
+        """Politique #25 : en production, enable_docs reste un choix opérateur explicite.
+
+        Le défaut reste False (docs fermées) ; l'ouverture explicite n'est pas
+        bloquée par les gardes production de ce ticket (TLS/reconnaissance : #25).
+        """
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=True):
+            opened = VaultSettings(
+                enable_docs=True,
+                api_key_pepper="production_docs_pepper_" + "d" * 20,
+            )
+            self.assertTrue(opened.enable_docs)
+            closed = VaultSettings(api_key_pepper="production_docs_pepper_" + "e" * 20)
+            self.assertFalse(closed.enable_docs)
 
     def test_vault_settings_generates_ephemeral_pepper_outside_production(self) -> None:
         """Hors production, un pepper aléatoire éphémère remplace l'ancien défaut public."""

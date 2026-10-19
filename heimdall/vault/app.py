@@ -73,7 +73,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
-from heimdall.vault.crypto import VaultCipher, generate_api_key, hash_api_key
+from heimdall.vault.crypto import (
+    VaultCipher,
+    decode_encoded_key,
+    generate_api_key,
+    hash_api_key,
+)
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
     create_api_key,
@@ -578,6 +583,24 @@ class VaultSettings(BaseSettings):
         _warn_generated_pepper_once()
         return self
 
+    @model_validator(mode="after")
+    def validate_require_auth_in_production(self) -> "VaultSettings":
+        """Refuse la désactivation de l'authentification en production (fail-closed).
+
+        ``require_auth=False`` n'existe que pour des tests isolés : associé à
+        ``HEIMDALL_ENV=production/prod``, il démarrerait un vault ouvert (lecture
+        et création sur tout projet, oracle 200/404). Comme le backend ``memory``
+        interdit en production et le pepper obligatoire, cette misconfiguration
+        est refusée au démarrage plutôt que tolérée silencieusement.
+        """
+        if not self.require_auth and _heimdall_env_mode() in _PRODUCTION_ENV_MODES:
+            raise ValueError(
+                "HEIMDALL_VAULT_REQUIRE_AUTH=false est interdit en production "
+                "(HEIMDALL_ENV=production/prod) : le serveur Vault doit rester "
+                "fail-closed. La désactivation est réservée aux tests isolés."
+            )
+        return self
+
     @property
     def effective_api_key_pepper(self) -> str:
         """Pepper résolu et non vide (garanti par ``resolve_api_key_pepper``)."""
@@ -606,15 +629,23 @@ class VaultSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_kek_distinct_from_pepper(self) -> "VaultSettings":
-        """La KEK de chiffrement et le pepper d'authentification doivent être distincts."""
-        if (
-            self.kek is not None
-            and self.api_key_pepper is not None
-            and self.kek == self.api_key_pepper
-        ):
-            raise ValueError(
-                "La KEK de chiffrement et le pepper d'authentification doivent être distincts."
-            )
+        """La KEK de chiffrement et le pepper d'authentification doivent être distincts.
+
+        La comparaison porte sur l'entropie décodée (KEK brute vs pepper UTF-8),
+        pas seulement sur les chaînes encodées : deux représentations d'une même
+        entropie (ex. pepper UTF-8 dont le base64 32 octets est la KEK) sont
+        refusées, conformément à l'invariant 5 (jamais la même clé pour le
+        chiffrement et le HMAC de vérification).
+        """
+        if self.kek is not None and self.api_key_pepper is not None:
+            pepper_bytes = self.api_key_pepper.encode("utf-8")
+            if self.kek == self.api_key_pepper or hmac.compare_digest(
+                decode_encoded_key(self.kek), pepper_bytes
+            ):
+                raise ValueError(
+                    "La KEK de chiffrement et le pepper d'authentification doivent "
+                    "être distincts, y compris sous des encodages différents."
+                )
         return self
 
     @field_validator("db_path")
@@ -816,8 +847,10 @@ def _register_middleware(app: FastAPI) -> None:
         s'exécute avant le routage et les dépendances. Une clé invalide ne crée
         aucun bucket arbitraire : seuls pair et global s'appliquent. Le choix du
         bucket par clé emprunte le même parcours à coût comparable que
-        ``verify_api_key`` (``_find_api_key_project``) : l'existence d'une clé
-        n'est pas observable par le temps de réponse du middleware.
+        ``verify_api_key`` (``_find_api_key_project_cached``) : le résultat est
+        mémoïsé dans la requête et réutilisé par l'authentification (un seul
+        full-scan par requête, ticket #65) ; l'existence d'une clé n'est pas
+        observable par le temps de réponse du middleware.
         """
         settings: VaultSettings = request.app.state.settings
         peer = request.client.host if request.client and request.client.host else "unknown"
@@ -832,7 +865,7 @@ def _register_middleware(app: FastAPI) -> None:
             except ValueError:
                 candidate_hash = None
             if candidate_hash is not None:
-                registered_project, _ = _find_api_key_project(request.app, candidate_hash)
+                registered_project, _ = _find_api_key_project_cached(request, candidate_hash)
                 if registered_project is not None:
                     key_hash = candidate_hash
 
@@ -976,6 +1009,31 @@ def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None,
     return matching_project, evaluated
 
 
+def _find_api_key_project_cached(request: Request, provided_hash: str) -> tuple[str | None, int]:
+    """Parcours complet d'empreintes mémoïsé dans la requête (anti-amplification CPU).
+
+    Le middleware de débit effectue déjà le parcours complet (mémoire + SQLite,
+    sans ``break``) pour choisir le bucket ; l'authentification réutilise ce
+    résultat au lieu de refaire le même full-scan + ``compare_digest`` par
+    candidat (2 parcours -> 1 par requête, ticket #65). La mémoïsation vit dans
+    l'état de la requête (``request.state``) : jamais partagée entre requêtes,
+    aucune empreinte persistée hors du scope courant. Le coût reste identique
+    entre clé connue/inconnue/révoquée : le premier parcours est exhaustif et
+    seul l'appel redondant est évité.
+    """
+    cached_hash: str | None = getattr(request.state, "api_key_lookup_hash", None)
+    if cached_hash is not None and hmac.compare_digest(cached_hash, provided_hash):
+        return (
+            getattr(request.state, "api_key_lookup_project", None),
+            getattr(request.state, "api_key_lookup_evaluated", 0),
+        )
+    matching_project, evaluated_count = _find_api_key_project(request.app, provided_hash)
+    request.state.api_key_lookup_hash = provided_hash
+    request.state.api_key_lookup_project = matching_project
+    request.state.api_key_lookup_evaluated = evaluated_count
+    return matching_project, evaluated_count
+
+
 def verify_api_key(
     request: Request,
     api_key: Annotated[str | None, Depends(project_api_key_header)] = None,
@@ -988,7 +1046,8 @@ def verify_api_key(
     - hachage HMAC-SHA256 avec pepper serveur distinct de la KEK.
     - comparaison constante via `hmac.compare_digest` sur empreintes de même longueur.
     - chemin de vérification de coût comparable (aucun break précoce, comparaison factice),
-      identique à celui du choix de bucket de débit (`_find_api_key_project`).
+      mémoïsé par requête : le parcours complet du middleware de débit est réutilisé
+      (`_find_api_key_project_cached`), un seul full-scan par requête (ticket #65).
     - si `settings.require_auth=False` et aucune clé fournie, retourne None (test mode).
     """
     settings: VaultSettings | None = getattr(request.app.state, "settings", None)
@@ -1009,7 +1068,7 @@ def verify_api_key(
         )
 
     provided_hash = hash_api_key(api_key, pepper=settings.effective_api_key_pepper)
-    matching_project, evaluated_count = _find_api_key_project(request.app, provided_hash)
+    matching_project, evaluated_count = _find_api_key_project_cached(request, provided_hash)
 
     # Coût comparable : comparaison factice si aucune clé n'a été évaluée
     if evaluated_count == 0:

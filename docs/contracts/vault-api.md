@@ -72,11 +72,16 @@ avec avertissement : les empreintes ne sont alors pas stables entre
 redémarrages, et un déploiement doit fournir un pepper persisté. La constante
 publique `heimdall_default_vault_pepper_dev_only` est refusée sauf
 `HEIMDALL_ENV=test` explicite (fixtures déterministes). Le pepper n'est jamais
-journalisé ni renvoyé au client.
+journalisé ni renvoyé au client. En production, `HEIMDALL_VAULT_REQUIRE_AUTH=false`
+est refusé au démarrage (`ValidationError`, fail-closed), comme le backend `memory`
+interdit et la KEK obligatoire pour SQLite.
 
 Chiffrement au repos : le backend SQLite (défaut en production) chiffre chaque
 valeur avec AES-256-GCM et une KEK `HEIMDALL_VAULT_KEK` de 32 octets encodée
-base64, **distincte du pepper** et jamais stockée dans la base. Chaque ciphertext
+base64, **distincte du pepper** et jamais stockée dans la base. La séparation
+est vérifiée sur l'entropie décodée (KEK brute vs pepper UTF-8) : deux
+représentations d'une même clé sont refusées, pas seulement la copie exacte des
+chaînes (invariant 5). Chaque ciphertext
 est lié par AAD au triplet `(project, env, name)` ; la contrainte SQLite
 `UNIQUE(project_id, env, name)` assure l'anti-écrasement entre workers. Le backend
 mémoire, réservé aux tests/développement, chiffre aussi son dictionnaire avec une
@@ -92,13 +97,17 @@ obsolètes — elles se recalculent après déchiffrement, aucun secret n'est pe
 Rate-limiting débit (#65) : fenêtres fixes par clé API validée, par pair réseau
 et globale. Les 400/401 consomment les buckets pair/global, une clé absente ou
 invalide ne crée pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
-Le choix du bucket par clé (`_find_api_key_project`) emprunte le même parcours
-complet à coût comparable que `verify_api_key` (parcours exhaustif mémoire puis
-SQLite, sans `break` précoce) : l'existence d'une clé n'est pas observable par
-le temps de réponse du middleware. Le quota de stockage (capacité du store) ne
-doit pas être présenté comme cette mitigation de débit : les deux mécanismes
-sont distincts et testés séparément. Tout rejet 400 du middleware de taille
-répond `Connection: close` (aucun octet non drainé réutilisé en keep-alive).
+Le choix du bucket par clé (`_find_api_key_project_cached`) emprunte le même
+parcours complet à coût comparable que `verify_api_key` (parcours exhaustif
+mémoire puis SQLite, sans `break` précoce) et le mémoïse dans l'état de la
+requête : l'authentification réutilise ce résultat, soit un seul full-scan par
+requête (anti-amplification CPU) ; l'existence d'une clé n'est pas observable
+par le temps de réponse du middleware. Le quota de stockage (capacité du store)
+ne doit pas être présenté comme cette mitigation de débit : les deux mécanismes
+sont distincts et testés séparément ; le quota SQLite inter-workers reste
+best-effort (TODO(#62), dépassement borné entre workers, aucune corruption).
+Tout rejet 400 du middleware de taille répond `Connection: close` (aucun octet
+non drainé réutilisé en keep-alive).
 
 Cette règle porte sur les clés d'authentification du serveur ; le
 client doit conserver son credential dans un stockage local protégé pour

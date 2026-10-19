@@ -163,6 +163,13 @@ class SqliteSecretStore:
     triplet ``(project, env, name)`` fournis par ``VaultCipher`` : jamais la KEK
     directement (invariant 5) et non corrélable entre triplets. Le mode
     ``:memory:`` est refusé fail-closed (base éphémère par connexion).
+
+    TODO(#62) : le quota (``max_secrets``, ``max_secrets_per_project``) est
+    best-effort inter-workers — ``count_secrets()`` puis ``create_secret()`` ne
+    sont pas sérialisés entre processus partageant le même fichier (le verrou
+    asyncio est local) : deux workers peuvent franchir le seuil simultanément et
+    le dépasser de façon bornée, sans corruption (UNIQUE protège l'unicité). À
+    contraindre en base (transaction) ou à documenter comme best-effort.
     """
 
     def __init__(
@@ -207,6 +214,10 @@ class SqliteSecretStore:
                 # Un doublon reste un 409 même si la capacité est saturée.
                 if get_secret(conn, project, env, name) is not None:
                     raise KeyError("Secret déjà existant")
+                # TODO(#62): quota non atomique inter-processus (verrou asyncio
+                # local + count/create non transactionnels) : dépassement borné
+                # possible entre workers, jamais de corruption. Best-effort
+                # documenté sur la classe ; à contraindre en base si requis.
                 if count_secrets(conn) >= self._max_secrets:
                     raise QuotaExceededError("Capacité maximale globale du store atteinte")
                 if count_secrets(conn, project) >= self._max_secrets_per_project:

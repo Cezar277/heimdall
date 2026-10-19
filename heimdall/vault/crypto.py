@@ -94,6 +94,38 @@ def generate_encryption_key() -> str:
     return base64.urlsafe_b64encode(secrets.token_bytes(_KEY_SIZE_BYTES)).decode("ascii")
 
 
+def decode_encoded_key(encoded: str | bytes) -> bytes:
+    """Décode une KEK base64 URL-safe (ou standard) de 32 octets en octets bruts.
+
+    Accepte l'alphabet standard et URL-safe, avec ou sans padding, mais valide
+    strictement (pas de caractères ignorés). Exposé pour la vérification de
+    séparation KEK/pepper (ticket #64) : comparer l'entropie décodée, pas
+    seulement les chaînes encodées, sous peine de laisser passer la même clé
+    sous deux représentations (invariant 5).
+    """
+    if isinstance(encoded, str):
+        if not encoded or encoded != encoded.strip():
+            raise ValueError("KEK invalide : valeur vide ou entourée d'espaces.")
+        try:
+            raw = encoded.encode("ascii")
+        except UnicodeEncodeError:
+            raise ValueError("KEK invalide : encodage non ASCII.") from None
+    elif isinstance(encoded, bytes):
+        raw = bytes(encoded)
+    else:
+        raise ValueError("KEK invalide : chaîne base64 attendue.")
+    try:
+        padding = b"=" * (-len(raw) % 4)
+        key = base64.b64decode(raw + padding, altchars=b"-_", validate=True)
+    except Exception:
+        raise ValueError("KEK invalide : encodage base64 incorrect.") from None
+    if len(key) != _KEY_SIZE_BYTES:
+        raise ValueError(
+            f"KEK invalide : {_KEY_SIZE_BYTES} octets décodés requis."
+        )
+    return key
+
+
 class VaultCipher:
     """Chiffrement authentifié AES-256-GCM des valeurs au repos (ticket #25/#26).
 
@@ -136,29 +168,7 @@ class VaultCipher:
     @classmethod
     def from_encoded_key(cls, encoded: str | bytes) -> "VaultCipher":
         """Décode une KEK base64 URL-safe (ou standard) de 32 octets."""
-        if isinstance(encoded, str):
-            if not encoded or encoded != encoded.strip():
-                raise ValueError("KEK invalide : valeur vide ou entourée d'espaces.")
-            try:
-                raw = encoded.encode("ascii")
-            except UnicodeEncodeError:
-                raise ValueError("KEK invalide : encodage non ASCII.") from None
-        elif isinstance(encoded, bytes):
-            raw = bytes(encoded)
-        else:
-            raise ValueError("KEK invalide : chaîne base64 attendue.")
-        try:
-            # Accepte l'alphabet standard et URL-safe, avec ou sans padding,
-            # mais valide strictement (pas de caractères ignorés).
-            padding = b"=" * (-len(raw) % 4)
-            key = base64.b64decode(raw + padding, altchars=b"-_", validate=True)
-        except Exception:
-            raise ValueError("KEK invalide : encodage base64 incorrect.") from None
-        if len(key) != _KEY_SIZE_BYTES:
-            raise ValueError(
-                f"KEK invalide : {_KEY_SIZE_BYTES} octets décodés requis."
-            )
-        return cls(key)
+        return cls(decode_encoded_key(encoded))
 
     @staticmethod
     def aad(project: str, env: str, name: str) -> bytes:
