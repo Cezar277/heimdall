@@ -129,6 +129,18 @@ def test_generation_refuses_source_outside_fixture_root(tmp_path, monkeypatch):
     assert not (tmp_path / "generated").exists()
 
 
+def test_generation_normalizes_relative_path_error(tmp_path, monkeypatch):
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    (fixtures / "sample.py.tmpl").write_text("PUBLIC_FIXTURE")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("support.trap_corpus.FIXTURES", fixtures)
+    monkeypatch.setattr(Path, "rglob", lambda root, pattern: [Path("fixtures/sample.py.tmpl")])
+    with pytest.raises(ValueError, match="^Gabarit hors corpus ou lien symbolique interdit$"):
+        build_corpus(tmp_path / "generated")
+    assert not (tmp_path / "generated").exists()
+
+
 def _symlink_or_skip(link, target, *, directory=False):
     try:
         link.symlink_to(target, target_is_directory=directory)
@@ -136,6 +148,23 @@ def _symlink_or_skip(link, target, *, directory=False):
         if getattr(error, "winerror", None) == 1314:
             pytest.skip("Création de liens symboliques non autorisée sous Windows")
         raise
+
+
+def test_scan_refuses_symlinked_fixture_root(tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sample.py.tmpl").write_text("PRIVATE_FIXTURE_DO_NOT_COPY")
+    fixtures = tmp_path / "fixtures"
+    _symlink_or_skip(fixtures, outside, directory=True)
+    monkeypatch.setattr("support.trap_corpus.FIXTURES", fixtures)
+
+    def unexpected_scan(path):
+        pytest.fail("Le scanner ne doit pas recevoir de corpus issu d'une racine symlinkée")
+
+    monkeypatch.setattr("support.trap_corpus.find_candidates", unexpected_scan)
+    with pytest.raises(ValueError, match="^Gabarit hors corpus ou lien symbolique interdit$"):
+        scan_corpus(tmp_path / "generated")
+    assert not (tmp_path / "generated").exists()
 
 
 def test_generation_refuses_template_symlink(tmp_path, monkeypatch):
@@ -173,7 +202,9 @@ def test_generation_refuses_target_symlink_escape(tmp_path, monkeypatch):
 
 
 @pytest.mark.xfail(
-    raises=NotImplementedError, reason="Scanner T22 non livré; aucune métrique inventée"
+    raises=NotImplementedError,
+    reason="Scanner T22 non livré; aucune métrique inventée",
+    strict=True,
 )
 def test_scanner_precision_and_recall(tmp_path):
     report = scan_corpus(tmp_path)

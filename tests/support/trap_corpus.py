@@ -53,6 +53,8 @@ def _replacements():
 
 def build_corpus(destination: Path):
     """Matérialise les gabarits dans un dossier temporaire vide, sans les exécuter."""
+    if FIXTURES.is_symlink():
+        raise ValueError("Gabarit hors corpus ou lien symbolique interdit")
     if destination.exists() and any(destination.iterdir()):
         raise ValueError("Le dossier du corpus doit être vide")
     source_root = FIXTURES.resolve()
@@ -60,7 +62,11 @@ def build_corpus(destination: Path):
     for template in sorted(FIXTURES.rglob("*.tmpl")):
         if template.is_symlink() or not template.resolve().is_relative_to(source_root):
             raise ValueError("Gabarit hors corpus ou lien symbolique interdit")
-        target = destination / template.relative_to(FIXTURES).with_suffix("")
+        try:
+            relative = template.relative_to(FIXTURES)
+        except ValueError:
+            raise ValueError("Gabarit hors corpus ou lien symbolique interdit") from None
+        target = destination / relative.with_suffix("")
         if not target.resolve().is_relative_to(destination_root):
             raise ValueError("Destination du gabarit hors corpus temporaire")
         content = template.read_text(encoding="utf-8")
