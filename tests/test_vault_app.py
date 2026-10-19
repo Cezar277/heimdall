@@ -11,10 +11,12 @@ X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
 import unittest
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -38,7 +40,9 @@ from heimdall.vault.app import (
     VaultSettings,
     app,
     create_app,
+    generate_api_key,
     get_settings,
+    hash_api_key,
     run_server,
 )
 
@@ -764,7 +768,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_post_secret_body_size_limit_stream_chunked_400(self) -> None:
         """Corps > 1 Mio en flux/chunked est interrompu et rejeté avec HTTP 400."""
-        async def chunk_generator():
+        async def chunk_generator() -> AsyncGenerator[bytes, None]:
             yield b"x" * 600_000
             yield b"x" * 600_000
 
@@ -913,7 +917,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         """L'interruption de flux s'arrête net dès dépassement sans lire les tronçons suivants."""
         third_chunk_read = False
 
-        async def chunk_generator():
+        async def chunk_generator() -> AsyncGenerator[bytes, None]:
             nonlocal third_chunk_read
             yield b"x" * 600_000
             yield b"x" * 600_000
@@ -1173,6 +1177,175 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         doc = InMemorySecretStore.__doc__ or ""
         self.assertIn("TODO(#62)", doc)
         self.assertIn("quota", doc)
+
+
+    async def test_invalid_api_key_returns_401_unauthorized(self) -> None:
+        """Une clé API invalide ou vide retourne 401 sans exposer d'oracle."""
+        invalid_cases = [
+            "invalid-key-token",
+            "   ",
+            "wrong_key_12345",
+        ]
+        for bad_key in invalid_cases:
+            with self.subTest(bad_key=bad_key):
+                headers = {"X-Heimdall-API-Key": bad_key}
+                post_resp = await self.client.post(
+                    "/api/v1/secrets",
+                    json={"project": "demo", "env": "dev", "name": "AUTH_KEY", "value": "val"},
+                    headers=headers,
+                )
+                self.assertEqual(post_resp.status_code, 401)
+                self.assertEqual(
+                    post_resp.json(),
+                    {"code": "unauthorized", "message": "Authentification requise"},
+                )
+                get_resp = await self.client.get(
+                    "/api/v1/secrets/demo/dev/AUTH_KEY",
+                    headers=headers,
+                )
+                self.assertEqual(get_resp.status_code, 401)
+                self.assertEqual(
+                    get_resp.json(),
+                    {"code": "unauthorized", "message": "Authentification requise"},
+                )
+
+    async def test_valid_api_key_allows_secret_creation_and_reading(self) -> None:
+        """Une clé API valide autorise la création (201) et la lecture (200) de secrets."""
+        test_app = create_app()
+        raw_key = generate_api_key()
+        test_app.state.register_api_key(raw_key, "demo")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as client:
+            headers = {"X-Heimdall-API-Key": raw_key}
+            create_resp = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "VALID_AUTH", "value": "topsecret"},
+                headers=headers,
+            )
+            self.assertEqual(create_resp.status_code, 201)
+            self.assertEqual(create_resp.headers.get("cache-control"), "no-store")
+
+            read_resp = await client.get(
+                "/api/v1/secrets/demo/dev/VALID_AUTH",
+                headers=headers,
+            )
+            self.assertEqual(read_resp.status_code, 200)
+            self.assertEqual(read_resp.headers.get("cache-control"), "no-store")
+            self.assertEqual(read_resp.json()["value"], "topsecret")
+
+    async def test_cross_project_api_key_returns_403_forbidden(self) -> None:
+        """Une clé API valide pour un projet A est rejetée avec 403 sur le projet B."""
+        test_app = create_app()
+        raw_key = generate_api_key()
+        test_app.state.register_api_key(raw_key, "project_alpha")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as client:
+            headers = {"X-Heimdall-API-Key": raw_key}
+            # Tentative de création sur project_beta avec la clé de project_alpha
+            create_resp = await client.post(
+                "/api/v1/secrets",
+                json={
+                    "project": "project_beta",
+                    "env": "dev",
+                    "name": "CROSS_AUTH",
+                    "value": "hacked",
+                },
+                headers=headers,
+            )
+            self.assertEqual(create_resp.status_code, 403)
+            self.assertEqual(
+                create_resp.json(),
+                {"code": "forbidden", "message": "Accès interdit"},
+            )
+
+            # Tentative de lecture sur project_beta avec la clé de project_alpha
+            read_resp = await client.get(
+                "/api/v1/secrets/project_beta/dev/CROSS_AUTH",
+                headers=headers,
+            )
+            self.assertEqual(read_resp.status_code, 403)
+            self.assertEqual(
+                read_resp.json(),
+                {"code": "forbidden", "message": "Accès interdit"},
+            )
+
+    async def test_require_auth_setting_rejects_missing_key_with_401(self) -> None:
+        """Quand require_auth=True, toute requête sans clé est rejetée avec 401."""
+        test_app = create_app(VaultSettings(require_auth=True))
+        raw_key = generate_api_key()
+        test_app.state.register_api_key(raw_key, "demo")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as client:
+            # Sans en-tête -> 401
+            resp_missing = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "REQ_AUTH", "value": "secret"},
+            )
+            self.assertEqual(resp_missing.status_code, 401)
+            self.assertEqual(
+                resp_missing.json(),
+                {"code": "unauthorized", "message": "Authentification requise"},
+            )
+
+            # Avec clé valide -> 201
+            resp_valid = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "REQ_AUTH", "value": "secret"},
+                headers={"X-Heimdall-API-Key": raw_key},
+            )
+            self.assertEqual(resp_valid.status_code, 201)
+
+    def test_generate_api_key_has_adequate_entropy(self) -> None:
+        """La clé générée dispose d'au moins 256 bits d'entropie (token_urlsafe(32))."""
+        key1 = generate_api_key()
+        key2 = generate_api_key()
+        self.assertNotEqual(key1, key2)
+        # 32 octets encodés en base64 url-safe donnent 43 caractères
+        self.assertGreaterEqual(len(key1), 43)
+
+    def test_hash_api_key_deterministic_sha256(self) -> None:
+        """hash_api_key retourne le SHA-256 déterministe en hexadécimal."""
+        expected = hashlib.sha256(b"my-api-key").hexdigest()
+        self.assertEqual(hash_api_key("my-api-key"), expected)
+
+    async def test_openapi_schema_declares_project_api_key_security(self) -> None:
+        """Le schéma OpenAPI déclare ProjectApiKey et l'associe aux routes secrets."""
+        dev_app = create_app(VaultSettings(enable_docs=True))
+        async with AsyncClient(
+            transport=ASGITransport(app=dev_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as dev_client:
+            openapi_resp = await dev_client.get("/openapi.json")
+            self.assertEqual(openapi_resp.status_code, 200)
+            schema = openapi_resp.json()
+
+            # Schéma de sécurité ProjectApiKey
+            security_schemes = schema["components"]["securitySchemes"]
+            self.assertIn("ProjectApiKey", security_schemes)
+            self.assertEqual(security_schemes["ProjectApiKey"]["type"], "apiKey")
+            self.assertEqual(security_schemes["ProjectApiKey"]["in"], "header")
+            self.assertEqual(security_schemes["ProjectApiKey"]["name"], "X-Heimdall-API-Key")
+
+            # Route POST /api/v1/secrets
+            post_op = schema["paths"]["/api/v1/secrets"]["post"]
+            self.assertEqual(post_op.get("security"), [{"ProjectApiKey": []}])
+
+            # Route GET /api/v1/secrets/{project}/{env}/{name}
+            get_op = schema["paths"]["/api/v1/secrets/{project}/{env}/{name}"]["get"]
+            self.assertEqual(get_op.get("security"), [{"ProjectApiKey": []}])
+
+            # Route GET /api/v1/health (publique, sans sécurité requise)
+            health_op = schema["paths"]["/api/v1/health"]["get"]
+            self.assertNotIn("security", health_op)
 
 
 if __name__ == "__main__":

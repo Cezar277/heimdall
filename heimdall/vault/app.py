@@ -38,19 +38,23 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 """
 
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import logging
 import os
 import re
+import secrets
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import uvicorn
-from fastapi import FastAPI, Response
+from fastapi import Depends, FastAPI, Response
 from fastapi import Path as FastApiPath
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -62,7 +66,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
-from heimdall.vault.database import DEFAULT_DB_PATH, resolve_db_path, validate_db_path
+from heimdall.vault.database import (
+    DEFAULT_DB_PATH,
+    db_session,
+    get_api_key_by_hash,
+    resolve_db_path,
+    validate_db_path,
+)
 
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
 _MAX_BODY_SIZE: int = 1_048_576  # 1 Mio (1 048 576 octets)
@@ -155,6 +165,27 @@ class InternalError(BaseModel):
     model_config = ConfigDict(extra="forbid")
     code: Literal["internal_error"] = "internal_error"
     message: Literal["Erreur interne"] = "Erreur interne"
+
+
+project_api_key_header = APIKeyHeader(
+    name="X-Heimdall-API-Key",
+    scheme_name="ProjectApiKey",
+    auto_error=False,
+    description=(
+        "Clé d'authentification projet (ticket #64). "
+        "Générée à >= 256 bits via secrets.token_urlsafe(32)."
+    ),
+)
+
+
+def generate_api_key() -> str:
+    """Génère une clé API aléatoire avec au moins 256 bits d'entropie (ticket #64)."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_api_key(key: str) -> str:
+    """Hachage SHA-256 de vérification d'une clé API (ticket #64)."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 PROJECT_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_-]{0,63}(?![\s\S])")
@@ -408,6 +439,13 @@ class VaultSettings(BaseSettings):
         default=False,
         description="Activer la documentation OpenAPI/Swagger (/docs). Faux par défaut.",
     )
+    require_auth: bool = Field(
+        default=False,
+        description=(
+            "Exiger l'en-tête X-Heimdall-API-Key pour toute requête sur les routes de secrets. "
+            "Faux par défaut pour compatibilité descendante du squelette (ticket #64)."
+        ),
+    )
     db_path: str = Field(
         default=str(DEFAULT_DB_PATH),
         description="Chemin du fichier de base de données SQLite.",
@@ -647,6 +685,73 @@ def _register_exception_handlers(app: FastAPI) -> None:
         )
 
 
+def verify_api_key(
+    request: Request,
+    api_key: Annotated[str | None, Depends(project_api_key_header)] = None,
+) -> str | None:
+    """Vérifie l'en-tête X-Heimdall-API-Key en temps constant (ticket #64).
+
+    - Rejette toute clé absente si settings.require_auth=True (HTTP 401).
+    - Si une clé est fournie :
+      - Rejette toute clé vide ou invalide (HTTP 401).
+      - Recherche le projet associé en mémoire puis en base SQLite avec
+        comparaison en temps constant hmac.compare_digest.
+      - Retourne l'identifiant du projet autorisé.
+    - Si aucune clé n'est fournie et settings.require_auth=False :
+      - Retourne None (mode de compatibilité descendante du squelette #63).
+    """
+    settings: VaultSettings = getattr(
+        request.app.state,
+        "settings",
+        VaultSettings(require_auth=False),
+    )
+    if api_key is None:
+        if settings.require_auth:
+            raise StarletteHTTPException(
+                status_code=401,
+                detail="Authentification requise",
+            )
+        return None
+
+    cleaned_key = api_key.strip()
+    if not cleaned_key:
+        raise StarletteHTTPException(
+            status_code=401,
+            detail="Authentification requise",
+        )
+
+    provided_hash = hash_api_key(cleaned_key)
+    registered_keys: dict[str, str] = getattr(request.app.state, "api_keys", {})
+    matching_project: str | None = None
+
+    for reg_hash, proj_id in registered_keys.items():
+        if hmac.compare_digest(provided_hash, reg_hash):
+            matching_project = proj_id
+            break
+
+    if matching_project is None and hasattr(request.app.state, "db_path"):
+        db_path = request.app.state.db_path
+        if isinstance(db_path, Path) and db_path.is_file():
+            try:
+                with db_session(db_path) as conn:
+                    row = get_api_key_by_hash(conn, provided_hash)
+                    if row and not row.get("revoked_at"):
+                        matching_project = row["project_id"]
+            except Exception as exc:
+                logger.debug(
+                    "Échec consultation clé API SQLite : %s",
+                    exc.__class__.__name__,
+                )
+
+    if matching_project is None:
+        raise StarletteHTTPException(
+            status_code=401,
+            detail="Authentification requise",
+        )
+
+    return matching_project
+
+
 def _register_routes(app: FastAPI) -> None:
     """Enregistre les routes de l'API Vault."""
 
@@ -674,8 +779,17 @@ def _register_routes(app: FastAPI) -> None:
     async def create_secret(
         secret_in: SecretCreate,
         response: Response,
+        authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretMetadata:
         """Créer un secret vaulté (ticket #63)."""
+        if (
+            authenticated_project is not None
+            and authenticated_project != secret_in.project
+        ):
+            raise StarletteHTTPException(
+                status_code=403,
+                detail="Accès interdit",
+            )
         response.headers["Cache-Control"] = "no-store"
         store: InMemorySecretStore = app.state.secret_store
         try:
@@ -726,8 +840,17 @@ def _register_routes(app: FastAPI) -> None:
             FastApiPath(description="Nom de variable ; aucune valeur secrète."),
         ],
         response: Response,
+        authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretRead:
         """Lire la valeur courante d'un secret (ticket #63)."""
+        if (
+            authenticated_project is not None
+            and authenticated_project != project
+        ):
+            raise StarletteHTTPException(
+                status_code=403,
+                detail="Accès interdit",
+            )
         response.headers["Cache-Control"] = "no-store"
         store: InMemorySecretStore = app.state.secret_store
         record = await store.get(project=project, env=env, name=name)
@@ -748,6 +871,7 @@ def _register_routes(app: FastAPI) -> None:
 def create_app(
     settings: VaultSettings | None = None,
     secret_store: InMemorySecretStore | None = None,
+    api_keys: dict[str, str] | None = None,
 ) -> FastAPI:
     """Fabrique et configure l'application FastAPI pour le serveur Vault."""
     effective_settings = settings if settings is not None else get_settings()
@@ -769,6 +893,13 @@ def create_app(
     app.state.secret_store = (
         secret_store if secret_store is not None else InMemorySecretStore()
     )
+    app.state.api_keys = dict(api_keys) if api_keys is not None else {}
+
+    def register_api_key(raw_key: str, project_id: str) -> None:
+        key_hash = hash_api_key(raw_key)
+        app.state.api_keys[key_hash] = project_id
+
+    app.state.register_api_key = register_api_key
 
     _register_middleware(app)
     _register_exception_handlers(app)
@@ -826,8 +957,12 @@ __all__ = [
     "VaultSettings",
     "app",
     "create_app",
+    "generate_api_key",
     "get_settings",
+    "hash_api_key",
+    "project_api_key_header",
     "run_server",
+    "verify_api_key",
 ]
 
 if __name__ == "__main__":
