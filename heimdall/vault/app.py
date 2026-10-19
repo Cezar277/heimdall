@@ -237,7 +237,10 @@ class InMemorySecretStore:
     au développement. Ne jamais déployer en production.
     TODO(#26, #62) : Remplacer par le chiffrement au repos (AES-256-GCM / DEK) et
     la persistance SQLite avec contrainte d'unicité UNIQUE(project_id, env, name)
-    et PRAGMA foreign_keys=ON. Ce stockage en mémoire est mono-processus.
+    et PRAGMA foreign_keys=ON.
+    Ce stockage en mémoire est strictement mono-processus (workers=1). Avec plusieurs
+    workers (workers > 1), chaque worker détiendrait une instance mémoire indépendante
+    et divergente sans garantie d'unicité inter-processus.
     """
 
     def __init__(self) -> None:
@@ -731,6 +734,10 @@ def run_server() -> None:
     route /api/v1/health sur la boucle locale. Ne jamais réutiliser ce montage HTTP
     au-delà du squelette : les tickets #64 et #65 implémentent le TLS obligatoire avec
     SAN-IP (https://127.0.0.1:8443) et l'authentification X-Heimdall-API-Key.
+
+    NOTE CONCURRENCE : Le serveur tourne avec un seul worker (workers=1 par défaut).
+    Ne pas augmenter le nombre de workers tant que le stockage persistant partagé
+    SQLite (#26, #62) n'est pas branché.
     """
     server_settings = get_settings()
     uvicorn.run(

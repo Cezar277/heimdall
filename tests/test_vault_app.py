@@ -28,6 +28,7 @@ from heimdall.vault.app import (
     ConflictError,
     ForbiddenError,
     HealthResponse,
+    InMemorySecretStore,
     NotFoundError,
     SecretCreate,
     SecretMetadata,
@@ -1013,6 +1014,48 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Cache-Control", get_responses["200"]["headers"])
         self.assertIn("headers", get_responses["429"])
         self.assertIn("Retry-After", get_responses["429"]["headers"])
+
+    async def test_get_secret_encoded_path_traversal_and_slash_rejected(self) -> None:
+        """Les traversées encodées (%2e%2e) et slashs (%2F) sont rejetés sans fuite."""
+        invalid_encoded_paths = [
+            "/api/v1/secrets/%2e%2e/dev/MY_KEY",
+            "/api/v1/secrets/%2E%2E/dev/MY_KEY",
+            "/api/v1/secrets/demo/%2e%2e/MY_KEY",
+            "/api/v1/secrets/demo/dev/%2e%2e",
+            "/api/v1/secrets/demo%2Fevil/dev/MY_KEY",
+            "/api/v1/secrets/demo/dev%2Fevil/MY_KEY",
+            "/api/v1/secrets/demo/dev/MY%2FKEY",
+        ]
+        for path in invalid_encoded_paths:
+            with self.subTest(path=path):
+                res = await self.client.get(path)
+                self.assertIn(res.status_code, (400, 404))
+                body = res.json()
+                self.assertIn(body.get("code"), ("bad_request", "not_found"))
+                self.assertNotIn("value", body)
+                self.assertNotIn("%2e", res.text.lower())
+                self.assertNotIn("%2f", res.text.lower())
+
+    def test_in_memory_secret_store_mutation_defensive_copy(self) -> None:
+        """La mutation d'un dict retourné par store.get() ne corrompt pas le store."""
+        store = InMemorySecretStore()
+        store.create(project="demo", env="dev", name="SAFE_KEY", value="original_value")
+        record = store.get(project="demo", env="dev", name="SAFE_KEY")
+        self.assertIsNotNone(record)
+        assert record is not None
+        record["value"] = "tampered_value"
+        record["status"] = "corrupted"
+
+        re_fetched = store.get(project="demo", env="dev", name="SAFE_KEY")
+        self.assertIsNotNone(re_fetched)
+        assert re_fetched is not None
+        self.assertEqual(re_fetched["value"], "original_value")
+        self.assertEqual(re_fetched["status"], "vaulte")
+
+    def test_single_worker_documented_for_memory_store(self) -> None:
+        """La documentation de InMemorySecretStore et run_server affirme workers=1."""
+        self.assertIn("workers=1", InMemorySecretStore.__doc__ or "")
+        self.assertIn("workers=1", run_server.__doc__ or "")
 
 
 if __name__ == "__main__":
