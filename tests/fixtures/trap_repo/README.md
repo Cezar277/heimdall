@@ -60,7 +60,7 @@ sans traceback ni contenu d'exception ; les erreurs restent propagées par
 Le test d'intégration est un `xfail` limité à `NotImplementedError` tant que
 T22 est un squelette. Une sortie vide, une autre exception, un Finding invalide
 ou des métriques sous le seuil sont de vrais échecs. Dès que T22 passe, pytest
-signale XPASS : retirer alors le marqueur. Aucun chiffre de performance du
+échoue avec XPASS(strict) : retirer alors le marqueur. Aucun chiffre de performance du
 scanner n'est annoncé tant qu'il n'est pas implémenté.
 
 ## Métriques

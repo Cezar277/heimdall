@@ -125,3 +125,25 @@ Les permaliens et lignes SAMM sont actualisés dans `t21-samm.md`. L'exception
 multi-tickets reste soumise à validation explicite du relecteur. La CI Linux
 n'est pas relancée sur cette révision conformément à la consigne de livraison ;
 son check vert reste une condition de fusion, pas une preuve acquise.
+
+
+## Revue : XFAIL strict et révision des preuves
+
+Le marqueur d'acceptation T22 utilise `strict=True`. Une exécution avec un
+scanner simulé conforme a produit XPASS(strict) et un code pytest 1 : le
+marqueur devra être retiré lorsque T22 sera livré.
+
+La racine FIXTURES elle-même est refusée si elle est un lien symbolique.
+Un test vérifie que `scan_corpus` bloque avant d'appeler le scanner ou de
+produire le corpus. Une erreur de `relative_to` devient le message fixe
+« Gabarit hors corpus ou lien symbolique interdit », sans refléter le chemin.
+
+Résultat ciblé : **26 passed, 3 skipped, 1 xfailed** ; lint réussi. Les trois
+tests nécessitant des liens réels sont ignorés sur cette session Windows
+(WinError 1314). Le test de normalisation de `relative_to` est exécuté.
+
+Les preuves SAMM épinglent maintenant le code testé `0b14b3826e60e5afed3ffc4577a2bf1c9d095c90`. Les commits
+de documentation ultérieurs n'en changent pas les modules référencés ;
+la commande de vérification est donnée dans la fiche. L'exception multi-tickets
+reste à valider explicitement par le relecteur, et le check CI Linux vert
+reste requis avant fusion. Aucun lancement de CI n'est revendiqué ici.
