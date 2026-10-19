@@ -12,6 +12,7 @@ X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -53,8 +54,14 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         if hasattr(app.state, "secret_store"):
             await app.state.secret_store.clear()
+        self.test_api_key = generate_api_key()
+        app.state.register_api_key(self.test_api_key, "demo")
         self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
-        self.client = AsyncClient(transport=self.transport, base_url="http://127.0.0.1:8443")
+        self.client = AsyncClient(
+            transport=self.transport,
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": self.test_api_key},
+        )
 
     async def asyncTearDown(self) -> None:
         await self.client.aclose()
@@ -571,8 +578,14 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         if hasattr(app.state, "secret_store"):
             await app.state.secret_store.clear()
+        self.test_api_key = generate_api_key()
+        app.state.register_api_key(self.test_api_key, "demo")
         self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
-        self.client = AsyncClient(transport=self.transport, base_url="http://127.0.0.1:8443")
+        self.client = AsyncClient(
+            transport=self.transport,
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": self.test_api_key},
+        )
 
     async def asyncTearDown(self) -> None:
         await self.client.aclose()
@@ -1087,8 +1100,14 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         """Le dépassement de quota retourne HTTP 429 trop de requêtes avec Retry-After."""
         bounded_store = InMemorySecretStore(max_secrets=1, max_secrets_per_project=1)
         test_app = create_app(secret_store=bounded_store)
+        test_key = generate_api_key()
+        test_app.state.register_api_key(test_key, "demo")
         transport = ASGITransport(app=test_app, client=("127.0.0.1", 54321))
-        async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8443") as client:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": test_key},
+        ) as client:
             res1 = await client.post(
                 "/api/v1/secrets",
                 json={"project": "demo", "env": "dev", "name": "FIRST_KEY", "value": "val1"},
@@ -1312,10 +1331,218 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         # 32 octets encodés en base64 url-safe donnent 43 caractères
         self.assertGreaterEqual(len(key1), 43)
 
-    def test_hash_api_key_deterministic_sha256(self) -> None:
-        """hash_api_key retourne le SHA-256 déterministe en hexadécimal."""
-        expected = hashlib.sha256(b"my-api-key").hexdigest()
-        self.assertEqual(hash_api_key("my-api-key"), expected)
+    def test_hash_api_key_uses_hmac_sha256_with_server_pepper(self) -> None:
+        """hash_api_key utilise HMAC-SHA256 avec pepper serveur (openapi.yaml:197-200)."""
+        custom_pepper = "custom_secret_pepper_value_999"
+        expected = hmac.new(
+            custom_pepper.encode("utf-8"),
+            b"my-api-key",
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertEqual(hash_api_key("my-api-key", pepper=custom_pepper), expected)
+
+    def test_hash_api_key_distinct_peppers_produce_different_hashes(self) -> None:
+        """Deux clés identiques sur des déploiements distincts ne donnent pas le même hash."""
+        key = "my-api-key-test"
+        hash_1 = hash_api_key(key, pepper="deployment_alpha_pepper")
+        hash_2 = hash_api_key(key, pepper="deployment_beta_pepper")
+        self.assertNotEqual(hash_1, hash_2)
+
+    def test_hash_api_key_differs_from_bare_sha256(self) -> None:
+        """Le hachage n'est jamais un SHA-256 nu (anti-corrélation inter-déploiements)."""
+        key = "my-api-key-test"
+        bare_sha = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        self.assertNotEqual(hash_api_key(key), bare_sha)
+
+    async def test_require_auth_by_default_rejects_missing_key_with_401(self) -> None:
+        """create_app() sans argument exige l'auth par défaut (fail-closed, 401)."""
+        default_app = create_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=default_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as client:
+            resp = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "FAIL_CLOSED", "value": "val"},
+            )
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(
+                resp.json(),
+                {"code": "unauthorized", "message": "Authentification requise"},
+            )
+
+    async def test_require_auth_explicit_false_allows_unauthenticated_test_mode(self) -> None:
+        """create_app(require_auth=False) permet le bypass pour fixtures de test isolées."""
+        test_app = create_app(VaultSettings(require_auth=False))
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as client:
+            resp = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "EXPLICIT_TEST", "value": "val"},
+            )
+            self.assertEqual(resp.status_code, 201)
+
+    def test_create_app_rejects_raw_keys_in_api_key_hashes_dict(self) -> None:
+        """create_app refuse les clés brutes passées à api_key_hashes ou api_keys."""
+        raw_token = generate_api_key()
+        # Passage d'une clé brute -> refus immédiat
+        with self.assertRaises(ValueError) as ctx:
+            create_app(api_key_hashes={raw_token: "demo"})
+        self.assertIn("Format d'empreinte de clé API invalide", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx_deprecated:
+            create_app(api_keys={raw_token: "demo"})
+        self.assertIn("Format d'empreinte de clé API invalide", str(ctx_deprecated.exception))
+
+        # Passage d'un hash HMAC valide -> accepté
+        valid_hash = hash_api_key(raw_token)
+        app_with_hash = create_app(api_key_hashes={valid_hash: "demo"})
+        self.assertEqual(app_with_hash.state.api_keys[valid_hash], "demo")
+
+    async def test_api_key_with_whitespace_rejected_401(self) -> None:
+        """Une clé API avec espaces en début/fin est rejetée avec 401 sans normalisation strip()."""
+        raw_key = generate_api_key()
+        test_app = create_app()
+        test_app.state.register_api_key(raw_key, "demo")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as client:
+            resp = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "STRIP_TEST", "value": "val"},
+                headers={"X-Heimdall-API-Key": f"  {raw_key}  "},
+            )
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(
+                resp.json(),
+                {"code": "unauthorized", "message": "Authentification requise"},
+            )
+
+    async def test_post_secret_transfer_encoding_and_content_length_simultaneous_rejected_400(
+        self,
+    ) -> None:
+        """Transfer-Encoding et Content-Length simultanés sont rejetés avec HTTP 400."""
+        valid_payload = json.dumps(
+            {"project": "demo", "env": "dev", "name": "SMUGGLE_KEY", "value": "val"}
+        ).encode("utf-8")
+        headers = [
+            ("Content-Type", "application/json"),
+            ("Transfer-Encoding", "chunked"),
+            ("Content-Length", str(len(valid_payload))),
+            ("X-Heimdall-API-Key", self.test_api_key),
+        ]
+        res = await self.client.post(
+            "/api/v1/secrets",
+            content=valid_payload,
+            headers=headers,
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(
+            res.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+
+    async def test_post_secret_content_length_whitespace_rejected_400(self) -> None:
+        """Content-Length avec espaces (' 10 ') est rejeté avec HTTP 400 (RFC 9110 §8.6)."""
+        valid_payload = json.dumps(
+            {"project": "demo", "env": "dev", "name": "WS_CL_KEY", "value": "val"}
+        ).encode("utf-8")
+        res_ws = await self.client.post(
+            "/api/v1/secrets",
+            content=valid_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": f" {len(valid_payload)} ",
+                "X-Heimdall-API-Key": self.test_api_key,
+            },
+        )
+        self.assertEqual(res_ws.status_code, 400)
+        self.assertEqual(
+            res_ws.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+
+    async def test_large_html_payload_never_reflected_in_errors(self) -> None:
+        """Valeur de 64 Ko avec HTML/JS jamais reflétée dans les erreurs (400, 409, 429)."""
+        html_canary = "<script>alert('xss_canary_injection_test');</script>"
+        large_html_value = html_canary * 1200  # ~63 Ko
+        self.assertGreater(len(large_html_value), 60_000)
+        self.assertLessEqual(len(large_html_value), 65536)
+
+        # 1. Erreur 400 : payload invalide (nom de projet incorrect)
+        res_400 = await self.client.post(
+            "/api/v1/secrets",
+            json={
+                "project": "InvalidProjectCase",
+                "env": "dev",
+                "name": "HTML_CANARY",
+                "value": large_html_value,
+            },
+        )
+        self.assertEqual(res_400.status_code, 400)
+        self.assertNotIn("xss_canary", res_400.text)
+        self.assertNotIn("<script>", res_400.text)
+
+        # 2. Succès 201 puis 409 conflict avec payload HTML
+        res_201 = await self.client.post(
+            "/api/v1/secrets",
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "HTML_CONFLICT_KEY",
+                "value": "initial_value",
+            },
+        )
+        self.assertEqual(res_201.status_code, 201)
+
+        res_409 = await self.client.post(
+            "/api/v1/secrets",
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "HTML_CONFLICT_KEY",
+                "value": large_html_value,
+            },
+        )
+        self.assertEqual(res_409.status_code, 409)
+        self.assertNotIn("xss_canary", res_409.text)
+        self.assertNotIn("<script>", res_409.text)
+
+        # 3. Erreur 429 quota de stockage avec payload HTML
+        quota_app = create_app(
+            secret_store=InMemorySecretStore(max_secrets=1, max_secrets_per_project=1)
+        )
+        quota_key = generate_api_key()
+        quota_app.state.register_api_key(quota_key, "demo")
+        async with AsyncClient(
+            transport=ASGITransport(app=quota_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": quota_key},
+        ) as quota_client:
+            # Remplit le quota
+            r1 = await quota_client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "FIRST", "value": "ok"},
+            )
+            self.assertEqual(r1.status_code, 201)
+
+            # Provoque 429 avec la valeur HTML 64 Ko
+            r_429 = await quota_client.post(
+                "/api/v1/secrets",
+                json={
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "OVERFLOW_HTML",
+                    "value": large_html_value,
+                },
+            )
+            self.assertEqual(r_429.status_code, 429)
+            self.assertNotIn("xss_canary", r_429.text)
+            self.assertNotIn("<script>", r_429.text)
 
     async def test_openapi_schema_declares_project_api_key_security(self) -> None:
         """Le schéma OpenAPI déclare ProjectApiKey et l'associe aux routes secrets."""

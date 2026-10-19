@@ -69,7 +69,6 @@ from starlette.requests import Request
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
     db_session,
-    get_api_key_by_hash,
     resolve_db_path,
     validate_db_path,
 )
@@ -183,9 +182,26 @@ def generate_api_key() -> str:
     return secrets.token_urlsafe(32)
 
 
-def hash_api_key(key: str) -> str:
-    """Hachage SHA-256 de vérification d'une clé API (ticket #64)."""
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+_DUMMY_HASH: str = "0" * 64
+_HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
+
+
+def hash_api_key(key: str, pepper: str | bytes | None = None) -> str:
+    """Hachage HMAC-SHA256 de vérification d'une clé API avec pepper serveur (ticket #64).
+
+    Conformité openapi.yaml:197-200 :
+    Le serveur DOIT stocker uniquement un haché salé de vérification de la clé
+    (sel unique par clé, ou HMAC avec un pepper serveur distinct de la KEK de
+    chiffrement), jamais sa valeur brute ; la fonction de hachage et la gestion
+    du sel/pepper sont documentées pour #25.
+    """
+    if pepper is None:
+        pepper = os.environ.get(
+            "HEIMDALL_VAULT_API_KEY_PEPPER",
+            "heimdall_default_vault_pepper_dev_only",
+        )
+    pepper_bytes = pepper.encode("utf-8") if isinstance(pepper, str) else bytes(pepper)
+    return hmac.new(pepper_bytes, key.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 PROJECT_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_-]{0,63}(?![\s\S])")
@@ -386,8 +402,8 @@ _SECRETS_POST_RESPONSES: dict[int | str, dict[str, Any]] = {
     429: {
         "model": RateLimitedError,
         "description": (
-            "Trop de requêtes — rate-limiting par clé API (ticket #65) ou quota de stockage "
-            "(ticket #62, retry inutile tant que la capacité reste pleine)."
+            "Trop de requêtes — quota de stockage par projet (ticket #63, #62) ; "
+            "rate-limiting réseau/clé à implémenter (ticket #65, TODO(#65))."
         ),
         "headers": _RETRY_AFTER_HEADER,
     },
@@ -408,7 +424,10 @@ _SECRETS_GET_RESPONSES: dict[int | str, dict[str, Any]] = {
     405: {"model": MethodNotAllowedError, "description": "Méthode non autorisée"},
     429: {
         "model": RateLimitedError,
-        "description": "Trop de requêtes — rate-limiting par clé API (ticket #65)",
+        "description": (
+            "Trop de requêtes — quota de stockage par projet (ticket #63, #62) ; "
+            "rate-limiting réseau/clé à implémenter (ticket #65, TODO(#65))."
+        ),
         "headers": _RETRY_AFTER_HEADER,
     },
     500: {"model": InternalError, "description": "Erreur interne"},
@@ -440,10 +459,18 @@ class VaultSettings(BaseSettings):
         description="Activer la documentation OpenAPI/Swagger (/docs). Faux par défaut.",
     )
     require_auth: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Exiger l'en-tête X-Heimdall-API-Key pour toute requête sur les routes de secrets. "
-            "Faux par défaut pour compatibilité descendante du squelette (ticket #64)."
+            "Vrai par défaut (fail-closed, openapi.yaml:19-20). "
+            "Désactivation explicite réservée aux tests unitaires isolés."
+        ),
+    )
+    api_key_pepper: str = Field(
+        default="heimdall_default_vault_pepper_dev_only",
+        description=(
+            "Pepper serveur distinct de la KEK pour hachage HMAC-SHA256 (ticket #64). "
+            "Jamais consigné dans les journaux d'audit ni retourné au client."
         ),
     )
     db_path: str = Field(
@@ -550,9 +577,22 @@ class BodySizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
+        raw_headers = scope.get("headers", [])
+        has_transfer_encoding = any(k.lower() == b"transfer-encoding" for k, _ in raw_headers)
         content_lengths = [
-            val for key, val in scope.get("headers", []) if key.lower() == b"content-length"
+            val for key, val in raw_headers if key.lower() == b"content-length"
         ]
+
+        # Rejet HTTP smuggling : coexistence de Transfer-Encoding et Content-Length
+        # interdite (RFC 9112 §4.2)
+        if has_transfer_encoding and content_lengths:
+            response = JSONResponse(
+                status_code=400,
+                content=_ERROR_PAYLOADS[400],
+            )
+            await response(scope, receive, send)
+            return
+
         if len(content_lengths) > 1:
             response = JSONResponse(
                 status_code=400,
@@ -564,7 +604,11 @@ class BodySizeLimitMiddleware:
         if content_lengths:
             val = content_lengths[0]
             try:
-                parsed_len = int(val)
+                # Format strict RFC 9110 §8.6 (chiffres uniquement, rejet d'espaces ou signes)
+                val_str = val.decode("ascii")
+                if not val_str.isdigit():
+                    raise ValueError("Content-Length non décimal ou contenant des espaces")
+                parsed_len = int(val_str)
                 if parsed_len < 0 or parsed_len > self.max_body_size:
                     response = JSONResponse(
                         status_code=400,
@@ -572,7 +616,7 @@ class BodySizeLimitMiddleware:
                     )
                     await response(scope, receive, send)
                     return
-            except (ValueError, TypeError):
+            except (ValueError, UnicodeDecodeError, TypeError):
                 response = JSONResponse(
                     status_code=400,
                     content=_ERROR_PAYLOADS[400],
@@ -685,25 +729,45 @@ def _register_exception_handlers(app: FastAPI) -> None:
         )
 
 
+def _lookup_db_api_key(db_path: Any, provided_hash: str) -> tuple[str | None, int]:
+    """Recherche la clé API en base SQLite à coût comparable et sans oracle temporel."""
+    if not (isinstance(db_path, Path) and db_path.is_file()):
+        return None, 0
+    matching_project: str | None = None
+    evaluated = 0
+    try:
+        with db_session(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT project_id, key_hash, revoked_at FROM api_keys"
+            )
+            for row in cursor.fetchall():
+                evaluated += 1
+                if hmac.compare_digest(provided_hash, row["key_hash"]):
+                    if not row["revoked_at"]:
+                        matching_project = row["project_id"]
+    except Exception as exc:
+        logger.debug("Échec consultation clé API SQLite : %s", exc.__class__.__name__)
+    return matching_project, evaluated
+
+
 def verify_api_key(
     request: Request,
     api_key: Annotated[str | None, Depends(project_api_key_header)] = None,
 ) -> str | None:
     """Vérifie l'en-tête X-Heimdall-API-Key en temps constant (ticket #64).
 
-    - Rejette toute clé absente si settings.require_auth=True (HTTP 401).
-    - Si une clé est fournie :
-      - Rejette toute clé vide ou invalide (HTTP 401).
-      - Recherche le projet associé en mémoire puis en base SQLite avec
-        comparaison en temps constant hmac.compare_digest.
-      - Retourne l'identifiant du projet autorisé.
-    - Si aucune clé n'est fournie et settings.require_auth=False :
-      - Retourne None (mode de compatibilité descendante du squelette #63).
+    Conformité openapi.yaml:19-20, 197-204 :
+    - fail-closed : authentification active par défaut (`require_auth=True`).
+    - rejet en 401 sans normalisation si la clé comporte des espaces de début/fin.
+    - hachage HMAC-SHA256 avec pepper serveur distinct de la KEK.
+    - comparaison constante via `hmac.compare_digest` sur empreintes de même longueur.
+    - chemin de vérification de coût comparable (aucun break précoce, comparaison factice).
+    - si `settings.require_auth=False` et aucune clé fournie, retourne None (test mode).
     """
     settings: VaultSettings = getattr(
         request.app.state,
         "settings",
-        VaultSettings(require_auth=False),
+        VaultSettings(require_auth=True),
     )
     if api_key is None:
         if settings.require_auth:
@@ -713,35 +777,34 @@ def verify_api_key(
             )
         return None
 
-    cleaned_key = api_key.strip()
-    if not cleaned_key:
+    if api_key != api_key.strip() or not api_key:
         raise StarletteHTTPException(
             status_code=401,
             detail="Authentification requise",
         )
 
-    provided_hash = hash_api_key(cleaned_key)
+    pepper = getattr(settings, "api_key_pepper", None)
+    provided_hash = hash_api_key(api_key, pepper=pepper)
     registered_keys: dict[str, str] = getattr(request.app.state, "api_keys", {})
     matching_project: str | None = None
+    evaluated_count = 0
 
+    # Parcours complet sans break précoce pour éviter tout oracle d'index
     for reg_hash, proj_id in registered_keys.items():
+        evaluated_count += 1
         if hmac.compare_digest(provided_hash, reg_hash):
             matching_project = proj_id
-            break
 
-    if matching_project is None and hasattr(request.app.state, "db_path"):
-        db_path = request.app.state.db_path
-        if isinstance(db_path, Path) and db_path.is_file():
-            try:
-                with db_session(db_path) as conn:
-                    row = get_api_key_by_hash(conn, provided_hash)
-                    if row and not row.get("revoked_at"):
-                        matching_project = row["project_id"]
-            except Exception as exc:
-                logger.debug(
-                    "Échec consultation clé API SQLite : %s",
-                    exc.__class__.__name__,
-                )
+    # Consultation base de données SQLite si configurée, à coût comparable
+    if hasattr(request.app.state, "db_path"):
+        db_match, db_eval = _lookup_db_api_key(request.app.state.db_path, provided_hash)
+        evaluated_count += db_eval
+        if db_match is not None:
+            matching_project = db_match
+
+    # Coût comparable : comparaison factice si aucune clé n'a été évaluée
+    if evaluated_count == 0:
+        hmac.compare_digest(provided_hash, _DUMMY_HASH)
 
     if matching_project is None:
         raise StarletteHTTPException(
@@ -782,6 +845,14 @@ def _register_routes(app: FastAPI) -> None:
         authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretMetadata:
         """Créer un secret vaulté (ticket #63)."""
+        settings: VaultSettings = getattr(
+            app.state, "settings", VaultSettings(require_auth=True)
+        )
+        if settings.require_auth and authenticated_project is None:
+            raise StarletteHTTPException(
+                status_code=401,
+                detail="Authentification requise",
+            )
         if (
             authenticated_project is not None
             and authenticated_project != secret_in.project
@@ -843,6 +914,14 @@ def _register_routes(app: FastAPI) -> None:
         authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretRead:
         """Lire la valeur courante d'un secret (ticket #63)."""
+        settings: VaultSettings = getattr(
+            app.state, "settings", VaultSettings(require_auth=True)
+        )
+        if settings.require_auth and authenticated_project is None:
+            raise StarletteHTTPException(
+                status_code=401,
+                detail="Authentification requise",
+            )
         if (
             authenticated_project is not None
             and authenticated_project != project
@@ -871,9 +950,19 @@ def _register_routes(app: FastAPI) -> None:
 def create_app(
     settings: VaultSettings | None = None,
     secret_store: InMemorySecretStore | None = None,
+    api_key_hashes: dict[str, str] | None = None,
     api_keys: dict[str, str] | None = None,
 ) -> FastAPI:
-    """Fabrique et configure l'application FastAPI pour le serveur Vault."""
+    """Fabrique et configure l'application FastAPI pour le serveur Vault.
+
+    Paramètres :
+    - `settings` : Configuration VaultSettings (défaut : get_settings()).
+    - `secret_store` : Magasin de secrets mémoire ou chiffré (défaut : InMemorySecretStore()).
+    - `api_key_hashes` : Dictionnaire {hash_hmac_hex: project_id} de clés pré-hachées.
+      Chaque clé DOIT être une chaîne hexadécimale de 64 caractères (^[0-9a-f]{64}$).
+      Les clés brutes sont expressément refusées pour éviter toute confusion de format.
+    - `api_keys` : Alias de `api_key_hashes` pour compatibilité descendante.
+    """
     effective_settings = settings if settings is not None else get_settings()
 
     docs_url = "/docs" if effective_settings.enable_docs else None
@@ -893,10 +982,26 @@ def create_app(
     app.state.secret_store = (
         secret_store if secret_store is not None else InMemorySecretStore()
     )
-    app.state.api_keys = dict(api_keys) if api_keys is not None else {}
+
+    raw_hashes = api_key_hashes if api_key_hashes is not None else api_keys
+    validated_hashes: dict[str, str] = {}
+    if raw_hashes is not None:
+        for key_candidate, project_id in raw_hashes.items():
+            if not isinstance(key_candidate, str) or not _HASH_PATTERN.match(key_candidate):
+                raise ValueError(
+                    f"Format d'empreinte de clé API invalide : '{key_candidate}'. "
+                    "api_key_hashes attend uniquement des empreintes hexadécimales de 64 "
+                    "caractères (^[0-9a-f]{64}$). Pour enregistrer une clé brute, utilisez "
+                    "app.state.register_api_key(raw_key, project_id)."
+                )
+            validated_hashes[key_candidate] = project_id
+    app.state.api_keys = validated_hashes
 
     def register_api_key(raw_key: str, project_id: str) -> None:
-        key_hash = hash_api_key(raw_key)
+        """Enregistre une clé API brute en calculant son HMAC-SHA256 avec le pepper serveur."""
+        if not raw_key or raw_key != raw_key.strip():
+            raise ValueError("La clé API brute ne peut pas être vide ou comporter d'espaces.")
+        key_hash = hash_api_key(raw_key, pepper=effective_settings.api_key_pepper)
         app.state.api_keys[key_hash] = project_id
 
     app.state.register_api_key = register_api_key
