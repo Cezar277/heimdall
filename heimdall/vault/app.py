@@ -37,11 +37,11 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   - Exception non gérée -> 500 {"code": "internal_error", "message": "Erreur interne"}.
 """
 
+import asyncio
 import ipaddress
 import logging
 import os
 import re
-import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -185,6 +185,9 @@ SecretName = Annotated[
         pattern=NAME_PATTERN,
     ),
 ]
+# NOTE DE SÉCURITÉ : Ne jamais journaliser SecretValue (valeur sensible brute pouvant
+# contenir des caractères de contrôle ou retours chariot multilignes : risque de log
+# injection et de fuite en clair).
 SecretValue = Annotated[
     str,
     StringConstraints(
@@ -207,7 +210,10 @@ class SecretCreate(BaseModel):
     @field_validator("value")
     @classmethod
     def validate_value_no_null(cls, v: str) -> str:
-        """Refuse les octets NUL dans la valeur du secret (défense en profondeur)."""
+        """Refuse les octets NUL dans la valeur du secret (défense en profondeur).
+
+        Ne jamais journaliser cette valeur en cas d'erreur (anti-fuite de secret).
+        """
         if "\x00" in v:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         return v
@@ -245,18 +251,18 @@ class InMemorySecretStore:
 
     def __init__(self) -> None:
         self._secrets: dict[tuple[str, str, str], dict[str, str]] = {}
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
 
-    def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
-        with self._lock:
+    async def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
+        async with self._lock:
             record = self._secrets.get((project, env, name))
             if record is None:
                 return None
             return dict(record)
 
-    def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
+    async def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         key = (project, env, name)
-        with self._lock:
+        async with self._lock:
             if key in self._secrets:
                 raise KeyError("Secret déjà existant")
             record = {
@@ -269,8 +275,8 @@ class InMemorySecretStore:
             self._secrets[key] = record
             return dict(record)
 
-    def clear(self) -> None:
-        with self._lock:
+    async def clear(self) -> None:
+        async with self._lock:
             self._secrets.clear()
 
 
@@ -631,7 +637,7 @@ def _register_routes(app: FastAPI) -> None:
         response.headers["Cache-Control"] = "no-store"
         store: InMemorySecretStore = app.state.secret_store
         try:
-            record = store.create(
+            record = await store.create(
                 project=secret_in.project,
                 env=secret_in.env,
                 name=secret_in.name,
@@ -676,7 +682,7 @@ def _register_routes(app: FastAPI) -> None:
         """Lire la valeur courante d'un secret (ticket #63)."""
         response.headers["Cache-Control"] = "no-store"
         store: InMemorySecretStore = app.state.secret_store
-        record = store.get(project=project, env=env, name=name)
+        record = await store.get(project=project, env=env, name=name)
         if record is None:
             raise StarletteHTTPException(
                 status_code=404,

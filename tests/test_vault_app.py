@@ -47,7 +47,7 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         if hasattr(app.state, "secret_store"):
-            app.state.secret_store.clear()
+            await app.state.secret_store.clear()
         self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
         self.client = AsyncClient(transport=self.transport, base_url="http://127.0.0.1:8443")
 
@@ -565,7 +565,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         if hasattr(app.state, "secret_store"):
-            app.state.secret_store.clear()
+            await app.state.secret_store.clear()
         self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
         self.client = AsyncClient(transport=self.transport, base_url="http://127.0.0.1:8443")
 
@@ -1036,17 +1036,17 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("%2e", res.text.lower())
                 self.assertNotIn("%2f", res.text.lower())
 
-    def test_in_memory_secret_store_mutation_defensive_copy(self) -> None:
+    async def test_in_memory_secret_store_mutation_defensive_copy(self) -> None:
         """La mutation d'un dict retourné par store.get() ne corrompt pas le store."""
         store = InMemorySecretStore()
-        store.create(project="demo", env="dev", name="SAFE_KEY", value="original_value")
-        record = store.get(project="demo", env="dev", name="SAFE_KEY")
+        await store.create(project="demo", env="dev", name="SAFE_KEY", value="original_value")
+        record = await store.get(project="demo", env="dev", name="SAFE_KEY")
         self.assertIsNotNone(record)
         assert record is not None
         record["value"] = "tampered_value"
         record["status"] = "corrupted"
 
-        re_fetched = store.get(project="demo", env="dev", name="SAFE_KEY")
+        re_fetched = await store.get(project="demo", env="dev", name="SAFE_KEY")
         self.assertIsNotNone(re_fetched)
         assert re_fetched is not None
         self.assertEqual(re_fetched["value"], "original_value")
