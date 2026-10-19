@@ -158,6 +158,11 @@ class SqliteSecretStore:
     ``foreign_keys=ON``). Les écritures sont sérialisées par un verrou asyncio
     local et par la contrainte UNIQUE SQLite ; un second worker obtient donc un
     409 sur un doublon, même après redémarrage.
+
+    L'empreinte d'intégrité persistée utilise la sous-clé HKDF dédiée et le
+    triplet ``(project, env, name)`` fournis par ``VaultCipher`` : jamais la KEK
+    directement (invariant 5) et non corrélable entre triplets. Le mode
+    ``:memory:`` est refusé fail-closed (base éphémère par connexion).
     """
 
     def __init__(
@@ -167,9 +172,15 @@ class SqliteSecretStore:
         max_secrets: int = _DEFAULT_MAX_SECRETS,
         max_secrets_per_project: int = _DEFAULT_MAX_SECRETS_PER_PROJECT,
     ) -> None:
-        self._db_path: Path | str = (
-            Path(db_path) if isinstance(db_path, str) and db_path != ":memory:" else db_path
-        )
+        if str(db_path).strip() == ":memory:":
+            # Fail-closed : chaque connexion ouvrirait une base éphémère isolée
+            # et sans schéma (`no such table` différé, écritures perdues).
+            raise ValueError(
+                "Le mode ':memory:' est interdit pour SqliteSecretStore : base "
+                "éphémère isolée par connexion (fail-closed). Fournir un fichier "
+                "SQLite persistant."
+            )
+        self._db_path: Path | str = Path(db_path) if isinstance(db_path, str) else db_path
         self._cipher = cipher
         self._max_secrets = max_secrets
         self._max_secrets_per_project = max_secrets_per_project
@@ -204,7 +215,7 @@ class SqliteSecretStore:
                     )
                 ensure_project(conn, project)
                 encrypted_value = self._cipher.encrypt(value.encode("utf-8"), aad=aad)
-                fingerprint = self._cipher.fingerprint(value.encode("utf-8"))
+                fingerprint = self._cipher.fingerprint(value.encode("utf-8"), aad=aad)
                 try:
                     create_secret(
                         conn,

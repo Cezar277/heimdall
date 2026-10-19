@@ -26,7 +26,8 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   fail-closed HTTP 403 du middleware loopback est une défense en profondeur au niveau transport
   (socket/peer), volontairement maintenue hors du contrat OpenAPI applicatif (route publique). Seul
   /api/v1/health est exposé (aucun alias racine non contractuel).
-- Allowlist sur les en-têtes d'exception : seuls Allow et Retry-After (1-3600) sont retransmis.
+- Allowlist sur les en-têtes d'exception : seuls Allow, Retry-After (1-3600) et
+  Connection: close sont retransmis (fermeture anti-smuggling des rejets 400).
 - Confinement crypto (ticket #17) : ce module n'importe JAMAIS cryptography ou
   argon2 (réservés exclusivement à heimdall/vault/crypto.py) et délègue la
   génération/hachage des clés API à `heimdall.vault.crypto`.
@@ -196,9 +197,11 @@ project_api_key_header = APIKeyHeader(
 _DUMMY_HASH: str = "0" * 64
 _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 # Politique #64 : une clé opérateur doit offrir une entropie comparable aux clés
-# émises par `generate_api_key` (43 caractères). Le seuil de 32 caractères laisse
-# une marge pour d'autres encodages 256 bits, tout en refusant les clés triviales.
-_MIN_API_KEY_LENGTH: int = 32
+# émises par `generate_api_key` (``secrets.token_urlsafe(32)`` → 43 caractères,
+# 256 bits). Le seuil de 43 caractères aligne l'enregistrement manuel sur la
+# génération : une clé de 32 caractères triviale (« a » * 32) est refusée même si
+# l'opérateur la juge longue.
+_MIN_API_KEY_LENGTH: int = 43
 
 # Valeur publique de développement héritée : refusée hors tests explicites pour
 # empêcher tout déploiement partagé avec un pepper commité dans le dépôt.
@@ -692,8 +695,24 @@ def _pin_db_path(settings: VaultSettings) -> Path:
     return Path(os.path.normpath(str(resolved)))
 
 
-class _PayloadTooLargeError(Exception):
-    """Exception interne levée dès que le flux reçu dépasse la limite de 1 Mio."""
+class _PayloadTooLargeError(StarletteHTTPException):
+    """Flux reçu dépassant la limite : rejet 400 fermant la connexion.
+
+    Sous-classe de ``StarletteHTTPException`` car FastAPI convertit toute
+    exception non-HTTP levée pendant la lecture du corps en
+    ``HTTPException(400, "There was an error parsing the body")`` : ce type
+    traverse cette conversion sans être ré-emballé, et le handler contractuel
+    (``router_error_handler``) conserve alors l'en-tête ``Connection: close``
+    (allowlist). Le middleware ``BodySizeLimitMiddleware`` intercepte aussi ce
+    type pour les applications internes qui ne passent pas par FastAPI.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=400,
+            detail="Requête invalide",
+            headers={"Connection": "close"},
+        )
 
 
 class BodySizeLimitMiddleware:
@@ -702,11 +721,24 @@ class BodySizeLimitMiddleware:
     Conforme à openapi.yaml:33-37 : compte le flux effectivement reçu, même sans
     Content-Length ou en transfert segmenté, et interrompt la lecture dès dépassement
     sans accumulation en mémoire (protection anti-OOM).
+
+    Chaque rejet 400 porte ``Connection: close`` : les octets non consommés du
+    corps resteraient sinon dans le tampon d'une connexion keep-alive et
+    pourraient désynchroniser la requête suivante (anti-smuggling, RFC 9112).
     """
 
     def __init__(self, app: Any, max_body_size: int = _MAX_BODY_SIZE) -> None:
         self.app = app
         self.max_body_size = max_body_size
+
+    @staticmethod
+    def _reject() -> JSONResponse:
+        """Réponse 400 contractuelle fermant la connexion (octets non drainés)."""
+        return JSONResponse(
+            status_code=400,
+            content=_ERROR_PAYLOADS[400],
+            headers={"Connection": "close"},
+        )
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -722,19 +754,11 @@ class BodySizeLimitMiddleware:
         # Rejet HTTP smuggling : coexistence de Transfer-Encoding et Content-Length
         # interdite (RFC 9112 §4.2)
         if has_transfer_encoding and content_lengths:
-            response = JSONResponse(
-                status_code=400,
-                content=_ERROR_PAYLOADS[400],
-            )
-            await response(scope, receive, send)
+            await self._reject()(scope, receive, send)
             return
 
         if len(content_lengths) > 1:
-            response = JSONResponse(
-                status_code=400,
-                content=_ERROR_PAYLOADS[400],
-            )
-            await response(scope, receive, send)
+            await self._reject()(scope, receive, send)
             return
 
         if content_lengths:
@@ -746,18 +770,10 @@ class BodySizeLimitMiddleware:
                     raise ValueError("Content-Length non décimal ou contenant des espaces")
                 parsed_len = int(val_str)
                 if parsed_len < 0 or parsed_len > self.max_body_size:
-                    response = JSONResponse(
-                        status_code=400,
-                        content=_ERROR_PAYLOADS[400],
-                    )
-                    await response(scope, receive, send)
+                    await self._reject()(scope, receive, send)
                     return
             except (ValueError, UnicodeDecodeError, TypeError):
-                response = JSONResponse(
-                    status_code=400,
-                    content=_ERROR_PAYLOADS[400],
-                )
-                await response(scope, receive, send)
+                await self._reject()(scope, receive, send)
                 return
 
         total_bytes = 0
@@ -775,11 +791,7 @@ class BodySizeLimitMiddleware:
         try:
             await self.app(scope, limited_receive, send)
         except _PayloadTooLargeError:
-            response = JSONResponse(
-                status_code=400,
-                content=_ERROR_PAYLOADS[400],
-            )
-            await response(scope, receive, send)
+            await self._reject()(scope, receive, send)
 
 
 def _register_middleware(app: FastAPI) -> None:
@@ -802,7 +814,10 @@ def _register_middleware(app: FastAPI) -> None:
 
         Les 400/401 sont comptés par le bucket pair/global puisque le middleware
         s'exécute avant le routage et les dépendances. Une clé invalide ne crée
-        aucun bucket arbitraire : seuls pair et global s'appliquent.
+        aucun bucket arbitraire : seuls pair et global s'appliquent. Le choix du
+        bucket par clé emprunte le même parcours à coût comparable que
+        ``verify_api_key`` (``_find_api_key_project``) : l'existence d'une clé
+        n'est pas observable par le temps de réponse du middleware.
         """
         settings: VaultSettings = request.app.state.settings
         peer = request.client.host if request.client and request.client.host else "unknown"
@@ -816,10 +831,10 @@ def _register_middleware(app: FastAPI) -> None:
                 )
             except ValueError:
                 candidate_hash = None
-            if candidate_hash is not None and _is_registered_key_hash(
-                request.app, candidate_hash
-            ):
-                key_hash = candidate_hash
+            if candidate_hash is not None:
+                registered_project, _ = _find_api_key_project(request.app, candidate_hash)
+                if registered_project is not None:
+                    key_hash = candidate_hash
 
         allowed, retry_after = request.app.state.rate_limiter.check(peer, key_hash)
         if not allowed:
@@ -893,6 +908,11 @@ def _register_exception_handlers(app: FastAPI) -> None:
                             filtered_headers["Retry-After"] = str(retry_sec)
                     except (ValueError, TypeError):
                         pass
+                elif lower_key == "connection":
+                    # Seule la fermeture de connexion est admise (anti-smuggling,
+                    # rejets du middleware de taille) ; jamais d'autre directive.
+                    if str(val).strip().lower() == "close":
+                        filtered_headers["Connection"] = "close"
         headers = filtered_headers or None
         return JSONResponse(
             status_code=status_code,
@@ -930,28 +950,30 @@ def _lookup_db_api_key(db_path: Any, provided_hash: str) -> tuple[str | None, in
     return matching_project, evaluated
 
 
-def _is_registered_key_hash(app: FastAPI, candidate_hash: str) -> bool:
-    """Indique si une empreinte correspond à une clé connue (mémoire ou SQLite).
+def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None, int]:
+    """Recherche le projet d'une empreinte de clé API à coût comparable.
 
-    Le bucket par clé ne doit exister que pour une clé validée/révoquée connue :
-    une valeur d'en-tête arbitraire ne doit pas permettre de créer un bucket
-    illimité. La clé brute n'est jamais conservée.
+    Parcours complet des empreintes en mémoire puis en base SQLite, sans ``break``
+    précoce et avec ``hmac.compare_digest`` pour chaque candidat : le coût est le
+    même que l'empreinte soit connue, inconnue ou révoquée. Ce parcours est
+    partagé par l'authentification (``verify_api_key``) et par le choix du bucket
+    de débit (ticket #65) : l'existence d'une clé n'est pas observable par le
+    temps de réponse du middleware.
+
+    Retourne ``(project_id ou None, nombre d'empreintes évaluées)``.
     """
-    registered: dict[str, str] = getattr(app.state, "api_keys", {})
-    if candidate_hash in registered:
-        return True
-    db_path = getattr(app.state, "db_path", None)
-    if not (isinstance(db_path, Path) and db_path.is_file()):
-        return False
-    try:
-        # Requête indexée : ce chemin ne sert qu'à choisir un bucket de débit,
-        # pas à authentifier. L'authentification garde son parcours à coût
-        # comparable dans `verify_api_key`.
-        with db_session(db_path) as conn:
-            row = get_api_key_by_hash(conn, candidate_hash)
-    except Exception:
-        return False
-    return bool(row is not None and not row["revoked_at"])
+    matching_project: str | None = None
+    evaluated = 0
+    registered_keys: dict[str, str] = getattr(app.state, "api_keys", {})
+    for reg_hash, proj_id in registered_keys.items():
+        evaluated += 1
+        if hmac.compare_digest(provided_hash, reg_hash):
+            matching_project = proj_id
+    db_match, db_eval = _lookup_db_api_key(getattr(app.state, "db_path", None), provided_hash)
+    evaluated += db_eval
+    if db_match is not None:
+        matching_project = db_match
+    return matching_project, evaluated
 
 
 def verify_api_key(
@@ -965,7 +987,8 @@ def verify_api_key(
     - rejet en 401 sans normalisation si la clé comporte des espaces de début/fin.
     - hachage HMAC-SHA256 avec pepper serveur distinct de la KEK.
     - comparaison constante via `hmac.compare_digest` sur empreintes de même longueur.
-    - chemin de vérification de coût comparable (aucun break précoce, comparaison factice).
+    - chemin de vérification de coût comparable (aucun break précoce, comparaison factice),
+      identique à celui du choix de bucket de débit (`_find_api_key_project`).
     - si `settings.require_auth=False` et aucune clé fournie, retourne None (test mode).
     """
     settings: VaultSettings | None = getattr(request.app.state, "settings", None)
@@ -986,22 +1009,7 @@ def verify_api_key(
         )
 
     provided_hash = hash_api_key(api_key, pepper=settings.effective_api_key_pepper)
-    registered_keys: dict[str, str] = getattr(request.app.state, "api_keys", {})
-    matching_project: str | None = None
-    evaluated_count = 0
-
-    # Parcours complet sans break précoce pour éviter tout oracle d'index
-    for reg_hash, proj_id in registered_keys.items():
-        evaluated_count += 1
-        if hmac.compare_digest(provided_hash, reg_hash):
-            matching_project = proj_id
-
-    # Consultation base de données SQLite si configurée, à coût comparable
-    if hasattr(request.app.state, "db_path"):
-        db_match, db_eval = _lookup_db_api_key(request.app.state.db_path, provided_hash)
-        evaluated_count += db_eval
-        if db_match is not None:
-            matching_project = db_match
+    matching_project, evaluated_count = _find_api_key_project(request.app, provided_hash)
 
     # Coût comparable : comparaison factice si aucune clé n'a été évaluée
     if evaluated_count == 0:

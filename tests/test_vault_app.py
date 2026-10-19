@@ -15,12 +15,16 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from unittest.mock import patch
 
+import uvicorn  # type: ignore[import-untyped]
 import yaml  # type: ignore[import-untyped]
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
@@ -46,8 +50,9 @@ from heimdall.vault.app import (
     hash_api_key,
     run_server,
 )
-from heimdall.vault.crypto import generate_encryption_key
+from heimdall.vault.crypto import VaultCipher, generate_encryption_key
 from heimdall.vault.database import db_session
+from heimdall.vault.store import SqliteSecretStore
 
 
 class VaultAppTests(unittest.IsolatedAsyncioTestCase):
@@ -235,7 +240,7 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("Secret crash detail", resp.text)
 
     async def test_exception_headers_allowlist_filtering(self) -> None:
-        """Seuls Allow et Retry-After (1-3600) sont retransmis, les autres sont filtrés."""
+        """Seuls Allow, Retry-After (1-3600) et Connection: close sont retransmis."""
         test_app = create_app()
 
         @test_app.get("/trigger-headers")
@@ -255,6 +260,17 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
                 headers={"Retry-After": val},  # Hors borne 1-3600 (ex: 9999, 0, -5)
             )
 
+        @test_app.get("/trigger-connection-close")
+        async def trigger_connection_close() -> None:
+            raise HTTPException(status_code=503, headers={"Connection": "close"})
+
+        @test_app.get("/trigger-connection-injected")
+        async def trigger_connection_injected() -> None:
+            raise HTTPException(
+                status_code=503,
+                headers={"Connection": "keep-alive, X-Injected: 1"},
+            )
+
         async with AsyncClient(
             transport=ASGITransport(app=test_app, client=("127.0.0.1", 54321)),
             base_url="http://127.0.0.1:8443",
@@ -268,6 +284,12 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
                     resp_bad = await c.get(f"/trigger-bad-retry/{bad_retry_val}")
                     self.assertEqual(resp_bad.status_code, 429)
                     self.assertNotIn("retry-after", resp_bad.headers)
+
+            # Connection: close admis tel quel ; toute autre valeur reste filtrée.
+            resp_close = await c.get("/trigger-connection-close")
+            self.assertEqual(resp_close.headers.get("connection"), "close")
+            resp_injected = await c.get("/trigger-connection-injected")
+            self.assertNotIn("connection", resp_injected.headers)
 
     async def test_exception_headers_retry_after_non_integer_types(self) -> None:
         """Garde-fou : un Retry-After non convertible (None, liste, etc.) ne lève pas 500."""
@@ -1395,6 +1417,126 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("TODO(#62)", doc)
         self.assertIn("quota", doc)
 
+    async def test_body_size_limit_rejections_close_connection(self) -> None:
+        """Tout rejet du middleware de taille porte Connection: close (keep-alive sûr).
+
+        Les octets non consommés resteraient sinon dans le tampon de la connexion
+        réutilisée (risque de désynchronisation/smuggling, RFC 9112). La requête
+        suivante est servie normalement, preuve d'absence d'état corrompu.
+        """
+        oversized = b"x" * 1_048_577
+        res_oversized = await self.client.post(
+            "/api/v1/secrets",
+            content=oversized,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(res_oversized.status_code, 400)
+        self.assertEqual(res_oversized.headers.get("connection"), "close")
+        self.assertEqual(
+            res_oversized.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+
+        async def chunk_generator() -> AsyncGenerator[bytes, None]:
+            yield b"x" * 600_000
+            yield b"x" * 600_000
+
+        res_chunked = await self.client.post(
+            "/api/v1/secrets",
+            content=chunk_generator(),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(res_chunked.status_code, 400)
+        self.assertEqual(res_chunked.headers.get("connection"), "close")
+
+        # Transfer-Encoding + Content-Length simultanés (anti-smuggling).
+        res_smuggle = await self.client.post(
+            "/api/v1/secrets",
+            content=b"{}",
+            headers=[
+                ("Content-Type", "application/json"),
+                ("Transfer-Encoding", "chunked"),
+                ("Content-Length", "2"),
+            ],
+        )
+        self.assertEqual(res_smuggle.status_code, 400)
+        self.assertEqual(res_smuggle.headers.get("connection"), "close")
+
+        # Content-Length dupliqué (anti-smuggling).
+        res_duplicated = await self.client.post(
+            "/api/v1/secrets",
+            content=b"{}",
+            headers=[
+                ("Content-Type", "application/json"),
+                ("Content-Length", "2"),
+                ("Content-Length", "2"),
+            ],
+        )
+        self.assertEqual(res_duplicated.status_code, 400)
+        self.assertEqual(res_duplicated.headers.get("connection"), "close")
+
+        # Requête suivante : toujours servie correctement.
+        follow_up = await self.client.get("/api/v1/health")
+        self.assertEqual(follow_up.status_code, 200)
+
+    async def test_sqlite_secret_store_refuses_memory_mode(self) -> None:
+        """:memory: est refusé fail-closed par le store SQLite (base éphémère silencieuse)."""
+        cipher = VaultCipher(b"k" * 32)
+        for memory_path in (":memory:", "  :memory:  ", Path(":memory:")):
+            with self.subTest(db_path=memory_path):
+                with self.assertRaises(ValueError) as ctx:
+                    SqliteSecretStore(memory_path, cipher)
+                self.assertIn(":memory:", str(ctx.exception))
+
+    def test_cipher_fingerprint_uses_dedicated_subkey_bound_to_triplet(self) -> None:
+        """L'empreinte n'utilise jamais la KEK comme clé HMAC et lie le triplet.
+
+        Invariant 5 : clé HMAC distincte de la clé maîtresse. Deux valeurs
+        identiques sous des triplets distincts produisent des empreintes
+        distinctes, non corrélables depuis la seule base.
+        """
+        cipher = VaultCipher(b"K" * 32)
+        other_cipher = VaultCipher(b"L" * 32)
+        aad_one = VaultCipher.aad("demo", "dev", "SECRET_ONE")
+        aad_two = VaultCipher.aad("demo", "dev", "SECRET_TWO")
+        plaintext = b"same-secret-value"
+
+        fp_one = cipher.fingerprint(plaintext, aad=aad_one)
+        fp_two = cipher.fingerprint(plaintext, aad=aad_two)
+        self.assertEqual(len(fp_one), 64)
+        self.assertNotEqual(fp_one, fp_two)
+
+        # Déterministe pour un même (KEK, triplet, valeur).
+        self.assertEqual(cipher.fingerprint(plaintext, aad=aad_one), fp_one)
+
+        # KEK distincte -> empreinte distincte.
+        self.assertNotEqual(other_cipher.fingerprint(plaintext, aad=aad_one), fp_one)
+
+        # La KEK utilisée directement en HMAC ne reproduit pas l'empreinte.
+        kek_direct_hmac = hmac.new(b"K" * 32, plaintext, hashlib.sha256).hexdigest()
+        self.assertNotEqual(fp_one, kek_direct_hmac)
+
+    async def test_sqlite_store_fingerprints_do_not_correlate_equal_values(self) -> None:
+        """Les empreintes persistées diffèrent pour une même valeur sur deux triplets."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            store = SqliteSecretStore(db_path, VaultCipher(b"F" * 32))
+            await store.create("demo", "dev", "SECRET_ONE", "shared-value")
+            await store.create("demo", "dev", "SECRET_TWO", "shared-value")
+            with db_session(db_path) as conn:
+                rows = conn.execute(
+                    "SELECT name, encrypted_value, fingerprint FROM secrets "
+                    "WHERE project_id = ? ORDER BY name",
+                    ("demo",),
+                ).fetchall()
+            self.assertEqual([row["name"] for row in rows], ["SECRET_ONE", "SECRET_TWO"])
+            fingerprints = {row["name"]: row["fingerprint"] for row in rows}
+            self.assertNotEqual(fingerprints["SECRET_ONE"], fingerprints["SECRET_TWO"])
+            # Ni la valeur en clair, ni un HMAC KEK direct ne sont persistés.
+            self.assertNotIn("shared-value", rows[0]["encrypted_value"])
+            kek_direct_hmac = hmac.new(b"F" * 32, b"shared-value", hashlib.sha256).hexdigest()
+            self.assertNotIn(kek_direct_hmac, set(fingerprints.values()))
+
 
     async def test_invalid_api_key_returns_401_unauthorized(self) -> None:
         """Une clé API invalide ou vide retourne 401 sans exposer d'oracle."""
@@ -1553,8 +1695,8 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(hash_api_key(key, pepper="test_pepper_value_123"), bare_sha)
 
     def test_hash_api_key_requires_an_explicit_pepper(self) -> None:
-        """Aucun pepper public par défaut : None/vide est refusé (pas de repli silencieux)."""
-        for bad_pepper in (None, "", "   ", b""):
+        """Aucun pepper public par défaut : None/vide/blanc est refusé (pas de repli silencieux)."""
+        for bad_pepper in (None, "", "   ", b"", b"   ", b"\t\n"):
             with self.subTest(pepper=bad_pepper):
                 with self.assertRaises(ValueError):
                     hash_api_key("any-key", pepper=bad_pepper)  # type: ignore[arg-type]
@@ -1671,9 +1813,14 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(test_app.state.api_keys), 1)
 
     def test_register_api_key_rejects_weak_caller_key(self) -> None:
-        """Politique #64 : une clé opérateur sous 32 caractères est refusée."""
+        """Politique #64 : une clé opérateur sous 43 caractères est refusée.
+
+        Le seuil aligne l'enregistrement manuel sur ``generate_api_key()``
+        (``secrets.token_urlsafe(32)`` → 43 caractères, 256 bits) : une clé de
+        32 caractères, même sans espace, reste trop faible et est refusée.
+        """
         test_app = create_app()
-        for weak_key in ("a", "short-key", " " * 32):
+        for weak_key in ("a", "short-key", " " * 32, "a" * 32, "a" * 42):
             with self.subTest(key=weak_key):
                 with self.assertRaises(ValueError):
                     test_app.state.register_api_key(weak_key, "demo")
@@ -1971,6 +2118,123 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             # Route GET /api/v1/health (publique, sans sécurité requise)
             health_op = schema["paths"]["/api/v1/health"]["get"]
             self.assertNotIn("security", health_op)
+
+
+class VaultSizedRejectionKeepAliveTests(unittest.TestCase):
+    """Preuve socket : un rejet 400 de taille ferme la connexion sans désynchroniser.
+
+    Complète les assertions ASGI : démarre un vrai serveur uvicorn sur la boucle
+    locale et vérifie au niveau HTTP/1.1 que la réponse porte ``Connection:
+    close``, que le serveur ferme effectivement la connexion (aucun octet de
+    corps non drainé réutilisable) et qu'une connexion neuve reste fonctionnelle.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = uvicorn.Server(
+            uvicorn.Config(
+                app=app,
+                host="127.0.0.1",
+                port=0,
+                log_level="error",
+                proxy_headers=False,
+                server_header=False,
+                date_header=False,
+            )
+        )
+        cls.thread = threading.Thread(target=cls.server.run, daemon=True)
+        cls.thread.start()
+        deadline = time.monotonic() + 15
+        while not cls.server.started:
+            if time.monotonic() > deadline:
+                raise RuntimeError("Serveur uvicorn de test non démarré à temps.")
+            time.sleep(0.05)
+        cls.port = cls.server.servers[0].sockets[0].getsockname()[1]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.should_exit = True
+        cls.thread.join(timeout=15)
+
+    @staticmethod
+    def _read_response(sock: socket.socket) -> bytes:
+        """Lit une réponse HTTP/1.1 complète (en-têtes + corps Content-Length)."""
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        headers, _, body = data.partition(b"\r\n\r\n")
+        content_length = 0
+        for line in headers.split(b"\r\n")[1:]:
+            if line.lower().startswith(b"content-length:"):
+                content_length = int(line.split(b":", 1)[1].strip())
+        while len(body) < content_length:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        return headers + b"\r\n\r\n" + body
+
+    def test_oversized_content_length_closes_connection(self) -> None:
+        """POST annoncé > 1 Mio : 400 + Connection: close, socket fermé, puis 200 sain."""
+        request_head = (
+            "POST /api/v1/secrets HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.port}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {2 * 1024 * 1024}\r\n"
+            "\r\n"
+        ).encode("ascii")
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            # Corps volontairement partiel : le rejet doit porter sur l'en-tête.
+            sock.sendall(request_head + b"x" * 128)
+            response = self._read_response(sock)
+            self.assertTrue(response.startswith(b"HTTP/1.1 400"), response[:64])
+            self.assertIn(b"connection: close", response.lower())
+            # Le serveur ferme la connexion : EOF, aucun octet résiduel réutilisable.
+            sock.settimeout(10)
+            self.assertEqual(sock.recv(65536), b"")
+
+        # Le serveur reste sain pour une connexion neuve.
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            sock.sendall(
+                (
+                    "GET /api/v1/health HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{self.port}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ).encode("ascii")
+            )
+            health = self._read_response(sock)
+            self.assertTrue(health.startswith(b"HTTP/1.1 200"), health[:64])
+            self.assertIn(b'"status":"ok"', health)
+
+    def test_streamed_oversized_body_closes_connection(self) -> None:
+        """POST chunked > 1 Mio : 400 + Connection: close, socket fermé, pas de désync.
+
+        Couvre le chemin ``_PayloadTooLargeError`` (lecture interrompue en plein
+        flux), converti par FastAPI en ``HTTPException`` : l'en-tête de fermeture
+        doit survivre à la conversion pour éviter tout octet résiduel.
+        """
+        chunk = b"x" * 600_000
+        chunked_body = b"%x\r\n" % len(chunk) + chunk + b"\r\n"
+        request_head = (
+            "POST /api/v1/secrets HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.port}\r\n"
+            "Content-Type: application/json\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+        ).encode("ascii")
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            # 2 x 600 000 octets > 1 Mio : le deuxième tronçon interrompt la lecture.
+            sock.sendall(request_head + chunked_body + chunked_body)
+            response = self._read_response(sock)
+            self.assertTrue(response.startswith(b"HTTP/1.1 400"), response[:64])
+            self.assertIn(b"connection: close", response.lower())
+            # Le serveur ferme la connexion : EOF, aucun octet résiduel réutilisable.
+            sock.settimeout(10)
+            self.assertEqual(sock.recv(65536), b"")
 
 
 if __name__ == "__main__":

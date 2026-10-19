@@ -82,12 +82,23 @@ est lié par AAD au triplet `(project, env, name)` ; la contrainte SQLite
 mémoire, réservé aux tests/développement, chiffre aussi son dictionnaire avec une
 KEK éphémère mais reste strictement mono-processus (`workers=1`). Aucune KEK
 éphémère n'est acceptée pour des données SQLite persistées : démarrage fail-closed.
+L'empreinte d'intégrité persistée (`fingerprint`) est calculée via une sous-clé
+HKDF-SHA256 dédiée (`info=b"heimdall-vault-fingerprint-v1"`) et liée au triplet :
+la KEK n'est jamais réutilisée directement comme clé HMAC (invariant 5) et un
+lecteur de la seule base ne peut pas corréler deux valeurs égales stockées sous
+des triplets distincts. Une rotation de KEK rend ces empreintes auxiliaires
+obsolètes — elles se recalculent après déchiffrement, aucun secret n'est perdu.
 
 Rate-limiting débit (#65) : fenêtres fixes par clé API validée, par pair réseau
 et globale. Les 400/401 consomment les buckets pair/global, une clé absente ou
 invalide ne crée pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
-Le quota de stockage (capacité du store) ne doit pas être présenté comme cette
-mitigation de débit : les deux mécanismes sont distincts et testés séparément.
+Le choix du bucket par clé (`_find_api_key_project`) emprunte le même parcours
+complet à coût comparable que `verify_api_key` (parcours exhaustif mémoire puis
+SQLite, sans `break` précoce) : l'existence d'une clé n'est pas observable par
+le temps de réponse du middleware. Le quota de stockage (capacité du store) ne
+doit pas être présenté comme cette mitigation de débit : les deux mécanismes
+sont distincts et testés séparément. Tout rejet 400 du middleware de taille
+répond `Connection: close` (aucun octet non drainé réutilisé en keep-alive).
 
 Cette règle porte sur les clés d'authentification du serveur ; le
 client doit conserver son credential dans un stockage local protégé pour

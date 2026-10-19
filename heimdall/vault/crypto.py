@@ -27,11 +27,19 @@ import hmac
 import secrets
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 _KEY_SIZE_BYTES: int = 32  # AES-256 / KEK 256 bits
 _NONCE_SIZE_BYTES: int = 12  # nonce AES-GCM 96 bits
 _TAG_SIZE_BYTES: int = 16
+
+# Label de domaine stable de la sous-clé d'empreinte (invariant 5 : la KEK de
+# chiffrement n'est jamais réutilisée directement comme clé HMAC). Changer ce
+# label rompt la vérification d'empreintes existantes ; c'est un dérivé
+# auxiliaire, jamais une donnée de référence (rotation documentée sur la classe).
+_FINGERPRINT_HKDF_INFO: bytes = b"heimdall-vault-fingerprint-v1"
 
 
 class VaultCipherError(ValueError):
@@ -59,8 +67,8 @@ def _normalize_pepper(pepper: str | bytes | None) -> bytes:
             raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
         return pepper.encode("utf-8")
     pepper_bytes = bytes(pepper)
-    if not pepper_bytes:
-        raise ValueError("Le pepper serveur ne peut pas être vide.")
+    if not pepper_bytes or not pepper_bytes.strip():
+        raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
     return pepper_bytes
 
 
@@ -95,6 +103,12 @@ class VaultCipher:
     - L'AAD lie le ciphertext au triplet ``(project, env, name)`` : un blob déplacé
       vers une autre identité échoue à l'authentification.
     - Les erreurs de déchiffrement sont génériques (aucun oracle sur la cause).
+    - L'empreinte d'intégrité (``fingerprint``) utilise une sous-clé HKDF-SHA256
+      dédiée et lie la valeur au triplet : la KEK n'est jamais réutilisée comme
+      clé HMAC (invariant 5) et deux valeurs égales sous des triplets distincts
+      ne sont pas corrélables par un lecteur de la seule base. L'empreinte est
+      auxiliaire : une rotation de KEK la rend obsolète (recalcul après
+      déchiffrement), jamais une perte de secret.
     """
 
     def __init__(self, key: bytes) -> None:
@@ -104,6 +118,12 @@ class VaultCipher:
             )
         self._key = bytes(key)
         self._aead = AESGCM(self._key)
+        self._fingerprint_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=_KEY_SIZE_BYTES,
+            salt=None,
+            info=_FINGERPRINT_HKDF_INFO,
+        ).derive(self._key)
 
     def __repr__(self) -> str:
         return "VaultCipher(<REDACTED>)"
@@ -174,9 +194,18 @@ class VaultCipher:
         except InvalidTag:
             raise VaultCipherError("Authentification de la donnée chiffrée échouée.") from None
 
-    def fingerprint(self, plaintext: bytes) -> str:
-        """Empreinte HMAC-SHA256 non réversible de la valeur (intégrité/corrélation)."""
-        return hmac.new(self._key, bytes(plaintext), hashlib.sha256).hexdigest()
+    def fingerprint(self, plaintext: bytes, *, aad: bytes = b"") -> str:
+        """Empreinte HMAC-SHA256 non réversible et liée au triplet d'identité.
+
+        Utilise la sous-clé HKDF dédiée (jamais la KEK, invariant 5) et intègre
+        l'AAD ``(project, env, name)`` au message : deux valeurs identiques
+        stockées sous des triplets distincts produisent des empreintes
+        distinctes, donc non corrélables depuis la seule base. Déterministe pour
+        un même ``(KEK, aad, valeur)`` ; auxiliaire, recalculable après une
+        rotation de KEK.
+        """
+        message = bytes(aad) + b"\x00" + bytes(plaintext)
+        return hmac.new(self._fingerprint_key, message, hashlib.sha256).hexdigest()
 
 
 def encrypt_at_rest(plaintext: bytes, key_id: str) -> bytes:
