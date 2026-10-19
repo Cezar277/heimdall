@@ -1057,6 +1057,44 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("workers=1", InMemorySecretStore.__doc__ or "")
         self.assertIn("workers=1", run_server.__doc__ or "")
 
+    async def test_in_memory_secret_store_saturation_quota_rejected(self) -> None:
+        """La saturation de la capacité maximale du store mémoire lève une erreur (anti-DoS)."""
+        bounded_store = InMemorySecretStore(max_secrets=2)
+        await bounded_store.create(project="demo", env="dev", name="KEY_ONE", value="val1")
+        await bounded_store.create(project="demo", env="dev", name="KEY_TWO", value="val2")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await bounded_store.create(project="demo", env="dev", name="KEY_THREE", value="val3")
+        self.assertIn("Capacité maximale", str(ctx.exception))
+
+    async def test_post_secret_capacity_exhaustion_returns_400(self) -> None:
+        """Le dépassement de capacité mémoire via l'API retourne 400 bad_request générique."""
+        bounded_store = InMemorySecretStore(max_secrets=1)
+        test_app = create_app(secret_store=bounded_store)
+        transport = ASGITransport(app=test_app, client=("127.0.0.1", 54321))
+        async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8443") as client:
+            res1 = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "FIRST_KEY", "value": "val1"},
+            )
+            self.assertEqual(res1.status_code, 201)
+
+            res2 = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "OVERFLOW_KEY", "value": "val2"},
+            )
+            self.assertEqual(res2.status_code, 400)
+            self.assertEqual(
+                res2.json(),
+                {"code": "bad_request", "message": "Requête invalide"},
+            )
+
+    def test_in_memory_secret_store_documents_quota_todo_62(self) -> None:
+        """Le docstring de InMemorySecretStore documente le TODO(#62) de quota/pagination."""
+        doc = InMemorySecretStore.__doc__ or ""
+        self.assertIn("TODO(#62)", doc)
+        self.assertIn("quota", doc)
+
 
 if __name__ == "__main__":
     unittest.main()

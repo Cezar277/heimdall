@@ -235,6 +235,9 @@ class SecretRead(SecretMetadata):
     value: SecretValue
 
 
+_DEFAULT_MAX_SECRETS: int = 10_000
+
+
 class InMemorySecretStore:
     """Stockage mémoire des secrets pour le squelette fonctionnel (ticket #63).
 
@@ -244,14 +247,18 @@ class InMemorySecretStore:
     TODO(#26, #62) : Remplacer par le chiffrement au repos (AES-256-GCM / DEK) et
     la persistance SQLite avec contrainte d'unicité UNIQUE(project_id, env, name)
     et PRAGMA foreign_keys=ON.
+    TODO(#62) : Définir un quota/nombre max de secrets par projet et pagination lors
+    du branchement SQLite pour borner la croissance mémoire et disque (protection
+    anti-DoS par épuisement des ressources).
     Ce stockage en mémoire est strictement mono-processus (workers=1). Avec plusieurs
     workers (workers > 1), chaque worker détiendrait une instance mémoire indépendante
     et divergente sans garantie d'unicité inter-processus.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_secrets: int = _DEFAULT_MAX_SECRETS) -> None:
         self._secrets: dict[tuple[str, str, str], dict[str, str]] = {}
         self._lock = asyncio.Lock()
+        self._max_secrets = max_secrets
 
     async def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
         async with self._lock:
@@ -265,6 +272,8 @@ class InMemorySecretStore:
         async with self._lock:
             if key in self._secrets:
                 raise KeyError("Secret déjà existant")
+            if len(self._secrets) >= self._max_secrets:
+                raise RuntimeError("Capacité maximale du store mémoire atteinte (quota)")
             record = {
                 "project": project,
                 "env": env,
@@ -647,6 +656,11 @@ def _register_routes(app: FastAPI) -> None:
             raise StarletteHTTPException(
                 status_code=409,
                 detail="Secret déjà existant",
+            ) from None
+        except RuntimeError:
+            raise StarletteHTTPException(
+                status_code=400,
+                detail="Requête invalide",
             ) from None
         return SecretMetadata(
             project=record["project"],
