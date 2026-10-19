@@ -55,13 +55,19 @@ def build_corpus(destination: Path):
     """Matérialise les gabarits dans un dossier temporaire vide, sans les exécuter."""
     if destination.exists() and any(destination.iterdir()):
         raise ValueError("Le dossier du corpus doit être vide")
+    source_root = FIXTURES.resolve()
+    destination_root = destination.resolve()
     for template in sorted(FIXTURES.rglob("*.tmpl")):
+        if template.is_symlink() or not template.resolve().is_relative_to(source_root):
+            raise ValueError("Gabarit hors corpus ou lien symbolique interdit")
+        target = destination / template.relative_to(FIXTURES).with_suffix("")
+        if not target.resolve().is_relative_to(destination_root):
+            raise ValueError("Destination du gabarit hors corpus temporaire")
         content = template.read_text(encoding="utf-8")
         for key, value in _replacements().items():
             content = content.replace("{{" + key + "}}", value)
         if "{{" in content:
             raise ValueError("Marqueur de fixture non résolu")
-        target = destination / template.relative_to(FIXTURES).with_suffix("")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8", newline="\n")
 

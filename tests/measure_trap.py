@@ -5,12 +5,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-from support.trap_corpus import scan_corpus
-
 
 def main():
     """0: seuils atteints; 1: seuils non atteints; 2: mesure impossible."""
     try:
+        # L'import fait partie de la mesure : dépendance absente => code 2.
+        from support.trap_corpus import scan_corpus  # noqa: PLC0415
+
         with tempfile.TemporaryDirectory(prefix="heimdall-t21-") as directory:
             report = scan_corpus(Path(directory))
         result = int(report["core"]["precision"] < 0.9 or report["core"]["recall"] < 0.9)

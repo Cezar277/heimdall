@@ -2,6 +2,7 @@
 
 import ast
 import base64
+import builtins
 import json
 import re
 from pathlib import Path
@@ -116,6 +117,61 @@ def test_generation_refuses_to_overwrite_files(tmp_path):
     assert (tmp_path / "existing").read_text() == "keep"
 
 
+def test_generation_refuses_source_outside_fixture_root(tmp_path, monkeypatch):
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    outside = tmp_path / "outside.tmpl"
+    outside.write_text("PRIVATE_FIXTURE_DO_NOT_COPY")
+    monkeypatch.setattr("support.trap_corpus.FIXTURES", fixtures)
+    monkeypatch.setattr(Path, "rglob", lambda root, pattern: [fixtures / ".." / outside.name])
+    with pytest.raises(ValueError, match="Gabarit hors corpus"):
+        build_corpus(tmp_path / "generated")
+    assert not (tmp_path / "generated").exists()
+
+
+def _symlink_or_skip(link, target, *, directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Création de liens symboliques non autorisée sous Windows")
+        raise
+
+
+def test_generation_refuses_template_symlink(tmp_path, monkeypatch):
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("PRIVATE_FIXTURE_DO_NOT_COPY")
+    _symlink_or_skip(fixtures / "leak.py.tmpl", outside)
+    monkeypatch.setattr("support.trap_corpus.FIXTURES", fixtures)
+    with pytest.raises(ValueError, match="lien symbolique interdit"):
+        build_corpus(tmp_path / "generated")
+    assert not (tmp_path / "generated").exists()
+
+
+def test_generation_refuses_target_symlink_escape(tmp_path, monkeypatch):
+    fixtures = tmp_path / "fixtures"
+    (fixtures / "python").mkdir(parents=True)
+    template = fixtures / "python" / "sample.py.tmpl"
+    template.write_text("PUBLIC_FIXTURE")
+    destination = tmp_path / "generated"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    # Reproduit l'apparition d'un lien après le contrôle du dossier vide.
+    def templates(root, pattern):
+        _symlink_or_skip(destination / "python", outside, directory=True)
+        return [template]
+
+    monkeypatch.setattr("support.trap_corpus.FIXTURES", fixtures)
+    monkeypatch.setattr(Path, "rglob", templates)
+    with pytest.raises(ValueError, match="hors corpus temporaire"):
+        build_corpus(destination)
+    assert not list(outside.iterdir())
+
+
 @pytest.mark.xfail(
     raises=NotImplementedError, reason="Scanner T22 non livré; aucune métrique inventée"
 )
@@ -154,7 +210,7 @@ def test_generated_formats_and_obfuscations(tmp_path):
 )
 def test_measure_command_thresholds(monkeypatch, capsys, precision, recall, code):
     monkeypatch.setattr(
-        "measure_trap.scan_corpus",
+        "support.trap_corpus.scan_corpus",
         lambda path: {"core": {"precision": precision, "recall": recall}},
     )
     assert main() == code
@@ -165,9 +221,26 @@ def test_measure_command_reports_unavailable(monkeypatch, capsys):
     def unavailable(path):
         raise NotImplementedError
 
-    monkeypatch.setattr("measure_trap.scan_corpus", unavailable)
+    monkeypatch.setattr("support.trap_corpus.scan_corpus", unavailable)
     assert main() == 2
     assert "indisponibles" in capsys.readouterr().out
+
+
+def test_measure_command_import_error_returns_two(monkeypatch, capsys):
+    original_import = builtins.__import__
+
+    def unavailable(name, *args, **kwargs):
+        if name == "support.trap_corpus":
+            raise ImportError("PRIVATE_IMPORT_DO_NOT_PRINT")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", unavailable)
+    assert main() == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "erreur interne" in output.err
+    assert "PRIVATE_IMPORT_DO_NOT_PRINT" not in output.err
+    assert "Traceback" not in output.err
 
 
 @pytest.mark.parametrize("error", [ValueError, OSError, RuntimeError])
@@ -175,7 +248,7 @@ def test_measure_command_internal_errors_return_two(monkeypatch, capsys, error):
     def broken(path):
         raise error("PRIVATE_CANARY_DO_NOT_PRINT")
 
-    monkeypatch.setattr("measure_trap.scan_corpus", broken)
+    monkeypatch.setattr("support.trap_corpus.scan_corpus", broken)
     assert main() == 2
     output = capsys.readouterr()
     assert output.out == ""
