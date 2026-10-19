@@ -1,0 +1,308 @@
+[
+  {
+    "id": "python-aws",
+    "file": "python/samples.py",
+    "line": 1,
+    "leak": true,
+    "type": "aws",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "python-stripe",
+    "file": "python/samples.py",
+    "line": 2,
+    "leak": true,
+    "type": "stripe",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "python-jwt",
+    "file": "python/samples.py",
+    "line": 3,
+    "leak": true,
+    "type": "jwt",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "python-pat",
+    "file": "python/samples.py",
+    "line": 4,
+    "leak": true,
+    "type": "pat",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "python-pem",
+    "file": "python/samples.py",
+    "line": 5,
+    "leak": true,
+    "type": "pem",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "python-uuid",
+    "file": "python/samples.py",
+    "line": 6,
+    "leak": false,
+    "type": "uuid",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "python-sha256",
+    "file": "python/samples.py",
+    "line": 7,
+    "leak": false,
+    "type": "sha256",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "python-commit",
+    "file": "python/samples.py",
+    "line": 8,
+    "leak": false,
+    "type": "commit",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "python-integrity",
+    "file": "python/samples.py",
+    "line": 9,
+    "leak": false,
+    "type": "lockfile",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "python-example",
+    "file": "python/samples.py",
+    "line": 10,
+    "leak": false,
+    "type": "placeholder",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "python-password",
+    "file": "python/samples.py",
+    "line": 11,
+    "leak": false,
+    "type": "placeholder",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "python-api_key",
+    "file": "python/samples.py",
+    "line": 12,
+    "leak": false,
+    "type": "placeholder",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "python-image",
+    "file": "python/samples.py",
+    "line": 13,
+    "leak": false,
+    "type": "image",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "python-encoded",
+    "file": "python/samples.py",
+    "line": 14,
+    "leak": true,
+    "type": "stripe",
+    "group": "obfuscated",
+    "expected_status": "limite_connue"
+  },
+  {
+    "id": "python-concat",
+    "file": "python/samples.py",
+    "line": 15,
+    "leak": true,
+    "type": "stripe",
+    "group": "obfuscated",
+    "expected_status": "limite_connue"
+  },
+  {
+    "id": "python-reconstructed",
+    "file": "python/samples.py",
+    "line": 18,
+    "leak": true,
+    "type": "stripe",
+    "group": "obfuscated",
+    "expected_status": "limite_connue"
+  },
+  {
+    "id": "python-mock",
+    "file": "tests/mock_python.py",
+    "line": 1,
+    "leak": false,
+    "type": "mock",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "javascript-aws",
+    "file": "javascript/samples.js",
+    "line": 1,
+    "leak": true,
+    "type": "aws",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "javascript-stripe",
+    "file": "javascript/samples.js",
+    "line": 2,
+    "leak": true,
+    "type": "stripe",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "javascript-jwt",
+    "file": "javascript/samples.js",
+    "line": 3,
+    "leak": true,
+    "type": "jwt",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "javascript-pat",
+    "file": "javascript/samples.js",
+    "line": 4,
+    "leak": true,
+    "type": "pat",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "javascript-pem",
+    "file": "javascript/samples.js",
+    "line": 5,
+    "leak": true,
+    "type": "pem",
+    "group": "plain",
+    "expected_status": "detecte"
+  },
+  {
+    "id": "javascript-uuid",
+    "file": "javascript/samples.js",
+    "line": 6,
+    "leak": false,
+    "type": "uuid",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "javascript-sha256",
+    "file": "javascript/samples.js",
+    "line": 7,
+    "leak": false,
+    "type": "sha256",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "javascript-commit",
+    "file": "javascript/samples.js",
+    "line": 8,
+    "leak": false,
+    "type": "commit",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "javascript-integrity",
+    "file": "javascript/samples.js",
+    "line": 9,
+    "leak": false,
+    "type": "lockfile",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "javascript-example",
+    "file": "javascript/samples.js",
+    "line": 10,
+    "leak": false,
+    "type": "placeholder",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "javascript-password",
+    "file": "javascript/samples.js",
+    "line": 11,
+    "leak": false,
+    "type": "placeholder",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "javascript-api_key",
+    "file": "javascript/samples.js",
+    "line": 12,
+    "leak": false,
+    "type": "placeholder",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "javascript-image",
+    "file": "javascript/samples.js",
+    "line": 13,
+    "leak": false,
+    "type": "image",
+    "group": "negative",
+    "expected_status": "non_signale"
+  },
+  {
+    "id": "javascript-encoded",
+    "file": "javascript/samples.js",
+    "line": 14,
+    "leak": true,
+    "type": "stripe",
+    "group": "obfuscated",
+    "expected_status": "limite_connue"
+  },
+  {
+    "id": "javascript-concat",
+    "file": "javascript/samples.js",
+    "line": 15,
+    "leak": true,
+    "type": "stripe",
+    "group": "obfuscated",
+    "expected_status": "limite_connue"
+  },
+  {
+    "id": "javascript-reconstructed",
+    "file": "javascript/samples.js",
+    "line": 18,
+    "leak": true,
+    "type": "stripe",
+    "group": "obfuscated",
+    "expected_status": "limite_connue"
+  },
+  {
+    "id": "javascript-mock",
+    "file": "tests/mock_javascript.js",
+    "line": 1,
+    "leak": false,
+    "type": "mock",
+    "group": "negative",
+    "expected_status": "non_signale"
+  }
+]

@@ -203,6 +203,10 @@ sur un scan opérationnel.
 
 ## Vérifier
 
+Corpus d'acceptation T21 : [34 cas synthétiques et mesure précision/rappel](tests/fixtures/trap_repo/README.md).
+Exécuter `python -m pytest tests/test_trap_acceptance.py -s -rx` ; l'acceptation
+du scanner reste explicitement en attente tant que T22 n'est pas implémenté.
+
 ```sh
 .venv/bin/python -m pytest                      # squelette + contrats
 .venv/bin/python -m unittest discover -s tests/contracts -v   # contrats seuls
