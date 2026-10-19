@@ -10,7 +10,7 @@ de collecte `ModuleNotFoundError: No module named 'support.trap_corpus'`.
 Le générateur et le calcul de mesure ont ensuite été implémentés, sans
 modifier le scanner de production.
 
-## Résultats ciblés
+## Résultats ciblés initiaux
 
 ```text
 .venv/Scripts/python.exe -m pytest tests/test_trap_acceptance.py -s -rx
@@ -71,3 +71,33 @@ garde réseau utilisant des appels POSIX et installation T17 supposant
 Pour le rapport, utiliser le SHA du commit de livraison dans les liens
 GitHub permanents et les lignes des fonctions correspondantes. Relecture
 inter-domaines et CI Linux restent nécessaires avant fusion.
+
+## Corrections de revue
+
+Le CLI réserve désormais 1 aux seuils non atteints et retourne 2 pour une
+erreur interne, y compris lors de la création/nettoyage du dossier temporaire.
+Le message d'erreur est fixe et ne reflète pas le contenu de l'exception.
+Les appels directs à `scan_corpus` continuent de propager les erreurs.
+
+Les tests ajoutent des Findings autrement valides avec `/etc/passwd`, `a\b`
+et `../escape`, ainsi que les erreurs ValueError/OSError/RuntimeError et
+l'indisponibilité du dossier temporaire. Résultat ciblé : **23 passed,
+1 xfailed** ; `ruff check heimdall tests` et `git diff --check` réussis.
+
+Les preuves SAMM (module, ligne, SHA et résultat) sont archivées dans
+[t21-samm.md](t21-samm.md). Aucun remplissage de feuille externe n'est revendiqué.
+
+### Exception de périmètre proposée pour la PR #153
+
+Cette livraison traite le parent T21 et ses quatre sous-tickets dans la
+branche T21 existante. L'oracle de #52 décrit conjointement les cas #49–#51 ;
+le générateur, les positions de référence et les métriques forment un corpus
+reproductible livré ensemble. Conserver cette PR déjà ouverte évite de
+répartir cette preuve entre des révisions intermédiaires incomplètes.
+
+Cette justification documente une exception ponctuelle à « une PR = un
+sous-ticket », à valider par le relecteur ; elle ne change pas CONTRIBUTING.
+Les prochaines livraisons respecteront une PR par sous-ticket. Les quatre
+sous-tickets restent traçables séparément ci-dessus et dans la fiche SAMM.
+La fusion reste conditionnée à l'approbation de revue et au check Linux
+`CI (/ci)` vert sur le dernier SHA ; les résultats Windows ne le remplacent pas.
