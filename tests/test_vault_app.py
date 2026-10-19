@@ -30,6 +30,7 @@ from heimdall.vault.app import (
     HealthResponse,
     InMemorySecretStore,
     NotFoundError,
+    QuotaExceededError,
     SecretCreate,
     SecretMetadata,
     SecretRead,
@@ -1058,18 +1059,29 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("workers=1", run_server.__doc__ or "")
 
     async def test_in_memory_secret_store_saturation_quota_rejected(self) -> None:
-        """La saturation de la capacité maximale du store mémoire lève une erreur (anti-DoS)."""
-        bounded_store = InMemorySecretStore(max_secrets=2)
-        await bounded_store.create(project="demo", env="dev", name="KEY_ONE", value="val1")
-        await bounded_store.create(project="demo", env="dev", name="KEY_TWO", value="val2")
+        """La saturation des quotas par projet et globaux lève QuotaExceededError (anti-DoS)."""
+        # Quota par projet
+        project_store = InMemorySecretStore(max_secrets=10, max_secrets_per_project=2)
+        await project_store.create(project="p1", env="dev", name="K1", value="v1")
+        await project_store.create(project="p1", env="dev", name="K2", value="v2")
+        with self.assertRaises(QuotaExceededError) as ctx:
+            await project_store.create(project="p1", env="dev", name="K3", value="v3")
+        self.assertIn("Quota maximal", str(ctx.exception))
 
-        with self.assertRaises(RuntimeError) as ctx:
-            await bounded_store.create(project="demo", env="dev", name="KEY_THREE", value="val3")
-        self.assertIn("Capacité maximale", str(ctx.exception))
+        # Un autre projet n'est pas affamé
+        await project_store.create(project="p2", env="dev", name="K1", value="v1")
 
-    async def test_post_secret_capacity_exhaustion_returns_400(self) -> None:
-        """Le dépassement de capacité mémoire via l'API retourne 400 bad_request générique."""
-        bounded_store = InMemorySecretStore(max_secrets=1)
+        # Quota global
+        global_store = InMemorySecretStore(max_secrets=2, max_secrets_per_project=10)
+        await global_store.create(project="p1", env="dev", name="K1", value="v1")
+        await global_store.create(project="p2", env="dev", name="K1", value="v1")
+        with self.assertRaises(QuotaExceededError) as ctx_global:
+            await global_store.create(project="p3", env="dev", name="K1", value="v1")
+        self.assertIn("Capacité maximale", str(ctx_global.exception))
+
+    async def test_post_secret_capacity_exhaustion_returns_429(self) -> None:
+        """Le dépassement de quota retourne HTTP 429 trop de requêtes avec Retry-After."""
+        bounded_store = InMemorySecretStore(max_secrets=1, max_secrets_per_project=1)
         test_app = create_app(secret_store=bounded_store)
         transport = ASGITransport(app=test_app, client=("127.0.0.1", 54321))
         async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8443") as client:
@@ -1083,11 +1095,50 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                 "/api/v1/secrets",
                 json={"project": "demo", "env": "dev", "name": "OVERFLOW_KEY", "value": "val2"},
             )
-            self.assertEqual(res2.status_code, 400)
+            self.assertEqual(res2.status_code, 429)
+            self.assertEqual(res2.headers.get("retry-after"), "60")
             self.assertEqual(
                 res2.json(),
-                {"code": "bad_request", "message": "Requête invalide"},
+                {"code": "rate_limited", "message": "Trop de requêtes"},
             )
+
+    async def test_post_secret_malformed_content_length_rejected_400(self) -> None:
+        """Un en-tête Content-Length malformé ou négatif est rejeté avec HTTP 400 bad_request."""
+        malformed_headers = [
+            {"Content-Length": "not_a_number"},
+            {"Content-Length": "-50"},
+            {"Content-Length": "10, 20"},
+        ]
+        valid_payload = json.dumps(
+            {"project": "demo", "env": "dev", "name": "VALID_KEY", "value": "secret"}
+        ).encode("utf-8")
+        for headers in malformed_headers:
+            with self.subTest(headers=headers):
+                res = await self.client.post(
+                    "/api/v1/secrets",
+                    content=valid_payload,
+                    headers={"Content-Type": "application/json", **headers},
+                )
+                self.assertEqual(res.status_code, 400)
+                self.assertEqual(
+                    res.json(),
+                    {"code": "bad_request", "message": "Requête invalide"},
+                )
+
+    async def test_in_memory_secret_store_create_returns_defensive_copy(self) -> None:
+        """La mutation d'un dict retourné par store.create() ne corrompt pas le store."""
+        store = InMemorySecretStore()
+        created = await store.create(
+            project="demo", env="dev", name="SAFE_CREATE", value="initial"
+        )
+        created["value"] = "tampered_after_create"
+        created["status"] = "tampered_status"
+
+        re_fetched = await store.get(project="demo", env="dev", name="SAFE_CREATE")
+        self.assertIsNotNone(re_fetched)
+        assert re_fetched is not None
+        self.assertEqual(re_fetched["value"], "initial")
+        self.assertEqual(re_fetched["status"], "vaulte")
 
     def test_in_memory_secret_store_documents_quota_todo_62(self) -> None:
         """Le docstring de InMemorySecretStore documente le TODO(#62) de quota/pagination."""

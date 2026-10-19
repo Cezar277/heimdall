@@ -236,6 +236,11 @@ class SecretRead(SecretMetadata):
 
 
 _DEFAULT_MAX_SECRETS: int = 10_000
+_DEFAULT_MAX_SECRETS_PER_PROJECT: int = 1_000
+
+
+class QuotaExceededError(Exception):
+    """Exception levée en cas de dépassement de quota (global ou par projet)."""
 
 
 class InMemorySecretStore:
@@ -247,18 +252,23 @@ class InMemorySecretStore:
     TODO(#26, #62) : Remplacer par le chiffrement au repos (AES-256-GCM / DEK) et
     la persistance SQLite avec contrainte d'unicité UNIQUE(project_id, env, name)
     et PRAGMA foreign_keys=ON.
-    TODO(#62) : Définir un quota/nombre max de secrets par projet et pagination lors
-    du branchement SQLite pour borner la croissance mémoire et disque (protection
-    anti-DoS par épuisement des ressources).
+    TODO(#62) : Poursuivre le quota par projet et la pagination lors du branchement
+    SQLite pour borner la croissance disque et mémoire (protection anti-DoS).
     Ce stockage en mémoire est strictement mono-processus (workers=1). Avec plusieurs
     workers (workers > 1), chaque worker détiendrait une instance mémoire indépendante
     et divergente sans garantie d'unicité inter-processus.
     """
 
-    def __init__(self, max_secrets: int = _DEFAULT_MAX_SECRETS) -> None:
+    def __init__(
+        self,
+        max_secrets: int = _DEFAULT_MAX_SECRETS,
+        max_secrets_per_project: int = _DEFAULT_MAX_SECRETS_PER_PROJECT,
+    ) -> None:
         self._secrets: dict[tuple[str, str, str], dict[str, str]] = {}
+        self._project_counts: dict[str, int] = {}
         self._lock = asyncio.Lock()
         self._max_secrets = max_secrets
+        self._max_secrets_per_project = max_secrets_per_project
 
     async def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
         async with self._lock:
@@ -273,7 +283,12 @@ class InMemorySecretStore:
             if key in self._secrets:
                 raise KeyError("Secret déjà existant")
             if len(self._secrets) >= self._max_secrets:
-                raise RuntimeError("Capacité maximale du store mémoire atteinte (quota)")
+                raise QuotaExceededError("Capacité maximale globale du store atteinte")
+            project_count = self._project_counts.get(project, 0)
+            if project_count >= self._max_secrets_per_project:
+                raise QuotaExceededError(
+                    f"Quota maximal de secrets atteint pour le projet '{project}'"
+                )
             record = {
                 "project": project,
                 "env": env,
@@ -282,11 +297,13 @@ class InMemorySecretStore:
                 "value": value,
             }
             self._secrets[key] = record
+            self._project_counts[project] = project_count + 1
             return dict(record)
 
     async def clear(self) -> None:
         async with self._lock:
             self._secrets.clear()
+            self._project_counts.clear()
 
 
 _MAX_RETRY_AFTER_SECONDS: int = 3600
@@ -494,7 +511,8 @@ class BodySizeLimitMiddleware:
         for key, val in scope.get("headers", []):
             if key.lower() == b"content-length":
                 try:
-                    if int(val) > self.max_body_size:
+                    parsed_len = int(val)
+                    if parsed_len < 0 or parsed_len > self.max_body_size:
                         response = JSONResponse(
                             status_code=400,
                             content=_ERROR_PAYLOADS[400],
@@ -657,10 +675,11 @@ def _register_routes(app: FastAPI) -> None:
                 status_code=409,
                 detail="Secret déjà existant",
             ) from None
-        except RuntimeError:
+        except QuotaExceededError:
             raise StarletteHTTPException(
-                status_code=400,
-                detail="Requête invalide",
+                status_code=429,
+                detail="Trop de requêtes",
+                headers={"Retry-After": "60"},
             ) from None
         return SecretMetadata(
             project=record["project"],
@@ -781,6 +800,7 @@ __all__ = [
     "InternalError",
     "MethodNotAllowedError",
     "NotFoundError",
+    "QuotaExceededError",
     "RateLimitedError",
     "SecretCreate",
     "SecretMetadata",
