@@ -1103,21 +1103,49 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_post_secret_malformed_content_length_rejected_400(self) -> None:
-        """Un en-tête Content-Length malformé ou négatif est rejeté avec HTTP 400 bad_request."""
-        malformed_headers = [
+        """Un en-tête Content-Length malformé, négatif ou dupliqué est rejeté avec HTTP 400."""
+        valid_payload = json.dumps(
+            {"project": "demo", "env": "dev", "name": "VALID_KEY", "value": "secret"}
+        ).encode("utf-8")
+
+        # Valeurs individuelles malformées
+        malformed_dict_headers = [
             {"Content-Length": "not_a_number"},
             {"Content-Length": "-50"},
             {"Content-Length": "10, 20"},
         ]
-        valid_payload = json.dumps(
-            {"project": "demo", "env": "dev", "name": "VALID_KEY", "value": "secret"}
-        ).encode("utf-8")
-        for headers in malformed_headers:
-            with self.subTest(headers=headers):
+        for headers in malformed_dict_headers:
+            with self.subTest(malformed_header=headers):
                 res = await self.client.post(
                     "/api/v1/secrets",
                     content=valid_payload,
                     headers={"Content-Type": "application/json", **headers},
+                )
+                self.assertEqual(res.status_code, 400)
+                self.assertEqual(
+                    res.json(),
+                    {"code": "bad_request", "message": "Requête invalide"},
+                )
+
+        # En-têtes dupliqués (anti-smuggling : même avec petites valeurs)
+        duplicate_header_cases = [
+            [
+                ("Content-Type", "application/json"),
+                ("Content-Length", "10"),
+                ("Content-Length", "20"),
+            ],
+            [
+                ("Content-Type", "application/json"),
+                ("Content-Length", "10"),
+                ("Content-Length", "10"),
+            ],
+        ]
+        for headers_list in duplicate_header_cases:
+            with self.subTest(duplicate_headers=headers_list):
+                res = await self.client.post(
+                    "/api/v1/secrets",
+                    content=valid_payload,
+                    headers=headers_list,
                 )
                 self.assertEqual(res.status_code, 400)
                 self.assertEqual(

@@ -253,7 +253,8 @@ class InMemorySecretStore:
     la persistance SQLite avec contrainte d'unicité UNIQUE(project_id, env, name)
     et PRAGMA foreign_keys=ON.
     TODO(#62) : Poursuivre le quota par projet et la pagination lors du branchement
-    SQLite pour borner la croissance disque et mémoire (protection anti-DoS).
+    SQLite pour borner la croissance disque et mémoire (protection anti-DoS), en
+    distinguant quota de stockage et débit (retry inutile tant que la capacité est pleine).
     Ce stockage en mémoire est strictement mono-processus (workers=1). Avec plusieurs
     workers (workers > 1), chaque worker détiendrait une instance mémoire indépendante
     et divergente sans garantie d'unicité inter-processus.
@@ -353,7 +354,10 @@ _SECRETS_POST_RESPONSES: dict[int | str, dict[str, Any]] = {
     409: {"model": ConflictError, "description": "Secret déjà existant"},
     429: {
         "model": RateLimitedError,
-        "description": "Trop de requêtes — rate-limiting par clé API (ticket #65)",
+        "description": (
+            "Trop de requêtes — rate-limiting par clé API (ticket #65) ou quota de stockage "
+            "(ticket #62, retry inutile tant que la capacité reste pleine)."
+        ),
         "headers": _RETRY_AFTER_HEADER,
     },
     500: {"model": InternalError, "description": "Erreur interne"},
@@ -508,24 +512,35 @@ class BodySizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        for key, val in scope.get("headers", []):
-            if key.lower() == b"content-length":
-                try:
-                    parsed_len = int(val)
-                    if parsed_len < 0 or parsed_len > self.max_body_size:
-                        response = JSONResponse(
-                            status_code=400,
-                            content=_ERROR_PAYLOADS[400],
-                        )
-                        await response(scope, receive, send)
-                        return
-                except (ValueError, TypeError):
+        content_lengths = [
+            val for key, val in scope.get("headers", []) if key.lower() == b"content-length"
+        ]
+        if len(content_lengths) > 1:
+            response = JSONResponse(
+                status_code=400,
+                content=_ERROR_PAYLOADS[400],
+            )
+            await response(scope, receive, send)
+            return
+
+        if content_lengths:
+            val = content_lengths[0]
+            try:
+                parsed_len = int(val)
+                if parsed_len < 0 or parsed_len > self.max_body_size:
                     response = JSONResponse(
                         status_code=400,
                         content=_ERROR_PAYLOADS[400],
                     )
                     await response(scope, receive, send)
                     return
+            except (ValueError, TypeError):
+                response = JSONResponse(
+                    status_code=400,
+                    content=_ERROR_PAYLOADS[400],
+                )
+                await response(scope, receive, send)
+                return
 
         total_bytes = 0
 
