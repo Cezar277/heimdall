@@ -48,8 +48,11 @@ python tests/measure_trap.py
 Sous Windows, utiliser `.venv/Scripts/python.exe`.
 
 Le script retourne 0 si les seuils sont atteints, 1 si précision ou rappel
-principal < 0,90, et 2 si T22 n'est pas livré. Les autres erreurs sont
-propagées : aucun scan incomplet n'est transformé en résultat propre.
+principal < 0,90, et 2 si T22 n'est pas livré ou si la mesure échoue (scan,
+validation Finding, disque, création/nettoyage du dossier temporaire).
+Le code 1 est réservé aux seuils. La frontière CLI affiche un message fixe
+sans traceback ni contenu d'exception ; les erreurs restent propagées par
+`scan_corpus` pour ses autres appelants. Aucun scan incomplet ne devient propre.
 
 Le test d'intégration est un `xfail` limité à `NotImplementedError` tant que
 T22 est un squelette. Une sortie vide, une autre exception, un Finding invalide

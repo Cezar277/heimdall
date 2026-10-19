@@ -75,11 +75,30 @@ def test_scanner_errors_are_not_clean_results(tmp_path, monkeypatch):
         scan_corpus(tmp_path)
 
 
-@pytest.mark.parametrize("findings", [None, [{}], [{"file": "../escape", "line": 1}]])
+@pytest.mark.parametrize("findings", [None, [{}]])
 def test_invalid_findings_are_rejected(tmp_path, monkeypatch, findings):
     monkeypatch.setattr("support.trap_corpus.find_candidates", lambda path: findings)
     with pytest.raises(ValueError):
         scan_corpus(tmp_path)
+
+
+@pytest.mark.parametrize("path", ["../escape", "/etc/passwd", r"a\b"])
+def test_invalid_finding_paths_are_rejected(tmp_path, monkeypatch, path):
+    finding = {
+        "file": "python/samples.py",
+        "line": 1,
+        "type": "aws",
+        "entropy": 4.0,
+        "snippet_hash": "a" * 64,
+        "status": "detecte",
+        "source": "regex",
+    }
+    monkeypatch.setattr("support.trap_corpus.find_candidates", lambda root: [finding])
+    # Le témoin est conforme : le rejet suivant doit venir du chemin seul.
+    assert scan_corpus(tmp_path / "valid")["core"]["tp"] == 1
+    finding["file"] = path
+    with pytest.raises(ValueError, match="Finding non conforme"):
+        scan_corpus(tmp_path / "invalid")
 
 
 def test_real_adapter_uses_scanner_results_not_expected(tmp_path, monkeypatch):
@@ -149,6 +168,31 @@ def test_measure_command_reports_unavailable(monkeypatch, capsys):
     monkeypatch.setattr("measure_trap.scan_corpus", unavailable)
     assert main() == 2
     assert "indisponibles" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("error", [ValueError, OSError, RuntimeError])
+def test_measure_command_internal_errors_return_two(monkeypatch, capsys, error):
+    def broken(path):
+        raise error("PRIVATE_CANARY_DO_NOT_PRINT")
+
+    monkeypatch.setattr("measure_trap.scan_corpus", broken)
+    assert main() == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "erreur interne" in output.err
+    assert "PRIVATE_CANARY_DO_NOT_PRINT" not in output.err
+
+
+def test_measure_command_temporary_directory_failure_returns_two(monkeypatch, capsys):
+    def broken(**kwargs):
+        raise OSError("PRIVATE_PATH_DO_NOT_PRINT")
+
+    monkeypatch.setattr("measure_trap.tempfile.TemporaryDirectory", broken)
+    assert main() == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "erreur interne" in output.err
+    assert "PRIVATE_PATH_DO_NOT_PRINT" not in output.err
 
 
 def test_only_templates_are_versioned():
