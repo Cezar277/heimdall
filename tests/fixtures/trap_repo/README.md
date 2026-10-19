@@ -28,6 +28,8 @@ temporaire système, jamais dans ce dépôt. Les charges sont déterministes et
 étiquetées dans le générateur comme factices : aucun fournisseur n'est appelé,
 le JWT a une signature invalide et est expiré, le PEM n'est pas un DER valide.
 Les fichiers produits sont du texte de test, jamais exécuté.
+Le générateur refuse les gabarits symlinks et les chemins source résolus hors
+fixtures ; les chemins de sortie résolus doivent rester sous le dossier temporaire.
 
 La CI T20 exécute pytest et n'a actuellement pas de scanner de secrets sur le
 dépôt. Il n'y a donc **aucune exclusion globale à ajouter** pour ces gabarits.
@@ -50,6 +52,7 @@ Sous Windows, utiliser `.venv/Scripts/python.exe`.
 Le script retourne 0 si les seuils sont atteints, 1 si précision ou rappel
 principal < 0,90, et 2 si T22 n'est pas livré ou si la mesure échoue (scan,
 validation Finding, disque, création/nettoyage du dossier temporaire).
+L'import des dépendances est aussi couvert : dépendance absente => code 2.
 Le code 1 est réservé aux seuils. La frontière CLI affiche un message fixe
 sans traceback ni contenu d'exception ; les erreurs restent propagées par
 `scan_corpus` pour ses autres appelants. Aucun scan incomplet ne devient propre.

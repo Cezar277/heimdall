@@ -102,27 +102,26 @@ sous-tickets restent traçables séparément ci-dessus et dans la fiche SAMM.
 La fusion reste conditionnée à l'approbation de revue et au check Linux
 `CI (/ci)` vert sur le dernier SHA ; les résultats Windows ne le remplacent pas.
 
+## Durcissements après la seconde revue
 
-## Durcissements apr?s la seconde revue
-
-L'import de `scan_corpus` est ex?cut? dans le `try` de `main()` : une d?pendance
-absente re?oit le m?me code 2 et le m?me message fixe qu'une erreur de mesure.
-Un test provoque un ImportError avec un canari et v?rifie qu'il n'est pas
-refl?t?. Une ex?cution isol?e `python -I -S tests/measure_trap.py` confirme
+L'import de `scan_corpus` est exécuté dans le `try` de `main()` : une dépendance
+absente reçoit le même code 2 et le même message fixe qu'une erreur de mesure.
+Un test provoque un ImportError avec un canari et vérifie qu'il n'est pas
+reflété. Une exécution isolée `python -I -S tests/measure_trap.py` confirme
 le code 2 sans traceback lorsque les paquets ne sont pas accessibles.
 
 `build_corpus` refuse les gabarits symlinks et les sources dont le chemin
-r?solu sort de la racine des fixtures. La destination r?solue de chaque
-gabarit doit rester sous le dossier temporaire, avant lecture et ?criture.
+résolu sort de la racine des fixtures. La destination résolue de chaque
+gabarit doit rester sous le dossier temporaire, avant lecture et écriture.
 Les tests couvrent le traversal source, un gabarit symlink externe et un
-lien de destination apparu apr?s le contr?le initial du dossier vide.
+lien de destination apparu après le contrôle initial du dossier vide.
 
-R?sultat Windows : **25 passed, 2 skipped, 1 xfailed** ; lint r?ussi. Les deux
-cas de liens r?els sont ignor?s car Windows refuse leur cr?ation sans le
-privil?ge requis (WinError 1314), pas parce que leur garde a ?chou?. Le test
-traversal et le test ImportError sont ex?cut?s et passent.
+Résultat Windows : **25 passed, 2 skipped, 1 xfailed** ; lint réussi. Les deux
+cas de liens réels sont ignorés car Windows refuse leur création sans le
+privilège requis (WinError 1314). Le test traversal et le test ImportError
+sont exécutés et passent.
 
-Les permaliens et lignes SAMM sont actualis?s dans `t21-samm.md`. L'exception
-multi-tickets reste soumise ? validation explicite du relecteur. La CI Linux
-n'est pas relanc?e sur cette r?vision conform?ment ? la consigne de livraison ;
+Les permaliens et lignes SAMM sont actualisés dans `t21-samm.md`. L'exception
+multi-tickets reste soumise à validation explicite du relecteur. La CI Linux
+n'est pas relancée sur cette révision conformément à la consigne de livraison ;
 son check vert reste une condition de fusion, pas une preuve acquise.
