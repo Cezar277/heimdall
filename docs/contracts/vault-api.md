@@ -3,9 +3,10 @@
 Ticket #15 · Porteur : C · Relecteur : A · Estimation : 6 h.
 
 Source contract-first : [openapi.yaml](../../openapi.yaml), OpenAPI 3.1.0.
-Le fichier est écrit indépendamment de FastAPI. L'application Vault réelle,
-le chiffrement et la gestion des clés seront implémentés dans #25 et les
-tickets associés. Ce ticket ne fournit pas de serveur fonctionnel.
+Le fichier est écrit indépendamment de FastAPI. Le serveur Vault, le chiffrement
+au repos (AES-256-GCM via KEK) et la persistance SQLite sont implémentés dans
+#25/#26/#62 ; la gestion de clés par identifiant (`encrypt_at_rest`/`key_id`) et
+la révocation restent suivies dans leurs tickets dédiés.
 
 ## Routes et décisions à relire
 
@@ -72,6 +73,21 @@ redémarrages, et un déploiement doit fournir un pepper persisté. La constante
 publique `heimdall_default_vault_pepper_dev_only` est refusée sauf
 `HEIMDALL_ENV=test` explicite (fixtures déterministes). Le pepper n'est jamais
 journalisé ni renvoyé au client.
+
+Chiffrement au repos : le backend SQLite (défaut en production) chiffre chaque
+valeur avec AES-256-GCM et une KEK `HEIMDALL_VAULT_KEK` de 32 octets encodée
+base64, **distincte du pepper** et jamais stockée dans la base. Chaque ciphertext
+est lié par AAD au triplet `(project, env, name)` ; la contrainte SQLite
+`UNIQUE(project_id, env, name)` assure l'anti-écrasement entre workers. Le backend
+mémoire, réservé aux tests/développement, chiffre aussi son dictionnaire avec une
+KEK éphémère mais reste strictement mono-processus (`workers=1`). Aucune KEK
+éphémère n'est acceptée pour des données SQLite persistées : démarrage fail-closed.
+
+Rate-limiting débit (#65) : fenêtres fixes par clé API validée, par pair réseau
+et globale. Les 400/401 consomment les buckets pair/global, une clé absente ou
+invalide ne crée pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
+Le quota de stockage (capacité du store) ne doit pas être présenté comme cette
+mitigation de débit : les deux mécanismes sont distincts et testés séparément.
 
 Cette règle porte sur les clés d'authentification du serveur ; le
 client doit conserver son credential dans un stockage local protégé pour
@@ -280,8 +296,9 @@ La comparaison n'est pas encore une preuve de conformité du serveur #25.
 À son arrivée, remplacer `build_app()` par sa vraie factory et ajouter les
 tests HTTP de 400/401/403/404/409/429/500, isolement interprojets, health limité,
 headers proxy falsifiés, no-store et
-handlers sans fuite. Le chiffrement, TLS, la limitation de débit et la
-révocation sont des exigences, pas des propriétés prouvées par cette PR.
+handlers sans fuite. Le chiffrement SQLite et la limitation de débit sont
+implémentés et testés ; TLS et la révocation restent des exigences à prouver
+par leurs tickets dédiés.
 Vérifier aussi les 401 indistinguables, le stockage haché des clés, les
 certificats non approuvés et SAN incorrects rejetés, `Retry-After` borné et le
 500 JSON constant sur une exception injectée (mode debug désactivé).

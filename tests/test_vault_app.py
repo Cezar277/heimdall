@@ -46,6 +46,8 @@ from heimdall.vault.app import (
     hash_api_key,
     run_server,
 )
+from heimdall.vault.crypto import generate_encryption_key
+from heimdall.vault.database import db_session
 
 
 class VaultAppTests(unittest.IsolatedAsyncioTestCase):
@@ -1096,6 +1098,177 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             await global_store.create(project="p3", env="dev", name="K1", value="v1")
         self.assertIn("Capacité maximale", str(ctx_global.exception))
 
+    async def test_sqlite_backend_persists_ciphertext_and_shares_state(self) -> None:
+        """SQLite chiffré : ciphertext en base, lecture inter-workers et 409 partagé."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            settings = VaultSettings(
+                storage_backend="sqlite",
+                kek=generate_encryption_key(),
+                db_path=str(db_path),
+                api_key_pepper="sqlite_shared_pepper_" + "x" * 24,
+            )
+            canary = "SQLITE_CANARY_VALUE_91b7"
+            payload = {
+                "project": "demo",
+                "env": "dev",
+                "name": "SHARED_KEY",
+                "value": canary,
+            }
+            api_key = generate_api_key()
+
+            app1 = create_app(settings)
+            app1.state.register_api_key(api_key, "demo")
+            transport1 = ASGITransport(app=app1, client=("127.0.0.1", 54321))
+            async with AsyncClient(
+                transport=transport1,
+                base_url="http://127.0.0.1:8443",
+                headers={"X-Heimdall-API-Key": api_key},
+            ) as client1:
+                created = await client1.post("/api/v1/secrets", json=payload)
+                self.assertEqual(created.status_code, 201)
+
+            with db_session(db_path) as conn:
+                row = conn.execute(
+                    "SELECT encrypted_value FROM secrets "
+                    "WHERE project_id = ? AND env = ? AND name = ?",
+                    ("demo", "dev", "SHARED_KEY"),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertNotIn(canary, row["encrypted_value"])
+            self.assertNotIn(canary, db_path.read_bytes().decode("utf-8", errors="ignore"))
+
+            # Second "worker" : même base, même KEK, clé API retrouvée en SQLite.
+            app2 = create_app(settings)
+            transport2 = ASGITransport(app=app2, client=("127.0.0.1", 54322))
+            async with AsyncClient(
+                transport=transport2,
+                base_url="http://127.0.0.1:8443",
+                headers={"X-Heimdall-API-Key": api_key},
+            ) as client2:
+                read = await client2.get("/api/v1/secrets/demo/dev/SHARED_KEY")
+                self.assertEqual(read.status_code, 200)
+                self.assertEqual(read.json()["value"], canary)
+                duplicate = await client2.post("/api/v1/secrets", json=payload)
+                self.assertEqual(duplicate.status_code, 409)
+                self.assertNotIn(canary, duplicate.text)
+
+    async def test_rate_limiting_by_validated_key_with_retry_after(self) -> None:
+        """Le débit d'une clé validée est borné (429 + Retry-After borné)."""
+        settings = VaultSettings(
+            api_key_pepper="rate_limit_key_pepper_" + "k" * 20,
+            rate_limit_per_key=2,
+            rate_limit_per_peer=1_000,
+            rate_limit_global=1_000,
+            rate_limit_window_seconds=60,
+        )
+        rate_app = create_app(settings)
+        api_key = generate_api_key()
+        rate_app.state.register_api_key(api_key, "demo")
+        transport = ASGITransport(app=rate_app, client=("127.0.0.1", 54321))
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": api_key},
+        ) as client:
+            for index in range(2):
+                res = await client.post(
+                    "/api/v1/secrets",
+                    json={
+                        "project": "demo",
+                        "env": "dev",
+                        "name": f"RATE_KEY_{index}",
+                        "value": "v",
+                    },
+                )
+                self.assertEqual(res.status_code, 201)
+            limited = await client.post(
+                "/api/v1/secrets",
+                json={
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "RATE_KEY_LIMITED",
+                    "value": "v",
+                },
+            )
+            self.assertEqual(limited.status_code, 429)
+            self.assertEqual(limited.headers.get("retry-after"), "60")
+            self.assertEqual(
+                limited.json(),
+                {"code": "rate_limited", "message": "Trop de requêtes"},
+            )
+            # La santé relève des limites publiques pair/global, pas du bucket clé.
+            health = await client.get("/api/v1/health")
+            self.assertEqual(health.status_code, 200)
+
+    async def test_rate_limiting_counts_400_against_validated_key_bucket(self) -> None:
+        """Une requête 400 portant une clé validée consomme aussi le bucket de cette clé."""
+        settings = VaultSettings(
+            api_key_pepper="rate_limit_400_key_pepper_" + "r" * 20,
+            rate_limit_per_key=1,
+            rate_limit_per_peer=100,
+            rate_limit_global=100,
+            rate_limit_window_seconds=60,
+        )
+        rate_app = create_app(settings)
+        api_key = generate_api_key()
+        rate_app.state.register_api_key(api_key, "demo")
+        transport = ASGITransport(app=rate_app, client=("127.0.0.1", 54321))
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": api_key},
+        ) as client:
+            invalid = await client.post("/api/v1/secrets", json={})
+            self.assertEqual(invalid.status_code, 400)
+            limited = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "AFTER_400", "value": "v"},
+            )
+            self.assertEqual(limited.status_code, 429)
+
+    async def test_rate_limiting_counts_invalid_requests(self) -> None:
+        """Les 400 et 401 consomment le budget pair avant tout routage."""
+        settings_400 = VaultSettings(
+            api_key_pepper="rate_limit_400_pepper_" + "p" * 20,
+            require_auth=False,
+            rate_limit_per_key=1_000,
+            rate_limit_per_peer=2,
+            rate_limit_global=1_000,
+            rate_limit_window_seconds=60,
+        )
+        app_400 = create_app(settings_400)
+        transport_400 = ASGITransport(app=app_400, client=("127.0.0.1", 54321))
+        async with AsyncClient(
+            transport=transport_400,
+            base_url="http://127.0.0.1:8443",
+        ) as client:
+            for _ in range(2):
+                res = await client.post("/api/v1/secrets", json={})
+                self.assertEqual(res.status_code, 400)
+            limited = await client.get("/api/v1/health")
+            self.assertEqual(limited.status_code, 429)
+            self.assertEqual(limited.headers.get("retry-after"), "60")
+
+        settings_401 = VaultSettings(
+            api_key_pepper="rate_limit_401_pepper_" + "q" * 20,
+            rate_limit_per_key=1_000,
+            rate_limit_per_peer=1,
+            rate_limit_global=1_000,
+            rate_limit_window_seconds=60,
+        )
+        app_401 = create_app(settings_401)
+        transport_401 = ASGITransport(app=app_401, client=("127.0.0.1", 54322))
+        async with AsyncClient(
+            transport=transport_401,
+            base_url="http://127.0.0.1:8443",
+        ) as client:
+            unauthorized = await client.get("/api/v1/secrets/demo/dev/KEY")
+            self.assertEqual(unauthorized.status_code, 401)
+            limited = await client.get("/api/v1/health")
+            self.assertEqual(limited.status_code, 429)
+
     async def test_post_secret_capacity_exhaustion_returns_429(self) -> None:
         """Le dépassement de quota retourne HTTP 429 trop de requêtes avec Retry-After."""
         bounded_store = InMemorySecretStore(max_secrets=1, max_secrets_per_project=1)
@@ -1176,6 +1349,20 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     {"code": "bad_request", "message": "Requête invalide"},
                 )
 
+    async def test_in_memory_secret_store_never_keeps_plaintext(self) -> None:
+        """Le dict interne ne contient que du ciphertext AES-GCM, jamais la valeur brute."""
+        store = InMemorySecretStore()
+        canary = "CANARY_IN_MEMORY_PLAINTEXT_8f3a"
+        await store.create(project="demo", env="dev", name="CANARY_KEY", value=canary)
+        internal = next(iter(store._secrets.values()))
+        self.assertNotEqual(internal.get("encrypted_value"), canary)
+        self.assertNotIn(canary, json.dumps(internal))
+        self.assertNotIn(canary, repr(store._secrets))
+        fetched = await store.get("demo", "dev", "CANARY_KEY")
+        self.assertIsNotNone(fetched)
+        assert fetched is not None
+        self.assertEqual(fetched["value"], canary)
+
     async def test_in_memory_secret_store_create_returns_defensive_copy(self) -> None:
         """La mutation d'un dict retourné par store.create() ne corrompt pas le store."""
         store = InMemorySecretStore()
@@ -1190,6 +1377,17 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         assert re_fetched is not None
         self.assertEqual(re_fetched["value"], "initial")
         self.assertEqual(re_fetched["status"], "vaulte")
+
+    async def test_in_memory_secret_store_clear_releases_quota(self) -> None:
+        """Après saturation, clear() libère la capacité (quota de stockage, pas débit)."""
+        store = InMemorySecretStore(max_secrets=1, max_secrets_per_project=1)
+        await store.create(project="demo", env="dev", name="FIRST_KEY", value="v1")
+        with self.assertRaises(QuotaExceededError):
+            await store.create(project="demo", env="dev", name="SECOND_KEY", value="v2")
+        await store.clear()
+        created = await store.create(project="demo", env="dev", name="SECOND_KEY", value="v2")
+        self.assertEqual(created["value"], "v2")
+        self.assertIsNotNone(await store.get("demo", "dev", "SECOND_KEY"))
 
     def test_in_memory_secret_store_documents_quota_todo_62(self) -> None:
         """Le docstring de InMemorySecretStore documente le TODO(#62) de quota/pagination."""
@@ -1472,15 +1670,16 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         test_app.state.register_api_key(raw_key, "demo")
         self.assertEqual(len(test_app.state.api_keys), 1)
 
-    def test_register_api_key_weak_caller_key_is_accepted(self) -> None:
-        """Pinnage #64 : la robustesse de la clé fournie par l'appelant n'est pas évaluée ici.
-
-        ``register_api_key`` est réservé aux tests/injections explicites ; la
-        politique d'entropie porte sur les clés émises par ``generate_api_key``
-        (≥ 256 bits). Décider d'un rejet des clés faibles est un choix de #64.
-        """
+    def test_register_api_key_rejects_weak_caller_key(self) -> None:
+        """Politique #64 : une clé opérateur sous 32 caractères est refusée."""
         test_app = create_app()
-        test_app.state.register_api_key("a", "demo")
+        for weak_key in ("a", "short-key", " " * 32):
+            with self.subTest(key=weak_key):
+                with self.assertRaises(ValueError):
+                    test_app.state.register_api_key(weak_key, "demo")
+        self.assertEqual(len(test_app.state.api_keys), 0)
+        # Une clé générée (43 caractères) reste acceptée.
+        test_app.state.register_api_key(generate_api_key(), "demo")
         self.assertEqual(len(test_app.state.api_keys), 1)
 
     def test_vault_settings_and_hash_reject_empty_pepper(self) -> None:
@@ -1491,6 +1690,58 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     VaultSettings(api_key_pepper=empty_val)
                 with self.assertRaises(ValueError):
                     hash_api_key("any-key", pepper=empty_val)
+
+    def test_vault_settings_rejects_pepper_with_leading_or_trailing_whitespace(self) -> None:
+        """Le pepper n'est jamais normalisé silencieusement (pas de perte d'entropie)."""
+        for padded in ("  secret_pepper_value  ", "\tsecret_pepper_value", "secret_pepper_value\n"):
+            with self.subTest(pepper=padded):
+                with self.assertRaises(ValidationError) as ctx:
+                    VaultSettings(api_key_pepper=padded)
+                self.assertIn("espaces de début ou de fin", str(ctx.exception))
+
+    def test_vault_settings_validates_kek_and_requires_distinct_pepper(self) -> None:
+        """La KEK doit être base64 32 octets, sans espaces, distincte du pepper."""
+        kek = generate_encryption_key()
+        settings = VaultSettings(kek=kek, api_key_pepper="distinct_pepper_" + "y" * 20)
+        self.assertEqual(settings.kek, kek)
+
+        for invalid_kek in ("", "  " + kek + "  ", "not-base64", generate_encryption_key()[:-4]):
+            with self.subTest(kek=invalid_kek):
+                with self.assertRaises(ValidationError):
+                    VaultSettings(kek=invalid_kek, api_key_pepper="distinct_pepper")
+
+        with self.assertRaises(ValidationError):
+            VaultSettings(kek=kek, api_key_pepper=kek)
+
+    def test_sqlite_backend_requires_explicit_kek(self) -> None:
+        """Aucune KEK éphémère pour des données persistées : échec fail-closed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = VaultSettings(
+                storage_backend="sqlite",
+                db_path=str(Path(tmp) / "vault.db"),
+                api_key_pepper="sqlite_kek_required_" + "z" * 20,
+            )
+            with self.assertRaises(ValueError) as ctx:
+                create_app(settings)
+            self.assertIn("HEIMDALL_VAULT_KEK", str(ctx.exception))
+
+    def test_memory_backend_forbidden_in_production(self) -> None:
+        """Le backend mémoire mono-processus est refusé en production, même explicite."""
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "HEIMDALL_ENV": "production",
+                "HEIMDALL_VAULT_API_KEY_PEPPER": "production_pepper_" + "m" * 20,
+            },
+            clear=True,
+        ):
+            settings = VaultSettings(
+                storage_backend="memory",
+                db_path=str(Path(tmp) / "vault.db"),
+            )
+            with self.assertRaises(ValueError) as ctx:
+                create_app(settings)
+            self.assertIn("memory", str(ctx.exception))
 
     def test_vault_settings_rejects_default_pepper_in_production(self) -> None:
         """En production, le pepper public commité au repo est refusé avec erreur explicite."""

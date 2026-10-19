@@ -43,7 +43,6 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   - Exception non gérée -> 500 {"code": "internal_error", "message": "Erreur interne"}.
 """
 
-import asyncio
 import hmac
 import ipaddress
 import logging
@@ -53,6 +52,7 @@ import secrets
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from uuid import uuid4
 
 import uvicorn
 from fastapi import Depends, FastAPI, Response
@@ -72,12 +72,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
-from heimdall.vault.crypto import generate_api_key, hash_api_key
+from heimdall.vault.crypto import VaultCipher, generate_api_key, hash_api_key
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
+    create_api_key,
     db_session,
+    ensure_project,
+    get_api_key_by_hash,
     resolve_db_path,
     validate_db_path,
+)
+from heimdall.vault.ratelimit import RateLimiter
+from heimdall.vault.store import (
+    InMemorySecretStore,
+    QuotaExceededError,
+    SqliteSecretStore,
 )
 
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -186,6 +195,10 @@ project_api_key_header = APIKeyHeader(
 
 _DUMMY_HASH: str = "0" * 64
 _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
+# Politique #64 : une clé opérateur doit offrir une entropie comparable aux clés
+# émises par `generate_api_key` (43 caractères). Le seuil de 32 caractères laisse
+# une marge pour d'autres encodages 256 bits, tout en refusant les clés triviales.
+_MIN_API_KEY_LENGTH: int = 32
 
 # Valeur publique de développement héritée : refusée hors tests explicites pour
 # empêcher tout déploiement partagé avec un pepper commité dans le dépôt.
@@ -208,6 +221,40 @@ def _warn_generated_pepper_once() -> None:
         "survivent pas au redémarrage ; fournir un pepper persisté distinct de "
         "la KEK en production (ticket #25)."
     )
+
+
+def _resolve_storage_backend(settings: "VaultSettings") -> Literal["memory", "sqlite"]:
+    """Résout le backend : SQLite en production, mémoire hors production par défaut.
+
+    Le backend mémoire est interdit en production même s'il est demandé
+    explicitement : il ne partage pas l'état entre workers et ne doit jamais
+    servir un déploiement réel.
+    """
+    in_production = _heimdall_env_mode() in _PRODUCTION_ENV_MODES
+    if settings.storage_backend is not None:
+        if in_production and settings.storage_backend == "memory":
+            raise ValueError(
+                "Le backend de stockage 'memory' est interdit en production "
+                "(HEIMDALL_ENV=production/prod) : utiliser 'sqlite' avec une KEK."
+            )
+        return settings.storage_backend
+    return "sqlite" if in_production else "memory"
+
+
+def _resolve_vault_cipher(
+    settings: "VaultSettings",
+    backend: Literal["memory", "sqlite"],
+) -> VaultCipher:
+    """Construit le chiffreur : KEK explicite obligatoire pour tout backend SQLite."""
+    if settings.kek is not None:
+        return VaultCipher.from_encoded_key(settings.kek)
+    if backend == "sqlite":
+        raise ValueError(
+            "HEIMDALL_VAULT_KEK est obligatoire pour le backend SQLite : fournir une "
+            "KEK 256 bits encodée base64, distincte du pepper d'authentification. "
+            "Aucune KEK éphémère n'est générée pour des données persistées."
+        )
+    return VaultCipher.generate()
 
 
 PROJECT_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_-]{0,63}(?![\s\S])")
@@ -305,81 +352,6 @@ class SecretRead(SecretMetadata):
     value: SecretValue
 
 
-_DEFAULT_MAX_SECRETS: int = 10_000
-_DEFAULT_MAX_SECRETS_PER_PROJECT: int = 1_000
-
-
-class QuotaExceededError(Exception):
-    """Exception levée en cas de dépassement de quota (global ou par projet)."""
-
-
-class InMemorySecretStore:
-    """Stockage mémoire des secrets pour le squelette fonctionnel (ticket #63).
-
-    NOTE DE SÉCURITÉ :
-    Squelette mémoire temporaire non chiffré, strictement réservé aux tests et
-    au développement. Ne jamais déployer en production.
-    TODO(#26, #62) : Remplacer par le chiffrement au repos (AES-256-GCM / DEK) et
-    la persistance SQLite avec contrainte d'unicité UNIQUE(project_id, env, name)
-    et PRAGMA foreign_keys=ON.
-    TODO(#62) : Poursuivre le quota par projet et la pagination lors du branchement
-    SQLite pour borner la croissance disque et mémoire (capacité de stockage), en
-    distinguant quota de stockage et débit (retry inutile tant que la capacité est pleine).
-    Ce quota n'est PAS un rate-limiting : il ne borne pas le débit des requêtes
-    (400/401 non comptées, ni bucket par clé validée, ni pair réseau, ni limite
-    globale) ; ces buckets relèvent de TODO(#65), conformément à openapi.yaml:289-294.
-    Ce stockage en mémoire est strictement mono-processus (workers=1). Avec plusieurs
-    workers (workers > 1), chaque worker détiendrait une instance mémoire indépendante
-    et divergente sans garantie d'unicité inter-processus.
-    """
-
-    def __init__(
-        self,
-        max_secrets: int = _DEFAULT_MAX_SECRETS,
-        max_secrets_per_project: int = _DEFAULT_MAX_SECRETS_PER_PROJECT,
-    ) -> None:
-        self._secrets: dict[tuple[str, str, str], dict[str, str]] = {}
-        self._project_counts: dict[str, int] = {}
-        self._lock = asyncio.Lock()
-        self._max_secrets = max_secrets
-        self._max_secrets_per_project = max_secrets_per_project
-
-    async def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
-        async with self._lock:
-            record = self._secrets.get((project, env, name))
-            if record is None:
-                return None
-            return dict(record)
-
-    async def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
-        key = (project, env, name)
-        async with self._lock:
-            if key in self._secrets:
-                raise KeyError("Secret déjà existant")
-            if len(self._secrets) >= self._max_secrets:
-                raise QuotaExceededError("Capacité maximale globale du store atteinte")
-            project_count = self._project_counts.get(project, 0)
-            if project_count >= self._max_secrets_per_project:
-                raise QuotaExceededError(
-                    f"Quota maximal de secrets atteint pour le projet '{project}'"
-                )
-            record = {
-                "project": project,
-                "env": env,
-                "name": name,
-                "status": "vaulte",
-                "value": value,
-            }
-            self._secrets[key] = record
-            self._project_counts[project] = project_count + 1
-            return dict(record)
-
-    async def clear(self) -> None:
-        async with self._lock:
-            self._secrets.clear()
-            self._project_counts.clear()
-
-
 _MAX_RETRY_AFTER_SECONDS: int = 3600
 
 _RETRY_AFTER_HEADER = {
@@ -417,7 +389,7 @@ _NO_STORE_HEADER = {
 _SECRETS_POST_RESPONSES: dict[int | str, dict[str, Any]] = {
     201: {
         "model": SecretMetadata,
-        "description": "Secret créé (squelette mémoire non chiffré, persistance chiffrée #26/#62).",
+        "description": "Secret créé et persisté chiffré (AES-256-GCM, tickets #26/#62).",
         "headers": _NO_STORE_HEADER,
     },
     400: {"model": BadRequestError, "description": "Requête invalide"},
@@ -428,8 +400,8 @@ _SECRETS_POST_RESPONSES: dict[int | str, dict[str, Any]] = {
     429: {
         "model": RateLimitedError,
         "description": (
-            "Trop de requêtes — quota de stockage par projet (ticket #63, #62) ; "
-            "rate-limiting réseau/clé à implémenter (ticket #65, TODO(#65))."
+            "Trop de requêtes — quota de stockage atteint (#62/#63) ou débit "
+            "clé/pair/global dépassé (#65)."
         ),
         "headers": _RETRY_AFTER_HEADER,
     },
@@ -451,8 +423,8 @@ _SECRETS_GET_RESPONSES: dict[int | str, dict[str, Any]] = {
     429: {
         "model": RateLimitedError,
         "description": (
-            "Trop de requêtes — quota de stockage par projet (ticket #63, #62) ; "
-            "rate-limiting réseau/clé à implémenter (ticket #65, TODO(#65))."
+            "Trop de requêtes — quota de stockage atteint (#62/#63) ou débit "
+            "clé/pair/global dépassé (#65)."
         ),
         "headers": _RETRY_AFTER_HEADER,
     },
@@ -504,6 +476,48 @@ class VaultSettings(BaseSettings):
             "Jamais consigné dans les journaux d'audit ni retourné au client."
         ),
     )
+    storage_backend: Literal["memory", "sqlite"] | None = Field(
+        default=None,
+        description=(
+            "Backend de stockage des secrets. Défaut : 'sqlite' en production "
+            "(persistant, multi-workers), 'memory' hors production (tests/dev). "
+            "Le backend 'sqlite' exige toujours une KEK via HEIMDALL_VAULT_KEK."
+        ),
+    )
+    kek: str | None = Field(
+        default=None,
+        repr=False,
+        description=(
+            "KEK AES-256 encodée base64 (32 octets), distincte du pepper d'authentification. "
+            "Obligatoire pour le backend 'sqlite' (aucune KEK éphémère pour des données "
+            "persistées) ; jamais stockée en base. Le backend 'memory' génère une KEK "
+            "éphémère interne au processus."
+        ),
+    )
+    rate_limit_per_key: int = Field(
+        default=600,
+        ge=1,
+        le=1_000_000,
+        description="Requêtes autorisées par fenêtre pour une clé API validée.",
+    )
+    rate_limit_per_peer: int = Field(
+        default=1_200,
+        ge=1,
+        le=1_000_000,
+        description="Requêtes autorisées par fenêtre pour une adresse de pair réseau.",
+    )
+    rate_limit_global: int = Field(
+        default=6_000,
+        ge=1,
+        le=10_000_000,
+        description="Requêtes autorisées par fenêtre toutes sources confondues.",
+    )
+    rate_limit_window_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=3_600,
+        description="Taille de la fenêtre de rate-limiting en secondes (Retry-After borné).",
+    )
     db_path: str = Field(
         default=str(DEFAULT_DB_PATH),
         description="Chemin du fichier de base de données SQLite.",
@@ -521,7 +535,11 @@ class VaultSettings(BaseSettings):
         """
         if value is None:
             return None
-        cleaned = value.strip()
+        if value != value.strip():
+            raise ValueError(
+                "Le pepper serveur ne doit pas comporter d'espaces de début ou de fin."
+            )
+        cleaned = value
         if not cleaned:
             raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
         if (
@@ -566,6 +584,35 @@ class VaultSettings(BaseSettings):
                 "Pepper serveur non résolu : VaultSettings a contourné sa validation."
             )
         return pepper
+
+    @field_validator("kek")
+    @classmethod
+    def validate_kek(cls, value: str | None) -> str | None:
+        """Valide la KEK : non vide, sans espaces de bord, base64 de 32 octets."""
+        if value is None:
+            return None
+        if not value or value != value.strip():
+            raise ValueError(
+                "La KEK ne doit pas être vide ni comporter d'espaces de début ou de fin."
+            )
+        try:
+            VaultCipher.from_encoded_key(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+    @model_validator(mode="after")
+    def validate_kek_distinct_from_pepper(self) -> "VaultSettings":
+        """La KEK de chiffrement et le pepper d'authentification doivent être distincts."""
+        if (
+            self.kek is not None
+            and self.api_key_pepper is not None
+            and self.kek == self.api_key_pepper
+        ):
+            raise ValueError(
+                "La KEK de chiffrement et le pepper d'authentification doivent être distincts."
+            )
+        return self
 
     @field_validator("db_path")
     @classmethod
@@ -739,6 +786,50 @@ def _register_middleware(app: FastAPI) -> None:
     """Enregistre les middlewares du serveur Vault."""
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=_MAX_BODY_SIZE)
 
+    # Le rate-limiting est enregistré avant le middleware loopback : ce dernier,
+    # ajouté en dernier, reste le plus externe et rejette les pairs non loopback
+    # avant toute consommation de budget ou tout accès à la base.
+    app.state.rate_limiter = RateLimiter(
+        per_key=app.state.settings.rate_limit_per_key,
+        per_peer=app.state.settings.rate_limit_per_peer,
+        global_limit=app.state.settings.rate_limit_global,
+        window_seconds=app.state.settings.rate_limit_window_seconds,
+    )
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
+        """Borne le débit par clé validée, pair réseau et global (ticket #65).
+
+        Les 400/401 sont comptés par le bucket pair/global puisque le middleware
+        s'exécute avant le routage et les dépendances. Une clé invalide ne crée
+        aucun bucket arbitraire : seuls pair et global s'appliquent.
+        """
+        settings: VaultSettings = request.app.state.settings
+        peer = request.client.host if request.client and request.client.host else "unknown"
+        key_hash: str | None = None
+        raw_key = request.headers.get("X-Heimdall-API-Key")
+        if raw_key and raw_key == raw_key.strip() and request.url.path != "/api/v1/health":
+            try:
+                candidate_hash = hash_api_key(
+                    raw_key,
+                    pepper=settings.effective_api_key_pepper,
+                )
+            except ValueError:
+                candidate_hash = None
+            if candidate_hash is not None and _is_registered_key_hash(
+                request.app, candidate_hash
+            ):
+                key_hash = candidate_hash
+
+        allowed, retry_after = request.app.state.rate_limiter.check(peer, key_hash)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content=_ERROR_PAYLOADS[429],
+                headers={"Retry-After": str(retry_after)},
+            )
+        return await call_next(request)
+
     @app.middleware("http")
     async def loopback_enforcement_middleware(request: Request, call_next: Any) -> Any:
         """Défense en profondeur fail-closed : bloque toute requête hors de l'allowlist loopback."""
@@ -837,6 +928,30 @@ def _lookup_db_api_key(db_path: Any, provided_hash: str) -> tuple[str | None, in
     except Exception as exc:
         logger.debug("Échec consultation clé API SQLite : %s", exc.__class__.__name__)
     return matching_project, evaluated
+
+
+def _is_registered_key_hash(app: FastAPI, candidate_hash: str) -> bool:
+    """Indique si une empreinte correspond à une clé connue (mémoire ou SQLite).
+
+    Le bucket par clé ne doit exister que pour une clé validée/révoquée connue :
+    une valeur d'en-tête arbitraire ne doit pas permettre de créer un bucket
+    illimité. La clé brute n'est jamais conservée.
+    """
+    registered: dict[str, str] = getattr(app.state, "api_keys", {})
+    if candidate_hash in registered:
+        return True
+    db_path = getattr(app.state, "db_path", None)
+    if not (isinstance(db_path, Path) and db_path.is_file()):
+        return False
+    try:
+        # Requête indexée : ce chemin ne sert qu'à choisir un bucket de débit,
+        # pas à authentifier. L'authentification garde son parcours à coût
+        # comparable dans `verify_api_key`.
+        with db_session(db_path) as conn:
+            row = get_api_key_by_hash(conn, candidate_hash)
+    except Exception:
+        return False
+    return bool(row is not None and not row["revoked_at"])
 
 
 def verify_api_key(
@@ -1033,9 +1148,19 @@ def _register_routes(app: FastAPI) -> None:
         )
 
 
+def _persist_api_key_hash(app: FastAPI, key_hash: str, project_id: str) -> None:
+    """Persiste une empreinte de clé API dans SQLite quand le backend le requiert."""
+    if getattr(app.state, "storage_backend", "memory") != "sqlite":
+        return
+    with db_session(app.state.db_path) as conn:
+        ensure_project(conn, project_id)
+        if get_api_key_by_hash(conn, key_hash) is None:
+            create_api_key(conn, f"key_{uuid4().hex}", project_id, key_hash)
+
+
 def create_app(
     settings: VaultSettings | None = None,
-    secret_store: InMemorySecretStore | None = None,
+    secret_store: InMemorySecretStore | SqliteSecretStore | None = None,
     api_key_hashes: dict[str, str] | None = None,
     api_keys: dict[str, str] | None = None,
 ) -> FastAPI:
@@ -1043,7 +1168,9 @@ def create_app(
 
     Paramètres :
     - `settings` : Configuration VaultSettings (défaut : get_settings()).
-    - `secret_store` : Magasin de secrets mémoire ou chiffré (défaut : InMemorySecretStore()).
+    - `secret_store` : Magasin de secrets explicite (défaut : résolu par
+      `settings.storage_backend` — SQLite chiffré en production, mémoire chiffré
+      hors production).
     - `api_key_hashes` : Dictionnaire {hash_hmac_hex: project_id} de clés pré-hachées.
       Chaque clé DOIT être une chaîne hexadécimale de 64 caractères (^[0-9a-f]{64}$).
       Les clés brutes sont expressément refusées pour éviter toute confusion de format.
@@ -1071,9 +1198,23 @@ def create_app(
     resolved_db = _pin_db_path(effective_settings)
     app.state.db_path = resolved_db
     logger.debug("Base de données SQLite configurée : %s", resolved_db.name)
-    app.state.secret_store = (
-        secret_store if secret_store is not None else InMemorySecretStore()
-    )
+
+    resolved_backend = _resolve_storage_backend(effective_settings)
+    if secret_store is None:
+        cipher = _resolve_vault_cipher(effective_settings, resolved_backend)
+        if resolved_backend == "sqlite":
+            app.state.secret_store = SqliteSecretStore(resolved_db, cipher)
+        else:
+            app.state.secret_store = InMemorySecretStore(cipher=cipher)
+        logger.debug("Backend de stockage des secrets : %s", resolved_backend)
+    else:
+        app.state.secret_store = secret_store
+        if isinstance(secret_store, SqliteSecretStore):
+            resolved_backend = "sqlite"
+            if isinstance(secret_store.db_path, Path):
+                # Aligner l'authentification sur la même base que le store explicite.
+                app.state.db_path = secret_store.db_path
+    app.state.storage_backend = resolved_backend
 
     if api_key_hashes is not None and api_keys is not None:
         raise ValueError(
@@ -1093,6 +1234,8 @@ def create_app(
                 )
             validated_hashes[key_candidate] = _validate_project_id(project_id)
     app.state.api_keys = validated_hashes
+    for preregistered_hash, preregistered_project in validated_hashes.items():
+        _persist_api_key_hash(app, preregistered_hash, preregistered_project)
 
     def register_api_key(raw_key: str, project_id: str) -> None:
         """Enregistre une clé API brute en calculant son HMAC-SHA256 avec le pepper serveur.
@@ -1101,11 +1244,19 @@ def create_app(
         à un identifiant hors contrat ne pourrait jamais matcher une requête et
         provoquerait un 403 silencieux à chaque appel.
         """
-        if not isinstance(raw_key, str) or not raw_key or raw_key != raw_key.strip():
-            raise ValueError("La clé API brute ne peut pas être vide ou comporter d'espaces.")
+        if (
+            not isinstance(raw_key, str)
+            or len(raw_key) < _MIN_API_KEY_LENGTH
+            or raw_key != raw_key.strip()
+        ):
+            raise ValueError(
+                "La clé API brute doit comporter au moins "
+                f"{_MIN_API_KEY_LENGTH} caractères, sans espaces de début ou de fin."
+            )
         _validate_project_id(project_id)
         key_hash = hash_api_key(raw_key, pepper=effective_settings.effective_api_key_pepper)
         app.state.api_keys[key_hash] = project_id
+        _persist_api_key_hash(app, key_hash, project_id)
 
     app.state.register_api_key = register_api_key
 
@@ -1125,12 +1276,14 @@ def run_server() -> None:
     NOTE DE SÉCURITÉ (ticket #25) :
     Ce montage HTTP en clair est strictement réservé au squelette minimal et à la
     route /api/v1/health sur la boucle locale. Ne jamais réutiliser ce montage HTTP
-    au-delà du squelette : les tickets #64 et #65 implémentent le TLS obligatoire avec
-    SAN-IP (https://127.0.0.1:8443) et l'authentification X-Heimdall-API-Key.
+    au-delà du squelette : le TLS obligatoire avec SAN-IP
+    (https://127.0.0.1:8443) reste à brancher dans son ticket dédié.
 
-    NOTE CONCURRENCE : Le serveur tourne avec un seul worker (workers=1 par défaut).
-    Ne pas augmenter le nombre de workers tant que le stockage persistant partagé
-    SQLite (#26, #62) n'est pas branché.
+    NOTE CONCURRENCE : Le stockage SQLite chiffré (#26, #62) et les empreintes de
+    clés API sont partagés entre workers. Le rate-limiter reste toutefois
+    mono-processus : le serveur conserve workers=1 par défaut afin de ne pas
+    multiplier la limite effective par le nombre de workers. Un backend de
+    rate-limiting partagé pourra lever cette contrainte (#65).
     """
     server_settings = get_settings()
     uvicorn.run(

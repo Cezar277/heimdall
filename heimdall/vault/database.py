@@ -848,6 +848,19 @@ def create_project(
     return {"id": project_id, "created_at": ts}
 
 
+def ensure_project(
+    conn: sqlite3.Connection,
+    project_id: str,
+    created_at: str | None = None,
+) -> None:
+    """Crée le projet s'il n'existe pas (idempotent, requête paramétrée)."""
+    ts = created_at or get_iso_timestamp()
+    conn.execute(
+        "INSERT OR IGNORE INTO projects (id, created_at) VALUES (?, ?)",
+        (project_id, ts),
+    )
+
+
 def get_project(conn: sqlite3.Connection, project_id: str) -> dict[str, Any] | None:
     """Récupère un projet par son identifiant."""
     query = "SELECT id, created_at FROM projects WHERE id = ?"
@@ -1057,6 +1070,24 @@ def list_secrets(
         )
         cursor = conn.execute(query, (project_id,))
     return [dict(row) for row in cursor.fetchall()]
+
+
+def count_secrets(conn: sqlite3.Connection, project_id: str | None = None) -> int:
+    """Compte les secrets (globalement ou pour un projet), sans exposer de valeur."""
+    if project_id is None:
+        row = conn.execute("SELECT COUNT(*) FROM secrets").fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM secrets WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def delete_all_secrets(conn: sqlite3.Connection) -> int:
+    """Supprime tous les secrets (isolation des tests, jamais exposé par l'API)."""
+    cursor = conn.execute("DELETE FROM secrets")
+    return cursor.rowcount
 
 
 def update_secret(  # noqa: PLR0913

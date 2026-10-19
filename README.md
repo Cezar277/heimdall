@@ -53,9 +53,24 @@ Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) vi
 #   via $HEIMDALL_VAULT_DB_PATH et côté serveur — fail-closed)
 python -m heimdall.vault.init_db
 
+# Variables minimales d'un déploiement réel (aucune valeur publique par défaut) :
+# KEK : python -c "from heimdall.vault.crypto import generate_encryption_key; print(generate_encryption_key())"
+export HEIMDALL_ENV=production
+export HEIMDALL_VAULT_API_KEY_PEPPER='<pepper aléatoire persistant, distinct de la KEK>'
+export HEIMDALL_VAULT_KEK='<KEK AES-256 base64, 32 octets, distincte du pepper>'
+# Backend par défaut en production : sqlite (chiffré, partagé entre workers).
+# Hors production : memory (chiffré éphémère, strictement mono-processus).
+# export HEIMDALL_VAULT_STORAGE_BACKEND=sqlite
+
 # Lancement du serveur Vault (point d'entrée unique, boucle locale vérifiée) :
 python -m heimdall.vault.app
 ```
+
+Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une KEK qui ne
+réside jamais dans la base ; `UNIQUE(project_id, env, name)` garantit le 409
+inter-workers et `PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
+Le backend mémoire, réservé aux tests/développement, chiffre également les
+valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
 
 > **Environnement cible (POSIX requis)** :
 > Heimdall Vault requiert un système POSIX (Linux, macOS, BSD) pour garantir le durcissement fail-closed des permissions (`0600` pour la base, `0700` pour les répertoires). Sous Windows, ces permissions ne sont pas applicables nativement : l'ouverture de la base refuse fail-closed (`RuntimeError`, aucun avertissement suivi de poursuite) — Windows est strictement hors cible de déploiement en production.
@@ -64,11 +79,12 @@ python -m heimdall.vault.app
 > Ce squelette minimal (#25) est strictement confiné à la boucle locale (`127.0.0.1`, `::1`, `localhost`).
 > Ne jamais exposer ce serveur en clair hors de localhost ni réutiliser ce montage HTTP au-delà du squelette minimal (#25). Les exigences runtime suivantes sont tracées et attribuées aux tickets du Vault :
 > - **Rejet fail-closed HTTP 403 sur IP non-loopback** : garde middleware en défense en profondeur (niveau transport/socket), volontairement maintenue hors du contrat OpenAPI applicatif (`/api/v1/health` étant publique sans clé).
-> - **TLS avec SAN IP obligatoire (`https://127.0.0.1:8443`)** : tickets #64 / #65.
+> - **TLS avec SAN IP obligatoire (`https://127.0.0.1:8443`)** : tickets #64 / #65 (le montage HTTP local reste un squelette).
 > - **Authentification par clé API de projet (`X-Heimdall-API-Key`)** : ticket #64.
 > - **Rejet HTTP 400 avant parsing au-delà de 1 Mio (1 048 576 octets)** : ticket #63.
 > - **En-tête `Cache-Control: no-store`** : ticket #63.
-> - **Rate-limit par bucket avec `Retry-After`** : ticket #64.
+> - **Rate-limit débit par clé validée, pair réseau et global avec `Retry-After`** : ticket #65.
+> - **Chiffrement au repos et persistance SQLite** : tickets #26 / #62.
 
 Vérifier la santé minimale (`/api/v1/health` contractuel) :
 
