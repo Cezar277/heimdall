@@ -1385,21 +1385,54 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp.status_code, 201)
 
     def test_create_app_rejects_raw_keys_in_api_key_hashes_dict(self) -> None:
-        """create_app refuse les clés brutes passées à api_key_hashes ou api_keys."""
+        """create_app refuse les clés brutes sans jamais refléter le secret dans le message."""
         raw_token = generate_api_key()
-        # Passage d'une clé brute -> refus immédiat
         with self.assertRaises(ValueError) as ctx:
             create_app(api_key_hashes={raw_token: "demo"})
         self.assertIn("Format d'empreinte de clé API invalide", str(ctx.exception))
+        # Mitigation fuite de secret : le candidat brut ne doit JAMAIS fuiter dans le message
+        self.assertNotIn(raw_token, str(ctx.exception))
 
         with self.assertRaises(ValueError) as ctx_deprecated:
             create_app(api_keys={raw_token: "demo"})
         self.assertIn("Format d'empreinte de clé API invalide", str(ctx_deprecated.exception))
+        self.assertNotIn(raw_token, str(ctx_deprecated.exception))
 
         # Passage d'un hash HMAC valide -> accepté
         valid_hash = hash_api_key(raw_token)
         app_with_hash = create_app(api_key_hashes={valid_hash: "demo"})
         self.assertEqual(app_with_hash.state.api_keys[valid_hash], "demo")
+
+    def test_create_app_rejects_simultaneous_api_key_hashes_and_api_keys(self) -> None:
+        """create_app refuse l'usage simultané de api_key_hashes et api_keys (fail-closed)."""
+        valid_hash = hash_api_key("some-key")
+        with self.assertRaises(ValueError) as ctx:
+            create_app(
+                api_key_hashes={valid_hash: "demo"},
+                api_keys={valid_hash: "demo"},
+            )
+        self.assertIn("pas les deux simultanément", str(ctx.exception))
+
+    def test_vault_settings_and_hash_reject_empty_pepper(self) -> None:
+        """Un pepper vide ou blanc est rejeté par VaultSettings et hash_api_key."""
+        for empty_val in ("", "   "):
+            with self.subTest(empty_val=empty_val):
+                with self.assertRaises(ValidationError):
+                    VaultSettings(api_key_pepper=empty_val)
+                with self.assertRaises(ValueError):
+                    hash_api_key("any-key", pepper=empty_val)
+
+    def test_vault_settings_rejects_default_pepper_in_production(self) -> None:
+        """En environnement de production, le pepper par défaut commité au repo est refusé."""
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}):
+            with self.assertRaises(ValidationError) as ctx:
+                VaultSettings(api_key_pepper="heimdall_default_vault_pepper_dev_only")
+            self.assertIn("interdit en production", str(ctx.exception))
+
+        # Avec un vrai pepper en production -> accepté
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}):
+            settings = VaultSettings(api_key_pepper="production_hardened_secret_pepper_12345")
+            self.assertEqual(settings.api_key_pepper, "production_hardened_secret_pepper_12345")
 
     async def test_api_key_with_whitespace_rejected_401(self) -> None:
         """Une clé API avec espaces en début/fin est rejetée avec 401 sans normalisation strip()."""

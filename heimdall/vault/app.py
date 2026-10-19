@@ -200,7 +200,14 @@ def hash_api_key(key: str, pepper: str | bytes | None = None) -> str:
             "HEIMDALL_VAULT_API_KEY_PEPPER",
             "heimdall_default_vault_pepper_dev_only",
         )
-    pepper_bytes = pepper.encode("utf-8") if isinstance(pepper, str) else bytes(pepper)
+    if isinstance(pepper, str):
+        if not pepper or not pepper.strip():
+            raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
+        pepper_bytes = pepper.encode("utf-8")
+    else:
+        pepper_bytes = bytes(pepper)
+        if not pepper_bytes:
+            raise ValueError("Le pepper serveur ne peut pas être vide.")
     return hmac.new(pepper_bytes, key.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -477,6 +484,24 @@ class VaultSettings(BaseSettings):
         default=str(DEFAULT_DB_PATH),
         description="Chemin du fichier de base de données SQLite.",
     )
+
+    @field_validator("api_key_pepper")
+    @classmethod
+    def validate_api_key_pepper(cls, value: str) -> str:
+        """Valide le pepper serveur : interdit vide et interdit le défaut en production."""
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
+        env_mode = os.environ.get("HEIMDALL_ENV", "").strip().lower()
+        if (
+            env_mode in ("production", "prod")
+            and cleaned == "heimdall_default_vault_pepper_dev_only"
+        ):
+            raise ValueError(
+                "Le pepper par défaut 'heimdall_default_vault_pepper_dev_only' est "
+                "interdit en production. Définissez la variable HEIMDALL_VAULT_API_KEY_PEPPER."
+            )
+        return cleaned
 
     @field_validator("db_path")
     @classmethod
@@ -983,15 +1008,20 @@ def create_app(
         secret_store if secret_store is not None else InMemorySecretStore()
     )
 
+    if api_key_hashes is not None and api_keys is not None:
+        raise ValueError(
+            "Spécifiez 'api_key_hashes' ou 'api_keys', pas les deux simultanément."
+        )
+
     raw_hashes = api_key_hashes if api_key_hashes is not None else api_keys
     validated_hashes: dict[str, str] = {}
     if raw_hashes is not None:
         for key_candidate, project_id in raw_hashes.items():
             if not isinstance(key_candidate, str) or not _HASH_PATTERN.match(key_candidate):
                 raise ValueError(
-                    f"Format d'empreinte de clé API invalide : '{key_candidate}'. "
-                    "api_key_hashes attend uniquement des empreintes hexadécimales de 64 "
-                    "caractères (^[0-9a-f]{64}$). Pour enregistrer une clé brute, utilisez "
+                    "Format d'empreinte de clé API invalide : attendu ^[0-9a-f]{64}$. "
+                    "api_key_hashes attend des empreintes hexadécimales de 64 caractères. "
+                    "Pour enregistrer une clé brute, utilisez "
                     "app.state.register_api_key(raw_key, project_id)."
                 )
             validated_hashes[key_candidate] = project_id
