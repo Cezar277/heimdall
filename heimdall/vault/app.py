@@ -28,7 +28,13 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   /api/v1/health est exposé (aucun alias racine non contractuel).
 - Allowlist sur les en-têtes d'exception : seuls Allow et Retry-After (1-3600) sont retransmis.
 - Confinement crypto (ticket #17) : ce module n'importe JAMAIS cryptography ou
-  argon2 (réservés exclusivement à heimdall/vault/crypto.py).
+  argon2 (réservés exclusivement à heimdall/vault/crypto.py) et délègue la
+  génération/hachage des clés API à `heimdall.vault.crypto`.
+- Pepper clés API (ticket #64) : `hash_api_key` exige un pepper explicite (aucun
+  défaut public, aucun repli silencieux). `VaultSettings` refuse la constante
+  publique commitée hors `HEIMDALL_ENV=test`, exige
+  `HEIMDALL_VAULT_API_KEY_PEPPER` en production et génère hors production un
+  pepper aléatoire éphémère au démarrage avec avertissement (documenté #25).
 - Gestion d'erreurs normalisée :
   - RequestValidationError -> 400 contractuel {"code": "bad_request", "message": "Requête invalide"}
     sans écho du corps ni enveloppe 422 de FastAPI.
@@ -38,7 +44,6 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 """
 
 import asyncio
-import hashlib
 import hmac
 import ipaddress
 import logging
@@ -61,11 +66,13 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
+from heimdall.vault.crypto import generate_api_key, hash_api_key
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
     db_session,
@@ -177,43 +184,52 @@ project_api_key_header = APIKeyHeader(
 )
 
 
-def generate_api_key() -> str:
-    """Génère une clé API aléatoire avec au moins 256 bits d'entropie (ticket #64)."""
-    return secrets.token_urlsafe(32)
-
-
 _DUMMY_HASH: str = "0" * 64
 _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 
+# Valeur publique de développement héritée : refusée hors tests explicites pour
+# empêcher tout déploiement partagé avec un pepper commité dans le dépôt.
+_INSECURE_DEFAULT_PEPPER: str = "heimdall_default_vault_pepper_dev_only"
+_TEST_ENV_MODES: frozenset[str] = frozenset({"test"})
+_PRODUCTION_ENV_MODES: frozenset[str] = frozenset({"production", "prod"})
 
-def hash_api_key(key: str, pepper: str | bytes | None = None) -> str:
-    """Hachage HMAC-SHA256 de vérification d'une clé API avec pepper serveur (ticket #64).
 
-    Conformité openapi.yaml:197-200 :
-    Le serveur DOIT stocker uniquement un haché salé de vérification de la clé
-    (sel unique par clé, ou HMAC avec un pepper serveur distinct de la KEK de
-    chiffrement), jamais sa valeur brute ; la fonction de hachage et la gestion
-    du sel/pepper sont documentées pour #25.
-    """
-    if pepper is None:
-        pepper = os.environ.get(
-            "HEIMDALL_VAULT_API_KEY_PEPPER",
-            "heimdall_default_vault_pepper_dev_only",
-        )
-    if isinstance(pepper, str):
-        if not pepper or not pepper.strip():
-            raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
-        pepper_bytes = pepper.encode("utf-8")
-    else:
-        pepper_bytes = bytes(pepper)
-        if not pepper_bytes:
-            raise ValueError("Le pepper serveur ne peut pas être vide.")
-    return hmac.new(pepper_bytes, key.encode("utf-8"), hashlib.sha256).hexdigest()
+def _heimdall_env_mode() -> str:
+    """Retourne le mode d'environnement Heimdall normalisé (``HEIMDALL_ENV``)."""
+    return os.environ.get("HEIMDALL_ENV", "").strip().lower()
+
+
+@lru_cache(maxsize=1)
+def _warn_generated_pepper_once() -> None:
+    """Avertit une seule fois par processus qu'un pepper éphémère a été généré."""
+    logger.warning(
+        "HEIMDALL_VAULT_API_KEY_PEPPER absent : pepper aléatoire éphémère généré "
+        "pour cet environnement hors production. Les empreintes de clés ne "
+        "survivent pas au redémarrage ; fournir un pepper persisté distinct de "
+        "la KEK en production (ticket #25)."
+    )
 
 
 PROJECT_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_-]{0,63}(?![\s\S])")
 ENV_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_-]{0,31}(?![\s\S])")
 NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Z][A-Z0-9_]{1,63}(?![\s\S])")
+
+
+def _validate_project_id(project_id: str) -> str:
+    """Valide l'identifiant de projet lié à une clé API (fail-fast sans écho).
+
+    Un identifiant hors ``PROJECT_PATTERN`` (ex. ``"../.."``, casse invalide, typo)
+    ne matcherait jamais un ``ProjectId`` de requête : la clé serait acceptée puis
+    refusée silencieusement en 403 à chaque appel. On refuse donc à l'enregistrement.
+    Le message est générique et ne reflète jamais la valeur fournie.
+    """
+    if not isinstance(project_id, str) or PROJECT_PATTERN.match(project_id) is None:
+        raise ValueError(
+            "Identifiant de projet invalide : attendu ^[a-z][a-z0-9_-]{0,63}$. "
+            "La clé API doit être liée à un identifiant de projet conforme au contrat."
+        )
+    return project_id
+
 
 ProjectId = Annotated[
     str,
@@ -307,8 +323,11 @@ class InMemorySecretStore:
     la persistance SQLite avec contrainte d'unicité UNIQUE(project_id, env, name)
     et PRAGMA foreign_keys=ON.
     TODO(#62) : Poursuivre le quota par projet et la pagination lors du branchement
-    SQLite pour borner la croissance disque et mémoire (protection anti-DoS), en
+    SQLite pour borner la croissance disque et mémoire (capacité de stockage), en
     distinguant quota de stockage et débit (retry inutile tant que la capacité est pleine).
+    Ce quota n'est PAS un rate-limiting : il ne borne pas le débit des requêtes
+    (400/401 non comptées, ni bucket par clé validée, ni pair réseau, ni limite
+    globale) ; ces buckets relèvent de TODO(#65), conformément à openapi.yaml:289-294.
     Ce stockage en mémoire est strictement mono-processus (workers=1). Avec plusieurs
     workers (workers > 1), chaque worker détiendrait une instance mémoire indépendante
     et divergente sans garantie d'unicité inter-processus.
@@ -473,10 +492,15 @@ class VaultSettings(BaseSettings):
             "Désactivation explicite réservée aux tests unitaires isolés."
         ),
     )
-    api_key_pepper: str = Field(
-        default="heimdall_default_vault_pepper_dev_only",
+    api_key_pepper: str | None = Field(
+        default=None,
+        repr=False,
         description=(
             "Pepper serveur distinct de la KEK pour hachage HMAC-SHA256 (ticket #64). "
+            "Obligatoire en production via HEIMDALL_VAULT_API_KEY_PEPPER. "
+            "Hors production, absent = pepper aléatoire éphémère généré au démarrage "
+            "avec avertissement (aucune valeur publique par défaut, aucune portabilité "
+            "des empreintes entre déploiements). "
             "Jamais consigné dans les journaux d'audit ni retourné au client."
         ),
     )
@@ -487,21 +511,61 @@ class VaultSettings(BaseSettings):
 
     @field_validator("api_key_pepper")
     @classmethod
-    def validate_api_key_pepper(cls, value: str) -> str:
-        """Valide le pepper serveur : interdit vide et interdit le défaut en production."""
+    def validate_api_key_pepper(cls, value: str | None) -> str | None:
+        """Valide le pepper : jamais vide et jamais le défaut public commité hors test.
+
+        La valeur ``heimdall_default_vault_pepper_dev_only`` est une constante
+        publique du dépôt : l'accepter reviendrait à un simple hash salé public,
+        corrélable entre déploiements. Elle n'est tolérée que sous
+        ``HEIMDALL_ENV=test`` explicite (fixtures déterministes).
+        """
+        if value is None:
+            return None
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
-        env_mode = os.environ.get("HEIMDALL_ENV", "").strip().lower()
         if (
-            env_mode in ("production", "prod")
-            and cleaned == "heimdall_default_vault_pepper_dev_only"
+            cleaned == _INSECURE_DEFAULT_PEPPER
+            and _heimdall_env_mode() not in _TEST_ENV_MODES
         ):
             raise ValueError(
-                "Le pepper par défaut 'heimdall_default_vault_pepper_dev_only' est "
-                "interdit en production. Définissez la variable HEIMDALL_VAULT_API_KEY_PEPPER."
+                "Le pepper public de développement 'heimdall_default_vault_pepper_dev_only' "
+                "est refusé (valeur commitée partagée). Définissez "
+                "HEIMDALL_VAULT_API_KEY_PEPPER avec un secret unique et aléatoire ; "
+                "seul HEIMDALL_ENV=test explicite l'autorise pour des fixtures déterministes."
             )
         return cleaned
+
+    @model_validator(mode="after")
+    def resolve_api_key_pepper(self) -> "VaultSettings":
+        """Résout le pepper absent : obligatoire en production, éphémère sinon.
+
+        Hors production, un pepper aléatoire de 256 bits est généré au démarrage
+        avec un avertissement (les empreintes ne survivent pas au redémarrage).
+        En production, l'absence lève une erreur explicite : fail-closed, jamais
+        de repli sur un pepper public.
+        """
+        if self.api_key_pepper is not None:
+            return self
+        if _heimdall_env_mode() in _PRODUCTION_ENV_MODES:
+            raise ValueError(
+                "HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire en production "
+                "(HEIMDALL_ENV=production/prod) : aucun pepper public par défaut "
+                "n'est accepté. Fournir un secret unique et persisté, distinct de la KEK."
+            )
+        self.api_key_pepper = secrets.token_urlsafe(32)
+        _warn_generated_pepper_once()
+        return self
+
+    @property
+    def effective_api_key_pepper(self) -> str:
+        """Pepper résolu et non vide (garanti par ``resolve_api_key_pepper``)."""
+        pepper = self.api_key_pepper
+        if pepper is None:
+            raise RuntimeError(
+                "Pepper serveur non résolu : VaultSettings a contourné sa validation."
+            )
+        return pepper
 
     @field_validator("db_path")
     @classmethod
@@ -789,11 +853,9 @@ def verify_api_key(
     - chemin de vérification de coût comparable (aucun break précoce, comparaison factice).
     - si `settings.require_auth=False` et aucune clé fournie, retourne None (test mode).
     """
-    settings: VaultSettings = getattr(
-        request.app.state,
-        "settings",
-        VaultSettings(require_auth=True),
-    )
+    settings: VaultSettings | None = getattr(request.app.state, "settings", None)
+    if settings is None:
+        settings = VaultSettings(require_auth=True)
     if api_key is None:
         if settings.require_auth:
             raise StarletteHTTPException(
@@ -808,8 +870,7 @@ def verify_api_key(
             detail="Authentification requise",
         )
 
-    pepper = getattr(settings, "api_key_pepper", None)
-    provided_hash = hash_api_key(api_key, pepper=pepper)
+    provided_hash = hash_api_key(api_key, pepper=settings.effective_api_key_pepper)
     registered_keys: dict[str, str] = getattr(request.app.state, "api_keys", {})
     matching_project: str | None = None
     evaluated_count = 0
@@ -870,9 +931,9 @@ def _register_routes(app: FastAPI) -> None:
         authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretMetadata:
         """Créer un secret vaulté (ticket #63)."""
-        settings: VaultSettings = getattr(
-            app.state, "settings", VaultSettings(require_auth=True)
-        )
+        settings: VaultSettings | None = getattr(app.state, "settings", None)
+        if settings is None:
+            settings = VaultSettings(require_auth=True)
         if settings.require_auth and authenticated_project is None:
             raise StarletteHTTPException(
                 status_code=401,
@@ -939,9 +1000,9 @@ def _register_routes(app: FastAPI) -> None:
         authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretRead:
         """Lire la valeur courante d'un secret (ticket #63)."""
-        settings: VaultSettings = getattr(
-            app.state, "settings", VaultSettings(require_auth=True)
-        )
+        settings: VaultSettings | None = getattr(app.state, "settings", None)
+        if settings is None:
+            settings = VaultSettings(require_auth=True)
         if settings.require_auth and authenticated_project is None:
             raise StarletteHTTPException(
                 status_code=401,
@@ -986,7 +1047,13 @@ def create_app(
     - `api_key_hashes` : Dictionnaire {hash_hmac_hex: project_id} de clés pré-hachées.
       Chaque clé DOIT être une chaîne hexadécimale de 64 caractères (^[0-9a-f]{64}$).
       Les clés brutes sont expressément refusées pour éviter toute confusion de format.
+      Chaque `project_id` DOIT satisfaire `PROJECT_PATTERN` (^[a-z][a-z0-9_-]{0,63}$) :
+      un identifiant hors contrat est refusé à l'enregistrement (fail-fast, sans écho).
     - `api_keys` : Alias de `api_key_hashes` pour compatibilité descendante.
+
+    Le pepper utilisé pour les empreintes de `register_api_key` est celui de
+    `effective_settings.effective_api_key_pepper` : obligatoire en production,
+    aléatoire éphémère hors production (jamais de défaut public).
     """
     effective_settings = settings if settings is not None else get_settings()
 
@@ -1017,21 +1084,27 @@ def create_app(
     validated_hashes: dict[str, str] = {}
     if raw_hashes is not None:
         for key_candidate, project_id in raw_hashes.items():
-            if not isinstance(key_candidate, str) or not _HASH_PATTERN.match(key_candidate):
+            if not isinstance(key_candidate, str) or not _HASH_PATTERN.fullmatch(key_candidate):
                 raise ValueError(
                     "Format d'empreinte de clé API invalide : attendu ^[0-9a-f]{64}$. "
                     "api_key_hashes attend des empreintes hexadécimales de 64 caractères. "
                     "Pour enregistrer une clé brute, utilisez "
                     "app.state.register_api_key(raw_key, project_id)."
                 )
-            validated_hashes[key_candidate] = project_id
+            validated_hashes[key_candidate] = _validate_project_id(project_id)
     app.state.api_keys = validated_hashes
 
     def register_api_key(raw_key: str, project_id: str) -> None:
-        """Enregistre une clé API brute en calculant son HMAC-SHA256 avec le pepper serveur."""
-        if not raw_key or raw_key != raw_key.strip():
+        """Enregistre une clé API brute en calculant son HMAC-SHA256 avec le pepper serveur.
+
+        L'identifiant de projet est validé contre ``PROJECT_PATTERN`` : une clé liée
+        à un identifiant hors contrat ne pourrait jamais matcher une requête et
+        provoquerait un 403 silencieux à chaque appel.
+        """
+        if not isinstance(raw_key, str) or not raw_key or raw_key != raw_key.strip():
             raise ValueError("La clé API brute ne peut pas être vide ou comporter d'espaces.")
-        key_hash = hash_api_key(raw_key, pepper=effective_settings.api_key_pepper)
+        _validate_project_id(project_id)
+        key_hash = hash_api_key(raw_key, pepper=effective_settings.effective_api_key_pepper)
         app.state.api_keys[key_hash] = project_id
 
     app.state.register_api_key = register_api_key

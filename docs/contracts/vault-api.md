@@ -61,6 +61,18 @@ journaux inclus). Chaque clé est générée à **au moins 256 bits d'entropie v
 la création. Le sel est unique par clé ; à défaut, un HMAC avec un pepper
 serveur **distinct de la KEK** de chiffrement est admis. La fonction de
 hachage et la gestion du sel sont documentées pour #25.
+
+Politique de pepper retenue pour #64/#25 : `hash_api_key` exige un pepper
+explicite, sans valeur publique par défaut ni repli silencieux.
+`HEIMDALL_VAULT_API_KEY_PEPPER` est **obligatoire** lorsque
+`HEIMDALL_ENV=production` ou `prod` (échec explicite au démarrage sinon).
+Hors production, son absence génère un pepper aléatoire éphémère au démarrage
+avec avertissement : les empreintes ne sont alors pas stables entre
+redémarrages, et un déploiement doit fournir un pepper persisté. La constante
+publique `heimdall_default_vault_pepper_dev_only` est refusée sauf
+`HEIMDALL_ENV=test` explicite (fixtures déterministes). Le pepper n'est jamais
+journalisé ni renvoyé au client.
+
 Cette règle porte sur les clés d'authentification du serveur ; le
 client doit conserver son credential dans un stockage local protégé pour
 pouvoir s'authentifier. Le serveur DOIT comparer des empreintes de même type

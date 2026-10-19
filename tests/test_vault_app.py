@@ -1352,7 +1352,22 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         """Le hachage n'est jamais un SHA-256 nu (anti-corrélation inter-déploiements)."""
         key = "my-api-key-test"
         bare_sha = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        self.assertNotEqual(hash_api_key(key), bare_sha)
+        self.assertNotEqual(hash_api_key(key, pepper="test_pepper_value_123"), bare_sha)
+
+    def test_hash_api_key_requires_an_explicit_pepper(self) -> None:
+        """Aucun pepper public par défaut : None/vide est refusé (pas de repli silencieux)."""
+        for bad_pepper in (None, "", "   ", b""):
+            with self.subTest(pepper=bad_pepper):
+                with self.assertRaises(ValueError):
+                    hash_api_key("any-key", pepper=bad_pepper)  # type: ignore[arg-type]
+
+    def test_hash_api_key_accepts_bytes_pepper(self) -> None:
+        """Un pepper bytes non vide est accepté et produit le même HMAC que sa forme str."""
+        pepper = "pepper_bytes_equivalence_456"
+        self.assertEqual(
+            hash_api_key("any-key", pepper=pepper),
+            hash_api_key("any-key", pepper=pepper.encode("utf-8")),
+        )
 
     async def test_require_auth_by_default_rejects_missing_key_with_401(self) -> None:
         """create_app() sans argument exige l'auth par défaut (fail-closed, 401)."""
@@ -1398,20 +1413,75 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Format d'empreinte de clé API invalide", str(ctx_deprecated.exception))
         self.assertNotIn(raw_token, str(ctx_deprecated.exception))
 
-        # Passage d'un hash HMAC valide -> accepté
-        valid_hash = hash_api_key(raw_token)
-        app_with_hash = create_app(api_key_hashes={valid_hash: "demo"})
+        # Passage d'un hash HMAC valide (même pepper que les settings) -> accepté
+        pepper = "test_hash_pepper_value_789"
+        valid_hash = hash_api_key(raw_token, pepper=pepper)
+        app_with_hash = create_app(
+            settings=VaultSettings(api_key_pepper=pepper),
+            api_key_hashes={valid_hash: "demo"},
+        )
         self.assertEqual(app_with_hash.state.api_keys[valid_hash], "demo")
+
+        # Ancrage strict : un saut de ligne final ne doit pas être accepté ($ nu le tolère).
+        with self.assertRaises(ValueError):
+            create_app(
+                settings=VaultSettings(api_key_pepper=pepper),
+                api_key_hashes={f"{valid_hash}\n": "demo"},
+            )
 
     def test_create_app_rejects_simultaneous_api_key_hashes_and_api_keys(self) -> None:
         """create_app refuse l'usage simultané de api_key_hashes et api_keys (fail-closed)."""
-        valid_hash = hash_api_key("some-key")
+        valid_hash = hash_api_key("some-key", pepper="test_pepper_value_321")
         with self.assertRaises(ValueError) as ctx:
             create_app(
                 api_key_hashes={valid_hash: "demo"},
                 api_keys={valid_hash: "demo"},
             )
         self.assertIn("pas les deux simultanément", str(ctx.exception))
+
+    def test_create_app_rejects_invalid_project_id_for_prehashed_keys(self) -> None:
+        """Un project_id hors contrat est refusé (fail-fast) sans refléter la valeur."""
+        pepper = "test_project_validation_pepper"
+        valid_hash = hash_api_key("some-key", pepper=pepper)
+        settings = VaultSettings(api_key_pepper=pepper)
+        for bad_project in ("../..", "Demo", "demo!", "a" * 65, ""):
+            with self.subTest(project=bad_project):
+                with self.assertRaises(ValueError) as ctx:
+                    create_app(
+                        settings=settings,
+                        api_key_hashes={valid_hash: bad_project},
+                    )
+                message = str(ctx.exception)
+                self.assertIn("Identifiant de projet invalide", message)
+                if bad_project:
+                    self.assertNotIn(bad_project, message)
+
+    def test_register_api_key_rejects_invalid_project_id_without_echo(self) -> None:
+        """register_api_key valide le project_id contre PROJECT_PATTERN, sans écho."""
+        test_app = create_app()
+        raw_key = generate_api_key()
+        for bad_project in ("../..", "Demo", "demo!", ""):
+            with self.subTest(project=bad_project):
+                with self.assertRaises(ValueError) as ctx:
+                    test_app.state.register_api_key(raw_key, bad_project)
+                message = str(ctx.exception)
+                self.assertIn("Identifiant de projet invalide", message)
+                if bad_project:
+                    self.assertNotIn(bad_project, message)
+        # Un identifiant conforme est accepté (fail-fast uniquement sur l'invalide).
+        test_app.state.register_api_key(raw_key, "demo")
+        self.assertEqual(len(test_app.state.api_keys), 1)
+
+    def test_register_api_key_weak_caller_key_is_accepted(self) -> None:
+        """Pinnage #64 : la robustesse de la clé fournie par l'appelant n'est pas évaluée ici.
+
+        ``register_api_key`` est réservé aux tests/injections explicites ; la
+        politique d'entropie porte sur les clés émises par ``generate_api_key``
+        (≥ 256 bits). Décider d'un rejet des clés faibles est un choix de #64.
+        """
+        test_app = create_app()
+        test_app.state.register_api_key("a", "demo")
+        self.assertEqual(len(test_app.state.api_keys), 1)
 
     def test_vault_settings_and_hash_reject_empty_pepper(self) -> None:
         """Un pepper vide ou blanc est rejeté par VaultSettings et hash_api_key."""
@@ -1423,16 +1493,60 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     hash_api_key("any-key", pepper=empty_val)
 
     def test_vault_settings_rejects_default_pepper_in_production(self) -> None:
-        """En environnement de production, le pepper par défaut commité au repo est refusé."""
-        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}):
+        """En production, le pepper public commité au repo est refusé avec erreur explicite."""
+        _public_default = "heimdall_default_vault_pepper_dev_only"
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=True):
             with self.assertRaises(ValidationError) as ctx:
-                VaultSettings(api_key_pepper="heimdall_default_vault_pepper_dev_only")
-            self.assertIn("interdit en production", str(ctx.exception))
+                VaultSettings(api_key_pepper=_public_default)
+            self.assertIn("HEIMDALL_VAULT_API_KEY_PEPPER", str(ctx.exception))
+            self.assertIn("refusé", str(ctx.exception))
 
         # Avec un vrai pepper en production -> accepté
-        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}):
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=True):
             settings = VaultSettings(api_key_pepper="production_hardened_secret_pepper_12345")
             self.assertEqual(settings.api_key_pepper, "production_hardened_secret_pepper_12345")
+
+    def test_vault_settings_rejects_public_default_pepper_outside_explicit_test_env(self) -> None:
+        """Hors HEIMDALL_ENV=test explicite, la constante publique partagée est refusée."""
+        _public_default = "heimdall_default_vault_pepper_dev_only"
+        for env_mode in ("", "development", "staging"):
+            with self.subTest(env_mode=env_mode):
+                with patch.dict(os.environ, {"HEIMDALL_ENV": env_mode}, clear=True):
+                    with self.assertRaises(ValidationError) as ctx:
+                        VaultSettings(api_key_pepper=_public_default)
+                    self.assertIn("HEIMDALL_VAULT_API_KEY_PEPPER", str(ctx.exception))
+        # Seul un HEIMDALL_ENV=test explicite l'autorise (fixtures déterministes).
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "test"}, clear=True):
+            settings = VaultSettings(api_key_pepper=_public_default)
+            self.assertEqual(settings.api_key_pepper, _public_default)
+
+    def test_vault_settings_requires_explicit_pepper_in_production(self) -> None:
+        """En production, l'absence de pepper est une erreur fail-closed (aucun défaut public)."""
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=True):
+            with self.assertRaises(ValidationError) as ctx:
+                VaultSettings()
+            self.assertIn("obligatoire en production", str(ctx.exception))
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "prod"}, clear=True):
+            with self.assertRaises(ValidationError):
+                VaultSettings()
+
+    def test_vault_settings_generates_ephemeral_pepper_outside_production(self) -> None:
+        """Hors production, un pepper aléatoire éphémère remplace l'ancien défaut public."""
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "development"}, clear=True):
+            first = VaultSettings()
+            second = VaultSettings()
+        for generated in (first.api_key_pepper, second.api_key_pepper):
+            self.assertIsNotNone(generated)
+            assert generated is not None
+            self.assertGreaterEqual(len(generated), 43)  # token_urlsafe(32)
+            self.assertNotEqual(generated, "heimdall_default_vault_pepper_dev_only")
+        self.assertNotEqual(first.api_key_pepper, second.api_key_pepper)
+        # Le pepper résolu est utilisable directement par le hachage.
+        assert first.api_key_pepper is not None
+        self.assertEqual(
+            first.effective_api_key_pepper,
+            first.api_key_pepper,
+        )
 
     async def test_api_key_with_whitespace_rejected_401(self) -> None:
         """Une clé API avec espaces en début/fin est rejetée avec 401 sans normalisation strip()."""
