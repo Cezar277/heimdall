@@ -1,6 +1,7 @@
 """Régressions de la revue #63 : admission, SQLite async et empreintes uniques."""
 
 import asyncio
+import secrets
 import sqlite3
 import tempfile
 import threading
@@ -282,6 +283,46 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                         with self.assertRaisesRegex(ValueError, "déjà associée"):
                             create_app(settings, api_key_hashes={fingerprint: "other"})
 
+    async def test_registration_db_io_does_not_block_read_path(self) -> None:
+        """L'E/S SQLite d'enregistrement ne bloque pas la lecture des empreintes.
+
+        Correction de la remarque de revue « ``api_keys_lock`` (threading.Lock)
+        tenu pendant l'I/O DB au register » : l'enregistrement sérialise ses
+        écritures avec un verrou de PERSISTANCE distinct, et ne tient le verrou
+        de SNAPSHOT (qui protège la copie en mémoire lue par le chemin de
+        requête) que pendant les microsecondes de mise à jour du dictionnaire.
+        Le parcours exhaustif d'authentification reste donc servi pendant
+        l'enregistrement.
+        """
+        target = create_app(VaultSettings(api_key_pepper="p" * 32))
+        first_key = generate_api_key()
+        target.state.register_api_key(first_key, "demo")
+        key = generate_api_key()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_persist(app: object, key_hash: str, project_id: str) -> None:
+            started.set()
+            release.wait(timeout=10)
+
+        with patch.object(app_module, "_persist_api_key_hash", blocking_persist):
+            worker = threading.Thread(
+                target=lambda: target.state.register_api_key(key, "demo"),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(started.wait(timeout=10))
+
+            # La lecture concurrente aboutit malgré l'E/S base en cours : le
+            # parcours exhaustif voit la clé déjà enregistrée et n'attend pas.
+            project, evaluated = app_module._find_api_key_project(target, "0" * 64)
+            self.assertIsNone(project)
+            self.assertEqual(evaluated, 1)
+
+            release.set()
+            worker.join(timeout=10)
+        self.assertFalse(worker.is_alive())
+
     async def test_oversized_key_is_rejected_before_hashing(self) -> None:
         target = create_app(VaultSettings(api_key_pepper="p" * 32))
         for length in (513, 65536):
@@ -291,7 +332,8 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.json(), app_module._ERROR_PAYLOADS[401])
                 self.assertEqual(response.headers["connection"], "close")
                 hashing.assert_not_called()
-        key = (generate_api_key() * 12)[:512]
+        key = secrets.token_urlsafe(384)
+        self.assertEqual(len(key), 512)
         target.state.register_api_key(key, "demo")
         self.assertEqual((await self._authenticated_get(target, key)).status_code, 404)
         with self.assertRaises(ValueError):

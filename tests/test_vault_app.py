@@ -1000,6 +1000,75 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             {"code": "bad_request", "message": "Requête invalide"},
         )
 
+    async def test_secret_value_is_nfc_normalized_and_nul_rejected(self) -> None:
+        """Décision #62 : la valeur est canonisée en NFC, le NUL reste refusé.
+
+        La remarque de revue « SecretValue multiligne : refus ``\\x00`` seul OU
+        normalisation NFC » est tranchée : les DEUX règles s'appliquent. La forme
+        Unicode canonique (NFC) est stockée, donc deux écritures visuellement
+        identiques d'un même secret ne peuvent plus diverger en base ni produire
+        deux empreintes d'intégrité différentes. La valeur reste multiligne
+        (retours à la ligne autorisés par le contrat) et n'est jamais journalisée.
+        """
+        composed = "caf\u00e9"  # « café » en NFC
+        decomposed = "cafe\u0301"  # « café » en NFD (e + accent combinant)
+        self.assertNotEqual(composed, decomposed)
+
+        created = await self.client.post(
+            "/api/v1/secrets",
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "NFC_KEY",
+                "value": decomposed,
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertNotIn("value", created.json())
+
+        read = await self.client.get("/api/v1/secrets/demo/dev/NFC_KEY")
+        self.assertEqual(read.status_code, 200)
+        self.assertEqual(read.json()["value"], composed)
+
+        # La valeur multiligne reste acceptée et restituée à l'identique.
+        multiline = "première ligne\nseconde ligne\n"
+        created_multiline = await self.client.post(
+            "/api/v1/secrets",
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "MULTILINE_KEY",
+                "value": multiline,
+            },
+        )
+        self.assertEqual(created_multiline.status_code, 201)
+        read_multiline = await self.client.get("/api/v1/secrets/demo/dev/MULTILINE_KEY")
+        self.assertEqual(read_multiline.status_code, 200)
+        self.assertEqual(read_multiline.json()["value"], multiline)
+
+        # Le NUL reste refusé après normalisation.
+        rejected = await self.client.post(
+            "/api/v1/secrets",
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "NFC_NUL_KEY",
+                "value": "cafe\u0301\x00",
+            },
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(
+            rejected.json(),
+            {"code": "bad_request", "message": "Requête invalide"},
+        )
+
+        # Défense en profondeur : le store canonise aussi, hors chemin HTTP.
+        direct_store = InMemorySecretStore()
+        await direct_store.create("demo", "dev", "DIRECT_NFC", decomposed)
+        direct = await direct_store.get("demo", "dev", "DIRECT_NFC")
+        assert direct is not None
+        self.assertEqual(direct["value"], composed)
+
     async def test_post_secret_body_size_limit_exact_boundaries(self) -> None:
         """Exactement 1 Mio (1 048 576 octets) est accepté (201), 1 048 577 octets rejeté (400)."""
         base_doc = {
@@ -1434,6 +1503,54 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                 {"code": "rate_limited", "message": "Trop de requêtes"},
             )
 
+    async def test_capacity_429_retry_is_useless_until_capacity_freed(self) -> None:
+        """Le 429 de CAPACITÉ n'est pas transitoire : le retry échoue (documenté #62).
+
+        Le contrat impose `Retry-After` sur tout 429, mais la saturation du
+        quota de stockage ne se résorbe pas : sans route DELETE dans le contrat
+        #63, aucun emplacement ne peut être libéré. Le client qui réessaie
+        (même après le délai annoncé) reçoit donc à nouveau 429. Cette sémantique
+        est documentée dans le code (store + handler) et pinnée ici.
+        """
+        bounded_store = InMemorySecretStore(max_secrets=1, max_secrets_per_project=1)
+        test_app = create_app(secret_store=bounded_store)
+        test_key = generate_api_key()
+        test_app.state.register_api_key(test_key, "demo")
+        transport = ASGITransport(app=test_app, client=("127.0.0.1", 54321))
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": test_key},
+        ) as client:
+            first = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "CAPACITY_KEY", "value": "val1"},
+            )
+            self.assertEqual(first.status_code, 201)
+
+            for attempt in ("RETRY_1", "RETRY_2"):
+                retry = await client.post(
+                    "/api/v1/secrets",
+                    json={
+                        "project": "demo",
+                        "env": "dev",
+                        "name": attempt,
+                        "value": "val2",
+                    },
+                )
+                self.assertEqual(retry.status_code, 429)
+                self.assertEqual(retry.headers.get("retry-after"), "60")
+                self.assertEqual(
+                    retry.json(),
+                    {"code": "rate_limited", "message": "Trop de requêtes"},
+                )
+
+        # La sémantique « retry inutile » est documentée dans le code lui-même.
+        store_doc = SqliteSecretStore.__doc__ or ""
+        self.assertIn("INUTILE", store_doc)
+        self.assertIn("TODO(#62)", store_doc)
+        self.assertIn("transitoire", store_doc)
+
     async def test_post_secret_malformed_content_length_rejected_400(self) -> None:
         """Un en-tête Content-Length malformé, négatif ou dupliqué est rejeté avec HTTP 400."""
         valid_payload = json.dumps(
@@ -1703,6 +1820,61 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             # Le quota reste appliqué après la transaction concurrente.
             with self.assertRaises(QuotaExceededError):
                 await reader.create("demo", "dev", "SECRET_AFTER", "value-after")
+
+    async def test_sqlite_quota_never_exceeded_with_two_workers(self) -> None:
+        """Deux workers sur le même fichier, ``max_secrets=2`` : jamais de dépassement.
+
+        Scénario explicitement demandé par la revue : deux ``SqliteSecretStore``
+        partagent un fichier SQLite de ``tmp/`` avec une capacité de 2. Les
+        créations concurrentes sont sérialisées par ``BEGIN IMMEDIATE`` (verrou
+        d'écriture acquis AVANT ``count_secrets()``) : la base ne contient
+        jamais plus de 2 secrets et la troisième création est refusée par le
+        quota, sans corruption.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            cipher = VaultCipher(b"W" * 32)
+            max_secrets = 2
+            store_one = SqliteSecretStore(
+                db_path, cipher, max_secrets=max_secrets, max_secrets_per_project=10
+            )
+            store_two = SqliteSecretStore(
+                db_path, cipher, max_secrets=max_secrets, max_secrets_per_project=10
+            )
+
+            start = threading.Barrier(2)
+            created: list[str] = []
+            refused: list[Exception] = []
+
+            def create_in_worker(store: SqliteSecretStore, name: str) -> None:
+                start.wait(timeout=5)
+                try:
+                    asyncio.run(store.create(project="demo", env="dev", name=name, value="v"))
+                    created.append(name)
+                except Exception as exc:  # pragma: no cover - diagnostic
+                    refused.append(exc)
+
+            threads = [
+                threading.Thread(target=create_in_worker, args=(store_one, "SECRET_A")),
+                threading.Thread(target=create_in_worker, args=(store_two, "SECRET_B")),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+            self.assertFalse([thread.name for thread in threads if thread.is_alive()])
+            self.assertEqual(refused, [])
+            self.assertEqual(len(created), 2)
+
+            with db_session(db_path) as conn:
+                self.assertEqual(count_secrets(conn), max_secrets)
+
+            # La capacité est pleine : toute création supplémentaire est refusée.
+            for store in (store_one, store_two):
+                with self.assertRaises(QuotaExceededError):
+                    await store.create("demo", "dev", "SECRET_C", "v")
+            with db_session(db_path) as conn:
+                self.assertEqual(count_secrets(conn), max_secrets)
 
     def test_cipher_fingerprint_uses_dedicated_subkey_bound_to_triplet(self) -> None:
         """L'empreinte n'utilise jamais la KEK comme clé HMAC et lie le triplet.
@@ -2140,6 +2312,50 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     test_app.state.register_api_key(weak_key, "demo")
         self.assertEqual(len(test_app.state.api_keys), 0)
         # Une clé générée (43 caractères, diversité suffisante) reste acceptée.
+        test_app.state.register_api_key(generate_api_key(), "demo")
+        self.assertEqual(len(test_app.state.api_keys), 1)
+
+    def test_register_api_key_rejects_trivial_patterns(self) -> None:
+        """Politique opérateur durcie (#64) : alphabet, diversité et motif répétitif.
+
+        Correction de la remarque de revue « seuil de diversité documenté comme
+        garde-fou trivial » : le contrôle ne se limite plus à
+        ``len(set(...)) >= 12`` (qui acceptait ``"abcdefghijkl" * 4``). Une clé
+        doit être un token base64url, d'au moins 43 caractères, avec au moins 16
+        caractères distincts et sans aucune période répétitive (motifs
+        ``"abcdefghijkl" * 4``, ``"ab" * 21 + "a"``, ``"0123456789" * 4 + "012"``
+        sont refusés).
+        """
+        test_app = create_app()
+        trivial_keys = (
+            # 12 caractères distincts, période 12 : motif prévisible.
+            "abcdefghijkl" * 4,
+            # 16 caractères distincts mais bloc répété : prévisible aussi.
+            "abcdefghijklmnop" * 3,
+            # Bloc répété long, alphabet respecté.
+            "aB3-_aB3-_aB3-_aB3-_aB3-_aB3-_aB3-_aB3-_",
+        )
+        for trivial_key in trivial_keys:
+            with self.subTest(key=trivial_key):
+                with self.assertRaises(ValueError):
+                    test_app.state.register_api_key(trivial_key, "demo")
+        self.assertEqual(len(test_app.state.api_keys), 0)
+
+    def test_register_api_key_rejects_non_base64url_alphabet(self) -> None:
+        """L'alphabet de la clé est strict : ni espaces, ni contrôles, ni ponctuation."""
+        test_app = create_app()
+        forbidden_keys = (
+            "abc def ghi jkl mno pqr stu vwx yz0 12345 6789",
+            "abc+def/ghi=jkl?mno&pqr#stu@uvw%xyz0123456789ABCD",
+            "abc\x00def\x01ghi\x1fjkl\x7fmno\x1bpqr stu vwx yz012345",
+            "abc.def.ghi.jkl.mno.pqr.stu.vwx.yz0123456789ABCDEFGH",
+        )
+        for forbidden_key in forbidden_keys:
+            with self.subTest(key=forbidden_key):
+                with self.assertRaises(ValueError):
+                    test_app.state.register_api_key(forbidden_key, "demo")
+        self.assertEqual(len(test_app.state.api_keys), 0)
+        # Une clé générée (base64url) reste acceptée.
         test_app.state.register_api_key(generate_api_key(), "demo")
         self.assertEqual(len(test_app.state.api_keys), 1)
 

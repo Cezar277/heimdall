@@ -36,8 +36,11 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   refuse la constante publique commitée hors `HEIMDALL_ENV=test`, exige
   `HEIMDALL_VAULT_API_KEY_PEPPER` en production et génère hors production un
   pepper aléatoire éphémère au démarrage avec avertissement (documenté #25).
-  Les clés opérateur trop peu diverses (`"a" * 43`) sont refusées à
-  l'enregistrement : longueur seule insuffisante.
+  Les clés opérateur trop peu diverses (`"a" * 43`, `"abcdefghijkl" * 4`) ou
+  répétitives sont refusées à l'enregistrement : alphabet base64url strict,
+  43 caractères minimum, 16 caractères distincts minimum, aucune période
+  répétitive. La valeur d'un secret est canonisée en NFC avant stockage et le
+  NUL y est interdit ; elle n'est jamais journalisée (décision #62).
 - Gestion d'erreurs normalisée :
   - RequestValidationError -> 400 contractuel {"code": "bad_request", "message": "Requête invalide"}
     sans écho du corps ni enveloppe 422 de FastAPI.
@@ -51,6 +54,7 @@ import ipaddress
 import logging
 import os
 import re
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -208,11 +212,21 @@ _DUMMY_HASH: str = "0" * 64
 _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 # Politique #64 : une clé opérateur doit offrir une entropie comparable aux clés
 # émises par `generate_api_key` (``secrets.token_urlsafe(32)`` → 43 caractères,
-# 256 bits). Le seuil de 43 caractères aligne l'enregistrement manuel sur la
-# génération ; la diversité minimale refuse les motifs triviaux du type
-# « a » * 43 qui franchiraient la seule barrière de longueur.
+# 256 bits). Le contrôle est fail-closed sur les MOTIFS TRIVIAUX, en quatre
+# temps (remarque de revue « seuil de diversité trivial ») :
+# - alphabet base64url strict (A-Z, a-z, 0-9, « _ », « - ») : ni espaces ni
+#   caractères de contrôle, donc aucune ambiguïté de transport ;
+# - longueur minimale 43 caractères (matériau ≥ 256 bits si le token est
+#   canonique) ;
+# - au moins 16 caractères distincts : refuse « a » * 43 mais aussi
+#   « abcdefghijkl » * 4 (12 distincts, motif prévisible) ;
+# - aucune période répétitive : la clé ne peut pas être la répétition d'un
+#   bloc plus court (refuse « abab… », « 0123456789… », « abcdefghijklmnop » * 3).
+# Ce contrôle ne mesure PAS l'entropie : il n'exclut que les motifs triviaux.
+# L'exigence réelle reste `generate_api_key()` côté opérateur (256 bits).
 _MIN_API_KEY_LENGTH: int = 43
-_MIN_API_KEY_DISTINCT_CHARS: int = 12
+_MIN_API_KEY_DISTINCT_CHARS: int = 16
+_API_KEY_ALPHABET_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]+$")
 # Aligné sur `crypto._MIN_PEPPER_BYTES` : défense en profondeur si les
 # empreintes stockées et le pepper fuient (résistance hors ligne).
 _MIN_API_KEY_PEPPER_BYTES: int = 32
@@ -295,6 +309,20 @@ def _validate_project_id(project_id: str) -> str:
     return project_id
 
 
+def _minimal_pattern_period(value: str) -> int:
+    """Retourne la plus courte période répétée d'une chaîne (sa longueur si aucune).
+
+    Exemple : « abcdefghijkl » * 4 → 12, « ababab… » → 2, une chaîne sans
+    motif répété → sa longueur. Complexité O(n²) bornée par la longueur
+    maximale de clé (512) : l'appel est réservé à l'enregistrement.
+    """
+    length = len(value)
+    for period in range(1, length // 2 + 1):
+        if all(value[index] == value[index % period] for index in range(length)):
+            return period
+    return length
+
+
 def _validate_raw_api_key(raw_key: str) -> str:
     """Valide une clé opérateur brute avant hachage (fail-fast, sans écho).
 
@@ -302,12 +330,13 @@ def _validate_raw_api_key(raw_key: str) -> str:
     (``secrets.token_urlsafe(32)``, 256 bits, 43 caractères) ou offrir une
     diversité équivalente. La longueur seule ne suffit pas : ``"a" * 43``
     serait brute-forçable hors ligne si la base d'empreintes et le pepper
-    fuyaient. Le message reste générique et ne reflète jamais la clé.
-    NOTE : ce garde-fou ne pinnera qu'un refus de motifs triviaux
-    (``len(set(...)) < 12``), pas une garantie d'entropie — un motif
-    prévisible à 12 caractères distincts reste accepté ici ; l'exigence
-    réelle d'entropie (``generate_api_key()`` côté opérateur) est suivie
-    en #64.
+    fuyaient. Quatre contrôles cumulatifs refusent les motifs triviaux :
+    alphabet base64url strict, longueur ≥ 43, ≥ 16 caractères distincts et
+    absence de période répétitive (la clé ne peut pas être la répétition d'un
+    bloc plus court : « abcdefghijkl » * 4 et « abcdefghijklmnop » * 3 sont
+    désormais refusés). Le message reste générique et ne reflète jamais la clé.
+    Ce contrôle reste un filtre de motifs triviaux, PAS une mesure d'entropie :
+    l'exigence réelle reste ``generate_api_key()`` côté opérateur (#64).
     """
     if (
         not isinstance(raw_key, str)
@@ -319,10 +348,21 @@ def _validate_raw_api_key(raw_key: str) -> str:
             f"{_MIN_API_KEY_LENGTH} et {_MAX_API_KEY_LENGTH} caractères, "
             "sans espaces de début ou de fin."
         )
+    if _API_KEY_ALPHABET_PATTERN.match(raw_key) is None:
+        raise ValueError(
+            "La clé API brute doit être un token base64url (A-Z, a-z, 0-9, "
+            "« _ » et « - ») : ni espaces ni caractères de contrôle."
+        )
     if len(set(raw_key)) < _MIN_API_KEY_DISTINCT_CHARS:
         raise ValueError(
             "La clé API brute est trop peu diverse : utiliser generate_api_key() "
             "ou une clé aléatoire d'au moins 256 bits (motif trivial refusé)."
+        )
+    if _minimal_pattern_period(raw_key) != len(raw_key):
+        raise ValueError(
+            "La clé API brute repose sur un motif répétitif : utiliser "
+            "generate_api_key() ou une clé aléatoire d'au moins 256 bits "
+            "(motif trivial refusé)."
         )
     return raw_key
 
@@ -353,7 +393,9 @@ SecretName = Annotated[
 ]
 # NOTE DE SÉCURITÉ : Ne jamais journaliser SecretValue (valeur sensible brute pouvant
 # contenir des caractères de contrôle ou retours chariot multilignes : risque de log
-# injection et de fuite en clair).
+# injection et de fuite en clair). Décision #62 : la valeur est canonisée en NFC
+# (forme Unicode canonique unique) et l'octet NUL reste interdit ; les retours à
+# la ligne restent autorisés (valeur multiligne contractuelle).
 SecretValue = Annotated[
     str,
     StringConstraints(
@@ -375,14 +417,24 @@ class SecretCreate(BaseModel):
 
     @field_validator("value")
     @classmethod
-    def validate_value_no_null(cls, v: str) -> str:
-        """Refuse les octets NUL dans la valeur du secret (défense en profondeur).
+    def validate_value(cls, v: str) -> str:
+        """Canonise la valeur en NFC et refuse l'octet NUL (défense en profondeur).
 
-        Ne jamais journaliser cette valeur en cas d'erreur (anti-fuite de secret).
+        Décision #62 (tranchée) : « refus du seul ``\\x00`` » OU « normalisation
+        NFC ». Les DEUX sont appliquées : la normalisation NFC donne une forme
+        canonique unique (deux écritures visuellement identiques d'un même
+        secret ne peuvent plus diverger en base, ni produire deux empreintes
+        d'intégrité différentes) et le NUL reste interdit car il tronque les
+        valeurs dans les.outils texte.
+
+        La valeur reste multiligne (retours à la ligne autorisés par le
+        contrat) : c'est précisément pourquoi elle ne doit JAMAIS être
+        journalisée (log injection / fuite en clair).
+        Ne jamais journaliser cette valeur en cas d'erreur (anti-fuite).
         """
         if "\x00" in v:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
-        return v
+        return unicodedata.normalize("NFC", v)
 
 
 class SecretMetadata(BaseModel):
@@ -1319,9 +1371,14 @@ def _register_routes(app: FastAPI) -> None:
                 detail="Secret déjà existant",
             ) from None
         except QuotaExceededError:
-            # 429 contractuel : le Retry-After est obligatoire, mais la capacité
-            # pleine n'est pas transitoire tant qu'aucune route DELETE n'existe
-            # (retry inutile documenté, TODO(#62)).
+            # 429 de CAPACITÉ (quota de stockage, #62) : distinct du 429 de
+            # DÉBIT (rate-limit, #65), lui transitoire.
+            # Le contrat OpenAPI impose `Retry-After` sur TOUT 429, donc
+            # l'en-tête est présent même ici ; en revanche ce 429 n'est PAS
+            # transitoire : sans route DELETE dans le contrat #63, un retry
+            # (même après le délai annoncé) sera refusé tant que la capacité
+            # reste pleine. Le retry est donc INUTILE jusqu'à libération d'un
+            # emplacement (route DELETE + quotas par projet, TODO(#62)).
             raise StarletteHTTPException(
                 status_code=429,
                 detail="Trop de requêtes",
@@ -1510,6 +1567,10 @@ def create_app(
                 )
             validated_hashes[key_candidate] = _validate_project_id(project_id)
     app.state.api_keys_lock = Lock()
+    # Verrou de persistance distinct du verrou de snapshot : l'écriture SQLite
+    # de l'enregistrement ne bloque jamais la copie en mémoire lue par le
+    # chemin de requête (remarque de revue « api_keys_lock tenu pendant l'I/O DB »).
+    app.state.api_keys_persist_lock = Lock()
     app.state.api_keys = validated_hashes
     for preregistered_hash, preregistered_project in validated_hashes.items():
         _persist_api_key_hash(app, preregistered_hash, preregistered_project)
@@ -1519,20 +1580,37 @@ def create_app(
 
         Les clés DOIVENT être générées par ``generate_api_key()`` (256 bits) ou
         offrir une diversité équivalente : la longueur seule est insuffisante et
-        les motifs triviaux (``"a" * 43``) sont refusés. L'identifiant de projet
-        est validé contre ``PROJECT_PATTERN`` : une clé liée à un identifiant
-        hors contrat ne pourrait jamais matcher une requête et provoquerait un
-        403 silencieux à chaque appel.
+        les motifs triviaux (``"a" * 43``, ``"abcdefghijkl" * 4``) sont refusés.
+        L'identifiant de projet est validé contre ``PROJECT_PATTERN`` : une clé
+        liée à un identifiant hors contrat ne pourrait jamais matcher une
+        requête et provoquerait un 403 silencieux à chaque appel.
+
+        ENREGISTREMENT AU DÉMARRAGE UNIQUEMENT (phase d'amorçage) : la fonction
+        est synchrone et performs une E/S SQLite. Deux verrous distincts la
+        protègent sans coupler le chemin de lecture des requêtes à l'I/O base :
+
+        - ``api_keys_persist_lock`` sérialise les écritures (pas de double
+          persistance de la même empreinte, pas de conflit de projet) ;
+        - ``api_keys_lock`` protège la copie en mémoire ; il n'est jamais tenu
+          pendant l'E/S base, donc la lecture concurrente des empreintes
+          (parcours exhaustif du chemin d'authentification) ne bloque pas.
+
+        Aucun ``asyncio.Lock`` n'est introduit ici : la fonction est synchrone et
+        appelée hors de la boucle asyncio (amorçage, CLI, tests).
         """
         raw_key = _validate_raw_api_key(raw_key)
         _validate_project_id(project_id)
         key_hash = hash_api_key(raw_key, pepper=effective_settings.effective_api_key_pepper)
-        with app.state.api_keys_lock:
-            registered_project = app.state.api_keys.get(key_hash)
-            if registered_project is not None and registered_project != project_id:
-                raise ValueError("Cette clé API est déjà associée à un autre projet.")
+        with app.state.api_keys_persist_lock:
+            with app.state.api_keys_lock:
+                registered_project = app.state.api_keys.get(key_hash)
+                if registered_project is not None and registered_project != project_id:
+                    raise ValueError("Cette clé API est déjà associée à un autre projet.")
+            # E/S base hors du verrou de snapshot : la lecture des requêtes
+            # reste servie pendant l'enregistrement.
             _persist_api_key_hash(app, key_hash, project_id)
-            app.state.api_keys[key_hash] = project_id
+            with app.state.api_keys_lock:
+                app.state.api_keys[key_hash] = project_id
 
     app.state.register_api_key = register_api_key
 

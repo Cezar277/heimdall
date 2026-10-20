@@ -8,6 +8,12 @@ au repos (AES-256-GCM via KEK) et la persistance SQLite sont implémentés dans
 #25/#26/#62 ; la gestion de clés par identifiant (`encrypt_at_rest`/`key_id`) et
 la révocation restent suivies dans leurs tickets dédiés.
 
+La traçabilité ticket → module → preuve de ce lot est dans
+[vault-traceability.md](./vault-traceability.md) : chaque brique livrée ici
+(chiffrement #26, stockage/quota #62, authentification #64, débit #65, routes
+#63) est rattachée à son ticket et à ses tests, et le découpage en PR
+distinctes est décrit au même endroit.
+
 ## Routes et décisions à relire
 
 | Méthode | Route | Succès | Contenu |
@@ -28,6 +34,14 @@ décodage de l'URL. Ces identifiants ne sont pas des chemins de fichiers.
 
 La valeur n'apparaît que dans le corps POST et dans la réponse GET autorisée.
 Elle accepte les clés multilignes et est limitée à 65536 caractères Unicode.
+Le serveur **DOIT (MUST) canoniser la valeur en Unicode NFC avant stockage**
+(décision #62, tranchée) : une forme canonique unique garantit que deux
+écritures visuellement identiques d'un même secret ne peuvent ni diverger en
+base, ni produire deux empreintes d'intégrité différentes. L'octet NUL (`\x00`)
+reste **interdit** (HTTP 400) car il tronque les valeurs dans les outils texte.
+Les retours à la ligne restent autorisés : la valeur **ne doit jamais être
+journalisée** (log injection, fuite en clair) — c'est une obligation
+d'implémentation, pas une option.
 Le serveur **DOIT (MUST) rejeter avec HTTP 400 tout corps de requête supérieur
 à 1 Mio (1 048 576 octets), avant le parsing JSON**, avec
 `{"code":"bad_request","message":"Requête invalide"}`. Il DOIT compter les
@@ -81,10 +95,30 @@ est refusé au démarrage (`ValidationError`, fail-closed), comme le backend `me
 interdit et la KEK obligatoire pour SQLite.
 
 Les clés opérateur enregistrées via `register_api_key` **DOIVENT** provenir de
-`generate_api_key()` (`secrets.token_urlsafe(32)`, 256 bits) ou offrir une
-diversité équivalente : la longueur seule (`>= 43` caractères) ne suffit pas.
-Les motifs triviaux comme `"a" * 43` sont refusés (`ValueError`) pour éviter
-un brute-force hors ligne si les empreintes stockées et le pepper fuient.
+`generate_api_key()` (`secrets.token_urlsafe(32)`, 256 bits). L'enregistrement
+applique quatre contrôles cumulatifs, fail-closed et sans écho de la valeur :
+
+| Contrôle | Règle | Motifs refusés |
+|---|---|---|
+| Alphabet | token base64url strict `A-Z a-z 0-9 _ -` | espaces, contrôles, ponctuation |
+| Longueur | `43 <= len <= 512` caractères | clés courtes ou surdimensionnées |
+| Diversité | `>= 16` caractères distincts | `"a" * 43`, `"abcdefghijkl" * 4` |
+| Motif | aucune période répétitive (la clé n'est pas la répétition d'un bloc plus court) | `"abab…"`, `"0123456789…"`, `"abcdefghijklmnop" * 3` |
+
+Ces contrôles filtrent les **motifs triviaux** ; ils ne mesurent pas l'entropie
+et ne remplacent pas `generate_api_key()` côté opérateur, qui reste la seule
+source acceptable de clé. Un refus lève `ValueError` avec un message générique
+(jamais l'écho de la clé). La matrice de tests est dans
+`tests/test_vault_app.py` (`test_register_api_key_rejects_weak_caller_key`,
+`test_register_api_key_rejects_trivial_patterns`,
+`test_register_api_key_rejects_non_base64url_alphabet`).
+
+L'enregistrement est une opération d'**amorçage** : il sérialise ses écritures
+avec un verrou de persistance distinct du verrou de snapshot qui protège la
+copie en mémoire des empreintes. L'E/S SQLite n'est jamais tenue sous le
+verrou de snapshot : le parcours exhaustif d'authentification (chemin de
+requête) reste servi pendant un enregistrement.
+
 `create()` retourne uniquement les métadonnées ; le plaintext n'est déchiffré
 que par la lecture autorisée et n'est jamais renvoyé au POST.
 
@@ -147,6 +181,10 @@ transaction que l'insertion, sous `BEGIN IMMEDIATE` : le verrou d'écriture est
 acquis avant le comptage, ce qui empêche tout dépassement inter-workers. Un 429
 de capacité n'est pas transitoire sans route DELETE : le retry reste refusé
 tant que la capacité est pleine, même si `Retry-After` reste contractuel.
+Le client ne doit donc pas boucler sur ce 429 : le retry est **inutile**
+tant que la capacité est pleine (libération par une route DELETE suivie en
+#62). Ce 429 de capacité est distinct du 429 de débit (rate-limit), lui
+transitoire.
 Les rejets avant lecture du corps répondent `Connection: close` : 400 du
 middleware de taille, 429 de débit (pair/global et clé), 403 loopback et 401 pour
 une clé surdimensionnée. Les tests socket uvicorn/h11 vérifient la fermeture,
@@ -175,7 +213,11 @@ Transport (#25) : en production, `run_server` refuse de démarrer sans
 `HEIMDALL_VAULT_SSL_CERTFILE` et `HEIMDALL_VAULT_SSL_KEYFILE` (fail-closed) et
 transmet les deux chemins à uvicorn. Le HTTP en clair reste confiné à la boucle
 locale en développement ; le certificat doit porter le SAN IP `127.0.0.1` pour
-`https://127.0.0.1:8443`. La révocation des clés API reste suivie séparément.
+`https://127.0.0.1:8443`. Le transport est vérifié de bout en bout dans
+`tests/test_vault_tls.py` : SAN IP contrôlé côté pair, client de confiance
+accepté, client sans confiance rejeté (aucun repli non vérifié), pas de
+downgrade en clair, TLS 1.3 observé. La révocation des clés API reste suivie
+séparément.
 
 Cette règle porte sur les clés d'authentification du serveur ; le
 client doit conserver son credential dans un stockage local protégé pour

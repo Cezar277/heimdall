@@ -17,11 +17,14 @@ Deux implémentations interchangeables exposent la même interface asynchrone
 Aucun module ne stocke de valeur brute en base, dans les logs ou dans un dict
 interne : les valeurs ne sont déchiffrées qu'au moment de la réponse autorisée.
 ``create`` ne retourne que les métadonnées (jamais le plaintext) ; seule la
-lecture autorisée ``get`` déchiffre la valeur.
+lecture autorisée ``get`` déchiffre la valeur. Les valeurs stockées sont
+canonicalisées en Unicode NFC (décision #62) : deux écritures visuellement
+identiques d'un même secret ne peuvent pas diverger en base.
 """
 
 import asyncio
 import sqlite3
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +124,10 @@ class InMemorySecretStore:
     async def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         key = (project, env, name)
         aad = VaultCipher.aad(project, env, name)
+        # Défense en profondeur : la valeur stockée est canonique (NFC), même si
+        # l'appelant contourne la validation HTTP (décision #62). La
+        # normalisation est idempotente, donc sans effet pour l'API.
+        value = unicodedata.normalize("NFC", value)
         async with self._lock:
             if key in self._secrets:
                 raise KeyError("Secret déjà existant")
@@ -167,10 +174,15 @@ class SqliteSecretStore:
     même transaction que l'insertion, sous ``BEGIN IMMEDIATE`` : le verrou
     d'écriture SQLite est acquis avant ``count_secrets()``, ce qui sérialise le
     comptage et la création entre processus et empêche tout dépassement
-    inter-workers. Le 429 de capacité (``QuotaExceededError``) n'est pas
-    transitoire : sans route DELETE, un retry avec ``Retry-After`` restera
-    refusé tant que la capacité est pleine ; le contrat impose néanmoins
-    l'en-tête sur tout 429.
+    inter-workers.
+
+    Le 429 de capacité (``QuotaExceededError``) n'est PAS transitoire : le
+    contrat impose l'en-tête ``Retry-After`` sur tout 429, mais un retry avec
+    ce délai restera refusé tant que la capacité est pleine — le contrat #63
+    n'expose aucune route DELETE, donc aucun emplacement ne peut être libéré.
+    Le retry est donc INUTILE tant que la capacité est pleine ; la libération
+    (route DELETE, quotas par projet) est suivie dans TODO(#62). Ce 429 de
+    capacité est distinct du 429 de débit (rate-limit, #65), lui transitoire.
 
     L'empreinte d'intégrité persistée utilise la sous-clé HKDF dédiée et le
     triplet ``(project, env, name)`` fournis par ``VaultCipher`` : jamais la KEK
@@ -219,6 +231,10 @@ class SqliteSecretStore:
 
     def _create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         aad = VaultCipher.aad(project, env, name)
+        # Défense en profondeur : valeur canonique (NFC) même hors du chemin
+        # HTTP, pour que l'empreinte d'intégrité soit toujours calculée sur la
+        # forme stockée (décision #62).
+        value = unicodedata.normalize("NFC", value)
         with db_session(self._db_path) as conn:
             # Verrou d'écriture inter-processus AVANT le comptage : le
             # quota et l'insertion forment une seule transaction atomique,

@@ -76,8 +76,14 @@ Le backend mémoire, réservé aux tests/développement, chiffre également les
 valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
 Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets
 (256 bits) ; les clés opérateur enregistrées doivent être générées par
-`generate_api_key()` ou offrir une diversité équivalente (les motifs triviaux
-comme `"a" * 43` sont refusés).
+`generate_api_key()` : l'enregistrement est fail-closed et refuse tout token
+qui n'est pas un base64url strict (`A-Z a-z 0-9 _ -`), qui fait moins de 43
+caractères, qui compte moins de 16 caractères distincts ou qui est la répétition
+d'un bloc plus court (`"a" * 43`, `"abcdefghijkl" * 4` : refusés). La valeur
+d'un secret est canonisée en Unicode NFC avant stockage et l'octet NUL y est
+interdit ; elle n'est jamais journalisée. La traçabilité
+ticket → module → preuve est dans
+[`docs/contracts/vault-traceability.md`](docs/contracts/vault-traceability.md).
 
 > **Environnement cible (POSIX requis)** :
 > Heimdall Vault requiert un système POSIX (Linux, macOS, BSD) pour garantir le durcissement fail-closed des permissions (`0600` pour la base, `0700` pour les répertoires). Sous Windows, ces permissions ne sont pas applicables nativement : l'ouverture de la base refuse fail-closed (`RuntimeError`, aucun avertissement suivi de poursuite) — Windows est strictement hors cible de déploiement en production.
