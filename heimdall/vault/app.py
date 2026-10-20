@@ -92,6 +92,7 @@ from heimdall.vault.crypto import (
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
     DatabaseUnavailableError,
+    _assert_not_symlink,
     ensure_project,
     get_iso_timestamp,
     resolve_db_path,
@@ -882,7 +883,12 @@ class VaultSettings(BaseSettings):
     @field_validator("ssl_certfile", "ssl_keyfile")
     @classmethod
     def validate_tls_file(cls, value: str | None) -> str | None:
-        """Valide un fichier TLS : absolu, existant, régulier, sans espace de bord."""
+        """Valide un fichier TLS : absolu, existant, régulier, sans symlink, sans espace de bord.
+
+        Les liens symboliques sont refusés via le même garde que la couche DB
+        (`_assert_not_symlink`, invariant n°3) : uvicorn suivrait sinon la cible
+        à l'ouverture, hors du chemin validé (TOCTOU).
+        """
         if value is None:
             return None
         if not value or value != value.strip():
@@ -892,6 +898,12 @@ class VaultSettings(BaseSettings):
             raise ValueError("Le chemin TLS doit être absolu.")
         if not path.is_file():
             raise ValueError("Le fichier TLS est introuvable ou n'est pas un fichier régulier.")
+        try:
+            _assert_not_symlink(path)
+        except PermissionError as exc:
+            raise ValueError(
+                "Le chemin TLS ne doit pas être un lien symbolique ni en traverser un."
+            ) from exc
         return str(path)
 
     @model_validator(mode="after")

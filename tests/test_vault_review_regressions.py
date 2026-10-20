@@ -404,6 +404,52 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                         await store.create("demo", "dev", "NUL_KEY", "a\x00b")
                     self.assertNotIn("a\x00b", str(ctx.exception))
 
+    async def test_full_scan_cost_is_pinned_at_bounded_cardinality(self) -> None:
+        """Verrouille LOW n°2 (full-scan O(N)) : à cardinalité bornée, coût pinné.
+
+        Le parcours exhaustif à coût comparable est conservé (anti-oracle) ;
+        ce test pince le plafond : N=25 empreintes → exactement 25 évaluations
+        par parcours (connue comme inconnue), et la requête HTTP aboutit
+        (404, ni 429 ni 500) à cette cardinalité, sur les deux backends.
+        """
+        for backend in ("memory", "sqlite"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmp:
+                target = create_app(
+                    VaultSettings(
+                        db_path=str(Path(tmp) / f"{backend}.db"),
+                        storage_backend=backend,
+                        kek=generate_encryption_key(),
+                        api_key_pepper="p" * 32,
+                    )
+                )
+                keys = [generate_api_key() for _ in range(25)]
+                for key in keys:
+                    target.state.register_api_key(key, "demo")
+                wanted = hash_api_key(keys[0], pepper="p" * 32)
+                project, evaluated = app_module._find_api_key_project(target, wanted)
+                self.assertEqual(project, "demo")
+                self.assertEqual(evaluated, 25)
+                unknown, evaluated_unknown = app_module._find_api_key_project(
+                    target, "f" * 64
+                )
+                self.assertIsNone(unknown)
+                self.assertEqual(evaluated_unknown, 25)
+                self.assertEqual(
+                    (await self._authenticated_get(target, keys[0])).status_code, 404
+                )
+
+    def test_indexed_lookup_is_banned_from_auth_path(self) -> None:
+        """Verrouille LOW n°3 : `get_api_key_by_hash` jamais utilisé dans `app.py`.
+
+        L'égalité SQL n'est pas à temps constant (oracle temporel) : seul le
+        full-scan à coût comparable sert l'authentification. La fonction reste
+        disponible pour l'admin/outils et les tests DB.
+        """
+        app_source = (
+            Path(__file__).resolve().parents[1] / "heimdall" / "vault" / "app.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("get_api_key_by_hash", app_source)
+
     async def test_quota_429_is_permanent_while_rate_429_is_transient(self) -> None:
         """Distingue quota (capacité) et débit : seul le débit se résorbe.
 
