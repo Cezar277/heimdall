@@ -53,9 +53,37 @@ Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) vi
 #   via $HEIMDALL_VAULT_DB_PATH et côté serveur — fail-closed)
 python -m heimdall.vault.init_db
 
+# Variables minimales d'un déploiement réel (aucune valeur publique par défaut) :
+# KEK : python -c "from heimdall.vault.crypto import generate_encryption_key; print(generate_encryption_key())"
+export HEIMDALL_ENV=production
+export HEIMDALL_VAULT_API_KEY_PEPPER='<pepper aléatoire persistant, distinct de la KEK>'
+export HEIMDALL_VAULT_KEK='<KEK AES-256 base64, 32 octets, distincte du pepper>'
+# TLS obligatoire en production : certificat avec SAN IP 127.0.0.1 + clé privée.
+export HEIMDALL_VAULT_SSL_CERTFILE='/chemin/absolu/server.crt'
+export HEIMDALL_VAULT_SSL_KEYFILE='/chemin/absolu/server.key'
+# Backend par défaut en production : sqlite (chiffré, partagé entre workers).
+# Hors production : memory (chiffré éphémère, strictement mono-processus).
+# export HEIMDALL_VAULT_STORAGE_BACKEND=sqlite
+
 # Lancement du serveur Vault (point d'entrée unique, boucle locale vérifiée) :
 python -m heimdall.vault.app
 ```
+
+Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une KEK qui ne
+réside jamais dans la base ; `UNIQUE(project_id, env, name)` garantit le 409
+inter-workers et `PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
+Le backend mémoire, réservé aux tests/développement, chiffre également les
+valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
+Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets
+(256 bits) ; les clés opérateur enregistrées doivent être générées par
+`generate_api_key()` : l'enregistrement est fail-closed et refuse tout token
+qui n'est pas un base64url strict (`A-Z a-z 0-9 _ -`), qui fait moins de 43
+caractères, qui compte moins de 16 caractères distincts ou qui est la répétition
+d'un bloc plus court (`"a" * 43`, `"abcdefghijkl" * 4` : refusés). La valeur
+d'un secret est canonisée en Unicode NFC avant stockage et l'octet NUL y est
+interdit ; elle n'est jamais journalisée. La traçabilité
+ticket → module → preuve est dans
+[`docs/contracts/vault-traceability.md`](docs/contracts/vault-traceability.md).
 
 > **Environnement cible (POSIX requis)** :
 > Heimdall Vault requiert un système POSIX (Linux, macOS, BSD) pour garantir le durcissement fail-closed des permissions (`0600` pour la base, `0700` pour les répertoires). Sous Windows, ces permissions ne sont pas applicables nativement : l'ouverture de la base refuse fail-closed (`RuntimeError`, aucun avertissement suivi de poursuite) — Windows est strictement hors cible de déploiement en production.
@@ -64,11 +92,31 @@ python -m heimdall.vault.app
 > Ce squelette minimal (#25) est strictement confiné à la boucle locale (`127.0.0.1`, `::1`, `localhost`).
 > Ne jamais exposer ce serveur en clair hors de localhost ni réutiliser ce montage HTTP au-delà du squelette minimal (#25). Les exigences runtime suivantes sont tracées et attribuées aux tickets du Vault :
 > - **Rejet fail-closed HTTP 403 sur IP non-loopback** : garde middleware en défense en profondeur (niveau transport/socket), volontairement maintenue hors du contrat OpenAPI applicatif (`/api/v1/health` étant publique sans clé).
-> - **TLS avec SAN IP obligatoire (`https://127.0.0.1:8443`)** : tickets #64 / #65.
+> - **TLS avec SAN IP (`https://127.0.0.1:8443`)** : obligatoire en production
+>   (`HEIMDALL_VAULT_SSL_CERTFILE` + `HEIMDALL_VAULT_SSL_KEYFILE`), HTTP en clair
+>   réservé au développement local. La révocation de clés reste suivie séparément.
 > - **Authentification par clé API de projet (`X-Heimdall-API-Key`)** : ticket #64.
 > - **Rejet HTTP 400 avant parsing au-delà de 1 Mio (1 048 576 octets)** : ticket #63.
 > - **En-tête `Cache-Control: no-store`** : ticket #63.
-> - **Rate-limit par bucket avec `Retry-After`** : ticket #64.
+> - **Rate-limit débit par clé validée, pair réseau et global avec `Retry-After`** : ticket #65.
+> - **Chiffrement au repos et persistance SQLite** : tickets #26 / #62.
+
+> **Limites de déploiement à l'état #63** :
+> - **Transport** : le lanceur `python -m heimdall.vault.app` refuse de démarrer
+>   en production sans certificat et clé TLS (`HEIMDALL_VAULT_SSL_CERTFILE`,
+>   `HEIMDALL_VAULT_SSL_KEYFILE`). Le HTTP en clair reste réservé à la boucle
+>   locale en développement. La révocation de clés reste à livrer dans son
+>   ticket dédié (#64).
+> - **Rate-limit partagé avec SQLite** : les buckets (clé validée, pair réseau,
+>   global) sont persistés dans la base sous transaction `BEGIN IMMEDIATE`, donc
+>   partagés entre workers sans multiplication du débit. Le backend mémoire reste
+>   strictement mono-processus ; `run_server` épingle `workers=1` par défaut.
+> - **Quota de stockage atomique** : avec plusieurs workers SQLite, la capacité
+>   `max_secrets`/`max_secrets_per_project` est vérifiée sous transaction
+>   `BEGIN IMMEDIATE` (verrou d'écriture acquis avant le comptage), donc sans
+>   dépassement inter-workers. L'unicité `UNIQUE(project_id, env, name)` reste
+>   garantie ; un 429 de capacité n'est pas transitoire tant qu'aucune route
+>   DELETE n'existe (retry inutile documenté, #62).
 
 Vérifier la santé minimale (`/api/v1/health` contractuel) :
 

@@ -60,6 +60,7 @@ _SECURE_FILE_MODE: int = 0o600
 _SECURE_DIR_MODE: int = 0o700
 _DIR_PERM_MASK: int = 0o777
 _CONTROL_CHAR_THRESHOLD: int = 0x20
+SQLITE_TIMEOUT_SECONDS: float = 0.25
 
 # `/dev/fd/N` (procfs Linux) permet à SQLite d'ouvrir l'inode EXACT déjà validé
 # par un descripteur épinglé `O_NOFOLLOW`, fermant la fenêtre TOCTOU de
@@ -87,7 +88,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_project_id ON api_keys(project_id);
-CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_api_keys_key_hash ON api_keys(key_hash);
 
 CREATE TABLE IF NOT EXISTS secrets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,6 +106,14 @@ CREATE TABLE IF NOT EXISTS secrets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_secrets_project_env_name ON secrets(project_id, env, name);
+
+-- Buckets de rate-limiting partagés entre workers (ticket #65). Les noms de
+-- buckets par clé sont des empreintes HMAC, jamais les clés brutes.
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+    name TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    reset_at REAL NOT NULL
+);
 """
 
 
@@ -545,7 +554,7 @@ def _connect_pinned_fd(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]
                 "Permissions de la base SQLite insuffisantes : attendu 0o600, "
                 f"obtenu {oct(applied_mode)}"
             )
-        conn = sqlite3.connect(f"/dev/fd/{fd}")
+        conn = sqlite3.connect(f"/dev/fd/{fd}", timeout=SQLITE_TIMEOUT_SECONDS)
         opened_identity = (fd_stat.st_dev, fd_stat.st_ino)
     except BaseException:
         os.close(fd)
@@ -577,7 +586,7 @@ def _connect_by_path(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]:
     _assert_not_symlink(path)
     _apply_secure_permissions(path)
     pre_open_stat = _stat_no_follow(path)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SECONDS)
     return conn, (pre_open_stat.st_dev, pre_open_stat.st_ino)
 
 
@@ -621,7 +630,7 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     if isinstance(resolved, Path):
         conn = _open_db_file(resolved)
     else:
-        conn = sqlite3.connect(resolved)
+        conn = sqlite3.connect(resolved, timeout=SQLITE_TIMEOUT_SECONDS)
 
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -637,6 +646,26 @@ def db_session(db_path: Path | str | None = None) -> Generator[sqlite3.Connectio
             yield conn
     finally:
         conn.close()
+
+
+class DatabaseUnavailableError(Exception):
+    """Stockage indisponible (contention ou panne), sans détail sensible."""
+
+
+@contextmanager
+def runtime_db_session(db_path: Path | str) -> Generator[sqlite3.Connection, None, None]:
+    """Traduit les pannes DB du serveur ; préserve les erreurs de programmation/intégrité.
+
+    La session de bas niveau reste disponible pour les outils d'administration.
+    Ouverture, transaction, commit et fermeture sont tous couverts ici.
+    """
+    try:
+        with db_session(db_path) as conn:
+            yield conn
+    except (sqlite3.IntegrityError, sqlite3.ProgrammingError):
+        raise
+    except (sqlite3.DatabaseError, OSError):
+        raise DatabaseUnavailableError("Stockage temporairement indisponible.") from None
 
 
 def _verify_schema(conn: sqlite3.Connection) -> None:
@@ -718,6 +747,18 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO projects (id, created_at) VALUES (?, ?);",
             (probe_proj, "2026-01-01"),
         )
+
+        # Une empreinte ne peut jamais désigner deux clés/projets.
+        probe_hash = f"schema_probe_hash_{uuid4().hex}"
+        create_api_key(conn, f"probe_key_{uuid4().hex}", probe_proj, probe_hash)
+        try:
+            create_api_key(conn, f"probe_key_{uuid4().hex}", probe_proj, probe_hash)
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise RuntimeError(
+                "Schéma de base de données non conforme : UNIQUE(key_hash) manquant."
+            )
 
         # Test comportemental du CHECK sur status
         chk_enforced = False
@@ -848,6 +889,19 @@ def create_project(
     return {"id": project_id, "created_at": ts}
 
 
+def ensure_project(
+    conn: sqlite3.Connection,
+    project_id: str,
+    created_at: str | None = None,
+) -> None:
+    """Crée le projet s'il n'existe pas (idempotent, requête paramétrée)."""
+    ts = created_at or get_iso_timestamp()
+    conn.execute(
+        "INSERT OR IGNORE INTO projects (id, created_at) VALUES (?, ?)",
+        (project_id, ts),
+    )
+
+
 def get_project(conn: sqlite3.Connection, project_id: str) -> dict[str, Any] | None:
     """Récupère un projet par son identifiant."""
     query = "SELECT id, created_at FROM projects WHERE id = ?"
@@ -911,7 +965,16 @@ def get_api_key(conn: sqlite3.Connection, key_id: str) -> dict[str, Any] | None:
 
 
 def get_api_key_by_hash(conn: sqlite3.Connection, key_hash: str) -> dict[str, Any] | None:
-    """Récupère une clé API par son haché de vérification."""
+    """Récupère une clé API par son haché de vérification.
+
+    DÉPRÉCIÉ POUR L'AUTHENTIFICATION : l'égalité est évaluée par SQLite, donc
+    PAS en temps constant (oracle temporel sur l'existence d'une empreinte).
+    Le chemin d'authentification du serveur DOIT utiliser le full-scan à coût
+    comparable (`app._find_api_key_project` + `constant_time_equal`, sans
+    `break`) ; cette fonction reste réservée aux accès admin/outils hors
+    requête (tests unitaires de la couche DB). Ne jamais l'appeler depuis
+    `heimdall/vault/app.py` (garde : test grep dédié).
+    """
     query = (
         "SELECT id, project_id, key_hash, created_at, revoked_at FROM api_keys WHERE key_hash = ?"
     )
@@ -1057,6 +1120,24 @@ def list_secrets(
         )
         cursor = conn.execute(query, (project_id,))
     return [dict(row) for row in cursor.fetchall()]
+
+
+def count_secrets(conn: sqlite3.Connection, project_id: str | None = None) -> int:
+    """Compte les secrets (globalement ou pour un projet), sans exposer de valeur."""
+    if project_id is None:
+        row = conn.execute("SELECT COUNT(*) FROM secrets").fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM secrets WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def delete_all_secrets(conn: sqlite3.Connection) -> int:
+    """Supprime tous les secrets (isolation des tests, jamais exposé par l'API)."""
+    cursor = conn.execute("DELETE FROM secrets")
+    return cursor.rowcount
 
 
 def update_secret(  # noqa: PLR0913
