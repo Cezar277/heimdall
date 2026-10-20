@@ -163,10 +163,14 @@ La génération du pepper et les comparaisons sensibles sont confinées dans
 `heimdall/vault/crypto.py`.
 
 Rate-limiting débit (#65) : fenêtres fixes par clé API validée, par pair réseau
-et globale. Les buckets pair/global sont consommés avant le hachage et le
-parcours d'authentification ; leur rejet 429 ne déclenche aucun lookup de clé.
-Après admission, le bucket de la clé validée est consommé séparément, sans
-recompter pair/global. Un rejet par clé consomme donc aussi pair/global. Les
+et globale. Un `peek` pair/global en lecture seule (sans consommation ni
+verrou d'écriture) précède le hachage et le parcours d'authentification ;
+leur rejet 429 ne déclenche aucun lookup de clé. Après résolution de
+l'empreinte, `check_authenticated` consomme pair/global + clé en une seule
+transaction (mémoire : une seule section critique ; SQLite : un seul
+`BEGIN IMMEDIATE`), sans fenêtre inter-transactions ni double verrou
+d'écriture. Sémantique préservée : pair/global restent consommés même quand
+le bucket clé est plein. Les
 400/401 consomment les buckets pair/global, une clé absente ou invalide ne crée
 pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
 Le choix du bucket par clé (`_find_api_key_project_cached`) emprunte le même

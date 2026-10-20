@@ -336,7 +336,10 @@ def _validate_raw_api_key(raw_key: str) -> str:
     bloc plus court : « abcdefghijkl » * 4 et « abcdefghijklmnop » * 3 sont
     désormais refusés). Le message reste générique et ne reflète jamais la clé.
     Ce contrôle reste un filtre de motifs triviaux, PAS une mesure d'entropie :
-    l'exigence réelle reste ``generate_api_key()`` côté opérateur (#64).
+    une clé séquentielle prévisible de 43 caractères
+    (ex. ``abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE``) passe ces quatre
+    contrôles tout en restant devinable — l'exigence réelle reste
+    ``generate_api_key()`` côté opérateur (#64).
     """
     if (
         not isinstance(raw_key, str)
