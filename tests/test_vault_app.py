@@ -58,20 +58,19 @@ from heimdall.vault.database import DatabaseUnavailableError, count_secrets, db_
 from heimdall.vault.ratelimit import SqliteRateLimiter
 from heimdall.vault.store import SqliteSecretStore
 
-# Singleton explicite des tests (l'app réelle passe par get_app()/run_server ;
-# aucun `from heimdall.vault.app import app` n'existe plus — factory explicite).
-app = get_app()
-
 
 class VaultAppTests(unittest.IsolatedAsyncioTestCase):
     """Tests du comportement HTTP du serveur Vault."""
 
     async def asyncSetUp(self) -> None:
-        if hasattr(app.state, "secret_store"):
-            await app.state.secret_store.clear()
+        # Construction paresseuse (LOW revue) : aucun `get_app()` à la collecte ;
+        # sous HEIMDALL_ENV=production sans pepper/KEK, seule l'exécution échoue.
+        self.app = get_app()
+        if hasattr(self.app.state, "secret_store"):
+            await self.app.state.secret_store.clear()
         self.test_api_key = generate_api_key()
-        app.state.register_api_key(self.test_api_key, "demo")
-        self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
+        self.app.state.register_api_key(self.test_api_key, "demo")
+        self.transport = ASGITransport(app=self.app, client=("127.0.0.1", 54321))
         self.client = AsyncClient(
             transport=self.transport,
             base_url="http://127.0.0.1:8443",
@@ -841,11 +840,13 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
     """Tests contractuels des routes POST et GET secrets (ticket #63)."""
 
     async def asyncSetUp(self) -> None:
-        if hasattr(app.state, "secret_store"):
-            await app.state.secret_store.clear()
+        # Construction paresseuse (LOW revue) : voir VaultAppTests.
+        self.app = get_app()
+        if hasattr(self.app.state, "secret_store"):
+            await self.app.state.secret_store.clear()
         self.test_api_key = generate_api_key()
-        app.state.register_api_key(self.test_api_key, "demo")
-        self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
+        self.app.state.register_api_key(self.test_api_key, "demo")
+        self.transport = ASGITransport(app=self.app, client=("127.0.0.1", 54321))
         self.client = AsyncClient(
             transport=self.transport,
             base_url="http://127.0.0.1:8443",
@@ -2977,7 +2978,7 @@ class VaultSizedRejectionKeepAliveTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.server = uvicorn.Server(
             uvicorn.Config(
-                app=app,
+                app=get_app(),
                 host="127.0.0.1",
                 port=0,
                 log_level="error",
