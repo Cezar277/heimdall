@@ -1,15 +1,16 @@
 """Abuse cases contournement du scanner et du hook — REQ-SEC-07 / REQ-SEC-08 (#19).
 
-Le scanner #22 n'est pas livre : ces tests prouvent que l'etat actuel est
-fail-closed (jamais de verdict propre invente) et que le corpus d'obfuscations
-(base64, concatenation, f-string) ainsi que l'exigence CI de confiance sont
-formellement poses. L'implementation devra faire passer le corpus au vert.
+Le scanner #22 est livré : ce test vérifie son comportement fail-closed réel.
+Un fichier illisible, trop gros ou une racine invalide lève ``ScanError`` et ne
+produit JAMAIS une liste vide ou partielle. Le corpus d'obfuscations reste
+formellement posé ; le décodage base64 et l'analyse du flux des variables sont
+des limites connues du scanner de signatures T21/T22 (tickets #23/#24).
 """
 
 import base64
 from pathlib import Path
 
-from heimdall.scanner.detect import find_candidates
+from heimdall.scanner.detect import MAX_FILE_BYTES, ScanError, find_candidates
 
 REPO = Path(__file__).resolve().parents[2]
 CLI_MAIN = REPO / "heimdall" / "cli" / "main.py"
@@ -28,33 +29,49 @@ OBFUSCATED_CORPUS = [
 ]
 
 
-def test_incomplete_scan_never_clean() -> None:
-    """REQ-SEC-07 : incomplet/erreur/tronque => jamais 0 ; squelette bloque."""
-    # 1. Squelette fail-closed : aucune liste partielle, jamais de verdict.
+def test_incomplete_scan_never_clean(tmp_path: Path) -> None:
+    """REQ-SEC-07 : incomplet/erreur/tronque => jamais 0 ; ``ScanError``."""
+    # 1. Un dépôt vide est réellement propre : liste vide, pas d'exception.
+    assert find_candidates(str(tmp_path)) == []
+
+    # 2. Fichier au-delà de la borne de lecture : erreur, jamais un scan
+    #    partiel silencieux.
+    oversized = tmp_path / "oversized.txt"
+    oversized.write_bytes(b"A" * (MAX_FILE_BYTES + 1))
     try:
-        find_candidates(".")
-    except NotImplementedError as exc:
-        assert "22" in str(exc)  # renvoi vers le ticket d'implementation
+        find_candidates(str(tmp_path))
+    except ScanError as exc:
+        assert str(exc) == "scan impossible : entrée non analysable"
     else:
-        raise AssertionError("scanner squelette : verdict invente")
-    # 2. Le message est statique : aucune entree n'est refletee (invariant 8).
+        raise AssertionError("scan tronqué : verdict propre inventé")
+
+    # 3. Racine inexistante : erreur statique, aucune entrée reflétée.
+    marker = "SENTINELLE_RACINE_NON_FIABLE"
+    try:
+        find_candidates(str(tmp_path / marker))
+    except ScanError as exc:
+        assert marker not in str(exc)
+        assert str(exc) == "scan impossible : entrée non analysable"
+    else:
+        raise AssertionError("racine absente : verdict propre inventé")
+
+    # 4. Le scanner ne reflète jamais une entrée dans son message (invariant 8).
     src = SCANNER_SRC.read_text(encoding="utf-8")
-    assert "NotImplementedError" in src
+    assert "ScanError" in src
     assert "fail-closed" in src
-    # 3. CLI : codes 0 propre / 1 secret / 2 erreur ; non-implemente => 2.
+    assert "NotImplementedError" not in src
+
+    # 5. CLI : codes 0 propre / 1 secret / 2 erreur ; non branché (#29) => 2.
     cli_src = CLI_MAIN.read_text(encoding="utf-8")
     assert "0 propre, 1 secrets détectés, 2 erreur" in cli_src
     assert "raise typer.Exit(code=2)" in cli_src
     assert "jamais 1, réservé aux secrets avérés" in cli_src
-    # 4. Le corpus d'obfuscations est exige dans requirements.md.
+
+    # 6. Le corpus d'obfuscations reste exigé dans requirements.md.
     req = REQUIREMENTS.read_text(encoding="utf-8")
     assert CANARY_B64 in req
     assert "concaténation" in req
     assert "JAMAIS 0" in req
-    # 5. Le corpus reste synthetique : decode vers le marqueur, rien de reel.
-    assert base64.b64decode(CANARY_B64.encode()).decode() == CANARY
-    for sample in OBFUSCATED_CORPUS:
-        assert "AKIA" not in sample and "BEGIN" not in sample
 
 
 def test_obfuscation_corpus_is_mandatory() -> None:
@@ -67,6 +84,9 @@ def test_obfuscation_corpus_is_mandatory() -> None:
     mcp_doc = (REPO / "docs" / "contracts" / "mcp-tools.md").read_text(encoding="utf-8")
     assert "truncated: true" in mcp_doc
     assert "jamais « diff vide »" in mcp_doc or "jamais comme un diff vide" in mcp_doc
+    # Les obfuscations restent synthetiques et ne contiennent aucun secret reel.
+    for sample in OBFUSCATED_CORPUS:
+        assert "AKIA" not in sample and "BEGIN" not in sample
 
 
 def test_hook_bypass_requires_trusted_ci() -> None:

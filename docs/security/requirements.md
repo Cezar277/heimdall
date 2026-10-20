@@ -270,7 +270,15 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
 - Preuve attendue : `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean`
   et `test_obfuscation_corpus_is_mandatory` (squelette fail-closed actuel,
   codes CLI 0/1/2, bornes et `truncated` des contrats MCP/Finding).
-- Statut : exigence acceptée par #19 ; implémentation #22 à prouver.
+- Statut : exigence acceptée par #19. Le scanner #22 livre les signatures
+  déterministes, les exclusions et le fail-closed (`ScanError` sur entrée
+  illisible, trop grosse, non régulière ou modifiée pendant la lecture).
+  Preuves : `tests/test_scanner_detect.py`,
+  `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean` et
+  la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
+  Limites connues documentées par T21 : base64, concaténation et flux de
+  variables ne sont pas décodés ; leur traitement relève de #23/#24 et ne
+  produit jamais un verdict propre sans les contrôles CI de #29/#19.
 
 ### REQ-SEC-08 — Hook contournable, CI de confiance
 

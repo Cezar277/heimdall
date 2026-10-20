@@ -5,13 +5,11 @@ le LLM sont masqués par le programme **avant** l'appel à ``json.dumps``.
 Masquer après sérialisation laisserait la valeur dans un buffer ou dans
 une trace.
 
-Le scanner déterministe (#22) n'est pas encore livré : ce module porte donc
-un masquage **volontairement conservateur** — en cas de doute on masque.
-Le LLM juge sur la forme (type, longueur, contexte), jamais sur la valeur :
-une valeur masquée en trop ne coûte rien, une valeur oubliée coûte un secret
-relu par le LLM et potentiellement recopié dans son historique de
-conversation Ollama. Le jour où #22 arrive, ses règles remplacent
-``_looks_like_secret`` sans changer l'interface ``mask_text``.
+Le scanner déterministe (#22) est livré ; le masquage reste volontairement
+conservateur et indépendant. Le LLM juge sur la forme (type, longueur, contexte),
+jamais sur la valeur : une valeur masquée en trop ne coûte rien, une valeur
+oubliée coûte un secret relu par le LLM et potentiellement recopié dans son
+historique de conversation Ollama.
 """
 
 import math
@@ -230,7 +228,7 @@ _CODE_LITERAL: Final[re.Pattern[str]] = re.compile(
     r"(?i)\A(?:none|null|nil|nan|true|false|undefined|self|this|object|void)\Z"
 )
 
-# Préfixes de jetons connus (liste courte, à compléter avec #22).
+# Préfixes de jetons connus (liste courte, maintenue avec le scanner #22).
 #
 # **DÉRIVÉS** de `_BARE_PREFIXES` : le vocabulaire qui masque un jeton nu et
 # celui qui sait dire de quel fournisseur il s'agit ne peuvent plus diverger.
@@ -300,7 +298,8 @@ def _secret_type(key: str | None, value: str) -> str:
 
 # Seuils d'entropie (bits par caractère) et de longueur : sans indice dans
 # le nom de la variable, une valeur courte ou prévisible n'est pas un secret.
-# Ces valeurs seront remplacées par celles du scanner #22.
+# Le scanner #22 utilise la même mesure sur les octets ; le masquage garde ses
+# seuils conservateurs car il couvre aussi les champs non produits par lui.
 # Borne assumée et documentée (ADR-003 §7) : une valeur courte (moins de 16
 # caractères) à nom neutre (`MY_DATA="motdepasse12"`) N'EST PAS masquée.
 # L'alternative — masquer toute valeur affectée dès 8 caractères —
@@ -363,8 +362,8 @@ def _looks_like_secret(key: str | None, value: str) -> bool:
             return True
         if _generic_name_carries_a_secret(key, value):
             return True
-    # Sans indice de nom, il faut une valeur longue et dense : c'est la règle
-    # d'entropie du scanner #22, appliquée ici pour ne rien laisser passer.
+    # Sans indice de nom, il faut une valeur longue et dense : c'est la même
+    # mesure d'entropie que le scanner #22, appliquée ici pour ne rien laisser passer.
     return len(value) >= MIN_ENTROPY_LENGTH and shannon_entropy(value) >= MIN_ENTROPY_BITS
 
 

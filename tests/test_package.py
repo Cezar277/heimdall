@@ -50,8 +50,8 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(version.exit_code, 0)
         self.assertIn(heimdall.__version__, version.output)
 
-    def test_scan_is_fail_closed_until_22(self) -> None:
-        """Sans scanner (#22), `scan` bloque en erreur d'outillage (exit 2)."""
+    def test_scan_is_fail_closed_until_29(self) -> None:
+        """Scanner #22 livré mais commande non branchée (#29) : exit 2."""
         runner = CliRunner()
         previous = os.getcwd()
         for argv in (["scan"], ["scan", "--ci"]):
@@ -63,7 +63,7 @@ class PackageSmokeTests(unittest.TestCase):
                     finally:
                         os.chdir(previous)
                     self.assertEqual(result.exit_code, 2)
-                    self.assertIn("#22", result.output)
+                    self.assertIn("#29", result.output)
                     # Invariant 11 : 2 = panne d'outillage, jamais 1 (secrets).
                     # Le stub n'écrit aucun fichier.
                     self.assertEqual(os.listdir(tmp), [])
@@ -71,7 +71,7 @@ class PackageSmokeTests(unittest.TestCase):
     def test_scan_reports_on_stderr(self) -> None:
         result = CliRunner().invoke(heimdall.cli.main.app, ["scan"])
         self.assertEqual(result.exit_code, 2)
-        self.assertIn("#22", result.stderr)
+        self.assertIn("#29", result.stderr)
 
     def test_cli_mcp_handles_broken_pipe_and_exception(self) -> None:
         """CLI `heimdall mcp` : BrokenPipeError -> 0, exception inattendue -> 2 sans fuite."""
@@ -91,8 +91,6 @@ class PackageSmokeTests(unittest.TestCase):
 
 
     def test_stubs_raise_not_implemented(self) -> None:
-        with self.assertRaises(NotImplementedError):
-            heimdall.scanner.detect.find_candidates(".")
         with self.assertRaises(NotImplementedError):
             heimdall.vault.crypto.encrypt_at_rest(b"x", "k")
         with self.assertRaises(ValueError):
@@ -190,7 +188,7 @@ class PackageSmokeTests(unittest.TestCase):
     def test_stubs_never_reflect_input(self) -> None:
         """Invariant 8 : aucune entrée reflétée en exception (pattern #22/#27)."""
         marker = "SENTINELLE_ENTREE_NON_FIABLE"
-        with self.assertRaises(NotImplementedError) as ctx:
+        with self.assertRaises(heimdall.scanner.detect.ScanError) as ctx:
             heimdall.scanner.detect.find_candidates(marker)
         self.assertNotIn(marker, str(ctx.exception))
         # #27 : run_stdio valide sa racine en ValueError, message statique.

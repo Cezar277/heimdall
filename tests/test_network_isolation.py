@@ -406,10 +406,10 @@ def test_scan_ci_never_attempts_external_traffic(
     """Une tentative externe reste visible même si la CLI la capture."""
     result = CliRunner().invoke(app, ["scan", "--ci", str(tmp_path)])
 
-    # Le scanner #22 n'est pas livré : son refus code 2 est attendu.
+    # Le scanner #22 n'est pas branché sur la CLI (#29) : son refus code 2 est attendu.
     assert result.exit_code in (0, 2), result.output
     if result.exit_code == 2:
-        assert "scanner non implémenté (voir #22)" in result.stderr
+        assert "commande non branchée (voir #29)" in result.stderr
     assert loopback_only.blocked == []
     assert all(
         not attempt.blocked

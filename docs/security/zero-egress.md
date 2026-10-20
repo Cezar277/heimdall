@@ -112,20 +112,21 @@ n'est **pas signée** : elle ne doit pas être comptabilisée comme preuve runti
 avant un artefact CI signé (trace et stdout/stderr attachés au job, piste de
 durcissement hors périmètre #82).
 
-La sortie d'erreur du scan (fd 2) est `heimdall scan: scanner non implémenté
-(voir #22) — refus par défaut.` Le code 2 est le refus fail-closed attendu, pas
-un scan réussi. `unshare --net` a aussi été essayé pour couper le réseau au niveau
+La sortie d'erreur observée alors était `heimdall scan: scanner non implémenté
+(voir #22) — refus par défaut.` (message depuis remplacé par `commande non
+branchée (voir #29)` sans changer le code de sortie). Le code 2 est le refus
+fail-closed attendu, pas un scan réussi. `unshare --net` a aussi été essayé pour couper le réseau au niveau
 du namespace, mais l'environnement refuse cette opération (`Operation not
 permitted`).
 
 ## Limite de la preuve et suite requise
 
-Le scanner #22 n'est pas encore implémenté et la commande CLI s'arrête avant
-tout scan réel. Cette preuve établit donc que le chemin CLI actuel (bloqué) ne
-crée pas de connexion, et que le garde CI bloque les destinations externes ;
-elle **ne prouve pas** qu'un scan opérationnel complet fonctionne hors ligne.
-Après livraison du scanner et de son orchestration, rejouer le test sur un dépôt
-de test, puis capturer la sortie complète de
+Le module scanner #22 est livré, mais la commande CLI n'est pas encore branchée
+(#29) : la commande s'arrête avant tout scan réel. Cette preuve établit donc que
+le chemin CLI actuel (bloqué) ne crée pas de connexion, et que le garde CI
+bloque les destinations externes ; elle **ne prouve pas** qu'un scan
+opérationnel complet fonctionne hors ligne. Après branchement de #29, rejouer
+le test sur un dépôt de test, puis capturer la sortie complète de
 `strace -f -e trace=execve,%network,write,writev,sendfile` sous réseau
 effectivement coupé. Le client Ollama est déjà épinglé à
 `127.0.0.1:11434`, sans proxy d'environnement ni redirections

@@ -86,8 +86,9 @@ L'outil est la seule fenêtre du LLM sur le commit en cours
 
 Masquage (`heimdall/mcp/masking.py`) : volontairement conservateur — en cas de
 doute on masque. Le LLM juge sur la forme (type, longueur, contexte), pas sur
-la valeur. Ces règles seront remplacées par celles du scanner déterministe
-(#22) sans changer l'interface `mask_text`.
+la valeur. Le scanner déterministe (#22) ne remplace pas ces règles sans
+changer l'interface `mask_text` : le masquage couvre aussi les champs que le
+scanner ne produit pas.
 
 ## 2 ter. Ce que `sanitize_file` garantit
 

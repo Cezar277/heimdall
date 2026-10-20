@@ -32,10 +32,15 @@ SHA-256** dans `requirements.lock` (en-tête du fichier = commandes exactes).
 ```sh
 heimdall --help
 heimdall --version
-heimdall scan             # bloqué tant que le scanner #22 n'est pas livré (fail-closed)
+heimdall scan             # commande non branchée (#29) : refus fail-closed
 heimdall scan --ci        # idem : refuse par défaut plutôt que d'inventer un verdict
 heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 ```
+
+Le scanner déterministe (#22) est utilisable dès maintenant comme bibliothèque
+(`heimdall.scanner`) et sera branché sur la commande `scan` par #29. Voir
+[docs/scanner.md](docs/scanner.md) pour l'API, les signatures, les exclusions,
+les limites connues et les preuves de test.
 
 ### Serveur Vault
 
@@ -81,7 +86,7 @@ curl http://127.0.0.1:8443/api/v1/health
 
 ```text
 heimdall/            paquet unique (#17)
-  scanner/           détection déterministe regex + entropie (#22, contrat #14)
+  scanner/           signatures regex + exclusions + Finding (#22, contrat #14)
   mcp/               serveur MCP stdio, 4 outils lecture seule (#27, contrat #16)
     prompts/         prompt système versionné du trieur (qualify_v1, #80)
   llm/               client Ollama local, sortie JSON contrainte (#80, T28.2), candidat fail-closed (#81)
@@ -96,6 +101,7 @@ openapi.yaml         contrat Vault API v1 (#15)
 ## Contrats et décisions
 
 - [Vault API v1 et vérification OpenAPI](docs/contracts/vault-api.md)
+- [Scanner déterministe : signatures, exclusions, Finding (#22)](docs/scanner.md)
 - [Finding v1 et machine d'états du secret](docs/contracts/finding.md)
 - [Outils MCP exposés au LLM (surface strictement limitée)](docs/contracts/mcp-tools.md)
 - [Serveur MCP stdio : lancement, outils, invariants (#27)](docs/mcp-server.md)
@@ -167,10 +173,10 @@ refuse aussi le lancement de processus enfants par les wrappers Python
 (`subprocess.Popen` par attribut, `os.*`) ; les alias précoces
 (`from subprocess import Popen`), les chemins C (`_posixsubprocess`) et un
 binaire ou une extension native appelant directement `fork(2)`/`execve(2)`
-relèvent de la trace `strace -f`. Le
-scan réel reste bloqué par le squelette du scanner #22 ; la trace disponible
-prouve uniquement l'absence de connexion sur ce chemin fail-closed, pas encore
-sur un scan opérationnel.
+relèvent de la trace `strace -f`. Le scanner déterministe #22 est livré, mais la commande CLI `scan` reste
+volontairement bloquée jusqu'au branchement de #29 ; la trace disponible prouve
+uniquement l'absence de connexion sur ce chemin fail-closed, pas encore sur une
+commande `scan` opérationnelle.
 
 ### Réglages GitHub du dépôt (une fois, non versionnables)
 

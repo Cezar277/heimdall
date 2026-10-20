@@ -175,8 +175,10 @@ recopiée à la main avait laissé `pk_test_` masqué mais typé
 `prefix_vocabulary_is_fully_mapped` ne le voyait pas puisqu'il ne parcourait
 que la liste de typage. `rk_test_` (clé restreinte Stripe en mode test)
 ajouté au même moment. Les motifs sont linéaires (aucun quantificateur
-imbriqué) : garde-fou temporel anti-ReDoS en test. Le jour où #22 arrive,
-ses règles remplacent `_looks_like_secret` sans changer `mask_text`.
+imbriqué) : garde-fou temporel anti-ReDoS en test. Le scanner #22 est livré
+avec ses propres signatures et exclusions ; `_looks_like_secret` reste un filet
+conservateur indépendant, car `mask_text` couvre aussi des champs que le
+scanner ne produit pas.
 Limites honnêtes : un jeton **sans préfixe connu, noyé dans 100 Ko de
 remplissage**, reste indétectable par fenêtre ; un SHA de commit copié en
 clair est masqué (faux positif bénin assumé) ; une valeur courte (< 16
