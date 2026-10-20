@@ -124,10 +124,12 @@ class InMemorySecretStore:
     async def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         key = (project, env, name)
         aad = VaultCipher.aad(project, env, name)
-        # Défense en profondeur : la valeur stockée est canonique (NFC), même si
-        # l'appelant contourne la validation HTTP (décision #62). La
-        # normalisation est idempotente, donc sans effet pour l'API.
+        # Défense en profondeur : la valeur stockée est canonique (NFC) et sans
+        # NUL, même si l'appelant contourne la validation HTTP (décision #62).
+        # La normalisation est idempotente, donc sans effet pour l'API.
         value = unicodedata.normalize("NFC", value)
+        if "\x00" in value:
+            raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         async with self._lock:
             if key in self._secrets:
                 raise KeyError("Secret déjà existant")
@@ -231,10 +233,13 @@ class SqliteSecretStore:
 
     def _create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         aad = VaultCipher.aad(project, env, name)
-        # Défense en profondeur : valeur canonique (NFC) même hors du chemin
-        # HTTP, pour que l'empreinte d'intégrité soit toujours calculée sur la
-        # forme stockée (décision #62).
+        # Défense en profondeur : valeur canonique (NFC) et sans NUL même hors
+        # du chemin HTTP, pour que l'empreinte d'intégrité soit toujours
+        # calculée sur la forme stockée (décision #62). Le NUL tronque les
+        # valeurs dans les outils texte : refusé comme au contrat API.
         value = unicodedata.normalize("NFC", value)
+        if "\x00" in value:
+            raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         with db_session(self._db_path) as conn:
             # Verrou d'écriture inter-processus AVANT le comptage : le
             # quota et l'insertion forment une seule transaction atomique,

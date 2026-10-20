@@ -36,7 +36,7 @@ from heimdall.vault.database import (
     init_db,
 )
 from heimdall.vault.ratelimit import RateLimiter
-from heimdall.vault.store import SqliteSecretStore
+from heimdall.vault.store import InMemorySecretStore, SqliteSecretStore
 
 
 class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
@@ -385,6 +385,24 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
         allowed, _ = limiter.peek("127.0.0.1")
         self.assertFalse(allowed)
         self.assertEqual(limiter._buckets["peer:127.0.0.1"].count, 1)
+
+    async def test_store_create_refuses_nul_even_off_http_path(self) -> None:
+        """Garde anti-contournement : le store refuse NUL même hors validation HTTP.
+
+        La route refuse déjà NUL (400) ; un appelant direct ne doit pas pouvoir
+        y stocker un NUL (tronque les outils texte en aval). Les deux backends
+        lèvent `ValueError` sans écho de la valeur.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = [
+                InMemorySecretStore(),
+                SqliteSecretStore(Path(tmp) / "nul.db", VaultCipher.generate()),
+            ]
+            for store in stores:
+                with self.subTest(store=type(store).__name__):
+                    with self.assertRaises(ValueError) as ctx:
+                        await store.create("demo", "dev", "NUL_KEY", "a\x00b")
+                    self.assertNotIn("a\x00b", str(ctx.exception))
 
     async def test_quota_429_is_permanent_while_rate_429_is_transient(self) -> None:
         """Distingue quota (capacité) et débit : seul le débit se résorbe.

@@ -1652,6 +1652,10 @@ def create_app(
       Les clés brutes sont expressément refusées pour éviter toute confusion de format.
       Chaque `project_id` DOIT satisfaire `PROJECT_PATTERN` (^[a-z][a-z0-9_-]{0,63}$) :
       un identifiant hors contrat est refusé à l'enregistrement (fail-fast, sans écho).
+      Les empreintes étant opaques (HMAC irréversible), les contrôles de robustesse
+      de `_validate_raw_api_key` ne s'y appliquent pas : elles DOIVENT provenir de
+      clés générées par `generate_api_key()` (confiance placée dans le détenteur
+      du pepper, qui peut hacher n'importe quoi).
     - `api_keys` : Alias de `api_key_hashes` pour compatibilité descendante.
 
     Le pepper utilisé pour les empreintes de `register_api_key` est celui de
