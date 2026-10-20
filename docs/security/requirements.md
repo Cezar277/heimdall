@@ -273,6 +273,12 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
 - Statut : exigence acceptée par #19. Le scanner #22 livre les signatures
   déterministes, les exclusions et le fail-closed (`ScanError` sur entrée
   illisible, trop grosse, non régulière ou modifiée pendant la lecture).
+  Durcissement post-relecture : deux valeurs distinctes du même type sur une
+  même ligne produisent deux Findings (aucun candidat perdu) ; les fichiers
+  UTF-16/UTF-32 sont décodés et scannés, un contenu NUL non décodable lève
+  `ScanError` au lieu d'être ignoré ; la clé HMAC locale est durcie (fichier
+  `0600`, propriétaire vérifié, parent `0700`, parent symlink refusé) et son
+  indisponibilité lève `ScanError` au lieu d'une clé éphémère.
   Preuves : `tests/test_scanner_detect.py`,
   `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean` et
   la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).

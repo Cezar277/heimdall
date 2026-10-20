@@ -70,7 +70,16 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
 
 - `pip install -e .[dev]` puis `pytest` : vert = critères d'acceptation #17.
 - La crypto est testable en isolement (`vault/crypto.py`) ; tout import
-  crypto hors `vault/` casse `test_crypto_confinement.py` et la revue.
+  `cryptography`/`argon2` hors `vault/crypto.py` casse
+  `test_crypto_confinement.py` et la revue.
+- **Clarification de l'invariant 5 (T22)** : l'invariant porte sur les
+  bibliothèques crypto `cryptography`/`argon2`, pas sur la bibliothèque
+  standard. L'empreinte HMAC-SHA-256 du Finding (`hmac`/`hashlib`, plus
+  `secrets` pour la génération de clé) est autorisée hors Vault, dans
+  `heimdall/scanner/hashing.py` seul : elle est non réversible, locale et sans
+  rapport avec la KEK ni les clés API. Aucune primitive de chiffrement, de
+  dérivation de clé ou de hachage salé n'est introduite hors
+  `heimdall/vault/crypto.py`.
 - Risque : épinglage strict → mises à jour manuelles (dépendances de #20 :
   mise à jour des pins, régénération hashée du lock avec
   `pip-compile --allow-unsafe`, CI verte, dans un ticket dédié, jamais en passant).

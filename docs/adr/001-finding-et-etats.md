@@ -19,6 +19,12 @@ décision. La CI doit bloquer un secret en clair, indépendamment de son état.
   faible entropie aux attaques par dictionnaire. Ne jamais transmettre la clé
   dans un Finding ni la journaliser. Ce hash est une empreinte, pas un secret
   récupérable, un identifiant global ou une preuve d'autorisation.
+- Cette empreinte est calculée avec `hmac`/`hashlib` de la bibliothèque
+  standard, dans `heimdall/scanner/hashing.py`. Ce n'est pas la crypto du Vault :
+  l'invariant 5 confine `cryptography`/`argon2` à `heimdall/vault/crypto.py` et
+  reste intact (ADR-002, clarification T22). La clé de signature est locale,
+  distincte de la KEK et des clés API ; un stockage indisponible fait lever
+  `ScanError` au lieu d'une clé éphémère.
 - L'empreinte est stable pour une même clé locale. Un autre poste ou une
   rotation de clé donne une autre empreinte : aucune déduplication interposte
   n'est garantie. L'identité du Vault sera définie dans son propre contrat.
