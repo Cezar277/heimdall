@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from heimdall.vault.database import db_session
+from heimdall.vault.database import runtime_db_session as db_session
 
 _MAX_RETRY_AFTER_SECONDS: int = 3_600
 _MAX_TRACKED_BUCKETS: int = 100_000

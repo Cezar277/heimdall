@@ -22,7 +22,13 @@ from heimdall.vault.crypto import (
     generate_encryption_key,
     hash_api_key,
 )
-from heimdall.vault.database import create_api_key, db_session, ensure_project, init_db
+from heimdall.vault.database import (
+    DatabaseUnavailableError,
+    create_api_key,
+    db_session,
+    ensure_project,
+    init_db,
+)
 from heimdall.vault.store import SqliteSecretStore
 
 
@@ -245,8 +251,8 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
             with db_session(target.state.db_path) as conn:
                 conn.execute("DELETE FROM api_keys")
             self.assertEqual((await self._authenticated_get(target, key)).status_code, 401)
-            with patch.object(app_module, "db_session", side_effect=sqlite3.OperationalError):
-                self.assertEqual((await self._authenticated_get(target, key)).status_code, 401)
+            with patch.object(app_module, "db_session", side_effect=DatabaseUnavailableError):
+                self.assertEqual((await self._authenticated_get(target, key)).status_code, 503)
 
     async def test_key_cannot_be_reassigned_to_another_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

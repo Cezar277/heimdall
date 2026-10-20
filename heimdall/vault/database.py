@@ -60,6 +60,7 @@ _SECURE_FILE_MODE: int = 0o600
 _SECURE_DIR_MODE: int = 0o700
 _DIR_PERM_MASK: int = 0o777
 _CONTROL_CHAR_THRESHOLD: int = 0x20
+SQLITE_TIMEOUT_SECONDS: float = 0.25
 
 # `/dev/fd/N` (procfs Linux) permet à SQLite d'ouvrir l'inode EXACT déjà validé
 # par un descripteur épinglé `O_NOFOLLOW`, fermant la fenêtre TOCTOU de
@@ -553,7 +554,7 @@ def _connect_pinned_fd(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]
                 "Permissions de la base SQLite insuffisantes : attendu 0o600, "
                 f"obtenu {oct(applied_mode)}"
             )
-        conn = sqlite3.connect(f"/dev/fd/{fd}")
+        conn = sqlite3.connect(f"/dev/fd/{fd}", timeout=SQLITE_TIMEOUT_SECONDS)
         opened_identity = (fd_stat.st_dev, fd_stat.st_ino)
     except BaseException:
         os.close(fd)
@@ -585,7 +586,7 @@ def _connect_by_path(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]:
     _assert_not_symlink(path)
     _apply_secure_permissions(path)
     pre_open_stat = _stat_no_follow(path)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SECONDS)
     return conn, (pre_open_stat.st_dev, pre_open_stat.st_ino)
 
 
@@ -629,7 +630,7 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     if isinstance(resolved, Path):
         conn = _open_db_file(resolved)
     else:
-        conn = sqlite3.connect(resolved)
+        conn = sqlite3.connect(resolved, timeout=SQLITE_TIMEOUT_SECONDS)
 
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -645,6 +646,26 @@ def db_session(db_path: Path | str | None = None) -> Generator[sqlite3.Connectio
             yield conn
     finally:
         conn.close()
+
+
+class DatabaseUnavailableError(Exception):
+    """Stockage indisponible (contention ou panne), sans détail sensible."""
+
+
+@contextmanager
+def runtime_db_session(db_path: Path | str) -> Generator[sqlite3.Connection, None, None]:
+    """Traduit les pannes DB du serveur ; préserve les erreurs de programmation/intégrité.
+
+    La session de bas niveau reste disponible pour les outils d'administration.
+    Ouverture, transaction, commit et fermeture sont tous couverts ici.
+    """
+    try:
+        with db_session(db_path) as conn:
+            yield conn
+    except (sqlite3.IntegrityError, sqlite3.ProgrammingError):
+        raise
+    except (sqlite3.DatabaseError, OSError):
+        raise DatabaseUnavailableError("Stockage temporairement indisponible.") from None
 
 
 def _verify_schema(conn: sqlite3.Connection) -> None:

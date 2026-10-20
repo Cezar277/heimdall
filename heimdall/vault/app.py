@@ -85,12 +85,13 @@ from heimdall.vault.crypto import (
 )
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
-    db_session,
+    DatabaseUnavailableError,
     ensure_project,
     get_iso_timestamp,
     resolve_db_path,
     validate_db_path,
 )
+from heimdall.vault.database import runtime_db_session as db_session
 from heimdall.vault.ratelimit import RateLimiter, SqliteRateLimiter
 from heimdall.vault.store import (
     InMemorySecretStore,
@@ -449,6 +450,11 @@ _SECRETS_POST_RESPONSES: dict[int | str, dict[str, Any]] = {
         "headers": _RETRY_AFTER_HEADER,
     },
     500: {"model": InternalError, "description": "Erreur interne"},
+    503: {
+        "model": UnavailableError,
+        "description": "Stockage temporairement indisponible",
+        "headers": _RETRY_AFTER_HEADER,
+    },
     "default": {"model": InternalError, "description": "Erreur inattendue"},
 }
 
@@ -472,6 +478,11 @@ _SECRETS_GET_RESPONSES: dict[int | str, dict[str, Any]] = {
         "headers": _RETRY_AFTER_HEADER,
     },
     500: {"model": InternalError, "description": "Erreur interne"},
+    503: {
+        "model": UnavailableError,
+        "description": "Stockage temporairement indisponible",
+        "headers": _RETRY_AFTER_HEADER,
+    },
     "default": {"model": InternalError, "description": "Erreur inattendue"},
 }
 
@@ -909,6 +920,39 @@ class BodySizeLimitMiddleware:
             await self._reject()(scope, receive, send)
 
 
+class DatabaseAvailabilityMiddleware:
+    """Transforme les pannes DB des middlewares ET routes en 503 contractuel."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def tracked_send(message: Any) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracked_send)
+        except DatabaseUnavailableError:
+            # Aucun détail SQL, chemin, empreinte ou secret dans les logs/réponses.
+            logger.warning("Stockage Vault indisponible.")
+            if started:
+                raise
+            response = JSONResponse(
+                status_code=503,
+                content=_ERROR_PAYLOADS[503],
+                headers={"Retry-After": "1", "Connection": "close", "Cache-Control": "no-store"},
+            )
+            await response(scope, receive, send)
+
+
 def _register_middleware(app: FastAPI) -> None:
     """Enregistre les middlewares du serveur Vault."""
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=_MAX_BODY_SIZE)
@@ -1082,22 +1126,16 @@ def _register_exception_handlers(app: FastAPI) -> None:
 def _lookup_db_api_key(db_path: Any, provided_hash: str) -> tuple[str | None, int]:
     """Recherche la clé API en base SQLite à coût comparable et sans oracle temporel."""
     if not (isinstance(db_path, Path) and db_path.is_file()):
-        return None, 0
+        raise DatabaseUnavailableError("Stockage temporairement indisponible.")
     matching_project: str | None = None
     evaluated = 0
-    try:
-        with db_session(db_path) as conn:
-            cursor = conn.execute(
-                "SELECT project_id, key_hash, revoked_at FROM api_keys"
-            )
-            for row in cursor.fetchall():
-                evaluated += 1
-                if constant_time_equal(provided_hash, row["key_hash"]):
-                    if not row["revoked_at"]:
-                        matching_project = row["project_id"]
-    except Exception as exc:
-        matching_project = None
-        logger.debug("Échec consultation clé API SQLite : %s", exc.__class__.__name__)
+    with db_session(db_path) as conn:
+        cursor = conn.execute("SELECT project_id, key_hash, revoked_at FROM api_keys")
+        for row in cursor.fetchall():
+            evaluated += 1
+            if constant_time_equal(provided_hash, row["key_hash"]):
+                if not row["revoked_at"]:
+                    matching_project = row["project_id"]
     return matching_project, evaluated
 
 
@@ -1120,8 +1158,9 @@ def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None,
         return _lookup_db_api_key(getattr(app.state, "db_path", None), provided_hash)
     matching_project: str | None = None
     evaluated = 0
-    registered_keys: dict[str, str] = getattr(app.state, "api_keys", {})
-    for reg_hash, proj_id in tuple(registered_keys.items()):
+    with app.state.api_keys_lock:
+        registered_keys = tuple(app.state.api_keys.items())
+    for reg_hash, proj_id in registered_keys:
         evaluated += 1
         if constant_time_equal(provided_hash, reg_hash):
             matching_project = proj_id
@@ -1465,11 +1504,10 @@ def create_app(
                     "app.state.register_api_key(raw_key, project_id)."
                 )
             validated_hashes[key_candidate] = _validate_project_id(project_id)
+    app.state.api_keys_lock = Lock()
     app.state.api_keys = validated_hashes
     for preregistered_hash, preregistered_project in validated_hashes.items():
         _persist_api_key_hash(app, preregistered_hash, preregistered_project)
-
-    registration_lock = Lock()
 
     def register_api_key(raw_key: str, project_id: str) -> None:
         """Enregistre une clé API brute en calculant son HMAC-SHA256 avec le pepper serveur.
@@ -1484,7 +1522,7 @@ def create_app(
         raw_key = _validate_raw_api_key(raw_key)
         _validate_project_id(project_id)
         key_hash = hash_api_key(raw_key, pepper=effective_settings.effective_api_key_pepper)
-        with registration_lock:
+        with app.state.api_keys_lock:
             registered_project = app.state.api_keys.get(key_hash)
             if registered_project is not None and registered_project != project_id:
                 raise ValueError("Cette clé API est déjà associée à un autre projet.")
@@ -1494,6 +1532,7 @@ def create_app(
     app.state.register_api_key = register_api_key
 
     _register_middleware(app)
+    app.add_middleware(DatabaseAvailabilityMiddleware)
     _register_exception_handlers(app)
     _register_routes(app)
 

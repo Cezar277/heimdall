@@ -322,7 +322,9 @@ class VaultContractTests(unittest.TestCase):
                      for path, item in SPEC["paths"].items()
                      for method in ("get", "post") if method in item]
         # LOW-3 : la 503 porte le même signal de backoff que les 429.
-        expected += [("/api/v1/health", "get", "503", "Retry-After")]
+        expected += [(path, method, "503", "Retry-After")
+                     for path, item in SPEC["paths"].items()
+                     for method in ("get", "post") if method in item]
         for path, method, status, name in expected:
             with self.subTest(path=path, status=status, header=name):
                 response = resolve(SPEC["paths"][path][method]["responses"][status], SPEC)

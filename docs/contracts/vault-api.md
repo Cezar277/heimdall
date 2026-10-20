@@ -110,6 +110,15 @@ Les opérations SQLite des requêtes (store, authentification et débit) sont
 exécutées via `asyncio.to_thread` : une attente de verrou SQLite ne bloque pas
 la boucle événementielle. Le store SQLite s'appuie sur ses transactions, sans
 verrou asyncio local. Les verrous asyncio restent réservés au store mémoire.
+Chaque connexion SQLite utilise un timeout explicite de 250 ms. Une contention
+au-delà de ce délai ou une panne d'accès (ouverture, transaction, commit) est
+traduite en **503 unavailable**, avec `Retry-After: 1`, `Connection: close` et
+`Cache-Control: no-store`. Aucun détail SQL, chemin ou secret n'est renvoyé ;
+un avertissement générique signale l'indisponibilité dans les logs. Cette
+politique couvre les buckets de débit, l'authentification et le store. Le 429
+reste réservé aux budgets de débit/quota effectivement dépassés et le 409 à
+un secret déjà présent. La session DB d'administration conserve ses exceptions
+natives ; la session serveur normalise uniquement les pannes d'accès.
 Les empreintes `api_keys.key_hash` ont un index UNIQUE ; leur persistance utilise
 `ON CONFLICT(key_hash) DO NOTHING`, puis vérifie le projet dans la même
 transaction. Réenregistrer une clé pour le même projet est idempotent et ne
@@ -147,9 +156,12 @@ lookup (401 générique), après admission pair/global. La même borne s'appliqu
 à l'enregistrement des clés opérateur.
 
 En mode SQLite, la base est l'unique autorité d'authentification : une clé
-révoquée, supprimée ou illisible reste refusée même si son empreinte existe
-dans le dictionnaire mémoire. La mémoïsation ne dure qu'une requête. Le mode
-mémoire consulte uniquement son dictionnaire. L'API de révocation reste suivie
+révoquée ou supprimée reste refusée en 401 même si son empreinte existe
+dans le dictionnaire mémoire. Une erreur de lecture est distinguée d'une clé
+inconnue et renvoie 503, sans repli mémoire. La mémoïsation ne dure qu'une requête. Le mode
+mémoire consulte uniquement son dictionnaire ; le snapshot de lecture et
+l'enregistrement partagent un `threading.Lock`, libéré avant les comparaisons.
+L'API de révocation reste suivie
 séparément en #64.
 
 Backend de débit #65 : avec le stockage SQLite, les buckets sont persistés dans

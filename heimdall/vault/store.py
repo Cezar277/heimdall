@@ -29,12 +29,12 @@ from heimdall.vault.crypto import VaultCipher, VaultCipherError
 from heimdall.vault.database import (
     count_secrets,
     create_secret,
-    db_session,
     delete_all_secrets,
     ensure_project,
     get_secret,
     init_db,
 )
+from heimdall.vault.database import runtime_db_session as db_session
 
 _DEFAULT_MAX_SECRETS: int = 10_000
 _DEFAULT_MAX_SECRETS_PER_PROJECT: int = 1_000
