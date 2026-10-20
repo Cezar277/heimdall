@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -673,12 +674,22 @@ def test_sqlite_quota_never_exceeded_with_two_workers_tmp_path(tmp_path: Path) -
     refused: list[Exception] = []
 
     def create_in_worker(store: SqliteSecretStore, name: str) -> None:
+        # Sous contention, le perdant du BEGIN IMMEDIATE lève une erreur
+        # transitoire (database is locked → DatabaseUnavailableError, 0.25 s
+        # de busy-timeout) : retry court, sans jamais dépasser le quota.
+        # Seule une erreur non transitoire est un vrai refus.
         start.wait(timeout=5)
-        try:
-            asyncio.run(store.create(project="demo", env="dev", name=name, value="v"))
-            created.append(name)
-        except Exception as exc:  # pragma: no cover - diagnostic
-            refused.append(exc)
+        for _ in range(20):
+            try:
+                asyncio.run(store.create(project="demo", env="dev", name=name, value="v"))
+                created.append(name)
+                return
+            except DatabaseUnavailableError:
+                time.sleep(0.05)
+            except Exception as exc:  # pragma: no cover - diagnostic
+                refused.append(exc)
+                return
+        refused.append(DatabaseUnavailableError("verrou persistant après retries"))
 
     threads = [
         threading.Thread(target=create_in_worker, args=(store_one, "TMP_PATH_A")),

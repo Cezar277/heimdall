@@ -54,7 +54,7 @@ from heimdall.vault.app import (
     run_server,
 )
 from heimdall.vault.crypto import VaultCipher, generate_encryption_key
-from heimdall.vault.database import count_secrets, db_session
+from heimdall.vault.database import DatabaseUnavailableError, count_secrets, db_session
 from heimdall.vault.ratelimit import SqliteRateLimiter
 from heimdall.vault.store import SqliteSecretStore
 
@@ -1917,20 +1917,31 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             errors: list[Exception] = []
 
             def create_in_worker(store: SqliteSecretStore, index: int) -> None:
+                # Sous contention, le perdant du BEGIN IMMEDIATE lève une erreur
+                # transitoire (database is locked → DatabaseUnavailableError) :
+                # retry court pour laisser la sérialisation trancher entre
+                # succès et refus de quota. Seule une erreur non transitoire
+                # est enregistrée comme refus définitif.
                 start.wait(timeout=5)
-                try:
-                    results.append(
-                        asyncio.run(
-                            store.create(
-                                project="demo",
-                                env="dev",
-                                name=f"SECRET_{index}",
-                                value=f"value-{index}",
+                for _ in range(20):
+                    try:
+                        results.append(
+                            asyncio.run(
+                                store.create(
+                                    project="demo",
+                                    env="dev",
+                                    name=f"SECRET_{index}",
+                                    value=f"value-{index}",
+                                )
                             )
                         )
-                    )
-                except Exception as exc:
-                    errors.append(exc)
+                        return
+                    except DatabaseUnavailableError:
+                        time.sleep(0.05)
+                    except Exception as exc:  # pragma: no cover - diagnostic
+                        errors.append(exc)
+                        return
+                errors.append(DatabaseUnavailableError("verrou persistant après retries"))
 
             threads = [
                 threading.Thread(target=create_in_worker, args=(store, index))
@@ -2002,12 +2013,21 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             refused: list[Exception] = []
 
             def create_in_worker(store: SqliteSecretStore, name: str) -> None:
+                # Sous contention, le perdant du BEGIN IMMEDIATE lève une erreur
+                # transitoire (database is locked → DatabaseUnavailableError) :
+                # retry court, sans jamais dépasser le quota.
                 start.wait(timeout=5)
-                try:
-                    asyncio.run(store.create(project="demo", env="dev", name=name, value="v"))
-                    created.append(name)
-                except Exception as exc:  # pragma: no cover - diagnostic
-                    refused.append(exc)
+                for _ in range(20):
+                    try:
+                        asyncio.run(store.create(project="demo", env="dev", name=name, value="v"))
+                        created.append(name)
+                        return
+                    except DatabaseUnavailableError:
+                        time.sleep(0.05)
+                    except Exception as exc:  # pragma: no cover - diagnostic
+                        refused.append(exc)
+                        return
+                refused.append(DatabaseUnavailableError("verrou persistant après retries"))
 
             threads = [
                 threading.Thread(target=create_in_worker, args=(store_one, "SECRET_A")),
