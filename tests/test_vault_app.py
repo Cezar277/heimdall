@@ -10,6 +10,7 @@ sans enveloppe framework, l'allowlist d'en-têtes d'erreurs, l'immunité au spoo
 X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 """
 
+import ast
 import asyncio
 import base64
 import hashlib
@@ -45,15 +46,15 @@ from heimdall.vault.app import (
     SecretRead,
     Settings,
     VaultSettings,
-    app,
     create_app,
     generate_api_key,
+    get_app,
     get_settings,
     hash_api_key,
     run_server,
 )
 from heimdall.vault.crypto import VaultCipher, generate_encryption_key
-from heimdall.vault.database import count_secrets, db_session
+from heimdall.vault.database import DatabaseUnavailableError, count_secrets, db_session
 from heimdall.vault.ratelimit import SqliteRateLimiter
 from heimdall.vault.store import SqliteSecretStore
 
@@ -62,11 +63,14 @@ class VaultAppTests(unittest.IsolatedAsyncioTestCase):
     """Tests du comportement HTTP du serveur Vault."""
 
     async def asyncSetUp(self) -> None:
-        if hasattr(app.state, "secret_store"):
-            await app.state.secret_store.clear()
+        # Construction paresseuse (LOW revue) : aucun `get_app()` à la collecte ;
+        # sous HEIMDALL_ENV=production sans pepper/KEK, seule l'exécution échoue.
+        self.app = get_app()
+        if hasattr(self.app.state, "secret_store"):
+            await self.app.state.secret_store.clear()
         self.test_api_key = generate_api_key()
-        app.state.register_api_key(self.test_api_key, "demo")
-        self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
+        self.app.state.register_api_key(self.test_api_key, "demo")
+        self.transport = ASGITransport(app=self.app, client=("127.0.0.1", 54321))
         self.client = AsyncClient(
             transport=self.transport,
             base_url="http://127.0.0.1:8443",
@@ -594,21 +598,31 @@ class VaultSettingsTests(unittest.TestCase):
     def test_run_server_passes_hardened_uvicorn_arguments(
         self, mock_uvicorn_run: unittest.mock.MagicMock
     ) -> None:
-        """run_server configure uvicorn avec anti-spoofing et sans fingerprinting."""
+        """run_server configure uvicorn avec anti-spoofing et sans fingerprinting.
+
+        Factory explicite : l'instance FastAPI construite (singleton `get_app`)
+        est passée en objet, jamais via une chaîne d'import (aucune création
+        différée par uvicorn).
+        """
         with patch.dict(os.environ, {"HEIMDALL_ENV": "test"}, clear=False):
             run_server()
-        mock_uvicorn_run.assert_called_once_with(
-            "heimdall.vault.app:app",
-            host="127.0.0.1",
-            port=8443,
-            # Un seul worker : le backend mémoire est mono-processus (#65).
-            workers=1,
-            ssl_certfile=None,
-            ssl_keyfile=None,
-            proxy_headers=False,
-            forwarded_allow_ips="",
-            server_header=False,
-            date_header=False,
+        mock_uvicorn_run.assert_called_once()
+        positional, keywords = mock_uvicorn_run.call_args
+        self.assertIs(positional[0], get_app())
+        self.assertEqual(
+            keywords,
+            {
+                "host": "127.0.0.1",
+                "port": 8443,
+                # Un seul worker : le backend mémoire est mono-processus (#65).
+                "workers": 1,
+                "ssl_certfile": None,
+                "ssl_keyfile": None,
+                "proxy_headers": False,
+                "forwarded_allow_ips": "",
+                "server_header": False,
+                "date_header": False,
+            },
         )
 
     @patch("uvicorn.run")
@@ -624,6 +638,31 @@ class VaultSettingsTests(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 run_server()
         self.assertIn("TLS", str(ctx.exception))
+        mock_uvicorn_run.assert_not_called()
+
+    @patch("uvicorn.run")
+    def test_run_server_checks_tls_before_any_app_construction(
+        self, mock_uvicorn_run: unittest.mock.MagicMock
+    ) -> None:
+        """Ordre fail-closed : le refus TLS précède toute construction d'app/disque.
+
+        Suggestion revue (optionnelle) : en production sans TLS, `run_server`
+        lève avant `get_app()` — aucun backend résolu, aucun `vault.db`, aucun
+        pepper généré. Verrouille l'ordre TLS-avant-disque.
+        """
+        settings = VaultSettings(api_key_pepper="p" * 32)
+        with (
+            patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=False),
+            patch("heimdall.vault.app.get_settings", return_value=settings),
+            patch(
+                "heimdall.vault.app.get_app",
+                side_effect=AssertionError("get_app() ne doit pas être appelé avant le garde TLS"),
+            ) as mock_get_app,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                run_server()
+        self.assertIn("TLS", str(ctx.exception))
+        mock_get_app.assert_not_called()
         mock_uvicorn_run.assert_not_called()
 
     @patch("uvicorn.run")
@@ -646,17 +685,22 @@ class VaultSettingsTests(unittest.TestCase):
                 patch("heimdall.vault.app.get_settings", return_value=settings),
             ):
                 run_server()
-        mock_uvicorn_run.assert_called_once_with(
-            "heimdall.vault.app:app",
-            host="127.0.0.1",
-            port=8443,
-            workers=1,
-            ssl_certfile=str(certfile),
-            ssl_keyfile=str(keyfile),
-            proxy_headers=False,
-            forwarded_allow_ips="",
-            server_header=False,
-            date_header=False,
+        mock_uvicorn_run.assert_called_once()
+        positional, keywords = mock_uvicorn_run.call_args
+        self.assertIs(positional[0], get_app())
+        self.assertEqual(
+            keywords,
+            {
+                "host": "127.0.0.1",
+                "port": 8443,
+                "workers": 1,
+                "ssl_certfile": str(certfile),
+                "ssl_keyfile": str(keyfile),
+                "proxy_headers": False,
+                "forwarded_allow_ips": "",
+                "server_header": False,
+                "date_header": False,
+            },
         )
 
     def test_documented_launch_command_uses_dedicated_runner(self) -> None:
@@ -669,6 +713,27 @@ class VaultSettingsTests(unittest.TestCase):
         app_code = (root / "heimdall" / "vault" / "app.py").read_text(encoding="utf-8")
         self.assertIn("python -m heimdall.vault.app", app_code)
         self.assertNotIn("uvicorn heimdall.vault.app:app", app_code)
+        # Factory explicite (LOW revue : pas de test sur chaîne fragile) :
+        # run_server passe l'objet construit par get_app() à uvicorn.run,
+        # vérifié par AST (insensible au reformatage).
+        tree = ast.parse(app_code)
+        run_server_def = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "run_server"
+        )
+        uvicorn_calls = [
+            node
+            for node in ast.walk(run_server_def)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run"
+            and node.args
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name)
+            and node.args[0].func.id == "get_app"
+        ]
+        self.assertEqual(len(uvicorn_calls), 1)
 
     def test_health_schema_response_codes_match_openapi_yaml(self) -> None:
         """Le schéma OpenAPI runtime de /api/v1/health correspond au contrat openapi.yaml."""
@@ -775,11 +840,13 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
     """Tests contractuels des routes POST et GET secrets (ticket #63)."""
 
     async def asyncSetUp(self) -> None:
-        if hasattr(app.state, "secret_store"):
-            await app.state.secret_store.clear()
+        # Construction paresseuse (LOW revue) : voir VaultAppTests.
+        self.app = get_app()
+        if hasattr(self.app.state, "secret_store"):
+            await self.app.state.secret_store.clear()
         self.test_api_key = generate_api_key()
-        app.state.register_api_key(self.test_api_key, "demo")
-        self.transport = ASGITransport(app=app, client=("127.0.0.1", 54321))
+        self.app.state.register_api_key(self.test_api_key, "demo")
+        self.transport = ASGITransport(app=self.app, client=("127.0.0.1", 54321))
         self.client = AsyncClient(
             transport=self.transport,
             base_url="http://127.0.0.1:8443",
@@ -1851,20 +1918,31 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             errors: list[Exception] = []
 
             def create_in_worker(store: SqliteSecretStore, index: int) -> None:
+                # Sous contention, le perdant du BEGIN IMMEDIATE lève une erreur
+                # transitoire (database is locked → DatabaseUnavailableError) :
+                # retry court pour laisser la sérialisation trancher entre
+                # succès et refus de quota. Seule une erreur non transitoire
+                # est enregistrée comme refus définitif.
                 start.wait(timeout=5)
-                try:
-                    results.append(
-                        asyncio.run(
-                            store.create(
-                                project="demo",
-                                env="dev",
-                                name=f"SECRET_{index}",
-                                value=f"value-{index}",
+                for _ in range(20):
+                    try:
+                        results.append(
+                            asyncio.run(
+                                store.create(
+                                    project="demo",
+                                    env="dev",
+                                    name=f"SECRET_{index}",
+                                    value=f"value-{index}",
+                                )
                             )
                         )
-                    )
-                except Exception as exc:
-                    errors.append(exc)
+                        return
+                    except DatabaseUnavailableError:
+                        time.sleep(0.05)
+                    except Exception as exc:  # pragma: no cover - diagnostic
+                        errors.append(exc)
+                        return
+                errors.append(DatabaseUnavailableError("verrou persistant après retries"))
 
             threads = [
                 threading.Thread(target=create_in_worker, args=(store, index))
@@ -1936,12 +2014,21 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             refused: list[Exception] = []
 
             def create_in_worker(store: SqliteSecretStore, name: str) -> None:
+                # Sous contention, le perdant du BEGIN IMMEDIATE lève une erreur
+                # transitoire (database is locked → DatabaseUnavailableError) :
+                # retry court, sans jamais dépasser le quota.
                 start.wait(timeout=5)
-                try:
-                    asyncio.run(store.create(project="demo", env="dev", name=name, value="v"))
-                    created.append(name)
-                except Exception as exc:  # pragma: no cover - diagnostic
-                    refused.append(exc)
+                for _ in range(20):
+                    try:
+                        asyncio.run(store.create(project="demo", env="dev", name=name, value="v"))
+                        created.append(name)
+                        return
+                    except DatabaseUnavailableError:
+                        time.sleep(0.05)
+                    except Exception as exc:  # pragma: no cover - diagnostic
+                        refused.append(exc)
+                        return
+                refused.append(DatabaseUnavailableError("verrou persistant après retries"))
 
             threads = [
                 threading.Thread(target=create_in_worker, args=(store_one, "SECRET_A")),
@@ -2891,7 +2978,7 @@ class VaultSizedRejectionKeepAliveTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.server = uvicorn.Server(
             uvicorn.Config(
-                app=app,
+                app=get_app(),
                 host="127.0.0.1",
                 port=0,
                 log_level="error",

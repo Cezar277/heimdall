@@ -108,9 +108,12 @@ applique six contrôles cumulatifs, fail-closed et sans écho de la valeur :
 | Clavier | aucune ligne de clavier connue QWERTY/AZERTY/QWERTZ (deux sens, insensible à la casse) | `"qwertyuiop…"`, `"azerty…"`, `"qwerty"`, `"yxcvbnm…"` |
 
 Ces contrôles filtrent les **motifs triviaux** ; ils ne mesurent pas l'entropie
-et ne remplacent pas `generate_api_key()` côté opérateur, qui reste la seule
-source acceptable de clé. Un refus lève `ValueError` avec un message générique
-(jamais l'écho de la clé). La matrice de tests est dans
+et ne remplacent pas `generate_api_key()` côté opérateur, qui reste EXIGÉ :
+toute clé opérateur DOIT provenir du générateur (256 bits aléatoires) — un
+contournement manuel, même passant les six contrôles, est une faute
+opérationnelle (en cas de fuite des empreintes et du pepper, seul un token
+aléatoire résiste au brute-force hors ligne). Un refus lève `ValueError`
+avec un message générique (jamais l'écho de la clé). La matrice de tests est dans
 `tests/test_vault_app.py` (`test_register_api_key_rejects_weak_caller_key`,
 `test_register_api_key_rejects_trivial_patterns`,
 `test_register_api_key_rejects_non_base64url_alphabet`).
