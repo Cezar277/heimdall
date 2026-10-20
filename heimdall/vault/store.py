@@ -84,12 +84,13 @@ class InMemorySecretStore:
     squelette de développement/test : une KEK éphémère est générée par instance
     et un dump mémoire du processus contient à la fois ciphertexts et clé. Il ne
     doit jamais être déployé en production.
-    TODO(#26, #62) : Remplacer ce mode par la persistance SQLite chiffrée
-    (``SqliteSecretStore``) avec contrainte d'unicité UNIQUE(project_id, env, name)
-    et PRAGMA foreign_keys=ON.
-    TODO(#62) : Poursuivre le quota par projet et la pagination lors du branchement
-    SQLite pour borner la croissance disque et mémoire (capacité de stockage), en
-    distinguant quota de stockage et débit (retry inutile tant que la capacité est pleine).
+    RÉSOLU (#26, #62, mergé PR #139) : la persistance SQLite chiffrée
+    (``SqliteSecretStore``) existe avec contrainte d'unicité
+    UNIQUE(project_id, env, name) et PRAGMA foreign_keys=ON ; c'est le backend
+    prod par défaut, et le quota par projet y est vérifié atomiquement.
+    RESTE (suivi post-#63, hors contrat v1) : pagination (pas de route de
+    listage) et route DELETE (libération de capacité) — sans elles, le 429 de
+    capacité reste permanent (retry inutile), voir TODO(#62) historique.
     Ce quota n'est PAS le rate-limiting : il ne borne pas le débit des requêtes.
     Le débit est borné séparément par le middleware `ratelimit.py` (buckets par
     clé validée, pair réseau et global, 400/401 inclus, ticket #65), conformément
