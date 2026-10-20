@@ -104,7 +104,7 @@ jamais 0 ou 1.
   et la protection contre les attributs Git (`textconv`) restent à faire avec
   #29/#30.
 
-## preuves locales
+## Preuves locales
 
 ```sh
 .venv/bin/python -m pytest tests/test_scanner_detect.py \
