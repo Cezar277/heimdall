@@ -31,11 +31,13 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 - Confinement crypto (ticket #17) : ce module n'importe JAMAIS cryptography ou
   argon2 (réservés exclusivement à heimdall/vault/crypto.py) et délègue la
   génération/hachage des clés API à `heimdall.vault.crypto`.
-- Pepper clés API (ticket #64) : `hash_api_key` exige un pepper explicite (aucun
-  défaut public, aucun repli silencieux). `VaultSettings` refuse la constante
-  publique commitée hors `HEIMDALL_ENV=test`, exige
+- Pepper clés API (ticket #64) : `hash_api_key` exige un pepper explicite d'au
+  moins 32 octets (aucun défaut public, aucun repli silencieux). `VaultSettings`
+  refuse la constante publique commitée hors `HEIMDALL_ENV=test`, exige
   `HEIMDALL_VAULT_API_KEY_PEPPER` en production et génère hors production un
   pepper aléatoire éphémère au démarrage avec avertissement (documenté #25).
+  Les clés opérateur trop peu diverses (`"a" * 43`) sont refusées à
+  l'enregistrement : longueur seule insuffisante.
 - Gestion d'erreurs normalisée :
   - RequestValidationError -> 400 contractuel {"code": "bad_request", "message": "Requête invalide"}
     sans écho du corps ni enveloppe 422 de FastAPI.
@@ -204,9 +206,13 @@ _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 # Politique #64 : une clé opérateur doit offrir une entropie comparable aux clés
 # émises par `generate_api_key` (``secrets.token_urlsafe(32)`` → 43 caractères,
 # 256 bits). Le seuil de 43 caractères aligne l'enregistrement manuel sur la
-# génération : une clé de 32 caractères triviale (« a » * 32) est refusée même si
-# l'opérateur la juge longue.
+# génération ; la diversité minimale refuse les motifs triviaux du type
+# « a » * 43 qui franchiraient la seule barrière de longueur.
 _MIN_API_KEY_LENGTH: int = 43
+_MIN_API_KEY_DISTINCT_CHARS: int = 12
+# Aligné sur `crypto._MIN_PEPPER_BYTES` : défense en profondeur si les
+# empreintes stockées et le pepper fuient (résistance hors ligne).
+_MIN_API_KEY_PEPPER_BYTES: int = 32
 
 # Valeur publique de développement héritée : refusée hors tests explicites pour
 # empêcher tout déploiement partagé avec un pepper commité dans le dépôt.
@@ -284,6 +290,32 @@ def _validate_project_id(project_id: str) -> str:
             "La clé API doit être liée à un identifiant de projet conforme au contrat."
         )
     return project_id
+
+
+def _validate_raw_api_key(raw_key: str) -> str:
+    """Valide une clé opérateur brute avant hachage (fail-fast, sans écho).
+
+    Les clés DOIVENT être générées par ``generate_api_key()``
+    (``secrets.token_urlsafe(32)``, 256 bits, 43 caractères) ou offrir une
+    diversité équivalente. La longueur seule ne suffit pas : ``"a" * 43``
+    serait brute-forçable hors ligne si la base d'empreintes et le pepper
+    fuyaient. Le message reste générique et ne reflète jamais la clé.
+    """
+    if (
+        not isinstance(raw_key, str)
+        or len(raw_key) < _MIN_API_KEY_LENGTH
+        or raw_key != raw_key.strip()
+    ):
+        raise ValueError(
+            "La clé API brute doit comporter au moins "
+            f"{_MIN_API_KEY_LENGTH} caractères, sans espaces de début ou de fin."
+        )
+    if len(set(raw_key)) < _MIN_API_KEY_DISTINCT_CHARS:
+        raise ValueError(
+            "La clé API brute est trop peu diverse : utiliser generate_api_key() "
+            "ou une clé aléatoire d'au moins 256 bits (motif trivial refusé)."
+        )
+    return raw_key
 
 
 ProjectId = Annotated[
@@ -477,6 +509,7 @@ class VaultSettings(BaseSettings):
         repr=False,
         description=(
             "Pepper serveur distinct de la KEK pour hachage HMAC-SHA256 (ticket #64). "
+            "Doit comporter au moins 32 octets (256 bits). "
             "Obligatoire en production via HEIMDALL_VAULT_API_KEY_PEPPER. "
             "Hors production, absent = pepper aléatoire éphémère généré au démarrage "
             "avec avertissement (aucune valeur publique par défaut, aucune portabilité "
@@ -550,6 +583,16 @@ class VaultSettings(BaseSettings):
         cleaned = value
         if not cleaned:
             raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
+        try:
+            pepper_bytes = cleaned.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("Le pepper serveur doit être encodable en UTF-8.") from None
+        if len(pepper_bytes) < _MIN_API_KEY_PEPPER_BYTES:
+            raise ValueError(
+                "Le pepper serveur doit comporter au moins "
+                f"{_MIN_API_KEY_PEPPER_BYTES} octets (256 bits) : un secret court "
+                "réduit la résistance hors ligne des empreintes de clés API."
+            )
         if (
             cleaned == _INSECURE_DEFAULT_PEPPER
             and _heimdall_env_mode() not in _TEST_ENV_MODES
@@ -1067,7 +1110,15 @@ def verify_api_key(
             detail="Authentification requise",
         )
 
-    provided_hash = hash_api_key(api_key, pepper=settings.effective_api_key_pepper)
+    try:
+        provided_hash = hash_api_key(api_key, pepper=settings.effective_api_key_pepper)
+    except ValueError:
+        # Encodage impossible (ex. surrogate isolé) : 401 générique, jamais 500
+        # ni écho de la valeur fournie.
+        raise StarletteHTTPException(
+            status_code=401,
+            detail="Authentification requise",
+        ) from None
     matching_project, evaluated_count = _find_api_key_project_cached(request, provided_hash)
 
     # Coût comparable : comparaison factice si aucune clé n'a été évaluée
@@ -1144,6 +1195,9 @@ def _register_routes(app: FastAPI) -> None:
                 detail="Secret déjà existant",
             ) from None
         except QuotaExceededError:
+            # 429 contractuel : le Retry-After est obligatoire, mais la capacité
+            # pleine n'est pas transitoire tant qu'aucune route DELETE n'existe
+            # (retry inutile documenté, TODO(#62)).
             raise StarletteHTTPException(
                 status_code=429,
                 detail="Trop de requêtes",
@@ -1307,19 +1361,14 @@ def create_app(
     def register_api_key(raw_key: str, project_id: str) -> None:
         """Enregistre une clé API brute en calculant son HMAC-SHA256 avec le pepper serveur.
 
-        L'identifiant de projet est validé contre ``PROJECT_PATTERN`` : une clé liée
-        à un identifiant hors contrat ne pourrait jamais matcher une requête et
-        provoquerait un 403 silencieux à chaque appel.
+        Les clés DOIVENT être générées par ``generate_api_key()`` (256 bits) ou
+        offrir une diversité équivalente : la longueur seule est insuffisante et
+        les motifs triviaux (``"a" * 43``) sont refusés. L'identifiant de projet
+        est validé contre ``PROJECT_PATTERN`` : une clé liée à un identifiant
+        hors contrat ne pourrait jamais matcher une requête et provoquerait un
+        403 silencieux à chaque appel.
         """
-        if (
-            not isinstance(raw_key, str)
-            or len(raw_key) < _MIN_API_KEY_LENGTH
-            or raw_key != raw_key.strip()
-        ):
-            raise ValueError(
-                "La clé API brute doit comporter au moins "
-                f"{_MIN_API_KEY_LENGTH} caractères, sans espaces de début ou de fin."
-            )
+        raw_key = _validate_raw_api_key(raw_key)
         _validate_project_id(project_id)
         key_hash = hash_api_key(raw_key, pepper=effective_settings.effective_api_key_pepper)
         app.state.api_keys[key_hash] = project_id

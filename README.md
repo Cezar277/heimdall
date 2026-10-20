@@ -71,6 +71,10 @@ réside jamais dans la base ; `UNIQUE(project_id, env, name)` garantit le 409
 inter-workers et `PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
 Le backend mémoire, réservé aux tests/développement, chiffre également les
 valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
+Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets
+(256 bits) ; les clés opérateur enregistrées doivent être générées par
+`generate_api_key()` ou offrir une diversité équivalente (les motifs triviaux
+comme `"a" * 43` sont refusés).
 
 > **Environnement cible (POSIX requis)** :
 > Heimdall Vault requiert un système POSIX (Linux, macOS, BSD) pour garantir le durcissement fail-closed des permissions (`0600` pour la base, `0700` pour les répertoires). Sous Windows, ces permissions ne sont pas applicables nativement : l'ouverture de la base refuse fail-closed (`RuntimeError`, aucun avertissement suivi de poursuite) — Windows est strictement hors cible de déploiement en production.

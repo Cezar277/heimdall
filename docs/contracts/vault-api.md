@@ -64,7 +64,11 @@ serveur **distinct de la KEK** de chiffrement est admis. La fonction de
 hachage et la gestion du sel sont documentées pour #25.
 
 Politique de pepper retenue pour #64/#25 : `hash_api_key` exige un pepper
-explicite, sans valeur publique par défaut ni repli silencieux.
+explicite, sans valeur publique par défaut ni repli silencieux. Le pepper doit
+comporter **au moins 32 octets (256 bits)** ; un secret d'un caractère ou trop
+court est refusé par `VaultSettings` (`ValidationError`) comme par
+`hash_api_key` (`ValueError`), en défense en profondeur si les empreintes
+stockées et le pepper fuient.
 `HEIMDALL_VAULT_API_KEY_PEPPER` est **obligatoire** lorsque
 `HEIMDALL_ENV=production` ou `prod` (échec explicite au démarrage sinon).
 Hors production, son absence génère un pepper aléatoire éphémère au démarrage
@@ -75,6 +79,14 @@ publique `heimdall_default_vault_pepper_dev_only` est refusée sauf
 journalisé ni renvoyé au client. En production, `HEIMDALL_VAULT_REQUIRE_AUTH=false`
 est refusé au démarrage (`ValidationError`, fail-closed), comme le backend `memory`
 interdit et la KEK obligatoire pour SQLite.
+
+Les clés opérateur enregistrées via `register_api_key` **DOIVENT** provenir de
+`generate_api_key()` (`secrets.token_urlsafe(32)`, 256 bits) ou offrir une
+diversité équivalente : la longueur seule (`>= 43` caractères) ne suffit pas.
+Les motifs triviaux comme `"a" * 43` sont refusés (`ValueError`) pour éviter
+un brute-force hors ligne si les empreintes stockées et le pepper fuient.
+`create()` retourne uniquement les métadonnées ; le plaintext n'est déchiffré
+que par la lecture autorisée et n'est jamais renvoyé au POST.
 
 Chiffrement au repos : le backend SQLite (défaut en production) chiffre chaque
 valeur avec AES-256-GCM et une KEK `HEIMDALL_VAULT_KEK` de 32 octets encodée

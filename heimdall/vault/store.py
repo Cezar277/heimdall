@@ -15,6 +15,8 @@ Deux implémentations interchangeables exposent la même interface asynchrone
 
 Aucun module ne stocke de valeur brute en base, dans les logs ou dans un dict
 interne : les valeurs ne sont déchiffrées qu'au moment de la réponse autorisée.
+``create`` ne retourne que les métadonnées (jamais le plaintext) ; seule la
+lecture autorisée ``get`` déchiffre la valeur.
 """
 
 import asyncio
@@ -137,12 +139,13 @@ class InMemorySecretStore:
             }
             self._secrets[key] = record
             self._project_counts[project] = project_count + 1
+            # Métadonnées seules : la route POST n'a pas besoin de la valeur et
+            # le plaintext ne doit pas prolonger sa durée de vie en mémoire.
             return {
                 "project": project,
                 "env": env,
                 "name": name,
                 "status": "vaulte",
-                "value": value,
             }
 
     async def clear(self) -> None:
@@ -169,7 +172,10 @@ class SqliteSecretStore:
     sont pas sérialisés entre processus partageant le même fichier (le verrou
     asyncio est local) : deux workers peuvent franchir le seuil simultanément et
     le dépasser de façon bornée, sans corruption (UNIQUE protège l'unicité). À
-    contraindre en base (transaction) ou à documenter comme best-effort.
+    contraindre en base (transaction) ou à documenter comme best-effort. Le 429
+    de capacité (``QuotaExceededError``) n'est pas transitoire : sans route
+    DELETE, un retry avec ``Retry-After`` restera refusé tant que la capacité
+    est pleine ; le contrat impose néanmoins l'en-tête sur tout 429.
     """
 
     def __init__(
@@ -243,7 +249,6 @@ class SqliteSecretStore:
                 "env": env,
                 "name": name,
                 "status": "vaulte",
-                "value": value,
             }
 
     async def clear(self) -> None:

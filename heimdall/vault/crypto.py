@@ -10,11 +10,13 @@ Ticket #25. Exigences du contrat (#15) à y implémenter :
 - ``Cache-Control: no-store`` sur toute réponse portant métadonnées/valeur,
   aucun secret dans logs, erreurs ou buckets de rate-limit.
 
-GESTION DU PEPPER (ticket #64) : ``hash_api_key`` exige un pepper explicite,
-jamais de valeur publique par défaut (pas de repli silencieux sur un secret
-commité). La politique de résolution (obligatoire en production, aléatoire
-éphémère sinon, avec avertissement) vit dans ``VaultSettings`` et est
-documentée pour #25. ``generate_api_key`` produit les clés à ≥ 256 bits.
+GESTION DU PEPPER (ticket #64) : ``hash_api_key`` exige un pepper explicite
+d'au moins 32 octets (256 bits), jamais de valeur publique par défaut (pas de
+repli silencieux sur un secret commité). La politique de résolution
+(obligatoire en production, aléatoire éphémère sinon, avec avertissement) vit
+dans ``VaultSettings`` et est documentée pour #25. ``generate_api_key`` produit
+les clés à ≥ 256 bits ; les clés opérateur trop peu diverses sont refusées à
+l'enregistrement par ``app.register_api_key``.
 
 AUCUN autre module (scanner, MCP, CLI) ne doit importer ce module ni les
 librairies crypto : la CLI ne manipule que des références (triplet
@@ -34,6 +36,9 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 _KEY_SIZE_BYTES: int = 32  # AES-256 / KEK 256 bits
 _NONCE_SIZE_BYTES: int = 12  # nonce AES-GCM 96 bits
 _TAG_SIZE_BYTES: int = 16
+# Défense en profondeur : un pepper plus court que 256 bits réduit la
+# résistance hors ligne si les empreintes stockées et le pepper fuient.
+_MIN_PEPPER_BYTES: int = 32
 
 # Label de domaine stable de la sous-clé d'empreinte (invariant 5 : la KEK de
 # chiffrement n'est jamais réutilisée directement comme clé HMAC). Changer ce
@@ -56,7 +61,12 @@ def generate_api_key() -> str:
 
 
 def _normalize_pepper(pepper: str | bytes | None) -> bytes:
-    """Normalise le pepper serveur en octets ; refuse absent ou vide (fail-closed)."""
+    """Normalise le pepper serveur en octets ; refuse absent, vide ou trop court.
+
+    Le seuil de 32 octets (256 bits) est une défense en profondeur : il aligne
+    le pepper sur la KEK et évite qu'un secret d'un seul caractère réduise la
+    résistance hors ligne des empreintes de clés API.
+    """
     if pepper is None:
         raise ValueError(
             "Le pepper serveur est obligatoire : passer explicitement "
@@ -65,10 +75,19 @@ def _normalize_pepper(pepper: str | bytes | None) -> bytes:
     if isinstance(pepper, str):
         if not pepper or not pepper.strip():
             raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
-        return pepper.encode("utf-8")
-    pepper_bytes = bytes(pepper)
-    if not pepper_bytes or not pepper_bytes.strip():
-        raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
+        try:
+            pepper_bytes = pepper.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("Le pepper serveur doit être encodable en UTF-8.") from None
+    else:
+        pepper_bytes = bytes(pepper)
+        if not pepper_bytes or not pepper_bytes.strip():
+            raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
+    if len(pepper_bytes) < _MIN_PEPPER_BYTES:
+        raise ValueError(
+            f"Le pepper serveur doit comporter au moins {_MIN_PEPPER_BYTES} octets "
+            "(256 bits) pour une résistance hors ligne suffisante."
+        )
     return pepper_bytes
 
 
@@ -81,12 +100,21 @@ def hash_api_key(key: str, pepper: str | bytes) -> str:
     chiffrement), jamais sa valeur brute ; la fonction de hachage et la gestion
     du sel/pepper sont documentées pour #25.
 
-    Le pepper est obligatoire et n'a aucune valeur par défaut : un appel sans
-    pepper lève ``ValueError`` au lieu de produire une empreinte portable et
-    corrélable entre déploiements.
+    Le pepper est obligatoire, doit comporter au moins 32 octets et n'a aucune
+    valeur par défaut : un appel sans pepper lève ``ValueError`` au lieu de
+    produire une empreinte portable et corrélable entre déploiements. Une clé
+    non encodable en UTF-8 (surrogate isolé) est refusée par une erreur
+    générique, sans écho de la valeur reçue.
     """
     pepper_bytes = _normalize_pepper(pepper)
-    return hmac.new(pepper_bytes, key.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not isinstance(key, str):
+        raise ValueError("Clé API invalide : chaîne attendue.")
+    try:
+        key_bytes = key.encode("utf-8")
+    except UnicodeEncodeError:
+        # Aucun écho de la valeur reçue : le message reste générique.
+        raise ValueError("Clé API invalide : encodage UTF-8 impossible.") from None
+    return hmac.new(pepper_bytes, key_bytes, hashlib.sha256).hexdigest()
 
 
 def generate_encryption_key() -> str:

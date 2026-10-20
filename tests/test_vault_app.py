@@ -1391,13 +1391,17 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         assert fetched is not None
         self.assertEqual(fetched["value"], canary)
 
-    async def test_in_memory_secret_store_create_returns_defensive_copy(self) -> None:
-        """La mutation d'un dict retourné par store.create() ne corrompt pas le store."""
+    async def test_in_memory_secret_store_create_returns_metadata_only(self) -> None:
+        """store.create() ne retourne jamais le plaintext, seulement les métadonnées."""
         store = InMemorySecretStore()
         created = await store.create(
             project="demo", env="dev", name="SAFE_CREATE", value="initial"
         )
-        created["value"] = "tampered_after_create"
+        self.assertNotIn("value", created)
+        self.assertEqual(
+            created,
+            {"project": "demo", "env": "dev", "name": "SAFE_CREATE", "status": "vaulte"},
+        )
         created["status"] = "tampered_status"
 
         re_fetched = await store.get(project="demo", env="dev", name="SAFE_CREATE")
@@ -1414,8 +1418,11 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             await store.create(project="demo", env="dev", name="SECOND_KEY", value="v2")
         await store.clear()
         created = await store.create(project="demo", env="dev", name="SECOND_KEY", value="v2")
-        self.assertEqual(created["value"], "v2")
-        self.assertIsNotNone(await store.get("demo", "dev", "SECOND_KEY"))
+        self.assertNotIn("value", created)
+        re_fetched = await store.get("demo", "dev", "SECOND_KEY")
+        self.assertIsNotNone(re_fetched)
+        assert re_fetched is not None
+        self.assertEqual(re_fetched["value"], "v2")
 
     def test_in_memory_secret_store_documents_quota_todo_62(self) -> None:
         """Le docstring de InMemorySecretStore documente le TODO(#62) de quota/pagination."""
@@ -1571,6 +1578,8 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(errors, errors)
             self.assertEqual(len(results), worker_count)
+            for result in results:
+                self.assertNotIn("value", result)
             with db_session(db_path) as conn:
                 # Le seuil est franchi par les workers concurrents : best-effort,
                 # dépassement borné au nombre de workers, jamais de corruption.
@@ -1679,6 +1688,29 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     get_resp.json(),
                     {"code": "unauthorized", "message": "Authentification requise"},
                 )
+
+    async def test_unhashable_api_key_returns_generic_401_without_echo(self) -> None:
+        """Une clé non hachable (ex. surrogate) reste un 401 générique, jamais un 500."""
+        canary = "CANARY_UNENCODABLE_API_KEY"
+        test_app = create_app()
+        with patch.object(
+            vault_app_module,
+            "hash_api_key",
+            side_effect=ValueError(f"clé invalide : {canary}"),
+        ):
+            transport = ASGITransport(app=test_app, client=("127.0.0.1", 54321))
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://127.0.0.1:8443",
+                headers={"X-Heimdall-API-Key": canary},
+            ) as client:
+                response = await client.get("/api/v1/secrets/demo/dev/UNHASHABLE")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json(),
+            {"code": "unauthorized", "message": "Authentification requise"},
+        )
+        self.assertNotIn(canary, response.text)
 
     async def test_api_key_full_scan_is_memoized_once_per_request(self) -> None:
         """Le full-scan d'empreintes est mémoïsé par requête (anti-amplification CPU).
@@ -1835,7 +1867,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     def test_hash_api_key_uses_hmac_sha256_with_server_pepper(self) -> None:
         """hash_api_key utilise HMAC-SHA256 avec pepper serveur (openapi.yaml:197-200)."""
-        custom_pepper = "custom_secret_pepper_value_999"
+        custom_pepper = "custom_secret_pepper_value_999_0123456789"
         expected = hmac.new(
             custom_pepper.encode("utf-8"),
             b"my-api-key",
@@ -1846,15 +1878,15 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
     def test_hash_api_key_distinct_peppers_produce_different_hashes(self) -> None:
         """Deux clés identiques sur des déploiements distincts ne donnent pas le même hash."""
         key = "my-api-key-test"
-        hash_1 = hash_api_key(key, pepper="deployment_alpha_pepper")
-        hash_2 = hash_api_key(key, pepper="deployment_beta_pepper")
+        hash_1 = hash_api_key(key, pepper="deployment_alpha_pepper_0123456789")
+        hash_2 = hash_api_key(key, pepper="deployment_beta_pepper_0123456789")
         self.assertNotEqual(hash_1, hash_2)
 
     def test_hash_api_key_differs_from_bare_sha256(self) -> None:
         """Le hachage n'est jamais un SHA-256 nu (anti-corrélation inter-déploiements)."""
         key = "my-api-key-test"
         bare_sha = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        self.assertNotEqual(hash_api_key(key, pepper="test_pepper_value_123"), bare_sha)
+        self.assertNotEqual(hash_api_key(key, pepper="test_pepper_value_123_0123456789"), bare_sha)
 
     def test_hash_api_key_requires_an_explicit_pepper(self) -> None:
         """Aucun pepper public par défaut : None/vide/blanc est refusé (pas de repli silencieux)."""
@@ -1865,11 +1897,24 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     def test_hash_api_key_accepts_bytes_pepper(self) -> None:
         """Un pepper bytes non vide est accepté et produit le même HMAC que sa forme str."""
-        pepper = "pepper_bytes_equivalence_456"
+        pepper = "pepper_bytes_equivalence_456_0123456789"
         self.assertEqual(
             hash_api_key("any-key", pepper=pepper),
             hash_api_key("any-key", pepper=pepper.encode("utf-8")),
         )
+
+    def test_hash_api_key_rejects_unencodable_key_without_echo(self) -> None:
+        """Une clé non encodable UTF-8 lève ValueError générique, sans écho du secret."""
+        pepper = "surrogate_pepper_" + "s" * 20
+        canary = "\ud800"
+        for bad_key in (canary, canary + "a" * 42):
+            with self.subTest(length=len(bad_key)):
+                with self.assertRaises(ValueError) as ctx:
+                    hash_api_key(bad_key, pepper=pepper)
+                message = str(ctx.exception)
+                self.assertIn("encodage UTF-8 impossible", message)
+                self.assertNotIn(canary, message)
+                self.assertNotIn(bad_key, message)
 
     async def test_require_auth_by_default_rejects_missing_key_with_401(self) -> None:
         """create_app() sans argument exige l'auth par défaut (fail-closed, 401)."""
@@ -1916,7 +1961,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(raw_token, str(ctx_deprecated.exception))
 
         # Passage d'un hash HMAC valide (même pepper que les settings) -> accepté
-        pepper = "test_hash_pepper_value_789"
+        pepper = "test_hash_pepper_value_789_0123456789"
         valid_hash = hash_api_key(raw_token, pepper=pepper)
         app_with_hash = create_app(
             settings=VaultSettings(api_key_pepper=pepper),
@@ -1933,7 +1978,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     def test_create_app_rejects_simultaneous_api_key_hashes_and_api_keys(self) -> None:
         """create_app refuse l'usage simultané de api_key_hashes et api_keys (fail-closed)."""
-        valid_hash = hash_api_key("some-key", pepper="test_pepper_value_321")
+        valid_hash = hash_api_key("some-key", pepper="test_pepper_value_321_0123456789")
         with self.assertRaises(ValueError) as ctx:
             create_app(
                 api_key_hashes={valid_hash: "demo"},
@@ -1943,7 +1988,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     def test_create_app_rejects_invalid_project_id_for_prehashed_keys(self) -> None:
         """Un project_id hors contrat est refusé (fail-fast) sans refléter la valeur."""
-        pepper = "test_project_validation_pepper"
+        pepper = "test_project_validation_pepper_0123456789"
         valid_hash = hash_api_key("some-key", pepper=pepper)
         settings = VaultSettings(api_key_pepper=pepper)
         for bad_project in ("../..", "Demo", "demo!", "a" * 65, ""):
@@ -1975,19 +2020,31 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(test_app.state.api_keys), 1)
 
     def test_register_api_key_rejects_weak_caller_key(self) -> None:
-        """Politique #64 : une clé opérateur sous 43 caractères est refusée.
+        """Politique #64 : longueur et diversité alignées sur generate_api_key().
 
-        Le seuil aligne l'enregistrement manuel sur ``generate_api_key()``
-        (``secrets.token_urlsafe(32)`` → 43 caractères, 256 bits) : une clé de
-        32 caractères, même sans espace, reste trop faible et est refusée.
+        Le seuil de 43 caractères aligne l'enregistrement manuel sur
+        ``secrets.token_urlsafe(32)`` (256 bits), mais ne suffit pas : les motifs
+        triviaux de 43 caractères comme ``"a" * 43`` sont aussi refusés, sinon
+        ils seraient brute-forçables hors ligne si les empreintes et le pepper
+        fuyaient.
         """
         test_app = create_app()
-        for weak_key in ("a", "short-key", " " * 32, "a" * 32, "a" * 42):
+        weak_keys = (
+            "a",
+            "short-key",
+            " " * 32,
+            "a" * 32,
+            "a" * 42,
+            "a" * 43,
+            "ab" * 21 + "a",
+            "0123456789" * 4 + "012",
+        )
+        for weak_key in weak_keys:
             with self.subTest(key=weak_key):
                 with self.assertRaises(ValueError):
                     test_app.state.register_api_key(weak_key, "demo")
         self.assertEqual(len(test_app.state.api_keys), 0)
-        # Une clé générée (43 caractères) reste acceptée.
+        # Une clé générée (43 caractères, diversité suffisante) reste acceptée.
         test_app.state.register_api_key(generate_api_key(), "demo")
         self.assertEqual(len(test_app.state.api_keys), 1)
 
@@ -1999,6 +2056,21 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     VaultSettings(api_key_pepper=empty_val)
                 with self.assertRaises(ValueError):
                     hash_api_key("any-key", pepper=empty_val)
+
+    def test_vault_settings_and_hash_reject_short_pepper(self) -> None:
+        """Un pepper sous 32 octets (256 bits) est refusé, en settings comme au hachage."""
+        for short_pepper in ("x", "x" * 31):
+            with self.subTest(pepper_length=len(short_pepper)):
+                with self.assertRaises(ValidationError) as ctx:
+                    VaultSettings(api_key_pepper=short_pepper)
+                self.assertIn("32 octets", str(ctx.exception))
+                with self.assertRaises(ValueError) as hash_ctx:
+                    hash_api_key("any-key", pepper=short_pepper)
+                self.assertIn("32 octets", str(hash_ctx.exception))
+        # Exactement 32 octets reste accepté (borne inclusive).
+        boundary = "b" * 32
+        self.assertEqual(VaultSettings(api_key_pepper=boundary).api_key_pepper, boundary)
+        self.assertEqual(len(hash_api_key("any-key", pepper=boundary)), 64)
 
     def test_vault_settings_rejects_pepper_with_leading_or_trailing_whitespace(self) -> None:
         """Le pepper n'est jamais normalisé silencieusement (pas de perte d'entropie)."""
