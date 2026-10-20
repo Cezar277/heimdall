@@ -75,15 +75,9 @@ inter-workers et `PRAGMA foreign_keys=ON` protège l'intégrité référentielle
 Le backend mémoire, réservé aux tests/développement, chiffre également les
 valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
 Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets
-(256 bits) ; les clés opérateur enregistrées doivent être générées par
-`generate_api_key()` : l'enregistrement est fail-closed et refuse tout token
-qui n'est pas un base64url strict (`A-Z a-z 0-9 _ -`), qui fait moins de 43
-caractères, qui compte moins de 16 caractères distincts ou qui est la répétition
-d'un bloc plus court (`"a" * 43`, `"abcdefghijkl" * 4` : refusés). La valeur
-d'un secret est canonisée en Unicode NFC avant stockage et l'octet NUL y est
-interdit ; elle n'est jamais journalisée. La traçabilité
-ticket → module → preuve est dans
-[`docs/contracts/vault-traceability.md`](docs/contracts/vault-traceability.md).
+(256 bits) et rester distinct de la KEK : la politique complète (émission,
+révocation, empreintes) est décrite dans la section « Clés API de projet »
+ci-dessous.
 
 > **Environnement cible (POSIX requis)** :
 > Heimdall Vault requiert un système POSIX (Linux, macOS, BSD) pour garantir le durcissement fail-closed des permissions (`0600` pour la base, `0700` pour les répertoires). Sous Windows, ces permissions ne sont pas applicables nativement : l'ouverture de la base refuse fail-closed (`RuntimeError`, aucun avertissement suivi de poursuite) — Windows est strictement hors cible de déploiement en production.
@@ -94,8 +88,10 @@ ticket → module → preuve est dans
 > - **Rejet fail-closed HTTP 403 sur IP non-loopback** : garde middleware en défense en profondeur (niveau transport/socket), volontairement maintenue hors du contrat OpenAPI applicatif (`/api/v1/health` étant publique sans clé).
 > - **TLS avec SAN IP (`https://127.0.0.1:8443`)** : obligatoire en production
 >   (`HEIMDALL_VAULT_SSL_CERTFILE` + `HEIMDALL_VAULT_SSL_KEYFILE`), HTTP en clair
->   réservé au développement local. La révocation de clés reste suivie séparément.
-> - **Authentification par clé API de projet (`X-Heimdall-API-Key`)** : ticket #64.
+>   réservé au développement local.
+> - **Authentification par clé API de projet (`X-Heimdall-API-Key`)** : livrée par
+>   le ticket #64 (empreinte HMAC-SHA256 + pepper, clé affichée une seule fois,
+>   révocation).
 > - **Rejet HTTP 400 avant parsing au-delà de 1 Mio (1 048 576 octets)** : ticket #63.
 > - **En-tête `Cache-Control: no-store`** : ticket #63.
 > - **Rate-limit débit par clé validée, pair réseau et global avec `Retry-After`** : ticket #65.
@@ -105,8 +101,7 @@ ticket → module → preuve est dans
 > - **Transport** : le lanceur `python -m heimdall.vault.app` refuse de démarrer
 >   en production sans certificat et clé TLS (`HEIMDALL_VAULT_SSL_CERTFILE`,
 >   `HEIMDALL_VAULT_SSL_KEYFILE`). Le HTTP en clair reste réservé à la boucle
->   locale en développement. La révocation de clés reste à livrer dans son
->   ticket dédié (#64).
+>   locale en développement. La révocation de clés est livrée (#64).
 > - **Rate-limit partagé avec SQLite** : les buckets (clé validée, pair réseau,
 >   global) sont persistés dans la base sous transaction `BEGIN IMMEDIATE`, donc
 >   partagés entre workers sans multiplication du débit. Le backend mémoire reste
@@ -124,6 +119,58 @@ Vérifier la santé minimale (`/api/v1/health` contractuel) :
 curl http://127.0.0.1:8443/api/v1/health
 # {"status": "ok"}
 ```
+
+### Clés API de projet (ticket #64)
+
+Seul un projet muni de sa clé API peut lire ou écrire ses secrets. La clé est
+transmise dans l'en-tête `X-Heimdall-API-Key` ; le serveur n'en conserve que
+son **empreinte de vérification** (HMAC-SHA256 avec le pepper serveur) : la clé
+brute n'est **jamais** stockée, journalisée ni renvoyée après sa création.
+
+```sh
+# 1. Émettre une clé pour un projet (affichée UNE SEULE FOIS : à copier aussitôt).
+#    Le pepper serveur est EXPLICITE : un pepper éphémère rendrait la clé morte
+#    au redémarrage du serveur.
+export HEIMDALL_VAULT_API_KEY_PEPPER='<pepper aléatoire persistant, distinct de la KEK>'
+heimdall vault key create --project demo
+# Clé API de projet émise — affichée UNE SEULE FOIS, à copier maintenant :
+# gWEWT-9b8Rzs0_dGpW1PEu-w7hIBN9_iViXwI2LwrhE
+# Identifiant : key_edb63e52fce048669734ddf21aa06cbf
+# Projet      : demo
+
+# 2. Lister les clés enregistrées (métadonnées seules : ni la clé ni son empreinte).
+heimdall vault key list --project demo
+# key_edb63e52fce048669734ddf21aa06cbf  projet=demo  créée=...  état=active
+
+# 3. Révoquer une clé : elle cesse d'authentifier immédiatement (401 générique).
+heimdall vault key revoke key_edb63e52fce048669734ddf21aa06cbf
+```
+
+Puis, côté serveur, chaque requête porte la clé du projet concerné :
+
+```sh
+curl -H "X-Heimdall-API-Key: <clé du projet>" \
+  http://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
+```
+
+Comportement fail-closed appliqué par `heimdall/vault/auth.py` :
+
+| Situation | Réponse |
+|---|---|
+| clé absente, inconnue, révoquée ou invalide | `401 unauthorized` (message générique, jamais d'écho de la clé) |
+| clé valide d'un **autre** projet | `403 forbidden` (décidé **avant** toute recherche de secret : l'existence d'une ressource n'est pas révélée) |
+| identifiant de projet hors contrat | `400 bad_request` |
+
+Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets
+(256 bits) et rester **distinct de la KEK** de chiffrement ; les clés opérateur
+enregistrées doivent être générées par `generate_api_key()` : l'enregistrement
+est fail-closed et refuse tout token qui n'est pas un base64url strict
+(`A-Z a-z 0-9 _ -`), qui fait moins de 43 caractères, qui compte moins de 16
+caractères distincts ou qui est la répétition d'un bloc plus court
+(`"a" * 43`, `"abcdefghijkl" * 4` : refusés). La valeur d'un secret est
+canonisée en Unicode NFC avant stockage et l'octet NUL y est interdit ; elle
+n'est jamais journalisée. La traçabilité ticket → module → preuve est dans
+[`docs/contracts/vault-traceability.md`](docs/contracts/vault-traceability.md).
 
 ## Structure
 

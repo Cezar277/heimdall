@@ -11,9 +11,9 @@ vérifiable par un fichier de test cité.
 | Ticket | Périmètre | Modules / symboles | Preuves (tests) |
 |---|---|---|---|
 | #25 | Serveur minimal, boucle locale, transport durci, TLS fail-closed en production | `heimdall/vault/app.py` (`VaultSettings`, `run_server`, `BodySizeLimitMiddleware`, `DatabaseAvailabilityMiddleware`, garde loopback) | `tests/test_vault_app.py`, `tests/test_vault_availability.py`, `tests/test_vault_early_rejections.py` |
-| #26 | Chiffrement au repos : AES-256-GCM, AAD, sous-clé HKDF, KEK/pepper distincts, confinement crypto | `heimdall/vault/crypto.py` (`VaultCipher`, `hash_api_key`, `verify_api_key`, `kek_matches_pepper`, `constant_time_equal`) | `tests/test_vault_app.py`, `tests/test_crypto_confinement.py` |
+| #26 | Chiffrement au repos : AES-256-GCM, AAD, sous-clé HKDF, KEK/pepper distincts, confinement crypto | `heimdall/vault/crypto.py` (`VaultCipher`, `hash_api_key`, `generate_api_key`, `kek_matches_pepper`, `constant_time_equal`) | `tests/test_vault_app.py`, `tests/test_crypto_confinement.py` |
 | #62 | Persistance SQLite : schéma, `UNIQUE`, `foreign_keys=ON`, quota atomique, registre des clés | `heimdall/vault/database.py`, `heimdall/vault/store.py` (`SqliteSecretStore`, `InMemorySecretStore`) | `tests/test_vault_db.py`, `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py` |
-| #64 | Authentification par clé de projet : HMAC-SHA256 + pepper, temps constant, révocation, politique opérateur | `heimdall/vault/app.py` (`_validate_raw_api_key`, `_validate_project_id`, `verify_api_key`, `_find_api_key_project*`, `_persist_api_key_hash`, `register_api_key`) | `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py`, `tests/security/test_vault_replay_bruteforce.py` |
+| #64 | Authentification par clé de projet : HMAC-SHA256 + pepper, temps constant, révocation, politique opérateur | `heimdall/vault/auth.py` (`generate_project_api_key`, `hash_project_api_key`, `validate_raw_api_key`, `validate_project_id`, `verify_api_key`, `require_project_access`, `ApiKeyRegistry`, `IssuedApiKey`), `heimdall/cli/vault_keys.py` (`heimdall vault key create/list/revoke`) | `tests/test_vault_auth.py`, `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py`, `tests/security/test_vault_replay_bruteforce.py` |
 | #65 | Limitation de débit : buckets clé/pair/global, `Retry-After` borné, backend partagé SQLite | `heimdall/vault/ratelimit.py` (`RateLimiter`, `SqliteRateLimiter`), middleware de débit de `app.py` | `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py` |
 | #63 | Routes `POST /api/v1/secrets` et `GET /api/v1/secrets/{project}/{env}/{name}` : validation stricte, 1 Mio, `no-store`, 201 sans `value` | `heimdall/vault/app.py` (`SecretCreate`, `SecretMetadata`, `SecretRead`, `_register_routes`), `openapi.yaml` | `tests/test_vault_app.py`, `tests/contracts/test_vault_openapi.py` |
 
@@ -27,11 +27,19 @@ briques #26/#62/#64/#65 y sont matérialisées parce que les routes #63 en
 dépendent (elles les exercent). Pour lever la remarque d'hygiène, la suite
 recommandée est une pile de branches, chaque brique restant dans son ticket :
 
+> **État d'avancement** : la brique #64 est désormais portée par sa propre
+> branche (`64-t254-authentification-par-clé-api-de-projet`), empilée sur la
+> branche #63 et relue en diff contre elle. La brique y est **isolée dans le
+> module `heimdall/vault/auth.py`** (registre, dépendance FastAPI, politique
+> opérateur) avec sa suite de tests `tests/test_vault_auth.py` ; `app.py` ne
+> fait plus que déléguer. Les branches #26/#62/#65 restent à extraire de la
+> même façon.
+
 ```bash
 # Ordre de dépendance (du socle vers les routes)
 git branch 26-vault-chiffrement      # crypto.py        (#26)
 git branch 62-vault-stockage-sqlite  # database/store   (#62)
-git branch 64-vault-auth-cles-projet # auth + registre  (#64)
+git branch 64-vault-auth-cles-projet # auth + registre  (#64)  <- fait
 git branch 65-vault-rate-limit       # ratelimit.py     (#65)
 git branch 63-routes-secrets         # app.py (routes)  (#63)  <- pile au-dessus
 ```
