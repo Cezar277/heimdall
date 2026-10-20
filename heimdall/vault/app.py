@@ -1547,7 +1547,7 @@ def _register_routes(app: FastAPI) -> None:
             # transitoire : sans route DELETE dans le contrat #63, un retry
             # (même après le délai annoncé) sera refusé tant que la capacité
             # reste pleine. Le retry est donc INUTILE jusqu'à libération d'un
-            # emplacement (route DELETE + quotas par projet, TODO(#62)).
+            # emplacement (route DELETE + quotas par projet, TODO(#156)).
             raise StarletteHTTPException(
                 status_code=429,
                 detail="Trop de requêtes",

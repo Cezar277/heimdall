@@ -1637,7 +1637,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         # La sémantique « retry inutile » est documentée dans le code lui-même.
         store_doc = SqliteSecretStore.__doc__ or ""
         self.assertIn("INUTILE", store_doc)
-        self.assertIn("TODO(#62)", store_doc)
+        self.assertIn("TODO(#156)", store_doc)
         self.assertIn("transitoire", store_doc)
 
     async def test_post_secret_malformed_content_length_rejected_400(self) -> None:
@@ -1738,10 +1738,10 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         assert re_fetched is not None
         self.assertEqual(re_fetched["value"], "v2")
 
-    def test_in_memory_secret_store_documents_quota_todo_62(self) -> None:
-        """Le docstring de InMemorySecretStore documente le TODO(#62) de quota/pagination."""
+    def test_in_memory_secret_store_documents_quota_followup(self) -> None:
+        """Le docstring de InMemorySecretStore documente le suivi quota/pagination (#156)."""
         doc = InMemorySecretStore.__doc__ or ""
-        self.assertIn("TODO(#62)", doc)
+        self.assertIn("TODO(#156)", doc)
         self.assertIn("quota", doc)
 
     async def test_body_size_limit_rejections_close_connection(self) -> None:

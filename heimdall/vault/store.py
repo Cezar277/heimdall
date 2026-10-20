@@ -90,7 +90,7 @@ class InMemorySecretStore:
     prod par défaut, et le quota par projet y est vérifié atomiquement.
     RESTE (suivi post-#63, hors contrat v1) : pagination (pas de route de
     listage) et route DELETE (libération de capacité) — sans elles, le 429 de
-    capacité reste permanent (retry inutile), voir TODO(#62) historique.
+    capacité reste permanent (retry inutile), voir TODO(#156).
     Ce quota n'est PAS le rate-limiting : il ne borne pas le débit des requêtes.
     Le débit est borné séparément par le middleware `ratelimit.py` (buckets par
     clé validée, pair réseau et global, 400/401 inclus, ticket #65), conformément
@@ -184,7 +184,7 @@ class SqliteSecretStore:
     ce délai restera refusé tant que la capacité est pleine — le contrat #63
     n'expose aucune route DELETE, donc aucun emplacement ne peut être libéré.
     Le retry est donc INUTILE tant que la capacité est pleine ; la libération
-    (route DELETE, quotas par projet) est suivie dans TODO(#62). Ce 429 de
+    (route DELETE, quotas par projet) est suivie dans TODO(#156). Ce 429 de
     capacité est distinct du 429 de débit (rate-limit, #65), lui transitoire.
 
     L'empreinte d'intégrité persistée utilise la sous-clé HKDF dédiée et le
