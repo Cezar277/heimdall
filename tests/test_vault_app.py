@@ -2455,6 +2455,9 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             "abc+def/ghi=jkl?mno&pqr#stu@uvw%xyz0123456789ABCD",
             "abc\x00def\x01ghi\x1fjkl\x7fmno\x1bpqr stu vwx yz012345",
             "abc.def.ghi.jkl.mno.pqr.stu.vwx.yz0123456789ABCDEFGH",
+            # `\n` final : refusé par le garde strip() ET par le motif (fullmatch).
+            "A" * 42 + "\n",
+            "\n" + "A" * 42,
         )
         for forbidden_key in forbidden_keys:
             with self.subTest(key=forbidden_key):
@@ -2464,6 +2467,20 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         # Une clé générée (base64url) reste acceptée.
         test_app.state.register_api_key(generate_api_key(), "demo")
         self.assertEqual(len(test_app.state.api_keys), 1)
+
+    def test_api_key_alphabet_uses_fullmatch_not_dollar(self) -> None:
+        """Pin LOW revue : `$` accepterait un `\\n` final via `match`, pas via `fullmatch`.
+
+        Aujourd'hui le garde `strip()` refuse déjà ces clés en amont ; `fullmatch`
+        lève l'ambiguïté au niveau du motif (défense en profondeur).
+        """
+        pattern = vault_app_module._API_KEY_ALPHABET_PATTERN
+        # L'ambiguïté documentée : `match` + `$` laisse passer le `\n` final.
+        self.assertIsNotNone(pattern.match("abc\n"))
+        # Le contrôle effectif ne le laisse plus passer, sans casser le valide.
+        self.assertIsNone(pattern.fullmatch("abc\n"))
+        self.assertIsNotNone(pattern.fullmatch("abc"))
+        self.assertIsNone(pattern.fullmatch("ab\ncd"))
 
     def test_vault_settings_and_hash_reject_empty_pepper(self) -> None:
         """Un pepper vide ou blanc est rejeté par VaultSettings et hash_api_key."""

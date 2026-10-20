@@ -431,7 +431,7 @@ def _validate_raw_api_key(raw_key: str) -> str:
             f"{_MIN_API_KEY_LENGTH} et {_MAX_API_KEY_LENGTH} caractères, "
             "sans espaces de début ou de fin."
         )
-    if _API_KEY_ALPHABET_PATTERN.match(raw_key) is None:
+    if _API_KEY_ALPHABET_PATTERN.fullmatch(raw_key) is None:
         raise ValueError(
             "La clé API brute doit être un token base64url (A-Z, a-z, 0-9, "
             "« _ » et « - ») : ni espaces ni caractères de contrôle."
