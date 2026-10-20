@@ -1,8 +1,11 @@
 """Régressions de la revue #63 : admission, SQLite async et empreintes uniques."""
 
 import asyncio
+import os
 import secrets
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -30,6 +33,7 @@ from heimdall.vault.database import (
     ensure_project,
     init_db,
 )
+from heimdall.vault.ratelimit import RateLimiter
 from heimdall.vault.store import SqliteSecretStore
 
 
@@ -338,3 +342,75 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self._authenticated_get(target, key)).status_code, 404)
         with self.assertRaises(ValueError):
             target.state.register_api_key(key + "A", "demo")
+
+    async def test_authenticated_burst_is_bounded_single_transaction(self) -> None:
+        """Rafale clé valide : exactement per_key admissions, sans dépassement.
+
+        Verrouille LOW n°1 : ``peek`` + ``check_authenticated`` unique ne
+        laissent aucune fenêtre inter-transactions (5×404 + 5×429 exacts,
+        mémoire comme SQLite partagé).
+        """
+        for backend in ("memory", "sqlite"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmp:
+                target = create_app(
+                    VaultSettings(
+                        db_path=str(Path(tmp) / f"{backend}.db"),
+                        storage_backend=backend,
+                        kek=generate_encryption_key(),
+                        api_key_pepper="p" * 32,
+                        rate_limit_per_key=5,
+                        rate_limit_per_peer=1_000,
+                        rate_limit_global=1_000,
+                    )
+                )
+                key = generate_api_key()
+                target.state.register_api_key(key, "demo")
+                responses = await asyncio.gather(
+                    *(self._authenticated_get(target, key) for _ in range(10))
+                )
+                codes = sorted(response.status_code for response in responses)
+                self.assertEqual(codes.count(404), 5)
+                self.assertEqual(codes.count(429), 5)
+
+    def test_peek_does_not_consume_or_create_buckets(self) -> None:
+        """``peek`` est lecture seule : ni consommation ni création de bucket."""
+        limiter = RateLimiter(per_key=1, per_peer=1, global_limit=1, window_seconds=60)
+        allowed, _ = limiter.peek("127.0.0.1")
+        self.assertTrue(allowed)
+        self.assertEqual(limiter._buckets, {})
+        allowed, _ = limiter.check("127.0.0.1")
+        self.assertTrue(allowed)
+        allowed, _ = limiter.peek("127.0.0.1")
+        self.assertFalse(allowed)
+        self.assertEqual(limiter._buckets["peer:127.0.0.1"].count, 1)
+
+
+class VaultImportSideEffectTests(unittest.TestCase):
+    def test_plain_import_creates_no_file_even_in_production(self) -> None:
+        """Verrouille LOW n°2 : ``import heimdall.vault.app`` sans accès à ``app``.
+
+        Même avec ``HEIMDALL_ENV=production`` (backend SQLite par défaut),
+        le simple import ne crée ni répertoire ni ``vault.db`` et ne lève
+        pas (le fail-closed n'a lieu qu'au premier accès à ``app``).
+        """
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as xdg:
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("HEIMDALL_VAULT_")
+            }
+            env["HEIMDALL_ENV"] = "production"
+            env["HOME"] = home
+            env["XDG_DATA_HOME"] = xdg
+            code = "import heimdall.vault.app; print('import-ok')"
+            result = subprocess.run(  # noqa: S603
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("import-ok", result.stdout)
+            self.assertEqual(list(Path(xdg).rglob("*")), [])
+            self.assertEqual(list(Path(home).rglob("*")), [])

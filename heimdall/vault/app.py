@@ -1010,6 +1010,31 @@ class DatabaseAvailabilityMiddleware:
             await response(scope, receive, send)
 
 
+async def _limiter_peek(limiter: RateLimiter | SqliteRateLimiter, peer: str) -> tuple[bool, int]:
+    """Lecture seule pair/global, sans verrou d'écriture (rejet précoce)."""
+    if isinstance(limiter, SqliteRateLimiter):
+        return await asyncio.to_thread(limiter.peek, peer)
+    return limiter.peek(peer)
+
+
+async def _limiter_consume_peer(
+    limiter: RateLimiter | SqliteRateLimiter, peer: str
+) -> tuple[bool, int]:
+    """Consomme pair/global pour les requêtes sans bucket clé (401/400/santé)."""
+    if isinstance(limiter, SqliteRateLimiter):
+        return await asyncio.to_thread(limiter.check, peer)
+    return limiter.check(peer)
+
+
+async def _limiter_consume_authenticated(
+    limiter: RateLimiter | SqliteRateLimiter, peer: str, key_hash: str
+) -> tuple[bool, int]:
+    """Consomme pair/global + clé en une seule transaction (requête authentifiée)."""
+    if isinstance(limiter, SqliteRateLimiter):
+        return await asyncio.to_thread(limiter.check_authenticated, peer, key_hash)
+    return limiter.check_authenticated(peer, key_hash)
+
+
 def _register_middleware(app: FastAPI) -> None:
     """Enregistre les middlewares du serveur Vault."""
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=_MAX_BODY_SIZE)
@@ -1035,25 +1060,30 @@ def _register_middleware(app: FastAPI) -> None:
     async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
         """Borne le débit par clé validée, pair réseau et global (ticket #65).
 
-        Les buckets pair/global sont consommés avant tout hachage ou lookup.
-        Les 400/401 sont comptés par le bucket pair/global puisque le middleware
-        s'exécute avant le routage et les dépendances. Une clé invalide ne crée
-        aucun bucket arbitraire : seuls pair et global s'appliquent. Le choix du
+        Rejet précoce sans coût CPU : ``peek`` pair/global (lecture seule,
+        sans consommation) précède tout hachage ou lookup. Les 400/401 sont
+        comptés par le bucket pair/global puisque le middleware s'exécute
+        avant le routage et les dépendances. Une clé invalide ne crée aucun
+        bucket arbitraire : seuls pair et global s'appliquent. Le choix du
         bucket par clé emprunte le même parcours à coût comparable que
         ``verify_api_key`` (``_find_api_key_project_cached``) : le résultat est
         mémoïsé dans la requête et réutilisé par l'authentification (un seul
         full-scan par requête, ticket #65) ; l'existence d'une clé n'est pas
-        observable par le temps de réponse du middleware. Avec le backend SQLite,
-        ``SqliteRateLimiter`` partage les buckets entre workers (transaction
-        ``BEGIN IMMEDIATE``) : la limite n'est jamais multipliée par le nombre
-        de processus. Le mode mémoire reste mono-processus (dev/test).
+        observable par le temps de réponse du middleware. La phase consommatrice
+        est ensuite UNIQUE : ``check_authenticated`` consomme pair/global + clé
+        en une seule transaction (mémoire : une seule section critique ;
+        SQLite : un seul ``BEGIN IMMEDIATE``), au lieu de deux transactions
+        successives (plus de fenêtre inter-transactions ni double verrou
+        d'écriture). Sémantique préservée : pair/global restent consommés même
+        quand le bucket clé est plein. Avec le backend SQLite,
+        ``SqliteRateLimiter`` partage les buckets entre workers : la limite
+        n'est jamais multipliée par le nombre de processus. Le mode mémoire
+        reste mono-processus (dev/test).
         """
         peer = request.client.host if request.client and request.client.host else "unknown"
         limiter: RateLimiter | SqliteRateLimiter = request.app.state.rate_limiter
-        if isinstance(limiter, SqliteRateLimiter):
-            allowed, retry_after = await asyncio.to_thread(limiter.check, peer)
-        else:
-            allowed, retry_after = limiter.check(peer)
+
+        allowed, retry_after = await _limiter_peek(limiter, peer)
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -1063,6 +1093,13 @@ def _register_middleware(app: FastAPI) -> None:
         key_hash: str | None = None
         raw_key = request.headers.get("X-Heimdall-API-Key")
         if raw_key is not None and len(raw_key) > _MAX_API_KEY_LENGTH:
+            allowed, retry_after = await _limiter_consume_peer(limiter, peer)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content=_ERROR_PAYLOADS[429],
+                    headers={"Retry-After": str(retry_after), "Connection": "close"},
+                )
             return JSONResponse(
                 status_code=401,
                 content=_ERROR_PAYLOADS[401],
@@ -1082,10 +1119,9 @@ def _register_middleware(app: FastAPI) -> None:
                     key_hash = candidate_hash
 
         if key_hash is not None:
-            if isinstance(limiter, SqliteRateLimiter):
-                allowed, retry_after = await asyncio.to_thread(limiter.check_key, key_hash)
-            else:
-                allowed, retry_after = limiter.check_key(key_hash)
+            allowed, retry_after = await _limiter_consume_authenticated(limiter, peer, key_hash)
+        else:
+            allowed, retry_after = await _limiter_consume_peer(limiter, peer)
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -1622,7 +1658,35 @@ def create_app(
     return app
 
 
-app = create_app()
+_APP_HOLDER: dict[str, FastAPI] = {}
+_app_lock = Lock()
+
+
+def get_app() -> FastAPI:
+    """Retourne l'instance lazy du serveur (construite au premier accès).
+
+    Remarque LOW n°2 : aucun effet disque à l'import — ``import
+    heimdall.vault.app`` ne résout aucun backend, ne génère ni cipher ni
+    pepper et n'appelle jamais ``init_db``. La construction (backend SQLite,
+    ``vault.db`` 600, pepper éphémère) n'a lieu qu'au premier accès à
+    ``heimdall.vault.app.app`` (uvicorn ``heimdall.vault.app:app`` ou
+    ``get_app()``), donc au démarrage du serveur, jamais à l'import.
+    """
+    if "app" not in _APP_HOLDER:
+        with _app_lock:
+            if "app" not in _APP_HOLDER:
+                _APP_HOLDER["app"] = create_app()
+    return _APP_HOLDER["app"]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "app":
+        return get_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 
 def run_server() -> None:
@@ -1688,9 +1752,10 @@ __all__ = [
     "UnauthorizedError",
     "UnavailableError",
     "VaultSettings",
-    "app",
+    "app",  # noqa: F822 -- fourni par __getattr__ (PEP 562, lazy sans effet disque)
     "create_app",
     "generate_api_key",
+    "get_app",
     "get_settings",
     "hash_api_key",
     "project_api_key_header",

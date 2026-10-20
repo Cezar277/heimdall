@@ -90,6 +90,73 @@ class RateLimiter:
         """Consomme seulement le bucket clé après admission pair/global."""
         return self._check([(f"key:{key_hash}", self._per_key)])
 
+    def peek(self, peer: str) -> tuple[bool, int]:
+        """Contrôle sans consommation des buckets pair/global (rejet précoce).
+
+        Utilisé avant tout hachage/lookup pour refuser sans coût CPU les
+        rafales déjà limitées. Ne crée ni ne mute aucun bucket.
+        """
+        now = time.monotonic()
+        for name, limit in (
+            ("global", self._global_limit),
+            (f"peer:{peer}", self._per_peer),
+        ):
+            bucket = self._buckets.get(name)
+            if bucket is None or now >= bucket.reset_at:
+                continue
+            if bucket.count >= limit:
+                retry = max(
+                    1,
+                    min(
+                        _MAX_RETRY_AFTER_SECONDS,
+                        math.ceil(bucket.reset_at - now),
+                    ),
+                )
+                return False, retry
+        return True, 0
+
+    def check_authenticated(self, peer: str, key_hash: str) -> tuple[bool, int]:
+        """Consomme pair/global + clé en une seule section critique.
+
+        Sémantique préservée (test ``peer_global_are_consumed_once``) :
+        pair/global sont consommés même quand le bucket clé est plein
+        (sur-consommation volontaire, pas d'atomicité tout-ou-rien), mais
+        l'ensemble est appliqué sans fenêtre entre deux transactions :
+        une seule mutation pour une requête authentifiée.
+        """
+        now = time.monotonic()
+        pending: list[_Bucket] = []
+        for name, limit in (
+            ("global", self._global_limit),
+            (f"peer:{peer}", self._per_peer),
+        ):
+            bucket = self._bucket(name, now)
+            if bucket.count >= limit:
+                retry = max(
+                    1,
+                    min(
+                        _MAX_RETRY_AFTER_SECONDS,
+                        math.ceil(bucket.reset_at - now),
+                    ),
+                )
+                return False, retry
+            pending.append(bucket)
+        for bucket in pending:
+            bucket.count += 1
+        key_bucket = self._bucket(f"key:{key_hash}", now)
+        if key_bucket.count >= self._per_key:
+            retry = max(
+                1,
+                min(
+                    _MAX_RETRY_AFTER_SECONDS,
+                    math.ceil(key_bucket.reset_at - now),
+                ),
+            )
+            return False, retry
+        key_bucket.count += 1
+        self._prune(now)
+        return True, 0
+
     def _check(self, specs: list[tuple[str, int]]) -> tuple[bool, int]:
         now = time.monotonic()
         buckets: list[_Bucket] = []
@@ -163,6 +230,117 @@ class SqliteRateLimiter:
     def check_key(self, key_hash: str) -> tuple[bool, int]:
         """Consomme seulement le bucket clé après admission pair/global."""
         return self._check([(f"key:{key_hash}", self._per_key)])
+
+    def peek(self, peer: str) -> tuple[bool, int]:
+        """Contrôle sans consommation des buckets pair/global (rejet précoce).
+
+        Lecture seule sans ``BEGIN IMMEDIATE`` : aucun verrou d'écriture,
+        aucun hachage ni lookup ne suit quand le pair/global est déjà plein.
+        """
+        with db_session(self._db_path) as conn:
+            now = time.time()
+            for name, limit in (
+                ("global", self._global_limit),
+                (f"peer:{peer}", self._per_peer),
+            ):
+                row = conn.execute(
+                    "SELECT count, reset_at FROM rate_limit_buckets WHERE name = ?",
+                    (name,),
+                ).fetchone()
+                if row is None or now >= float(row["reset_at"]):
+                    continue
+                if int(row["count"]) >= limit:
+                    retry = max(
+                        1,
+                        min(
+                            _MAX_RETRY_AFTER_SECONDS,
+                            math.ceil(float(row["reset_at"]) - now),
+                        ),
+                    )
+                    return False, retry
+            return True, 0
+
+    def check_authenticated(self, peer: str, key_hash: str) -> tuple[bool, int]:
+        """Consomme pair/global + clé en une seule transaction ``BEGIN IMMEDIATE``.
+
+        Sémantique préservée : pair/global sont consommés même quand le
+        bucket clé est plein (une seule transaction au lieu de deux,
+        sans fenêtre inter-transactions ni double verrou d'écriture).
+        """
+        with db_session(self._db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            pending: list[tuple[str, int, float]] = []
+            for name, limit in (
+                ("global", self._global_limit),
+                (f"peer:{peer}", self._per_peer),
+            ):
+                row = conn.execute(
+                    "SELECT count, reset_at FROM rate_limit_buckets WHERE name = ?",
+                    (name,),
+                ).fetchone()
+                if row is None or now >= float(row["reset_at"]):
+                    count, reset_at = 0, now + self._window_seconds
+                else:
+                    count, reset_at = int(row["count"]), float(row["reset_at"])
+                if count >= limit:
+                    retry = max(
+                        1,
+                        min(
+                            _MAX_RETRY_AFTER_SECONDS,
+                            math.ceil(reset_at - now),
+                        ),
+                    )
+                    return False, retry
+                pending.append((name, count + 1, reset_at))
+            key_name = f"key:{key_hash}"
+            row = conn.execute(
+                "SELECT count, reset_at FROM rate_limit_buckets WHERE name = ?",
+                (key_name,),
+            ).fetchone()
+            if row is None or now >= float(row["reset_at"]):
+                key_count, key_reset = 0, now + self._window_seconds
+            else:
+                key_count, key_reset = int(row["count"]), float(row["reset_at"])
+            if key_count >= self._per_key:
+                for name, count, reset_at in pending:
+                    conn.execute(
+                        "INSERT INTO rate_limit_buckets (name, count, reset_at) "
+                        "VALUES (?, ?, ?) "
+                        "ON CONFLICT(name) DO UPDATE SET count = excluded.count, "
+                        "reset_at = excluded.reset_at",
+                        (name, count, reset_at),
+                    )
+                retry = max(
+                    1,
+                    min(
+                        _MAX_RETRY_AFTER_SECONDS,
+                        math.ceil(key_reset - now),
+                    ),
+                )
+                row = conn.execute("SELECT COUNT(*) FROM rate_limit_buckets").fetchone()
+                if row is not None and int(row[0]) > _MAX_TRACKED_BUCKETS:
+                    conn.execute(
+                        "DELETE FROM rate_limit_buckets WHERE reset_at <= ?",
+                        (now,),
+                    )
+                return False, retry
+            pending.append((key_name, key_count + 1, key_reset))
+            for name, count, reset_at in pending:
+                conn.execute(
+                    "INSERT INTO rate_limit_buckets (name, count, reset_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(name) DO UPDATE SET count = excluded.count, "
+                    "reset_at = excluded.reset_at",
+                    (name, count, reset_at),
+                )
+            row = conn.execute("SELECT COUNT(*) FROM rate_limit_buckets").fetchone()
+            if row is not None and int(row[0]) > _MAX_TRACKED_BUCKETS:
+                conn.execute(
+                    "DELETE FROM rate_limit_buckets WHERE reset_at <= ?",
+                    (now,),
+                )
+            return True, 0
 
     def _check(self, specs: list[tuple[str, int]]) -> tuple[bool, int]:
         with db_session(self._db_path) as conn:

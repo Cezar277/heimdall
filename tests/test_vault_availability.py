@@ -87,14 +87,14 @@ class DatabaseAvailabilityTests(unittest.IsolatedAsyncioTestCase):
                                 )
 
                             if stage == "key":
-                                # L'admission pair/global est déjà passée ; exercer
-                                # la seconde transaction, celle du bucket clé.
+                                # L'admission pair/global (peek) est déjà passée ; exercer
+                                # la transaction consommatrice unique (pair/global + clé).
                                 with (
                                     patch.object(
-                                        apps[0].state.rate_limiter, "check", return_value=(True, 0)
+                                        apps[0].state.rate_limiter, "peek", return_value=(True, 0)
                                     ),
                                     patch.object(
-                                        apps[1].state.rate_limiter, "check", return_value=(True, 0)
+                                        apps[1].state.rate_limiter, "peek", return_value=(True, 0)
                                     ),
                                 ):
                                     responses = await asyncio.gather(
