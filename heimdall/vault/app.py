@@ -638,6 +638,15 @@ _SECRETS_GET_RESPONSES: dict[int | str, dict[str, Any]] = {
     "default": {"model": InternalError, "description": "Erreur inattendue"},
 }
 
+_SECRETS_STATE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_SECRETS_GET_RESPONSES,
+    200: {
+        "model": SecretMetadata,
+        "description": "Métadonnées courantes, sans la valeur (état seul).",
+        "headers": _NO_STORE_HEADER,
+    },
+}
+
 
 class VaultSettings(BaseSettings):
     """Configuration du serveur Vault via variables d'environnement."""
@@ -824,6 +833,24 @@ class VaultSettings(BaseSettings):
                 "HEIMDALL_VAULT_REQUIRE_AUTH=false est interdit en production "
                 "(HEIMDALL_ENV=production/prod) : le serveur Vault doit rester "
                 "fail-closed. La désactivation est réservée aux tests isolés."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_docs_disabled_in_production(self) -> "VaultSettings":
+        """Refuse la documentation OpenAPI en production (anti-fingerprinting).
+
+        ``enable_docs=True`` expose `/docs` et `/openapi.json` (schéma, version)
+        sans authentification : comme `require_auth=False` et le backend
+        `memory`, cette exposition est refusée en production
+        (`HEIMDALL_ENV=production/prod`), réservée au développement local.
+        """
+        if self.enable_docs and _heimdall_env_mode() in _PRODUCTION_ENV_MODES:
+            raise ValueError(
+                "HEIMDALL_VAULT_ENABLE_DOCS=true est interdit en production "
+                "(HEIMDALL_ENV=production/prod) : /docs et /openapi.json "
+                "exposeraient le schéma sans authentification (fingerprinting). "
+                "La documentation est réservée au développement local."
             )
         return self
 
@@ -1589,6 +1616,68 @@ def _register_routes(app: FastAPI) -> None:
             name=record["name"],
             status=record["status"],  # type: ignore[arg-type]
             value=record["value"],
+        )
+
+    @app.get(
+        "/api/v1/secrets/{project}/{env}/{name}/state",
+        response_model=SecretMetadata,
+        status_code=200,
+        responses=_SECRETS_STATE_RESPONSES,
+        tags=["Secrets"],
+        summary="Lire l'état courant d'un secret sans la valeur",
+        operation_id="getSecretState",
+    )
+    async def get_secret_state(
+        project: Annotated[
+            ProjectId,
+            FastApiPath(description="Identifiant public du projet ; aucune valeur secrète."),
+        ],
+        env: Annotated[
+            EnvironmentId,
+            FastApiPath(description="Environnement autorisé ; aucune valeur secrète."),
+        ],
+        name: Annotated[
+            SecretName,
+            FastApiPath(description="Nom de variable ; aucune valeur secrète."),
+        ],
+        response: Response,
+        authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
+    ) -> SecretMetadata:
+        """Lire l'état courant d'un secret sans exposer la valeur (contrat openapi.yaml).
+
+        Même contrôle d'accès que la lecture : authentification requise,
+        isolement par projet (403), 404 si inexistant, `Cache-Control: no-store`.
+        Seules les métadonnées sont retournées, jamais la valeur.
+        """
+        settings: VaultSettings | None = getattr(app.state, "settings", None)
+        if settings is None:
+            settings = VaultSettings(require_auth=True)
+        if settings.require_auth and authenticated_project is None:
+            raise StarletteHTTPException(
+                status_code=401,
+                detail="Authentification requise",
+            )
+        if (
+            authenticated_project is not None
+            and authenticated_project != project
+        ):
+            raise StarletteHTTPException(
+                status_code=403,
+                detail="Accès interdit",
+            )
+        response.headers["Cache-Control"] = "no-store"
+        store: InMemorySecretStore = app.state.secret_store
+        record = await store.get(project=project, env=env, name=name)
+        if record is None:
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            )
+        return SecretMetadata(
+            project=record["project"],
+            env=record["env"],
+            name=record["name"],
+            status=record["status"],  # type: ignore[arg-type]
         )
 
 

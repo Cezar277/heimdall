@@ -180,7 +180,11 @@ parcours complet à coût comparable que `verify_api_key` (parcours exhaustif
 du backend actif, sans `break` précoce) et le mémoïse dans l'état de la
 requête : l'authentification réutilise ce résultat, soit un seul full-scan par
 requête (anti-amplification CPU) ; l'existence d'une clé n'est pas observable
-par le temps de réponse du middleware. Le quota de stockage (capacité du store)
+par le temps de réponse du middleware. Plafond opérationnel : le coût est
+linéaire en nombre de clés (N `compare_digest` + 1 SELECT complet par requête,
+même invalide) — dimensionné pour une faible cardinalité (pinné à N=25 en
+test) ; au-delà, prévoir un cache LRU d'empreintes inconnues avec TTL court
+en #65, sans réintroduire d'oracle temporel. Le quota de stockage (capacité du store)
 ne doit pas être présenté comme cette mitigation de débit : les deux mécanismes
 sont distincts et testés séparément. Le quota SQLite est vérifié dans la même
 transaction que l'insertion, sous `BEGIN IMMEDIATE` : le verrou d'écriture est

@@ -557,6 +557,28 @@ class VaultSecretValueHygieneTests(unittest.TestCase):
                                 )
         self.assertEqual(violations, [])
 
+    def test_cli_never_handles_secret_values(self) -> None:
+        """Verrouille LOW n°4 (SecretValue) côté CLI : aucun affichage brut.
+
+        La CLI ne manipule que des références (triplet), jamais de valeurs
+        déchiffrées ; `init_db --verbose` n'imprime que des chemins assainis.
+        Ce test échoue si `cli/main.py`, `vault/init_db.py` ou `vault/client.py`
+        référence un jour `SecretRead`, un chiffré ou un plaintext (fuite et
+        injection terminal via `\\r`/`\\x1b` rejoués).
+        """
+        root = Path(__file__).resolve().parents[1]
+        modules = [
+            root / "heimdall" / "cli" / "main.py",
+            root / "heimdall" / "vault" / "init_db.py",
+            root / "heimdall" / "vault" / "client.py",
+        ]
+        tokens = ("SecretRead", "encrypted_value", "secret_value", "plaintext")
+        for module in modules:
+            with self.subTest(module=module.name):
+                source = module.read_text(encoding="utf-8")
+                for token in tokens:
+                    self.assertNotIn(token, source)
+
 
 class VaultImportSideEffectTests(unittest.TestCase):
     def test_plain_import_creates_no_file_even_in_production(self) -> None:

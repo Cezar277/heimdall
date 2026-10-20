@@ -682,6 +682,95 @@ class VaultSettingsTests(unittest.TestCase):
         )
         self.assertEqual(actual_responses, expected_responses)
 
+    def test_state_schema_response_codes_match_openapi_yaml(self) -> None:
+        """Le schéma OpenAPI runtime de .../state correspond au contrat (getSecretState).
+
+        Ferme l'écart contrat/implémentation LOW revue : la route expose
+        exactement les réponses du contrat (200 SecretMetadata + no-store,
+        mêmes erreurs que la lecture).
+        """
+        spec_file = Path(__file__).resolve().parents[1] / "openapi.yaml"
+        spec = yaml.safe_load(spec_file.read_text(encoding="utf-8"))
+        state_path = "/api/v1/secrets/{project}/{env}/{name}/state"
+        expected_responses = set(spec["paths"][state_path]["get"]["responses"].keys())
+
+        dev_app = create_app(VaultSettings(enable_docs=True))
+        actual_paths = dev_app.openapi()["paths"]
+        self.assertIn(state_path, actual_paths)
+        actual_responses = set(actual_paths[state_path]["get"]["responses"].keys())
+        self.assertEqual(actual_responses, expected_responses)
+        self.assertEqual(
+            actual_paths[state_path]["get"]["operationId"], "getSecretState"
+        )
+
+
+class VaultSecretStateRouteTests(unittest.IsolatedAsyncioTestCase):
+    """Tests contractuels de GET .../state : métadonnées sans la valeur."""
+
+    async def asyncSetUp(self) -> None:
+        self.test_app = create_app(VaultSettings(api_key_pepper="state_pepper_" + "s" * 20))
+        self.test_api_key = generate_api_key()
+        self.test_app.state.register_api_key(self.test_api_key, "demo")
+        self.transport = ASGITransport(app=self.test_app, client=("127.0.0.1", 54321))
+        self.client = AsyncClient(
+            transport=self.transport,
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": self.test_api_key},
+        )
+        created = await self.client.post(
+            "/api/v1/secrets",
+            json={"project": "demo", "env": "dev", "name": "STATE_KEY", "value": "v"},
+        )
+        self.assertEqual(created.status_code, 201)
+
+    async def asyncTearDown(self) -> None:
+        await self.client.aclose()
+
+    async def test_state_returns_metadata_without_value_and_no_store(self) -> None:
+        """200 avec métadonnées seules, Cache-Control: no-store, sans `value`."""
+        response = await self.client.get("/api/v1/secrets/demo/dev/STATE_KEY/state")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("cache-control"), "no-store")
+        body = response.json()
+        self.assertEqual(
+            body, {"project": "demo", "env": "dev", "name": "STATE_KEY", "status": "vaulte"}
+        )
+        self.assertNotIn("value", body)
+
+    async def test_state_unauthorized_without_key(self) -> None:
+        """401 sans clé (le contrat exigeait 401, l'app répondait 404 routeur)."""
+        async with AsyncClient(
+            transport=ASGITransport(app=self.test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+        ) as anonymous:
+            response = await anonymous.get("/api/v1/secrets/demo/dev/STATE_KEY/state")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json(), {"code": "unauthorized", "message": "Authentification requise"}
+        )
+
+    async def test_state_forbidden_for_other_project(self) -> None:
+        """403 quand la clé appartient à un autre projet (même contrôle que lecture)."""
+        other_key = generate_api_key()
+        self.test_app.state.register_api_key(other_key, "other")
+        async with AsyncClient(
+            transport=ASGITransport(app=self.test_app, client=("127.0.0.1", 54321)),
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": other_key},
+        ) as other_client:
+            response = await other_client.get("/api/v1/secrets/demo/dev/STATE_KEY/state")
+        self.assertEqual(response.status_code, 403)
+
+    async def test_state_not_found_for_unknown_secret(self) -> None:
+        """404 quand le secret n'existe pas (pas de fuite d'existence)."""
+        response = await self.client.get("/api/v1/secrets/demo/dev/MISSING_KEY/state")
+        self.assertEqual(response.status_code, 404)
+
+    async def test_state_rejects_invalid_path(self) -> None:
+        """400 sur paramètre de chemin invalide, sans écho."""
+        response = await self.client.get("/api/v1/secrets/BAD!/dev/STATE_KEY/state")
+        self.assertEqual(response.status_code, 400)
+
 class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
     """Tests contractuels des routes POST et GET secrets (ticket #63)."""
 
@@ -2551,20 +2640,34 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"HEIMDALL_ENV": "test"}, clear=True):
             self.assertFalse(VaultSettings(require_auth=False).require_auth)
 
-    def test_enable_docs_policy_pinned_in_production(self) -> None:
-        """Politique #25 : en production, enable_docs reste un choix opérateur explicite.
+    def test_enable_docs_refused_in_production(self) -> None:
+        """Fail-closed : enable_docs=True est refusé en production (fingerprinting).
 
-        Le défaut reste False (docs fermées) ; l'ouverture explicite n'est pas
-        bloquée par les gardes production de ce ticket (TLS/reconnaissance : #25).
+        LOW revue : `/docs` + `/openapi.json` sans auth exposeraient le schéma,
+        comme `require_auth=False` et le backend `memory` déjà refusés en prod.
+        Le défaut False reste accepté ; l'ouverture reste possible hors prod.
         """
-        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=True):
+        for env_mode in ("production", "prod"):
+            with self.subTest(env_mode=env_mode), patch.dict(
+                os.environ,
+                {"HEIMDALL_ENV": env_mode},
+                clear=True,
+            ):
+                with self.assertRaises(ValidationError) as ctx:
+                    VaultSettings(
+                        enable_docs=True,
+                        api_key_pepper="production_docs_pepper_" + "d" * 20,
+                    )
+                self.assertIn("ENABLE_DOCS", str(ctx.exception))
+                closed = VaultSettings(api_key_pepper="production_docs_pepper_" + "e" * 20)
+                self.assertFalse(closed.enable_docs)
+
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "test"}, clear=True):
             opened = VaultSettings(
                 enable_docs=True,
-                api_key_pepper="production_docs_pepper_" + "d" * 20,
+                api_key_pepper="test_docs_pepper_" + "d" * 20,
             )
             self.assertTrue(opened.enable_docs)
-            closed = VaultSettings(api_key_pepper="production_docs_pepper_" + "e" * 20)
-            self.assertFalse(closed.enable_docs)
 
     def test_vault_settings_generates_ephemeral_pepper_outside_production(self) -> None:
         """Hors production, un pepper aléatoire éphémère remplace l'ancien défaut public."""
