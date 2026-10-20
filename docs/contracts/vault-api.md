@@ -106,9 +106,24 @@ lecteur de la seule base ne peut pas corréler deux valeurs égales stockées so
 des triplets distincts. Une rotation de KEK rend ces empreintes auxiliaires
 obsolètes — elles se recalculent après déchiffrement, aucun secret n'est perdu.
 
+Les opérations SQLite des requêtes (store, authentification et débit) sont
+exécutées via `asyncio.to_thread` : une attente de verrou SQLite ne bloque pas
+la boucle événementielle. Le store SQLite s'appuie sur ses transactions, sans
+verrou asyncio local. Les verrous asyncio restent réservés au store mémoire.
+Les empreintes `api_keys.key_hash` ont un index UNIQUE ; leur persistance utilise
+`ON CONFLICT(key_hash) DO NOTHING`, sans réactiver une clé révoquée ni changer
+son projet. `init_db` ajoute cet index aux bases existantes ; s'il existe déjà
+des empreintes dupliquées, l'initialisation échoue sans suppression automatique.
+La génération du pepper et les comparaisons sensibles sont confinées dans
+`heimdall/vault/crypto.py`.
+
 Rate-limiting débit (#65) : fenêtres fixes par clé API validée, par pair réseau
-et globale. Les 400/401 consomment les buckets pair/global, une clé absente ou
-invalide ne crée pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
+et globale. Les buckets pair/global sont consommés avant le hachage et le
+parcours d'authentification ; leur rejet 429 ne déclenche aucun lookup de clé.
+Après admission, le bucket de la clé validée est consommé séparément, sans
+recompter pair/global. Un rejet par clé consomme donc aussi pair/global. Les
+400/401 consomment les buckets pair/global, une clé absente ou invalide ne crée
+pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
 Le choix du bucket par clé (`_find_api_key_project_cached`) emprunte le même
 parcours complet à coût comparable que `verify_api_key` (parcours exhaustif
 mémoire puis SQLite, sans `break` précoce) et le mémoïse dans l'état de la

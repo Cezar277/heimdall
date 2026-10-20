@@ -159,9 +159,9 @@ class SqliteSecretStore:
     """Stockage SQLite chiffré, partagé entre workers (tickets #26/#62).
 
     La base est initialisée et vérifiée par ``init_db`` (schéma, UNIQUE,
-    ``foreign_keys=ON``). Les écritures sont sérialisées par un verrou asyncio
-    local et par la contrainte UNIQUE SQLite ; un second worker obtient donc un
-    409 sur un doublon, même après redémarrage.
+    ``foreign_keys=ON``). Les accès SQLite sont déportés dans des threads ; les écritures sont
+    sérialisées par les transactions et la contrainte UNIQUE SQLite ; un second
+    worker obtient donc un 409 sur un doublon, même après redémarrage.
 
     Le quota (``max_secrets``, ``max_secrets_per_project``) est vérifié dans la
     même transaction que l'insertion, sous ``BEGIN IMMEDIATE`` : le verrou
@@ -197,7 +197,6 @@ class SqliteSecretStore:
         self._cipher = cipher
         self._max_secrets = max_secrets
         self._max_secrets_per_project = max_secrets_per_project
-        self._lock = asyncio.Lock()
         init_db(db_path)
 
     @property
@@ -206,53 +205,58 @@ class SqliteSecretStore:
         return self._db_path
 
     async def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
-        async with self._lock:
-            with db_session(self._db_path) as conn:
-                record = get_secret(conn, project, env, name)
-            if record is None:
-                return None
-            return _decrypt_record(record, self._cipher, project, env, name)
+        return await asyncio.to_thread(self._get, project, env, name)
+
+    def _get(self, project: str, env: str, name: str) -> dict[str, str] | None:
+        with db_session(self._db_path) as conn:
+            record = get_secret(conn, project, env, name)
+        if record is None:
+            return None
+        return _decrypt_record(record, self._cipher, project, env, name)
 
     async def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
+        return await asyncio.to_thread(self._create, project, env, name, value)
+
+    def _create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         aad = VaultCipher.aad(project, env, name)
-        async with self._lock:
-            with db_session(self._db_path) as conn:
-                # Verrou d'écriture inter-processus AVANT le comptage : le
-                # quota et l'insertion forment une seule transaction atomique,
-                # même entre workers partageant le fichier SQLite. Le verrou
-                # asyncio local ne suffit pas, d'où ce BEGIN IMMEDIATE.
-                conn.execute("BEGIN IMMEDIATE")
-                # Un doublon reste un 409 même si la capacité est saturée.
-                if get_secret(conn, project, env, name) is not None:
-                    raise KeyError("Secret déjà existant")
-                if count_secrets(conn) >= self._max_secrets:
-                    raise QuotaExceededError("Capacité maximale globale du store atteinte")
-                if count_secrets(conn, project) >= self._max_secrets_per_project:
-                    raise QuotaExceededError(
-                        f"Quota maximal de secrets atteint pour le projet '{project}'"
-                    )
-                ensure_project(conn, project)
-                encrypted_value = self._cipher.encrypt(value.encode("utf-8"), aad=aad)
-                fingerprint = self._cipher.fingerprint(value.encode("utf-8"), aad=aad)
-                try:
-                    create_secret(
-                        conn,
-                        project,
-                        env,
-                        name,
-                        encrypted_value,
-                        fingerprint=fingerprint,
-                    )
-                except sqlite3.IntegrityError:
-                    raise KeyError("Secret déjà existant") from None
-            return {
-                "project": project,
-                "env": env,
-                "name": name,
-                "status": "vaulte",
-            }
+        with db_session(self._db_path) as conn:
+            # Verrou d'écriture inter-processus AVANT le comptage : le
+            # quota et l'insertion forment une seule transaction atomique,
+            # même entre workers partageant le fichier SQLite.
+            conn.execute("BEGIN IMMEDIATE")
+            # Un doublon reste un 409 même si la capacité est saturée.
+            if get_secret(conn, project, env, name) is not None:
+                raise KeyError("Secret déjà existant")
+            if count_secrets(conn) >= self._max_secrets:
+                raise QuotaExceededError("Capacité maximale globale du store atteinte")
+            if count_secrets(conn, project) >= self._max_secrets_per_project:
+                raise QuotaExceededError(
+                    f"Quota maximal de secrets atteint pour le projet '{project}'"
+                )
+            ensure_project(conn, project)
+            encrypted_value = self._cipher.encrypt(value.encode("utf-8"), aad=aad)
+            fingerprint = self._cipher.fingerprint(value.encode("utf-8"), aad=aad)
+            try:
+                create_secret(
+                    conn,
+                    project,
+                    env,
+                    name,
+                    encrypted_value,
+                    fingerprint=fingerprint,
+                )
+            except sqlite3.IntegrityError:
+                raise KeyError("Secret déjà existant") from None
+        return {
+            "project": project,
+            "env": env,
+            "name": name,
+            "status": "vaulte",
+        }
 
     async def clear(self) -> None:
-        async with self._lock:
-            with db_session(self._db_path) as conn:
-                delete_all_secrets(conn)
+        await asyncio.to_thread(self._clear)
+
+    def _clear(self) -> None:
+        with db_session(self._db_path) as conn:
+            delete_all_secrets(conn)

@@ -124,7 +124,7 @@ class VaultDatabaseTests(unittest.TestCase):
             cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='index' ORDER BY name")
             indexes = {row["name"] for row in cursor.fetchall()}
             self.assertIn("idx_api_keys_project_id", indexes)
-            self.assertIn("idx_api_keys_key_hash", indexes)
+            self.assertIn("uq_api_keys_key_hash", indexes)
             self.assertIn("idx_secrets_project_env_name", indexes)
         finally:
             conn.close()

@@ -60,6 +60,28 @@ def generate_api_key() -> str:
     return secrets.token_urlsafe(32)
 
 
+def generate_api_key_pepper() -> str:
+    """Génère un pepper éphémère indépendant avec 256 bits d'entropie."""
+    return secrets.token_urlsafe(_KEY_SIZE_BYTES)
+
+
+def constant_time_equal(left: str | bytes, right: str | bytes) -> bool:
+    """Compare deux empreintes ou deux secrets de même type en temps constant."""
+    if isinstance(left, str) and isinstance(right, str):
+        return hmac.compare_digest(left, right)
+    if isinstance(left, bytes) and isinstance(right, bytes):
+        return hmac.compare_digest(left, right)
+    raise TypeError("La comparaison exige deux valeurs de même type.")
+
+
+def kek_matches_pepper(kek: str, pepper: str) -> bool:
+    """Détecte la réutilisation de clé, y compris sous des encodages différents."""
+    pepper_bytes = pepper.encode("utf-8")
+    encoded_match = constant_time_equal(kek.encode("utf-8"), pepper_bytes)
+    decoded_match = constant_time_equal(decode_encoded_key(kek), pepper_bytes)
+    return encoded_match or decoded_match
+
+
 def _normalize_pepper(pepper: str | bytes | None) -> bytes:
     """Normalise le pepper serveur en octets ; refuse absent, vide ou trop court.
 

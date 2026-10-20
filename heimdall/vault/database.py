@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_project_id ON api_keys(project_id);
-CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_api_keys_key_hash ON api_keys(key_hash);
 
 CREATE TABLE IF NOT EXISTS secrets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -726,6 +726,18 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO projects (id, created_at) VALUES (?, ?);",
             (probe_proj, "2026-01-01"),
         )
+
+        # Une empreinte ne peut jamais désigner deux clés/projets.
+        probe_hash = f"schema_probe_hash_{uuid4().hex}"
+        create_api_key(conn, f"probe_key_{uuid4().hex}", probe_proj, probe_hash)
+        try:
+            create_api_key(conn, f"probe_key_{uuid4().hex}", probe_proj, probe_hash)
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise RuntimeError(
+                "Schéma de base de données non conforme : UNIQUE(key_hash) manquant."
+            )
 
         # Test comportemental du CHECK sur status
         chk_enforced = False

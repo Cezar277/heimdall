@@ -77,7 +77,6 @@ class RateLimiter:
 
         Le nom de bucket d'une clé est son empreinte HMAC, jamais la clé brute.
         """
-        now = time.monotonic()
         specs: list[tuple[str, int]] = [
             ("global", self._global_limit),
             (f"peer:{peer}", self._per_peer),
@@ -85,6 +84,14 @@ class RateLimiter:
         if key_hash is not None:
             specs.append((f"key:{key_hash}", self._per_key))
 
+        return self._check(specs)
+
+    def check_key(self, key_hash: str) -> tuple[bool, int]:
+        """Consomme seulement le bucket clé après admission pair/global."""
+        return self._check([(f"key:{key_hash}", self._per_key)])
+
+    def _check(self, specs: list[tuple[str, int]]) -> tuple[bool, int]:
+        now = time.monotonic()
         buckets: list[_Bucket] = []
         for name, limit in specs:
             bucket = self._bucket(name, now)
@@ -151,6 +158,13 @@ class SqliteRateLimiter:
         if key_hash is not None:
             specs.append((f"key:{key_hash}", self._per_key))
 
+        return self._check(specs)
+
+    def check_key(self, key_hash: str) -> tuple[bool, int]:
+        """Consomme seulement le bucket clé après admission pair/global."""
+        return self._check([(f"key:{key_hash}", self._per_key)])
+
+    def _check(self, specs: list[tuple[str, int]]) -> tuple[bool, int]:
         with db_session(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             now = time.time()

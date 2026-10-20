@@ -46,12 +46,11 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   - Exception non gérée -> 500 {"code": "internal_error", "message": "Erreur interne"}.
 """
 
-import hmac
+import asyncio
 import ipaddress
 import logging
 import os
 import re
-import secrets
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -77,16 +76,17 @@ from starlette.requests import Request
 
 from heimdall.vault.crypto import (
     VaultCipher,
-    decode_encoded_key,
+    constant_time_equal,
     generate_api_key,
+    generate_api_key_pepper,
     hash_api_key,
+    kek_matches_pepper,
 )
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
-    create_api_key,
     db_session,
     ensure_project,
-    get_api_key_by_hash,
+    get_iso_timestamp,
     resolve_db_path,
     validate_db_path,
 )
@@ -639,7 +639,7 @@ class VaultSettings(BaseSettings):
                 "(HEIMDALL_ENV=production/prod) : aucun pepper public par défaut "
                 "n'est accepté. Fournir un secret unique et persisté, distinct de la KEK."
             )
-        self.api_key_pepper = secrets.token_urlsafe(32)
+        self.api_key_pepper = generate_api_key_pepper()
         _warn_generated_pepper_once()
         return self
 
@@ -698,10 +698,7 @@ class VaultSettings(BaseSettings):
         chiffrement et le HMAC de vérification).
         """
         if self.kek is not None and self.api_key_pepper is not None:
-            pepper_bytes = self.api_key_pepper.encode("utf-8")
-            if self.kek == self.api_key_pepper or hmac.compare_digest(
-                decode_encoded_key(self.kek), pepper_bytes
-            ):
+            if kek_matches_pepper(self.kek, self.api_key_pepper):
                 raise ValueError(
                     "La KEK de chiffrement et le pepper d'authentification doivent "
                     "être distincts, y compris sous des encodages différents."
@@ -934,6 +931,7 @@ def _register_middleware(app: FastAPI) -> None:
     async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
         """Borne le débit par clé validée, pair réseau et global (ticket #65).
 
+        Les buckets pair/global sont consommés avant tout hachage ou lookup.
         Les 400/401 sont comptés par le bucket pair/global puisque le middleware
         s'exécute avant le routage et les dépendances. Une clé invalide ne crée
         aucun bucket arbitraire : seuls pair et global s'appliquent. Le choix du
@@ -948,6 +946,17 @@ def _register_middleware(app: FastAPI) -> None:
         """
         settings: VaultSettings = request.app.state.settings
         peer = request.client.host if request.client and request.client.host else "unknown"
+        limiter: RateLimiter | SqliteRateLimiter = request.app.state.rate_limiter
+        if isinstance(limiter, SqliteRateLimiter):
+            allowed, retry_after = await asyncio.to_thread(limiter.check, peer)
+        else:
+            allowed, retry_after = limiter.check(peer)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content=_ERROR_PAYLOADS[429],
+                headers={"Retry-After": str(retry_after)},
+            )
         key_hash: str | None = None
         raw_key = request.headers.get("X-Heimdall-API-Key")
         if raw_key and raw_key == raw_key.strip() and request.url.path != "/api/v1/health":
@@ -959,11 +968,15 @@ def _register_middleware(app: FastAPI) -> None:
             except ValueError:
                 candidate_hash = None
             if candidate_hash is not None:
-                registered_project, _ = _find_api_key_project_cached(request, candidate_hash)
+                registered_project, _ = await _find_api_key_project_cached(request, candidate_hash)
                 if registered_project is not None:
                     key_hash = candidate_hash
 
-        allowed, retry_after = request.app.state.rate_limiter.check(peer, key_hash)
+        if key_hash is not None:
+            if isinstance(limiter, SqliteRateLimiter):
+                allowed, retry_after = await asyncio.to_thread(limiter.check_key, key_hash)
+            else:
+                allowed, retry_after = limiter.check_key(key_hash)
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -1069,7 +1082,7 @@ def _lookup_db_api_key(db_path: Any, provided_hash: str) -> tuple[str | None, in
             )
             for row in cursor.fetchall():
                 evaluated += 1
-                if hmac.compare_digest(provided_hash, row["key_hash"]):
+                if constant_time_equal(provided_hash, row["key_hash"]):
                     if not row["revoked_at"]:
                         matching_project = row["project_id"]
     except Exception as exc:
@@ -1081,7 +1094,7 @@ def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None,
     """Recherche le projet d'une empreinte de clé API à coût comparable.
 
     Parcours complet des empreintes en mémoire puis en base SQLite, sans ``break``
-    précoce et avec ``hmac.compare_digest`` pour chaque candidat : le coût est le
+    précoce et avec ``constant_time_equal`` pour chaque candidat : le coût est le
     même que l'empreinte soit connue, inconnue ou révoquée. Ce parcours est
     partagé par l'authentification (``verify_api_key``) et par le choix du bucket
     de débit (ticket #65) : l'existence d'une clé n'est pas observable par le
@@ -1092,9 +1105,9 @@ def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None,
     matching_project: str | None = None
     evaluated = 0
     registered_keys: dict[str, str] = getattr(app.state, "api_keys", {})
-    for reg_hash, proj_id in registered_keys.items():
+    for reg_hash, proj_id in tuple(registered_keys.items()):
         evaluated += 1
-        if hmac.compare_digest(provided_hash, reg_hash):
+        if constant_time_equal(provided_hash, reg_hash):
             matching_project = proj_id
     db_match, db_eval = _lookup_db_api_key(getattr(app.state, "db_path", None), provided_hash)
     evaluated += db_eval
@@ -1103,7 +1116,9 @@ def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None,
     return matching_project, evaluated
 
 
-def _find_api_key_project_cached(request: Request, provided_hash: str) -> tuple[str | None, int]:
+async def _find_api_key_project_cached(
+    request: Request, provided_hash: str
+) -> tuple[str | None, int]:
     """Parcours complet d'empreintes mémoïsé dans la requête (anti-amplification CPU).
 
     Le middleware de débit effectue déjà le parcours complet (mémoire + SQLite,
@@ -1116,19 +1131,21 @@ def _find_api_key_project_cached(request: Request, provided_hash: str) -> tuple[
     seul l'appel redondant est évité.
     """
     cached_hash: str | None = getattr(request.state, "api_key_lookup_hash", None)
-    if cached_hash is not None and hmac.compare_digest(cached_hash, provided_hash):
+    if cached_hash is not None and constant_time_equal(cached_hash, provided_hash):
         return (
             getattr(request.state, "api_key_lookup_project", None),
             getattr(request.state, "api_key_lookup_evaluated", 0),
         )
-    matching_project, evaluated_count = _find_api_key_project(request.app, provided_hash)
+    matching_project, evaluated_count = await asyncio.to_thread(
+        _find_api_key_project, request.app, provided_hash
+    )
     request.state.api_key_lookup_hash = provided_hash
     request.state.api_key_lookup_project = matching_project
     request.state.api_key_lookup_evaluated = evaluated_count
     return matching_project, evaluated_count
 
 
-def verify_api_key(
+async def verify_api_key(
     request: Request,
     api_key: Annotated[str | None, Depends(project_api_key_header)] = None,
 ) -> str | None:
@@ -1138,7 +1155,7 @@ def verify_api_key(
     - fail-closed : authentification active par défaut (`require_auth=True`).
     - rejet en 401 sans normalisation si la clé comporte des espaces de début/fin.
     - hachage HMAC-SHA256 avec pepper serveur distinct de la KEK.
-    - comparaison constante via `hmac.compare_digest` sur empreintes de même longueur.
+    - comparaison constante via `constant_time_equal` sur empreintes de même longueur.
     - chemin de vérification de coût comparable (aucun break précoce, comparaison factice),
       mémoïsé par requête : le parcours complet du middleware de débit est réutilisé
       (`_find_api_key_project_cached`), un seul full-scan par requête (ticket #65).
@@ -1170,11 +1187,11 @@ def verify_api_key(
             status_code=401,
             detail="Authentification requise",
         ) from None
-    matching_project, evaluated_count = _find_api_key_project_cached(request, provided_hash)
+    matching_project, evaluated_count = await _find_api_key_project_cached(request, provided_hash)
 
     # Coût comparable : comparaison factice si aucune clé n'a été évaluée
     if evaluated_count == 0:
-        hmac.compare_digest(provided_hash, _DUMMY_HASH)
+        constant_time_equal(provided_hash, _DUMMY_HASH)
 
     if matching_project is None:
         raise StarletteHTTPException(
@@ -1326,8 +1343,11 @@ def _persist_api_key_hash(app: FastAPI, key_hash: str, project_id: str) -> None:
         return
     with db_session(app.state.db_path) as conn:
         ensure_project(conn, project_id)
-        if get_api_key_by_hash(conn, key_hash) is None:
-            create_api_key(conn, f"key_{uuid4().hex}", project_id, key_hash)
+        conn.execute(
+            "INSERT INTO api_keys (id, project_id, key_hash, created_at, revoked_at) "
+            "VALUES (?, ?, ?, ?, NULL) ON CONFLICT(key_hash) DO NOTHING",
+            (f"key_{uuid4().hex}", project_id, key_hash, get_iso_timestamp()),
+        )
 
 
 def _configure_secret_store(
