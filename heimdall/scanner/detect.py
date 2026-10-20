@@ -28,7 +28,7 @@ from typing import Final, Literal
 
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.errors import ScanError
-from heimdall.scanner.exclusions import is_binary, is_excluded, is_excluded_directory
+from heimdall.scanner.exclusions import decode_text, is_excluded, is_excluded_directory
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.signatures import find_signature_matches
 
@@ -148,7 +148,14 @@ class Scanner:
             if text is None:
                 continue
             findings.extend(self._scan_text(text, relative))
-        findings.sort(key=lambda finding: (finding.file, finding.line, finding.type))
+        findings.sort(
+            key=lambda finding: (
+                finding.file,
+                finding.line,
+                finding.type,
+                finding.snippet_hash,
+            )
+        )
         return findings
 
     def _iter_files(self) -> Iterator[tuple[Path, str]]:
@@ -221,16 +228,17 @@ class Scanner:
             raise ScanError(_SCAN_ERROR) from None
         finally:
             os.close(descriptor)
-        if is_binary(data):
-            return None
-        return data.decode("utf-8", errors="replace")
+        return decode_text(data)
 
     def _scan_text(self, text: str, relative: str) -> list[Finding]:
         findings: list[Finding] = []
-        seen: set[tuple[int, str]] = set()
+        # Une position (fichier, ligne) peut porter plusieurs valeurs distinctes
+        # du même type : les perdre serait un fail-open. Seule une valeur
+        # strictement identique, déjà émise sur la même ligne, est dédupliquée.
+        seen: set[tuple[int, str, str]] = set()
         for line_number, line in enumerate(text.splitlines(), start=1):
             for match in find_signature_matches(line):
-                key = (line_number, match.secret_type)
+                key = (line_number, match.secret_type, match.value)
                 if key in seen:
                     continue
                 seen.add(key)

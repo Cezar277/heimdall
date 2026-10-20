@@ -5,17 +5,22 @@ Le périmètre est une politique explicite, pas une heuristique :
 - fichiers de contrôle de version et d'outillage (``.gitignore``, ...) ;
 - répertoires générés ou tiers (``.git``, ``vendor``, ``node_modules``, ...) ;
 - lockfiles et sommes de contrôle générées ;
-- binaires (extension connue ou octet NUL dans le contenu lu).
+- binaires à extension connue ou signature magique connue.
 
-Un fichier exclu est ignoré **par politique**. Tout autre échec de lecture ou
-de décodage est fail-closed : il remonte en ``ScanError``, jamais en verdict
-propre. Le contenu n'est jamais exécuté.
+Les fichiers texte UTF-8, UTF-16 et UTF-32 (avec ou sans BOM) sont décodés et
+scannés. Un contenu NUL qui n'est ni décodable ni une signature binaire connue
+lève ``ScanError`` : il n'est jamais ignoré silencieusement. Tout autre échec
+de lecture ou de décodage est également fail-closed. Le contenu n'est jamais
+exécuté.
 """
 
 from __future__ import annotations
 
+import codecs
 from pathlib import PurePosixPath
 from typing import Final
+
+from heimdall.scanner.errors import ScanError
 
 EXCLUDED_DIRECTORIES: Final[frozenset[str]] = frozenset(
     {
@@ -32,7 +37,6 @@ EXCLUDED_DIRECTORIES: Final[frozenset[str]] = frozenset(
         "bower_components",
         "build",
         "dist",
-        "env",
         "htmlcov",
         "node_modules",
         "target",
@@ -46,6 +50,7 @@ EXCLUDED_DIRECTORIES: Final[frozenset[str]] = frozenset(
 
 EXCLUDED_FILES: Final[frozenset[str]] = frozenset(
     {
+        ".coverage",
         ".dockerignore",
         ".gitattributes",
         ".gitignore",
@@ -128,6 +133,129 @@ def is_excluded(relative_path: str | PurePosixPath) -> bool:
     return any(name.endswith(suffix) for suffix in EXCLUDED_SUFFIXES)
 
 
-def is_binary(data: bytes) -> bool:
-    """Détection binaire conservative : un octet NUL suffit à exclure."""
-    return b"\x00" in data
+_TEXT_RATIO_MIN: Final[float] = 0.95
+_ASCII_RATIO_MIN: Final[float] = 0.05
+_DECODE_ERROR: Final[str] = "scan impossible : entrée non analysable"
+
+# Signatures fortes de formats binaires connus. Un fichier sans extension qui
+# porte l'une d'elles est ignoré par politique ; les autres contenus NUL non
+# décodables lèvent ``ScanError`` (fail-closed).
+_BINARY_MAGIC: Final[tuple[bytes, ...]] = (
+    b"\x7fELF",
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",
+    b"GIF87a",
+    b"GIF89a",
+    b"%PDF-",
+    b"PK\x03\x04",
+    b"PK\x05\x06",
+    b"PK\x07\x08",
+    b"\x1f\x8b",
+    b"BZh",
+    b"\xfd7zXZ\x00",
+    b"7z\xbc\xaf\x27\x1c",
+    b"Rar!\x1a\x07",
+    b"SQLite format 3\x00",
+    b"OggS",
+    b"fLaC",
+    b"RIFF",
+    b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
+    b"\x00asm",
+    b"wOFF",
+    b"wOF2",
+    b"II*\x00",
+    b"MM\x00*",
+    b"\x00\x00\x01\x00",
+    b"OTTO",
+    b"dex\n",
+    b"\xca\xfe\xba\xbe",
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+)
+
+
+def _printable_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    printable = sum(1 for character in text if character.isprintable() or character in "\r\n\t")
+    return printable / len(text)
+
+
+def _ascii_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    return sum(1 for character in text if character.isascii()) / len(text)
+
+
+def _decode_exact(data: bytes, encoding: str) -> str:
+    try:
+        text = data.decode(encoding)
+    except UnicodeDecodeError:
+        raise ScanError(_DECODE_ERROR) from None
+    if text == "":
+        return text
+    if "\x00" in text or _printable_ratio(text) < _TEXT_RATIO_MIN:
+        raise ScanError(_DECODE_ERROR)
+    return text
+
+
+def _decode_utf16_or_32(data: bytes) -> str | None:
+    """Décode un texte UTF-16/32 sans BOM, sinon ``None``.
+
+    Le meilleur candidat est choisi par proportion d'ASCII puis de caractères
+    imprimables : un texte UTF-16BE mal décodé en LE devient du CJK (ASCII 0)
+    et perd face au bon décodage. Un binaire qui ne produit pas un texte
+    plausible n'est jamais retenu.
+    """
+    best: tuple[tuple[float, float], str] | None = None
+    for encoding, width in (
+        ("utf-16-le", 2),
+        ("utf-16-be", 2),
+        ("utf-32-le", 4),
+        ("utf-32-be", 4),
+    ):
+        if len(data) % width:
+            continue
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        ratio = _printable_ratio(text)
+        ascii_ratio = _ascii_ratio(text)
+        if "\x00" in text or ratio < _TEXT_RATIO_MIN or ascii_ratio < _ASCII_RATIO_MIN:
+            continue
+        score = (ascii_ratio, ratio)
+        if best is None or score > best[0]:
+            best = (score, text)
+    return None if best is None else best[1]
+
+
+def decode_text(data: bytes) -> str | None:
+    """Décode un fichier texte ou identifie un binaire connu.
+
+    - BOM UTF-8/UTF-16/UTF-32 : décodage strict ;
+    - UTF-16/UTF-32 sans BOM : heuristique bornée, jamais de remplacement ;
+    - UTF-8 invalide sans NUL : remplacement, comme avant (#22) ;
+    - NUL sans décodage possible et sans signature binaire : ``ScanError``.
+    """
+    if not data:
+        return ""
+    for bom, encoding in (
+        (codecs.BOM_UTF32_LE, "utf-32"),
+        (codecs.BOM_UTF32_BE, "utf-32"),
+        (codecs.BOM_UTF16_LE, "utf-16"),
+        (codecs.BOM_UTF16_BE, "utf-16"),
+        (codecs.BOM_UTF8, "utf-8-sig"),
+    ):
+        if data.startswith(bom):
+            return _decode_exact(data, encoding)
+    if b"\x00" not in data:
+        return data.decode("utf-8", errors="replace")
+    if any(data.startswith(magic) for magic in _BINARY_MAGIC):
+        return None
+    decoded = _decode_utf16_or_32(data)
+    if decoded is not None:
+        return decoded
+    raise ScanError(_DECODE_ERROR)

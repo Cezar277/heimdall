@@ -3,9 +3,14 @@
 La clé locale fait 32 octets et vit hors du dépôt :
 ``$HEIMDALL_SNIPPET_HMAC_KEY`` (hexadécimal, 64 caractères) ou, à défaut,
 ``$XDG_DATA_HOME/heimdall/snippet-hmac.key`` (défaut
-``~/.local/share/heimdall/snippet-hmac.key``), créé en ``0600``. Si le stockage
-local est indisponible, une clé de processus est utilisée : l'empreinte reste
-non réversible, mais n'est plus stable entre deux exécutions.
+``~/.local/share/heimdall/snippet-hmac.key``), créé en ``0600``. Le fichier
+doit appartenir à l'utilisateur courant et son répertoire parent est durci en
+``0700``. Toute lecture ou création impossible lève ``ScanError`` : aucune clé
+éphémère ne rend les empreintes instables entre deux exécutions.
+
+La primitive ``hmac``/``hashlib`` de la bibliothèque standard n'est pas la
+crypto du Vault : l'invariant 5 confiné ``cryptography``/``argon2`` à
+``vault/crypto.py`` reste intact (voir ADR-001/ADR-002, clarification T22).
 """
 
 from __future__ import annotations
@@ -49,6 +54,51 @@ def _open_flags(base: int) -> int:
     )
 
 
+def _current_uid() -> int | None:
+    getuid = getattr(os, "getuid", None)
+    return None if getuid is None else int(getuid())
+
+
+def _check_owner_and_mode(metadata: os.stat_result) -> None:
+    """Refuse une clé lisible par un autre utilisateur (POSIX)."""
+    if os.name != "posix":
+        return
+    uid = _current_uid()
+    owner = getattr(metadata, "st_uid", None)
+    if uid is not None and owner is not None and owner != uid:
+        raise ScanError(_KEY_ERROR)
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise ScanError(_KEY_ERROR)
+
+
+def _harden_parent(parent: Path) -> Path:
+    """Crée ou durcit le répertoire de la clé et retourne son chemin résolu."""
+    try:
+        if parent.is_symlink():
+            raise ScanError(_KEY_ERROR)
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        resolved = parent.resolve(strict=True)
+        metadata = resolved.stat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ScanError(_KEY_ERROR)
+        if os.name == "posix":
+            uid = _current_uid()
+            owner = getattr(metadata, "st_uid", None)
+            if uid is not None and owner is not None and owner != uid:
+                raise ScanError(_KEY_ERROR)
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                os.chmod(resolved, 0o700)
+                if stat.S_IMODE(resolved.stat().st_mode) & 0o077:
+                    raise ScanError(_KEY_ERROR)
+        return resolved
+    except (OSError, RuntimeError):
+        raise ScanError(_KEY_ERROR) from None
+
+
+def _key_location(path: Path) -> Path:
+    return _harden_parent(path.parent) / path.name
+
+
 def _read_key(path: Path) -> bytes:
     try:
         descriptor = os.open(path, _open_flags(os.O_RDONLY))
@@ -58,6 +108,7 @@ def _read_key(path: Path) -> bytes:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != KEY_BYTES:
             raise ScanError(_KEY_ERROR)
+        _check_owner_and_mode(metadata)
         key = os.read(descriptor, KEY_BYTES + 1)
     except OSError:
         raise ScanError(_KEY_ERROR) from None
@@ -71,7 +122,6 @@ def _read_key(path: Path) -> bytes:
 def _create_key(path: Path) -> bytes | None:
     key = secrets.token_bytes(KEY_BYTES)
     try:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         descriptor = os.open(
             path,
             _open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL),
@@ -80,25 +130,30 @@ def _create_key(path: Path) -> bytes | None:
     except FileExistsError:
         return None
     except OSError:
-        # Stockage local indisponible : clé de processus, jamais de blocage
-        # du scan pour un simple problème de cache d'empreinte.
-        return key
+        raise ScanError(_KEY_ERROR) from None
     try:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(descriptor, 0o600)
         pending = key
         while pending:
             written = os.write(descriptor, pending)
             if written <= 0:
                 raise OSError("écriture partielle")
             pending = pending[written:]
+        os.fsync(descriptor)
+        if os.fstat(descriptor).st_size != KEY_BYTES:
+            raise OSError("taille inattendue")
     except OSError:
         try:
             path.unlink()
         except OSError:
             pass
-        return key
+        raise ScanError(_KEY_ERROR) from None
     finally:
         os.close(descriptor)
     return key
+
 
 def _environment_key() -> bytes | None:
     encoded = os.environ.get(KEY_ENV)
@@ -118,7 +173,7 @@ def load_local_key() -> bytes:
     environment_key = _environment_key()
     if environment_key is not None:
         return environment_key
-    path = _key_path()
+    path = _key_location(_key_path())
     try:
         return _read_key(path)
     except ScanError:

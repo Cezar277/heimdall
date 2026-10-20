@@ -15,12 +15,14 @@ import os
 import re
 import stat
 import time
+import types
 from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator
 from support.fake_secrets import fake_token
 
+from heimdall.scanner import hashing
 from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
     Finding,
@@ -30,7 +32,7 @@ from heimdall.scanner.detect import (
 )
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.exclusions import (
-    is_binary,
+    decode_text,
     is_excluded,
     is_excluded_directory,
 )
@@ -47,8 +49,8 @@ def _fixed_hmac_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(KEY_ENV, "42" * 32)
 
 
-def _aws(seed: str = "aws") -> str:
-    return "AK" + "IA" + hashlib.sha256(f"heimdall-t22-{seed}".encode()).hexdigest()[:16].upper()
+def _aws(seed: str = "aws", prefix: str = "AKIA") -> str:
+    return prefix + hashlib.sha256(f"heimdall-t22-{seed}".encode()).hexdigest()[:16].upper()
 
 
 def _stripe(seed: str = "stripe") -> str:
@@ -205,9 +207,39 @@ def test_multiple_types_on_one_line_are_all_reported(tmp_path: Path) -> None:
     ]
 
 
-def test_duplicate_same_type_on_one_line_is_reported_once(tmp_path: Path) -> None:
-    findings = _scan_lines(tmp_path, f'A = "{_aws("a")}"; B = "{_aws("b")}"')
+@pytest.mark.parametrize("prefix", ["AKIA", "ASIA", "ABIA", "ACCA"])
+def test_aws_access_key_prefixes_are_detected(tmp_path: Path, prefix: str) -> None:
+    findings = _scan_lines(tmp_path, f'AWS = "{_aws(prefix, prefix)}"')
     assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+
+
+def test_distinct_values_same_type_on_one_line_are_all_reported(tmp_path: Path) -> None:
+    """Invariant 1 : deux secrets distincts ne doivent jamais fusionner."""
+    findings = _scan_lines(tmp_path, f'A = "{_aws("a")}"; B = "{_aws("b")}"')
+    assert [(finding["line"], finding["type"]) for finding in findings] == [
+        (1, "aws"),
+        (1, "aws"),
+    ]
+    assert len({finding["snippet_hash"] for finding in findings}) == 2
+
+
+def test_identical_value_same_type_on_one_line_is_reported_once(tmp_path: Path) -> None:
+    secret = _aws("same")
+    findings = _scan_lines(tmp_path, f'A = "{secret}"; B = "{secret}"')
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+
+
+def test_jwt_payload_above_previous_bound_is_detected(tmp_path: Path) -> None:
+    """Une charge JWT de 9 000 caractères reste dans la borne 64 Kio."""
+    jwt = ".".join(
+        [
+            _b64(b'{"alg":"HS256","typ":"JWT"}'),
+            "A" * 9_000,
+            _b64(hashlib.sha256(b"heimdall-long-jwt").digest()),
+        ]
+    )
+    findings = _scan_lines(tmp_path, f'JWT = "{jwt}"')
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "jwt")]
 
 
 # --- Exclusions (#59) -------------------------------------------------------
@@ -215,6 +247,7 @@ def test_duplicate_same_type_on_one_line_is_reported_once(tmp_path: Path) -> Non
 
 def test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries() -> None:
     for path in (
+        ".coverage",
         ".gitignore",
         ".git/config",
         "package-lock.json",
@@ -229,9 +262,10 @@ def test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries() -> None:
     for path in (".env", "app.py", "deploy.pem", "requirements.txt", "notes"):
         assert not is_excluded(path), path
     assert is_excluded_directory("VENDOR")
+    assert is_excluded_directory(".venv")
+    assert not is_excluded_directory("env")
     assert not is_excluded_directory("src")
-    assert is_binary(b"abc\x00def")
-    assert not is_binary(b"abc")
+    assert not is_excluded("")
 
 
 def test_scan_skips_excluded_files_but_scans_env_and_pem(tmp_path: Path) -> None:
@@ -246,7 +280,6 @@ def test_scan_skips_excluded_files_but_scans_env_and_pem(tmp_path: Path) -> None
     _write(tmp_path, ".gitignore", f'AWS = "{_aws("ignore")}"')
     _write(tmp_path, "image.png", f'AWS = "{_aws("image")}"')
     _write(tmp_path, "blob.bin", f'AWS = "{_aws("blob")}"')
-    _write(tmp_path, "binary_noext", (f'AWS = "{_aws("nul")}"\n').encode() + b"\x00")
     _write(tmp_path, "script", f'AWS = "{_aws("script")}"')
 
     findings = find_candidates(str(tmp_path))
@@ -257,6 +290,78 @@ def test_scan_skips_excluded_files_but_scans_env_and_pem(tmp_path: Path) -> None
         ("requirements.txt", "aws"),
         ("script", "aws"),
     ]
+
+
+def test_env_directory_is_scanned_but_virtualenvs_are_excluded(tmp_path: Path) -> None:
+    """"env" n'est pas un virtualenv par convention : ne jamais le sauter."""
+    _write(tmp_path, "env/app.py", f'AWS = "{_aws("env")}"')
+    _write(tmp_path, ".venv/lib.py", f'AWS = "{_aws("dotvenv")}"')
+    _write(tmp_path, "venv/lib.py", f'AWS = "{_aws("venv")}"')
+    _write(tmp_path, "virtualenv/lib.py", f'AWS = "{_aws("virtualenv")}"')
+    findings = find_candidates(str(tmp_path))
+    assert [(finding["file"], finding["type"]) for finding in findings] == [
+        ("env/app.py", "aws")
+    ]
+
+
+def test_utf16_utf32_without_bom_is_scanned(tmp_path: Path) -> None:
+    encodings = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+    for index, encoding in enumerate(encodings):
+        _write(
+            tmp_path,
+            f"encoded_{index}.txt",
+            f'AWS = "{_aws(encoding)}"'.encode(encoding),
+        )
+    findings = find_candidates(str(tmp_path))
+    assert [finding["type"] for finding in findings] == ["aws"] * len(encodings)
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+def test_utf16_utf32_with_bom_is_scanned(tmp_path: Path, encoding: str) -> None:
+    _write(tmp_path, "encoded.txt", f'AWS = "{_aws(encoding)}"'.encode(encoding))
+    assert [finding["type"] for finding in find_candidates(str(tmp_path))] == ["aws"]
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+def test_decode_text_handles_utf16_utf32_without_bom(encoding: str) -> None:
+    text = 'AWS = "AKIA' + "A" * 16 + '"'
+    assert decode_text(text.encode(encoding)) == text
+
+
+def test_decode_text_handles_bom_and_plain_utf8() -> None:
+    assert decode_text(b"") == ""
+    assert decode_text(b"abc") == "abc"
+    for encoding in ("utf-8-sig", "utf-16", "utf-32"):
+        assert decode_text("AZERTY".encode(encoding)) == "AZERTY"
+    assert decode_text(b"caf\xe9") == "caf\ufffd"
+    assert decode_text(b"\xef\xbb\xbf") == ""
+
+
+@pytest.mark.parametrize("payload", [b"\xff\xfeA", b"\xef\xbb\xbf\xff", b"\xfe\xff\x00\x00"])
+def test_decode_text_fails_closed_on_invalid_bom_text(payload: bytes) -> None:
+    with pytest.raises(ScanError):
+        decode_text(payload)
+
+
+def test_decode_text_fails_closed_on_ambiguous_nul() -> None:
+    with pytest.raises(ScanError):
+        decode_text(b"abc\x00def")
+
+
+@pytest.mark.parametrize("magic", [b"\x7fELF", b"\x89PNG\r\n\x1a\n", b"PK\x03\x04"])
+def test_decode_text_identifies_known_binary_magic(magic: bytes) -> None:
+    assert decode_text(magic + b"\x00\x00") is None
+
+
+def test_extensionless_known_binary_is_ignored(tmp_path: Path) -> None:
+    _write(tmp_path, "elf", b"\x7fELF\x00\x00")
+    assert find_candidates(str(tmp_path)) == []
+
+
+def test_extensionless_ambiguous_nul_is_fail_closed(tmp_path: Path) -> None:
+    _write(tmp_path, "ambiguous", b"hello\x00world")
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
 
 
 def test_case_insensitive_excluded_directory(tmp_path: Path) -> None:
@@ -324,6 +429,33 @@ def test_invalid_relative_name_is_fail_closed(tmp_path: Path) -> None:
     _write(tmp_path, "bad:name.txt", f'AWS = "{_aws()}"')
     with pytest.raises(ScanError):
         find_candidates(str(tmp_path))
+
+
+def test_file_changed_during_read_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(tmp_path, "changing.txt", f'AWS = "{_aws("changing")}"')
+    real_fstat = os.fstat
+    calls = 0
+
+    def altered_fstat(descriptor: int) -> object:
+        nonlocal calls
+        metadata = real_fstat(descriptor)
+        calls += 1
+        if calls == 2:
+            return types.SimpleNamespace(
+                st_mode=metadata.st_mode,
+                st_size=metadata.st_size,
+                st_mtime_ns=metadata.st_mtime_ns + 1,
+                st_dev=metadata.st_dev,
+                st_ino=metadata.st_ino,
+            )
+        return metadata
+
+    monkeypatch.setattr("heimdall.scanner.detect.os.fstat", altered_fstat)
+    with pytest.raises(ScanError) as context:
+        scan(path)
+    assert str(context.value) == "scan impossible : entrée non analysable"
 
 
 def test_report_is_deterministic_and_sorted(tmp_path: Path) -> None:
@@ -394,6 +526,124 @@ def test_local_key_rejects_invalid_material(
     monkeypatch.setenv(KEY_ENV, "zz")
     with pytest.raises(ScanError):
         SnippetHasher()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="modes et UID POSIX")
+def test_local_key_rejects_permissive_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(KEY_ENV)
+    key_path = tmp_path / "permissive.key"
+    key_path.write_bytes(b"k" * 32)
+    key_path.chmod(0o644)
+    monkeypatch.setenv(KEY_FILE_ENV, str(key_path))
+    with pytest.raises(ScanError):
+        load_local_key()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="UID POSIX")
+def test_local_key_rejects_foreign_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(KEY_ENV)
+    key_path = tmp_path / "foreign.key"
+    key_path.write_bytes(b"k" * 32)
+    key_path.chmod(0o600)
+    monkeypatch.setenv(KEY_FILE_ENV, str(key_path))
+    real_getuid = os.getuid
+    monkeypatch.setattr(hashing.os, "getuid", lambda: real_getuid() + 1)
+    with pytest.raises(ScanError):
+        load_local_key()
+
+
+def test_local_key_storage_unavailable_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Aucune clé éphémère : un stockage indisponible doit lever ScanError."""
+    monkeypatch.delenv(KEY_ENV)
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv(KEY_FILE_ENV, str(blocked / "key"))
+    with pytest.raises(ScanError):
+        load_local_key()
+
+
+def test_local_key_default_xdg_path_is_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(KEY_ENV)
+    monkeypatch.delenv(KEY_FILE_ENV, raising=False)
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    key = load_local_key()
+    key_path = xdg / "heimdall" / "snippet-hmac.key"
+    assert key_path.is_file()
+    assert len(key) == 32
+    if os.name == "posix":
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(key_path.parent.stat().st_mode) == 0o700
+
+
+def test_local_key_requires_absolute_xdg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(KEY_ENV)
+    monkeypatch.delenv(KEY_FILE_ENV, raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", "relative")
+    with pytest.raises(ScanError):
+        load_local_key()
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="permissions POSIX non applicables (root)",
+)
+def test_local_key_unwritable_parent_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(KEY_ENV)
+    restricted = tmp_path / "restricted"
+    restricted.mkdir()
+    restricted.chmod(0o500)
+    monkeypatch.setenv(KEY_FILE_ENV, str(restricted / "key"))
+    try:
+        with pytest.raises(ScanError):
+            load_local_key()
+    finally:
+        restricted.chmod(0o700)
+
+
+def test_local_key_write_failure_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(KEY_ENV)
+    key_path = tmp_path / "partial.key"
+    monkeypatch.setenv(KEY_FILE_ENV, str(key_path))
+    real_write = os.write
+
+    def broken_write(descriptor: int, data: bytes) -> int:
+        if len(data) == 32:
+            return 0
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(hashing.os, "write", broken_write)
+    with pytest.raises(ScanError):
+        load_local_key()
+    assert not key_path.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="liens symboliques indisponibles")
+def test_local_key_rejects_symlink_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(KEY_ENV)
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv(KEY_FILE_ENV, str(link / "key"))
+    with pytest.raises(ScanError):
+        load_local_key()
 
 
 # --- Anti-ReDoS -------------------------------------------------------------

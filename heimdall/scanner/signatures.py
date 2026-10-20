@@ -40,7 +40,7 @@ SIGNATURES: Final[tuple[Signature, ...]] = (
     _signature(
         "aws_access_key_id",
         "aws",
-        r"(?P<value>\b(?:AKIA|ASIA)[0-9A-Z]{16}\b)",
+        r"(?P<value>\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b)",
     ),
     _signature(
         "aws_secret_access_key",
@@ -72,7 +72,7 @@ SIGNATURES: Final[tuple[Signature, ...]] = (
         "jwt",
         "jwt",
         r"(?P<value>\beyJ[A-Za-z0-9_-]{8,1024}\."
-        r"[A-Za-z0-9_-]{8,8192}\.[A-Za-z0-9_-]{8,1024}\b)",
+        r"[A-Za-z0-9_-]{8,65536}\.[A-Za-z0-9_-]{8,1024}\b)",
     ),
     _signature(
         "pem_private_key",
