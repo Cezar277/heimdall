@@ -369,6 +369,36 @@ class VaultKeyCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 2)
         self.assertIn("absolu", result.output)
 
+    def test_list_on_empty_registry_says_nothing_registered(self) -> None:
+        """Un registre vide est signalé explicitement (pas de ligne fantôme)."""
+        init_db(self.db_path)
+        result = self.runner.invoke(
+            cli_app, ["vault", "key", "list", "--db-path", str(self.db_path)]
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Aucune clé API enregistrée", result.output)
+
+    def test_revoke_unknown_key_id_fails(self) -> None:
+        """Révoquer une clé inconnue échoue sans rien modifier."""
+        init_db(self.db_path)
+        unknown = "key_" + "0" * 32
+        result = self.runner.invoke(
+            cli_app,
+            ["vault", "key", "revoke", unknown, "--db-path", str(self.db_path)],
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("introuvable", result.output)
+
+    def test_revoke_rejects_a_malformed_key_id_without_echo(self) -> None:
+        """Un identifiant de clé hors format est refusé sans être réfléchi."""
+        result = self.runner.invoke(
+            cli_app,
+            ["vault", "key", "revoke", "pas-un-identifiant", "--db-path", str(self.db_path)],
+        )
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("Identifiant de clé API invalide", result.output)
+        self.assertNotIn("pas-un-identifiant", result.output)
+
     def test_memory_db_is_refused(self) -> None:
         """Le mode ':memory:' est interdit en CLI (base éphémère)."""
         result = self.runner.invoke(
