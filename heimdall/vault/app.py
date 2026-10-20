@@ -37,11 +37,12 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   `HEIMDALL_VAULT_API_KEY_PEPPER` en production et génère hors production un
   pepper aléatoire éphémère au démarrage avec avertissement (documenté #25).
   Les clés opérateur trop peu diverses (`"a" * 43`, `"abcdefghijkl" * 4`),
-  répétitives ou séquentielles (`abcdefgh…`) sont refusées à
-  l'enregistrement : alphabet base64url strict, 43 caractères minimum,
-  16 caractères distincts minimum, aucune période répétitive, aucune suite
-  monotone de 8+. La valeur d'un secret est canonisée en NFC avant stockage
-  et le NUL y est interdit ; elle n'est jamais journalisée (décision #62).
+  répétitives, séquentielles (`abcdefgh…`) ou de clavier (`qwertyuiop…`)
+  sont refusées à l'enregistrement : alphabet base64url strict, 43 caractères
+  minimum, 16 caractères distincts minimum, aucune période répétitive,
+  aucune suite monotone de 8+, aucune ligne de clavier connue. La valeur
+  d'un secret est canonisée en NFC avant stockage et le NUL y est interdit ;
+  elle n'est jamais journalisée (décision #62).
 - Gestion d'erreurs normalisée :
   - RequestValidationError -> 400 contractuel {"code": "bad_request", "message": "Requête invalide"}
     sans écho du corps ni enveloppe 422 de FastAPI.
@@ -213,7 +214,7 @@ _DUMMY_HASH: str = "0" * 64
 _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 # Politique #64 : une clé opérateur doit offrir une entropie comparable aux clés
 # émises par `generate_api_key` (``secrets.token_urlsafe(32)`` → 43 caractères,
-# 256 bits). Le contrôle est fail-closed sur les MOTIFS TRIVIAUX, en cinq
+# 256 bits). Le contrôle est fail-closed sur les MOTIFS TRIVIAUX, en six
 # temps (remarque de revue « seuil de diversité trivial ») :
 # - alphabet base64url strict (A-Z, a-z, 0-9, « _ », « - ») : ni espaces ni
 #   caractères de contrôle, donc aucune ambiguïté de transport ;
@@ -224,7 +225,10 @@ _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 # - aucune période répétitive : la clé ne peut pas être la répétition d'un
 #   bloc plus court (refuse « abab… », « 0123456789… », « abcdefghijklmnop » * 3) ;
 # - aucune suite monotone de 8+ caractères (``abcdefgh…``, ``0123456789…``,
-#   ``ZYXW…``) : devinables malgré 16+ distincts et sans période répétitive.
+#   ``ZYXW…``) : devinables malgré 16+ distincts et sans période répétitive ;
+# - aucune ligne de clavier connue QWERTY/AZERTY/QWERTZ (``qwertyuiop…``,
+#   ``azerty…``, deux sens, insensible à la casse) : ni monotone ni
+#   répétitive, mais devinable.
 # Ce contrôle ne mesure PAS l'entropie : il n'exclut que les motifs triviaux.
 # L'exigence réelle reste `generate_api_key()` côté opérateur (256 bits).
 _MIN_API_KEY_LENGTH: int = 43
@@ -328,6 +332,47 @@ def _minimal_pattern_period(value: str) -> int:
 
 _MIN_MONOTONIC_RUN_LENGTH: int = 8
 
+# Séquences de clavier connues (lignes complètes QWERTY/AZERTY/QWERTZ dans
+# les deux sens + préfixes célèbres) : devinables même avec 16+ distincts,
+# sans période répétitive ni suite monotone (ex. « qwertyuiop » n'est pas
+# ordinalement monotone). Comparaison insensible à la casse, fenêtre 8
+# (ligne entière si la ligne est plus courte) : un token aléatoire 256 bits
+# contient une telle sous-séquence avec une probabilité négligeable, un motif
+# humain l'y place systématiquement. Chiffres et alphabet séquentiels sont
+# déjà couverts par le contrôle monotone ; ici seules les lignes de clavier.
+_KEYBOARD_SEQUENCES: tuple[str, ...] = (
+    "qwertyuiop",
+    "asdfghjkl",
+    "zxcvbnm",
+    "azertyuiop",
+    "qsdfghjklm",
+    "wxcvbn",
+    "qwertzuiop",
+    "yxcvbnm",
+    "qwerty",
+    "azerty",
+    "qwertz",
+)
+_KEYBOARD_SEQUENCES += tuple(seq[::-1] for seq in _KEYBOARD_SEQUENCES)
+_MIN_KEYBOARD_RUN_LENGTH: int = 8
+
+
+def _has_known_keyboard_run(value: str) -> bool:
+    """Détecte une ligne de clavier connue (insensible à la casse).
+
+    Fenêtre 8 (ou ligne entière si plus courte) : toute sous-séquence de
+    8 d'une ligne connue — ou une ligne courte entière — présente dans la
+    clé en minuscules déclenche le refus. O(n·m) borné (512 caractères,
+    ~22 séquences) : appel réservé à l'enregistrement.
+    """
+    lowered = value.lower()
+    for seq in _KEYBOARD_SEQUENCES:
+        window = min(len(seq), _MIN_KEYBOARD_RUN_LENGTH)
+        for start in range(len(seq) - window + 1):
+            if seq[start : start + window] in lowered:
+                return True
+    return False
+
 
 def _has_long_monotonic_run(value: str, min_run: int = _MIN_MONOTONIC_RUN_LENGTH) -> bool:
     """Détecte une suite monotone (croissante/décroissante, pas de ±1) de ``min_run``+.
@@ -362,13 +407,15 @@ def _validate_raw_api_key(raw_key: str) -> str:
     (``secrets.token_urlsafe(32)``, 256 bits, 43 caractères) ou offrir une
     diversité équivalente. La longueur seule ne suffit pas : ``"a" * 43``
     serait brute-forçable hors ligne si la base d'empreintes et le pepper
-    fuyaient. Cinq contrôles cumulatifs refusent les motifs triviaux :
+    fuyaient. Six contrôles cumulatifs refusent les motifs triviaux :
     alphabet base64url strict, longueur ≥ 43, ≥ 16 caractères distincts,
     absence de période répétitive (la clé ne peut pas être la répétition d'un
     bloc plus court : « abcdefghijkl » * 4 et « abcdefghijklmnop » * 3 sont
-    désormais refusés) et absence de suite monotone de 8+ caractères
+    désormais refusés), absence de suite monotone de 8+ caractères
     (``abcdefgh…``, ``0123456789…`` : devinables même avec 16+ distincts,
-    sans période répétitive). Le message reste générique et ne reflète jamais
+    sans période répétitive) et absence de ligne de clavier connue
+    (``qwertyuiop…``, ``azerty…`` : ni monotone ni répétitive, mais
+    devinable). Le message reste générique et ne reflète jamais
     la clé. Ce contrôle reste un filtre de motifs triviaux, PAS une mesure
     d'entropie : l'exigence réelle reste ``generate_api_key()`` côté opérateur
     (#64).
@@ -404,6 +451,12 @@ def _validate_raw_api_key(raw_key: str) -> str:
             "La clé API brute repose sur une suite prévisible : utiliser "
             "generate_api_key() ou une clé aléatoire d'au moins 256 bits "
             "(motif trivial refusé)."
+        )
+    if _has_known_keyboard_run(raw_key):
+        raise ValueError(
+            "La clé API brute repose sur une séquence de clavier prévisible : "
+            "utiliser generate_api_key() ou une clé aléatoire d'au moins "
+            "256 bits (motif trivial refusé)."
         )
     return raw_key
 
@@ -1658,7 +1711,8 @@ def create_app(
         Les clés DOIVENT être générées par ``generate_api_key()`` (256 bits) ou
         offrir une diversité équivalente : la longueur seule est insuffisante et
         les motifs triviaux (``"a" * 43``, ``"abcdefghijkl" * 4``, suites
-        monotones de 8+ comme ``abcdefgh…``/``0123456789…``) sont refusés.
+        monotones 8+ comme ``abcdefgh…``/``0123456789…``, lignes de clavier
+        comme ``qwertyuiop…``/``azerty…``) sont refusés.
         L'identifiant de projet est validé contre ``PROJECT_PATTERN`` : une clé
         liée à un identifiant hors contrat ne pourrait jamais matcher une
         requête et provoquerait un 403 silencieux à chaque appel.

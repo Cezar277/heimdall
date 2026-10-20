@@ -96,7 +96,7 @@ interdit et la KEK obligatoire pour SQLite.
 
 Les clés opérateur enregistrées via `register_api_key` **DOIVENT** provenir de
 `generate_api_key()` (`secrets.token_urlsafe(32)`, 256 bits). L'enregistrement
-applique cinq contrôles cumulatifs, fail-closed et sans écho de la valeur :
+applique six contrôles cumulatifs, fail-closed et sans écho de la valeur :
 
 | Contrôle | Règle | Motifs refusés |
 |---|---|---|
@@ -105,6 +105,7 @@ applique cinq contrôles cumulatifs, fail-closed et sans écho de la valeur :
 | Diversité | `>= 16` caractères distincts | `"a" * 43`, `"abcdefghijkl" * 4` |
 | Motif | aucune période répétitive (la clé n'est pas la répétition d'un bloc plus court) | `"abab…"`, `"0123456789…"`, `"abcdefghijklmnop" * 3` |
 | Suite | aucune suite monotone de 8+ caractères | `"abcdefgh…"`, `"0123456789…"`, `"ZYXW…"`, `"abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE"` |
+| Clavier | aucune ligne de clavier connue QWERTY/AZERTY/QWERTZ (deux sens, insensible à la casse) | `"qwertyuiop…"`, `"azerty…"`, `"qwerty"`, `"yxcvbnm…"` |
 
 Ces contrôles filtrent les **motifs triviaux** ; ils ne mesurent pas l'entropie
 et ne remplacent pas `generate_api_key()` côté opérateur, qui reste la seule

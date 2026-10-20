@@ -2316,16 +2316,17 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(test_app.state.api_keys), 1)
 
     def test_register_api_key_rejects_trivial_patterns(self) -> None:
-        """Politique opérateur durcie (#64) : alphabet, diversité, motif et suite.
+        """Politique opérateur durcie (#64) : alphabet, diversité, motif, suite, clavier.
 
         Correction de la remarque de revue « seuil de diversité documenté comme
         garde-fou trivial » : le contrôle ne se limite plus à
         ``len(set(...)) >= 12`` (qui acceptait ``"abcdefghijkl" * 4``). Une clé
         doit être un token base64url, d'au moins 43 caractères, avec au moins 16
-        caractères distincts, sans aucune période répétitive et sans suite
-        monotone de 8+ (motifs ``"abcdefghijkl" * 4``, ``"ab" * 21 + "a"``,
-        ``"0123456789" * 4 + "012"`` et suites séquentielles
-        ``"abcdefgh…"``/``"0123456789…"`` sont refusés).
+        caractères distincts, sans aucune période répétitive, sans suite monotone
+        de 8+ et sans ligne de clavier connue (motifs ``"abcdefghijkl" * 4``,
+        ``"ab" * 21 + "a"``, ``"0123456789" * 4 + "012"``, suites séquentielles
+        ``"abcdefgh…"``/``"0123456789…"`` et lignes ``"qwertyuiop…"``/``"azerty…"``
+        sont refusés).
         """
         test_app = create_app()
         trivial_keys = (
@@ -2343,6 +2344,12 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             # Exemple revue (5e contrôle) : suite de 8 répétée, refusée
             # (diversité 8 < 16, période 8 et suite monotone cumulés).
             "abcdefgh" * 6,
+            # Lignes de clavier (6e contrôle) : ni monotones ni répétitives,
+            # mais devinables — y compris en milieu de clé et en sens inverse.
+            "qwertyuiopZx9-plQv2Mw4Rt6Yb8Nd3Ff7Hg5Jj1Kk0Ll",
+            "azertyuiopZx9-plQv2Mw4Rt6Yb8Nd3Ff7Hg5Jj1Kk0Ll",
+            "poiuytrewqZx9-plQv2Mw4Rt6Yb8Nd3Ff7Hg5Jj1Kk0Ll",
+            "Zx9-plQv2Mw4qwertyuiopRt6Yb8Nd3Ff7Hg5Jj1Kk0Ll",
         )
         for trivial_key in trivial_keys:
             with self.subTest(key=trivial_key):
