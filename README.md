@@ -86,6 +86,20 @@ valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
 > - **Rate-limit débit par clé validée, pair réseau et global avec `Retry-After`** : ticket #65.
 > - **Chiffrement au repos et persistance SQLite** : tickets #26 / #62.
 
+> **Limites de déploiement à l'état #63** :
+> - **Transport** : le lanceur `python -m heimdall.vault.app` sert du HTTP en clair,
+>   strictement réservé à la boucle locale. Ne pas exposer ce montage hors de
+>   `127.0.0.1`/`::1`/`localhost` ; TLS avec SAN IP (`https://127.0.0.1:8443`) et
+>   révocation restent à livrer dans les tickets dédiés (#25/#64/#65).
+> - **Rate-limit mono-processus** : `run_server` épingle `workers=1`. Les buckets
+>   (clé validée, pair réseau, global) vivent en mémoire par processus ; avec
+>   `workers > 1`, chaque worker appliquerait sa propre limite et le débit effectif
+>   serait multiplié. Un backend partagé est requis avant tout multi-worker (#65).
+> - **Quota de stockage best-effort** : avec plusieurs workers SQLite, la capacité
+>   `max_secrets`/`max_secrets_per_project` peut être franchie de façon bornée
+>   (comptage puis insertion non atomiques entre processus, TODO(#62)). L'unicité
+>   `UNIQUE(project_id, env, name)` et l'intégrité de la base restent garanties.
+
 Vérifier la santé minimale (`/api/v1/health` contractuel) :
 
 ```sh

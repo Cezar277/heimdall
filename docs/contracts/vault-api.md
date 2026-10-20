@@ -109,6 +109,13 @@ best-effort (TODO(#62), dépassement borné entre workers, aucune corruption).
 Tout rejet 400 du middleware de taille répond `Connection: close` (aucun octet
 non drainé réutilisé en keep-alive).
 
+Limite de déploiement #65 : le rate-limiter livré est mono-processus et
+`run_server` épingle `workers=1` (le lanceur ignore `WEB_CONCURRENCY`). Avec
+plusieurs workers sans backend partagé (Redis/SQLite dédié), chaque processus
+appliquerait ses propres buckets et le débit effectif serait multiplié par le
+nombre de workers ; un backend partagé est requis avant tout passage multi-worker.
+Le quota de stockage reste indépendant de cette limite de débit.
+
 Cette règle porte sur les clés d'authentification du serveur ; le
 client doit conserver son credential dans un stockage local protégé pour
 pouvoir s'authentifier. Le serveur DOIT comparer des empreintes de même type

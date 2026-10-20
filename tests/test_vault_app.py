@@ -23,6 +23,7 @@ import time
 import unittest
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import uvicorn  # type: ignore[import-untyped]
@@ -32,6 +33,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ValidationError
 
 import heimdall.vault.app as vault_app_module
+import heimdall.vault.store as vault_store_module
 from heimdall.vault.app import (
     BadRequestError,
     ConflictError,
@@ -53,7 +55,7 @@ from heimdall.vault.app import (
     run_server,
 )
 from heimdall.vault.crypto import VaultCipher, generate_encryption_key
-from heimdall.vault.database import db_session
+from heimdall.vault.database import count_secrets, db_session
 from heimdall.vault.store import SqliteSecretStore
 
 
@@ -569,6 +571,8 @@ class VaultSettingsTests(unittest.TestCase):
             "heimdall.vault.app:app",
             host="127.0.0.1",
             port=8443,
+            # Un seul worker : le rate-limiter est en mémoire par processus (#65).
+            workers=1,
             proxy_headers=False,
             forwarded_allow_ips="",
             server_header=False,
@@ -1496,6 +1500,105 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("TODO(#62)", doc)
         self.assertIn("quota", doc)
         self.assertIn("inter-workers", doc)
+
+    async def test_sqlite_quota_best_effort_inter_workers_bounded_overrun(self) -> None:
+        """Quota SQLite best-effort : dépassement borné entre workers, sans corruption.
+
+        Le verrou asyncio de ``SqliteSecretStore`` est local à l'instance : le
+        couple ``count_secrets()`` puis ``create_secret()`` n'est pas atomique
+        entre processus partageant le même fichier. Ce test force l'entrelacement
+        (barrière dans ``count_secrets``) pour prouver le dépassement documenté
+        (TODO(#62)), puis vérifie que les secrets restent lisibles et que
+        l'unicité SQLite n'est pas contournée.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            cipher = VaultCipher(b"Q" * 32)
+            worker_count = 3
+            stores = [
+                SqliteSecretStore(
+                    db_path,
+                    cipher,
+                    max_secrets=2,
+                    max_secrets_per_project=10,
+                )
+                for _ in range(worker_count)
+            ]
+
+            barrier = threading.Barrier(worker_count)
+            local = threading.local()
+            real_count_secrets = vault_store_module.count_secrets
+
+            def synchronized_count(conn: Any, project_id: str | None = None) -> int:
+                # Chaque worker lit le quota avant la barrière : tous observent
+                # la capacité libre avant que le premier n'écrive.
+                observed = real_count_secrets(conn, project_id)
+                if not getattr(local, "counted", False):
+                    local.counted = True
+                    barrier.wait(timeout=5)
+                return observed
+
+            results: list[dict[str, str]] = []
+            errors: list[BaseException] = []
+
+            def create_in_worker(store: SqliteSecretStore, index: int) -> None:
+                try:
+                    results.append(
+                        asyncio.run(
+                            store.create(
+                                project="demo",
+                                env="dev",
+                                name=f"SECRET_{index}",
+                                value=f"value-{index}",
+                            )
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            with patch.object(
+                vault_store_module, "count_secrets", synchronized_count
+            ):
+                threads = [
+                    threading.Thread(target=create_in_worker, args=(store, index))
+                    for index, store in enumerate(stores)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=30)
+            self.assertFalse([thread.name for thread in threads if thread.is_alive()])
+
+            self.assertFalse(errors, errors)
+            self.assertEqual(len(results), worker_count)
+            with db_session(db_path) as conn:
+                # Le seuil est franchi par les workers concurrents : best-effort,
+                # dépassement borné au nombre de workers, jamais de corruption.
+                self.assertEqual(count_secrets(conn), worker_count)
+                rows = conn.execute(
+                    "SELECT name FROM secrets ORDER BY name"
+                ).fetchall()
+            self.assertEqual(
+                [row["name"] for row in rows],
+                [f"SECRET_{index}" for index in range(worker_count)],
+            )
+
+            # Les valeurs restent déchiffrables par une nouvelle instance.
+            reader = SqliteSecretStore(
+                db_path,
+                cipher,
+                max_secrets=2,
+                max_secrets_per_project=10,
+            )
+            for index in range(worker_count):
+                record = await reader.get("demo", "dev", f"SECRET_{index}")
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertEqual(record["value"], f"value-{index}")
+
+            # Une fois le dépassement constaté, le quota reste appliqué.
+            with self.assertRaises(QuotaExceededError):
+                await reader.create("demo", "dev", "SECRET_AFTER", "value-after")
 
     def test_cipher_fingerprint_uses_dedicated_subkey_bound_to_triplet(self) -> None:
         """L'empreinte n'utilise jamais la KEK comme clé HMAC et lie le triplet.

@@ -1348,15 +1348,20 @@ def run_server() -> None:
 
     NOTE CONCURRENCE : Le stockage SQLite chiffré (#26, #62) et les empreintes de
     clés API sont partagés entre workers. Le rate-limiter reste toutefois
-    mono-processus : le serveur conserve workers=1 par défaut afin de ne pas
-    multiplier la limite effective par le nombre de workers. Un backend de
-    rate-limiting partagé pourra lever cette contrainte (#65).
+    mono-processus : le serveur épingle workers=1 (le lanceur ignore
+    WEB_CONCURRENCY) afin de ne pas multiplier la limite effective par le nombre
+    de workers. Un backend de rate-limiting partagé pourra lever cette
+    contrainte (#65).
     """
     server_settings = get_settings()
     uvicorn.run(
         "heimdall.vault.app:app",
         host=server_settings.host,
         port=server_settings.port,
+        # Épinglé : le rate-limiter est en mémoire par processus (#65). Laisser
+        # uvicorn dériver le nombre de workers de WEB_CONCURRENCY multiplierait
+        # la limite effective (N workers = N × quota) sans backend partagé.
+        workers=1,
         proxy_headers=False,
         forwarded_allow_ips="",
         server_header=False,
