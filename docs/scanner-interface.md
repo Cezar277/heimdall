@@ -47,10 +47,25 @@ Les deux cibles sont figées (immuables) et validées à la construction :
   grammaire lexicale du contrat #14, appliquée avant toute lecture ;
 - les numéros de ligne d'un `DiffTarget` sont des entiers ≥ 1 **strictement
   croissants** (le parseur de diff du MCP produit déjà cette forme :
-  `DiffEntry.lines`).
+  `DiffEntry.lines`) ;
+- un conteneur de lignes ou une ligne malformée est refusé : `lines` doit
+  être une suite de couples `(entier, texte)`, et le résultat est normalisé
+  en tuple de couples.
 
 Un chemin refusé est une **erreur** (`InvalidTarget`), pas un fichier ignoré
 en silence : une cible illisible ne doit jamais devenir « aucun secret ».
+
+### Le contenu analysé n'apparaît jamais dans un `repr`
+
+Les lignes ajoutées du diff et le contenu du fichier sont **exactement là où
+vivent les secrets**. Un `log.debug("%r", cible)`, un `print` de débogage ou
+une traceback future ne doivent pas les écrire en clair (invariant 8).
+
+Les deux cibles excluent donc leur contenu du `repr` (`field(repr=False)`) et
+exposent un `repr` résumé : `DiffTarget(path='src/app.py', lignes=3)` et
+`FileTarget(path='src/app.py', caracteres=812)`. Le chemin et la taille
+restent visibles, le contenu jamais. Le `Finding`, lui, ne porte qu'une
+empreinte : son `repr` est sûr et n'a pas besoin d'être masqué.
 
 ## La sortie
 
@@ -101,6 +116,45 @@ L'ordre de sortie est stable : `scan()` trie par `(ligne, type, empreinte)` et
 `scan_all()` par `(fichier, ligne, type, empreinte)`. Deux scans de la même
 cible rendent donc la même liste, dans le même ordre.
 
+## Le contrat d'erreur : un seul type
+
+Tout ce qui entre dans le scanner vient d'une frontière non fiable (parseur
+MCP, CLI, données relues du Vault ou d'un cache). Le contrat d'erreur est donc
+**unique et typé** :
+
+| Erreur | Lever par | Sens |
+| --- | --- | --- |
+| `InvalidFinding` | `Finding(...)`, `Finding.from_dict(...)` | la donnée ne respecte pas le contrat #14 |
+| `InvalidTarget` | `DiffTarget(...)`, `FileTarget(...)`, `Scanner.scan(cible)` | la cible est inexploitable |
+| `ScanError` | `Scanner(moteur)`, `Scanner.scan(...)` | moteur ou sortie inexploitables |
+
+Les trois dérivent de `ScanError`, lui-même de `Exception` ; `InvalidFinding`
+et `InvalidTarget` dérivent aussi de `ValueError`, pour les appelants qui
+traitent les erreurs de contrat comme des valeurs invalides.
+
+Aucune `TypeError` ni `AttributeError` brute ne doit sortir de l'interface :
+un `status` non hashable, un conteneur de lignes malformé, une cible qui
+n'est pas une cible ou un moteur sans méthode `analyser` sont refusés par
+l'erreur de contrat, que l'appelant (Vault, CLI) sait catcher. Le refus
+reste fail-closed dans tous les cas : il bloque, il ne rend jamais la main
+sur une liste partielle.
+
+## Ce que ce ticket ne fait pas
+
+- **Aucune I/O.** L'interface ne lit aucun fichier et n'ouvre aucun
+  descripteur : elle ne fait que valider et transporter. La lecture du
+  fichier appartient au moteur (#54/#59), qui doit appliquer le confinement
+  complet.
+- **La garde de chemin est lexicale, et ce n'est pas assez.** `..`, un chemin
+  absolu, `C:/` ou un caractère de contrôle sont refusés *avant* toute
+  lecture, mais cette garde **ne protège pas contre les liens symboliques ni
+  contre le TOCTOU**. Conformément à l'invariant 3, le consommateur doit, sur
+  une racine fixée au démarrage, résoudre le chemin
+  (`resolve` + `is_relative_to(racine)`), refuser les liens sortants et
+  revérifier l'identité du descripteur à l'usage. C'est le cas de
+  `heimdall/mcp/gitdiff.py` et de la lecture de fichier par #54/#59 ; la garde
+  lexicale de ce ticket ne doit pas être considérée comme suffisante.
+
 ## Le code est au moins aussi strict que le schéma
 
 La validation locale reproduit la grammaire du schéma #14, et le test
@@ -136,6 +190,21 @@ réconciliation proposée au relecteur est :
 
 Ce ticket ne modifie pas l'épic : il fournit l'interface et le contrat, sans
 toucher aux signatures ni aux exclusions.
+
+## Contraintes pour le moteur (#54 / #59)
+
+Le moteur injecté doit :
+
+- rendre des `Finding` **déjà conformes** (la façade les revalide de toute
+  façon, et refuse un objet qui ne l'est pas) ;
+- ne rendre **que** des Findings de la cible analysée, dans l'état `detecte`,
+  avec une origine `regex` ou `entropy` ;
+- ne jamais rendre la valeur brute d'un candidat : la façade ne manipule que
+  des empreintes ;
+- appliquer, avant toute lecture, le confinement complet de l'invariant 3
+  (`resolve` + `is_relative_to` sur une racine fixée, refus des liens
+  sortants, identité de descripteur revérifiée à l'usage) : la garde lexicale
+  des cibles ne suffit pas.
 
 ## Preuves locales
 
