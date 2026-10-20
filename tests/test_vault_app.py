@@ -2316,15 +2316,16 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(test_app.state.api_keys), 1)
 
     def test_register_api_key_rejects_trivial_patterns(self) -> None:
-        """Politique opérateur durcie (#64) : alphabet, diversité et motif répétitif.
+        """Politique opérateur durcie (#64) : alphabet, diversité, motif et suite.
 
         Correction de la remarque de revue « seuil de diversité documenté comme
         garde-fou trivial » : le contrôle ne se limite plus à
         ``len(set(...)) >= 12`` (qui acceptait ``"abcdefghijkl" * 4``). Une clé
         doit être un token base64url, d'au moins 43 caractères, avec au moins 16
-        caractères distincts et sans aucune période répétitive (motifs
-        ``"abcdefghijkl" * 4``, ``"ab" * 21 + "a"``, ``"0123456789" * 4 + "012"``
-        sont refusés).
+        caractères distincts, sans aucune période répétitive et sans suite
+        monotone de 8+ (motifs ``"abcdefghijkl" * 4``, ``"ab" * 21 + "a"``,
+        ``"0123456789" * 4 + "012"`` et suites séquentielles
+        ``"abcdefgh…"``/``"0123456789…"`` sont refusés).
         """
         test_app = create_app()
         trivial_keys = (
@@ -2334,11 +2335,17 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             "abcdefghijklmnop" * 3,
             # Bloc répété long, alphabet respecté.
             "aB3-_aB3-_aB3-_aB3-_aB3-_aB3-_aB3-_aB3-_",
+            # Suites monotones longues : alphabet/longueur/diversité OK,
+            # ni répétition, mais devinables (seuil 8+).
+            "abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE",
+            "0123456789abcdefABCDEFGHIJKLMNOPQRSTUVWXYghijklmn",
+            "zyxwvutsrqponmlkjihgfedcba9876543210_-ABCab",
         )
         for trivial_key in trivial_keys:
             with self.subTest(key=trivial_key):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ValueError) as ctx:
                     test_app.state.register_api_key(trivial_key, "demo")
+                self.assertNotIn(trivial_key, str(ctx.exception))
         self.assertEqual(len(test_app.state.api_keys), 0)
 
     def test_register_api_key_rejects_non_base64url_alphabet(self) -> None:

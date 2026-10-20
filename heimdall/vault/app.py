@@ -36,11 +36,12 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   refuse la constante publique commitée hors `HEIMDALL_ENV=test`, exige
   `HEIMDALL_VAULT_API_KEY_PEPPER` en production et génère hors production un
   pepper aléatoire éphémère au démarrage avec avertissement (documenté #25).
-  Les clés opérateur trop peu diverses (`"a" * 43`, `"abcdefghijkl" * 4`) ou
-  répétitives sont refusées à l'enregistrement : alphabet base64url strict,
-  43 caractères minimum, 16 caractères distincts minimum, aucune période
-  répétitive. La valeur d'un secret est canonisée en NFC avant stockage et le
-  NUL y est interdit ; elle n'est jamais journalisée (décision #62).
+  Les clés opérateur trop peu diverses (`"a" * 43`, `"abcdefghijkl" * 4`),
+  répétitives ou séquentielles (`abcdefgh…`) sont refusées à
+  l'enregistrement : alphabet base64url strict, 43 caractères minimum,
+  16 caractères distincts minimum, aucune période répétitive, aucune suite
+  monotone de 8+. La valeur d'un secret est canonisée en NFC avant stockage
+  et le NUL y est interdit ; elle n'est jamais journalisée (décision #62).
 - Gestion d'erreurs normalisée :
   - RequestValidationError -> 400 contractuel {"code": "bad_request", "message": "Requête invalide"}
     sans écho du corps ni enveloppe 422 de FastAPI.
@@ -212,7 +213,7 @@ _DUMMY_HASH: str = "0" * 64
 _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 # Politique #64 : une clé opérateur doit offrir une entropie comparable aux clés
 # émises par `generate_api_key` (``secrets.token_urlsafe(32)`` → 43 caractères,
-# 256 bits). Le contrôle est fail-closed sur les MOTIFS TRIVIAUX, en quatre
+# 256 bits). Le contrôle est fail-closed sur les MOTIFS TRIVIAUX, en cinq
 # temps (remarque de revue « seuil de diversité trivial ») :
 # - alphabet base64url strict (A-Z, a-z, 0-9, « _ », « - ») : ni espaces ni
 #   caractères de contrôle, donc aucune ambiguïté de transport ;
@@ -221,7 +222,9 @@ _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 # - au moins 16 caractères distincts : refuse « a » * 43 mais aussi
 #   « abcdefghijkl » * 4 (12 distincts, motif prévisible) ;
 # - aucune période répétitive : la clé ne peut pas être la répétition d'un
-#   bloc plus court (refuse « abab… », « 0123456789… », « abcdefghijklmnop » * 3).
+#   bloc plus court (refuse « abab… », « 0123456789… », « abcdefghijklmnop » * 3) ;
+# - aucune suite monotone de 8+ caractères (``abcdefgh…``, ``0123456789…``,
+#   ``ZYXW…``) : devinables malgré 16+ distincts et sans période répétitive.
 # Ce contrôle ne mesure PAS l'entropie : il n'exclut que les motifs triviaux.
 # L'exigence réelle reste `generate_api_key()` côté opérateur (256 bits).
 _MIN_API_KEY_LENGTH: int = 43
@@ -323,6 +326,35 @@ def _minimal_pattern_period(value: str) -> int:
     return length
 
 
+_MIN_MONOTONIC_RUN_LENGTH: int = 8
+
+
+def _has_long_monotonic_run(value: str, min_run: int = _MIN_MONOTONIC_RUN_LENGTH) -> bool:
+    """Détecte une suite monotone (croissante/décroissante, pas de ±1) de ``min_run``+.
+
+    Cible les motifs séquentiels prévisibles (``abcdefgh…``, ``0123456789…``,
+    ``ZYXW…``) qu'aucun des quatre contrôles précédents ne voit : alphabet
+    valide, longueur et diversité suffisantes, aucune période répétitive.
+    Seuil 8 : une suite de 8 sur token aléatoire 256 bits est négligeable
+    (≈ 43 × 64⁻⁷), un motif humain séquentiel l'atteint systématiquement.
+    Complexité O(n) bornée par 512 (appel réservé à l'enregistrement).
+    """
+    run = 1
+    last_step = 0
+    for prev, cur in zip(value, value[1:], strict=False):
+        step = ord(cur) - ord(prev)
+        if step in (1, -1) and step == last_step:
+            run += 1
+        elif step in (1, -1):
+            run = 2
+        else:
+            run = 1
+        last_step = step if step in (1, -1) else 0
+        if run >= min_run:
+            return True
+    return False
+
+
 def _validate_raw_api_key(raw_key: str) -> str:
     """Valide une clé opérateur brute avant hachage (fail-fast, sans écho).
 
@@ -330,16 +362,16 @@ def _validate_raw_api_key(raw_key: str) -> str:
     (``secrets.token_urlsafe(32)``, 256 bits, 43 caractères) ou offrir une
     diversité équivalente. La longueur seule ne suffit pas : ``"a" * 43``
     serait brute-forçable hors ligne si la base d'empreintes et le pepper
-    fuyaient. Quatre contrôles cumulatifs refusent les motifs triviaux :
-    alphabet base64url strict, longueur ≥ 43, ≥ 16 caractères distincts et
+    fuyaient. Cinq contrôles cumulatifs refusent les motifs triviaux :
+    alphabet base64url strict, longueur ≥ 43, ≥ 16 caractères distincts,
     absence de période répétitive (la clé ne peut pas être la répétition d'un
     bloc plus court : « abcdefghijkl » * 4 et « abcdefghijklmnop » * 3 sont
-    désormais refusés). Le message reste générique et ne reflète jamais la clé.
-    Ce contrôle reste un filtre de motifs triviaux, PAS une mesure d'entropie :
-    une clé séquentielle prévisible de 43 caractères
-    (ex. ``abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE``) passe ces quatre
-    contrôles tout en restant devinable — l'exigence réelle reste
-    ``generate_api_key()`` côté opérateur (#64).
+    désormais refusés) et absence de suite monotone de 8+ caractères
+    (``abcdefgh…``, ``0123456789…`` : devinables même avec 16+ distincts,
+    sans période répétitive). Le message reste générique et ne reflète jamais
+    la clé. Ce contrôle reste un filtre de motifs triviaux, PAS une mesure
+    d'entropie : l'exigence réelle reste ``generate_api_key()`` côté opérateur
+    (#64).
     """
     if (
         not isinstance(raw_key, str)
@@ -364,6 +396,12 @@ def _validate_raw_api_key(raw_key: str) -> str:
     if _minimal_pattern_period(raw_key) != len(raw_key):
         raise ValueError(
             "La clé API brute repose sur un motif répétitif : utiliser "
+            "generate_api_key() ou une clé aléatoire d'au moins 256 bits "
+            "(motif trivial refusé)."
+        )
+    if _has_long_monotonic_run(raw_key):
+        raise ValueError(
+            "La clé API brute repose sur une suite prévisible : utiliser "
             "generate_api_key() ou une clé aléatoire d'au moins 256 bits "
             "(motif trivial refusé)."
         )
@@ -1619,7 +1657,8 @@ def create_app(
 
         Les clés DOIVENT être générées par ``generate_api_key()`` (256 bits) ou
         offrir une diversité équivalente : la longueur seule est insuffisante et
-        les motifs triviaux (``"a" * 43``, ``"abcdefghijkl" * 4``) sont refusés.
+        les motifs triviaux (``"a" * 43``, ``"abcdefghijkl" * 4``, suites
+        monotones de 8+ comme ``abcdefgh…``/``0123456789…``) sont refusés.
         L'identifiant de projet est validé contre ``PROJECT_PATTERN`` : une clé
         liée à un identifiant hors contrat ne pourrait jamais matcher une
         requête et provoquerait un 403 silencieux à chaque appel.
