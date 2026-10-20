@@ -183,8 +183,8 @@ jamais 0 ou 1.
 .venv/bin/python tests/measure_trap.py
 ```
 
-Résultats de la livraison : **102 tests passés**, couverture du paquet
-`heimdall/scanner` **90,66 %** (branches incluses), suite complète **916 tests
-passés**, mesure T21 `core` précision **1,00**, rappel **1,00**, aucune fausse
-alerte sur les 18 non-leaks.
+Résultats de la livraison : **122 tests passés**, couverture du paquet
+`heimdall/scanner` **91,31 %** (branches incluses), suite complète **936 tests
+passés**, couverture globale **96,69 %**, mesure T21 `core` précision **1,00**,
+rappel **1,00**, aucune fausse alerte sur les 18 non-leaks.
 Les liens permanents et la fiche SAMM sont dans [t22-samm.md](t22-samm.md).
