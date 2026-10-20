@@ -14,6 +14,7 @@ from unittest.mock import patch
 from httpx import ASGITransport, AsyncClient
 
 import heimdall.vault.app as app_module
+import heimdall.vault.auth as auth_module
 import heimdall.vault.ratelimit as ratelimit_module
 import heimdall.vault.store as store_module
 from heimdall.vault.app import VaultSettings, create_app
@@ -54,7 +55,7 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                 (store_module, lambda: store.get("demo", "dev", "TOKEN"), 1),
                 (store_module, lambda: store.create("demo", "dev", "TOKEN", "value"), 1),
                 (store_module, store.clear, 1),
-                (app_module, lambda: self._authenticated_get(target, key), 1),
+                (auth_module, lambda: self._authenticated_get(target, key), 1),
                 (ratelimit_module, lambda: self._authenticated_get(target, key), 1),
                 (ratelimit_module, lambda: self._authenticated_get(target, key), 2),
             )
@@ -129,8 +130,8 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                         first = await self._authenticated_get(target, key)
                         self.assertEqual(first.status_code, 404)
                         with (
-                            patch.object(app_module, "hash_api_key") as hashing,
-                            patch.object(app_module, "_find_api_key_project") as lookup,
+                            patch.object(auth_module, "hash_project_api_key") as hashing,
+                            patch.object(auth_module, "find_api_key_project") as lookup,
                         ):
                             second = await self._authenticated_get(target, key)
                             self.assertEqual(second.status_code, 429)
@@ -178,9 +179,10 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             fingerprint = hash_api_key(generate_api_key(), pepper="p" * 32)
+            registry = target.state.api_key_registry
             await asyncio.gather(
                 *(
-                    asyncio.to_thread(app_module._persist_api_key_hash, target, fingerprint, "demo")
+                    asyncio.to_thread(registry.register_hash, fingerprint, "demo")
                     for _ in range(5)
                 )
             )
@@ -188,7 +190,7 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0], 1)
                 conn.execute("UPDATE api_keys SET revoked_at = '2026-01-01'")
             with self.assertRaisesRegex(ValueError, "déjà associée"):
-                app_module._persist_api_key_hash(target, fingerprint, "other")
+                registry.register_hash(fingerprint, "other")
             with db_session(db_path) as conn:
                 row = conn.execute("SELECT project_id, revoked_at FROM api_keys").fetchone()
                 self.assertEqual(tuple(row), ("demo", "2026-01-01"))
@@ -235,7 +237,7 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
             target.state.register_api_key(key, "demo")
             fingerprint = hash_api_key(key, pepper="p" * 32)
             with patch.object(
-                app_module, "_lookup_db_api_key", wraps=app_module._lookup_db_api_key
+                auth_module, "lookup_db_api_key", wraps=auth_module.lookup_db_api_key
             ) as lookup:
                 self.assertEqual((await self._authenticated_get(target, key)).status_code, 404)
                 self.assertEqual(lookup.call_count, 1)
@@ -252,7 +254,9 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
             with db_session(target.state.db_path) as conn:
                 conn.execute("DELETE FROM api_keys")
             self.assertEqual((await self._authenticated_get(target, key)).status_code, 401)
-            with patch.object(app_module, "db_session", side_effect=DatabaseUnavailableError):
+            with patch.object(
+                auth_module, "db_session", side_effect=DatabaseUnavailableError
+            ):
                 self.assertEqual((await self._authenticated_get(target, key)).status_code, 503)
 
     async def test_key_cannot_be_reassigned_to_another_project(self) -> None:
@@ -301,11 +305,15 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
         started = threading.Event()
         release = threading.Event()
 
-        def blocking_persist(app: object, key_hash: str, project_id: str) -> None:
+        def blocking_persist(
+            key_id: str, key_hash: str, project_id: str, created_at: str
+        ) -> tuple[str, bool]:
             started.set()
             release.wait(timeout=10)
+            return key_id, False
 
-        with patch.object(app_module, "_persist_api_key_hash", blocking_persist):
+        registry = target.state.api_key_registry
+        with patch.object(registry, "_persist_hash", blocking_persist):
             worker = threading.Thread(
                 target=lambda: target.state.register_api_key(key, "demo"),
                 daemon=True,
@@ -315,7 +323,7 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
 
             # La lecture concurrente aboutit malgré l'E/S base en cours : le
             # parcours exhaustif voit la clé déjà enregistrée et n'attend pas.
-            project, evaluated = app_module._find_api_key_project(target, "0" * 64)
+            project, evaluated = auth_module.find_api_key_project(target, "0" * 64)
             self.assertIsNone(project)
             self.assertEqual(evaluated, 1)
 
