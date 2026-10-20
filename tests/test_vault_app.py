@@ -10,6 +10,7 @@ sans enveloppe framework, l'allowlist d'en-têtes d'erreurs, l'immunité au spoo
 X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 """
 
+import ast
 import asyncio
 import base64
 import hashlib
@@ -641,6 +642,31 @@ class VaultSettingsTests(unittest.TestCase):
         mock_uvicorn_run.assert_not_called()
 
     @patch("uvicorn.run")
+    def test_run_server_checks_tls_before_any_app_construction(
+        self, mock_uvicorn_run: unittest.mock.MagicMock
+    ) -> None:
+        """Ordre fail-closed : le refus TLS précède toute construction d'app/disque.
+
+        Suggestion revue (optionnelle) : en production sans TLS, `run_server`
+        lève avant `get_app()` — aucun backend résolu, aucun `vault.db`, aucun
+        pepper généré. Verrouille l'ordre TLS-avant-disque.
+        """
+        settings = VaultSettings(api_key_pepper="p" * 32)
+        with (
+            patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=False),
+            patch("heimdall.vault.app.get_settings", return_value=settings),
+            patch(
+                "heimdall.vault.app.get_app",
+                side_effect=AssertionError("get_app() ne doit pas être appelé avant le garde TLS"),
+            ) as mock_get_app,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                run_server()
+        self.assertIn("TLS", str(ctx.exception))
+        mock_get_app.assert_not_called()
+        mock_uvicorn_run.assert_not_called()
+
+    @patch("uvicorn.run")
     def test_run_server_passes_tls_files_in_production(
         self, mock_uvicorn_run: unittest.mock.MagicMock
     ) -> None:
@@ -688,9 +714,27 @@ class VaultSettingsTests(unittest.TestCase):
         app_code = (root / "heimdall" / "vault" / "app.py").read_text(encoding="utf-8")
         self.assertIn("python -m heimdall.vault.app", app_code)
         self.assertNotIn("uvicorn heimdall.vault.app:app", app_code)
-        # Factory explicite : l'instance est construite par get_app(), jamais
-        # via une chaîne d'import (aucune création différée par uvicorn).
-        self.assertIn("get_app(),", app_code)
+        # Factory explicite (LOW revue : pas de test sur chaîne fragile) :
+        # run_server passe l'objet construit par get_app() à uvicorn.run,
+        # vérifié par AST (insensible au reformatage).
+        tree = ast.parse(app_code)
+        run_server_def = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "run_server"
+        )
+        uvicorn_calls = [
+            node
+            for node in ast.walk(run_server_def)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run"
+            and node.args
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name)
+            and node.args[0].func.id == "get_app"
+        ]
+        self.assertEqual(len(uvicorn_calls), 1)
 
     def test_health_schema_response_codes_match_openapi_yaml(self) -> None:
         """Le schéma OpenAPI runtime de /api/v1/health correspond au contrat openapi.yaml."""
