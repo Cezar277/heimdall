@@ -45,9 +45,9 @@ from heimdall.vault.app import (
     SecretRead,
     Settings,
     VaultSettings,
-    app,
     create_app,
     generate_api_key,
+    get_app,
     get_settings,
     hash_api_key,
     run_server,
@@ -56,6 +56,10 @@ from heimdall.vault.crypto import VaultCipher, generate_encryption_key
 from heimdall.vault.database import count_secrets, db_session
 from heimdall.vault.ratelimit import SqliteRateLimiter
 from heimdall.vault.store import SqliteSecretStore
+
+# Singleton explicite des tests (l'app réelle passe par get_app()/run_server ;
+# aucun `from heimdall.vault.app import app` n'existe plus — factory explicite).
+app = get_app()
 
 
 class VaultAppTests(unittest.IsolatedAsyncioTestCase):
@@ -594,21 +598,31 @@ class VaultSettingsTests(unittest.TestCase):
     def test_run_server_passes_hardened_uvicorn_arguments(
         self, mock_uvicorn_run: unittest.mock.MagicMock
     ) -> None:
-        """run_server configure uvicorn avec anti-spoofing et sans fingerprinting."""
+        """run_server configure uvicorn avec anti-spoofing et sans fingerprinting.
+
+        Factory explicite : l'instance FastAPI construite (singleton `get_app`)
+        est passée en objet, jamais via une chaîne d'import (aucune création
+        différée par uvicorn).
+        """
         with patch.dict(os.environ, {"HEIMDALL_ENV": "test"}, clear=False):
             run_server()
-        mock_uvicorn_run.assert_called_once_with(
-            "heimdall.vault.app:app",
-            host="127.0.0.1",
-            port=8443,
-            # Un seul worker : le backend mémoire est mono-processus (#65).
-            workers=1,
-            ssl_certfile=None,
-            ssl_keyfile=None,
-            proxy_headers=False,
-            forwarded_allow_ips="",
-            server_header=False,
-            date_header=False,
+        mock_uvicorn_run.assert_called_once()
+        positional, keywords = mock_uvicorn_run.call_args
+        self.assertIs(positional[0], get_app())
+        self.assertEqual(
+            keywords,
+            {
+                "host": "127.0.0.1",
+                "port": 8443,
+                # Un seul worker : le backend mémoire est mono-processus (#65).
+                "workers": 1,
+                "ssl_certfile": None,
+                "ssl_keyfile": None,
+                "proxy_headers": False,
+                "forwarded_allow_ips": "",
+                "server_header": False,
+                "date_header": False,
+            },
         )
 
     @patch("uvicorn.run")
@@ -646,17 +660,22 @@ class VaultSettingsTests(unittest.TestCase):
                 patch("heimdall.vault.app.get_settings", return_value=settings),
             ):
                 run_server()
-        mock_uvicorn_run.assert_called_once_with(
-            "heimdall.vault.app:app",
-            host="127.0.0.1",
-            port=8443,
-            workers=1,
-            ssl_certfile=str(certfile),
-            ssl_keyfile=str(keyfile),
-            proxy_headers=False,
-            forwarded_allow_ips="",
-            server_header=False,
-            date_header=False,
+        mock_uvicorn_run.assert_called_once()
+        positional, keywords = mock_uvicorn_run.call_args
+        self.assertIs(positional[0], get_app())
+        self.assertEqual(
+            keywords,
+            {
+                "host": "127.0.0.1",
+                "port": 8443,
+                "workers": 1,
+                "ssl_certfile": str(certfile),
+                "ssl_keyfile": str(keyfile),
+                "proxy_headers": False,
+                "forwarded_allow_ips": "",
+                "server_header": False,
+                "date_header": False,
+            },
         )
 
     def test_documented_launch_command_uses_dedicated_runner(self) -> None:
@@ -669,6 +688,9 @@ class VaultSettingsTests(unittest.TestCase):
         app_code = (root / "heimdall" / "vault" / "app.py").read_text(encoding="utf-8")
         self.assertIn("python -m heimdall.vault.app", app_code)
         self.assertNotIn("uvicorn heimdall.vault.app:app", app_code)
+        # Factory explicite : l'instance est construite par get_app(), jamais
+        # via une chaîne d'import (aucune création différée par uvicorn).
+        self.assertIn("get_app(),", app_code)
 
     def test_health_schema_response_codes_match_openapi_yaml(self) -> None:
         """Le schéma OpenAPI runtime de /api/v1/health correspond au contrat openapi.yaml."""

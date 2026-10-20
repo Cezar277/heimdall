@@ -231,7 +231,10 @@ _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 #   ``azerty…``, deux sens, insensible à la casse) : ni monotone ni
 #   répétitive, mais devinable.
 # Ce contrôle ne mesure PAS l'entropie : il n'exclut que les motifs triviaux.
-# L'exigence réelle reste `generate_api_key()` côté opérateur (256 bits).
+# EXIGENCE OPÉRATEUR (#64) : toute clé DOIT provenir de `generate_api_key()`
+# (256 bits aléatoires). Un contournement manuel — même passant les six
+# contrôles — est une faute opérationnelle : en cas de fuite des empreintes
+# et du pepper, seul un token aléatoire résiste au brute-force hors ligne.
 _MIN_API_KEY_LENGTH: int = 43
 _MIN_API_KEY_DISTINCT_CHARS: int = 16
 _API_KEY_ALPHABET_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -418,8 +421,11 @@ def _validate_raw_api_key(raw_key: str) -> str:
     (``qwertyuiop…``, ``azerty…`` : ni monotone ni répétitive, mais
     devinable). Le message reste générique et ne reflète jamais
     la clé. Ce contrôle reste un filtre de motifs triviaux, PAS une mesure
-    d'entropie : l'exigence réelle reste ``generate_api_key()`` côté opérateur
-    (#64).
+    d'entropie. EXIGENCE OPÉRATEUR (#64) : toute clé DOIT provenir de
+    ``generate_api_key()`` (256 bits aléatoires) ; un contournement manuel —
+    même passant les six contrôles — est une faute opérationnelle, car en cas
+    de fuite des empreintes et du pepper, seul un token aléatoire résiste au
+    brute-force hors ligne.
     """
     if (
         not isinstance(raw_key, str)
@@ -1813,11 +1819,13 @@ def create_app(
     def register_api_key(raw_key: str, project_id: str) -> None:
         """Enregistre une clé API brute en calculant son HMAC-SHA256 avec le pepper serveur.
 
-        Les clés DOIVENT être générées par ``generate_api_key()`` (256 bits) ou
-        offrir une diversité équivalente : la longueur seule est insuffisante et
-        les motifs triviaux (``"a" * 43``, ``"abcdefghijkl" * 4``, suites
-        monotones 8+ comme ``abcdefgh…``/``0123456789…``, lignes de clavier
-        comme ``qwertyuiop…``/``azerty…``) sont refusés.
+        Les clés DOIVENT être générées par ``generate_api_key()`` (256 bits) :
+        tout contournement manuel est une faute opérationnelle (en cas de fuite
+        des empreintes et du pepper, seul un token aléatoire résiste au
+        brute-force hors ligne). Les motifs triviaux (``"a" * 43``,
+        ``"abcdefghijkl" * 4``, suites monotones 8+ comme ``abcdefgh…``/
+        ``0123456789…``, lignes de clavier comme ``qwertyuiop…``/``azerty…``)
+        sont refusés fail-fast, sans écho.
         L'identifiant de projet est validé contre ``PROJECT_PATTERN`` : une clé
         liée à un identifiant hors contrat ne pourrait jamais matcher une
         requête et provoquerait un 403 silencieux à chaque appel.
@@ -1864,26 +1872,21 @@ _app_lock = Lock()
 
 
 def get_app() -> FastAPI:
-    """Retourne l'instance lazy du serveur (construite au premier accès).
+    """Fabrique explicite du serveur (appelée par `run_server`, jamais à l'import).
 
-    Remarque LOW n°2 : aucun effet disque à l'import — ``import
-    heimdall.vault.app`` ne résout aucun backend, ne génère ni cipher ni
-    pepper et n'appelle jamais ``init_db``. La construction (backend SQLite,
-    ``vault.db`` 600, pepper éphémère) n'a lieu qu'au premier accès à
-    ``heimdall.vault.app.app`` (uvicorn ``heimdall.vault.app:app`` ou
-    ``get_app()``), donc au démarrage du serveur, jamais à l'import.
+    Garantie sans effet disque à l'import : ``import heimdall.vault.app`` ne
+    résout aucun backend, ne génère ni cipher ni pepper et n'appelle jamais
+    ``init_db``. Il n'existe volontairement AUCUNE variable module ``app`` :
+    `from heimdall.vault.app import app` lève `ImportError` (aucune création
+    accidentelle de `vault.db` par un import). La construction (backend SQLite,
+    ``vault.db`` 600, pepper éphémère) n'a lieu qu'à l'appel explicite de
+    cette factory, donc au démarrage du serveur via `run_server`.
     """
     if "app" not in _APP_HOLDER:
         with _app_lock:
             if "app" not in _APP_HOLDER:
                 _APP_HOLDER["app"] = create_app()
     return _APP_HOLDER["app"]
-
-
-def __getattr__(name: str) -> Any:
-    if name == "app":
-        return get_app()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
@@ -1918,7 +1921,7 @@ def run_server() -> None:
             "Le HTTP en clair reste réservé au développement local."
         )
     uvicorn.run(
-        "heimdall.vault.app:app",
+        get_app(),
         host=server_settings.host,
         port=server_settings.port,
         # Épinglé par défaut : le backend mémoire est strictement mono-processus.
@@ -1953,7 +1956,6 @@ __all__ = [
     "UnauthorizedError",
     "UnavailableError",
     "VaultSettings",
-    "app",  # noqa: F822 -- fourni par __getattr__ (PEP 562, lazy sans effet disque)
     "create_app",
     "generate_api_key",
     "get_app",

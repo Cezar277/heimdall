@@ -30,13 +30,14 @@ from heimdall.vault.crypto import (
 )
 from heimdall.vault.database import (
     DatabaseUnavailableError,
+    count_secrets,
     create_api_key,
     db_session,
     ensure_project,
     init_db,
 )
 from heimdall.vault.ratelimit import RateLimiter
-from heimdall.vault.store import InMemorySecretStore, SqliteSecretStore
+from heimdall.vault.store import InMemorySecretStore, QuotaExceededError, SqliteSecretStore
 
 
 class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
@@ -581,37 +582,123 @@ class VaultSecretValueHygieneTests(unittest.TestCase):
 
 
 class VaultImportSideEffectTests(unittest.TestCase):
+    def _production_env_without_secrets(self, home: str, xdg: str) -> dict[str, str]:
+        """Environnement production isolé, sans pepper/KEK, user-site préservé."""
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("HEIMDALL_VAULT_")
+        }
+        env["HEIMDALL_ENV"] = "production"
+        env["HOME"] = home
+        env["XDG_DATA_HOME"] = xdg
+        # HOME override déplace le user-site (``~/.local``) : sans ceci,
+        # une install ``--user`` (ex. CI sous ``/home/runner/.local``)
+        # devient invisible et le test échoue en faux rouge
+        # (``ModuleNotFoundError: uvicorn``). On fige donc la vraie base
+        # utilisateur du parent, indépendante de HOME.
+        env["PYTHONUSERBASE"] = site.getuserbase()
+        return env
+
+    def _run_isolated(self, code: str, env: dict[str, str]) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(  # noqa: S603
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+
     def test_plain_import_creates_no_file_even_in_production(self) -> None:
-        """Verrouille LOW n°2 : ``import heimdall.vault.app`` sans accès à ``app``.
+        """Verrouille la factory explicite : l'import seul ne crée rien.
 
         Même avec ``HEIMDALL_ENV=production`` (backend SQLite par défaut),
         le simple import ne crée ni répertoire ni ``vault.db`` et ne lève
-        pas (le fail-closed n'a lieu qu'au premier accès à ``app``).
+        pas (le fail-closed n'a lieu qu'à l'appel explicite de ``get_app()``).
         """
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as xdg:
-            env = {
-                key: value
-                for key, value in os.environ.items()
-                if not key.startswith("HEIMDALL_VAULT_")
-            }
-            env["HEIMDALL_ENV"] = "production"
-            env["HOME"] = home
-            env["XDG_DATA_HOME"] = xdg
-            # HOME override déplace le user-site (``~/.local``) : sans ceci,
-            # une install ``--user`` (ex. CI sous ``/home/runner/.local``)
-            # devient invisible et le test échoue en faux rouge
-            # (``ModuleNotFoundError: uvicorn``). On fige donc la vraie base
-            # utilisateur du parent, indépendante de HOME.
-            env["PYTHONUSERBASE"] = site.getuserbase()
+            env = self._production_env_without_secrets(home, xdg)
             code = "import heimdall.vault.app; print('import-ok')"
-            result = subprocess.run(  # noqa: S603
-                [sys.executable, "-c", code],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=False,
-            )
+            result = self._run_isolated(code, env)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("import-ok", result.stdout)
             self.assertEqual(list(Path(xdg).rglob("*")), [])
             self.assertEqual(list(Path(home).rglob("*")), [])
+
+    def test_from_import_app_fails_without_disk_effect(self) -> None:
+        """``from heimdall.vault.app import app`` n'existe plus : ImportError sans effet disque.
+
+        La factory est explicite (`get_app()`) : aucun import, même attributif,
+        ne doit créer `vault.db` ni générer de pepper.
+        """
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as xdg:
+            env = self._production_env_without_secrets(home, xdg)
+            code = "from heimdall.vault.app import app"
+            result = self._run_isolated(code, env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("ImportError", result.stderr)
+            self.assertNotIn("vault.db", result.stderr)
+            self.assertEqual(list(Path(xdg).rglob("*")), [])
+            self.assertEqual(list(Path(home).rglob("*")), [])
+
+    def test_get_app_is_fail_closed_before_any_disk_effect(self) -> None:
+        """`get_app()` en production sans pepper/KEK échoue AVANT tout effet disque."""
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as xdg:
+            env = self._production_env_without_secrets(home, xdg)
+            code = "from heimdall.vault.app import get_app; get_app()"
+            result = self._run_isolated(code, env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("ValidationError", result.stderr)
+            self.assertEqual(list(Path(xdg).rglob("*")), [])
+            self.assertEqual(list(Path(home).rglob("*")), [])
+
+
+def test_sqlite_quota_never_exceeded_with_two_workers_tmp_path(tmp_path: Path) -> None:
+    """Pin suggestion revue : deux stores, même fichier `tmp_path`, `max_secrets=2`.
+
+    Verrouille le quota atomique inter-workers (`BEGIN IMMEDIATE`) : jamais de
+    dépassement, troisième création refusée sur les deux stores, sans corruption.
+    """
+    db_path = tmp_path / "vault.db"
+    cipher = VaultCipher.generate()
+    max_secrets = 2
+    store_one = SqliteSecretStore(
+        db_path, cipher, max_secrets=max_secrets, max_secrets_per_project=10
+    )
+    store_two = SqliteSecretStore(
+        db_path, cipher, max_secrets=max_secrets, max_secrets_per_project=10
+    )
+    start = threading.Barrier(2)
+    created: list[str] = []
+    refused: list[Exception] = []
+
+    def create_in_worker(store: SqliteSecretStore, name: str) -> None:
+        start.wait(timeout=5)
+        try:
+            asyncio.run(store.create(project="demo", env="dev", name=name, value="v"))
+            created.append(name)
+        except Exception as exc:  # pragma: no cover - diagnostic
+            refused.append(exc)
+
+    threads = [
+        threading.Thread(target=create_in_worker, args=(store_one, "TMP_PATH_A")),
+        threading.Thread(target=create_in_worker, args=(store_two, "TMP_PATH_B")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not [thread.name for thread in threads if thread.is_alive()]
+    assert refused == []
+    assert len(created) == max_secrets
+    with db_session(db_path) as conn:
+        assert count_secrets(conn) == max_secrets
+    for store in (store_one, store_two):
+        try:
+            asyncio.run(store.create("demo", "dev", "TMP_PATH_C", "v"))
+        except QuotaExceededError:
+            pass
+        else:
+            raise AssertionError("quota non appliqué après saturation")
+    with db_session(db_path) as conn:
+        assert count_secrets(conn) == max_secrets
