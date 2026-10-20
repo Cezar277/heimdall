@@ -16,8 +16,11 @@ payload: list[dict[str, object]] = find_candidates(".")  # contrat #14
 ```
 
 `Scanner` accepte un répertoire ou un fichier régulier explicite. `root` est
-résolu une fois ; chaque fichier est revérifié à l'usage (identité du
-descripteur, chemin résolu sous la racine, refus des liens symboliques).
+résolu une fois, **sans suivre de lien symbolique** : la racine elle-même et
+chacun de ses ancêtres sont vérifiés par `lstat`, et un lien dans ce chemin
+lève `ScanError` (la cible n'est pas lue à la place de la racine). Chaque
+fichier est ensuite revérifié à l'usage (identité du descripteur, chemin résolu
+sous la racine, refus des liens symboliques).
 
 Un Finding contient exactement : `file`, `line`, `type`, `entropy`,
 `snippet_hash`, `status` (`detecte`) et `source` (`regex`). **La valeur brute
@@ -31,6 +34,8 @@ n'est jamais conservée** : seule une empreinte HMAC-SHA-256 est produite.
 | `aws_secret_access_key` | `aws` | affectation `aws_secret_access_key` + 40 caractères |
 | `stripe_secret_key` | `stripe` | `sk_live_`/`sk_test_`/`rk_live_`/`rk_test_` + charge |
 | `slack_token` | `slack` | `xoxb-`, `xoxa-`, `xoxp-`, `xoxr-`, `xoxs-` |
+| `slack_app_token` | `slack` | `xapp-` (app-level), `xwfp-` (workflow) |
+| `slack_rotating_token` | `slack` | `xoxe.` (jeton app-level rotatif) |
 | `github_classic_pat` | `pat` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` + 36 caractères |
 | `github_fine_grained_pat` | `pat` | `github_pat_` + charge |
 | `jwt` | `jwt` | trois segments base64url, en-tête `eyJ`, charge ≤ 64 Kio |
@@ -39,6 +44,20 @@ n'est jamais conservée** : seule une empreinte HMAC-SHA-256 est produite.
 Les motifs sont linéaires et bornés : pas de quantification imbriquée, pas de
 `.*`, bornes explicites pour les charges. Les tests anti-ReDoS exécutent le
 scanner sur des lignes proches de 1 Mio (`tests/test_scanner_detect.py`).
+
+Les familles Slack couvertes sont celles publiées par Slack
+([docs.slack.dev,Tokens](https://docs.slack.dev/authentication/tokens),
+consultées le 2026-10-20) : `xoxb-` (bot), `xoxp-` (user), `xapp-` (app-level),
+`xwfp-` (workflow), `xoxe.` (app-level rotatif) et les familles historiques
+`xoxa-`, `xoxr-`, `xoxs-`. Une famille ajoutée ultérieurement par Slack ne
+serait pas couverte avant #23/#24.
+
+**Fenêtre multi-ligne bornée.** Chaque ligne est analysée seule, puis
+jointure avec la ligne suivante (sans séparateur) si la fenêtre totale ne
+dépasse pas **4 Kio**. Un secret coupé par un retour à la ligne
+(`aws_secret_access_key =` puis la valeur à la ligne suivante) est donc
+détecté, et le Finding porte la ligne où la correspondance commence. Au-delà
+de 4 Kio, la jointure n'est pas faite : c'est une limite documentée.
 
 Une ligne peut produire plusieurs Findings de types différents. Deux **valeurs
 distinctes** du même type sur la même ligne produisent **deux** Findings
@@ -57,7 +76,8 @@ Politique explicite, jamais une heuristique :
   `target`, caches Python ;
 - lockfiles : suffixe `.lock`, `package-lock.json`, `yarn.lock`,
   `pnpm-lock.yaml`, `go.sum`, `bun.lockb` ;
-- binaires : extension connue ou signature magique connue (ELF, PNG, PDF, ZIP…).
+- binaires : extension connue, ou signature magique connue **et** contenu
+  majoritairement binaire (ELF, PNG, PDF, ZIP…).
 
 Un répertoire nommé `env/` n'est **pas** exclu : seuls les environnements
 virtuels connus le sont. Un dossier de sources `env/` est donc scanné.
@@ -75,11 +95,15 @@ Les fichiers texte sont décodés, pas ignorés :
 | UTF-8 (avec ou sans BOM) | décodage strict avec BOM, remplacement sans BOM |
 | UTF-16 / UTF-32 avec BOM | décodage strict, fichier scanné |
 | UTF-16 / UTF-32 sans BOM | heuristique bornée (proportion ASCII puis caractères imprimables), fichier scanné |
-| contenu NUL non décodable et sans signature binaire | `ScanError` (fail-closed) |
-| binaire à extension connue ou à signature magique | ignoré par politique |
+| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | ignoré par politique |
+| signature binaire suivie de texte clair | `ScanError` (fail-closed) |
+| contenu NUL non décodable | `ScanError` (fail-closed) |
 
 Un secret encodé en UTF-16/UTF-32 est donc détecté ; il n'est plus sauté
-silencieusement.
+silencieusement. Quatre octets de signature binaire (`PK\x03\x04`, en-tête
+PNG…) ne suffisent plus à faire ignorer un fichier : la signature n'est retenue
+que si le contenu est réellement majoritairement binaire, sinon le fichier est
+refusé (`ScanError`) plutôt que sauté.
 
 ## Comportement fail-closed
 
@@ -89,12 +113,14 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | Situation | Résultat |
 | --- | --- |
 | racine absente, non régulière ou illisible | `ScanError` |
+| racine ou fichier unique symlinké (ou ancêtre symlinké) | `ScanError` |
 | fichier non régulier (FIFO, device) | `ScanError` |
 | fichier > 1 Mio | `ScanError` |
 | fichier modifié pendant la lecture | `ScanError` |
 | nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` |
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
-| contenu NUL non décodable (hors binaire connu) | `ScanError` |
+| clé HMAC demandée avec `..` dans le chemin | `ScanError` |
+| contenu NUL non décodable (hors binaire réellement binaire) | `ScanError` |
 | fichier exclu ou binaire connu | ignoré par politique |
 | scan réussi sans signature | liste vide (réellement propre) |
 
@@ -110,7 +136,9 @@ jamais 0 ou 1.
   (`$HEIMDALL_SNIPPET_HMAC_KEY` en hexadécimal ou fichier XDG en `0600`). Le
   fichier doit être un fichier régulier, appartenir à l'utilisateur courant et
   n'être lisible par personne d'autre ; son répertoire parent est durci en
-  `0700` et un parent symlink est refusé.
+  `0700` et un parent symlink est refusé. Un chemin de clé contenant `..`
+  (`$HEIMDALL_SNIPPET_HMAC_KEY_FILE`) est refusé : le fichier réellement
+  utilisé ne doit pas pouvoir différer du fichier demandé.
 - Si la clé ne peut être ni lue ni créée (stockage indisponible, permissions
   trop larges, propriétaire étranger), le scan lève `ScanError` : **aucune clé
   éphémère** ne vient masquer la panne, et les empreintes restent stables
@@ -131,6 +159,13 @@ jamais 0 ou 1.
 - La charge d'un JWT est bornée à 64 Kio et l'en-tête à 1 Kio : un jeton
   conforme est détecté, un jeton hors de ces bornes ne l'est pas. Les autres
   préfixes AWS (au-delà de `AKIA`/`ASIA`/`ABIA`/`ACCA`) ne sont pas couverts.
+- La jointure multi-ligne est bornée à 4 Kio : un secret coupé par un retour
+  à la ligne n'est recherché que si la fenêtre des deux lignes tient dans
+  cette borne. Au-delà, la coupure n'est pas détectée.
+- Seules les familles de jetons Slack publiées par Slack sont couvertes
+  (`xoxb-`, `xoxp-`, `xapp-`, `xwfp-`, `xoxe.` et les historiques `xoxa-`,
+  `xoxr-`, `xoxs-`) : une famille ajoutée par Slack n'est pas couverte avant
+  #23/#24.
 - La détection PEM porte sur la ligne d'en-tête ; le corps multiligne n'est
   pas hashé. Le Finding ne fuit donc aucune valeur, mais deux clés différentes
   partagent l'empreinte de leur en-tête.

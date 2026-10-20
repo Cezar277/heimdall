@@ -276,9 +276,14 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   Durcissement post-relecture : deux valeurs distinctes du même type sur une
   même ligne produisent deux Findings (aucun candidat perdu) ; les fichiers
   UTF-16/UTF-32 sont décodés et scannés, un contenu NUL non décodable lève
-  `ScanError` au lieu d'être ignoré ; la clé HMAC locale est durcie (fichier
-  `0600`, propriétaire vérifié, parent `0700`, parent symlink refusé) et son
-  indisponibilité lève `ScanError` au lieu d'une clé éphémère.
+  `ScanError` au lieu d'être ignoré ; une racine ou un fichier unique
+  symlinké est refusé au lieu d'être suivi ; une signature binaire ne suffit
+  pas à faire ignorer un fichier dont le contenu est majoritairement textuel
+  (le refus est alors explicite) ; un secret coupé par un retour à la ligne
+  est recherché dans une fenêtre multi-ligne bornée à 4 Kio ; la clé HMAC
+  locale est durcie (fichier `0600`, propriétaire vérifié, parent `0700`,
+  parent symlink refusé, `..` refusé) et son indisponibilité lève `ScanError`
+  au lieu d'une clé éphémère.
   Preuves : `tests/test_scanner_detect.py`,
   `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean` et
   la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
