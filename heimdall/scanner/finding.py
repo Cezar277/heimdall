@@ -15,7 +15,6 @@ pas dans un journal.
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -123,9 +122,13 @@ def _check_type(value: object) -> None:
 def _check_entropy(value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise InvalidFinding("Finding non conforme au contrat v1 : champ entropy")
-    # NaN et infinis sont refusés : le schéma ne sait pas les exprimer, et
-    # `json.dumps` en produirait un « NaN » que JSON interdit.
-    if not math.isfinite(value) or not 0.0 <= value <= MAX_ENTROPY:
+    # La borne est vérifiée **avant** toute conversion en flottant : un entier
+    # énorme (10**1000) ferait échouer `math.isfinite` par OverflowError, et
+    # le refus doit rester une erreur de contrat, pas une exception imprévue.
+    # La comparaison rejette aussi NaN et les infinis (toute comparaison avec
+    # NaN est fausse) : NaN n'est pas du JSON, `json.dumps` n'en produirait pas
+    # un document valide.
+    if not 0.0 <= value <= MAX_ENTROPY:
         raise InvalidFinding("Finding non conforme au contrat v1 : champ entropy")
 
 

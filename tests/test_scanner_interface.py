@@ -305,6 +305,15 @@ def test_non_object_and_non_string_inputs_are_refused():
         FileTarget(path="src/app.py", text=42)  # type: ignore[arg-type]
 
 
+def test_out_of_range_numbers_raise_the_contract_error_not_an_accident():
+    """Un nombre hors bornes est une erreur de contrat, pas une OverflowError."""
+    with pytest.raises(InvalidFinding):
+        _finding(entropy=10**1000)
+    # `line` n'a pas de borne haute au contrat (#14) : un grand numéro de
+    # ligne est accepté, il reste un entier positif.
+    assert _finding(line=10**1000).line == 10**1000
+
+
 # --- Cibles d'analyse ---
 
 
