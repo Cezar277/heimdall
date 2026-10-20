@@ -255,5 +255,129 @@ class ApiKeyRegistryTests(unittest.TestCase):
             vault_auth.validate_api_key_pepper("trop-court")
 
 
+class VaultKeyCliTests(unittest.IsolatedAsyncioTestCase):
+    """CLI `heimdall vault key` : émission, listage, révocation."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "vault.db"
+        self.runner = CliRunner()
+        self._pepper_env = os.environ.get("HEIMDALL_VAULT_API_KEY_PEPPER")
+        os.environ["HEIMDALL_VAULT_API_KEY_PEPPER"] = PEPPER
+
+    def tearDown(self) -> None:
+        if self._pepper_env is None:
+            os.environ.pop("HEIMDALL_VAULT_API_KEY_PEPPER", None)
+        else:
+            os.environ["HEIMDALL_VAULT_API_KEY_PEPPER"] = self._pepper_env
+        self._tmp.cleanup()
+
+    def _create(self) -> str:
+        result = self.runner.invoke(
+            cli_app,
+            ["vault", "key", "create", "--project", "demo", "--db-path", str(self.db_path)],
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        return result.output
+
+    @staticmethod
+    def _extract_key(output: str) -> str:
+        """Extrait la clé affichée : ligne suivant l'en-tête d'émission."""
+        lines = output.splitlines()
+        for index, line in enumerate(lines):
+            if line.startswith("Clé API de projet émise"):
+                return lines[index + 1].strip()
+        raise AssertionError("Clé API non affichée")
+
+    def test_create_displays_the_key_once_and_stores_only_the_hash(self) -> None:
+        """La clé est affichée une fois ; la base ne contient que son haché."""
+        output = self._create()
+        raw_key = self._extract_key(output)
+        self.assertGreaterEqual(len(raw_key), 43)
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT id, key_hash FROM api_keys").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertNotEqual(rows[0][1], raw_key)
+        self.assertNotIn(raw_key, rows[0][1])
+
+    def test_list_shows_metadata_only(self) -> None:
+        """Le listage n'expose ni la clé brute ni son empreinte."""
+        output = self._create()
+        raw_key = self._extract_key(output)
+        result = self.runner.invoke(
+            cli_app, ["vault", "key", "list", "--db-path", str(self.db_path)]
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn(raw_key, result.output)
+        self.assertNotIn(vault_auth.hash_project_api_key(raw_key, PEPPER), result.output)
+        self.assertIn("projet=demo", result.output)
+
+    async def test_revoke_stops_the_key_from_authenticating(self) -> None:
+        """Après révocation, la clé n'authentifie plus (401 générique)."""
+        output = self._create()
+        raw_key = self._extract_key(output)
+        self.assertGreaterEqual(len(raw_key), 43)
+        key_id = next(
+            line for line in output.splitlines() if line.startswith("Identifiant")
+        ).split(":", 1)[1].strip()
+        result = self.runner.invoke(
+            cli_app,
+            ["vault", "key", "revoke", key_id, "--db-path", str(self.db_path)],
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        with sqlite3.connect(self.db_path) as conn:
+            revoked_at = conn.execute(
+                "SELECT revoked_at FROM api_keys WHERE id = ?", (key_id,)
+            ).fetchone()[0]
+        self.assertIsNotNone(revoked_at)
+
+        # Le serveur configuré sur la même base refuse la clé révoquée.
+        target = create_app(
+            VaultSettings(
+                db_path=str(self.db_path),
+                storage_backend="sqlite",
+                kek=generate_encryption_key(),
+                api_key_pepper=PEPPER,
+            )
+        )
+        transport = ASGITransport(app=target, client=("127.0.0.1", 54321))
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://127.0.0.1:8443",
+            headers={"X-Heimdall-API-Key": raw_key},
+        ) as client:
+            response = await client.get("/api/v1/secrets/demo/dev/MY_KEY")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), _UNAUTHORIZED_BODY)
+        self.assertNotIn(raw_key, response.text)
+
+    def test_create_without_explicit_pepper_fails_closed(self) -> None:
+        """Sans pepper explicite, la CLI refuse d'émettre une clé morte."""
+        os.environ.pop("HEIMDALL_VAULT_API_KEY_PEPPER", None)
+        result = self.runner.invoke(
+            cli_app,
+            ["vault", "key", "create", "--project", "demo", "--db-path", str(self.db_path)],
+        )
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("HEIMDALL_VAULT_API_KEY_PEPPER", result.output)
+
+    def test_relative_db_path_is_refused(self) -> None:
+        """Un chemin relatif est refusé (dépend du répertoire courant)."""
+        result = self.runner.invoke(
+            cli_app, ["vault", "key", "create", "--project", "demo", "--db-path", "relatif.db"]
+        )
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("absolu", result.output)
+
+    def test_memory_db_is_refused(self) -> None:
+        """Le mode ':memory:' est interdit en CLI (base éphémère)."""
+        result = self.runner.invoke(
+            cli_app,
+            ["vault", "key", "create", "--project", "demo", "--db-path", ":memory:"],
+        )
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn(":memory:", result.output)
+
+
 if __name__ == "__main__":
     unittest.main()
