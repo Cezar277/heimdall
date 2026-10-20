@@ -303,6 +303,11 @@ def _validate_raw_api_key(raw_key: str) -> str:
     diversité équivalente. La longueur seule ne suffit pas : ``"a" * 43``
     serait brute-forçable hors ligne si la base d'empreintes et le pepper
     fuyaient. Le message reste générique et ne reflète jamais la clé.
+    NOTE : ce garde-fou ne pinnera qu'un refus de motifs triviaux
+    (``len(set(...)) < 12``), pas une garantie d'entropie — un motif
+    prévisible à 12 caractères distincts reste accepté ici ; l'exigence
+    réelle d'entropie (``generate_api_key()`` côté opérateur) est suivie
+    en #64.
     """
     if (
         not isinstance(raw_key, str)
