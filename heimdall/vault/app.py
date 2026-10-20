@@ -90,7 +90,7 @@ from heimdall.vault.database import (
     resolve_db_path,
     validate_db_path,
 )
-from heimdall.vault.ratelimit import RateLimiter
+from heimdall.vault.ratelimit import RateLimiter, SqliteRateLimiter
 from heimdall.vault.store import (
     InMemorySecretStore,
     QuotaExceededError,
@@ -563,6 +563,23 @@ class VaultSettings(BaseSettings):
         default=str(DEFAULT_DB_PATH),
         description="Chemin du fichier de base de données SQLite.",
     )
+    ssl_certfile: str | None = Field(
+        default=None,
+        repr=False,
+        description=(
+            "Certificat TLS PEM (chaîne complète) pour le lanceur uvicorn. "
+            "Doit contenir le SAN IP 127.0.0.1 en développement. "
+            "Obligatoire en production avec ssl_keyfile (fail-closed)."
+        ),
+    )
+    ssl_keyfile: str | None = Field(
+        default=None,
+        repr=False,
+        description=(
+            "Clé privée TLS PEM associée à ssl_certfile. "
+            "Obligatoire en production avec ssl_certfile (fail-closed)."
+        ),
+    )
 
     @field_validator("api_key_pepper")
     @classmethod
@@ -699,6 +716,30 @@ class VaultSettings(BaseSettings):
             return validate_db_path(value)
         except IsADirectoryError as exc:
             raise ValueError(str(exc)) from exc
+
+    @field_validator("ssl_certfile", "ssl_keyfile")
+    @classmethod
+    def validate_tls_file(cls, value: str | None) -> str | None:
+        """Valide un fichier TLS : absolu, existant, régulier, sans espace de bord."""
+        if value is None:
+            return None
+        if not value or value != value.strip():
+            raise ValueError("Le chemin TLS ne doit pas être vide ni comporter d'espaces de bord.")
+        path = Path(value)
+        if not path.is_absolute():
+            raise ValueError("Le chemin TLS doit être absolu.")
+        if not path.is_file():
+            raise ValueError("Le fichier TLS est introuvable ou n'est pas un fichier régulier.")
+        return str(path)
+
+    @model_validator(mode="after")
+    def validate_tls_pair(self) -> "VaultSettings":
+        """Certificat et clé TLS vont toujours ensemble (fail-closed)."""
+        if (self.ssl_certfile is None) != (self.ssl_keyfile is None):
+            raise ValueError(
+                "Les options TLS ssl_certfile et ssl_keyfile doivent être fournies ensemble."
+            )
+        return self
 
     @field_validator("host")
     @classmethod
@@ -875,12 +916,19 @@ def _register_middleware(app: FastAPI) -> None:
     # Le rate-limiting est enregistré avant le middleware loopback : ce dernier,
     # ajouté en dernier, reste le plus externe et rejette les pairs non loopback
     # avant toute consommation de budget ou tout accès à la base.
-    app.state.rate_limiter = RateLimiter(
-        per_key=app.state.settings.rate_limit_per_key,
-        per_peer=app.state.settings.rate_limit_per_peer,
-        global_limit=app.state.settings.rate_limit_global,
-        window_seconds=app.state.settings.rate_limit_window_seconds,
-    )
+    limiter_kwargs = {
+        "per_key": app.state.settings.rate_limit_per_key,
+        "per_peer": app.state.settings.rate_limit_per_peer,
+        "global_limit": app.state.settings.rate_limit_global,
+        "window_seconds": app.state.settings.rate_limit_window_seconds,
+    }
+    if app.state.storage_backend == "sqlite":
+        # Backend persistant : les buckets sont partagés entre workers, donc
+        # une limite unique (jamais N × la limite avec workers > 1).
+        app.state.rate_limiter = SqliteRateLimiter(app.state.db_path, **limiter_kwargs)
+    else:
+        # Mode mémoire : strictement mono-processus (workers=1 documenté).
+        app.state.rate_limiter = RateLimiter(**limiter_kwargs)
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
@@ -893,7 +941,10 @@ def _register_middleware(app: FastAPI) -> None:
         ``verify_api_key`` (``_find_api_key_project_cached``) : le résultat est
         mémoïsé dans la requête et réutilisé par l'authentification (un seul
         full-scan par requête, ticket #65) ; l'existence d'une clé n'est pas
-        observable par le temps de réponse du middleware.
+        observable par le temps de réponse du middleware. Avec le backend SQLite,
+        ``SqliteRateLimiter`` partage les buckets entre workers (transaction
+        ``BEGIN IMMEDIATE``) : la limite n'est jamais multipliée par le nombre
+        de processus. Le mode mémoire reste mono-processus (dev/test).
         """
         settings: VaultSettings = request.app.state.settings
         peer = request.client.host if request.client and request.client.host else "unknown"
@@ -1279,6 +1330,42 @@ def _persist_api_key_hash(app: FastAPI, key_hash: str, project_id: str) -> None:
             create_api_key(conn, f"key_{uuid4().hex}", project_id, key_hash)
 
 
+def _configure_secret_store(
+    app: FastAPI,
+    settings: VaultSettings,
+    resolved_db: Path,
+    secret_store: InMemorySecretStore | SqliteSecretStore | None,
+) -> Literal["memory", "sqlite"]:
+    """Résout et attache le store, sans jamais laisser fuiter le backend mémoire en prod."""
+    resolved_backend = _resolve_storage_backend(settings)
+    if secret_store is None:
+        cipher = _resolve_vault_cipher(settings, resolved_backend)
+        if resolved_backend == "sqlite":
+            app.state.secret_store = SqliteSecretStore(resolved_db, cipher)
+        else:
+            app.state.secret_store = InMemorySecretStore(cipher=cipher)
+        logger.debug("Backend de stockage des secrets : %s", resolved_backend)
+        return resolved_backend
+
+    if _heimdall_env_mode() in _PRODUCTION_ENV_MODES and isinstance(
+        secret_store, InMemorySecretStore
+    ):
+        # Défense en profondeur : même un store explicite ne doit jamais
+        # contourner l'interdiction du backend mémoire en production.
+        raise ValueError(
+            "Un InMemorySecretStore explicite est interdit en production "
+            "(HEIMDALL_ENV=production/prod) : utiliser SqliteSecretStore "
+            "avec une KEK persistante."
+        )
+    app.state.secret_store = secret_store
+    if isinstance(secret_store, SqliteSecretStore):
+        if isinstance(secret_store.db_path, Path):
+            # Aligner l'authentification sur la même base que le store explicite.
+            app.state.db_path = secret_store.db_path
+        return "sqlite"
+    return "memory"
+
+
 def create_app(
     settings: VaultSettings | None = None,
     secret_store: InMemorySecretStore | SqliteSecretStore | None = None,
@@ -1320,22 +1407,9 @@ def create_app(
     app.state.db_path = resolved_db
     logger.debug("Base de données SQLite configurée : %s", resolved_db.name)
 
-    resolved_backend = _resolve_storage_backend(effective_settings)
-    if secret_store is None:
-        cipher = _resolve_vault_cipher(effective_settings, resolved_backend)
-        if resolved_backend == "sqlite":
-            app.state.secret_store = SqliteSecretStore(resolved_db, cipher)
-        else:
-            app.state.secret_store = InMemorySecretStore(cipher=cipher)
-        logger.debug("Backend de stockage des secrets : %s", resolved_backend)
-    else:
-        app.state.secret_store = secret_store
-        if isinstance(secret_store, SqliteSecretStore):
-            resolved_backend = "sqlite"
-            if isinstance(secret_store.db_path, Path):
-                # Aligner l'authentification sur la même base que le store explicite.
-                app.state.db_path = secret_store.db_path
-    app.state.storage_backend = resolved_backend
+    app.state.storage_backend = _configure_secret_store(
+        app, effective_settings, resolved_db, secret_store
+    )
 
     if api_key_hashes is not None and api_keys is not None:
         raise ValueError(
@@ -1389,28 +1463,40 @@ app = create_app()
 def run_server() -> None:
     """Démarre le serveur Vault avec les paramètres validés (localhost uniquement).
 
-    NOTE DE SÉCURITÉ (ticket #25) :
-    Ce montage HTTP en clair est strictement réservé au squelette minimal et à la
-    route /api/v1/health sur la boucle locale. Ne jamais réutiliser ce montage HTTP
-    au-delà du squelette : le TLS obligatoire avec SAN-IP
-    (https://127.0.0.1:8443) reste à brancher dans son ticket dédié.
+    NOTE TLS (ticket #25) :
+    En production (``HEIMDALL_ENV=production/prod``), le lanceur refuse de
+    démarrer sans ``HEIMDALL_VAULT_SSL_CERTFILE`` et
+    ``HEIMDALL_VAULT_SSL_KEYFILE`` : le HTTP en clair reste réservé au
+    développement local. Le certificat doit porter le SAN IP ``127.0.0.1``
+    pour ``https://127.0.0.1:8443``. La révocation de clés reste suivie dans
+    son ticket dédié.
 
-    NOTE CONCURRENCE : Le stockage SQLite chiffré (#26, #62) et les empreintes de
-    clés API sont partagés entre workers. Le rate-limiter reste toutefois
-    mono-processus : le serveur épingle workers=1 (le lanceur ignore
-    WEB_CONCURRENCY) afin de ne pas multiplier la limite effective par le nombre
-    de workers. Un backend de rate-limiting partagé pourra lever cette
-    contrainte (#65).
+    NOTE CONCURRENCE : Le stockage SQLite chiffré (#26, #62), les empreintes de
+    clés API et, avec ce même backend, les buckets de rate-limiting (#65) sont
+    partagés entre workers. Le serveur épingle toutefois workers=1 (le lanceur
+    ignore WEB_CONCURRENCY) : le mode mémoire reste strictement mono-processus
+    et cette contrainte évite tout écart de configuration. Le backend SQLite
+    peut être répliqué sans multiplier la limite de débit.
     """
     server_settings = get_settings()
+    if _heimdall_env_mode() in _PRODUCTION_ENV_MODES and (
+        server_settings.ssl_certfile is None or server_settings.ssl_keyfile is None
+    ):
+        raise ValueError(
+            "TLS obligatoire en production (HEIMDALL_ENV=production/prod) : fournir "
+            "HEIMDALL_VAULT_SSL_CERTFILE et HEIMDALL_VAULT_SSL_KEYFILE. "
+            "Le HTTP en clair reste réservé au développement local."
+        )
     uvicorn.run(
         "heimdall.vault.app:app",
         host=server_settings.host,
         port=server_settings.port,
-        # Épinglé : le rate-limiter est en mémoire par processus (#65). Laisser
-        # uvicorn dériver le nombre de workers de WEB_CONCURRENCY multiplierait
-        # la limite effective (N workers = N × quota) sans backend partagé.
+        # Épinglé par défaut : le backend mémoire est strictement mono-processus.
+        # Le backend SQLite partage ses buckets (#65), mais workers>1 reste une
+        # décision d'exploitation explicite hors de ce lanceur minimal.
         workers=1,
+        ssl_certfile=server_settings.ssl_certfile,
+        ssl_keyfile=server_settings.ssl_keyfile,
         proxy_headers=False,
         forwarded_allow_ips="",
         server_header=False,

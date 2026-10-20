@@ -23,7 +23,6 @@ import time
 import unittest
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import uvicorn  # type: ignore[import-untyped]
@@ -33,7 +32,6 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ValidationError
 
 import heimdall.vault.app as vault_app_module
-import heimdall.vault.store as vault_store_module
 from heimdall.vault.app import (
     BadRequestError,
     ConflictError,
@@ -56,6 +54,7 @@ from heimdall.vault.app import (
 )
 from heimdall.vault.crypto import VaultCipher, generate_encryption_key
 from heimdall.vault.database import count_secrets, db_session
+from heimdall.vault.ratelimit import SqliteRateLimiter
 from heimdall.vault.store import SqliteSecretStore
 
 
@@ -469,6 +468,36 @@ class VaultSettingsTests(unittest.TestCase):
         valid = VaultSettings(port=443)
         self.assertEqual(valid.port, 443)
 
+    def test_tls_settings_require_absolute_existing_pair(self) -> None:
+        """TLS : certificat et clé vont ensemble, en chemins absolus existants."""
+        with tempfile.TemporaryDirectory() as tmp:
+            certfile = Path(tmp) / "server.crt"
+            keyfile = Path(tmp) / "server.key"
+            certfile.write_text("dummy-cert", encoding="utf-8")
+            keyfile.write_text("dummy-key", encoding="utf-8")
+
+            valid = VaultSettings(
+                ssl_certfile=str(certfile),
+                ssl_keyfile=str(keyfile),
+            )
+            self.assertEqual(valid.ssl_certfile, str(certfile))
+            self.assertEqual(valid.ssl_keyfile, str(keyfile))
+
+            with self.assertRaises(ValidationError):
+                VaultSettings(ssl_certfile=str(certfile))
+            with self.assertRaises(ValidationError):
+                VaultSettings(ssl_keyfile=str(keyfile))
+            with self.assertRaises(ValidationError):
+                VaultSettings(
+                    ssl_certfile="relative-server.crt",
+                    ssl_keyfile=str(keyfile),
+                )
+            with self.assertRaises(ValidationError):
+                VaultSettings(
+                    ssl_certfile=str(Path(tmp) / "missing.crt"),
+                    ssl_keyfile=str(keyfile),
+                )
+
     def test_load_settings_from_environment_variables(self) -> None:
         """La configuration doit lire les variables d'environnement préfixées HEIMDALL_VAULT_."""
         env = {
@@ -566,13 +595,64 @@ class VaultSettingsTests(unittest.TestCase):
         self, mock_uvicorn_run: unittest.mock.MagicMock
     ) -> None:
         """run_server configure uvicorn avec anti-spoofing et sans fingerprinting."""
-        run_server()
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "test"}, clear=False):
+            run_server()
         mock_uvicorn_run.assert_called_once_with(
             "heimdall.vault.app:app",
             host="127.0.0.1",
             port=8443,
-            # Un seul worker : le rate-limiter est en mémoire par processus (#65).
+            # Un seul worker : le backend mémoire est mono-processus (#65).
             workers=1,
+            ssl_certfile=None,
+            ssl_keyfile=None,
+            proxy_headers=False,
+            forwarded_allow_ips="",
+            server_header=False,
+            date_header=False,
+        )
+
+    @patch("uvicorn.run")
+    def test_run_server_requires_tls_in_production(
+        self, mock_uvicorn_run: unittest.mock.MagicMock
+    ) -> None:
+        """En production, le lanceur refuse le HTTP en clair (fail-closed)."""
+        settings = VaultSettings(api_key_pepper="p" * 32)
+        with (
+            patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=False),
+            patch("heimdall.vault.app.get_settings", return_value=settings),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                run_server()
+        self.assertIn("TLS", str(ctx.exception))
+        mock_uvicorn_run.assert_not_called()
+
+    @patch("uvicorn.run")
+    def test_run_server_passes_tls_files_in_production(
+        self, mock_uvicorn_run: unittest.mock.MagicMock
+    ) -> None:
+        """Le lanceur transmet certificat et clé TLS à uvicorn en production."""
+        with tempfile.TemporaryDirectory() as tmp:
+            certfile = Path(tmp) / "server.crt"
+            keyfile = Path(tmp) / "server.key"
+            certfile.write_text("dummy-cert", encoding="utf-8")
+            keyfile.write_text("dummy-key", encoding="utf-8")
+            settings = VaultSettings(
+                api_key_pepper="p" * 32,
+                ssl_certfile=str(certfile),
+                ssl_keyfile=str(keyfile),
+            )
+            with (
+                patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=False),
+                patch("heimdall.vault.app.get_settings", return_value=settings),
+            ):
+                run_server()
+        mock_uvicorn_run.assert_called_once_with(
+            "heimdall.vault.app:app",
+            host="127.0.0.1",
+            port=8443,
+            workers=1,
+            ssl_certfile=str(certfile),
+            ssl_keyfile=str(keyfile),
             proxy_headers=False,
             forwarded_allow_ips="",
             server_header=False,
@@ -1146,6 +1226,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             api_key = generate_api_key()
 
             app1 = create_app(settings)
+            self.assertIsInstance(app1.state.rate_limiter, SqliteRateLimiter)
             app1.state.register_api_key(api_key, "demo")
             transport1 = ASGITransport(app=app1, client=("127.0.0.1", 54321))
             async with AsyncClient(
@@ -1296,6 +1377,33 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(unauthorized.status_code, 401)
             limited = await client.get("/api/v1/health")
             self.assertEqual(limited.status_code, 429)
+
+    async def test_sqlite_rate_limiter_is_shared_between_workers(self) -> None:
+        """Deux instances SqliteRateLimiter partagent les buckets (pas de N × limite)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            kwargs = {
+                "per_key": 1,
+                "per_peer": 100,
+                "global_limit": 100,
+                "window_seconds": 60,
+            }
+            worker_one = SqliteRateLimiter(db_path, **kwargs)
+            worker_two = SqliteRateLimiter(db_path, **kwargs)
+
+            allowed, retry = worker_one.check("127.0.0.1", "a" * 64)
+            self.assertTrue(allowed)
+            self.assertEqual(retry, 0)
+
+            allowed, retry = worker_two.check("127.0.0.1", "a" * 64)
+            self.assertFalse(allowed)
+            self.assertGreaterEqual(retry, 1)
+            self.assertLessEqual(retry, 60)
+
+            # Le même bucket est réinitialisé pour tous les workers.
+            worker_two.clear()
+            allowed, _ = worker_one.check("127.0.0.1", "a" * 64)
+            self.assertTrue(allowed)
 
     async def test_post_secret_capacity_exhaustion_returns_429(self) -> None:
         """Le dépassement de quota retourne HTTP 429 trop de requêtes avec Retry-After."""
@@ -1501,54 +1609,43 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     SqliteSecretStore(memory_path, cipher)
                 self.assertIn(":memory:", str(ctx.exception))
 
-    def test_sqlite_secret_store_documents_quota_todo_62(self) -> None:
-        """Le quota SQLite documente son caractère best-effort inter-workers (TODO(#62))."""
+    def test_sqlite_secret_store_documents_atomic_quota(self) -> None:
+        """Le quota SQLite est documenté comme atomique inter-workers."""
         doc = SqliteSecretStore.__doc__ or ""
-        self.assertIn("TODO(#62)", doc)
+        self.assertIn("BEGIN IMMEDIATE", doc)
         self.assertIn("quota", doc)
         self.assertIn("inter-workers", doc)
 
-    async def test_sqlite_quota_best_effort_inter_workers_bounded_overrun(self) -> None:
-        """Quota SQLite best-effort : dépassement borné entre workers, sans corruption.
+    async def test_sqlite_quota_is_atomic_inter_workers(self) -> None:
+        """Quota SQLite atomique : aucun dépassement entre workers concurrents.
 
-        Le verrou asyncio de ``SqliteSecretStore`` est local à l'instance : le
-        couple ``count_secrets()`` puis ``create_secret()`` n'est pas atomique
-        entre processus partageant le même fichier. Ce test force l'entrelacement
-        (barrière dans ``count_secrets``) pour prouver le dépassement documenté
-        (TODO(#62)), puis vérifie que les secrets restent lisibles et que
-        l'unicité SQLite n'est pas contournée.
+        Trois instances ``SqliteSecretStore`` partagent le même fichier et
+        démarrent ensemble avec ``max_secrets=2``. ``BEGIN IMMEDIATE`` acquiert
+        le verrou d'écriture avant ``count_secrets()`` : deux créations
+        réussissent au maximum, la troisième obtient ``QuotaExceededError``.
+        Les valeurs restent déchiffrables et l'unicité SQLite intacte.
         """
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "vault.db"
             cipher = VaultCipher(b"Q" * 32)
             worker_count = 3
+            max_secrets = 2
             stores = [
                 SqliteSecretStore(
                     db_path,
                     cipher,
-                    max_secrets=2,
+                    max_secrets=max_secrets,
                     max_secrets_per_project=10,
                 )
                 for _ in range(worker_count)
             ]
 
-            barrier = threading.Barrier(worker_count)
-            local = threading.local()
-            real_count_secrets = vault_store_module.count_secrets
-
-            def synchronized_count(conn: Any, project_id: str | None = None) -> int:
-                # Chaque worker lit le quota avant la barrière : tous observent
-                # la capacité libre avant que le premier n'écrive.
-                observed = real_count_secrets(conn, project_id)
-                if not getattr(local, "counted", False):
-                    local.counted = True
-                    barrier.wait(timeout=5)
-                return observed
-
+            start = threading.Barrier(worker_count)
             results: list[dict[str, str]] = []
-            errors: list[BaseException] = []
+            errors: list[Exception] = []
 
             def create_in_worker(store: SqliteSecretStore, index: int) -> None:
+                start.wait(timeout=5)
                 try:
                     results.append(
                         asyncio.run(
@@ -1563,49 +1660,47 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                 except Exception as exc:
                     errors.append(exc)
 
-            with patch.object(
-                vault_store_module, "count_secrets", synchronized_count
-            ):
-                threads = [
-                    threading.Thread(target=create_in_worker, args=(store, index))
-                    for index, store in enumerate(stores)
-                ]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join(timeout=30)
+            threads = [
+                threading.Thread(target=create_in_worker, args=(store, index))
+                for index, store in enumerate(stores)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
             self.assertFalse([thread.name for thread in threads if thread.is_alive()])
 
-            self.assertFalse(errors, errors)
-            self.assertEqual(len(results), worker_count)
+            # Exactement deux créations acceptées, la troisième refusée par le quota.
+            self.assertEqual(len(results), max_secrets)
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], QuotaExceededError)
             for result in results:
                 self.assertNotIn("value", result)
             with db_session(db_path) as conn:
-                # Le seuil est franchi par les workers concurrents : best-effort,
-                # dépassement borné au nombre de workers, jamais de corruption.
-                self.assertEqual(count_secrets(conn), worker_count)
+                self.assertEqual(count_secrets(conn), max_secrets)
                 rows = conn.execute(
                     "SELECT name FROM secrets ORDER BY name"
                 ).fetchall()
-            self.assertEqual(
-                [row["name"] for row in rows],
-                [f"SECRET_{index}" for index in range(worker_count)],
-            )
+            created_names = [row["name"] for row in rows]
+            self.assertEqual(len(created_names), max_secrets)
+            allowed_names = {f"SECRET_{index}" for index in range(worker_count)}
+            self.assertTrue(set(created_names) <= allowed_names)
 
-            # Les valeurs restent déchiffrables par une nouvelle instance.
+            # Les valeurs acceptées restent déchiffrables par une nouvelle instance.
             reader = SqliteSecretStore(
                 db_path,
                 cipher,
-                max_secrets=2,
+                max_secrets=max_secrets,
                 max_secrets_per_project=10,
             )
-            for index in range(worker_count):
-                record = await reader.get("demo", "dev", f"SECRET_{index}")
+            for name in created_names:
+                index = name.rsplit("_", 1)[1]
+                record = await reader.get("demo", "dev", name)
                 self.assertIsNotNone(record)
                 assert record is not None
                 self.assertEqual(record["value"], f"value-{index}")
 
-            # Une fois le dépassement constaté, le quota reste appliqué.
+            # Le quota reste appliqué après la transaction concurrente.
             with self.assertRaises(QuotaExceededError):
                 await reader.create("demo", "dev", "SECRET_AFTER", "value-after")
 
@@ -2141,6 +2236,22 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError) as ctx:
                 create_app(settings)
             self.assertIn("memory", str(ctx.exception))
+
+    def test_explicit_in_memory_store_forbidden_in_production(self) -> None:
+        """Un store mémoire explicite ne contourne pas l'interdiction prod (fail-closed)."""
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "HEIMDALL_ENV": "production",
+                "HEIMDALL_VAULT_API_KEY_PEPPER": "production_pepper_" + "m" * 20,
+            },
+            clear=True,
+        ):
+            settings = VaultSettings(db_path=str(Path(tmp) / "vault.db"))
+            with self.assertRaises(ValueError) as ctx:
+                create_app(settings, secret_store=InMemorySecretStore())
+            self.assertIn("InMemorySecretStore", str(ctx.exception))
+            self.assertIn("production", str(ctx.exception))
 
     def test_vault_settings_rejects_default_pepper_in_production(self) -> None:
         """En production, le pepper public commité au repo est refusé avec erreur explicite."""

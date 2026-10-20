@@ -58,6 +58,9 @@ python -m heimdall.vault.init_db
 export HEIMDALL_ENV=production
 export HEIMDALL_VAULT_API_KEY_PEPPER='<pepper aléatoire persistant, distinct de la KEK>'
 export HEIMDALL_VAULT_KEK='<KEK AES-256 base64, 32 octets, distincte du pepper>'
+# TLS obligatoire en production : certificat avec SAN IP 127.0.0.1 + clé privée.
+export HEIMDALL_VAULT_SSL_CERTFILE='/chemin/absolu/server.crt'
+export HEIMDALL_VAULT_SSL_KEYFILE='/chemin/absolu/server.key'
 # Backend par défaut en production : sqlite (chiffré, partagé entre workers).
 # Hors production : memory (chiffré éphémère, strictement mono-processus).
 # export HEIMDALL_VAULT_STORAGE_BACKEND=sqlite
@@ -83,7 +86,9 @@ comme `"a" * 43` sont refusés).
 > Ce squelette minimal (#25) est strictement confiné à la boucle locale (`127.0.0.1`, `::1`, `localhost`).
 > Ne jamais exposer ce serveur en clair hors de localhost ni réutiliser ce montage HTTP au-delà du squelette minimal (#25). Les exigences runtime suivantes sont tracées et attribuées aux tickets du Vault :
 > - **Rejet fail-closed HTTP 403 sur IP non-loopback** : garde middleware en défense en profondeur (niveau transport/socket), volontairement maintenue hors du contrat OpenAPI applicatif (`/api/v1/health` étant publique sans clé).
-> - **TLS avec SAN IP obligatoire (`https://127.0.0.1:8443`)** : tickets #64 / #65 (le montage HTTP local reste un squelette).
+> - **TLS avec SAN IP (`https://127.0.0.1:8443`)** : obligatoire en production
+>   (`HEIMDALL_VAULT_SSL_CERTFILE` + `HEIMDALL_VAULT_SSL_KEYFILE`), HTTP en clair
+>   réservé au développement local. La révocation de clés reste suivie séparément.
 > - **Authentification par clé API de projet (`X-Heimdall-API-Key`)** : ticket #64.
 > - **Rejet HTTP 400 avant parsing au-delà de 1 Mio (1 048 576 octets)** : ticket #63.
 > - **En-tête `Cache-Control: no-store`** : ticket #63.
@@ -91,18 +96,21 @@ comme `"a" * 43` sont refusés).
 > - **Chiffrement au repos et persistance SQLite** : tickets #26 / #62.
 
 > **Limites de déploiement à l'état #63** :
-> - **Transport** : le lanceur `python -m heimdall.vault.app` sert du HTTP en clair,
->   strictement réservé à la boucle locale. Ne pas exposer ce montage hors de
->   `127.0.0.1`/`::1`/`localhost` ; TLS avec SAN IP (`https://127.0.0.1:8443`) et
->   révocation restent à livrer dans les tickets dédiés (#25/#64/#65).
-> - **Rate-limit mono-processus** : `run_server` épingle `workers=1`. Les buckets
->   (clé validée, pair réseau, global) vivent en mémoire par processus ; avec
->   `workers > 1`, chaque worker appliquerait sa propre limite et le débit effectif
->   serait multiplié. Un backend partagé est requis avant tout multi-worker (#65).
-> - **Quota de stockage best-effort** : avec plusieurs workers SQLite, la capacité
->   `max_secrets`/`max_secrets_per_project` peut être franchie de façon bornée
->   (comptage puis insertion non atomiques entre processus, TODO(#62)). L'unicité
->   `UNIQUE(project_id, env, name)` et l'intégrité de la base restent garanties.
+> - **Transport** : le lanceur `python -m heimdall.vault.app` refuse de démarrer
+>   en production sans certificat et clé TLS (`HEIMDALL_VAULT_SSL_CERTFILE`,
+>   `HEIMDALL_VAULT_SSL_KEYFILE`). Le HTTP en clair reste réservé à la boucle
+>   locale en développement. La révocation de clés reste à livrer dans son
+>   ticket dédié (#64).
+> - **Rate-limit partagé avec SQLite** : les buckets (clé validée, pair réseau,
+>   global) sont persistés dans la base sous transaction `BEGIN IMMEDIATE`, donc
+>   partagés entre workers sans multiplication du débit. Le backend mémoire reste
+>   strictement mono-processus ; `run_server` épingle `workers=1` par défaut.
+> - **Quota de stockage atomique** : avec plusieurs workers SQLite, la capacité
+>   `max_secrets`/`max_secrets_per_project` est vérifiée sous transaction
+>   `BEGIN IMMEDIATE` (verrou d'écriture acquis avant le comptage), donc sans
+>   dépassement inter-workers. L'unicité `UNIQUE(project_id, env, name)` reste
+>   garantie ; un 429 de capacité n'est pas transitoire tant qu'aucune route
+>   DELETE n'existe (retry inutile documenté, #62).
 
 Vérifier la santé minimale (`/api/v1/health` contractuel) :
 

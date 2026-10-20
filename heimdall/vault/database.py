@@ -105,6 +105,14 @@ CREATE TABLE IF NOT EXISTS secrets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_secrets_project_env_name ON secrets(project_id, env, name);
+
+-- Buckets de rate-limiting partagés entre workers (ticket #65). Les noms de
+-- buckets par clé sont des empreintes HMAC, jamais les clés brutes.
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+    name TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    reset_at REAL NOT NULL
+);
 """
 
 

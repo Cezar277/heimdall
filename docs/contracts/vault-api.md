@@ -116,17 +116,26 @@ requête : l'authentification réutilise ce résultat, soit un seul full-scan pa
 requête (anti-amplification CPU) ; l'existence d'une clé n'est pas observable
 par le temps de réponse du middleware. Le quota de stockage (capacité du store)
 ne doit pas être présenté comme cette mitigation de débit : les deux mécanismes
-sont distincts et testés séparément ; le quota SQLite inter-workers reste
-best-effort (TODO(#62), dépassement borné entre workers, aucune corruption).
+sont distincts et testés séparément. Le quota SQLite est vérifié dans la même
+transaction que l'insertion, sous `BEGIN IMMEDIATE` : le verrou d'écriture est
+acquis avant le comptage, ce qui empêche tout dépassement inter-workers. Un 429
+de capacité n'est pas transitoire sans route DELETE : le retry reste refusé
+tant que la capacité est pleine, même si `Retry-After` reste contractuel.
 Tout rejet 400 du middleware de taille répond `Connection: close` (aucun octet
 non drainé réutilisé en keep-alive).
 
-Limite de déploiement #65 : le rate-limiter livré est mono-processus et
-`run_server` épingle `workers=1` (le lanceur ignore `WEB_CONCURRENCY`). Avec
-plusieurs workers sans backend partagé (Redis/SQLite dédié), chaque processus
-appliquerait ses propres buckets et le débit effectif serait multiplié par le
-nombre de workers ; un backend partagé est requis avant tout passage multi-worker.
-Le quota de stockage reste indépendant de cette limite de débit.
+Backend de débit #65 : avec le stockage SQLite, les buckets sont persistés dans
+la base et incrémentés sous `BEGIN IMMEDIATE` : la limite (clé/pair/global) est
+partagée entre workers et n'est jamais multipliée par leur nombre. Le backend
+mémoire, réservé au développement/test, reste strictement mono-processus et
+`run_server` épingle `workers=1` par défaut. Le quota de stockage reste
+indépendant de cette limite de débit.
+
+Transport (#25) : en production, `run_server` refuse de démarrer sans
+`HEIMDALL_VAULT_SSL_CERTFILE` et `HEIMDALL_VAULT_SSL_KEYFILE` (fail-closed) et
+transmet les deux chemins à uvicorn. Le HTTP en clair reste confiné à la boucle
+locale en développement ; le certificat doit porter le SAN IP `127.0.0.1` pour
+`https://127.0.0.1:8443`. La révocation des clés API reste suivie séparément.
 
 Cette règle porte sur les clés d'authentification du serveur ; le
 client doit conserver son credential dans un stockage local protégé pour
@@ -335,9 +344,9 @@ La comparaison n'est pas encore une preuve de conformité du serveur #25.
 À son arrivée, remplacer `build_app()` par sa vraie factory et ajouter les
 tests HTTP de 400/401/403/404/409/429/500, isolement interprojets, health limité,
 headers proxy falsifiés, no-store et
-handlers sans fuite. Le chiffrement SQLite et la limitation de débit sont
-implémentés et testés ; TLS et la révocation restent des exigences à prouver
-par leurs tickets dédiés.
+handlers sans fuite. Le chiffrement SQLite, la limitation de débit partagée et
+le démarrage TLS fail-closed en production sont implémentés et testés ; la
+révocation des clés reste une exigence à prouver par son ticket dédié.
 Vérifier aussi les 401 indistinguables, le stockage haché des clés, les
 certificats non approuvés et SAN incorrects rejetés, `Retry-After` borné et le
 500 JSON constant sur une exception injectée (mode debug désactivé).
