@@ -184,8 +184,10 @@ INVALID_SAMPLES: list[dict[str, object]] = [
     _sample(snippet_hash="g" * 64),
     # champ status
     _sample(status="inconnu"),
+    _sample(status=[]),
     # champ source
     _sample(source="humain"),
+    _sample(source={}),
 ]
 
 # Propriétés inconnues : le schéma les refuse (`additionalProperties: false`).
@@ -283,6 +285,42 @@ def test_error_messages_never_reflect_the_rejected_value():
     assert canary not in str(ctx.value)
 
 
+def test_repr_never_leaks_the_secret():
+    """Le ``repr`` d'une cible ne montre jamais le contenu analysé.
+
+    C'est là que vivent les secrets : un ``log.debug("%r", cible)``, un
+    ``print`` de débogage ou une traceback future ne doivent pas les écrire
+    en clair (invariant 8).
+    """
+    canary = "SYNTHETIC_CANARY_7f3a"
+    fichier = FileTarget(path="src/app.py", text=f"TOKEN = {canary}")
+    diff = DiffTarget(path="src/app.py", lines=((1, f"TOKEN = {canary}"),))
+
+    assert canary not in repr(fichier)
+    assert canary not in repr(diff)
+    assert canary not in str(fichier)
+    assert canary not in str(diff)
+    # Le chemin et la taille restent visibles : un débogage est encore utile.
+    assert "src/app.py" in repr(fichier)
+    assert "src/app.py" in repr(diff)
+    assert "1" in repr(diff)
+    # Le Finding, lui, ne porte qu'une empreinte : son repr reste sûr.
+    assert canary not in repr(_finding())
+
+
+@pytest.mark.parametrize("champ", ["status", "source"])
+@pytest.mark.parametrize("valeur", [[], {}, set(), 1, 1.5, True, None, b"detecte"])
+def test_non_string_status_or_source_is_a_contract_error(champ, valeur):
+    """Une valeur non hashable ne doit pas lever un ``TypeError`` brut.
+
+    ``from_dict`` relit des données venues du Vault, d'un cache ou d'un autre
+    outil : elles ne sont pas de confiance. L'appelant (Vault, CLI) ne
+    catcherait pas un ``TypeError``, seulement l'erreur de contrat.
+    """
+    with pytest.raises(InvalidFinding):
+        _finding(**{champ: valeur})
+
+
 def test_invalid_finding_raises_a_typed_error():
     with pytest.raises(InvalidFinding):
         _finding(line=0)
@@ -331,6 +369,36 @@ def test_diff_target_refuses_unordered_or_invalid_lines():
         DiffTarget(path="src/app.py", lines=((1, "a"), (1, "b")))
     with pytest.raises(InvalidTarget):
         DiffTarget(path="src/app.py", lines=((1, 42),))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        (None,),
+        "ab",
+        [["ok"] * 3],
+        [None],
+        [1, 2],
+        42,
+        None,
+        {"ligne": 1},
+    ],
+)
+def test_malformed_lines_are_a_contract_error(lines):
+    """Un conteneur ou une entrée malformée est un ``InvalidTarget``.
+
+    Ni ``TypeError`` (déballage impossible) ni ``ValueError`` (trop peu de
+    valeurs) ne doivent sortir : l'appelant ne les catcherait pas.
+    """
+    with pytest.raises(InvalidTarget):
+        DiffTarget(path="src/app.py", lines=lines)  # type: ignore[arg-type]
+
+
+def test_malformed_lines_are_normalised():
+    """Une liste de listes valide devient un tuple de couples (int, str)."""
+    target = DiffTarget(path="src/app.py", lines=[[1, "a"], [2, "b"]])  # type: ignore[arg-type]
+    assert target.lines == ((1, "a"), (2, "b"))
+    assert target.lignes() == ((1, "a"), (2, "b"))
 
 
 def test_file_target_numbers_lines_from_one():
@@ -414,10 +482,19 @@ def test_scanner_scan_all_sorts_by_file_then_line():
         "pas un Finding",
         _finding(file="src/autre.py", line=1),  # chemin différent de la cible
         _finding(file="src/app.py", line=1, status="confirme"),  # état non initial
+        _finding(file="src/app.py", line=1, status="vaulte"),  # état non initial
+        _finding(file="src/app.py", line=1, status="rote"),  # état non initial
+        _finding(file="src/app.py", line=1, status="faux_positif"),  # état non initial
         _finding(file="src/app.py", line=1, source="llm"),  # origine non déterministe
     ],
 )
 def test_scanner_refuses_a_non_conforming_engine_output(finding):
+    """Aucun état autre que ``detecte`` ne sort du scanner.
+
+    Le LLM ne change jamais l'état d'un Finding : la façade refuse donc
+    ``confirme``, ``vaulte``, ``rote`` et ``faux_positif`` aussi sûrement que
+    ``source: llm``.
+    """
     moteur = _MoteurFactice([finding])
     with pytest.raises(ScanError):
         Scanner(moteur).scan(DiffTarget(path="src/app.py", lines=((1, "x"),)))
@@ -430,6 +507,43 @@ def test_scanner_propagates_engine_failure_without_partial_result():
 
     with pytest.raises(RuntimeError):
         Scanner(_MoteurCasse()).scan(DiffTarget(path="src/app.py", lines=((1, "x"),)))
+
+
+@pytest.mark.parametrize("cible", ["pas une cible", None, 42, object(), {"path": "a.py"}])
+def test_scanner_refuses_a_target_that_is_not_a_target(cible):
+    """Une cible qui n'est pas une cible est une erreur de contrat.
+
+    La cible vient du parseur MCP ou de la CLI : c'est une frontière non
+    fiable, et l'appelant ne catcherait pas une ``AttributeError``.
+    """
+    with pytest.raises(ScanError):
+        Scanner(_MoteurFactice([])).scan(cible)
+    with pytest.raises(InvalidTarget):
+        Scanner(_MoteurFactice([])).scan(cible)
+
+
+@pytest.mark.parametrize("moteur", [None, object(), "moteur", 42])
+def test_scanner_refuses_a_moteur_without_analyser(moteur):
+    """Un moteur sans méthode ``analyser`` est refusé à la construction."""
+    with pytest.raises(ScanError):
+        Scanner(moteur)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("rendu", [None, 42, "pas une liste"])
+def test_scanner_refuses_an_engine_that_renders_nothing_usable(rendu):
+    """Un moteur qui ne rend pas une liste de Findings est refusé (fail-closed)."""
+
+    class _MoteurVide:
+        def analyser(self, cible):
+            return rendu
+
+    with pytest.raises(ScanError):
+        Scanner(_MoteurVide()).scan(DiffTarget(path="src/app.py", lines=((1, "x"),)))
+
+
+def test_scan_all_refuses_a_non_iterable_list_of_targets():
+    with pytest.raises(ScanError):
+        Scanner(_MoteurFactice([])).scan_all(None)  # type: ignore[arg-type]
 
 
 def test_scanner_output_validates_against_the_contract():
@@ -445,3 +559,25 @@ def test_public_api_is_exported_once():
     assert heimdall.scanner.Finding is finding_module.Finding
     assert heimdall.scanner.detect.Finding is finding_module.Finding
     assert heimdall.scanner.Scanner.__module__ == "heimdall.scanner.interface"
+
+
+def test_no_raw_typing_error_escapes_the_contract():
+    """Toute entrée non conforme sort par une erreur de contrat, jamais par une
+    ``TypeError``/``AttributeError`` brute que l'appelant ne catcherait pas.
+
+    Le contrat d'erreur est unique : ``InvalidFinding``, ``InvalidTarget`` ou
+    ``ScanError`` — les trois sont des ``ScanError``.
+    """
+    entrees = [
+        lambda: _finding(status=[]),
+        lambda: _finding(source={}),
+        lambda: DiffTarget(path="src/app.py", lines=(None,)),
+        lambda: DiffTarget(path="src/app.py", lines="ab"),
+        lambda: FileTarget(path="src/app.py", text=42),
+        lambda: Scanner(None),
+        lambda: Scanner(_MoteurFactice([])).scan("pas une cible"),
+        lambda: Scanner(_MoteurFactice([])).scan_all(None),
+    ]
+    for entree in entrees:
+        with pytest.raises(ScanError):
+            entree()

@@ -19,8 +19,8 @@ Findings, pas des verdicts sur un secret.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Final, Protocol
 
 from heimdall.scanner.errors import InvalidTarget, ScanError
 from heimdall.scanner.finding import (
@@ -28,6 +28,9 @@ from heimdall.scanner.finding import (
     Finding,
     validate_relative_path,
 )
+
+#: Nombre de parties d'une ligne ajoutée : ``(numéro, texte)``.
+_LINE_PARTS: Final[int] = 2
 
 
 def _check_path(value: object) -> None:
@@ -38,6 +41,36 @@ def _check_path(value: object) -> None:
         raise InvalidTarget("cible d'analyse non conforme : chemin relatif") from None
 
 
+def _check_lines(lines: object) -> tuple[tuple[int, str], ...]:
+    """Valide et normalise les lignes ajoutées d'une cible.
+
+    La cible vient d'un parseur de diff ou d'un appelant non fiable : toute
+    forme inattendue est refusée par ``InvalidTarget``, et **jamais** par un
+    ``TypeError`` ou un ``ValueError`` brut que l'appelant (CLI, Vault) ne
+    catcherait pas. Le résultat est normalisé en couples ``(int, str)``.
+    """
+    if not isinstance(lines, (tuple, list)):
+        raise InvalidTarget("cible d'analyse non conforme : lignes")
+    entries = tuple(lines)
+    normalisees: list[tuple[int, str]] = []
+    previous = 0
+    for entry in entries:
+        if not isinstance(entry, (tuple, list)) or len(entry) != _LINE_PARTS:
+            raise InvalidTarget("cible d'analyse non conforme : ligne")
+        number, text = entry
+        # `type(...) is not int` refuse aussi les booléens : `True` vaut 1 en
+        # Python, alors que le schéma distingue le booléen de l'entier.
+        if type(number) is not int or number < 1:
+            raise InvalidTarget("cible d'analyse non conforme : numéro de ligne")
+        if number <= previous:
+            raise InvalidTarget("cible d'analyse non conforme : lignes désordonnées")
+        if not isinstance(text, str):
+            raise InvalidTarget("cible d'analyse non conforme : texte de ligne")
+        previous = number
+        normalisees.append((number, text))
+    return tuple(normalisees)
+
+
 @dataclass(frozen=True, slots=True)
 class DiffTarget:
     """Les lignes ajoutées du diff indexé, avec leur numéro de ligne réel.
@@ -46,22 +79,26 @@ class DiffTarget:
     position de la ligne **dans le fichier**, pas sa position dans le diff.
     Les numéros sont strictement croissants (le parseur de diff du MCP
     produit cette forme : ``DiffEntry.lines``).
+
+    **Le contenu n'apparaît jamais dans le ``repr``** : ces lignes sont
+    précisément là où vivent les secrets, et un ``log.debug("%r", cible)`` ou
+    une traceback les écrirait en clair (invariant 8). Le ``repr`` résumé ne
+    montre que le chemin et le nombre de lignes.
     """
 
     path: str
-    lines: tuple[tuple[int, str], ...]
+    lines: tuple[tuple[int, str], ...] = field(repr=False)
 
     def __post_init__(self) -> None:
         _check_path(self.path)
-        previous = 0
-        for number, text in self.lines:
-            if type(number) is not int or number < 1:
-                raise InvalidTarget("cible d'analyse non conforme : numéro de ligne")
-            if number <= previous:
-                raise InvalidTarget("cible d'analyse non conforme : lignes désordonnées")
-            if not isinstance(text, str):
-                raise InvalidTarget("cible d'analyse non conforme : texte de ligne")
-            previous = number
+        entries = _check_lines(self.lines)
+        # Normalisation : `lines` est désormais un tuple de couples (int, str),
+        # quoi que l'appelant ait fourni.
+        object.__setattr__(self, "lines", entries)
+
+    def __repr__(self) -> str:
+        """Résumé sans le contenu des lignes (jamais de secret en clair)."""
+        return f"DiffTarget(path={self.path!r}, lignes={len(self.lines)})"
 
     def lignes(self) -> tuple[tuple[int, str], ...]:
         """Les lignes à analyser, numérotées comme dans le fichier."""
@@ -70,15 +107,24 @@ class DiffTarget:
 
 @dataclass(frozen=True, slots=True)
 class FileTarget:
-    """Un fichier entier (démarrage à froid : premier scan du dépôt)."""
+    """Un fichier entier (démarrage à froid : premier scan du dépôt).
+
+    **Le contenu n'apparaît jamais dans le ``repr``** : c'est le fichier
+    entier, secrets compris ; seul le chemin et la taille sont affichés
+    (invariant 8).
+    """
 
     path: str
-    text: str
+    text: str = field(repr=False)
 
     def __post_init__(self) -> None:
         _check_path(self.path)
         if not isinstance(self.text, str):
             raise InvalidTarget("cible d'analyse non conforme : contenu")
+
+    def __repr__(self) -> str:
+        """Résumé sans le contenu du fichier (jamais de secret en clair)."""
+        return f"FileTarget(path={self.path!r}, caracteres={len(self.text)})"
 
     def lignes(self) -> tuple[tuple[int, str], ...]:
         """Les lignes à analyser, numérotées à partir de 1."""
@@ -129,11 +175,19 @@ class Scanner:
 
     Refuser est fail-closed : une sortie non conforme est une **erreur**, pas
     une liste partielle présentée comme complète.
+
+    **Un seul type d'erreur sort de la façade** : ``ScanError`` (dont
+    ``InvalidTarget`` hérite) pour la cible, le moteur et la sortie. Aucune
+    ``TypeError`` ni ``AttributeError`` brute ne doit atteindre l'appelant : la
+    cible et le moteur viennent d'autres composants (parseur MCP, CLI), donc
+    d'une frontière non fiable.
     """
 
     __slots__ = ("_moteur",)
 
     def __init__(self, moteur: Moteur) -> None:
+        if not callable(getattr(moteur, "analyser", None)):
+            raise ScanError("moteur de détection invalide")
         self._moteur = moteur
 
     def scan(self, cible: ScanTarget) -> list[Finding]:
@@ -142,7 +196,15 @@ class Scanner:
         L'ordre de tri est ``(ligne, type, empreinte)`` : deux scans de la
         même cible rendent la même liste, dans le même ordre.
         """
-        findings = list(self._moteur.analyser(cible))
+        if not isinstance(cible, (DiffTarget, FileTarget)):
+            raise InvalidTarget("cible d'analyse non conforme : type")
+        resultat = self._moteur.analyser(cible)
+        if resultat is None:
+            raise ScanError("sortie scanner non conforme au contrat Finding v1")
+        try:
+            findings = list(resultat)
+        except TypeError:
+            raise ScanError("sortie scanner non conforme au contrat Finding v1") from None
         for finding in findings:
             _check_finding(finding, cible)
         findings.sort(key=lambda item: (item.line, item.type, item.snippet_hash))
@@ -150,8 +212,12 @@ class Scanner:
 
     def scan_all(self, cibles: Iterable[ScanTarget]) -> list[Finding]:
         """Analyse plusieurs cibles et rend tous les Findings, triés par fichier."""
+        try:
+            iterables = list(cibles)
+        except TypeError:
+            raise ScanError("cible d'analyse non conforme : liste de cibles") from None
         findings: list[Finding] = []
-        for cible in cibles:
+        for cible in iterables:
             findings.extend(self.scan(cible))
         findings.sort(key=lambda item: (item.file, item.line, item.type, item.snippet_hash))
         return findings

@@ -142,12 +142,15 @@ def _check_hash(value: object) -> None:
 
 
 def _check_status(value: object) -> None:
-    if value not in FINDING_STATUSES:
+    # `isinstance(value, str)` d'abord : l'appartenance à un `frozenset`
+    # lève un `TypeError` sur une valeur non hashable (liste, dict), et une
+    # donnée relue depuis le Vault ou un cache n'est pas de confiance.
+    if not isinstance(value, str) or value not in FINDING_STATUSES:
         raise InvalidFinding("Finding non conforme au contrat v1 : champ status")
 
 
 def _check_source(value: object) -> None:
-    if value not in FINDING_SOURCES:
+    if not isinstance(value, str) or value not in FINDING_SOURCES:
         raise InvalidFinding("Finding non conforme au contrat v1 : champ source")
 
 
