@@ -2340,6 +2340,9 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             "abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE",
             "0123456789abcdefABCDEFGHIJKLMNOPQRSTUVWXYghijklmn",
             "zyxwvutsrqponmlkjihgfedcba9876543210_-ABCab",
+            # Exemple revue (5e contrôle) : suite de 8 répétée, refusée
+            # (diversité 8 < 16, période 8 et suite monotone cumulés).
+            "abcdefgh" * 6,
         )
         for trivial_key in trivial_keys:
             with self.subTest(key=trivial_key):
