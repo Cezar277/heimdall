@@ -1811,9 +1811,9 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         """Le full-scan d'empreintes est mémoïsé par requête (anti-amplification CPU).
 
         Le middleware de débit réalise le parcours complet pour choisir le bucket ;
-        l'authentification réutilise ce résultat au lieu de rescanner la base :
-        un seul parcours (donc un seul SELECT api_keys) par requête, que la clé
-        soit connue ou inconnue.
+        l'authentification réutilise ce résultat : un seul parcours mémoire par
+        requête, que la clé soit connue ou inconnue. Le backend mémoire ne lit
+        aucune base SQLite.
         """
         settings = VaultSettings(api_key_pepper="single_scan_pepper_" + "s" * 24)
         scan_app = create_app(settings)
@@ -1845,7 +1845,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                 known = await client.get("/api/v1/secrets/demo/dev/ABSENT_KEY")
                 self.assertEqual(known.status_code, 404)
                 self.assertEqual(len(lookup_calls), 1)
-                self.assertEqual(len(db_calls), 1)
+                self.assertEqual(len(db_calls), 0)
 
                 lookup_calls.clear()
                 db_calls.clear()
@@ -1855,7 +1855,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(unknown.status_code, 401)
                 self.assertEqual(len(lookup_calls), 1)
-                self.assertEqual(len(db_calls), 1)
+                self.assertEqual(len(db_calls), 0)
 
     async def test_valid_api_key_allows_secret_creation_and_reading(self) -> None:
         """Une clé API valide autorise la création (201) et la lecture (200) de secrets."""

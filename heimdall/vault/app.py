@@ -53,6 +53,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
@@ -201,6 +202,7 @@ project_api_key_header = APIKeyHeader(
 )
 
 
+_MAX_API_KEY_LENGTH: int = 512
 _DUMMY_HASH: str = "0" * 64
 _HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
 # Politique #64 : une clé opérateur doit offrir une entropie comparable aux clés
@@ -303,12 +305,13 @@ def _validate_raw_api_key(raw_key: str) -> str:
     """
     if (
         not isinstance(raw_key, str)
-        or len(raw_key) < _MIN_API_KEY_LENGTH
+        or not _MIN_API_KEY_LENGTH <= len(raw_key) <= _MAX_API_KEY_LENGTH
         or raw_key != raw_key.strip()
     ):
         raise ValueError(
-            "La clé API brute doit comporter au moins "
-            f"{_MIN_API_KEY_LENGTH} caractères, sans espaces de début ou de fin."
+            "La clé API brute doit comporter entre "
+            f"{_MIN_API_KEY_LENGTH} et {_MAX_API_KEY_LENGTH} caractères, "
+            "sans espaces de début ou de fin."
         )
     if len(set(raw_key)) < _MIN_API_KEY_DISTINCT_CHARS:
         raise ValueError(
@@ -944,7 +947,6 @@ def _register_middleware(app: FastAPI) -> None:
         ``BEGIN IMMEDIATE``) : la limite n'est jamais multipliée par le nombre
         de processus. Le mode mémoire reste mono-processus (dev/test).
         """
-        settings: VaultSettings = request.app.state.settings
         peer = request.client.host if request.client and request.client.host else "unknown"
         limiter: RateLimiter | SqliteRateLimiter = request.app.state.rate_limiter
         if isinstance(limiter, SqliteRateLimiter):
@@ -955,15 +957,21 @@ def _register_middleware(app: FastAPI) -> None:
             return JSONResponse(
                 status_code=429,
                 content=_ERROR_PAYLOADS[429],
-                headers={"Retry-After": str(retry_after)},
+                headers={"Retry-After": str(retry_after), "Connection": "close"},
             )
         key_hash: str | None = None
         raw_key = request.headers.get("X-Heimdall-API-Key")
+        if raw_key is not None and len(raw_key) > _MAX_API_KEY_LENGTH:
+            return JSONResponse(
+                status_code=401,
+                content=_ERROR_PAYLOADS[401],
+                headers={"Connection": "close"},
+            )
         if raw_key and raw_key == raw_key.strip() and request.url.path != "/api/v1/health":
             try:
                 candidate_hash = hash_api_key(
                     raw_key,
-                    pepper=settings.effective_api_key_pepper,
+                    pepper=request.app.state.settings.effective_api_key_pepper,
                 )
             except ValueError:
                 candidate_hash = None
@@ -981,7 +989,7 @@ def _register_middleware(app: FastAPI) -> None:
             return JSONResponse(
                 status_code=429,
                 content=_ERROR_PAYLOADS[429],
-                headers={"Retry-After": str(retry_after)},
+                headers={"Retry-After": str(retry_after), "Connection": "close"},
             )
         return await call_next(request)
 
@@ -993,6 +1001,7 @@ def _register_middleware(app: FastAPI) -> None:
             return JSONResponse(
                 status_code=403,
                 content=_ERROR_PAYLOADS[403],
+                headers={"Connection": "close"},
             )
         host = client.host
         is_allowed = host in _ALLOWED_LOOPBACK_HOSTS
@@ -1009,6 +1018,7 @@ def _register_middleware(app: FastAPI) -> None:
             return JSONResponse(
                 status_code=403,
                 content=_ERROR_PAYLOADS[403],
+                headers={"Connection": "close"},
             )
         return await call_next(request)
 
@@ -1086,6 +1096,7 @@ def _lookup_db_api_key(db_path: Any, provided_hash: str) -> tuple[str | None, in
                     if not row["revoked_at"]:
                         matching_project = row["project_id"]
     except Exception as exc:
+        matching_project = None
         logger.debug("Échec consultation clé API SQLite : %s", exc.__class__.__name__)
     return matching_project, evaluated
 
@@ -1093,7 +1104,8 @@ def _lookup_db_api_key(db_path: Any, provided_hash: str) -> tuple[str | None, in
 def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None, int]:
     """Recherche le projet d'une empreinte de clé API à coût comparable.
 
-    Parcours complet des empreintes en mémoire puis en base SQLite, sans ``break``
+    Parcours complet des empreintes de la source autoritaire (mémoire en mode
+    memory, base seule en mode sqlite), sans ``break``
     précoce et avec ``constant_time_equal`` pour chaque candidat : le coût est le
     même que l'empreinte soit connue, inconnue ou révoquée. Ce parcours est
     partagé par l'authentification (``verify_api_key``) et par le choix du bucket
@@ -1102,6 +1114,10 @@ def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None,
 
     Retourne ``(project_id ou None, nombre d'empreintes évaluées)``.
     """
+    if getattr(app.state, "storage_backend", "memory") == "sqlite":
+        # SQLite est l'unique autorité : révocation, suppression ou erreur DB
+        # ne doivent jamais retomber sur une ancienne entrée en mémoire.
+        return _lookup_db_api_key(getattr(app.state, "db_path", None), provided_hash)
     matching_project: str | None = None
     evaluated = 0
     registered_keys: dict[str, str] = getattr(app.state, "api_keys", {})
@@ -1109,10 +1125,6 @@ def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None,
         evaluated += 1
         if constant_time_equal(provided_hash, reg_hash):
             matching_project = proj_id
-    db_match, db_eval = _lookup_db_api_key(getattr(app.state, "db_path", None), provided_hash)
-    evaluated += db_eval
-    if db_match is not None:
-        matching_project = db_match
     return matching_project, evaluated
 
 
@@ -1121,8 +1133,8 @@ async def _find_api_key_project_cached(
 ) -> tuple[str | None, int]:
     """Parcours complet d'empreintes mémoïsé dans la requête (anti-amplification CPU).
 
-    Le middleware de débit effectue déjà le parcours complet (mémoire + SQLite,
-    sans ``break``) pour choisir le bucket ; l'authentification réutilise ce
+    Le middleware de débit effectue déjà le parcours complet du backend actif
+    (sans ``break``) pour choisir le bucket ; l'authentification réutilise ce
     résultat au lieu de refaire le même full-scan + ``compare_digest`` par
     candidat (2 parcours -> 1 par requête, ticket #65). La mémoïsation vit dans
     l'état de la requête (``request.state``) : jamais partagée entre requêtes,
@@ -1172,7 +1184,7 @@ async def verify_api_key(
             )
         return None
 
-    if api_key != api_key.strip() or not api_key:
+    if len(api_key) > _MAX_API_KEY_LENGTH or api_key != api_key.strip() or not api_key:
         raise StarletteHTTPException(
             status_code=401,
             detail="Authentification requise",
@@ -1348,6 +1360,11 @@ def _persist_api_key_hash(app: FastAPI, key_hash: str, project_id: str) -> None:
             "VALUES (?, ?, ?, ?, NULL) ON CONFLICT(key_hash) DO NOTHING",
             (f"key_{uuid4().hex}", project_id, key_hash, get_iso_timestamp()),
         )
+        row = conn.execute(
+            "SELECT project_id FROM api_keys WHERE key_hash = ?", (key_hash,)
+        ).fetchone()
+        if row is None or row["project_id"] != project_id:
+            raise ValueError("Cette clé API est déjà associée à un autre projet.")
 
 
 def _configure_secret_store(
@@ -1452,6 +1469,8 @@ def create_app(
     for preregistered_hash, preregistered_project in validated_hashes.items():
         _persist_api_key_hash(app, preregistered_hash, preregistered_project)
 
+    registration_lock = Lock()
+
     def register_api_key(raw_key: str, project_id: str) -> None:
         """Enregistre une clé API brute en calculant son HMAC-SHA256 avec le pepper serveur.
 
@@ -1465,8 +1484,12 @@ def create_app(
         raw_key = _validate_raw_api_key(raw_key)
         _validate_project_id(project_id)
         key_hash = hash_api_key(raw_key, pepper=effective_settings.effective_api_key_pepper)
-        app.state.api_keys[key_hash] = project_id
-        _persist_api_key_hash(app, key_hash, project_id)
+        with registration_lock:
+            registered_project = app.state.api_keys.get(key_hash)
+            if registered_project is not None and registered_project != project_id:
+                raise ValueError("Cette clé API est déjà associée à un autre projet.")
+            _persist_api_key_hash(app, key_hash, project_id)
+            app.state.api_keys[key_hash] = project_id
 
     app.state.register_api_key = register_api_key
 

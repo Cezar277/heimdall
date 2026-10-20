@@ -180,7 +180,8 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
             with db_session(db_path) as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0], 1)
                 conn.execute("UPDATE api_keys SET revoked_at = '2026-01-01'")
-            app_module._persist_api_key_hash(target, fingerprint, "other")
+            with self.assertRaisesRegex(ValueError, "déjà associée"):
+                app_module._persist_api_key_hash(target, fingerprint, "other")
             with db_session(db_path) as conn:
                 row = conn.execute("SELECT project_id, revoked_at FROM api_keys").fetchone()
                 self.assertEqual(tuple(row), ("demo", "2026-01-01"))
@@ -212,3 +213,80 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                 init_db(db_path)
             with db_session(db_path) as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0], 2)
+
+    async def test_sqlite_revocation_deletion_and_failure_override_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = create_app(
+                VaultSettings(
+                    db_path=str(Path(tmp) / "vault.db"),
+                    storage_backend="sqlite",
+                    kek=generate_encryption_key(),
+                    api_key_pepper="p" * 32,
+                )
+            )
+            key = generate_api_key()
+            target.state.register_api_key(key, "demo")
+            fingerprint = hash_api_key(key, pepper="p" * 32)
+            with patch.object(
+                app_module, "_lookup_db_api_key", wraps=app_module._lookup_db_api_key
+            ) as lookup:
+                self.assertEqual((await self._authenticated_get(target, key)).status_code, 404)
+                self.assertEqual(lookup.call_count, 1)
+                self.assertEqual(
+                    (await self._authenticated_get(target, "unknown")).status_code, 401
+                )
+                self.assertEqual(lookup.call_count, 2)
+            with db_session(target.state.db_path) as conn:
+                conn.execute("UPDATE api_keys SET revoked_at = ?", ("2026-01-01",))
+            self.assertIn(fingerprint, target.state.api_keys)
+            self.assertEqual((await self._authenticated_get(target, key)).status_code, 401)
+            target.state.register_api_key(key, "demo")
+            self.assertEqual((await self._authenticated_get(target, key)).status_code, 401)
+            with db_session(target.state.db_path) as conn:
+                conn.execute("DELETE FROM api_keys")
+            self.assertEqual((await self._authenticated_get(target, key)).status_code, 401)
+            with patch.object(app_module, "db_session", side_effect=sqlite3.OperationalError):
+                self.assertEqual((await self._authenticated_get(target, key)).status_code, 401)
+
+    async def test_key_cannot_be_reassigned_to_another_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for backend in ("memory", "sqlite"):
+                with self.subTest(backend=backend):
+                    settings = VaultSettings(
+                        db_path=str(Path(tmp) / f"{backend}.db"),
+                        storage_backend=backend,
+                        kek=generate_encryption_key(),
+                        api_key_pepper="p" * 32,
+                    )
+                    target = create_app(settings)
+                    key = generate_api_key()
+                    target.state.register_api_key(key, "demo")
+                    target.state.register_api_key(key, "demo")
+                    with self.assertRaisesRegex(ValueError, "déjà associée") as error:
+                        target.state.register_api_key(key, "other")
+                    self.assertNotIn(key, str(error.exception))
+                    fingerprint = hash_api_key(key, pepper="p" * 32)
+                    self.assertEqual(target.state.api_keys[fingerprint], "demo")
+                    self.assertEqual((await self._authenticated_get(target, key)).status_code, 404)
+                    if backend == "sqlite":
+                        other_worker = create_app(settings)
+                        with self.assertRaisesRegex(ValueError, "déjà associée"):
+                            other_worker.state.register_api_key(key, "other")
+                        self.assertNotIn(fingerprint, other_worker.state.api_keys)
+                        with self.assertRaisesRegex(ValueError, "déjà associée"):
+                            create_app(settings, api_key_hashes={fingerprint: "other"})
+
+    async def test_oversized_key_is_rejected_before_hashing(self) -> None:
+        target = create_app(VaultSettings(api_key_pepper="p" * 32))
+        for length in (513, 65536):
+            with self.subTest(length=length), patch.object(app_module, "hash_api_key") as hashing:
+                response = await self._authenticated_get(target, "A" * length)
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.json(), app_module._ERROR_PAYLOADS[401])
+                self.assertEqual(response.headers["connection"], "close")
+                hashing.assert_not_called()
+        key = (generate_api_key() * 12)[:512]
+        target.state.register_api_key(key, "demo")
+        self.assertEqual((await self._authenticated_get(target, key)).status_code, 404)
+        with self.assertRaises(ValueError):
+            target.state.register_api_key(key + "A", "demo")

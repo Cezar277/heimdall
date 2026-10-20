@@ -111,8 +111,10 @@ exécutées via `asyncio.to_thread` : une attente de verrou SQLite ne bloque pas
 la boucle événementielle. Le store SQLite s'appuie sur ses transactions, sans
 verrou asyncio local. Les verrous asyncio restent réservés au store mémoire.
 Les empreintes `api_keys.key_hash` ont un index UNIQUE ; leur persistance utilise
-`ON CONFLICT(key_hash) DO NOTHING`, sans réactiver une clé révoquée ni changer
-son projet. `init_db` ajoute cet index aux bases existantes ; s'il existe déjà
+`ON CONFLICT(key_hash) DO NOTHING`, puis vérifie le projet dans la même
+transaction. Réenregistrer une clé pour le même projet est idempotent et ne
+réactive pas une clé révoquée ; la lier à un autre projet lève une `ValueError`
+générique et conserve l'association initiale, en mémoire comme en SQLite. `init_db` ajoute cet index aux bases existantes ; s'il existe déjà
 des empreintes dupliquées, l'initialisation échoue sans suppression automatique.
 La génération du pepper et les comparaisons sensibles sont confinées dans
 `heimdall/vault/crypto.py`.
@@ -126,7 +128,7 @@ recompter pair/global. Un rejet par clé consomme donc aussi pair/global. Les
 pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
 Le choix du bucket par clé (`_find_api_key_project_cached`) emprunte le même
 parcours complet à coût comparable que `verify_api_key` (parcours exhaustif
-mémoire puis SQLite, sans `break` précoce) et le mémoïse dans l'état de la
+du backend actif, sans `break` précoce) et le mémoïse dans l'état de la
 requête : l'authentification réutilise ce résultat, soit un seul full-scan par
 requête (anti-amplification CPU) ; l'existence d'une clé n'est pas observable
 par le temps de réponse du middleware. Le quota de stockage (capacité du store)
@@ -136,8 +138,19 @@ transaction que l'insertion, sous `BEGIN IMMEDIATE` : le verrou d'écriture est
 acquis avant le comptage, ce qui empêche tout dépassement inter-workers. Un 429
 de capacité n'est pas transitoire sans route DELETE : le retry reste refusé
 tant que la capacité est pleine, même si `Retry-After` reste contractuel.
-Tout rejet 400 du middleware de taille répond `Connection: close` (aucun octet
-non drainé réutilisé en keep-alive).
+Les rejets avant lecture du corps répondent `Connection: close` : 400 du
+middleware de taille, 429 de débit (pair/global et clé), 403 loopback et 401 pour
+une clé surdimensionnée. Les tests socket uvicorn/h11 vérifient la fermeture,
+l'absence de réponse à la requête pipelinée et le fonctionnement d'une nouvelle
+connexion. L'en-tête de clé est limité à 512 caractères avant tout hachage ou
+lookup (401 générique), après admission pair/global. La même borne s'applique
+à l'enregistrement des clés opérateur.
+
+En mode SQLite, la base est l'unique autorité d'authentification : une clé
+révoquée, supprimée ou illisible reste refusée même si son empreinte existe
+dans le dictionnaire mémoire. La mémoïsation ne dure qu'une requête. Le mode
+mémoire consulte uniquement son dictionnaire. L'API de révocation reste suivie
+séparément en #64.
 
 Backend de débit #65 : avec le stockage SQLite, les buckets sont persistés dans
 la base et incrémentés sous `BEGIN IMMEDIATE` : la limite (clé/pair/global) est
