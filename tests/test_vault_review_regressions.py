@@ -3,6 +3,7 @@
 import asyncio
 import os
 import secrets
+import site
 import sqlite3
 import subprocess
 import sys
@@ -402,6 +403,12 @@ class VaultImportSideEffectTests(unittest.TestCase):
             env["HEIMDALL_ENV"] = "production"
             env["HOME"] = home
             env["XDG_DATA_HOME"] = xdg
+            # HOME override déplace le user-site (``~/.local``) : sans ceci,
+            # une install ``--user`` (ex. CI sous ``/home/runner/.local``)
+            # devient invisible et le test échoue en faux rouge
+            # (``ModuleNotFoundError: uvicorn``). On fige donc la vraie base
+            # utilisateur du parent, indépendante de HOME.
+            env["PYTHONUSERBASE"] = site.getuserbase()
             code = "import heimdall.vault.app; print('import-ok')"
             result = subprocess.run(  # noqa: S603
                 [sys.executable, "-c", code],
