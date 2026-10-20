@@ -12,8 +12,8 @@ Invariants :
 - un Finding ne contient jamais la valeur candidate, seulement son empreinte
   HMAC-SHA-256 et son entropie ;
 - les chemins sont relatifs, en ``/``, sans ``..`` ni segment vide ;
-- les liens symboliques ne sont jamais suivis et les fichiers restent confinés
-  à la racine résolue ;
+- les liens symboliques ne sont jamais suivis, ni dans le périmètre, ni dans
+  le chemin de la racine, et les fichiers restent confinés à la racine résolue ;
 - les lectures sont bornées (1 Mio) et les regex sont linéaires et bornées.
 """
 
@@ -30,13 +30,14 @@ from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text, is_excluded, is_excluded_directory
 from heimdall.scanner.hashing import SnippetHasher
-from heimdall.scanner.signatures import find_signature_matches
+from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
 FindingStatus = Literal["detecte", "confirme", "vaulte", "rote", "faux_positif"]
 FindingSource = Literal["regex", "entropy", "llm"]
 
 MAX_FILE_BYTES: Final[int] = 1_048_576
 MAX_PATH_LENGTH: Final[int] = 4096
+MULTILINE_WINDOW: Final[int] = 4096
 _READ_CHUNK: Final[int] = 65_536
 _FIRST_CONTROL: Final[int] = 0x20
 _DELETE: Final[int] = 0x7F
@@ -101,12 +102,32 @@ def _raise_walk_error(_error: OSError) -> None:
     raise ScanError(_SCAN_ERROR)
 
 
+def _resolve_root(root: str | os.PathLike[str]) -> Path:
+    """Résout la racine sans jamais suivre un lien symbolique.
+
+    La racine elle-même et chacun de ses ancêtres sont vérifiés par
+    ``lstat`` : un lien symbolique dans le chemin de la racine est refusé
+    (``ScanError``) au lieu d'être suivi en silence. La promesse « les liens
+    symboliques ne sont jamais suivis » vaut donc aussi pour la racine et
+    pour le fichier unique.
+    """
+    try:
+        absolute = Path(os.path.abspath(Path(root).expanduser()))
+        for candidate in (absolute, *absolute.parents):
+            if candidate.is_symlink():
+                raise ScanError(_SCAN_ERROR)
+        return absolute.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ScanError(_SCAN_ERROR) from None
+
+
 class Scanner:
     """Scanner déterministe d'une racine confinée.
 
     ``root`` peut être un répertoire ou un fichier régulier explicite. La
-    racine est résolue une fois ; chaque fichier est ensuite vérifié à l'usage
-    (identité de descripteur, chemin résolu sous la racine, refus des liens).
+    racine est résolue une fois, sans suivre de lien symbolique ; chaque
+    fichier est ensuite vérifié à l'usage (identité de descripteur, chemin
+    résolu sous la racine, refus des liens).
     """
 
     __slots__ = ("_hasher", "_root", "_single")
@@ -117,10 +138,7 @@ class Scanner:
         *,
         hasher: SnippetHasher | None = None,
     ) -> None:
-        try:
-            resolved = Path(root).expanduser().resolve(strict=True)
-        except (OSError, RuntimeError):
-            raise ScanError(_SCAN_ERROR) from None
+        resolved = _resolve_root(root)
         if resolved.is_dir():
             self._root = resolved
             self._single: Path | None = None
@@ -236,22 +254,60 @@ class Scanner:
         # du même type : les perdre serait un fail-open. Seule une valeur
         # strictement identique, déjà émise sur la même ligne, est dédupliquée.
         seen: set[tuple[int, str, str]] = set()
-        for line_number, line in enumerate(text.splitlines(), start=1):
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            line_number = index + 1
             for match in find_signature_matches(line):
-                key = (line_number, match.secret_type, match.value)
-                if key in seen:
+                self._append(findings, seen, match, line_number, relative)
+            following = self._joined_window(line, lines, index)
+            if following is None:
+                continue
+            joined, limit = following
+            for match in find_signature_matches(joined):
+                # Seule une correspondance qui commence dans la ligne courante
+                # est retenue : une valeur située après la jonction appartient
+                # à la ligne suivante et y est déjà signalée.
+                if match.start >= limit:
                     continue
-                seen.add(key)
-                findings.append(
-                    Finding(
-                        file=relative,
-                        line=line_number,
-                        type=match.secret_type,
-                        entropy=round(shannon_entropy(match.value.encode("utf-8")), 4),
-                        snippet_hash=self._hasher.hash(match.value),
-                    )
-                )
+                self._append(findings, seen, match, line_number, relative)
         return findings
+
+    def _joined_window(
+        self, line: str, lines: list[str], index: int
+    ) -> tuple[str, int] | None:
+        """Jointure bornée de deux lignes, pour les secrets coupés par un ``\\n``.
+
+        La fenêtre est limitée à :data:`MULTILINE_WINDOW` octets : au-delà, un
+        secret coupé n'est pas recherché (limite documentée).
+        """
+        if index + 1 >= len(lines):
+            return None
+        following = lines[index + 1]
+        if len(line) + len(following) > MULTILINE_WINDOW:
+            return None
+        return line + following, len(line)
+
+    def _append(
+        self,
+        findings: list[Finding],
+        seen: set[tuple[int, str, str]],
+        match: SignatureMatch,
+        line_number: int,
+        relative: str,
+    ) -> None:
+        key = (line_number, match.secret_type, match.value)
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append(
+            Finding(
+                file=relative,
+                line=line_number,
+                type=match.secret_type,
+                entropy=round(shannon_entropy(match.value.encode("utf-8")), 4),
+                snippet_hash=self._hasher.hash(match.value),
+            )
+        )
 
 
 def scan(root: str | os.PathLike[str], *, hasher: SnippetHasher | None = None) -> list[Finding]:

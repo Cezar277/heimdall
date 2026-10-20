@@ -140,6 +140,8 @@ def test_signature_rules_are_identifiable() -> None:
         "aws_secret_access_key",
         "stripe_secret_key",
         "slack_token",
+        "slack_app_token",
+        "slack_rotating_token",
         "github_classic_pat",
         "github_fine_grained_pat",
         "jwt",
@@ -240,6 +242,41 @@ def test_jwt_payload_above_previous_bound_is_detected(tmp_path: Path) -> None:
     )
     findings = _scan_lines(tmp_path, f'JWT = "{jwt}"')
     assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "jwt")]
+
+
+@pytest.mark.parametrize("prefix", ["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xapp-", "xwfp-"])
+def test_slack_token_families_are_detected(tmp_path: Path, prefix: str) -> None:
+    """Familles Slack documentées (docs.slack.dev, consultées le 2026-10-20)."""
+    token = fake_token(prefix, 24)
+    findings = _scan_lines(tmp_path, f'SLACK = "{token}"')
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "slack")]
+
+
+def test_slack_rotating_token_is_detected(tmp_path: Path) -> None:
+    token = "xoxe." + fake_token("xapp-", 24)
+    findings = _scan_lines(tmp_path, f'SLACK = "{token}"')
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "slack")]
+
+
+def test_unknown_slack_family_is_not_reported(tmp_path: Path) -> None:
+    """Limite documentée : une famille Slack non publiée n'est pas couverte."""
+    token = fake_token("xoxo-", 24)
+    assert _scan_lines(tmp_path, f'SLACK = "{token}"') == []
+
+
+def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:
+    """Un secret coupé par un retour à la ligne reste détecté (fenêtre 4 Kio)."""
+    secret = fake_token("", 40)
+    _write(tmp_path, "split.py", f'aws_secret_access_key =\n"{secret}"\n')
+    findings = find_candidates(str(tmp_path))
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+
+
+def test_split_secret_beyond_the_window_is_a_documented_limit(tmp_path: Path) -> None:
+    """Au-delà de la fenêtre de 4 Kio, le secret coupé n'est pas recherché."""
+    secret = fake_token("", 40)
+    _write(tmp_path, "wide.py", "aws_secret_access_key = " + "x" * 5_000 + f'\n"{secret}"\n')
+    assert find_candidates(str(tmp_path)) == []
 
 
 # --- Exclusions (#59) -------------------------------------------------------
@@ -350,12 +387,33 @@ def test_decode_text_fails_closed_on_ambiguous_nul() -> None:
 
 @pytest.mark.parametrize("magic", [b"\x7fELF", b"\x89PNG\r\n\x1a\n", b"PK\x03\x04"])
 def test_decode_text_identifies_known_binary_magic(magic: bytes) -> None:
-    assert decode_text(magic + b"\x00\x00") is None
+    """Un vrai binaire (majorité non textuelle) reste ignoré par politique."""
+    assert decode_text(magic + bytes(range(256))) is None
+
+
+@pytest.mark.parametrize("magic", [b"\x7fELF", b"\x89PNG\r\n\x1a\n", b"PK\x03\x04"])
+def test_decode_text_refuses_magic_followed_by_text(magic: bytes) -> None:
+    """Une signature binaire suivie de texte clair n'est pas un contournement."""
+    with pytest.raises(ScanError):
+        decode_text(magic + b"\x00" + b"AKIA" + b"A" * 16)
 
 
 def test_extensionless_known_binary_is_ignored(tmp_path: Path) -> None:
-    _write(tmp_path, "elf", b"\x7fELF\x00\x00")
+    _write(tmp_path, "elf", b"\x7fELF" + bytes(range(256)))
     assert find_candidates(str(tmp_path)) == []
+
+
+def test_binary_magic_followed_by_a_secret_is_fail_closed(tmp_path: Path) -> None:
+    """4 octets de signature ne doivent pas transformer un refus en silence."""
+    _write(tmp_path, "polyglot_zip", b"PK\x03\x04\x00AKIA" + b"A" * 16)
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
+
+
+def test_png_magic_followed_by_a_secret_is_fail_closed(tmp_path: Path) -> None:
+    _write(tmp_path, "polyglot_png", b"\x89PNG\r\n\x1a\n\x00" + b"AKIA" + b"A" * 16)
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
 
 
 def test_extensionless_ambiguous_nul_is_fail_closed(tmp_path: Path) -> None:
@@ -368,6 +426,50 @@ def test_case_insensitive_excluded_directory(tmp_path: Path) -> None:
     _write(tmp_path, "VENDOR/lib.py", f'AWS = "{_aws("upper")}"')
     _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
     assert [finding["file"] for finding in find_candidates(str(tmp_path))] == ["app.py"]
+
+
+def test_symlinked_root_is_refused(tmp_path: Path) -> None:
+    """Une racine symlinkée est refusée : la cible ne doit pas être lue."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write(outside, "secret.txt", f'AWS = "{_aws("outside")}"')
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Création de liens symboliques non autorisée sous Windows")
+        raise
+    with pytest.raises(ScanError):
+        scan(link)
+
+
+def test_symlinked_single_file_root_is_refused(tmp_path: Path) -> None:
+    target = _write(tmp_path, "outside.txt", f'AWS = "{_aws("outside")}"')
+    link = tmp_path / "link.txt"
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Création de liens symboliques non autorisée sous Windows")
+        raise
+    with pytest.raises(ScanError):
+        scan(link)
+
+
+def test_root_under_a_symlinked_directory_is_refused(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write(outside, "secret.txt", f'AWS = "{_aws("outside")}"')
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Création de liens symboliques non autorisée sous Windows")
+        raise
+    with pytest.raises(ScanError):
+        scan(link / "secret.txt")
 
 
 def test_symlinks_are_never_followed(tmp_path: Path) -> None:
@@ -611,6 +713,16 @@ def test_local_key_unwritable_parent_is_fail_closed(
             load_local_key()
     finally:
         restricted.chmod(0o700)
+
+
+def test_local_key_rejects_parent_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``..`` dans l'override réécrirait le chemin de la clé : refus."""
+    monkeypatch.delenv(KEY_ENV)
+    monkeypatch.setenv(KEY_FILE_ENV, str(tmp_path / "a" / ".." / "b.key"))
+    with pytest.raises(ScanError):
+        load_local_key()
 
 
 def test_local_key_write_failure_is_fail_closed(

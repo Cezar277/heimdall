@@ -37,10 +37,16 @@ def _key_path() -> Path:
         path = Path(override).expanduser()
         if not path.is_absolute():
             raise ScanError(_KEY_ERROR)
+        # Aucun ``..`` : le chemin de la clé ne doit pas être réécrit
+        # silencieusement (il resterait un autre fichier que celui demandé).
+        if any(part == ".." for part in path.parts):
+            raise ScanError(_KEY_ERROR)
         return path
     xdg = os.environ.get("XDG_DATA_HOME")
     base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
     if not base.is_absolute():
+        raise ScanError(_KEY_ERROR)
+    if any(part == ".." for part in base.parts):
         raise ScanError(_KEY_ERROR)
     return base / "heimdall" / "snippet-hmac.key"
 

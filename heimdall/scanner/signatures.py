@@ -30,6 +30,7 @@ class SignatureMatch:
     secret_type: str
     signature: str
     value: str
+    start: int = 0
 
 
 def _signature(name: str, secret_type: str, pattern: str) -> Signature:
@@ -57,6 +58,16 @@ SIGNATURES: Final[tuple[Signature, ...]] = (
         "slack_token",
         "slack",
         r"(?P<value>\bxox[abprs]-[A-Za-z0-9-]{10,250}\b)",
+    ),
+    _signature(
+        "slack_app_token",
+        "slack",
+        r"(?P<value>\b(?<!\.)(?:xapp|xwfp)-[A-Za-z0-9-]{10,250}\b)",
+    ),
+    _signature(
+        "slack_rotating_token",
+        "slack",
+        r"(?P<value>\bxoxe\.[A-Za-z0-9-]{10,250}\b)",
     ),
     _signature(
         "github_classic_pat",
@@ -97,6 +108,7 @@ def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:
                     secret_type=signature.secret_type,
                     signature=signature.name,
                     value=match.group("value"),
+                    start=match.start(),
                 )
             )
     return tuple(matches)

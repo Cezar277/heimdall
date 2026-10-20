@@ -135,6 +135,11 @@ def is_excluded(relative_path: str | PurePosixPath) -> bool:
 
 _TEXT_RATIO_MIN: Final[float] = 0.95
 _ASCII_RATIO_MIN: Final[float] = 0.05
+_BINARY_RATIO_MIN: Final[float] = 0.50
+_FIRST_CONTROL_BYTE: Final[int] = 0x20
+_DELETE_BYTE: Final[int] = 0x7F
+_HIGH_BIT: Final[int] = 0x80
+_TEXT_BYTES: Final[frozenset[int]] = frozenset({0x09, 0x0A, 0x0D})
 _DECODE_ERROR: Final[str] = "scan impossible : entrée non analysable"
 
 # Signatures fortes de formats binaires connus. Un fichier sans extension qui
@@ -189,6 +194,22 @@ def _ascii_ratio(text: str) -> float:
     return sum(1 for character in text if character.isascii()) / len(text)
 
 
+def _binary_byte_ratio(data: bytes) -> float:
+    """Part des octets qui ne sont pas du texte ASCII imprimable."""
+    if not data:
+        return 0.0
+    binary = sum(
+        1
+        for byte in data
+        if (
+            (byte < _FIRST_CONTROL_BYTE and byte not in _TEXT_BYTES)
+            or byte == _DELETE_BYTE
+            or byte >= _HIGH_BIT
+        )
+    )
+    return binary / len(data)
+
+
 def _decode_exact(data: bytes, encoding: str) -> str:
     try:
         text = data.decode(encoding)
@@ -238,7 +259,10 @@ def decode_text(data: bytes) -> str | None:
     - BOM UTF-8/UTF-16/UTF-32 : décodage strict ;
     - UTF-16/UTF-32 sans BOM : heuristique bornée, jamais de remplacement ;
     - UTF-8 invalide sans NUL : remplacement, comme avant (#22) ;
-    - NUL sans décodage possible et sans signature binaire : ``ScanError``.
+    - signature binaire **et** contenu majoritairement binaire : ignoré par
+      politique (une simple signature suivie de texte clair ne suffit pas :
+      ce serait un contournement) ;
+    - NUL sans décodage possible : ``ScanError``.
     """
     if not data:
         return ""
@@ -253,9 +277,10 @@ def decode_text(data: bytes) -> str | None:
             return _decode_exact(data, encoding)
     if b"\x00" not in data:
         return data.decode("utf-8", errors="replace")
-    if any(data.startswith(magic) for magic in _BINARY_MAGIC):
-        return None
     decoded = _decode_utf16_or_32(data)
     if decoded is not None:
         return decoded
+    if any(data.startswith(magic) for magic in _BINARY_MAGIC):
+        if _binary_byte_ratio(data) >= _BINARY_RATIO_MIN:
+            return None
     raise ScanError(_DECODE_ERROR)
