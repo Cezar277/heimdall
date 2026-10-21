@@ -120,8 +120,11 @@ reste sur le nom exact, jamais sur une sous-chaîne.
 
 ## Comment un candidat devient un Finding
 
-1. `find_signature_matches(line)` parcourt les règles dans l'ordre stable du
-   registre, applique le filtre de mots-clés s'il existe, puis `finditer()`.
+1. `find_signature_matches(line)` — importé explicitement de
+   `heimdall.scanner.signatures`, jamais du paquet `heimdall.scanner` (voir
+   [Une seule surface d'export](#une-seule-surface-dexport)) — parcourt les
+   règles dans l'ordre stable du registre, applique le filtre de mots-clés
+   s'il existe, puis `finditer()`.
 2. Les correspondances sont dédupliquées par `(type, valeur)` : une même
    valeur répétée sur la même ligne ne produit qu'un candidat, mais deux
    valeurs distinctes du même type restent deux candidats.
@@ -179,8 +182,27 @@ Cette règle couvre aussi les objets intermédiaires :
 - `SignatureMatch.value`, `RuleMatch.group("value")` et `RuleMatch.string`
   restent des **données sensibles** : le moteur les hache immédiatement et
   aucun appelant ne doit les journaliser, les sérialiser ni les transmettre à
-  un LLM. `find_signature_matches()` est volontairement absente de `__all__`
-  pour cette raison (import explicite réservé au moteur et aux tests).
+  un LLM.
+
+### Une seule surface d'export
+
+`find_signature_matches()` rend la **valeur brute** des candidats : elle
+n'est exportée par **aucun** paquet public.
+
+- elle est absente de `__all__` dans `heimdall.scanner.signatures` ;
+- elle n'est **pas** réexportée par `heimdall.scanner` : la réexportation
+  rendait `from heimdall.scanner import find_signature_matches` possible et
+  élargissait la surface sensible au niveau le plus visible du paquet, alors
+  que le registre la tient déjà hors de son `__all__` ;
+- elle reste accessible par un import **explicite** de
+  `heimdall.scanner.signatures`, réservé au moteur et aux tests.
+
+`heimdall.scanner` n'expose donc que la surface publique annoncée par son
+`__all__`. Les deux tests
+`test_the_raw_value_matcher_is_not_reexported_by_the_scanner_package` et
+`test_the_scanner_package_still_exports_its_documented_surface` verrouillent
+cette politique : l'absence de réexportation d'un côté, l'intégrité de la
+surface publique de l'autre.
 
 La durée de vie de la valeur candidate est **bornée à son hachage** :
 
@@ -347,6 +369,11 @@ noms qu'elle reconnaît effectivement.
 - Le type d'un Finding produit par le registre est **borné** à l'ensemble
   `aws` / `stripe` / `slack` / `pat` / `jwt` / `pem` : un nouveau fournisseur
   implique d'ajouter son type à `ALLOWED_SECRET_TYPES` et de le documenter ici.
+- `find_signature_matches` n'est exportée par **aucun** paquet public :
+  `heimdall.scanner` ne l'expose pas, et le registre la tient hors de son
+  `__all__`. Elle s'importe explicitement de `heimdall.scanner.signatures`,
+  et rend la valeur brute : c'est une surface sensible assumée, réservée au
+  moteur et aux tests.
 
 ## Ajouter ou modifier une règle
 
@@ -374,7 +401,7 @@ noms qu'elle reconnaît effectivement.
 ```
 
 Résultats locaux du 21 octobre 2026 (après les correctifs de relecture) :
-**158 passed** pour le fichier ciblé, **1269 passed, 1 xfailed** pour la suite
+**160 passed** pour le fichier ciblé, **1271 passed, 1 xfailed** pour la suite
 complète (le `xfail` est celui de T21, qui attend le branchement réel du
 scanner #59). Les couples module + ligne et les permaliens sont dans
 [t54-samm.md](t54-samm.md).
