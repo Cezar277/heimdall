@@ -10,7 +10,8 @@ Invariants :
   empreinte HMAC-SHA-256 et l'entropie ;
 - une même valeur identique n'est produite qu'une fois par ligne, mais deux
   valeurs distinctes du même type restent deux Findings ;
-- la jointure de deux lignes pour un secret coupé est **bornée** à 4 Kio ;
+- la jointure de deux lignes pour un secret coupé est **bornée** à 4 Kio
+  (4096 octets UTF-8) et n'a lieu qu'entre lignes **contiguës** ;
 - les regex du registre sont linéaires et bornées (anti-ReDoS).
 """
 
@@ -24,7 +25,7 @@ from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import ScanTarget
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
-#: Fenêtre maximale de jointure de deux lignes pour un secret coupé.
+#: Fenêtre maximale de jointure de deux lignes, en **octets UTF-8** (4 Kio).
 MULTILINE_WINDOW: Final[int] = 4096
 
 
@@ -66,13 +67,31 @@ class SignatureEngine:
         lines: tuple[tuple[int, str], ...],
         index: int,
     ) -> tuple[str, int] | None:
-        """Jointure bornée de deux lignes, pour un secret coupé par ``\\n``."""
+        """Jointure bornée de deux lignes **contiguës**, pour un secret coupé.
+
+        ``DiffTarget`` ne contient que les lignes *ajoutées* du diff : deux
+        entrées voisines de la liste peuvent porter des numéros distants
+        (12 puis 15). Les joindre fabriquerait une chaîne qui n'existe dans
+        aucun fichier et attribuerait le Finding à la mauvaise ligne. La
+        jointure exige donc ``numéro_suivant == numéro_courant + 1``.
+
+        La borne est mesurée en octets UTF-8, conformément à la fenêtre de
+        4 Kio documentée.
+        """
         if index + 1 >= len(lines):
             return None
-        following = lines[index + 1][1]
-        if len(line) + len(following) > MULTILINE_WINDOW:
+        current_number, _current = lines[index]
+        following_number, following = lines[index + 1]
+        if following_number != current_number + 1:
             return None
-        return line + following, len(line)
+        joined = line + following
+        if len(joined) > MULTILINE_WINDOW:
+            return None
+        # Le nombre de caractères minore le nombre d'octets UTF-8 : le premier
+        # contrôle évite d'encoder les lignes déjà trop longues.
+        if not joined.isascii() and len(joined.encode("utf-8")) > MULTILINE_WINDOW:
+            return None
+        return joined, len(line)
 
     def _append(
         self,

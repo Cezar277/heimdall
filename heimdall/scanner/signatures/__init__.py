@@ -13,7 +13,7 @@ des ``Finding`` avec une empreinte HMAC (voir ``signature_engine``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final
 
 from heimdall.scanner.signatures.aws_cloud import RULES as AWS_CLOUD_RULES
@@ -52,13 +52,22 @@ class SignatureMatch:
 
     Usage **interne** : ``value`` n'est jamais sérialisée dans un Finding. Le
     moteur la hache immédiatement (HMAC-SHA-256, ADR-001) et ne la conserve
-    pas au-delà de la construction du Finding.
+    pas au-delà de la construction du Finding. Le ``repr`` ne reflète jamais
+    ``value`` (invariant 8) : journaliser un match ne doit pas écrire le
+    secret en clair.
     """
 
     secret_type: str
     signature: str
-    value: str
+    value: str = field(repr=False)
     start: int = 0
+
+    def __repr__(self) -> str:
+        """Résumé sans la valeur candidate (jamais de secret dans un ``repr``)."""
+        return (
+            f"SignatureMatch(type={self.secret_type!r}, "
+            f"signature={self.signature!r}, start={self.start})"
+        )
 
     @property
     def rule_id(self) -> str:
@@ -86,6 +95,12 @@ def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:
     deux valeurs distinctes du même type restent deux candidats (un secret ne
     doit jamais en masquer un autre). L'ordre du registre est conservé, puis
     l'ordre des occurrences dans la ligne.
+
+    .. warning::
+       Le retour contient la **valeur brute** du candidat
+       (``SignatureMatch.value``). Ces données sont sensibles : ne jamais les
+       journaliser, les sérialiser ni les transmettre à un LLM. Le moteur les
+       hache immédiatement et ne rend que des ``Finding`` sans valeur.
     """
     matches: list[SignatureMatch] = []
     seen: set[tuple[str, str]] = set()
@@ -107,6 +122,9 @@ def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:
     return tuple(matches)
 
 
+# ``find_signature_matches`` reste importable explicitement, mais n'est
+# volontairement pas dans ``__all__`` : son retour contient des valeurs brutes
+# (surface sensible, réservée au moteur et aux tests).
 __all__ = [
     "FAMILIES",
     "RULES",
@@ -114,6 +132,5 @@ __all__ = [
     "Rule",
     "Signature",
     "SignatureMatch",
-    "find_signature_matches",
     "rules_for_family",
 ]

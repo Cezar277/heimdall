@@ -16,12 +16,98 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Any, Final
 
 #: Grammaire commune aux identifiants de règle et aux types Finding (#14).
 _ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z][a-z0-9_]*")
 _MAX_IDENTIFIER_LENGTH: Final[int] = 64
 _VALUE_GROUP: Final[str] = "value"
+
+
+class RuleMatch:
+    """Correspondance d'une règle dont le ``repr`` ne montre pas le candidat.
+
+    ``re.Match`` expose le texte reconnu dans son ``repr`` (``match='...'``) :
+    un simple ``log.debug("%r", match)`` écrirait un secret en clair. Ce
+    wrapper délègue l'API utile de ``re.Match`` mais son ``repr`` se limite à
+    l'identifiant de règle et aux bornes.
+
+    Le candidat reste accessible par ``group("value")`` : ces données sont
+    sensibles et ne doivent jamais être journalisées, sérialisées ni
+    transmises à un LLM.
+    """
+
+    __slots__ = ("_match", "_rule_id")
+
+    def __init__(self, match: re.Match[str], rule_id: str) -> None:
+        self._match = match
+        self._rule_id = rule_id
+
+    def __repr__(self) -> str:
+        start, end = self._match.span()
+        return f"RuleMatch(rule={self._rule_id!r}, span=({start}, {end}))"
+
+    def group(self, *groups: int | str) -> Any:
+        """Délègue à ``re.Match.group`` (le groupe ``value`` est sensible)."""
+        return self._match.group(*groups)
+
+    def __getitem__(self, group: int | str) -> Any:
+        """Délègue à ``re.Match.__getitem__`` (accès explicite au candidat)."""
+        return self._match[group]
+
+    def groups(self, default: str | None = None) -> tuple[str | None, ...]:
+        """Délègue à ``re.Match.groups``."""
+        return self._match.groups(default)
+
+    def groupdict(self, default: str | None = None) -> dict[str, str | None]:
+        """Délègue à ``re.Match.groupdict``."""
+        return self._match.groupdict(default)
+
+    def start(self, group: int | str = 0) -> int:
+        """Délègue à ``re.Match.start``."""
+        return self._match.start(group)
+
+    def end(self, group: int | str = 0) -> int:
+        """Délègue à ``re.Match.end``."""
+        return self._match.end(group)
+
+    def span(self, group: int | str = 0) -> tuple[int, int]:
+        """Délègue à ``re.Match.span``."""
+        return self._match.span(group)
+
+    def expand(self, template: str) -> str:
+        """Délègue à ``re.Match.expand``."""
+        return self._match.expand(template)
+
+    @property
+    def re(self) -> re.Pattern[str]:
+        """Motif compilé, comme ``re.Match.re``."""
+        return self._match.re
+
+    @property
+    def string(self) -> str:
+        """Ligne analysée, comme ``re.Match.string`` (donnée sensible)."""
+        return self._match.string
+
+    @property
+    def pos(self) -> int:
+        """Position de départ de la recherche."""
+        return self._match.pos
+
+    @property
+    def endpos(self) -> int:
+        """Position de fin de la recherche."""
+        return self._match.endpos
+
+    @property
+    def lastindex(self) -> int | None:
+        """Index du dernier groupe capturé."""
+        return self._match.lastindex
+
+    @property
+    def lastgroup(self) -> str | None:
+        """Nom du dernier groupe capturé."""
+        return self._match.lastgroup
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,13 +175,17 @@ class Rule:
         """Motif compilé (le groupe nommé ``value`` porte le candidat)."""
         return self._pattern
 
-    def matches(self, line: str) -> tuple[re.Match[str], ...]:
+    def matches(self, line: str) -> tuple[RuleMatch, ...]:
         """Toutes les correspondances de la règle dans ``line``.
 
         Les mots-clés, s'ils sont déclarés, sont un **filtre de contexte** :
         aucun d'eux présent (casse ignorée) signifie aucune correspondance.
         Le filtre ne remplace pas l'ancrage de la regex ; il évite seulement
         de chercher une forme trop générique dans un contexte non pertinent.
+
+        Les objets rendus portent le candidat via ``group("value")`` ; leur
+        ``repr`` est masqué (``RuleMatch``) pour qu'une journalisation
+        accidentelle n'écrive jamais le secret en clair.
         """
         if not isinstance(line, str):
             return ()
@@ -103,7 +193,11 @@ class Rule:
             lowered = line.casefold()
             if not any(keyword in lowered for keyword in self.keywords):
                 return ()
-        return tuple(match for match in self._pattern.finditer(line) if match.group(_VALUE_GROUP))
+        return tuple(
+            RuleMatch(match, self.id)
+            for match in self._pattern.finditer(line)
+            if match.group(_VALUE_GROUP)
+        )
 
 
 def _check_identifier(value: object, label: str) -> None:

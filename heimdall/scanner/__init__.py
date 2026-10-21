@@ -31,8 +31,8 @@ from heimdall.scanner.signatures import (
     Rule,
     Signature,
     SignatureMatch,
-    find_signature_matches,
 )
+from heimdall.scanner.signatures import find_signature_matches as find_signature_matches
 
 __all__ = [
     "FINDING_FIELDS",
@@ -54,5 +54,4 @@ __all__ = [
     "SignatureEngine",
     "SignatureMatch",
     "find_candidates",
-    "find_signature_matches",
 ]

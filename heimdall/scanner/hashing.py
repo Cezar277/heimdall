@@ -5,9 +5,17 @@ La clé locale fait 32 octets et vit **hors du dépôt** :
 fichier sous ``$XDG_DATA_HOME/heimdall/snippet-hmac.key`` (défaut
 ``~/.local/share/heimdall/snippet-hmac.key``), créé en ``0600``. Le fichier
 doit appartenir à l'utilisateur courant et son répertoire parent est durci en
-``0700``. Toute lecture ou création impossible lève ``ScanError`` : aucune clé
-éphémère ne masque une panne, et les empreintes restent stables entre deux
-exécutions.
+``0700``. Aucun composant du chemin ne peut être un lien symbolique : le
+chemin résolu doit être **exactement** le chemin demandé, sinon la clé serait
+créée hors du répertoire prévu. Toute lecture ou création impossible lève
+``ScanError`` : aucune clé éphémère ne masque une panne, et les empreintes
+restent stables entre deux exécutions.
+
+Dérogation assumée à l'invariant 3 (garde de chemin unique du MCP) : ce
+chemin est un **état local** fourni par l'opérateur (``XDG_DATA_HOME`` ou
+``HEIMDALL_SNIPPET_HMAC_KEY_FILE``), jamais un chemin issu du dépôt ou du LLM.
+La garde reste fail-closed (absolu, sans ``..``, sans lien symbolique,
+propriétaire et permissions vérifiés).
 
 La primitive ``hmac``/``hashlib`` de la bibliothèque standard n'est pas la
 crypto du Vault : l'invariant 5 (``cryptography``/``argon2`` confinés à
@@ -73,12 +81,24 @@ def _check_owner_and_mode(metadata: os.stat_result) -> None:
 
 
 def _harden_parent(parent: Path) -> Path:
-    """Crée ou durcit le répertoire de la clé et retourne son chemin résolu."""
+    """Crée ou durcit le répertoire de la clé et retourne son chemin résolu.
+
+    ``parent`` est absolu et sans ``..`` (voir ``_key_path``). Après
+    ``mkdir``, la résolution doit rendre **exactement** le chemin demandé :
+    un lien symbolique sur le dernier composant *ou sur un composant
+    intermédiaire* est refusé, car il déporterait la clé hors du répertoire
+    prévu. ``O_NOFOLLOW`` protège ensuite l'ouverture du fichier lui-même.
+    """
     try:
         if parent.is_symlink():
             raise ScanError(_KEY_ERROR)
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         resolved = parent.resolve(strict=True)
+        # Sans lien symbolique, `resolve` est idempotent : toute différence
+        # signifie qu'un composant a été redirigé (attaque ou configuration
+        # inattendue), donc refus fail-closed.
+        if resolved != parent:
+            raise ScanError(_KEY_ERROR)
         metadata = resolved.stat()
         if not stat.S_ISDIR(metadata.st_mode):
             raise ScanError(_KEY_ERROR)
@@ -87,7 +107,14 @@ def _harden_parent(parent: Path) -> Path:
             owner = getattr(metadata, "st_uid", None)
             if uid is not None and owner is not None and owner != uid:
                 raise ScanError(_KEY_ERROR)
-            if stat.S_IMODE(metadata.st_mode) & 0o077:
+            mode = stat.S_IMODE(metadata.st_mode)
+            # Un répertoire accessible en écriture au monde (ex. /tmp, 01777)
+            # n'est jamais chmodé : cela détruirait les permissions d'un
+            # répertoire partagé, voire bloquerait le système si le scanner
+            # tourne en root. On refuse fail-closed avant tout changement.
+            if mode & 0o002:
+                raise ScanError(_KEY_ERROR)
+            if mode & 0o077:
                 os.chmod(resolved, 0o700)
                 if stat.S_IMODE(resolved.stat().st_mode) & 0o077:
                     raise ScanError(_KEY_ERROR)
