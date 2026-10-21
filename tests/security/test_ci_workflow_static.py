@@ -52,6 +52,31 @@ def test_actions_epinglees_par_sha() -> None:
     assert sorted(uses) == sorted(expected)
 
 
+def test_all_workflows_pin_actions_by_sha() -> None:
+    """Aucun workflow ne consomme d'action via tag mutable (revue #144).
+
+    `test_actions_epinglees_par_sha` ne lit que `ci.yml` : sans ce garde,
+    `vault-contract.yml` est repassé à `actions/checkout@v7` sans être
+    détecté. Ici on itère sur tous les `*.yml` de `.github/workflows/`
+    avec la même regex : chaque `uses:` doit être `nom@sha40`.
+    Seule la forme est exigée (pas la liste exacte par fichier, qui
+    évolue avec Dependabot, ex. `actions/cache` en #143).
+    """
+    workflows = sorted((REPO / ".github" / "workflows").glob("*.yml"))
+    assert workflows, "aucun workflow ?"
+    for workflow in workflows:
+        active = "\n".join(
+            line
+            for line in workflow.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        uses = re.findall(r"uses:\s*(\S+)", active)
+        for action in uses:
+            assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", action), (
+                f"{workflow.name}: {action}"
+            )
+
+
 def test_pas_de_pull_request_target_ni_pull_request() -> None:
     # pull_request_target exécuterait du code de PR avec un token en écriture.
     assert "pull_request_target" not in ACTIVE
