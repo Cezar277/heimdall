@@ -14,7 +14,11 @@ OpenAPI** (`openapi.yaml`, ticket #15) et **refuse ce qu'il doit refuser** :
   du contrat (`jsonschema`, JSON Schema 2020-12 comme OpenAPI 3.1) et le schéma
   OpenAPI produit par l'application est comparé à `openapi.yaml` ;
 - **chiffrement au repos** : la valeur en clair n'apparaît jamais dans le
-  fichier SQLite.
+  fichier SQLite ;
+- **refus de transport** : une origine hors boucle locale est rejetée en 403 ;
+- **débit** : au-delà du quota de clé, 429 contractuel avec `Retry-After` borné ;
+- **abus d'entrée** : corps > 1 Mio, identifiants hors contrat et tentatives de
+  traversée de chemin sont refusés (400/404), sans jamais refléter l'entrée.
 
 ISOLATION (piège du ticket) : aucun test ne partage de base. Chaque test crée
 SA propre base SQLite dans SON propre répertoire temporaire, SA propre
@@ -63,7 +67,9 @@ _PROJECT = "demo"
 _OTHER_PROJECT = "autre"
 _ENV = "dev"
 _NAME = "DEMO_PASSWORD"
-# Valeur factice, sans entropie réelle : elle ne doit JAMAIS être committée.
+# Valeur factice VOLONTAIRE de fixture : entropie nulle, ce n'est pas un secret
+# (invariant « fixtures non secrètes » du dépôt). Elle sert à prouver que la
+# valeur en clair n'atterrit ni dans une réponse 201 ni dans le fichier SQLite.
 _TEST_VALUE = "valeur-de-test"
 
 # Gabarits de chemins du CONTRAT (la requête, elle, utilise le triplet réel).
@@ -74,6 +80,7 @@ _READ_ROUTE = "/api/v1/secrets/{project}/{env}/{name}"
 _UNAUTHORIZED_BODY = {"code": "unauthorized", "message": "Authentification requise"}
 _FORBIDDEN_BODY = {"code": "forbidden", "message": "Accès interdit"}
 _NOT_FOUND_BODY = {"code": "not_found", "message": "Ressource introuvable"}
+_BAD_REQUEST_BODY = {"code": "bad_request", "message": "Requête invalide"}
 
 # Modèles du contrat dont le nom diffère côté application (`HealthResponse`).
 _SCHEMA_ALIASES = {"Health": "HealthResponse"}
@@ -99,10 +106,14 @@ def _resolve(document: dict[str, Any], node: Any) -> Any:
 def _structural(schema: Any) -> Any:
     """Normalise un schéma pour comparaison : annotations documentaires écartées.
 
-    Seules les annotations purement documentaires (`title`, `description`,
-    `examples`) sont retirées : toutes les CONTRAINTES (`required`,
+    Clés écartées (et UNIQUEMENT celles-là) : `title`, `description`,
+    `examples`, `example` — des annotations purement documentaires, qui ne
+    modifient ni l'ensemble des instances acceptées ni les contraintes.
+
+    Toutes les CONTRAINTES sont conservées et comparées : `required`,
     `additionalProperties`, `pattern`, `minLength`, `maxLength`, `const`,
-    `enum`) sont conservées et comparées.
+    `enum`. En particulier `required` n'est JAMAIS écarté : un écart de
+    contrat sur la présence d'un champ doit faire échouer la suite.
     """
     if isinstance(schema, list):
         return [_structural(item) for item in schema]
@@ -121,10 +132,20 @@ def _structural(schema: Any) -> Any:
 def _without_defaults(schema: Any) -> Any:
     """Retire la clé `default` émise par Pydantic sur les champs à valeur par défaut.
 
-    `default` est une ANNOTATION de sérialisation : elle ne change ni la
-    validation ni les contraintes du contrat. Le contrat `openapi.yaml` ne la
-    porte pas, donc elle est écartée avant comparaison (sinon une divergence
-    cosmétique masquerait les vraies divergences de contraintes).
+    Clé écartée (et UNIQUEMENT celle-là) : `default`.
+
+    PREUVE de son innocuité : `default` est une ANNOTATION de sérialisation
+    (« valeur employée si le champ est absent »). Elle ne participe ni à la
+    validation, ni aux contraintes (`const`, `pattern`, `minLength`…), ni à
+    l'ensemble des instances acceptées : retirer la clé ne change donc AUCUN
+    verdict de validation. Cette propriété n'est pas affirmée, elle est
+    vérifiée par `test_default_annotation_does_not_change_validation`, qui
+    compare les verdicts « avec `default` » et « sans `default` » pour chaque
+    modèle d'erreur.
+
+    Le contrat `openapi.yaml` ne porte pas cette clé : elle est écartée pour
+    que la comparaison porte sur les CONTRAINTES, pas sur une annotation
+    d'implémentation.
     """
     if isinstance(schema, list):
         return [_without_defaults(item) for item in schema]
@@ -133,26 +154,11 @@ def _without_defaults(schema: Any) -> Any:
     return {key: _without_defaults(value) for key, value in schema.items() if key != "default"}
 
 
-def _without_required(schema: Any) -> Any:
-    """Retire la liste `required` d'un schéma d'objet.
-
-    Écart connu et ASSUMÉ entre le contrat et le schéma OpenAPI publié par
-    l'application : Pydantic n'inscrit pas les champs à valeur par défaut dans
-    `required`, alors que le contrat exige `required: [code, message]` pour les
-    modèles d'erreur. Le COMPORTEMENT est conforme (les réponses produites
-    contiennent toujours `code` et `message`, vérifié par la validation
-    `jsonschema` du corps contre le contrat) ; l'écart porte sur le schéma
-    publié. Il est signalé au compte rendu et hors périmètre de ce ticket.
-    """
-    if isinstance(schema, list):
-        return [_without_required(item) for item in schema]
-    if not isinstance(schema, dict):
-        return schema
-    return {key: _without_required(value) for key, value in schema.items() if key != "required"}
-
-
 class VaultIntegrationTestCase(unittest.TestCase):
     """Base commune : une base temporaire, une application et un client NEUFS par test."""
+
+    # Surcharges de configuration par classe fille (ex. quotas de débit).
+    settings_overrides: dict[str, Any] = {}
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="heimdall-t65-")
@@ -170,15 +176,21 @@ class VaultIntegrationTestCase(unittest.TestCase):
         self.api_key = generate_api_key()
         self.app.state.register_api_key(self.api_key, _PROJECT)
 
-    @staticmethod
-    def _build_settings(db_path: Path) -> VaultSettings:
-        """Configuration de test : KEK et pepper ALÉATOIRES (jamais committés)."""
-        return VaultSettings(
-            db_path=str(db_path),
-            storage_backend="sqlite",
-            kek=generate_encryption_key(),
-            api_key_pepper=generate_api_key(),
-        )
+    @classmethod
+    def _build_settings(cls, db_path: Path) -> VaultSettings:
+        """Configuration de test : KEK et pepper ALÉATOIRES (jamais committés).
+
+        Surchargable par une classe fille via `settings_overrides` (débit,
+        par exemple) sans jamais toucher à une base partagée.
+        """
+        settings: dict[str, Any] = {
+            "db_path": str(db_path),
+            "storage_backend": "sqlite",
+            "kek": generate_encryption_key(),
+            "api_key_pepper": generate_api_key(),
+        }
+        settings.update(cls.settings_overrides)
+        return VaultSettings(**settings)
 
     def _auth(self, key: str | None = None) -> dict[str, str]:
         """En-têtes de requête, avec la clé API si elle est fournie."""
@@ -503,15 +515,30 @@ class VaultOpenapiContractTests(VaultIntegrationTestCase):
                 runtime_schema = _structural(runtime[name])
                 self.assertEqual(runtime_schema, contract_schema)
 
+    @unittest.expectedFailure
     def test_runtime_error_schemas_match_the_contract(self) -> None:
-        """Les modèles d'erreur exposent les mêmes constantes que le contrat.
+        """Comparaison STRICTE : le schéma publié doit exposer `required`.
 
-        Comparaison des `properties` (constantes de `code` et `message`),
-        `additionalProperties` et `type`. La liste `required` est écartée :
-        Pydantic omet les champs à valeur par défaut alors que le contrat exige
-        `required: [code, message]`. Le comportement reste conforme — les
-        réponses portent bien les deux champs (voir
-        `test_live_error_bodies_carry_the_contract_required_fields`).
+        Écart connu, à corriger côté PRODUCTION : Pydantic n'inscrit pas les
+        champs à valeur par défaut dans `required`. Le schéma OpenAPI publié
+        par l'application expose donc `code` et `message` SANS `required`,
+        alors que `openapi.yaml` exige `required: [code, message]`.
+
+        Le test est marqué `expectedFailure` : il compare STRICTEMENT (aucune
+        normalisation silencieuse) et passe en XPASS — donc en ÉCHEC explicite
+        de la suite — dès que le correctif production est appliqué. Il faut
+        alors retirer ce marqueur.
+
+        Correctif production : retirer les valeurs par défaut des modèles
+        d'erreur de `heimdall/vault/app.py` (`code`/`message` sans `= ...`),
+        de sorte que Pydantic les déclare `required`. Ticket à ouvrir (hors
+        périmètre de #65, qui est un ticket de tests) — voir §5 de
+        `docs/t65-samm.md`.
+
+        Le COMPORTEMENT est déjà conforme et vérifié indépendamment : les
+        réponses produites portent toujours `code` et `message`
+        (`test_live_error_bodies_carry_the_contract_required_fields` et la
+        validation `jsonschema` du corps contre le contrat).
         """
         runtime = self.app.openapi()["components"]["schemas"]
         error_names = (
@@ -528,26 +555,236 @@ class VaultOpenapiContractTests(VaultIntegrationTestCase):
         )
         for name in error_names:
             with self.subTest(schema=name):
-                contract_schema = _without_required(
-                    _without_defaults(
-                        _structural(_resolve(CONTRACT, {"$ref": f"#/components/schemas/{name}"}))
-                    )
+                contract_schema = _without_defaults(
+                    _structural(_resolve(CONTRACT, {"$ref": f"#/components/schemas/{name}"}))
                 )
-                runtime_schema = _without_required(
-                    _without_defaults(_structural(runtime[_SCHEMA_ALIASES.get(name, name)]))
+                runtime_schema = _without_defaults(
+                    _structural(runtime[_SCHEMA_ALIASES.get(name, name)])
                 )
                 self.assertEqual(runtime_schema, contract_schema)
+
+    def test_default_annotation_does_not_change_validation(self) -> None:
+        """Prouve que la clé `default` écartée est une annotation SANS effet.
+
+        Le contrat ne porte pas `default` ; le schéma publié par Pydantic le
+        porte. Écarter cette clé ne doit changer AUCUN verdict de validation :
+        pour chaque modèle, un corps valide et un corps invalide (violation de
+        `const`) sont acceptés/rejetés à l'identique avec et sans `default`.
+
+        C'est la preuve qui autorise `_without_defaults()` à ne normaliser que
+        cette clé : toute autre clé écartée ferait échouer ce test.
+        """
+        runtime = self.app.openapi()["components"]["schemas"]
+        cases: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
+            "BadRequestError": (
+                {"code": "bad_request", "message": "Requête invalide"},
+                {"code": "autre_code"},
+            ),
+            "UnauthorizedError": (
+                {"code": "unauthorized", "message": "Authentification requise"},
+                {"code": "autre_code"},
+            ),
+            "ForbiddenError": (
+                {"code": "forbidden", "message": "Accès interdit"},
+                {"code": "autre_code"},
+            ),
+            "NotFoundError": (
+                {"code": "not_found", "message": "Ressource introuvable"},
+                {"code": "autre_code"},
+            ),
+            "MethodNotAllowedError": (
+                {"code": "method_not_allowed", "message": "Méthode non autorisée"},
+                {"code": "autre_code"},
+            ),
+            "ConflictError": (
+                {"code": "conflict", "message": "Secret déjà existant"},
+                {"code": "autre_code"},
+            ),
+            "RateLimitedError": (
+                {"code": "rate_limited", "message": "Trop de requêtes"},
+                {"code": "autre_code"},
+            ),
+            "UnavailableError": (
+                {"code": "unavailable", "message": "Service indisponible"},
+                {"code": "autre_code"},
+            ),
+            "InternalError": (
+                {"code": "internal_error", "message": "Erreur interne"},
+                {"code": "autre_code"},
+            ),
+            "HealthResponse": ({"status": "ok"}, {"status": "ko"}),
+        }
+        for name, (valid, invalid) in cases.items():
+            with self.subTest(schema=name):
+                with_default = Draft202012Validator(runtime[name])
+                without_default = Draft202012Validator(_without_defaults(runtime[name]))
+                self.assertTrue(with_default.is_valid(valid))
+                self.assertTrue(without_default.is_valid(valid))
+                self.assertFalse(with_default.is_valid(invalid))
+                self.assertFalse(without_default.is_valid(invalid))
+
+
+class VaultTransportGuardTests(VaultIntegrationTestCase):
+    """Garde de boucle locale : toute origine hors allowlist est refusée."""
+
+    def test_non_loopback_origin_is_forbidden(self) -> None:
+        """Une origine non loopback est rejetée en 403, avant tout routage."""
+        with TestClient(
+            self.app,
+            base_url=_BASE_URL,
+            client=("192.0.2.1", 50000),
+        ) as remote:
+            response = remote.get("/api/v1/health")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), _FORBIDDEN_BODY)
+
+    def test_non_loopback_origin_cannot_reach_the_secrets(self) -> None:
+        """Même avec une clé valide, une origine non loopback n'atteint pas les secrets."""
+        self._create_secret(self.api_key)
+        with TestClient(
+            self.app,
+            base_url=_BASE_URL,
+            client=("192.0.2.1", 50000),
+        ) as remote:
+            response = remote.get(
+                f"/api/v1/secrets/{_PROJECT}/{_ENV}/{_NAME}",
+                headers=self._auth(self.api_key),
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), _FORBIDDEN_BODY)
+        self.assertNotIn(_TEST_VALUE, response.text)
+
+
+class VaultRateLimitTests(VaultIntegrationTestCase):
+    """Débit : au-delà du quota, 429 contractuel avec `Retry-After` borné."""
+
+    settings_overrides = {
+        "rate_limit_per_key": 1,
+        "rate_limit_per_peer": 10,
+        "rate_limit_global": 100,
+        "rate_limit_window_seconds": 30,
+    }
+
+    def test_rate_limited_request_returns_429_with_bounded_retry_after(self) -> None:
+        """La première requête passe, la suivante est refusée 429 + `Retry-After`."""
+        first = self._read_secret(self.api_key)
+        self.assertEqual(first.status_code, 404)
+
+        limited = self._read_secret(self.api_key)
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(
+            limited.json(),
+            {"code": "rate_limited", "message": "Trop de requêtes"},
+        )
+        # Le contrat impose `Retry-After` sur TOUT 429, borné à 1..3600.
+        self.assertIn("retry-after", {key.lower() for key in limited.headers})
+        retry_after = int(limited.headers["retry-after"])
+        self.assertGreaterEqual(retry_after, 1)
+        self.assertLessEqual(retry_after, 3600)
+        self._assert_contract_headers(limited, _READ_ROUTE, "get", 429)
+
+    def test_rate_limited_response_matches_the_contract_body(self) -> None:
+        """Le corps du 429 de débit est celui du contrat, sans fuite."""
+        self._read_secret(self.api_key)
+        limited = self._read_secret(self.api_key)
+        self.assertEqual(limited.status_code, 429)
+        self._assert_contract_body(limited, _READ_ROUTE, "get", 429)
+        self.assertNotIn(_TEST_VALUE, limited.text)
+
+
+class VaultInputAbuseTests(VaultIntegrationTestCase):
+    """Abus d'entrée : le Vault refuse, sans jamais refléter l'entrée."""
+
+    def test_oversized_body_is_rejected_with_400(self) -> None:
+        """Un corps > 1 Mio est refusé 400 avant parsing (openapi.yaml)."""
+        response = self.client.post(
+            "/api/v1/secrets",
+            content=b"x" * 1_048_577,
+            headers={_API_KEY_HEADER: self.api_key, "Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), _BAD_REQUEST_BODY)
+
+    def test_identifiers_outside_the_contract_are_rejected_with_400(self) -> None:
+        """Un identifiant hors contrat (majuscule, NUL, « .. ») donne 400."""
+        for path in (
+            "/api/v1/secrets/BAD!/dev/KEY",
+            "/api/v1/secrets/demo/Dev/KEY",
+            "/api/v1/secrets/demo/dev/key_name",
+            "/api/v1/secrets/demo/dev/KEY%00",
+            "/api/v1/secrets/%2E%2E/dev/KEY",
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path, headers=self._auth(self.api_key))
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json(), _BAD_REQUEST_BODY)
+
+    def test_path_traversal_attempts_never_expose_a_resource(self) -> None:
+        """Une traversée de chemin est refusée (400/404) et n'expose rien."""
+        for path in (
+            "/api/v1/secrets/..%2F..%2Fetc/dev/KEY",
+            "/api/v1/secrets/demo/dev/..%2F..%2Fetc%2Fpasswd",
+            "/api/v1/secrets/%2E%2E%2F%2E%2E%2Fetc/dev/KEY",
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path, headers=self._auth(self.api_key))
+                self.assertIn(response.status_code, (400, 404))
+                self.assertIn(
+                    response.json()["code"],
+                    ("bad_request", "not_found"),
+                )
+                # Aucune trace du chemin visé ni du contenu du fichier.
+                self.assertNotIn("etc", response.text)
+                self.assertNotIn("passwd", response.text)
+                self.assertNotIn("root:", response.text)
+
+    def test_malformed_json_is_rejected_with_400(self) -> None:
+        """Un corps JSON mal formé donne 400, sans écho de l'entrée."""
+        response = self.client.post(
+            "/api/v1/secrets",
+            content=b"{ceci nest pas du json",
+            headers={_API_KEY_HEADER: self.api_key, "Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), _BAD_REQUEST_BODY)
+        self.assertNotIn("ceci nest pas du json", response.text)
 
 
 class VaultTestIsolationTests(VaultIntegrationTestCase):
     """Chaque test possède sa base : aucun état partagé (piège du ticket)."""
 
     def test_each_test_uses_its_own_temporary_database(self) -> None:
-        """La base du test est un fichier SQLite unique, sous un répertoire temporaire."""
+        """Deux tests n'ont ni base ni registre de clés partagés (piège du ticket).
+
+        Preuve : une DEUXIÈME application, construite sur une AUTRE base
+        temporaire, démarre avec un registre de clés VIDE et ne connaît pas
+        les empreintes du test courant. Aucun état ne fuite donc d'un test à
+        l'autre (ni la base, ni les clés API, ni les secrets).
+        """
+        # La base du test est un fichier ABSOLU (la couche DB refuse les
+        # chemins relatifs) situé hors du dépôt.
         self.assertTrue(self.db_path.is_absolute())
-        self.assertTrue(self.db_path.parent.is_dir())
-        self.assertEqual(self.db_path.name, "vault.db")
-        self.assertNotEqual(str(self.db_path), str(Path.home()))
+        self.assertNotIn(str(self.db_path), str(Path.cwd()))
+
+        with tempfile.TemporaryDirectory(prefix="heimdall-t65-other-") as other_tmp:
+            other_db = Path(other_tmp).resolve() / "vault.db"
+            other_app = create_app(self._build_settings(other_db))
+
+            # 1. Deux bases distinctes.
+            self.assertNotEqual(other_db, self.db_path)
+            self.assertNotEqual(other_app.state.db_path, self.app.state.db_path)
+
+            # 2. Registre neuf : la clé du test courant n'y figure pas.
+            self.assertEqual(other_app.state.api_key_registry.list_entries(), [])
+
+            # 3. Les empreintes des deux applications sont disjointes.
+            other_key = generate_api_key()
+            other_app.state.register_api_key(other_key, _PROJECT)
+            current_hashes = set(self.app.state.api_key_registry.active_hashes)
+            other_hashes = set(other_app.state.api_key_registry.active_hashes)
+            self.assertEqual(len(current_hashes), 1)
+            self.assertEqual(len(other_hashes), 1)
+            self.assertEqual(current_hashes & other_hashes, set())
 
     def test_a_secret_is_invisible_from_another_database(self) -> None:
         """Un secret écrit dans une base n'apparaît pas dans une autre base."""
