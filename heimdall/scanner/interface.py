@@ -71,7 +71,15 @@ def _guard_call(action: Callable[[], _T], message: str) -> _T:
 
 
 def _check_path(value: object) -> None:
-    """Refuse un chemin qui n'est pas relatif au dépôt (contrat #14)."""
+    """Refuse un chemin qui n'est pas relatif au dépôt (contrat #14).
+
+    Garde lexicale seule (délègue à ``validate_relative_path``), sans I/O :
+    insuffisante contre les liens symboliques sortants et les TOCTOU
+    (invariant 3). Le consommateur qui ouvre le fichier DOIT résoudre avec
+    une racine fixée au démarrage (``resolve()`` + ``is_relative_to()``,
+    voir ``heimdall.mcp.paths.confine``) — exigible côté moteur #54/#59
+    et ``heimdall/mcp/gitdiff.py``.
+    """
     try:
         validate_relative_path(value)
     except ValueError:
@@ -238,8 +246,14 @@ class Scanner:
     __slots__ = ("_moteur",)
 
     def __init__(self, moteur: Moteur) -> None:
-        if not callable(getattr(moteur, "analyser", None)):
-            raise ScanError("moteur de détection invalide")
+        echec = False
+        analyser: object = None
+        try:
+            analyser = getattr(moteur, "analyser", None)
+        except Exception:
+            echec = True
+        if echec or not callable(analyser):
+            raise ScanError("moteur de détection invalide") from None
         self._moteur = moteur
 
     def scan(self, cible: ScanTarget) -> list[Finding]:
