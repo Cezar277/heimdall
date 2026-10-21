@@ -61,14 +61,12 @@ from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, Literal
-from uuid import uuid4
 
 import uvicorn
 from fastapi import Depends, FastAPI, Response
 from fastapi import Path as FastApiPath
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.security import APIKeyHeader
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -81,24 +79,20 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
+from heimdall.vault import auth as vault_auth
 from heimdall.vault.crypto import (
     VaultCipher,
-    constant_time_equal,
     generate_api_key,
     generate_api_key_pepper,
-    hash_api_key,
     kek_matches_pepper,
 )
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
     DatabaseUnavailableError,
     _assert_not_symlink,
-    ensure_project,
-    get_iso_timestamp,
     resolve_db_path,
     validate_db_path,
 )
-from heimdall.vault.database import runtime_db_session as db_session
 from heimdall.vault.ratelimit import RateLimiter, SqliteRateLimiter
 from heimdall.vault.store import (
     InMemorySecretStore,
@@ -107,6 +101,14 @@ from heimdall.vault.store import (
 )
 
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Alias de compatibilité ascendante : la primitive de hachage du pepper, la
+# dépendance FastAPI et le type d'identifiant de projet restent importables
+# depuis `heimdall.vault.app` (documentation et tests historiques).
+hash_api_key = vault_auth.hash_project_api_key
+project_api_key_header = vault_auth.project_api_key_header
+verify_api_key = vault_auth.verify_api_key
+ProjectId = vault_auth.ProjectId
 _MAX_BODY_SIZE: int = 1_048_576  # 1 Mio (1 048 576 octets)
 
 logger = logging.getLogger("heimdall.vault.app")
@@ -199,59 +201,16 @@ class InternalError(BaseModel):
     message: Literal["Erreur interne"] = "Erreur interne"
 
 
-project_api_key_header = APIKeyHeader(
-    name="X-Heimdall-API-Key",
-    scheme_name="ProjectApiKey",
-    auto_error=False,
-    description=(
-        "Clé d'authentification projet (ticket #64). "
-        "Générée à >= 256 bits via secrets.token_urlsafe(32)."
-    ),
-)
+# La dépendance FastAPI qui lit l'en-tête `X-Heimdall-API-Key`, la politique de
+# pepper, les constantes de validation des clés et le registre des clés API de
+# projet vivent dans `heimdall.vault.auth` (ticket #64) : ce module reste
+# centré sur le serveur (configuration, middlewares, routes).
 
+# Mode d'environnement normalisé (`HEIMDALL_ENV`) : partagé avec le module
+# d'authentification, qui porte la politique du pepper.
+_heimdall_env_mode = vault_auth.heimdall_env_mode
 
-_MAX_API_KEY_LENGTH: int = 512
-_DUMMY_HASH: str = "0" * 64
-_HASH_PATTERN: re.Pattern[str] = re.compile(r"^[0-9a-f]{64}$")
-# Politique #64 : une clé opérateur doit offrir une entropie comparable aux clés
-# émises par `generate_api_key` (``secrets.token_urlsafe(32)`` → 43 caractères,
-# 256 bits). Le contrôle est fail-closed sur les MOTIFS TRIVIAUX, en six
-# temps (remarque de revue « seuil de diversité trivial ») :
-# - alphabet base64url strict (A-Z, a-z, 0-9, « _ », « - ») : ni espaces ni
-#   caractères de contrôle, donc aucune ambiguïté de transport ;
-# - longueur minimale 43 caractères (matériau ≥ 256 bits si le token est
-#   canonique) ;
-# - au moins 16 caractères distincts : refuse « a » * 43 mais aussi
-#   « abcdefghijkl » * 4 (12 distincts, motif prévisible) ;
-# - aucune période répétitive : la clé ne peut pas être la répétition d'un
-#   bloc plus court (refuse « abab… », « 0123456789… », « abcdefghijklmnop » * 3) ;
-# - aucune suite monotone de 8+ caractères (``abcdefgh…``, ``0123456789…``,
-#   ``ZYXW…``) : devinables malgré 16+ distincts et sans période répétitive ;
-# - aucune ligne de clavier connue QWERTY/AZERTY/QWERTZ (``qwertyuiop…``,
-#   ``azerty…``, deux sens, insensible à la casse) : ni monotone ni
-#   répétitive, mais devinable.
-# Ce contrôle ne mesure PAS l'entropie : il n'exclut que les motifs triviaux.
-# EXIGENCE OPÉRATEUR (#64) : toute clé DOIT provenir de `generate_api_key()`
-# (256 bits aléatoires). Un contournement manuel — même passant les six
-# contrôles — est une faute opérationnelle : en cas de fuite des empreintes
-# et du pepper, seul un token aléatoire résiste au brute-force hors ligne.
-_MIN_API_KEY_LENGTH: int = 43
-_MIN_API_KEY_DISTINCT_CHARS: int = 16
-_API_KEY_ALPHABET_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]+$")
-# Aligné sur `crypto._MIN_PEPPER_BYTES` : défense en profondeur si les
-# empreintes stockées et le pepper fuient (résistance hors ligne).
-_MIN_API_KEY_PEPPER_BYTES: int = 32
-
-# Valeur publique de développement héritée : refusée hors tests explicites pour
-# empêcher tout déploiement partagé avec un pepper commité dans le dépôt.
-_INSECURE_DEFAULT_PEPPER: str = "heimdall_default_vault_pepper_dev_only"
-_TEST_ENV_MODES: frozenset[str] = frozenset({"test"})
 _PRODUCTION_ENV_MODES: frozenset[str] = frozenset({"production", "prod"})
-
-
-def _heimdall_env_mode() -> str:
-    """Retourne le mode d'environnement Heimdall normalisé (``HEIMDALL_ENV``)."""
-    return os.environ.get("HEIMDALL_ENV", "").strip().lower()
 
 
 @lru_cache(maxsize=1)
@@ -299,183 +258,13 @@ def _resolve_vault_cipher(
     return VaultCipher.generate()
 
 
-PROJECT_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_-]{0,63}(?![\s\S])")
+# Motifs d'identifiants du contrat (#15) : `project` vient du module
+# d'authentification (#64), qui valide aussi les clés API.
+PROJECT_PATTERN: re.Pattern[str] = vault_auth.PROJECT_ID_PATTERN
 ENV_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_-]{0,31}(?![\s\S])")
 NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Z][A-Z0-9_]{1,63}(?![\s\S])")
 
 
-def _validate_project_id(project_id: str) -> str:
-    """Valide l'identifiant de projet lié à une clé API (fail-fast sans écho).
-
-    Un identifiant hors ``PROJECT_PATTERN`` (ex. ``"../.."``, casse invalide, typo)
-    ne matcherait jamais un ``ProjectId`` de requête : la clé serait acceptée puis
-    refusée silencieusement en 403 à chaque appel. On refuse donc à l'enregistrement.
-    Le message est générique et ne reflète jamais la valeur fournie.
-    """
-    if not isinstance(project_id, str) or PROJECT_PATTERN.match(project_id) is None:
-        raise ValueError(
-            "Identifiant de projet invalide : attendu ^[a-z][a-z0-9_-]{0,63}$. "
-            "La clé API doit être liée à un identifiant de projet conforme au contrat."
-        )
-    return project_id
-
-
-def _minimal_pattern_period(value: str) -> int:
-    """Retourne la plus courte période répétée d'une chaîne (sa longueur si aucune).
-
-    Exemple : « abcdefghijkl » * 4 → 12, « ababab… » → 2, une chaîne sans
-    motif répété → sa longueur. Complexité O(n²) bornée par la longueur
-    maximale de clé (512) : l'appel est réservé à l'enregistrement.
-    """
-    length = len(value)
-    for period in range(1, length // 2 + 1):
-        if all(value[index] == value[index % period] for index in range(length)):
-            return period
-    return length
-
-
-_MIN_MONOTONIC_RUN_LENGTH: int = 8
-
-# Séquences de clavier connues (lignes complètes QWERTY/AZERTY/QWERTZ dans
-# les deux sens + préfixes célèbres) : devinables même avec 16+ distincts,
-# sans période répétitive ni suite monotone (ex. « qwertyuiop » n'est pas
-# ordinalement monotone). Comparaison insensible à la casse, fenêtre 8
-# (ligne entière si la ligne est plus courte) : un token aléatoire 256 bits
-# contient une telle sous-séquence avec une probabilité négligeable, un motif
-# humain l'y place systématiquement. Chiffres et alphabet séquentiels sont
-# déjà couverts par le contrôle monotone ; ici seules les lignes de clavier.
-_KEYBOARD_SEQUENCES: tuple[str, ...] = (
-    "qwertyuiop",
-    "asdfghjkl",
-    "zxcvbnm",
-    "azertyuiop",
-    "qsdfghjklm",
-    "wxcvbn",
-    "qwertzuiop",
-    "yxcvbnm",
-    "qwerty",
-    "azerty",
-    "qwertz",
-)
-_KEYBOARD_SEQUENCES += tuple(seq[::-1] for seq in _KEYBOARD_SEQUENCES)
-_MIN_KEYBOARD_RUN_LENGTH: int = 8
-
-
-def _has_known_keyboard_run(value: str) -> bool:
-    """Détecte une ligne de clavier connue (insensible à la casse).
-
-    Fenêtre 8 (ou ligne entière si plus courte) : toute sous-séquence de
-    8 d'une ligne connue — ou une ligne courte entière — présente dans la
-    clé en minuscules déclenche le refus. O(n·m) borné (512 caractères,
-    ~22 séquences) : appel réservé à l'enregistrement.
-    """
-    lowered = value.lower()
-    for seq in _KEYBOARD_SEQUENCES:
-        window = min(len(seq), _MIN_KEYBOARD_RUN_LENGTH)
-        for start in range(len(seq) - window + 1):
-            if seq[start : start + window] in lowered:
-                return True
-    return False
-
-
-def _has_long_monotonic_run(value: str, min_run: int = _MIN_MONOTONIC_RUN_LENGTH) -> bool:
-    """Détecte une suite monotone (croissante/décroissante, pas de ±1) de ``min_run``+.
-
-    Cible les motifs séquentiels prévisibles (``abcdefgh…``, ``0123456789…``,
-    ``ZYXW…``) qu'aucun des quatre contrôles précédents ne voit : alphabet
-    valide, longueur et diversité suffisantes, aucune période répétitive.
-    Seuil 8 : une suite de 8 sur token aléatoire 256 bits est négligeable
-    (≈ 43 × 64⁻⁷), un motif humain séquentiel l'atteint systématiquement.
-    Complexité O(n) bornée par 512 (appel réservé à l'enregistrement).
-    """
-    run = 1
-    last_step = 0
-    for prev, cur in zip(value, value[1:], strict=False):
-        step = ord(cur) - ord(prev)
-        if step in (1, -1) and step == last_step:
-            run += 1
-        elif step in (1, -1):
-            run = 2
-        else:
-            run = 1
-        last_step = step if step in (1, -1) else 0
-        if run >= min_run:
-            return True
-    return False
-
-
-def _validate_raw_api_key(raw_key: str) -> str:
-    """Valide une clé opérateur brute avant hachage (fail-fast, sans écho).
-
-    Les clés DOIVENT être générées par ``generate_api_key()``
-    (``secrets.token_urlsafe(32)``, 256 bits, 43 caractères) ou offrir une
-    diversité équivalente. La longueur seule ne suffit pas : ``"a" * 43``
-    serait brute-forçable hors ligne si la base d'empreintes et le pepper
-    fuyaient. Six contrôles cumulatifs refusent les motifs triviaux :
-    alphabet base64url strict, longueur ≥ 43, ≥ 16 caractères distincts,
-    absence de période répétitive (la clé ne peut pas être la répétition d'un
-    bloc plus court : « abcdefghijkl » * 4 et « abcdefghijklmnop » * 3 sont
-    désormais refusés), absence de suite monotone de 8+ caractères
-    (``abcdefgh…``, ``0123456789…`` : devinables même avec 16+ distincts,
-    sans période répétitive) et absence de ligne de clavier connue
-    (``qwertyuiop…``, ``azerty…`` : ni monotone ni répétitive, mais
-    devinable). Le message reste générique et ne reflète jamais
-    la clé. Ce contrôle reste un filtre de motifs triviaux, PAS une mesure
-    d'entropie. EXIGENCE OPÉRATEUR (#64) : toute clé DOIT provenir de
-    ``generate_api_key()`` (256 bits aléatoires) ; un contournement manuel —
-    même passant les six contrôles — est une faute opérationnelle, car en cas
-    de fuite des empreintes et du pepper, seul un token aléatoire résiste au
-    brute-force hors ligne.
-    """
-    if (
-        not isinstance(raw_key, str)
-        or not _MIN_API_KEY_LENGTH <= len(raw_key) <= _MAX_API_KEY_LENGTH
-        or raw_key != raw_key.strip()
-    ):
-        raise ValueError(
-            "La clé API brute doit comporter entre "
-            f"{_MIN_API_KEY_LENGTH} et {_MAX_API_KEY_LENGTH} caractères, "
-            "sans espaces de début ou de fin."
-        )
-    if _API_KEY_ALPHABET_PATTERN.fullmatch(raw_key) is None:
-        raise ValueError(
-            "La clé API brute doit être un token base64url (A-Z, a-z, 0-9, "
-            "« _ » et « - ») : ni espaces ni caractères de contrôle."
-        )
-    if len(set(raw_key)) < _MIN_API_KEY_DISTINCT_CHARS:
-        raise ValueError(
-            "La clé API brute est trop peu diverse : utiliser generate_api_key() "
-            "ou une clé aléatoire d'au moins 256 bits (motif trivial refusé)."
-        )
-    if _minimal_pattern_period(raw_key) != len(raw_key):
-        raise ValueError(
-            "La clé API brute repose sur un motif répétitif : utiliser "
-            "generate_api_key() ou une clé aléatoire d'au moins 256 bits "
-            "(motif trivial refusé)."
-        )
-    if _has_long_monotonic_run(raw_key):
-        raise ValueError(
-            "La clé API brute repose sur une suite prévisible : utiliser "
-            "generate_api_key() ou une clé aléatoire d'au moins 256 bits "
-            "(motif trivial refusé)."
-        )
-    if _has_known_keyboard_run(raw_key):
-        raise ValueError(
-            "La clé API brute repose sur une séquence de clavier prévisible : "
-            "utiliser generate_api_key() ou une clé aléatoire d'au moins "
-            "256 bits (motif trivial refusé)."
-        )
-    return raw_key
-
-
-ProjectId = Annotated[
-    str,
-    StringConstraints(
-        min_length=1,
-        max_length=64,
-        pattern=PROJECT_PATTERN,
-    ),
-]
 EnvironmentId = Annotated[
     str,
     StringConstraints(
@@ -765,43 +554,14 @@ class VaultSettings(BaseSettings):
     @field_validator("api_key_pepper")
     @classmethod
     def validate_api_key_pepper(cls, value: str | None) -> str | None:
-        """Valide le pepper : jamais vide et jamais le défaut public commité hors test.
+        """Valide le pepper : jamais vide, jamais court, jamais le défaut public.
 
-        La valeur ``heimdall_default_vault_pepper_dev_only`` est une constante
-        publique du dépôt : l'accepter reviendrait à un simple hash salé public,
-        corrélable entre déploiements. Elle n'est tolérée que sous
-        ``HEIMDALL_ENV=test`` explicite (fixtures déterministes).
+        La politique (longueur minimale, refus de la constante publique
+        committée hors ``HEIMDALL_ENV=test``) est appliquée par le module
+        d'authentification `heimdall.vault.auth` (ticket #64), seul propriétaire
+        du pepper et de la stratégie d'empreinte.
         """
-        if value is None:
-            return None
-        if value != value.strip():
-            raise ValueError(
-                "Le pepper serveur ne doit pas comporter d'espaces de début ou de fin."
-            )
-        cleaned = value
-        if not cleaned:
-            raise ValueError("Le pepper serveur ne peut pas être vide ou blanc.")
-        try:
-            pepper_bytes = cleaned.encode("utf-8")
-        except UnicodeEncodeError:
-            raise ValueError("Le pepper serveur doit être encodable en UTF-8.") from None
-        if len(pepper_bytes) < _MIN_API_KEY_PEPPER_BYTES:
-            raise ValueError(
-                "Le pepper serveur doit comporter au moins "
-                f"{_MIN_API_KEY_PEPPER_BYTES} octets (256 bits) : un secret court "
-                "réduit la résistance hors ligne des empreintes de clés API."
-            )
-        if (
-            cleaned == _INSECURE_DEFAULT_PEPPER
-            and _heimdall_env_mode() not in _TEST_ENV_MODES
-        ):
-            raise ValueError(
-                "Le pepper public de développement 'heimdall_default_vault_pepper_dev_only' "
-                "est refusé (valeur commitée partagée). Définissez "
-                "HEIMDALL_VAULT_API_KEY_PEPPER avec un secret unique et aléatoire ; "
-                "seul HEIMDALL_ENV=test explicite l'autorise pour des fixtures déterministes."
-            )
-        return cleaned
+        return vault_auth.validate_api_key_pepper(value)
 
     @model_validator(mode="after")
     def resolve_api_key_pepper(self) -> "VaultSettings":
@@ -1205,7 +965,7 @@ def _register_middleware(app: FastAPI) -> None:
         avant le routage et les dépendances. Une clé invalide ne crée aucun
         bucket arbitraire : seuls pair et global s'appliquent. Le choix du
         bucket par clé emprunte le même parcours à coût comparable que
-        ``verify_api_key`` (``_find_api_key_project_cached``) : le résultat est
+        ``verify_api_key`` (``find_api_key_project_cached``) : le résultat est
         mémoïsé dans la requête et réutilisé par l'authentification (un seul
         full-scan par requête, ticket #65) ; l'existence d'une clé n'est pas
         observable par le temps de réponse du middleware. La phase consommatrice
@@ -1231,7 +991,7 @@ def _register_middleware(app: FastAPI) -> None:
             )
         key_hash: str | None = None
         raw_key = request.headers.get("X-Heimdall-API-Key")
-        if raw_key is not None and len(raw_key) > _MAX_API_KEY_LENGTH:
+        if raw_key is not None and len(raw_key) > vault_auth.MAX_API_KEY_LENGTH:
             allowed, retry_after = await _limiter_consume_peer(limiter, peer)
             if not allowed:
                 return JSONResponse(
@@ -1246,14 +1006,16 @@ def _register_middleware(app: FastAPI) -> None:
             )
         if raw_key and raw_key == raw_key.strip() and request.url.path != "/api/v1/health":
             try:
-                candidate_hash = hash_api_key(
+                candidate_hash = vault_auth.hash_project_api_key(
                     raw_key,
                     pepper=request.app.state.settings.effective_api_key_pepper,
                 )
             except ValueError:
                 candidate_hash = None
             if candidate_hash is not None:
-                registered_project, _ = await _find_api_key_project_cached(request, candidate_hash)
+                registered_project, _ = await vault_auth.find_api_key_project_cached(
+                    request, candidate_hash
+                )
                 if registered_project is not None:
                     key_hash = candidate_hash
 
@@ -1355,136 +1117,6 @@ def _register_exception_handlers(app: FastAPI) -> None:
         )
 
 
-def _lookup_db_api_key(db_path: Any, provided_hash: str) -> tuple[str | None, int]:
-    """Recherche la clé API en base SQLite à coût comparable et sans oracle temporel."""
-    if not (isinstance(db_path, Path) and db_path.is_file()):
-        raise DatabaseUnavailableError("Stockage temporairement indisponible.")
-    matching_project: str | None = None
-    evaluated = 0
-    with db_session(db_path) as conn:
-        cursor = conn.execute("SELECT project_id, key_hash, revoked_at FROM api_keys")
-        for row in cursor.fetchall():
-            evaluated += 1
-            if constant_time_equal(provided_hash, row["key_hash"]):
-                if not row["revoked_at"]:
-                    matching_project = row["project_id"]
-    return matching_project, evaluated
-
-
-def _find_api_key_project(app: FastAPI, provided_hash: str) -> tuple[str | None, int]:
-    """Recherche le projet d'une empreinte de clé API à coût comparable.
-
-    Parcours complet des empreintes de la source autoritaire (mémoire en mode
-    memory, base seule en mode sqlite), sans ``break``
-    précoce et avec ``constant_time_equal`` pour chaque candidat : le coût est le
-    même que l'empreinte soit connue, inconnue ou révoquée. Ce parcours est
-    partagé par l'authentification (``verify_api_key``) et par le choix du bucket
-    de débit (ticket #65) : l'existence d'une clé n'est pas observable par le
-    temps de réponse du middleware.
-
-    Retourne ``(project_id ou None, nombre d'empreintes évaluées)``.
-    """
-    if getattr(app.state, "storage_backend", "memory") == "sqlite":
-        # SQLite est l'unique autorité : révocation, suppression ou erreur DB
-        # ne doivent jamais retomber sur une ancienne entrée en mémoire.
-        return _lookup_db_api_key(getattr(app.state, "db_path", None), provided_hash)
-    matching_project: str | None = None
-    evaluated = 0
-    with app.state.api_keys_lock:
-        registered_keys = tuple(app.state.api_keys.items())
-    for reg_hash, proj_id in registered_keys:
-        evaluated += 1
-        if constant_time_equal(provided_hash, reg_hash):
-            matching_project = proj_id
-    return matching_project, evaluated
-
-
-async def _find_api_key_project_cached(
-    request: Request, provided_hash: str
-) -> tuple[str | None, int]:
-    """Parcours complet d'empreintes mémoïsé dans la requête (anti-amplification CPU).
-
-    Le middleware de débit effectue déjà le parcours complet du backend actif
-    (sans ``break``) pour choisir le bucket ; l'authentification réutilise ce
-    résultat au lieu de refaire le même full-scan + ``compare_digest`` par
-    candidat (2 parcours -> 1 par requête, ticket #65). La mémoïsation vit dans
-    l'état de la requête (``request.state``) : jamais partagée entre requêtes,
-    aucune empreinte persistée hors du scope courant. Le coût reste identique
-    entre clé connue/inconnue/révoquée : le premier parcours est exhaustif et
-    seul l'appel redondant est évité.
-    """
-    cached_hash: str | None = getattr(request.state, "api_key_lookup_hash", None)
-    if cached_hash is not None and constant_time_equal(cached_hash, provided_hash):
-        return (
-            getattr(request.state, "api_key_lookup_project", None),
-            getattr(request.state, "api_key_lookup_evaluated", 0),
-        )
-    matching_project, evaluated_count = await asyncio.to_thread(
-        _find_api_key_project, request.app, provided_hash
-    )
-    request.state.api_key_lookup_hash = provided_hash
-    request.state.api_key_lookup_project = matching_project
-    request.state.api_key_lookup_evaluated = evaluated_count
-    return matching_project, evaluated_count
-
-
-async def verify_api_key(
-    request: Request,
-    api_key: Annotated[str | None, Depends(project_api_key_header)] = None,
-) -> str | None:
-    """Vérifie l'en-tête X-Heimdall-API-Key en temps constant (ticket #64).
-
-    Conformité openapi.yaml:19-20, 197-204 :
-    - fail-closed : authentification active par défaut (`require_auth=True`).
-    - rejet en 401 sans normalisation si la clé comporte des espaces de début/fin.
-    - hachage HMAC-SHA256 avec pepper serveur distinct de la KEK.
-    - comparaison constante via `constant_time_equal` sur empreintes de même longueur.
-    - chemin de vérification de coût comparable (aucun break précoce, comparaison factice),
-      mémoïsé par requête : le parcours complet du middleware de débit est réutilisé
-      (`_find_api_key_project_cached`), un seul full-scan par requête (ticket #65).
-    - si `settings.require_auth=False` et aucune clé fournie, retourne None (test mode).
-    """
-    settings: VaultSettings | None = getattr(request.app.state, "settings", None)
-    if settings is None:
-        settings = VaultSettings(require_auth=True)
-    if api_key is None:
-        if settings.require_auth:
-            raise StarletteHTTPException(
-                status_code=401,
-                detail="Authentification requise",
-            )
-        return None
-
-    if len(api_key) > _MAX_API_KEY_LENGTH or api_key != api_key.strip() or not api_key:
-        raise StarletteHTTPException(
-            status_code=401,
-            detail="Authentification requise",
-        )
-
-    try:
-        provided_hash = hash_api_key(api_key, pepper=settings.effective_api_key_pepper)
-    except ValueError:
-        # Encodage impossible (ex. surrogate isolé) : 401 générique, jamais 500
-        # ni écho de la valeur fournie.
-        raise StarletteHTTPException(
-            status_code=401,
-            detail="Authentification requise",
-        ) from None
-    matching_project, evaluated_count = await _find_api_key_project_cached(request, provided_hash)
-
-    # Coût comparable : comparaison factice si aucune clé n'a été évaluée
-    if evaluated_count == 0:
-        constant_time_equal(provided_hash, _DUMMY_HASH)
-
-    if matching_project is None:
-        raise StarletteHTTPException(
-            status_code=401,
-            detail="Authentification requise",
-        )
-
-    return matching_project
-
-
 def _register_routes(app: FastAPI) -> None:
     """Enregistre les routes de l'API Vault."""
 
@@ -1516,21 +1148,14 @@ def _register_routes(app: FastAPI) -> None:
     ) -> SecretMetadata:
         """Créer un secret vaulté (ticket #63)."""
         settings: VaultSettings | None = getattr(app.state, "settings", None)
-        if settings is None:
-            settings = VaultSettings(require_auth=True)
-        if settings.require_auth and authenticated_project is None:
-            raise StarletteHTTPException(
-                status_code=401,
-                detail="Authentification requise",
-            )
-        if (
-            authenticated_project is not None
-            and authenticated_project != secret_in.project
-        ):
-            raise StarletteHTTPException(
-                status_code=403,
-                detail="Accès interdit",
-            )
+        require_auth = True if settings is None else settings.require_auth
+        # Autorisation AVANT toute écriture : une clé d'un autre projet est
+        # refusée en 403 sans que l'existence d'un secret ne soit révélée.
+        vault_auth.ensure_project_access(
+            authenticated_project,
+            secret_in.project,
+            require_auth=require_auth,
+        )
         response.headers["Cache-Control"] = "no-store"
         store: InMemorySecretStore = app.state.secret_store
         try:
@@ -1574,6 +1199,11 @@ def _register_routes(app: FastAPI) -> None:
         tags=["Secrets"],
         summary="Lire la valeur courante d'un secret",
         operation_id="getSecret",
+        # Ticket #64 : la dépendance lit l'en-tête X-Heimdall-API-Key, retrouve
+        # la clé et vérifie qu'elle appartient AU projet demandé. Le contrôle est
+        # fait avant toute recherche de ressource (401 clé absente/inconnue/
+        # révoquée, 403 clé d'un autre projet).
+        dependencies=[Depends(vault_auth.require_project_access())],
     )
     async def get_secret(
         project: Annotated[
@@ -1589,25 +1219,8 @@ def _register_routes(app: FastAPI) -> None:
             FastApiPath(description="Nom de variable ; aucune valeur secrète."),
         ],
         response: Response,
-        authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretRead:
         """Lire la valeur courante d'un secret (ticket #63)."""
-        settings: VaultSettings | None = getattr(app.state, "settings", None)
-        if settings is None:
-            settings = VaultSettings(require_auth=True)
-        if settings.require_auth and authenticated_project is None:
-            raise StarletteHTTPException(
-                status_code=401,
-                detail="Authentification requise",
-            )
-        if (
-            authenticated_project is not None
-            and authenticated_project != project
-        ):
-            raise StarletteHTTPException(
-                status_code=403,
-                detail="Accès interdit",
-            )
         response.headers["Cache-Control"] = "no-store"
         store: InMemorySecretStore = app.state.secret_store
         record = await store.get(project=project, env=env, name=name)
@@ -1687,24 +1300,6 @@ def _register_routes(app: FastAPI) -> None:
         )
 
 
-def _persist_api_key_hash(app: FastAPI, key_hash: str, project_id: str) -> None:
-    """Persiste une empreinte de clé API dans SQLite quand le backend le requiert."""
-    if getattr(app.state, "storage_backend", "memory") != "sqlite":
-        return
-    with db_session(app.state.db_path) as conn:
-        ensure_project(conn, project_id)
-        conn.execute(
-            "INSERT INTO api_keys (id, project_id, key_hash, created_at, revoked_at) "
-            "VALUES (?, ?, ?, ?, NULL) ON CONFLICT(key_hash) DO NOTHING",
-            (f"key_{uuid4().hex}", project_id, key_hash, get_iso_timestamp()),
-        )
-        row = conn.execute(
-            "SELECT project_id FROM api_keys WHERE key_hash = ?", (key_hash,)
-        ).fetchone()
-        if row is None or row["project_id"] != project_id:
-            raise ValueError("Cette clé API est déjà associée à un autre projet.")
-
-
 def _configure_secret_store(
     app: FastAPI,
     settings: VaultSettings,
@@ -1734,9 +1329,11 @@ def _configure_secret_store(
         )
     app.state.secret_store = secret_store
     if isinstance(secret_store, SqliteSecretStore):
-        if isinstance(secret_store.db_path, Path):
-            # Aligner l'authentification sur la même base que le store explicite.
-            app.state.db_path = secret_store.db_path
+        # Aligner l'authentification sur la même base que le store explicite.
+        # Le chemin est normalisé en ``Path`` : la lecture d'empreintes
+        # (``lookup_db_api_key``) et l'écriture (``_persist_hash``) doivent
+        # viser exactement le même fichier, quel que soit le type fourni.
+        app.state.db_path = Path(secret_store.db_path)
         return "sqlite"
     return "memory"
 
@@ -1799,25 +1396,33 @@ def create_app(
     validated_hashes: dict[str, str] = {}
     if raw_hashes is not None:
         for key_candidate, project_id in raw_hashes.items():
-            if not isinstance(key_candidate, str) or not _HASH_PATTERN.fullmatch(key_candidate):
-                raise ValueError(
-                    "Format d'empreinte de clé API invalide : attendu ^[0-9a-f]{64}$. "
-                    "api_key_hashes attend des empreintes hexadécimales de 64 caractères. "
-                    "Pour enregistrer une clé brute, utilisez "
-                    "app.state.register_api_key(raw_key, project_id)."
-                )
-            validated_hashes[key_candidate] = _validate_project_id(project_id)
-    app.state.api_keys_lock = Lock()
+            validated_hashes[key_candidate] = project_id
+
+    # Ticket #64 : le registre des clés API de projet est l'unique source de
+    # vérité des empreintes (mémoire en mode `memory`, base SQLite en mode
+    # `sqlite`). Il porte le pepper serveur, les verrous et la persistance.
+    registry = vault_auth.ApiKeyRegistry(
+        pepper=effective_settings.effective_api_key_pepper,
+        storage_backend=app.state.storage_backend,
+        # Le store explicite peut avoir aligné ``app.state.db_path`` sur un
+        # autre fichier : le registre doit lire ET écrire cette même base.
+        # Utiliser ``resolved_db`` ici désynchroniserait l'écriture
+        # (``_persist_hash``) de la lecture d'authentification
+        # (``find_api_key_project``), soit un 401 permanent fail-closed.
+        db_path=app.state.db_path if app.state.storage_backend == "sqlite" else None,
+    )
+    for preregistered_hash, preregistered_project in validated_hashes.items():
+        registry.register_hash(preregistered_hash, preregistered_project)
+    app.state.api_key_registry = registry
     # Verrou de persistance distinct du verrou de snapshot : l'écriture SQLite
     # de l'enregistrement ne bloque jamais la copie en mémoire lue par le
     # chemin de requête (remarque de revue « api_keys_lock tenu pendant l'I/O DB »).
-    app.state.api_keys_persist_lock = Lock()
-    app.state.api_keys = validated_hashes
-    for preregistered_hash, preregistered_project in validated_hashes.items():
-        _persist_api_key_hash(app, preregistered_hash, preregistered_project)
+    app.state.api_keys_lock = registry.lock
+    app.state.api_keys_persist_lock = registry.persist_lock
+    app.state.api_keys = registry.active_hashes
 
-    def register_api_key(raw_key: str, project_id: str) -> None:
-        """Enregistre une clé API brute en calculant son HMAC-SHA256 avec le pepper serveur.
+    def register_api_key(raw_key: str, project_id: str) -> str:
+        """Enregistre une clé API brute et retourne son identifiant (ticket #64).
 
         Les clés DOIVENT être générées par ``generate_api_key()`` (256 bits) :
         tout contournement manuel est une faute opérationnelle (en cas de fuite
@@ -1832,7 +1437,7 @@ def create_app(
 
         ENREGISTREMENT AU DÉMARRAGE UNIQUEMENT (phase d'amorçage) : la fonction
         est synchrone et performs une E/S SQLite. Deux verrous distincts la
-        protègent sans coupler le chemin de lecture des requêtes à l'I/O base :
+        protègent sans coupler le chemin de lecture des requêtes à l'E/S base :
 
         - ``api_keys_persist_lock`` sérialise les écritures (pas de double
           persistance de la même empreinte, pas de conflit de projet) ;
@@ -1842,20 +1447,10 @@ def create_app(
 
         Aucun ``asyncio.Lock`` n'est introduit ici : la fonction est synchrone et
         appelée hors de la boucle asyncio (amorçage, CLI, tests).
+
+        La clé brute n'est jamais conservée : seule son empreinte l'est.
         """
-        raw_key = _validate_raw_api_key(raw_key)
-        _validate_project_id(project_id)
-        key_hash = hash_api_key(raw_key, pepper=effective_settings.effective_api_key_pepper)
-        with app.state.api_keys_persist_lock:
-            with app.state.api_keys_lock:
-                registered_project = app.state.api_keys.get(key_hash)
-                if registered_project is not None and registered_project != project_id:
-                    raise ValueError("Cette clé API est déjà associée à un autre projet.")
-            # E/S base hors du verrou de snapshot : la lecture des requêtes
-            # reste servie pendant l'enregistrement.
-            _persist_api_key_hash(app, key_hash, project_id)
-            with app.state.api_keys_lock:
-                app.state.api_keys[key_hash] = project_id
+        return registry.register(raw_key, project_id)
 
     app.state.register_api_key = register_api_key
 

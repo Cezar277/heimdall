@@ -94,6 +94,19 @@ journalisé ni renvoyé au client. En production, `HEIMDALL_VAULT_REQUIRE_AUTH=f
 est refusé au démarrage (`ValidationError`, fail-closed), comme le backend `memory`
 interdit et la KEK obligatoire pour SQLite.
 
+Émission et cycle de vie (ticket #64) : la clé est émise par le Vault, jamais
+déduite par l'opérateur. La commande `heimdall vault key create --project <id>`
+génère la clé avec `secrets.token_urlsafe(32)` (256 bits), **persiste uniquement
+son empreinte** et l'affiche **une seule fois** ; `heimdall vault key list`
+expose les métadonnées seules (jamais la clé ni son empreinte) et
+`heimdall vault key revoke --key-id <id>` révoque une clé, qui cesse alors
+d'authentifier immédiatement (401 générique). Le pepper serveur est **explicite
+et obligatoire** pour ces opérations : un pepper éphémère (généré au
+démarrage) ne survivrait pas au redémarrage et rendrait la clé inutilisable.
+La révocation est persistée dans la base, qui reste la source de vérité y
+compris pour un serveur déjà démarré ; ré-enregistrer une clé révoquée ne la
+réactive pas.
+
 Les clés opérateur enregistrées via `register_api_key` **DOIVENT** provenir de
 `generate_api_key()` (`secrets.token_urlsafe(32)`, 256 bits). L'enregistrement
 applique six contrôles cumulatifs, fail-closed et sans écho de la valeur :
@@ -122,7 +135,18 @@ L'enregistrement est une opération d'**amorçage** : il sérialise ses écritur
 avec un verrou de persistance distinct du verrou de snapshot qui protège la
 copie en mémoire des empreintes. L'E/S SQLite n'est jamais tenue sous le
 verrou de snapshot : le parcours exhaustif d'authentification (chemin de
-requête) reste servi pendant un enregistrement.
+requête) reste servi pendant un enregistrement. Ces deux verrous, le registre
+des clés et la dépendance FastAPI vivent dans `heimdall/vault/auth.py` (ticket
+#64), seul module responsable de l'authentification ; `heimdall/vault/app.py`
+délègue et se limite au serveur (configuration, middlewares, routes).
+
+Le contrôle d'accès est une **dépendance FastAPI** : `verify_api_key` lit
+l'en-tête, retrouve la clé et retourne le projet lié ;
+`require_project_access()` vérifie en plus que la clé appartient AU projet
+demandé par la route (403 sur un autre projet) — la décision est prise **avant**
+toute recherche de ressource, donc l'existence d'un secret n'est jamais
+révélée à une clé étrangère. Un identifiant de projet hors contrat est
+rejeté en 400 avant toute décision d'autorisation.
 
 `create()` retourne uniquement les métadonnées ; le plaintext n'est déchiffré
 que par la lecture autorisée et n'est jamais renvoyé au POST.
@@ -178,7 +202,7 @@ d'écriture. Sémantique préservée : pair/global restent consommés même quan
 le bucket clé est plein. Les
 400/401 consomment les buckets pair/global, une clé absente ou invalide ne crée
 pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
-Le choix du bucket par clé (`_find_api_key_project_cached`) emprunte le même
+Le choix du bucket par clé (`auth.find_api_key_project_cached`) emprunte le même
 parcours complet à coût comparable que `verify_api_key` (parcours exhaustif
 du backend actif, sans `break` précoce) et le mémoïse dans l'état de la
 requête : l'authentification réutilise ce résultat, soit un seul full-scan par
@@ -212,8 +236,11 @@ dans le dictionnaire mémoire. Une erreur de lecture est distinguée d'une clé
 inconnue et renvoie 503, sans repli mémoire. La mémoïsation ne dure qu'une requête. Le mode
 mémoire consulte uniquement son dictionnaire ; le snapshot de lecture et
 l'enregistrement partagent un `threading.Lock`, libéré avant les comparaisons.
-L'API de révocation reste suivie
-séparément en #64.
+L'API de révocation est livrée en #64 : `heimdall vault key revoke` marque la
+clé dans la table `api_keys` (`revoked_at`), la base reste la seule autorité
+et la clé refusée répond 401 générique — y compris pour un serveur déjà
+démarré, dont la lecture en base voit la révocation à la requête suivante.
+Ré-enregistrer une clé révoquée ne la réactive pas.
 
 Backend de débit #65 : avec le stockage SQLite, les buckets sont persistés dans
 la base et incrémentés sous `BEGIN IMMEDIATE` : la limite (clé/pair/global) est

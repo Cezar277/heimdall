@@ -89,12 +89,12 @@ La justification précise l’exposition ; l’impact découle du dommage décri
 
 | ID | Scénario | Mesure prévue / ticket | Imp | P | Score | Justification de P |
 | --- | --- | --- | --- | --- | --- | --- |
-| <a id="vlt-s"></a>VLT-S | Un attaquant réutilise une clé volée ou distingue les clés existantes par latence. | Clés aléatoires, hachés seuls serveur, compare_digest et coût comparable, révocation ; #25/#26. | 3 | 2 | 6 | Vol préalable ou oracle de traitement nécessaire. |
+| <a id="vlt-s"></a>VLT-S | Un attaquant réutilise une clé volée ou distingue les clés existantes par latence. | Clés aléatoires, hachés seuls serveur, compare_digest et coût comparable, révocation ; #25/#26/**#64** (prouvé : `heimdall/vault/auth.py`, `tests/test_vault_auth.py`). | 3 | 2 | 6 | Vol préalable ou oracle de traitement nécessaire. |
 | <a id="vlt-t"></a>VLT-T | Un POST rejoué écrase une valeur ou impose un état choisi par le client. | Création sans écrasement, 409 conflit, schéma fermé, état serveur ; rotation séparée ; #15/#25/#40. | 3 | 2 | 6 | Accès authentifié et contrôles métier absents nécessaires. |
 | <a id="vlt-r"></a>VLT-R | Un accès autorisé à une valeur n’est pas attribuable à une identité et une opération. | Événements d’accès avec identifiant non sensible, droits de logs et rétention ; #25/#19. | 2 | 2 | 4 | Dépend d’une journalisation insuffisante. |
 | <a id="vlt-i"></a>VLT-I | Un proxy, cache, erreur ou certificat non vérifié expose une réponse GET. | TLS vérifié, no-store obligatoire, erreurs constantes, aucun corps sensible en trace ; #15/#25/#26. | 3 | 2 | 6 | Interception ou mauvaise configuration requise. |
 | <a id="vlt-d"></a>VLT-D | Des corps volumineux ou des clés invalides tournantes contournent les quotas. | 1 Mio avant parsing avec/sans longueur annoncée, quotas globaux/auth, Retry-After borné, XFF ignoré ; #25. | 3 | 2 | 6 | Service partagé joignable ; nécessite pression soutenue. |
-| <a id="vlt-e"></a>VLT-E | Une clé du projet A lit le secret du projet B en changeant l’URL. | Autoriser projet/env/opération avant recherche, 403 indépendant de l’existence, tests interprojets ; #25. | 3 | 3 | 9 | Paramètres directement contrôlables par tout client autorisé. |
+| <a id="vlt-e"></a>VLT-E | Une clé du projet A lit le secret du projet B en changeant l’URL. | Autoriser projet/env/opération avant recherche, 403 indépendant de l’existence, tests interprojets ; #25/**#64** (prouvé : `heimdall/vault/auth.py::require_project_access`, `tests/test_vault_auth.py`). | 3 | 3 | 9 | Paramètres directement contrôlables par tout client autorisé. |
 
 ## Stockages D1–D4 / clés
 

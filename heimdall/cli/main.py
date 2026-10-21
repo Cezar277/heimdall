@@ -1,7 +1,7 @@
 """Point d'entrée ``heimdall`` — squelette du ticket #17.
 
 Les sous-commandes réelles arrivent avec leurs tickets :
-``scan`` (#22 scanner + #32 validation Y/N/E), ``vault`` (#25/#26),
+``scan`` (#22 scanner + #32 validation Y/N/E), ``vault`` (#25/#26/#64),
 ``mcp`` (#27). En attendant, comportement fail-closed : ``scan`` bloque
 avec un message explicite au lieu d'inventer un verdict.
 
@@ -13,6 +13,7 @@ jamais 1, réservé aux secrets avérés.
 import typer
 
 import heimdall
+from heimdall.cli.vault_keys import vault_app
 from heimdall.mcp.server import run_stdio
 
 app = typer.Typer(
@@ -21,6 +22,8 @@ app = typer.Typer(
     no_args_is_help=True,
     invoke_without_command=True,  # `--version` seul ne doit pas exiger de sous-commande.
 )
+# Administration du Vault (clés API de projet, ticket #64).
+app.add_typer(vault_app, name="vault")
 
 
 @app.callback()

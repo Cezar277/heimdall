@@ -32,7 +32,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ValidationError
 
-import heimdall.vault.app as vault_app_module
+import heimdall.vault.auth as vault_auth_module
 from heimdall.vault.app import (
     BadRequestError,
     ConflictError,
@@ -2137,8 +2137,8 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         canary = "CANARY_UNENCODABLE_API_KEY"
         test_app = create_app()
         with patch.object(
-            vault_app_module,
-            "hash_api_key",
+            vault_auth_module,
+            "hash_project_api_key",
             side_effect=ValueError(f"clé invalide : {canary}"),
         ):
             transport = ASGITransport(app=test_app, client=("127.0.0.1", 54321))
@@ -2170,8 +2170,8 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
         lookup_calls: list[str] = []
         db_calls: list[str] = []
-        real_lookup = vault_app_module._find_api_key_project
-        real_db_lookup = vault_app_module._lookup_db_api_key
+        real_lookup = vault_auth_module.find_api_key_project
+        real_db_lookup = vault_auth_module.lookup_db_api_key
 
         def counting_lookup(target_app, provided_hash):
             lookup_calls.append(provided_hash)
@@ -2182,8 +2182,8 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             return real_db_lookup(db_path, provided_hash)
 
         with patch.object(
-            vault_app_module, "_find_api_key_project", counting_lookup
-        ), patch.object(vault_app_module, "_lookup_db_api_key", counting_db_lookup):
+            vault_auth_module, "find_api_key_project", counting_lookup
+        ), patch.object(vault_auth_module, "lookup_db_api_key", counting_db_lookup):
             transport = ASGITransport(app=scan_app, client=("127.0.0.1", 54321))
             async with AsyncClient(
                 transport=transport,
@@ -2561,7 +2561,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         Aujourd'hui le garde `strip()` refuse déjà ces clés en amont ; `fullmatch`
         lève l'ambiguïté au niveau du motif (défense en profondeur).
         """
-        pattern = vault_app_module._API_KEY_ALPHABET_PATTERN
+        pattern = vault_auth_module.API_KEY_ALPHABET_PATTERN
         # L'ambiguïté documentée : `match` + `$` laisse passer le `\n` final.
         self.assertIsNotNone(pattern.match("abc\n"))
         # Le contrôle effectif ne le laisse plus passer, sans casser le valide.
