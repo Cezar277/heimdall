@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==83.0.0"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -23,7 +23,7 @@ classifiers = [
 dependencies = [
   # --- Runtime (versions verrouillées, voir docs/adr/002-stack-python.md) ---
   "fastapi==0.143.1",       # API du Vault (#25). Épinglé à l'identique de tests/contracts/requirements.txt
-  "pydantic==2.13.5",       # Modèles + génération OpenAPI comparée au contrat (#15)
+  "pydantic==2.14.1",       # Modèles + génération OpenAPI comparée au contrat (#15)
   "pydantic-settings==2.15.0", # Settings via variables d'environnement (#25)
   "uvicorn==0.54.0",        # Serveur ASGI du Vault (#25), réseau privé + TLS uniquement
   "mcp==2.3.0",             # SDK officiel du serveur MCP stdio (#27)
@@ -37,11 +37,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest==9.1.1",
-  "ruff==0.16.10",
+  "ruff==0.17.0",
   "mypy==2.4.0",
   "bandit==1.9.4",
-  "setuptools==83.0.0",     # backend de build, installé depuis le lock en CI
-  "pytest-cov==7.0.0",      # couverture + seuil CI (#20), aligné sur tests/security
+  "setuptools==84.0.0",     # backend de build, installé depuis le lock en CI
+  "pytest-cov==7.1.0",      # couverture + seuil CI (#20), aligné sur tests/security
   "pip-audit==2.10.1",      # audit CVE des dépendances en CI (#20), réseau documenté README
   "tomli==2.5.0; python_version < '3.11'",  # lecture TOML des tests d'acceptation sur 3.10
   # Dépendances des tests de contrats (#14/#15/#16), alignées sur tests/contracts/requirements.txt

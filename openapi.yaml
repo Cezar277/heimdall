@@ -69,6 +69,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
         default:
           $ref: '#/components/responses/UnexpectedError'
   /api/v1/secrets/{project}/{env}/{name}:
@@ -114,6 +116,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
         default:
           $ref: '#/components/responses/UnexpectedError'
   /api/v1/secrets/{project}/{env}/{name}/state:
@@ -152,6 +156,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
         default:
           $ref: '#/components/responses/UnexpectedError'
   /api/v1/health:
@@ -176,10 +182,10 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
-        '503':
-          $ref: '#/components/responses/Unavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
         default:
           $ref: '#/components/responses/UnexpectedError'
 components:
