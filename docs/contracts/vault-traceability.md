@@ -27,13 +27,13 @@ briques #26/#62/#64/#65 y sont matérialisées parce que les routes #63 en
 dépendent (elles les exercent). Pour lever la remarque d'hygiène, la suite
 recommandée est une pile de branches, chaque brique restant dans son ticket :
 
-> **État d'avancement** : la brique #64 est désormais portée par sa propre
-> branche (`64-t254-authentification-par-clé-api-de-projet`), empilée sur la
-> branche #63 et relue en diff contre elle. La brique y est **isolée dans le
-> module `heimdall/vault/auth.py`** (registre, dépendance FastAPI, politique
-> opérateur) avec sa suite de tests `tests/test_vault_auth.py` ; `app.py` ne
-> fait plus que déléguer. Les branches #26/#62/#65 restent à extraire de la
-> même façon.
+> **État d'avancement** : la brique #64 est portée par sa propre branche
+> (`64-t254-authentification-par-clé-api-de-projet`), désormais basée sur `main`
+> après la fusion de #63 (PR #151) et relue en diff autonome contre `main`. La
+> brique y est **isolée dans le module `heimdall/vault/auth.py`** (registre,
+> dépendance FastAPI, politique opérateur) avec sa suite de tests
+> `tests/test_vault_auth.py` ; `app.py` ne fait plus que déléguer. Les branches
+> #26/#62/#65 restent à extraire de la même façon.
 
 ```bash
 # Ordre de dépendance (du socle vers les routes)
@@ -41,7 +41,7 @@ git branch 26-vault-chiffrement      # crypto.py        (#26)
 git branch 62-vault-stockage-sqlite  # database/store   (#62)
 git branch 64-vault-auth-cles-projet # auth + registre  (#64)  <- fait
 git branch 65-vault-rate-limit       # ratelimit.py     (#65)
-git branch 63-routes-secrets         # app.py (routes)  (#63)  <- pile au-dessus
+git branch 63-routes-secrets         # app.py (routes)  (#63)  <- fusionnée dans main
 ```
 
 Chaque branche doit être revue contre son seul ticket, puis fusionnée dans

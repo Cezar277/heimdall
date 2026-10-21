@@ -8,10 +8,10 @@ Révision du code testé : `e1275cec846a217c6bc2e482e911f6b58e8ad272` (merge de
 `main` dans la branche #64).
 
 Les permaliens épinglent la révision du code, pas le commit de documentation qui
-archive cette fiche. Le code des modules référencés est inchangé entre cette
-révision et le HEAD de livraison : contrôle effectué avec
+archive cette fiche. Le code des modules référencés est inchangé jusqu'à la
+livraison : contrôle effectué avec
 `git diff e1275cec846a217c6bc2e482e911f6b58e8ad272 HEAD -- heimdall/ tests/`
-(sortie vide). Le commit suivant ne modifie que la documentation.
+(sortie vide) ; seuls des commits de documentation suivent.
 
 ## 1. Exigences du ticket et preuves
 
@@ -42,9 +42,10 @@ révision et le HEAD de livraison : contrôle effectué avec
 python -m pytest tests/test_vault_auth.py -q
 # 25 passed, 17 subtests passed
 python -m pytest -q
-# suite complète : aucun échec
+# 1004 passed, 1 skipped, 1 xfailed, 4268 subtests passed
 ruff check heimdall tests      # All checks passed!
-mypy heimdall                 # Success: no issues found in 26 source files
+mypy heimdall tests/contracts/fastapi_contract_fixture.py
+# Success: no issues found in 26 source files
 bandit -r heimdall -q         # aucun rapport
 ```
 
