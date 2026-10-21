@@ -8,10 +8,11 @@ Révision du code testé : `e1275cec846a217c6bc2e482e911f6b58e8ad272` (merge de
 `main` dans la branche #64).
 
 Les permaliens épinglent la révision du code, pas le commit de documentation qui
-archive cette fiche. Le code des modules référencés est inchangé jusqu'à la
-livraison : contrôle effectué avec
-`git diff e1275cec846a217c6bc2e482e911f6b58e8ad272 HEAD -- heimdall/ tests/`
-(sortie vide) ; seuls des commits de documentation suivent.
+archive cette fiche. Le code #64 référencé est inchangé jusqu'à la livraison :
+contrôle effectué avec
+`git diff e1275cec846a217c6bc2e482e911f6b58e8ad272 HEAD -- heimdall/vault/ heimdall/cli/vault_keys.py heimdall/cli/main.py tests/test_vault_auth.py tests/test_vault_app.py tests/test_vault_review_regressions.py`
+(sortie vide) ; les commits suivants ne modifient que la documentation, et les
+évolutions scanner #53 apportées par `main` sont hors de ce périmètre.
 
 ## 1. Exigences du ticket et preuves
 
