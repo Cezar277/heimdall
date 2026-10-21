@@ -2,8 +2,9 @@
 
 Statut : livré par le ticket #53 (sous-ticket de l'épic #22). Ce document fixe
 la **surface** du scanner et la **forme** de sa sortie. Il ne décrit aucune
-détection : les signatures (#54) et les exclusions (#59) restent des tickets
-séparés, tout comme la mesure sur le jeu piège (#60).
+détection : les signatures sont livrées par #54 et décrites dans
+[scanner-signatures.md](scanner-signatures.md) ; les exclusions (#59) et la
+mesure sur le jeu piège (#60) restent des tickets séparés.
 
 Références :
 
@@ -13,7 +14,10 @@ Références :
 - implémentation : [`heimdall/scanner/finding.py`](../heimdall/scanner/finding.py)
   (sortie) et [`heimdall/scanner/interface.py`](../heimdall/scanner/interface.py)
   (cible + façade) ;
-- tests : [`tests/test_scanner_interface.py`](../tests/test_scanner_interface.py).
+- moteur de signatures : [`heimdall/scanner/signature_engine.py`](../heimdall/scanner/signature_engine.py)
+  et son registre dans [`heimdall/scanner/signatures/`](../heimdall/scanner/signatures/) ;
+- tests : [`tests/test_scanner_interface.py`](../tests/test_scanner_interface.py)
+  et [`tests/test_scanner_signatures.py`](../tests/test_scanner_signatures.py).
 
 ## En une phrase
 
@@ -141,10 +145,10 @@ sur une liste partielle.
 
 ### Le moteur ne peut rien laisser passer non plus
 
-Le moteur est injecté : c'est du code d'un autre ticket (#54/#59), et son
-message d'exception n'est pas sous le contrôle de cette façade. Une panne du
-moteur, un rendu non conforme ou une itération qui échoue sont donc
-**enveloppés** :
+Le moteur est injecté : c'est du code d'un autre ticket (#54 pour les
+signatures, #59 pour les exclusions), et son message d'exception n'est pas
+sous le contrôle de cette façade. Une panne du moteur, un rendu non conforme
+ou une itération qui échoue sont donc **enveloppés** :
 
 | Situation | Avant | Après |
 | --- | --- | --- |
@@ -164,8 +168,9 @@ sont pas capturées — une interruption doit rester une interruption.
 
 - **Aucune I/O.** L'interface ne lit aucun fichier et n'ouvre aucun
   descripteur : elle ne fait que valider et transporter. La lecture du
-  fichier appartient au moteur (#54/#59), qui doit appliquer le confinement
-  complet.
+  fichier appartient au moteur (#59), qui doit appliquer le confinement
+  complet. Le moteur de signatures #54 ne lit rien non plus : il reçoit une
+  cible déjà validée.
 - **La garde de chemin est lexicale, et ce n'est pas assez.** `..`, un chemin
   absolu, `C:/` ou un caractère de contrôle sont refusés *avant* toute
   lecture, mais cette garde **ne protège pas contre les liens symboliques ni
@@ -173,7 +178,7 @@ sont pas capturées — une interruption doit rester une interruption.
   une racine fixée au démarrage, résoudre le chemin
   (`resolve` + `is_relative_to(racine)`), refuser les liens sortants et
   revérifier l'identité du descripteur à l'usage. C'est le cas de
-  `heimdall/mcp/gitdiff.py` et de la lecture de fichier par #54/#59 ; la garde
+  `heimdall/mcp/gitdiff.py` et de la lecture de fichier par #59 ; la garde
   lexicale de ce ticket ne doit pas être considérée comme suffisante.
 
 ## Le code est au moins aussi strict que le schéma
@@ -212,7 +217,7 @@ réconciliation proposée au relecteur est :
 Ce ticket ne modifie pas l'épic : il fournit l'interface et le contrat, sans
 toucher aux signatures ni aux exclusions.
 
-## Contraintes pour le moteur (#54 / #59)
+## Contraintes pour les moteurs (#54 / #59)
 
 Le moteur injecté doit :
 
