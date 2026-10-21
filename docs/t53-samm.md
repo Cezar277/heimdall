@@ -4,20 +4,16 @@ Périmètre : ticket #53 (sous-ticket #53 de l'épic #22, « Interface Scanner e
 sortie Finding »). Cette fiche fournit les couples **module + ligne** et les
 permaliens du code testé ; elle ne prétend pas modifier une feuille externe.
 
-Révision du code testé : `b6730cb9b62ff6e9fd58ce409de5b76a2c5e9072`
+Révision du code testé pour la preuve initiale : `b6730cb9b62ff6e9fd58ce409de5b76a2c5e9072`
 (commit `fix(scanner): exceptions du moteur et de l'itération enveloppées (#53)`,
 au-dessus de `8b163cece98f83a1f33f99eff3bee8ebbc687a0d` — `fix(scanner): repr
 sans secret et erreurs de contrat typées (#53)`).
 
-Les permaliens épinglent la révision du **code**, pas le commit de
-documentation qui archive cette fiche. Aucun fichier de production ni de test
-ne change après `b6730cb…` : contrôle effectué avec
-
-```sh
-git diff b6730cb9b62ff6e9fd58ce409de5b76a2c5e9072 HEAD -- heimdall tests
-```
-
-(sortie vide au moment de l'archivage de cette fiche).
+Les permaliens de la première table épinglent cette révision **historique**,
+pas le commit de documentation qui archive cette fiche. Les correctifs de
+suivi de la revue #155 modifient ensuite `finding.py`, `interface.py`,
+`errors.py`, `detect.py` et les tests ; leurs preuves sont dans la section
+« Suivi de la revue #155 » ci-dessous, avec leurs propres permaliens.
 
 | Exigence vérifiée | Implémentation (module + ligne) | Test et preuve permanente | Résultat local |
 |---|---|---|---|
@@ -66,28 +62,42 @@ d'itération, et moteur dont `analyser` rend un générateur qui lève à la
 consommation. Le canari est vérifié absent du **type**, du **message**, de
 `__context__` **et** de la traceback formatée.
 
+## Suivi de la revue #155
+
+Révision des correctifs : `f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f`
+(`fix(scanner): corriger la revue #155 sans changer le contrat`). Les quatre
+remarques MEDIUM/LOW de la revue et les tests manquants sont traités sans
+changer le contrat de sortie ni le fail-closed.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| MEDIUM — `FileTarget.lignes()` utilisait `splitlines()` (coupait aussi sur `\v`, `\f`, `\u2028/29`) | découpage sur `\n` seul, `\r\n` normalisé, autres séparateurs conservés dans le contenu | [interface.py:174–190](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/interface.py#L174-L190) + [tests:424–451](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L424-L451) |
+| LOW — les contrôles `Cf` (bidi, marques invisibles) passaient la garde de chemin | refus de toute catégorie Unicode `C` (contrôle, format, surrogate, privé, non assigné) | [finding.py:66–100](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/finding.py#L66-L100) + [tests:468–491](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L468-L491) |
+| LOW — `find_candidates` levait `NotImplementedError`, hors contrat `ScanError` | `ScannerNotImplemented` hérite des deux : contrat unique et compatibilité historique | [errors.py:26–32](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/errors.py#L26-L32), [detect.py:26–40](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/detect.py#L26-L40) + [tests:784–796](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L784-L796) |
+| LOW — `Scanner` relisait `moteur.analyser` à chaque scan (TOCTOU) | méthode liée figée à la construction et appelée ensuite | [interface.py:261–273](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/interface.py#L261-L273), [interface.py:288](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/interface.py#L288) + [tests:534–555](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L534-L555) |
+| Tests manquants | `bool` refusé comme numéro de ligne, `KeyboardInterrupt` non converti, `scan_all` fail-closed sur liste mixte | [tests:375–387](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L375-L387), [tests:603–611](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L603-L611), [tests:758–768](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L758-L768) |
+
 ## Résultats locaux
 
-Environnement : Linux, Python 3.14.6, venv du dépôt.
+Environnement : Linux, Python 3.14.7, venv du dépôt.
 
 ```text
 .venv/bin/python -m pytest tests/test_scanner_interface.py
-129 passed
+148 passed
 
-.venv/bin/python -m pytest --cov=heimdall --cov-branch --cov-report=term-missing
-suite complète : 975 passed, 1 xfailed (+ 3848 subtests), code retour 0
-couverture Heimdall : 98 % (98,44 % au total)
-heimdall/scanner/finding.py : 100 % (branches incluses)
-heimdall/scanner/interface.py : 100 % (branches incluses)
-heimdall/scanner/errors.py : 100 % (branches incluses)
+.venv/bin/python -m pytest
+suite complète : 1127 passed, 1 skipped, 1 xfailed (+ 4251 subtests), code retour 0
 
 .venv/bin/ruff check heimdall tests        # All checks passed
 .venv/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
-                                            # Success: no issues found
+                                            # Success: no issues found in 27 source files
 .venv/bin/bandit -r heimdall -q             # code retour 0, aucun rapport
 .venv/bin/python docs/security/check_model.py
                                             # OK (48 scénarios, DFD, PNG)
 ```
+
+Couverture : non mesurée localement (`pytest-cov` absent du venv) ; la CI
+applique les seuils 85 % global et 70 % scanner.
 
 Le `xfailed` restant est celui de T21 (`tests/test_trap_acceptance.py`) : il
 attend la livraison du scanner #22 et devient un `XPASS(strict)` dès que le
@@ -96,7 +106,7 @@ moteur réel (#54/#59) est branché sur cette interface.
 ## Limite assumée : la garde de chemin reste lexicale
 
 La garde de chemin de cette interface est **lexicale** (`..`, absolu, `C:/`,
-caractères de contrôle refusés avant toute lecture) et cette PR ne fait
+contrôles et formats Unicode refusés avant toute lecture) et cette PR ne fait
 **aucune I/O**. Conformément à l'invariant 3, le confinement complet
 (`resolve` + `is_relative_to` sur une racine fixée au démarrage, refus des
 liens sortants, identité de descripteur revérifiée à l'usage) reste à faire
