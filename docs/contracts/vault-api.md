@@ -202,7 +202,7 @@ d'écriture. Sémantique préservée : pair/global restent consommés même quan
 le bucket clé est plein. Les
 400/401 consomment les buckets pair/global, une clé absente ou invalide ne crée
 pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
-Le choix du bucket par clé (`_find_api_key_project_cached`) emprunte le même
+Le choix du bucket par clé (`auth.find_api_key_project_cached`) emprunte le même
 parcours complet à coût comparable que `verify_api_key` (parcours exhaustif
 du backend actif, sans `break` précoce) et le mémoïse dans l'état de la
 requête : l'authentification réutilise ce résultat, soit un seul full-scan par
