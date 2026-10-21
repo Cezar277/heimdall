@@ -108,12 +108,14 @@ def _structural(schema: Any) -> Any:
 
     Clés écartées (et UNIQUEMENT celles-là) : `title`, `description`,
     `examples`, `example` — des annotations purement documentaires, qui ne
-    modifient ni l'ensemble des instances acceptées ni les contraintes.
+    modifient ni l'ensemble des instances acceptées ni les contraintes. C'est
+    la convention déjà retenue par le test de contrat du dépôt
+    (`tests/contracts/test_vault_openapi.py`).
 
     Toutes les CONTRAINTES sont conservées et comparées : `required`,
     `additionalProperties`, `pattern`, `minLength`, `maxLength`, `const`,
-    `enum`. En particulier `required` n'est JAMAIS écarté : un écart de
-    contrat sur la présence d'un champ doit faire échouer la suite.
+    `enum`. AUCUNE normalisation n'est appliquée à `required` : un écart de
+    contrat sur la présence d'un champ fait échouer la suite.
     """
     if isinstance(schema, list):
         return [_structural(item) for item in schema]
@@ -127,31 +129,6 @@ def _structural(schema: Any) -> Any:
             sorted(value) if key == "required" and isinstance(value, list) else _structural(value)
         )
     return result
-
-
-def _without_defaults(schema: Any) -> Any:
-    """Retire la clé `default` émise par Pydantic sur les champs à valeur par défaut.
-
-    Clé écartée (et UNIQUEMENT celle-là) : `default`.
-
-    PREUVE de son innocuité : `default` est une ANNOTATION de sérialisation
-    (« valeur employée si le champ est absent »). Elle ne participe ni à la
-    validation, ni aux contraintes (`const`, `pattern`, `minLength`…), ni à
-    l'ensemble des instances acceptées : retirer la clé ne change donc AUCUN
-    verdict de validation. Cette propriété n'est pas affirmée, elle est
-    vérifiée par `test_default_annotation_does_not_change_validation`, qui
-    compare les verdicts « avec `default` » et « sans `default` » pour chaque
-    modèle d'erreur.
-
-    Le contrat `openapi.yaml` ne porte pas cette clé : elle est écartée pour
-    que la comparaison porte sur les CONTRAINTES, pas sur une annotation
-    d'implémentation.
-    """
-    if isinstance(schema, list):
-        return [_without_defaults(item) for item in schema]
-    if not isinstance(schema, dict):
-        return schema
-    return {key: _without_defaults(value) for key, value in schema.items() if key != "default"}
 
 
 class VaultIntegrationTestCase(unittest.TestCase):
@@ -515,30 +492,18 @@ class VaultOpenapiContractTests(VaultIntegrationTestCase):
                 runtime_schema = _structural(runtime[name])
                 self.assertEqual(runtime_schema, contract_schema)
 
-    @unittest.expectedFailure
     def test_runtime_error_schemas_match_the_contract(self) -> None:
-        """Comparaison STRICTE : le schéma publié doit exposer `required`.
+        """Comparaison STRICTE : le schéma publié DOIT exposer `required`.
 
-        Écart connu, à corriger côté PRODUCTION : Pydantic n'inscrit pas les
-        champs à valeur par défaut dans `required`. Le schéma OpenAPI publié
-        par l'application expose donc `code` et `message` SANS `required`,
-        alors que `openapi.yaml` exige `required: [code, message]`.
+        Aucun écart toléré : le schéma OpenAPI publié par l'application est
+        comparé champ par champ au contrat, `required` compris. C'est
+        possible parce que les modèles d'erreur de `heimdall/vault/app.py`
+        déclarent `code`/`message` (et `status` pour `HealthResponse`) SANS
+        valeur par défaut : Pydantic les inscrit donc dans `required`, comme
+        l'exige `openapi.yaml`.
 
-        Le test est marqué `expectedFailure` : il compare STRICTEMENT (aucune
-        normalisation silencieuse) et passe en XPASS — donc en ÉCHEC explicite
-        de la suite — dès que le correctif production est appliqué. Il faut
-        alors retirer ce marqueur.
-
-        Correctif production : retirer les valeurs par défaut des modèles
-        d'erreur de `heimdall/vault/app.py` (`code`/`message` sans `= ...`),
-        de sorte que Pydantic les déclare `required`. Ticket à ouvrir (hors
-        périmètre de #65, qui est un ticket de tests) — voir §5 de
-        `docs/t255-samm.md`.
-
-        Le COMPORTEMENT est déjà conforme et vérifié indépendamment : les
-        réponses produites portent toujours `code` et `message`
-        (`test_live_error_bodies_carry_the_contract_required_fields` et la
-        validation `jsonschema` du corps contre le contrat).
+        Un drift futur sur `required` (ou sur toute autre contrainte) fait
+        ÉCHOUER ce test : il n'est plus masqué par une normalisation.
         """
         runtime = self.app.openapi()["components"]["schemas"]
         error_names = (
@@ -555,73 +520,29 @@ class VaultOpenapiContractTests(VaultIntegrationTestCase):
         )
         for name in error_names:
             with self.subTest(schema=name):
-                contract_schema = _without_defaults(
-                    _structural(_resolve(CONTRACT, {"$ref": f"#/components/schemas/{name}"}))
+                contract_schema = _structural(
+                    _resolve(CONTRACT, {"$ref": f"#/components/schemas/{name}"})
                 )
-                runtime_schema = _without_defaults(
-                    _structural(runtime[_SCHEMA_ALIASES.get(name, name)])
-                )
+                runtime_schema = _structural(runtime[_SCHEMA_ALIASES.get(name, name)])
                 self.assertEqual(runtime_schema, contract_schema)
 
-    def test_default_annotation_does_not_change_validation(self) -> None:
-        """Prouve que la clé `default` écartée est une annotation SANS effet.
-
-        Le contrat ne porte pas `default` ; le schéma publié par Pydantic le
-        porte. Écarter cette clé ne doit changer AUCUN verdict de validation :
-        pour chaque modèle, un corps valide et un corps invalide (violation de
-        `const`) sont acceptés/rejetés à l'identique avec et sans `default`.
-
-        C'est la preuve qui autorise `_without_defaults()` à ne normaliser que
-        cette clé : toute autre clé écartée ferait échouer ce test.
-        """
+    def test_published_error_schema_declares_the_contract_required_fields(self) -> None:
+        """Le schéma publié déclare explicitement les champs exigés par le contrat."""
         runtime = self.app.openapi()["components"]["schemas"]
-        cases: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
-            "BadRequestError": (
-                {"code": "bad_request", "message": "Requête invalide"},
-                {"code": "autre_code"},
-            ),
-            "UnauthorizedError": (
-                {"code": "unauthorized", "message": "Authentification requise"},
-                {"code": "autre_code"},
-            ),
-            "ForbiddenError": (
-                {"code": "forbidden", "message": "Accès interdit"},
-                {"code": "autre_code"},
-            ),
-            "NotFoundError": (
-                {"code": "not_found", "message": "Ressource introuvable"},
-                {"code": "autre_code"},
-            ),
-            "MethodNotAllowedError": (
-                {"code": "method_not_allowed", "message": "Méthode non autorisée"},
-                {"code": "autre_code"},
-            ),
-            "ConflictError": (
-                {"code": "conflict", "message": "Secret déjà existant"},
-                {"code": "autre_code"},
-            ),
-            "RateLimitedError": (
-                {"code": "rate_limited", "message": "Trop de requêtes"},
-                {"code": "autre_code"},
-            ),
-            "UnavailableError": (
-                {"code": "unavailable", "message": "Service indisponible"},
-                {"code": "autre_code"},
-            ),
-            "InternalError": (
-                {"code": "internal_error", "message": "Erreur interne"},
-                {"code": "autre_code"},
-            ),
-            "HealthResponse": ({"status": "ok"}, {"status": "ko"}),
-        }
-        for name, (valid, invalid) in cases.items():
+        for name, required in (
+            ("BadRequestError", ["code", "message"]),
+            ("UnauthorizedError", ["code", "message"]),
+            ("ForbiddenError", ["code", "message"]),
+            ("NotFoundError", ["code", "message"]),
+            ("MethodNotAllowedError", ["code", "message"]),
+            ("ConflictError", ["code", "message"]),
+            ("RateLimitedError", ["code", "message"]),
+            ("UnavailableError", ["code", "message"]),
+            ("InternalError", ["code", "message"]),
+            ("HealthResponse", ["status"]),
+        ):
             with self.subTest(schema=name):
-                with_default = Draft202012Validator(runtime[name])
-                without_default = Draft202012Validator(_without_defaults(runtime[name]))
-                self.assertTrue(with_default.is_valid(valid))
-                self.assertTrue(without_default.is_valid(valid))
-                self.assertFalse(with_default.is_valid(invalid))
-                self.assertFalse(without_default.is_valid(invalid))
+                self.assertEqual(runtime[name].get("required"), required)
 
 
 class VaultTransportGuardTests(VaultIntegrationTestCase):

@@ -49,6 +49,14 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   - StarletteHTTPException -> format contractuel préservant le status_code (400, 401, 403, 404,
     405, 409, 429, 503) sans fuite d'enveloppe framework {"detail": ...}.
   - Exception non gérée -> 500 {"code": "internal_error", "message": "Erreur interne"}.
+- Schéma OpenAPI publié aligné sur le contrat (openapi.yaml:412-508) : les modèles
+  d'erreur et `HealthResponse` déclarent `code`, `message` et `status` SANS valeur
+  par défaut. Un champ à valeur par défaut est omis de `required` par Pydantic :
+  le schéma publié n'exposerait alors plus `required: [code, message]` exigé par
+  le contrat (drift de contrat). Les champs restent donc OBLIGATOIRES dans le
+  modèle : les gestionnaires d'exceptions construisent les charges utiles
+  explicitement, et le schéma publié expose exactement les contraintes du
+  contrat (vérifié par `tests/test_vault_integration_testclient.py`).
 """
 
 import asyncio
@@ -133,72 +141,72 @@ class BadRequestError(BaseModel):
     """Erreur 400 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["bad_request"] = "bad_request"
-    message: Literal["Requête invalide"] = "Requête invalide"
+    code: Literal["bad_request"]
+    message: Literal["Requête invalide"]
 
 
 class UnauthorizedError(BaseModel):
     """Erreur 401 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["unauthorized"] = "unauthorized"
-    message: Literal["Authentification requise"] = "Authentification requise"
+    code: Literal["unauthorized"]
+    message: Literal["Authentification requise"]
 
 
 class ForbiddenError(BaseModel):
     """Erreur 403 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["forbidden"] = "forbidden"
-    message: Literal["Accès interdit"] = "Accès interdit"
+    code: Literal["forbidden"]
+    message: Literal["Accès interdit"]
 
 
 class NotFoundError(BaseModel):
     """Erreur 404 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["not_found"] = "not_found"
-    message: Literal["Ressource introuvable"] = "Ressource introuvable"
+    code: Literal["not_found"]
+    message: Literal["Ressource introuvable"]
 
 
 class MethodNotAllowedError(BaseModel):
     """Erreur 405 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["method_not_allowed"] = "method_not_allowed"
-    message: Literal["Méthode non autorisée"] = "Méthode non autorisée"
+    code: Literal["method_not_allowed"]
+    message: Literal["Méthode non autorisée"]
 
 
 class ConflictError(BaseModel):
     """Erreur 409 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["conflict"] = "conflict"
-    message: Literal["Secret déjà existant"] = "Secret déjà existant"
+    code: Literal["conflict"]
+    message: Literal["Secret déjà existant"]
 
 
 class RateLimitedError(BaseModel):
     """Erreur 429 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["rate_limited"] = "rate_limited"
-    message: Literal["Trop de requêtes"] = "Trop de requêtes"
+    code: Literal["rate_limited"]
+    message: Literal["Trop de requêtes"]
 
 
 class UnavailableError(BaseModel):
     """Erreur 503 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["unavailable"] = "unavailable"
-    message: Literal["Service indisponible"] = "Service indisponible"
+    code: Literal["unavailable"]
+    message: Literal["Service indisponible"]
 
 
 class InternalError(BaseModel):
     """Erreur 500 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["internal_error"] = "internal_error"
-    message: Literal["Erreur interne"] = "Erreur interne"
+    code: Literal["internal_error"]
+    message: Literal["Erreur interne"]
 
 
 # La dépendance FastAPI qui lit l'en-tête `X-Heimdall-API-Key`, la politique de
@@ -737,7 +745,7 @@ class HealthResponse(BaseModel):
     """Réponse minimale du endpoint de santé sans information sensible."""
 
     model_config = ConfigDict(extra="forbid")
-    status: Literal["ok"] = "ok"
+    status: Literal["ok"]
 
 
 def _pin_db_path(settings: VaultSettings) -> Path:
