@@ -924,7 +924,12 @@ def list_registered_keys(db_path: Path, project_id: str | None = None) -> list[d
 
     Ni la clé brute ni son empreinte ne sont retournées : seules l'identifiant,
     le projet, la date de création et l'éventuelle révocation sont exposées.
+
+    Un filtre de projet hors contrat est refusé (fail-fast) : un simple
+    « aucune clé » masquerait une coquille de configuration opérateur.
     """
+    if project_id is not None:
+        project_id = validate_project_id(project_id)
     with db_session(db_path) as conn:
         rows = conn.execute(
             "SELECT id, project_id, created_at, revoked_at FROM api_keys ORDER BY created_at ASC"

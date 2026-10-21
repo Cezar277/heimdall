@@ -519,6 +519,14 @@ class VaultKeyCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Identifiant de projet invalide", result.output)
         self.assertNotIn("../..", result.output)
 
+    def test_library_list_refuses_an_invalid_project_filter(self) -> None:
+        """La garde est aussi dans la bibliothèque, pas seulement dans la CLI."""
+        init_db(self.db_path)
+        with self.assertRaises(ValueError) as ctx:
+            vault_auth.list_registered_keys(self.db_path, "Demo")
+        self.assertIn("Identifiant de projet invalide", str(ctx.exception))
+        self.assertNotIn("Demo", str(ctx.exception))
+
     def test_list_on_empty_registry_says_nothing_registered(self) -> None:
         """Un registre vide est signalé explicitement (pas de ligne fantôme)."""
         init_db(self.db_path)
