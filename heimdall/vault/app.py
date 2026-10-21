@@ -1329,9 +1329,11 @@ def _configure_secret_store(
         )
     app.state.secret_store = secret_store
     if isinstance(secret_store, SqliteSecretStore):
-        if isinstance(secret_store.db_path, Path):
-            # Aligner l'authentification sur la même base que le store explicite.
-            app.state.db_path = secret_store.db_path
+        # Aligner l'authentification sur la même base que le store explicite.
+        # Le chemin est normalisé en ``Path`` : la lecture d'empreintes
+        # (``lookup_db_api_key``) et l'écriture (``_persist_hash``) doivent
+        # viser exactement le même fichier, quel que soit le type fourni.
+        app.state.db_path = Path(secret_store.db_path)
         return "sqlite"
     return "memory"
 
@@ -1402,7 +1404,12 @@ def create_app(
     registry = vault_auth.ApiKeyRegistry(
         pepper=effective_settings.effective_api_key_pepper,
         storage_backend=app.state.storage_backend,
-        db_path=resolved_db if app.state.storage_backend == "sqlite" else None,
+        # Le store explicite peut avoir aligné ``app.state.db_path`` sur un
+        # autre fichier : le registre doit lire ET écrire cette même base.
+        # Utiliser ``resolved_db`` ici désynchroniserait l'écriture
+        # (``_persist_hash``) de la lecture d'authentification
+        # (``find_api_key_project``), soit un 401 permanent fail-closed.
+        db_path=app.state.db_path if app.state.storage_backend == "sqlite" else None,
     )
     for preregistered_hash, preregistered_project in validated_hashes.items():
         registry.register_hash(preregistered_hash, preregistered_project)

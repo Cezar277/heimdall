@@ -124,6 +124,10 @@ def list_keys(
     """Liste les clés API enregistrées (métadonnées seules, jamais la clé)."""
     try:
         resolved = _resolve_db_path(db_path)
+        if project is not None:
+            # Une coquille de filtre doit échouer franchement, pas afficher
+            # « Aucune clé » et masquer une mauvaise configuration opérateur.
+            vault_auth.validate_project_id(project)
     except ValueError as exc:
         typer.echo(f"Erreur : {exc}", err=True)
         raise typer.Exit(code=2) from None

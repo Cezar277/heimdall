@@ -29,8 +29,9 @@ from typer.testing import CliRunner
 from heimdall.cli.main import app as cli_app
 from heimdall.vault import auth as vault_auth
 from heimdall.vault.app import VaultSettings, create_app
-from heimdall.vault.crypto import generate_api_key, generate_encryption_key
+from heimdall.vault.crypto import VaultCipher, generate_api_key, generate_encryption_key
 from heimdall.vault.database import init_db
+from heimdall.vault.store import SqliteSecretStore
 
 PEPPER = "t64_pepper_value_0123456789abcdef"
 OTHER_PEPPER = "t64_other_pepper_value_9876543210abcd"
@@ -159,6 +160,61 @@ class ApiKeyVerificationTests(unittest.IsolatedAsyncioTestCase):
         # 404 : autorisé mais le secret n'existe pas (le store mémoire est vide).
         self.assertEqual(response.status_code, 404)
 
+    async def test_explicit_secret_store_path_is_shared_by_auth(self) -> None:
+        """Un store explicite sur un autre fichier aligne écriture ET lecture.
+
+        Régression de l'extraction #64 : le registre était construit avec le
+        chemin des settings (``resolved_db``) alors que ``create_app`` venait
+        d'aligner ``app.state.db_path`` sur le store explicite. L'écriture
+        allait dans A et la vérification lisait B → 401 permanent.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_db = Path(tmp) / "settings.db"
+            store_db = Path(tmp) / "store.db"
+            store = SqliteSecretStore(store_db, VaultCipher(b"S" * 32))
+            target = create_app(
+                VaultSettings(
+                    db_path=str(settings_db),
+                    storage_backend="sqlite",
+                    kek=generate_encryption_key(),
+                    api_key_pepper=PEPPER,
+                ),
+                secret_store=store,
+            )
+            registry = target.state.api_key_registry
+            self.assertEqual(registry.db_path, store_db)
+
+            raw_key = generate_api_key()
+            key_id = target.state.register_api_key(raw_key, "demo")
+
+            # La clé enregistrée doit être retrouvée par l'authentification :
+            # création puis lecture du secret prouvent que le registre écrit
+            # et lit le MÊME fichier que le store explicite.
+            transport = ASGITransport(app=target, client=("127.0.0.1", 54321))
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://127.0.0.1:8443",
+                headers={"X-Heimdall-API-Key": raw_key},
+            ) as client:
+                created = await client.post(
+                    "/api/v1/secrets",
+                    json={
+                        "project": "demo",
+                        "env": "dev",
+                        "name": "ABSENT",
+                        "value": "valeur-de-test",
+                    },
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                response = await client.get("/api/v1/secrets/demo/dev/ABSENT")
+                self.assertEqual(response.status_code, 200, response.text)
+
+                # La révocation doit viser le même fichier que l'authentification.
+                self.assertTrue(registry.revoke(key_id))
+                revoked = await client.get("/api/v1/secrets/demo/dev/ABSENT")
+            self.assertEqual(revoked.status_code, 401)
+            self.assertEqual(revoked.json(), _UNAUTHORIZED_BODY)
+
     async def test_received_key_is_never_echoed_in_the_response(self) -> None:
         """La clé reçue n'apparaît ni dans le corps d'erreur ni dans l'en-tête."""
         target = create_app(VaultSettings(api_key_pepper=PEPPER))
@@ -258,6 +314,29 @@ class ApiKeyRegistryTests(unittest.TestCase):
                 if bad_project:
                     self.assertNotIn(bad_project, str(ctx.exception))
 
+    def test_registry_without_pepper_refuses_every_write(self) -> None:
+        """Un registre à pepper vide ne peut ni enregistrer ni émettre."""
+        registry = vault_auth.ApiKeyRegistry(pepper="")
+        with self.assertRaises(ValueError):
+            registry.register(generate_api_key(), "demo")
+        with self.assertRaises(ValueError):
+            registry.issue("demo")
+        with self.assertRaises(ValueError):
+            registry.register_hash("a" * 64, "demo")
+        self.assertEqual(registry.active_hashes, {})
+
+    def test_key_id_with_trailing_newline_is_refused(self) -> None:
+        """``fullmatch`` : un ``\\n`` final ne doit pas passer avant l'écho CLI."""
+        for malformed in (
+            "key_" + "a" * 32 + "\n",
+            "key_" + "a" * 32 + "\r\n",
+            "key_" + "a" * 32 + " ",
+        ):
+            with self.subTest(malformed=repr(malformed[-2:])):
+                with self.assertRaises(ValueError) as ctx:
+                    vault_auth.validate_key_id(malformed)
+                self.assertNotIn(malformed, str(ctx.exception))
+
     def test_public_dev_pepper_is_refused_outside_test_mode(self) -> None:
         """Le pepper public committé est refusé hors HEIMDALL_ENV=test."""
         with self.assertRaises(ValueError):
@@ -324,25 +403,15 @@ class VaultKeyCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("projet=demo", result.output)
 
     async def test_revoke_stops_the_key_from_authenticating(self) -> None:
-        """Après révocation, la clé n'authentifie plus (401 générique)."""
+        """Cycle CLI complet : create → authentifié → revoke → 401 générique."""
         output = self._create()
         raw_key = self._extract_key(output)
         self.assertGreaterEqual(len(raw_key), 43)
         key_id = next(
             line for line in output.splitlines() if line.startswith("Identifiant")
         ).split(":", 1)[1].strip()
-        result = self.runner.invoke(
-            cli_app,
-            ["vault", "key", "revoke", key_id, "--db-path", str(self.db_path)],
-        )
-        self.assertEqual(result.exit_code, 0, result.output)
-        with sqlite3.connect(self.db_path) as conn:
-            revoked_at = conn.execute(
-                "SELECT revoked_at FROM api_keys WHERE id = ?", (key_id,)
-            ).fetchone()[0]
-        self.assertIsNotNone(revoked_at)
 
-        # Le serveur configuré sur la même base refuse la clé révoquée.
+        # Le serveur configuré sur la même base voit la clé avant révocation.
         target = create_app(
             VaultSettings(
                 db_path=str(self.db_path),
@@ -357,10 +426,37 @@ class VaultKeyCliTests(unittest.IsolatedAsyncioTestCase):
             base_url="http://127.0.0.1:8443",
             headers={"X-Heimdall-API-Key": raw_key},
         ) as client:
-            response = await client.get("/api/v1/secrets/demo/dev/MY_KEY")
-        self.assertEqual(response.status_code, 401)
-        self.assertEqual(response.json(), _UNAUTHORIZED_BODY)
-        self.assertNotIn(raw_key, response.text)
+            # Avant révocation : la clé authentifie et accède à SA ressource.
+            created = await client.post(
+                "/api/v1/secrets",
+                json={
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "MY_KEY",
+                    "value": "valeur-de-test",
+                },
+            )
+            self.assertEqual(created.status_code, 201, created.text)
+            before = await client.get("/api/v1/secrets/demo/dev/MY_KEY")
+            self.assertEqual(before.status_code, 200, before.text)
+
+            result = self.runner.invoke(
+                cli_app,
+                ["vault", "key", "revoke", key_id, "--db-path", str(self.db_path)],
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            with sqlite3.connect(self.db_path) as conn:
+                revoked_at = conn.execute(
+                    "SELECT revoked_at FROM api_keys WHERE id = ?", (key_id,)
+                ).fetchone()[0]
+            self.assertIsNotNone(revoked_at)
+
+            # La même instance applicative refuse désormais la clé révoquée :
+            # la lecture SQLite est l'autorité, pas l'instantané mémoire.
+            after = await client.get("/api/v1/secrets/demo/dev/MY_KEY")
+        self.assertEqual(after.status_code, 401)
+        self.assertEqual(after.json(), _UNAUTHORIZED_BODY)
+        self.assertNotIn(raw_key, after.text)
 
     def test_create_without_explicit_pepper_fails_closed(self) -> None:
         """Sans pepper explicite, la CLI refuse d'émettre une clé morte."""
@@ -379,6 +475,49 @@ class VaultKeyCliTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.exit_code, 2)
         self.assertIn("absolu", result.output)
+
+    def test_revoke_works_without_a_server_pepper(self) -> None:
+        """La révocation n'a pas de pepper : aucun registre « pepper vide ».
+
+        La révocation ne calcule ni ne vérifie d'empreinte : elle écrit
+        directement dans la base. Elle doit donc fonctionner sans pepper
+        serveur, sans construire de registre capable d'émettre des
+        empreintes faibles.
+        """
+        output = self._create()
+        key_id = next(
+            line for line in output.splitlines() if line.startswith("Identifiant")
+        ).split(":", 1)[1].strip()
+        os.environ.pop("HEIMDALL_VAULT_API_KEY_PEPPER", None)
+        result = self.runner.invoke(
+            cli_app,
+            ["vault", "key", "revoke", key_id, "--db-path", str(self.db_path)],
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        with sqlite3.connect(self.db_path) as conn:
+            revoked_at = conn.execute(
+                "SELECT revoked_at FROM api_keys WHERE id = ?", (key_id,)
+            ).fetchone()[0]
+        self.assertIsNotNone(revoked_at)
+
+    def test_list_rejects_an_invalid_project_filter(self) -> None:
+        """Un filtre ``--project`` hors contrat échoue en 2, sans écho."""
+        init_db(self.db_path)
+        result = self.runner.invoke(
+            cli_app,
+            [
+                "vault",
+                "key",
+                "list",
+                "--project",
+                "../..",
+                "--db-path",
+                str(self.db_path),
+            ],
+        )
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("Identifiant de projet invalide", result.output)
+        self.assertNotIn("../..", result.output)
 
     def test_list_on_empty_registry_says_nothing_registered(self) -> None:
         """Un registre vide est signalé explicitement (pas de ligne fantôme)."""

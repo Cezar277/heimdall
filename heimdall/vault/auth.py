@@ -392,8 +392,10 @@ def validate_key_id(key_id: str) -> str:
     L'identifiant n'est pas un secret, mais il est affiché par la CLI et
     utilisé dans des requêtes : un format hors contrat est refusé avant tout
     usage, pour ne jamais réfléchir une entrée arbitraire dans la sortie.
+    ``fullmatch`` est obligatoire : avec ``match`` et un motif ancré par ``$``,
+    ``key_<32hex>\\n`` passerait avant l'écho CLI (injection de retour ligne).
     """
-    if not isinstance(key_id, str) or KEY_ID_PATTERN.match(key_id) is None:
+    if not isinstance(key_id, str) or KEY_ID_PATTERN.fullmatch(key_id) is None:
         raise ValueError(
             "Identifiant de clé API invalide : attendu key_<32 caractères hexadécimaux>."
         )
@@ -480,7 +482,7 @@ class ApiKeyRegistry:
     ) -> None:
         self._pepper = pepper
         self._storage_backend = storage_backend
-        self._db_path = db_path
+        self._db_path = Path(db_path) if isinstance(db_path, str) else db_path
         self._lock = Lock()
         self._persist_lock = Lock()
         self._entries: dict[str, ApiKeyEntry] = {}
@@ -529,7 +531,7 @@ class ApiKeyRegistry:
         est validé contre le motif du contrat.
         """
         raw_key = validate_raw_api_key(raw_key)
-        key_hash = hash_project_api_key(raw_key, pepper=self._pepper)
+        key_hash = hash_project_api_key(raw_key, pepper=self._require_pepper())
         return self.register_hash(key_hash, project_id)
 
     def register_hash(self, key_hash: str, project_id: str) -> str:
@@ -547,6 +549,7 @@ class ApiKeyRegistry:
                 "Pour enregistrer une clé brute, utilisez "
                 "app.state.register_api_key(raw_key, project_id)."
             )
+        self._require_pepper()
         project_id = validate_project_id(project_id)
         with self._persist_lock:
             with self._lock:
@@ -581,6 +584,7 @@ class ApiKeyRegistry:
         empreinte.
         """
         project_id = validate_project_id(project_id)
+        self._require_pepper()
         raw_key = generate_project_api_key()
         key_id = self.register(raw_key, project_id)
         with self._lock:
@@ -629,6 +633,20 @@ class ApiKeyRegistry:
         return sorted(entries, key=lambda entry: entry.created_at)
 
     # -- Internes ----------------------------------------------------------
+
+    def _require_pepper(self) -> str:
+        """Exige un pepper serveur non vide pour toute écriture (fail-closed).
+
+        Un registre construit avec un pepper vide (par erreur, ou pour une
+        simple révocation) ne doit jamais pouvoir enregistrer ni émettre une
+        clé : l'empreinte serait calculée sans sel serveur, donc corrélable
+        entre déploiements.
+        """
+        if not isinstance(self._pepper, str) or not self._pepper.strip():
+            raise ValueError(
+                "Pepper serveur obligatoire pour enregistrer ou émettre une clé API."
+            )
+        return self._pepper
 
     def _entry_id_for_hash(self, key_hash: str) -> str | None:
         """Retourne l'identifiant de la clé correspondant à une empreinte."""
@@ -714,7 +732,11 @@ def find_api_key_project(app: Any, provided_hash: str) -> tuple[str | None, int]
     if registry.storage_backend == "sqlite":
         # SQLite est l'unique autorité : révocation, suppression ou erreur DB
         # ne doivent jamais retomber sur une ancienne entrée en mémoire.
-        return lookup_db_api_key(getattr(app.state, "db_path", None), provided_hash)
+        # La lecture passe par la MÊME référence que l'écriture
+        # (``registry.db_path``, utilisé par ``_persist_hash`` et ``revoke``) :
+        # lire ``app.state.db_path`` pouvait viser un autre fichier que celui
+        # où la clé est enregistrée (store explicite sur un autre chemin).
+        return lookup_db_api_key(registry.db_path, provided_hash)
     matching_project: str | None = None
     evaluated = 0
     with registry.lock:
@@ -920,10 +942,16 @@ def revoke_registered_key(db_path: Path, key_id: str) -> bool:
     L'identifiant est validé avant usage ; la révocation est persistée dans la
     base, qui reste la source de vérité : la clé cesse d'authentifier
     immédiatement, y compris pour un serveur déjà démarré.
+
+    Cette opération ne construit pas d'``ApiKeyRegistry`` : elle n'émet ni ne
+    vérifie aucune empreinte, donc n'a pas besoin de pepper. Un registre
+    « révocation seule » avec un pepper vide serait réutilisable par erreur
+    pour ``register``/``issue`` et produirait des empreintes faibles ; l'accès
+    direct à la base supprime cette surface.
     """
     validate_key_id(key_id)
-    registry = ApiKeyRegistry(pepper="", storage_backend="sqlite", db_path=db_path)
-    return registry.revoke(key_id)
+    with db_session(db_path) as conn:
+        return revoke_api_key(conn, key_id)
 
 
 __all__ = [
