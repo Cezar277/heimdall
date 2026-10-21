@@ -326,10 +326,12 @@ FastAPI pilote l'application **en mémoire, sans port réseau**, sur une **base
 SQLite temporaire créée par test** (aucun état partagé : ni base, ni registre
 de clés, ni secrets). La suite vérifie le cas nominal (POST puis GET), le refus
 401 d'une clé invalide, le refus 403 d'un secret appartenant à un autre
-projet, la conformité des réponses au contrat `openapi.yaml`, le refus 403
-d'une origine hors boucle locale, le 429 de débit avec `Retry-After` borné, et
-le refus des abus d'entrée (corps > 1 Mio, identifiants hors contrat,
-traversée de chemin). Preuves : [`docs/t255-samm.md`](docs/t255-samm.md).
+projet, la conformité des réponses au contrat `openapi.yaml` **et du schéma
+OpenAPI publié par l'application** (comparaison stricte, `required` compris),
+le refus 403 d'une origine hors boucle locale, le 429 de débit avec
+`Retry-After` borné, et le refus des abus d'entrée (corps > 1 Mio, identifiants
+hors contrat, traversée de chemin). Preuves :
+[`docs/t255-samm.md`](docs/t255-samm.md).
 
 Règles de contribution : [CONTRIBUTING.md](CONTRIBUTING.md).
 Jamais de vrai secret dans le dépôt, même expiré ; seul `.env.example`
