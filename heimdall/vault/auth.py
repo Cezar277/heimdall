@@ -721,7 +721,7 @@ def find_api_key_project(app: Any, provided_hash: str) -> tuple[str | None, int]
     ``constant_time_equal`` pour chaque candidat : le coût est le même que
     l'empreinte soit connue, inconnue ou révoquée. Ce parcours est partagé par
     l'authentification (``verify_api_key``) et par le choix du bucket de débit
-    (ticket #65) : l'existence d'une clé n'est pas observable par le temps de
+    (lot #63) : l'existence d'une clé n'est pas observable par le temps de
     réponse du middleware.
 
     Retourne ``(project_id ou None, nombre d'empreintes évaluées)``.
@@ -756,7 +756,7 @@ async def find_api_key_project_cached(
     Le middleware de débit effectue déjà le parcours complet du backend actif
     (sans ``break``) pour choisir le bucket ; l'authentification réutilise ce
     résultat au lieu de refaire le même full-scan + ``compare_digest`` par
-    candidat (2 parcours -> 1 par requête, ticket #65). La mémoïsation vit dans
+    candidat (2 parcours -> 1 par requête, lot #63). La mémoïsation vit dans
     l'état de la requête (``request.state``) : jamais partagée entre requêtes,
     aucune empreinte persistée hors du scope courant. Le coût reste identique
     entre clé connue/inconnue/révoquée : le premier parcours est exhaustif et
@@ -813,7 +813,7 @@ async def verify_api_key(
     - chemin de vérification de coût comparable (aucun break précoce, comparaison
       factice), mémoïsé par requête : le parcours complet du middleware de débit
       est réutilisé (``find_api_key_project_cached``), un seul full-scan par
-      requête (ticket #65).
+      requête (lot #63).
     - si ``settings.require_auth=False`` et aucune clé fournie, retourne None
       (mode test isolé).
 

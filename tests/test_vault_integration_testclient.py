@@ -1,4 +1,4 @@
-"""Tests d'intégration du Vault avec le `TestClient` FastAPI (ticket #65).
+"""Tests d'intégration du Vault avec le `TestClient` FastAPI (ticket #65, T255).
 
 Ce fichier est la preuve automatisée que le Vault **respecte le contrat
 OpenAPI** (`openapi.yaml`, ticket #15) et **refuse ce qu'il doit refuser** :

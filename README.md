@@ -94,7 +94,8 @@ ci-dessous.
 >   révocation).
 > - **Rejet HTTP 400 avant parsing au-delà de 1 Mio (1 048 576 octets)** : ticket #63.
 > - **En-tête `Cache-Control: no-store`** : ticket #63.
-> - **Rate-limit débit par clé validée, pair réseau et global avec `Retry-After`** : ticket #65.
+> - **Rate-limit débit par clé validée, pair réseau et global avec `Retry-After`** :
+>   livré dans le lot d'intégration #63 (pas d'issue GitHub propre).
 > - **Chiffrement au repos et persistance SQLite** : tickets #26 / #62.
 
 > **Limites de déploiement à l'état #63** :
@@ -187,7 +188,7 @@ heimdall/            paquet unique (#17)
   vault/             Vault chiffré ; crypto CONFINÉE à vault/crypto.py (#25, contrat #15)
   cli/               entrée `heimdall` (Typer)
 tests/               fumée paquet + confinement crypto + tests/contracts/
-                     + tests d'intégration Vault (TestClient, #65)
+                     + tests d'intégration Vault (TestClient, #65 / T255)
 docs/                adr/, contracts/, meetings/
 schemas/             finding.schema.json, mcp-tools.schema.json
 openapi.yaml         contrat Vault API v1 (#15)

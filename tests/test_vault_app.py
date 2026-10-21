@@ -624,7 +624,7 @@ class VaultSettingsTests(unittest.TestCase):
             {
                 "host": "127.0.0.1",
                 "port": 8443,
-                # Un seul worker : le backend mémoire est mono-processus (#65).
+                # Un seul worker : le backend mémoire est mono-processus (lot #63).
                 "workers": 1,
                 "ssl_certfile": None,
                 "ssl_keyfile": None,

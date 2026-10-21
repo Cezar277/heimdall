@@ -1,7 +1,7 @@
 # Traçabilité du Vault — tickets, modules, preuves (SAMM)
 
 Ce document répond à la remarque de revue « hygiène : la PR `Closes #63`
-embarque #64/#65/#26/#62 ». Il rend explicite, module par module et preuve par
+embarque #64/#26/#62 et la brique de débit ». Il rend explicite, module par module et preuve par
 preuve, à quel ticket appartient chaque brique du Vault, et décrit le découpage
 de la suite. La traçabilité n'est plus implicite : chaque ligne ci-dessous est
 vérifiable par un fichier de test cité.
@@ -14,18 +14,21 @@ vérifiable par un fichier de test cité.
 | #26 | Chiffrement au repos : AES-256-GCM, AAD, sous-clé HKDF, KEK/pepper distincts, confinement crypto | `heimdall/vault/crypto.py` (`VaultCipher`, `hash_api_key`, `generate_api_key`, `kek_matches_pepper`, `constant_time_equal`) | `tests/test_vault_app.py`, `tests/test_crypto_confinement.py` |
 | #62 | Persistance SQLite : schéma, `UNIQUE`, `foreign_keys=ON`, quota atomique, registre des clés | `heimdall/vault/database.py`, `heimdall/vault/store.py` (`SqliteSecretStore`, `InMemorySecretStore`) | `tests/test_vault_db.py`, `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py` |
 | #64 | Authentification par clé de projet : HMAC-SHA256 + pepper, temps constant, révocation, politique opérateur | `heimdall/vault/auth.py` (`generate_project_api_key`, `hash_project_api_key`, `validate_raw_api_key`, `validate_project_id`, `verify_api_key`, `require_project_access`, `ApiKeyRegistry`, `IssuedApiKey`), `heimdall/cli/vault_keys.py` (`heimdall vault key create/list/revoke`) | `tests/test_vault_auth.py`, `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py`, `tests/security/test_vault_replay_bruteforce.py` |
-| #65 | Limitation de débit : buckets clé/pair/global, `Retry-After` borné, backend partagé SQLite | `heimdall/vault/ratelimit.py` (`RateLimiter`, `SqliteRateLimiter`), middleware de débit de `app.py` | `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py` |
 | #63 | Routes `POST /api/v1/secrets` et `GET /api/v1/secrets/{project}/{env}/{name}` : validation stricte, 1 Mio, `no-store`, 201 sans `value` | `heimdall/vault/app.py` (`SecretCreate`, `SecretMetadata`, `SecretRead`, `_register_routes`), `openapi.yaml` | `tests/test_vault_app.py`, `tests/contracts/test_vault_openapi.py` |
-| T255 | Tests d'intégration `TestClient` : cas nominal, 401 clé invalide, 403 projet étranger, conformité OpenAPI (corps + schéma publié), refus de transport, 429 + `Retry-After`, abus d'entrée, base temporaire par test. **Corrige au passage** le drift `required` du schéma publié | `tests/test_vault_integration_testclient.py`, `heimdall/vault/app.py` (modèles d'erreur et `HealthResponse` : champs sans valeur par défaut → `required` conforme au contrat) | `tests/test_vault_integration_testclient.py` (30 tests), `docs/t255-samm.md` |
+| #65 | **Tests d'intégration `TestClient`** (sous-ticket 5 de #25, branche `65-t255-tests-dintégration-testclient`) : cas nominal, 401 clé invalide, 403 projet étranger, conformité OpenAPI (corps + schéma publié), refus de transport, 429 + `Retry-After`, abus d'entrée, base temporaire par test. **Corrige au passage** le drift `required` du schéma publié | `tests/test_vault_integration_testclient.py`, `heimdall/vault/app.py` (modèles d'erreur et `HealthResponse` : champs sans valeur par défaut → `required` conforme au contrat) | `tests/test_vault_integration_testclient.py` (30 tests), `docs/t255-samm.md` |
+| #63 (lot d'intégration) | Limitation de débit : buckets clé/pair/global, `Retry-After` borné, backend partagé SQLite — brique **sans issue GitHub propre**, livrée dans le lot d'intégration #63 | `heimdall/vault/ratelimit.py` (`RateLimiter`, `SqliteRateLimiter`), middleware de débit de `app.py` | `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py` |
 
-> **Numérotation** : `#65` désigne **uniquement** la limitation de débit
-> (`heimdall/vault/ratelimit.py`), comme dans le code du Vault. Les tests
-> d'intégration `TestClient` sont le sous-ticket **T255** (branche
-> `65-t255-tests-dintégration-testclient`, sous-ticket 5 du ticket parent
-> `#25 « Vault minimal »`), et non une seconde ligne `#65` : la matrice ne
-> contient ainsi qu'un seul `#65` normatif, sans ambiguïté pour l'audit
-> SAMM/pentest. L'issue GitHub correspondante porte le libellé « Tests
-> d'intégration TestClient » ; aucun code n'est impacté.
+> **Numérotation** : `#65` est l'issue GitHub **« Tests d'intégration TestClient »**
+> (sous-ticket 5 de `#25 « Vault minimal »`, branche
+> `65-t255-tests-dintégration-testclient`) : c'est elle que la PR ferme
+> (`Closes #65`), et la matrice ne contient qu'**un seul** `#65` normatif.
+> La limitation de débit n'a **pas** d'issue GitHub propre : elle a été livrée
+> dans le lot d'intégration du ticket #63 et est donc étiquetée
+> « #63 (lot d'intégration) ». L'ancien libellé « #65 » employé dans le code
+> pour le débit désignait le slot 5 de #25 — devenu l'issue #65 des tests
+> d'intégration — d'où la collision signalée par la revue : il a été remplacé
+> partout (code, docs, README) pour qu'aucune ligne ne prête à confusion à
+> l'audit SAMM/pentest.
 
 Le contrat normatif des routes reste `openapi.yaml` (ticket #15) ; sa lecture
 documentaire est `docs/contracts/vault-api.md`.
@@ -33,8 +36,8 @@ documentaire est `docs/contracts/vault-api.md`.
 ## 2. Découpage de la suite (recommandation de la revue)
 
 La branche `63-t253-routes-post-et-get-secret` est un **lot d'intégration** : les
-briques #26/#62/#64/#65 y sont matérialisées parce que les routes #63 en
-dépendent (elles les exercent). Pour lever la remarque d'hygiène, la suite
+briques #26/#62/#64 et la brique de débit y sont matérialisées parce que les
+routes #63 en dépendent (elles les exercent). Pour lever la remarque d'hygiène, la suite
 recommandée est une pile de branches, chaque brique restant dans son ticket :
 
 > **État d'avancement** : la brique #64 est portée par sa propre branche
@@ -43,14 +46,14 @@ recommandée est une pile de branches, chaque brique restant dans son ticket :
 > brique y est **isolée dans le module `heimdall/vault/auth.py`** (registre,
 > dépendance FastAPI, politique opérateur) avec sa suite de tests
 > `tests/test_vault_auth.py` ; `app.py` ne fait plus que déléguer. Les branches
-> #26/#62/#65 restent à extraire de la même façon.
+> #26/#62 et la brique de débit restent à extraire de la même façon.
 
 ```bash
 # Ordre de dépendance (du socle vers les routes)
 git branch 26-vault-chiffrement      # crypto.py        (#26)
 git branch 62-vault-stockage-sqlite  # database/store   (#62)
 git branch 64-vault-auth-cles-projet # auth + registre  (#64)  <- fait
-git branch 65-vault-rate-limit       # ratelimit.py     (#65)
+git branch 63-lot-rate-limit        # ratelimit.py     (lot #63)
 git branch 63-routes-secrets         # app.py (routes)  (#63)  <- fusionnée dans main
 ```
 

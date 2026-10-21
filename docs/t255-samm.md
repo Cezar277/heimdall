@@ -17,11 +17,13 @@ livraison : contrôle effectué avec
 `git diff 65ba2ca HEAD -- tests/test_vault_integration_testclient.py heimdall/vault/app.py tests/test_vault_app.py pyproject.toml requirements.lock`
 (sortie vide) ; les commits suivants ne modifient que la documentation.
 
-> **Numérotation** : dans le code du Vault, `#65` désigne **uniquement** la
-> limitation de débit (`heimdall/vault/ratelimit.py`,
-> `docs/contracts/vault-traceability.md`). Les tests d'intégration `TestClient`
-> sont le sous-ticket **T255** : la matrice ticket → module → preuve ne
-> contient qu'un seul `#65` normatif (voir §5.2).
+> **Numérotation** : `#65` est l'issue GitHub **« Tests d'intégration TestClient »**
+> (sous-ticket 5 de `#25 « Vault minimal »`, branche
+> `65-t255-tests-dintégration-testclient`) : c'est elle que la PR ferme
+> (`Closes #65`). La limitation de débit n'a pas d'issue GitHub propre (livrée
+> dans le lot d'intégration #63) et n'est plus étiquetée `#65` : la matrice
+> `docs/contracts/vault-traceability.md` ne contient qu'un seul `#65` normatif
+> (voir §5.2).
 
 ## 1. Exigences du ticket et preuves
 
@@ -106,13 +108,28 @@ Le schéma OpenAPI **publié par l'application** n'exposait pas la liste
   `tests/test_vault_integration_testclient.py:529–546` vérifie explicitement
   les listes `required` publiées. Un drift futur fait échouer la suite.
 
-### 5.2 Numérotation `#65`
+### 5.2 Numérotation `#65` — collision résorbée
 
-Dans le code du Vault, `#65` désigne **uniquement** la limitation de débit
-(`heimdall/vault/ratelimit.py`). Les tests d'intégration `TestClient` sont le
-sous-ticket **T255** (sous-ticket 5 du parent `#25`), afin que la matrice
-`docs/contracts/vault-traceability.md` ne contienne qu'un seul `#65`
-normatif — source d'erreur d'audit SAMM/pentest. Aucun code n'est impacté.
+`#65` est l'issue GitHub **« Tests d'intégration TestClient »** (sous-ticket 5
+de `#25 « Vault minimal »`, branche `65-t255-tests-dintégration-testclient`) :
+c'est elle que la PR ferme (`Closes #65`).
+
+La limitation de débit n'a **pas** d'issue GitHub propre : elle a été livrée
+dans le lot d'intégration du ticket #63. L'ancien libellé « #65 » employé dans
+le code pour le débit désignait le *slot 5* de #25 — devenu l'issue #65 des
+tests d'intégration — d'où la collision (source d'erreur pour l'audit
+SAMM/pentest). Il a été remplacé partout par « lot #63 » :
+
+- code : `heimdall/vault/ratelimit.py`, `heimdall/vault/app.py`,
+  `heimdall/vault/auth.py`, `heimdall/vault/database.py`,
+  `heimdall/vault/store.py`, `tests/test_vault_app.py` ;
+- docs : `docs/contracts/vault-traceability.md`, `docs/contracts/vault-api.md`,
+  `README.md` ;
+- la matrice `docs/contracts/vault-traceability.md` ne contient plus qu'**un
+  seul** `#65` normatif (les tests d'intégration), et la limitation de débit
+  est étiquetée « #63 (lot d'intégration) ».
+
+Aucun changement fonctionnel : commentaires et libellés uniquement.
 
 La réussite de la CI Linux sur le SHA final et l'accord explicite du relecteur
 sont requis avant fusion.

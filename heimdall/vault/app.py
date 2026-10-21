@@ -400,7 +400,7 @@ _SECRETS_POST_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": RateLimitedError,
         "description": (
             "Trop de requêtes — quota de stockage atteint (#62/#63) ou débit "
-            "clé/pair/global dépassé (#65)."
+            "clé/pair/global dépassé (#63, lot d'intégration)."
         ),
         "headers": _RETRY_AFTER_HEADER,
     },
@@ -428,7 +428,7 @@ _SECRETS_GET_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": RateLimitedError,
         "description": (
             "Trop de requêtes — quota de stockage atteint (#62/#63) ou débit "
-            "clé/pair/global dépassé (#65)."
+            "clé/pair/global dépassé (#63, lot d'intégration)."
         ),
         "headers": _RETRY_AFTER_HEADER,
     },
@@ -965,7 +965,7 @@ def _register_middleware(app: FastAPI) -> None:
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
-        """Borne le débit par clé validée, pair réseau et global (ticket #65).
+        """Borne le débit par clé validée, pair réseau et global (lot #63).
 
         Rejet précoce sans coût CPU : ``peek`` pair/global (lecture seule,
         sans consommation) précède tout hachage ou lookup. Les 400/401 sont
@@ -975,7 +975,7 @@ def _register_middleware(app: FastAPI) -> None:
         bucket par clé emprunte le même parcours à coût comparable que
         ``verify_api_key`` (``find_api_key_project_cached``) : le résultat est
         mémoïsé dans la requête et réutilisé par l'authentification (un seul
-        full-scan par requête, ticket #65) ; l'existence d'une clé n'est pas
+        full-scan par requête, lot #63) ; l'existence d'une clé n'est pas
         observable par le temps de réponse du middleware. La phase consommatrice
         est ensuite UNIQUE : ``check_authenticated`` consomme pair/global + clé
         en une seule transaction (mémoire : une seule section critique ;
@@ -1180,7 +1180,7 @@ def _register_routes(app: FastAPI) -> None:
             ) from None
         except QuotaExceededError:
             # 429 de CAPACITÉ (quota de stockage, #62) : distinct du 429 de
-            # DÉBIT (rate-limit, #65), lui transitoire.
+            # DÉBIT (rate-limit, lot #63), lui transitoire.
             # Le contrat OpenAPI impose `Retry-After` sur TOUT 429, donc
             # l'en-tête est présent même ici ; en revanche ce 429 n'est PAS
             # transitoire : sans route DELETE dans le contrat #63, un retry
@@ -1508,8 +1508,8 @@ def run_server() -> None:
     son ticket dédié.
 
     NOTE CONCURRENCE : Le stockage SQLite chiffré (#26, #62), les empreintes de
-    clés API et, avec ce même backend, les buckets de rate-limiting (#65) sont
-    partagés entre workers. Le serveur épingle toutefois workers=1 (le lanceur
+    clés API et, avec ce même backend, les buckets de rate-limiting (lot #63)
+    sont partagés entre workers. Le serveur épingle toutefois workers=1 (le lanceur
     ignore WEB_CONCURRENCY) : le mode mémoire reste strictement mono-processus
     et cette contrainte évite tout écart de configuration. Le backend SQLite
     peut être répliqué sans multiplier la limite de débit.
@@ -1528,7 +1528,7 @@ def run_server() -> None:
         host=server_settings.host,
         port=server_settings.port,
         # Épinglé par défaut : le backend mémoire est strictement mono-processus.
-        # Le backend SQLite partage ses buckets (#65), mais workers>1 reste une
+        # Le backend SQLite partage ses buckets (lot #63), mais workers>1 reste une
         # décision d'exploitation explicite hors de ce lanceur minimal.
         workers=1,
         ssl_certfile=server_settings.ssl_certfile,
