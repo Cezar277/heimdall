@@ -16,6 +16,7 @@ dépôt.
 import dataclasses
 import json
 import math
+import traceback as traceback_module
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,9 @@ VALIDATOR = Draft202012Validator(SCHEMA)
 
 # Empreinte synthétique : 64 caractères hexadécimaux, sans valeur de secret.
 FAKE_HASH = "a" * 64
+
+# Marqueur synthétique unique : aucune valeur réelle (invariant 8).
+CANARY = "SYNTHETIC_CANARY_7f3a"
 
 BASE: dict[str, object] = {
     "file": "config/app.py",
@@ -500,13 +504,91 @@ def test_scanner_refuses_a_non_conforming_engine_output(finding):
         Scanner(moteur).scan(DiffTarget(path="src/app.py", lines=((1, "x"),)))
 
 
-def test_scanner_propagates_engine_failure_without_partial_result():
+def test_scanner_converts_an_engine_failure_into_a_contract_error():
+    """Une panne du moteur sort en ``ScanError``, jamais en exception brute.
+
+    Le contrat d'erreur est unique : un appelant qui ne catche que
+    ``ScanError`` / ``InvalidFinding`` / ``InvalidTarget`` (CLI, Vault) ne
+    doit pas être traversé par une ``RuntimeError`` du moteur.
+    """
+
     class _MoteurCasse:
         def analyser(self, cible):
             raise RuntimeError("panne du moteur")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ScanError):
         Scanner(_MoteurCasse()).scan(DiffTarget(path="src/app.py", lines=((1, "x"),)))
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        ValueError(f"échec du moteur : {CANARY}"),
+        RuntimeError(f"échec du moteur : {CANARY}"),
+        KeyError(f"échec du moteur : {CANARY}"),
+        ZeroDivisionError(f"échec du moteur : {CANARY}"),
+    ],
+    ids=["value_error", "runtime_error", "key_error", "zero_division"],
+)
+def test_an_engine_that_raises_yields_a_static_scan_error(exception):
+    """Le moteur qui lève : ``ScanError``, message statique, aucun canari.
+
+    Le message d'une exception du moteur peut contenir un extrait de secret
+    ou un chemin : il ne doit **jamais** être reflété par la façade
+    (invariant 8), ni dans le type, ni dans le message, ni dans la traceback.
+    """
+
+    class _MoteurCasse:
+        def analyser(self, cible):
+            raise exception
+
+    with pytest.raises(ScanError) as ctx:
+        Scanner(_MoteurCasse()).scan(DiffTarget(path="src/app.py", lines=((1, "x"),)))
+    assert CANARY not in str(ctx.value)
+    assert CANARY not in type(ctx.value).__name__
+    # La cause est masquée : ni la cause ni le contexte implicite ne
+    # ressuscitent le message du moteur.
+    assert ctx.value.__cause__ is None
+    assert ctx.value.__context__ is None
+    # La traceback affichée (ce que journalise un `logging` en `exc_info=True`)
+    # ne contient pas le canari non plus.
+    traceback = "".join(traceback_module.format_exception(ctx.value))
+    assert CANARY not in traceback
+
+
+def test_an_engine_output_that_raises_while_being_consumed_is_a_contract_error():
+    """Un rendu générateur qui lève à la consommation : ``ScanError``.
+
+    Le ``except TypeError`` d'avant ne couvrait que le rendu non itérable :
+    un générateur qui explose en cours de consommation traversait la façade
+    en ``RuntimeError`` brute.
+    """
+
+    class _MoteurGenerateur:
+        def analyser(self, cible):
+            def _rendement():
+                yield _finding(file="src/app.py", line=1)
+                raise RuntimeError(f"échec du moteur : {CANARY}")
+
+            return _rendement()
+
+    with pytest.raises(ScanError) as ctx:
+        Scanner(_MoteurGenerateur()).scan(DiffTarget(path="src/app.py", lines=((1, "x"),)))
+    assert CANARY not in str(ctx.value)
+    assert ctx.value.__context__ is None
+
+
+def test_scan_all_refuses_a_generator_that_raises_while_iterating():
+    """Un générateur de cibles qui lève : ``ScanError``, pas ``RuntimeError``."""
+
+    def _cibles():
+        yield DiffTarget(path="src/app.py", lines=((1, "x"),))
+        raise RuntimeError(f"échec du moteur : {CANARY}")
+
+    with pytest.raises(ScanError) as ctx:
+        Scanner(_MoteurFactice([])).scan_all(_cibles())
+    assert CANARY not in str(ctx.value)
+    assert ctx.value.__context__ is None
 
 
 @pytest.mark.parametrize("cible", ["pas une cible", None, 42, object(), {"path": "a.py"}])
@@ -568,6 +650,23 @@ def test_no_raw_typing_error_escapes_the_contract():
     Le contrat d'erreur est unique : ``InvalidFinding``, ``InvalidTarget`` ou
     ``ScanError`` — les trois sont des ``ScanError``.
     """
+
+    class _MoteurCasse:
+        def analyser(self, cible):
+            raise RuntimeError(f"échec du moteur : {CANARY}")
+
+    class _MoteurGenerateur:
+        def analyser(self, cible):
+            def _rendement():
+                yield _finding(file="src/app.py", line=1)
+                raise RuntimeError(f"échec du moteur : {CANARY}")
+
+            return _rendement()
+
+    def _cibles_qui_echouent():
+        yield DiffTarget(path="src/app.py", lines=((1, "x"),))
+        raise RuntimeError(f"échec du moteur : {CANARY}")
+
     entrees = [
         lambda: _finding(status=[]),
         lambda: _finding(source={}),
@@ -577,6 +676,11 @@ def test_no_raw_typing_error_escapes_the_contract():
         lambda: Scanner(None),
         lambda: Scanner(_MoteurFactice([])).scan("pas une cible"),
         lambda: Scanner(_MoteurFactice([])).scan_all(None),
+        lambda: Scanner(_MoteurCasse()).scan(DiffTarget(path="src/app.py", lines=((1, "x"),))),
+        lambda: Scanner(_MoteurGenerateur()).scan(
+            DiffTarget(path="src/app.py", lines=((1, "x"),))
+        ),
+        lambda: Scanner(_MoteurFactice([])).scan_all(_cibles_qui_echouent()),
     ]
     for entree in entrees:
         with pytest.raises(ScanError):

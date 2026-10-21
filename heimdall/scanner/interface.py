@@ -18,9 +18,9 @@ Findings, pas des verdicts sur un secret.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Final, Protocol
+from typing import Final, Protocol, TypeVar, cast
 
 from heimdall.scanner.errors import InvalidTarget, ScanError
 from heimdall.scanner.finding import (
@@ -31,6 +31,43 @@ from heimdall.scanner.finding import (
 
 #: Nombre de parties d'une ligne ajoutée : ``(numéro, texte)``.
 _LINE_PARTS: Final[int] = 2
+
+#: Message statique : le moteur injecté a levé une exception (invariant 8 :
+#: ni le message du moteur, ni ``str(e)`` ne sont jamais reflétés).
+_MSG_ENGINE_FAILURE: Final[str] = "moteur de détection en échec"
+#: Message statique : la sortie du moteur n'est pas conforme au contrat.
+_MSG_BAD_OUTPUT: Final[str] = "sortie scanner non conforme au contrat Finding v1"
+#: Message statique : la suite de cibles n'est pas exploitable.
+_MSG_BAD_TARGETS: Final[str] = "cible d'analyse non conforme : liste de cibles"
+
+_T = TypeVar("_T")
+
+
+def _guard_call(action: Callable[[], _T], message: str) -> _T:
+    """Exécute ``action`` et convertit toute exception en ``ScanError``.
+
+    Le contrat d'erreur de la façade est **unique** : une exception levée
+    par le moteur (ou pendant la consommation de son rendu) ne doit jamais
+    atteindre l'appelant, qui ne sait catcher que ``ScanError`` /
+    ``InvalidFinding`` / ``InvalidTarget``.
+
+    Le message de l'erreur est **statique** : ni le message de l'exception
+    d'origine, ni son type ne sont reflétés (invariant 8). L'erreur est
+    relancée **hors** du bloc ``except`` : ``__context__`` reste vide, donc
+    même une inspection de la traceback ne ressuscite pas le message du
+    moteur. Une ``ScanError`` déjà typée est laissée telle quelle.
+    """
+    echec = False
+    resultat: _T | None = None
+    try:
+        resultat = action()
+    except ScanError:
+        raise
+    except Exception:
+        echec = True
+    if echec:
+        raise ScanError(message) from None
+    return cast(_T, resultat)
 
 
 def _check_path(value: object) -> None:
@@ -157,11 +194,21 @@ def _check_finding(finding: object, cible: ScanTarget) -> None:
     copie et rend son avis à l'humain, jamais dans le Finding lui-même.
     """
     if not isinstance(finding, Finding):
-        raise ScanError("sortie scanner non conforme au contrat Finding v1")
+        raise ScanError(_MSG_BAD_OUTPUT)
     if finding.file != cible.path:
-        raise ScanError("sortie scanner non conforme au contrat Finding v1")
+        raise ScanError(_MSG_BAD_OUTPUT)
     if finding.status != "detecte" or finding.source not in SCANNER_SOURCES:
-        raise ScanError("sortie scanner non conforme au contrat Finding v1")
+        raise ScanError(_MSG_BAD_OUTPUT)
+
+
+def _valider_et_trier(findings: list[Finding], cible: ScanTarget) -> None:
+    """Vérifie chaque Finding rendu par le moteur, puis trie la liste.
+
+    Le tri est stable et déterministe : ``(ligne, type, empreinte)``.
+    """
+    for finding in findings:
+        _check_finding(finding, cible)
+    findings.sort(key=lambda item: (item.line, item.type, item.snippet_hash))
 
 
 class Scanner:
@@ -181,6 +228,11 @@ class Scanner:
     ``TypeError`` ni ``AttributeError`` brute ne doit atteindre l'appelant : la
     cible et le moteur viennent d'autres composants (parseur MCP, CLI), donc
     d'une frontière non fiable.
+
+    Cela vaut aussi pour les **exceptions levées par le moteur lui-même** :
+    une panne du moteur, un rendu non conforme ou une itération qui échoue
+    remontent en ``ScanError``, avec un message **statique** — ni le message
+    du moteur, ni une valeur candidate, ne sont jamais reflétés (invariant 8).
     """
 
     __slots__ = ("_moteur",)
@@ -195,27 +247,31 @@ class Scanner:
 
         L'ordre de tri est ``(ligne, type, empreinte)`` : deux scans de la
         même cible rendent la même liste, dans le même ordre.
+
+        **Toute exception du moteur est convertie en ``ScanError``** : le
+        contrat d'erreur est unique, et le message de l'exception du moteur
+        (qui pourrait contenir un extrait de secret ou un chemin) n'est
+        jamais reflété (invariant 8).
         """
         if not isinstance(cible, (DiffTarget, FileTarget)):
             raise InvalidTarget("cible d'analyse non conforme : type")
-        resultat = self._moteur.analyser(cible)
+        resultat = _guard_call(lambda: self._moteur.analyser(cible), _MSG_ENGINE_FAILURE)
         if resultat is None:
-            raise ScanError("sortie scanner non conforme au contrat Finding v1")
-        try:
-            findings = list(resultat)
-        except TypeError:
-            raise ScanError("sortie scanner non conforme au contrat Finding v1") from None
-        for finding in findings:
-            _check_finding(finding, cible)
-        findings.sort(key=lambda item: (item.line, item.type, item.snippet_hash))
+            raise ScanError(_MSG_BAD_OUTPUT)
+        # Rendu non itérable **ou** générateur qui lève à la consommation :
+        # la sortie ne peut pas être vérifiée, donc elle est refusée.
+        findings = _guard_call(lambda: list(resultat), _MSG_BAD_OUTPUT)
+        _guard_call(lambda: _valider_et_trier(findings, cible), _MSG_BAD_OUTPUT)
         return findings
 
     def scan_all(self, cibles: Iterable[ScanTarget]) -> list[Finding]:
-        """Analyse plusieurs cibles et rend tous les Findings, triés par fichier."""
-        try:
-            iterables = list(cibles)
-        except TypeError:
-            raise ScanError("cible d'analyse non conforme : liste de cibles") from None
+        """Analyse plusieurs cibles et rend tous les Findings, triés par fichier.
+
+        La matérialisation de ``cibles`` est protégée : un générateur qui
+        lève en cours d'itération est une ``ScanError``, jamais une exception
+        brute que l'appelant (CLI, Vault) ne catcherait pas.
+        """
+        iterables = _guard_call(lambda: list(cibles), _MSG_BAD_TARGETS)
         findings: list[Finding] = []
         for cible in iterables:
             findings.extend(self.scan(cible))

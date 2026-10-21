@@ -126,7 +126,7 @@ MCP, CLI, données relues du Vault ou d'un cache). Le contrat d'erreur est donc
 | --- | --- | --- |
 | `InvalidFinding` | `Finding(...)`, `Finding.from_dict(...)` | la donnée ne respecte pas le contrat #14 |
 | `InvalidTarget` | `DiffTarget(...)`, `FileTarget(...)`, `Scanner.scan(cible)` | la cible est inexploitable |
-| `ScanError` | `Scanner(moteur)`, `Scanner.scan(...)` | moteur ou sortie inexploitables |
+| `ScanError` | `Scanner(moteur)`, `Scanner.scan(...)`, `Scanner.scan_all(...)` | moteur ou sortie inexploitables |
 
 Les trois dérivent de `ScanError`, lui-même de `Exception` ; `InvalidFinding`
 et `InvalidTarget` dérivent aussi de `ValueError`, pour les appelants qui
@@ -138,6 +138,27 @@ n'est pas une cible ou un moteur sans méthode `analyser` sont refusés par
 l'erreur de contrat, que l'appelant (Vault, CLI) sait catcher. Le refus
 reste fail-closed dans tous les cas : il bloque, il ne rend jamais la main
 sur une liste partielle.
+
+### Le moteur ne peut rien laisser passer non plus
+
+Le moteur est injecté : c'est du code d'un autre ticket (#54/#59), et son
+message d'exception n'est pas sous le contrôle de cette façade. Une panne du
+moteur, un rendu non conforme ou une itération qui échoue sont donc
+**enveloppés** :
+
+| Situation | Avant | Après |
+| --- | --- | --- |
+| `moteur.analyser(cible)` lève | exception brute du moteur | `ScanError` |
+| le rendu n'est pas consommable (`None`, non itérable, générateur qui lève à la consommation) | `TypeError` brut, ou exception brute | `ScanError` |
+| l'itération de `scan_all(cibles)` échoue | exception brute | `ScanError` |
+
+Le message de l'erreur est **statique** : ni le message du moteur, ni une
+valeur candidate ne sont reflétés (invariant 8). L'exception d'origine est
+relancée **hors** du bloc `except` : `__cause__` et `__context__` restent
+vides, donc la traceback journalisée ne ressuscite pas le message du moteur.
+
+Seule exception : les `BaseException` (`KeyboardInterrupt`, `SystemExit`) ne
+sont pas capturées — une interruption doit rester une interruption.
 
 ## Ce que ce ticket ne fait pas
 
@@ -204,7 +225,10 @@ Le moteur injecté doit :
 - appliquer, avant toute lecture, le confinement complet de l'invariant 3
   (`resolve` + `is_relative_to` sur une racine fixée, refus des liens
   sortants, identité de descripteur revérifiée à l'usage) : la garde lexicale
-  des cibles ne suffit pas.
+  des cibles ne suffit pas ;
+- lever des exceptions **sans secret dans le message** si le moteur échoue :
+  la façade masque leur message (invariant 8), mais mieux vaut ne pas en
+  mettre — un moteur qui plante sur un candidat doit rester muet.
 
 ## Preuves locales
 
