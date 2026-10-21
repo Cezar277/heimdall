@@ -43,10 +43,10 @@ contrôle effectué avec
 python -m pytest tests/test_vault_auth.py -q
 # 25 passed, 17 subtests passed
 python -m pytest -q
-# 1004 passed, 1 skipped, 1 xfailed, 4268 subtests passed
+# 1134 passed, 1 skipped, 1 xfailed, 4268 subtests passed
 ruff check heimdall tests      # All checks passed!
 mypy heimdall tests/contracts/fastapi_contract_fixture.py
-# Success: no issues found in 26 source files
+# Success: no issues found in 29 source files
 bandit -r heimdall -q         # aucun rapport
 ```
 
