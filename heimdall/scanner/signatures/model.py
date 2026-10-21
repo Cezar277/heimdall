@@ -18,10 +18,15 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from heimdall.scanner.errors import ScanError
+
 #: Grammaire commune aux identifiants de règle et aux types Finding (#14).
 _ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z][a-z0-9_]*")
 _MAX_IDENTIFIER_LENGTH: Final[int] = 64
 _VALUE_GROUP: Final[str] = "value"
+#: Message statique : une ligne non textuelle est une violation de contrat
+#: (invariant 8 : ni l'entrée ni sa valeur ne sont jamais reflétées).
+_MSG_BAD_LINE: Final[str] = "ligne d'analyse non conforme au contrat"
 
 
 class RuleMatch:
@@ -186,9 +191,16 @@ class Rule:
         Les objets rendus portent le candidat via ``group("value")`` ; leur
         ``repr`` est masqué (``RuleMatch``) pour qu'une journalisation
         accidentelle n'écrive jamais le secret en clair.
+
+        Une ligne qui n'est pas un ``str`` est une **violation de contrat**,
+        pas une « absence de correspondance » : l'interface #53 refuse déjà
+        toute ligne non textuelle (``interface._check_lines``). Si cette garde
+        de défense est malgré tout franchie, on échoue fail-closed
+        (``ScanError``) au lieu de rendre un ``miss`` silencieux, qui ferait
+        passer une ligne jamais analysée pour une ligne propre.
         """
         if not isinstance(line, str):
-            return ()
+            raise ScanError(_MSG_BAD_LINE)
         if self.keywords:
             lowered = line.casefold()
             if not any(keyword in lowered for keyword in self.keywords):

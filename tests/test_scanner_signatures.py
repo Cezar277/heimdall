@@ -19,6 +19,7 @@ import os
 import stat
 import time
 from pathlib import Path
+from typing import Final
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -51,6 +52,9 @@ VALIDATOR = Draft202012Validator(FINDING_SCHEMA)
 HOSTILE_LENGTH = 100_000
 #: Marge large : une regex linéaire fait quelques millisecondes, pas 2 s.
 REDOS_BUDGET_SECONDS = 2.0
+#: `os.getuid` n'existe pas hors POSIX : le test qui s'appuie sur la lecture
+#: seule d'un répertoire est neutralisé sous root (où le bit n'oppose rien).
+_IS_ROOT: Final[bool] = getattr(os, "getuid", lambda: -1)() == 0
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +126,80 @@ def test_keywords_are_a_context_filter() -> None:
     value_only = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     assert rule.matches(value_only) == ()
     assert rule.matches(f'aws_secret_access_key = "{value_only}"')
+
+
+#: Les trois noms de paramètre AWS acceptés, plus leurs variantes de casse.
+#: Ils correspondent **exactement** aux mots-clés déclarés par la règle : un
+#: mot-clé sans effet dans le motif serait une couverture annoncée plus
+#: large que le code (faux sentiment de sécurité, puis faux négatif).
+_AWS_SECRET_PARAMETER_NAMES: Final[tuple[str, ...]] = (
+    "aws_secret_access_key",
+    "aws_secret_key",
+    "secret_access_key",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SECRET_KEY",
+    "Secret_Access_Key",
+)
+
+
+@pytest.mark.parametrize("parameter", _AWS_SECRET_PARAMETER_NAMES)
+def test_every_declared_aws_parameter_name_is_really_covered(parameter: str) -> None:
+    """Chaque nom de paramètre annoncé est détecté (verrou anti-régression).
+
+    Régression corrigée : les mots-clés annonçaient trois noms alors que la
+    regex n'en reconnaissait qu'un. Les deux autres ne donnaient **aucune**
+    correspondance : un secret manqué, pas une fuite.
+    """
+    rule = rules_for_family("aws_cloud")[1]
+    assert rule.id == "aws_secret_access_key"
+    value = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    matches = rule.matches(f'{parameter} = "{value}"')
+    assert len(matches) == 1
+    assert matches[0].group("value") == value
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        '{name} = "{value}"',
+        "{name}={value}",
+        "{name}: {value}",
+        '"{name}": "{value}"',
+        '"{name}" : "{value}"',
+        "os.environ['{name}'] = '{value}'",
+    ],
+)
+def test_aws_secret_is_detected_in_every_common_assignment_form(template: str) -> None:
+    """Le nom du paramètre est reconnu quelle que soit la forme d'écriture.
+
+    Les fichiers JSON et `.env` sont les formes les plus fréquentes en
+    dépôt : un guillemet fermant après le nom ne doit pas masquer la clé.
+    """
+    rule = rules_for_family("aws_cloud")[1]
+    value = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    matches = rule.matches(template.format(name="aws_secret_access_key", value=value))
+    assert len(matches) == 1
+    assert matches[0].group("value") == value
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        "aws_secret_access_keys",  # pluriel
+        "aws_secret_access_key_hash",  # suffixe
+        "aws_secret_key_rotation",  # suffixe
+        "secret_access_keys",  # pluriel
+        "access_key_secret",  # nom différent
+    ],
+)
+def test_a_parameter_name_outside_the_announced_scope_stays_silent(
+    parameter: str,
+) -> None:
+    """Hors des trois noms annoncés, la règle reste muette (pas de faux positif)."""
+    rule = rules_for_family("aws_cloud")[1]
+    value = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert rule.matches(f'{parameter} = "{value}"') == ()
+    assert rule.matches(f'"{parameter}": "{value}"') == ()
 
 
 def test_identical_value_is_deduplicated_but_distinct_values_are_not() -> None:
@@ -200,9 +278,22 @@ def test_rule_validation_refuses_broken_patterns_and_metadata() -> None:
 
 
 def test_matches_refuses_a_non_string_line() -> None:
-    """Une entrée qui n'est pas une ligne ne produit jamais de correspondance."""
+    """Une entrée qui n'est pas une ligne échoue au lieu d'être ignorée.
+
+    L'interface #53 refuse déjà toute ligne non textuelle
+    (``interface._check_lines``) : cette garde de défense ne doit pas
+    dégrader un « miss » silencieux, qui ferait passer une ligne jamais
+    analysée pour une ligne propre.
+    """
     rule = rules_for_family("aws_cloud")[0]
-    assert rule.matches(42) == ()  # type: ignore[arg-type]
+    with pytest.raises(ScanError):
+        rule.matches(42)  # type: ignore[arg-type]
+
+
+def test_find_signature_matches_refuses_a_non_string_line() -> None:
+    """Le matcher public applique la même garde fail-closed."""
+    with pytest.raises(ScanError):
+        find_signature_matches(None)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -667,6 +758,67 @@ def test_xdg_data_home_default_location_is_used(
     assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
     assert stat.S_IMODE(key_file.parent.stat().st_mode) == 0o700
     assert load_local_key() == key
+
+
+def test_ci_scan_with_an_exported_key_writes_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """En CI, une clé exportée évite toute écriture et stabilise les empreintes.
+
+    Sans ``HEIMDALL_SNIPPET_HMAC_KEY``, le premier scan crée
+    ``$XDG_DATA_HOME/heimdall/snippet-hmac.key`` : sur un runner éphémère en
+    lecture seule, le scan échoue ; sur un runner inscriptible, la clé est
+    régénérée à chaque run et les ``snippet_hash`` ne sont plus stables
+    d'un run à l'autre. La CI exporte donc la clé (64 caractères
+    hexadécimaux, 32 octets) : aucun fichier n'est écrit, et l'empreinte
+    est reproductible.
+    """
+    monkeypatch.setenv(KEY_ENV, "42" * 32)
+    monkeypatch.delenv(KEY_FILE_ENV, raising=False)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    xdg.chmod(0o500)  # Lecture seule : une écriture y échouerait.
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    value = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    try:
+        findings = _findings(
+            FileTarget(path="config.json", text=f'"aws_secret_access_key": "{value}"')
+        )
+        assert [(finding.line, finding.type) for finding in findings] == [(1, "aws")]
+        # Aucun fichier créé : le répertoire est resté vide.
+        assert list(xdg.iterdir()) == []
+        # Empreinte stable, reproductible avec la seule clé exportée.
+        expected = SnippetHasher(bytes.fromhex("42" * 32)).hash(value)
+        assert findings[0].snippet_hash == expected
+    finally:
+        xdg.chmod(0o700)
+
+
+@pytest.mark.skipif(
+    _IS_ROOT,
+    reason="root : la lecture seule d'un répertoire n'est pas opposable",
+)
+def test_scan_without_any_usable_key_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ni clé exportée ni répertoire inscriptible : le scan échoue.
+
+    Le comportement fail-closed est **conservé** : aucune clé éphémère ne
+    masque une panne, car une clé régénérée à chaque run produirait des
+    empreintes instables sans que l'opérateur ne voie d'erreur.
+    """
+    monkeypatch.delenv(KEY_ENV)
+    monkeypatch.delenv(KEY_FILE_ENV, raising=False)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    xdg.chmod(0o500)
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    value = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    try:
+        with pytest.raises(ScanError):
+            _findings(FileTarget(path="config.json", text=f'"aws_secret_access_key": "{value}"'))
+    finally:
+        xdg.chmod(0o700)
 
 
 def test_xdg_data_home_refuses_parent_segments(
