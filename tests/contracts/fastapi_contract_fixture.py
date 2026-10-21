@@ -143,6 +143,7 @@ def build_app() -> FastAPI:
         "Retry-After": {"required": True, "schema": {"type": "integer", "minimum": 1, "maximum": 3600}}
     }
     responses[429]["headers"] = retry_after
+    responses[503] = {"model": UnavailableError, "headers": retry_after}
 
     @app.post("/api/v1/secrets", response_model=SecretMetadata, status_code=201,
               operation_id="createSecret", responses={**{k: v for k, v in responses.items() if k != 404}, 409: {"model": ConflictError},

@@ -42,19 +42,81 @@ heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) via son lanceur dédié, seul point d'entrée supporté garantissant l'application de l'allowlist d'hôte et le durcissement du transport :
 
 ```sh
+# Initialisation à froid de la base de données SQLite (#62) :
+# Chemin par défaut hors dépôt : $XDG_DATA_HOME/heimdall/vault.db
+# (sinon ~/.local/share/heimdall/vault.db) ; surcharge par argument
+# ou via $HEIMDALL_VAULT_DB_PATH.
+# Chemin ABSOLU exigé (CLI et serveur) : un chemin relatif dépend du répertoire
+# courant et ferait diverger la CLI et le serveur sans erreur.
+# Codes de retour : 0 (succès), 1 (erreur d'initialisation ou permissions),
+# 2 (chemin relatif, ou ':memory:' : réservé aux tests via API, interdit en CLI,
+#   via $HEIMDALL_VAULT_DB_PATH et côté serveur — fail-closed)
+python -m heimdall.vault.init_db
+
+# Variables minimales d'un déploiement réel (aucune valeur publique par défaut) :
+# KEK : python -c "from heimdall.vault.crypto import generate_encryption_key; print(generate_encryption_key())"
+export HEIMDALL_ENV=production
+export HEIMDALL_VAULT_API_KEY_PEPPER='<pepper aléatoire persistant, distinct de la KEK>'
+export HEIMDALL_VAULT_KEK='<KEK AES-256 base64, 32 octets, distincte du pepper>'
+# TLS obligatoire en production : certificat avec SAN IP 127.0.0.1 + clé privée.
+export HEIMDALL_VAULT_SSL_CERTFILE='/chemin/absolu/server.crt'
+export HEIMDALL_VAULT_SSL_KEYFILE='/chemin/absolu/server.key'
+# Backend par défaut en production : sqlite (chiffré, partagé entre workers).
+# Hors production : memory (chiffré éphémère, strictement mono-processus).
+# export HEIMDALL_VAULT_STORAGE_BACKEND=sqlite
+
 # Lancement du serveur Vault (point d'entrée unique, boucle locale vérifiée) :
 python -m heimdall.vault.app
 ```
+
+Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une KEK qui ne
+réside jamais dans la base ; `UNIQUE(project_id, env, name)` garantit le 409
+inter-workers et `PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
+Le backend mémoire, réservé aux tests/développement, chiffre également les
+valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
+Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets
+(256 bits) ; les clés opérateur enregistrées doivent être générées par
+`generate_api_key()` : l'enregistrement est fail-closed et refuse tout token
+qui n'est pas un base64url strict (`A-Z a-z 0-9 _ -`), qui fait moins de 43
+caractères, qui compte moins de 16 caractères distincts ou qui est la répétition
+d'un bloc plus court (`"a" * 43`, `"abcdefghijkl" * 4` : refusés). La valeur
+d'un secret est canonisée en Unicode NFC avant stockage et l'octet NUL y est
+interdit ; elle n'est jamais journalisée. La traçabilité
+ticket → module → preuve est dans
+[`docs/contracts/vault-traceability.md`](docs/contracts/vault-traceability.md).
+
+> **Environnement cible (POSIX requis)** :
+> Heimdall Vault requiert un système POSIX (Linux, macOS, BSD) pour garantir le durcissement fail-closed des permissions (`0600` pour la base, `0700` pour les répertoires). Sous Windows, ces permissions ne sont pas applicables nativement : l'ouverture de la base refuse fail-closed (`RuntimeError`, aucun avertissement suivi de poursuite) — Windows est strictement hors cible de déploiement en production.
 
 > **Note sécurité & dette technique (contrat OpenAPI #15)** :
 > Ce squelette minimal (#25) est strictement confiné à la boucle locale (`127.0.0.1`, `::1`, `localhost`).
 > Ne jamais exposer ce serveur en clair hors de localhost ni réutiliser ce montage HTTP au-delà du squelette minimal (#25). Les exigences runtime suivantes sont tracées et attribuées aux tickets du Vault :
 > - **Rejet fail-closed HTTP 403 sur IP non-loopback** : garde middleware en défense en profondeur (niveau transport/socket), volontairement maintenue hors du contrat OpenAPI applicatif (`/api/v1/health` étant publique sans clé).
-> - **TLS avec SAN IP obligatoire (`https://127.0.0.1:8443`)** : tickets #64 / #65.
+> - **TLS avec SAN IP (`https://127.0.0.1:8443`)** : obligatoire en production
+>   (`HEIMDALL_VAULT_SSL_CERTFILE` + `HEIMDALL_VAULT_SSL_KEYFILE`), HTTP en clair
+>   réservé au développement local. La révocation de clés reste suivie séparément.
 > - **Authentification par clé API de projet (`X-Heimdall-API-Key`)** : ticket #64.
 > - **Rejet HTTP 400 avant parsing au-delà de 1 Mio (1 048 576 octets)** : ticket #63.
 > - **En-tête `Cache-Control: no-store`** : ticket #63.
-> - **Rate-limit par bucket avec `Retry-After`** : ticket #64.
+> - **Rate-limit débit par clé validée, pair réseau et global avec `Retry-After`** : ticket #65.
+> - **Chiffrement au repos et persistance SQLite** : tickets #26 / #62.
+
+> **Limites de déploiement à l'état #63** :
+> - **Transport** : le lanceur `python -m heimdall.vault.app` refuse de démarrer
+>   en production sans certificat et clé TLS (`HEIMDALL_VAULT_SSL_CERTFILE`,
+>   `HEIMDALL_VAULT_SSL_KEYFILE`). Le HTTP en clair reste réservé à la boucle
+>   locale en développement. La révocation de clés reste à livrer dans son
+>   ticket dédié (#64).
+> - **Rate-limit partagé avec SQLite** : les buckets (clé validée, pair réseau,
+>   global) sont persistés dans la base sous transaction `BEGIN IMMEDIATE`, donc
+>   partagés entre workers sans multiplication du débit. Le backend mémoire reste
+>   strictement mono-processus ; `run_server` épingle `workers=1` par défaut.
+> - **Quota de stockage atomique** : avec plusieurs workers SQLite, la capacité
+>   `max_secrets`/`max_secrets_per_project` est vérifiée sous transaction
+>   `BEGIN IMMEDIATE` (verrou d'écriture acquis avant le comptage), donc sans
+>   dépassement inter-workers. L'unicité `UNIQUE(project_id, env, name)` reste
+>   garantie ; un 429 de capacité n'est pas transitoire tant qu'aucune route
+>   DELETE n'existe (retry inutile documenté, #62).
 
 Vérifier la santé minimale (`/api/v1/health` contractuel) :
 
@@ -68,6 +130,8 @@ curl http://127.0.0.1:8443/api/v1/health
 ```text
 heimdall/            paquet unique (#17)
   scanner/           détection déterministe regex + entropie (#22, contrat #14)
+    interface.py     cible (diff indexé ou fichier) + scan(cible) -> list[Finding] (#53)
+    finding.py       sortie Finding conforme au schéma #14 par construction (#53)
   mcp/               serveur MCP stdio, 4 outils lecture seule (#27, contrat #16)
     prompts/         prompt système versionné du trieur (qualify_v1, #80)
   llm/               client Ollama local, sortie JSON contrainte (#80, T28.2), candidat fail-closed (#81)
@@ -83,6 +147,7 @@ openapi.yaml         contrat Vault API v1 (#15)
 
 - [Vault API v1 et vérification OpenAPI](docs/contracts/vault-api.md)
 - [Finding v1 et machine d'états du secret](docs/contracts/finding.md)
+- [Interface du scanner et sortie Finding](docs/scanner-interface.md)
 - [Outils MCP exposés au LLM (surface strictement limitée)](docs/contracts/mcp-tools.md)
 - [Serveur MCP stdio : lancement, outils, invariants (#27)](docs/mcp-server.md)
 - [ADR-001 : Finding et faux positifs](docs/adr/001-finding-et-etats.md)
@@ -106,7 +171,7 @@ collaborateurs de confiance (garde `author_association`) :
    retour à la ligne sur une PR du dépôt (espaces initiaux retirés ; `/ciX`
    est refusé).
    Le job de contexte vérifie la commande exactement avant de lancer les tests ;
-   la réaction 👀 accuse réception et le check `CI (/ci)` apparaît sur la PR.
+   le check `CI (/ci)` apparaît sur la PR.
 2. **Approbation d'un relecteur** : approuver la PR (`pull_request_review`,
    état `approved`) la lance aussi.
 
@@ -144,6 +209,20 @@ connues. Seuls les **noms et versions des paquets** installés sont transmis —
 aucun code source, aucun secret, aucune métadonnée du projet. Aucun appel
 réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
 
+La preuve et sa limite actuelle sont archivées dans
+[`docs/security/zero-egress.md`](docs/security/zero-egress.md) : le test CI
+interdit les connexions Python hors loopback et n'autorise, comme exception
+journalisée, que l'IPC local `AF_UNIX` (réserve : un relais inter-processus
+reste hors du garde et n'apparaît dans la trace que s'il ressort en IP). Il
+refuse aussi le lancement de processus enfants par les wrappers Python
+(`subprocess.Popen` par attribut, `os.*`) ; les alias précoces
+(`from subprocess import Popen`), les chemins C (`_posixsubprocess`) et un
+binaire ou une extension native appelant directement `fork(2)`/`execve(2)`
+relèvent de la trace `strace -f`. Le
+scan réel reste bloqué par le squelette du scanner #22 ; la trace disponible
+prouve uniquement l'absence de connexion sur ce chemin fail-closed, pas encore
+sur un scan opérationnel.
+
 ### Réglages GitHub du dépôt (une fois, non versionnables)
 
 - **Code security** : activer *Dependabot alerts* et *Dependabot security
@@ -174,6 +253,10 @@ réseau n'a lieu à l'exécution de `heimdall` (y compris `heimdall scan --ci`).
   ré-approuver) pour re-signaler le check. À n'activer que si nécessaire.
 
 ## Vérifier
+
+Corpus d'acceptation T21 : [34 cas synthétiques et mesure précision/rappel](tests/fixtures/trap_repo/README.md).
+Exécuter `python -m pytest tests/test_trap_acceptance.py -s -rx` ; l'acceptation
+du scanner reste explicitement en attente tant que T22 n'est pas implémenté.
 
 ```sh
 .venv/bin/python -m pytest                      # squelette + contrats

@@ -101,6 +101,28 @@ class VaultContractTests(unittest.TestCase):
     def test_openapi_valid(self):
         validate(SPEC)
 
+    def test_raw_spec_has_no_duplicate_keys(self):
+        """Verrouille LOW revue (503 dupliqué sur /api/v1/health) : le parseur
+        YAML standard écrase silencieusement les doublons, donc on parse le
+        brut avec un loader qui refuse toute clé dupliquée."""
+
+        class _NoDupLoader(yaml.SafeLoader):
+            pass
+
+        def _no_dup_construct(loader, node, deep=False):
+            seen = set()
+            for key_node, _ in node.value:
+                key = loader.construct_object(key_node, deep=True)
+                if key in seen:
+                    raise ValueError(f"Clé dupliquée dans openapi.yaml : {key!r}")
+                seen.add(key)
+            return yaml.constructor.SafeConstructor.construct_mapping(loader, node, deep=deep)
+
+        _NoDupLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_dup_construct)
+        with open(ROOT / "openapi.yaml", encoding="utf-8") as handle:
+            yaml.load(handle, Loader=_NoDupLoader)
+
     def test_fastapi_wire_contract_matches(self):
         self.assertEqual(wire_contract(SPEC), wire_contract(build_app().openapi()))
 
@@ -322,7 +344,9 @@ class VaultContractTests(unittest.TestCase):
                      for path, item in SPEC["paths"].items()
                      for method in ("get", "post") if method in item]
         # LOW-3 : la 503 porte le même signal de backoff que les 429.
-        expected += [("/api/v1/health", "get", "503", "Retry-After")]
+        expected += [(path, method, "503", "Retry-After")
+                     for path, item in SPEC["paths"].items()
+                     for method in ("get", "post") if method in item]
         for path, method, status, name in expected:
             with self.subTest(path=path, status=status, header=name):
                 response = resolve(SPEC["paths"][path][method]["responses"][status], SPEC)

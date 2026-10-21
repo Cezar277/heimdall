@@ -10,5 +10,6 @@ importer ``cryptography`` ou ``argon2`` — vérifié par
 """
 
 from heimdall.vault.client import VaultClient
+from heimdall.vault.database import db_session, get_connection, init_db
 
-__all__ = ["VaultClient"]
+__all__ = ["VaultClient", "db_session", "get_connection", "init_db"]

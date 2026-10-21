@@ -37,11 +37,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest==9.1.1",
-  "ruff==0.16.10",
+  "ruff==0.17.0",
   "mypy==2.4.0",
   "bandit==1.9.4",
   "setuptools==84.0.0",     # backend de build, installé depuis le lock en CI
-  "pytest-cov==7.0.0",      # couverture + seuil CI (#20), aligné sur tests/security
+  "pytest-cov==7.1.0",      # couverture + seuil CI (#20), aligné sur tests/security
   "pip-audit==2.10.1",      # audit CVE des dépendances en CI (#20), réseau documenté README
   "tomli==2.5.0; python_version < '3.11'",  # lecture TOML des tests d'acceptation sur 3.10
   # Dépendances des tests de contrats (#14/#15/#16), alignées sur tests/contracts/requirements.txt

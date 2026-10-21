@@ -126,8 +126,11 @@ ollama list              # contrôle taille + digest
 python3 tests/benchmarks/benchmark_llm_ollama.py --models gemma3:270m --full --out bench.json
 ```
 
-La preuve « zéro trafic sortant » (fixture `socket.connect` loopback-only +
-`ss -tunp`) est portée par T28.4, pas par ce ticket.
+La preuve « zéro trafic sortant » (garde sockets loopback-only en CI et trace
+`strace`) est archivée dans
+[`docs/security/zero-egress.md`](../security/zero-egress.md), ticket T28.4
+(#82). Elle documente aussi la limite actuelle : le scan complet attend le
+scanner #22, et la trace observée porte sur le chemin fail-closed.
 
 ## Prompt produit (T28.2, #80)
 
