@@ -187,6 +187,7 @@ heimdall/            paquet unique (#17)
   vault/             Vault chiffré ; crypto CONFINÉE à vault/crypto.py (#25, contrat #15)
   cli/               entrée `heimdall` (Typer)
 tests/               fumée paquet + confinement crypto + tests/contracts/
+                     + tests d'intégration Vault (TestClient, #65)
 docs/                adr/, contracts/, meetings/
 schemas/             finding.schema.json, mcp-tools.schema.json
 openapi.yaml         contrat Vault API v1 (#15)
@@ -310,6 +311,7 @@ du scanner reste explicitement en attente tant que T22 n'est pas implémenté.
 ```sh
 .venv/bin/python -m pytest                      # squelette + contrats
 .venv/bin/python -m unittest discover -s tests/contracts -v   # contrats seuls
+.venv/bin/python -m pytest tests/test_vault_integration_testclient.py -q   # Vault (TestClient)
 .venv/bin/ruff check heimdall tests
 .venv/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
 .venv/bin/bandit -r heimdall -q
@@ -318,6 +320,13 @@ du scanner reste explicitement en attente tant que T22 n'est pas implémenté.
 .venv/bin/pip-audit --skip-editable             # comme la CI : requête réseau (PyPI)
 git diff --check
 ```
+
+Tests d'intégration du Vault (ticket #65) : le `TestClient` de FastAPI pilote
+l'application **en mémoire, sans port réseau**, sur une **base SQLite
+temporaire créée par test** (aucun état partagé). La suite vérifie le cas
+nominal (POST puis GET), le refus 401 d'une clé invalide, le refus 403 d'un
+secret appartenant à un autre projet, et la conformité des réponses au contrat
+`openapi.yaml`. Preuves : [`docs/t65-samm.md`](docs/t65-samm.md).
 
 Règles de contribution : [CONTRIBUTING.md](CONTRIBUTING.md).
 Jamais de vrai secret dans le dépôt, même expiré ; seul `.env.example`
