@@ -25,9 +25,22 @@ from heimdall.scanner.interface import (
     Scanner,
     ScanTarget,
 )
+from heimdall.scanner.signature_engine import MoteurSignatures, SignatureEngine
+from heimdall.scanner.signatures import (
+    SIGNATURES,
+    Rule,
+    Signature,
+    SignatureMatch,
+)
+
+# ``find_signature_matches`` n'est **pas** réexportée ici : son retour porte
+# la **valeur brute** des candidats (surface sensible). Elle reste importable
+# explicitement depuis ``heimdall.scanner.signatures``, et la seule surface
+# publique du paquet est celle de ``__all__`` ci-dessous.
 
 __all__ = [
     "FINDING_FIELDS",
+    "SIGNATURES",
     "DiffTarget",
     "FileTarget",
     "Finding",
@@ -36,8 +49,13 @@ __all__ = [
     "InvalidFinding",
     "InvalidTarget",
     "Moteur",
+    "MoteurSignatures",
+    "Rule",
     "ScanError",
     "ScanTarget",
     "Scanner",
+    "Signature",
+    "SignatureEngine",
+    "SignatureMatch",
     "find_candidates",
 ]
