@@ -32,6 +32,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from pydantic import ValidationError
 
 from heimdall.vault.app import VaultSettings, create_app, run_server
 
@@ -191,6 +192,35 @@ class VaultTlsLauncherTests(unittest.TestCase):
             self.assertEqual(settings.ssl_keyfile, str(keyfile))
             with self.assertRaises(ValueError):
                 VaultSettings(api_key_pepper="p" * 32, ssl_certfile=str(certfile))
+
+    def test_symlinked_certificate_and_key_are_refused(self) -> None:
+        """LOW revue : les chemins TLS refusent les symlinks (invariant n°3).
+
+        Même garde que la couche DB (`_assert_not_symlink` via lstat) :
+        uvicorn suivrait sinon la cible à l'ouverture, hors du chemin validé.
+        Répertoire résolu au préalable pour ne tester que le lien lui-même,
+        pas un ancêtre.
+        """
+        with tempfile.TemporaryDirectory(prefix="heimdall-tls-link-") as tmp:
+            base = Path(tmp).resolve()
+            certfile, keyfile = _generate_self_signed_cert(base)
+            cases = (
+                ("cert-link.crt", certfile, keyfile),
+                ("key-link.key", certfile, keyfile),
+            )
+            for link_name, real_cert, real_key in cases:
+                with self.subTest(link=link_name):
+                    link = base / link_name
+                    target = real_cert if "cert" in link_name else real_key
+                    link.symlink_to(target)
+                    kwargs: dict[str, str] = {
+                        "api_key_pepper": "p" * 32,
+                        "ssl_certfile": str(link if "cert" in link_name else real_cert),
+                        "ssl_keyfile": str(link if "key" in link_name else real_key),
+                    }
+                    with self.assertRaises(ValidationError) as ctx:
+                        VaultSettings(**kwargs)  # type: ignore[arg-type]
+                    self.assertIn("symbolique", str(ctx.exception))
 
 
 class VaultTlsContractTests(unittest.TestCase):

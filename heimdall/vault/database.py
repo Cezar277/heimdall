@@ -965,7 +965,16 @@ def get_api_key(conn: sqlite3.Connection, key_id: str) -> dict[str, Any] | None:
 
 
 def get_api_key_by_hash(conn: sqlite3.Connection, key_hash: str) -> dict[str, Any] | None:
-    """Récupère une clé API par son haché de vérification."""
+    """Récupère une clé API par son haché de vérification.
+
+    DÉPRÉCIÉ POUR L'AUTHENTIFICATION : l'égalité est évaluée par SQLite, donc
+    PAS en temps constant (oracle temporel sur l'existence d'une empreinte).
+    Le chemin d'authentification du serveur DOIT utiliser le full-scan à coût
+    comparable (`app._find_api_key_project` + `constant_time_equal`, sans
+    `break`) ; cette fonction reste réservée aux accès admin/outils hors
+    requête (tests unitaires de la couche DB). Ne jamais l'appeler depuis
+    `heimdall/vault/app.py` (garde : test grep dédié).
+    """
     query = (
         "SELECT id, project_id, key_hash, created_at, revoked_at FROM api_keys WHERE key_hash = ?"
     )

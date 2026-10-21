@@ -165,9 +165,11 @@ Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets
 (256 bits) et rester **distinct de la KEK** de chiffrement ; les clés opérateur
 enregistrées doivent être générées par `generate_api_key()` : l'enregistrement
 est fail-closed et refuse tout token qui n'est pas un base64url strict
-(`A-Z a-z 0-9 _ -`), qui fait moins de 43 caractères, qui compte moins de 16
-caractères distincts ou qui est la répétition d'un bloc plus court
-(`"a" * 43`, `"abcdefghijkl" * 4` : refusés). La valeur d'un secret est
+(`A-Z a-z 0-9 _ -`, `fullmatch` : un `\n` final est refusé), qui fait moins de
+43 caractères, qui compte moins de 16 caractères distincts, qui est la
+répétition d'un bloc plus court, qui contient une suite monotone de 8+
+caractères ou une ligne de clavier connue (`"a" * 43`, `"abcdefghijkl" * 4`,
+`"abcdefgh…"`, `"qwertyuiop…"` : refusés). La valeur d'un secret est
 canonisée en Unicode NFC avant stockage et l'octet NUL y est interdit ; elle
 n'est jamais journalisée. La traçabilité ticket → module → preuve est dans
 [`docs/contracts/vault-traceability.md`](docs/contracts/vault-traceability.md).
@@ -297,6 +299,10 @@ sur un scan opérationnel.
   ré-approuver) pour re-signaler le check. À n'activer que si nécessaire.
 
 ## Vérifier
+
+Corpus d'acceptation T21 : [34 cas synthétiques et mesure précision/rappel](tests/fixtures/trap_repo/README.md).
+Exécuter `python -m pytest tests/test_trap_acceptance.py -s -rx` ; l'acceptation
+du scanner reste explicitement en attente tant que T22 n'est pas implémenté.
 
 ```sh
 .venv/bin/python -m pytest                      # squelette + contrats

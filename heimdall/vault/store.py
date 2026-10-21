@@ -84,12 +84,13 @@ class InMemorySecretStore:
     squelette de développement/test : une KEK éphémère est générée par instance
     et un dump mémoire du processus contient à la fois ciphertexts et clé. Il ne
     doit jamais être déployé en production.
-    TODO(#26, #62) : Remplacer ce mode par la persistance SQLite chiffrée
-    (``SqliteSecretStore``) avec contrainte d'unicité UNIQUE(project_id, env, name)
-    et PRAGMA foreign_keys=ON.
-    TODO(#62) : Poursuivre le quota par projet et la pagination lors du branchement
-    SQLite pour borner la croissance disque et mémoire (capacité de stockage), en
-    distinguant quota de stockage et débit (retry inutile tant que la capacité est pleine).
+    RÉSOLU (#26, #62, mergé PR #139) : la persistance SQLite chiffrée
+    (``SqliteSecretStore``) existe avec contrainte d'unicité
+    UNIQUE(project_id, env, name) et PRAGMA foreign_keys=ON ; c'est le backend
+    prod par défaut, et le quota par projet y est vérifié atomiquement.
+    RESTE (suivi post-#63, hors contrat v1) : pagination (pas de route de
+    listage) et route DELETE (libération de capacité) — sans elles, le 429 de
+    capacité reste permanent (retry inutile), voir TODO(#156).
     Ce quota n'est PAS le rate-limiting : il ne borne pas le débit des requêtes.
     Le débit est borné séparément par le middleware `ratelimit.py` (buckets par
     clé validée, pair réseau et global, 400/401 inclus, ticket #65), conformément
@@ -124,10 +125,12 @@ class InMemorySecretStore:
     async def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         key = (project, env, name)
         aad = VaultCipher.aad(project, env, name)
-        # Défense en profondeur : la valeur stockée est canonique (NFC), même si
-        # l'appelant contourne la validation HTTP (décision #62). La
-        # normalisation est idempotente, donc sans effet pour l'API.
+        # Défense en profondeur : la valeur stockée est canonique (NFC) et sans
+        # NUL, même si l'appelant contourne la validation HTTP (décision #62).
+        # La normalisation est idempotente, donc sans effet pour l'API.
         value = unicodedata.normalize("NFC", value)
+        if "\x00" in value:
+            raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         async with self._lock:
             if key in self._secrets:
                 raise KeyError("Secret déjà existant")
@@ -181,7 +184,7 @@ class SqliteSecretStore:
     ce délai restera refusé tant que la capacité est pleine — le contrat #63
     n'expose aucune route DELETE, donc aucun emplacement ne peut être libéré.
     Le retry est donc INUTILE tant que la capacité est pleine ; la libération
-    (route DELETE, quotas par projet) est suivie dans TODO(#62). Ce 429 de
+    (route DELETE, quotas par projet) est suivie dans TODO(#156). Ce 429 de
     capacité est distinct du 429 de débit (rate-limit, #65), lui transitoire.
 
     L'empreinte d'intégrité persistée utilise la sous-clé HKDF dédiée et le
@@ -231,10 +234,13 @@ class SqliteSecretStore:
 
     def _create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         aad = VaultCipher.aad(project, env, name)
-        # Défense en profondeur : valeur canonique (NFC) même hors du chemin
-        # HTTP, pour que l'empreinte d'intégrité soit toujours calculée sur la
-        # forme stockée (décision #62).
+        # Défense en profondeur : valeur canonique (NFC) et sans NUL même hors
+        # du chemin HTTP, pour que l'empreinte d'intégrité soit toujours
+        # calculée sur la forme stockée (décision #62). Le NUL tronque les
+        # valeurs dans les outils texte : refusé comme au contrat API.
         value = unicodedata.normalize("NFC", value)
+        if "\x00" in value:
+            raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         with db_session(self._db_path) as conn:
             # Verrou d'écriture inter-processus AVANT le comptage : le
             # quota et l'insertion forment une seule transaction atomique,

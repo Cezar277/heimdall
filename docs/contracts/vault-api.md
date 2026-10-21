@@ -109,7 +109,7 @@ réactive pas.
 
 Les clés opérateur enregistrées via `register_api_key` **DOIVENT** provenir de
 `generate_api_key()` (`secrets.token_urlsafe(32)`, 256 bits). L'enregistrement
-applique quatre contrôles cumulatifs, fail-closed et sans écho de la valeur :
+applique six contrôles cumulatifs, fail-closed et sans écho de la valeur :
 
 | Contrôle | Règle | Motifs refusés |
 |---|---|---|
@@ -117,11 +117,16 @@ applique quatre contrôles cumulatifs, fail-closed et sans écho de la valeur :
 | Longueur | `43 <= len <= 512` caractères | clés courtes ou surdimensionnées |
 | Diversité | `>= 16` caractères distincts | `"a" * 43`, `"abcdefghijkl" * 4` |
 | Motif | aucune période répétitive (la clé n'est pas la répétition d'un bloc plus court) | `"abab…"`, `"0123456789…"`, `"abcdefghijklmnop" * 3` |
+| Suite | aucune suite monotone de 8+ caractères | `"abcdefgh…"`, `"0123456789…"`, `"ZYXW…"`, `"abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE"` |
+| Clavier | aucune ligne de clavier connue QWERTY/AZERTY/QWERTZ (deux sens, insensible à la casse) | `"qwertyuiop…"`, `"azerty…"`, `"qwerty"`, `"yxcvbnm…"` |
 
 Ces contrôles filtrent les **motifs triviaux** ; ils ne mesurent pas l'entropie
-et ne remplacent pas `generate_api_key()` côté opérateur, qui reste la seule
-source acceptable de clé. Un refus lève `ValueError` avec un message générique
-(jamais l'écho de la clé). La matrice de tests est dans
+et ne remplacent pas `generate_api_key()` côté opérateur, qui reste EXIGÉ :
+toute clé opérateur DOIT provenir du générateur (256 bits aléatoires) — un
+contournement manuel, même passant les six contrôles, est une faute
+opérationnelle (en cas de fuite des empreintes et du pepper, seul un token
+aléatoire résiste au brute-force hors ligne). Un refus lève `ValueError`
+avec un message générique (jamais l'écho de la clé). La matrice de tests est dans
 `tests/test_vault_app.py` (`test_register_api_key_rejects_weak_caller_key`,
 `test_register_api_key_rejects_trivial_patterns`,
 `test_register_api_key_rejects_non_base64url_alphabet`).
@@ -187,10 +192,14 @@ La génération du pepper et les comparaisons sensibles sont confinées dans
 `heimdall/vault/crypto.py`.
 
 Rate-limiting débit (#65) : fenêtres fixes par clé API validée, par pair réseau
-et globale. Les buckets pair/global sont consommés avant le hachage et le
-parcours d'authentification ; leur rejet 429 ne déclenche aucun lookup de clé.
-Après admission, le bucket de la clé validée est consommé séparément, sans
-recompter pair/global. Un rejet par clé consomme donc aussi pair/global. Les
+et globale. Un `peek` pair/global en lecture seule (sans consommation ni
+verrou d'écriture) précède le hachage et le parcours d'authentification ;
+leur rejet 429 ne déclenche aucun lookup de clé. Après résolution de
+l'empreinte, `check_authenticated` consomme pair/global + clé en une seule
+transaction (mémoire : une seule section critique ; SQLite : un seul
+`BEGIN IMMEDIATE`), sans fenêtre inter-transactions ni double verrou
+d'écriture. Sémantique préservée : pair/global restent consommés même quand
+le bucket clé est plein. Les
 400/401 consomment les buckets pair/global, une clé absente ou invalide ne crée
 pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
 Le choix du bucket par clé (`_find_api_key_project_cached`) emprunte le même
@@ -198,7 +207,11 @@ parcours complet à coût comparable que `verify_api_key` (parcours exhaustif
 du backend actif, sans `break` précoce) et le mémoïse dans l'état de la
 requête : l'authentification réutilise ce résultat, soit un seul full-scan par
 requête (anti-amplification CPU) ; l'existence d'une clé n'est pas observable
-par le temps de réponse du middleware. Le quota de stockage (capacité du store)
+par le temps de réponse du middleware. Plafond opérationnel : le coût est
+linéaire en nombre de clés (N `compare_digest` + 1 SELECT complet par requête,
+même invalide) — dimensionné pour une faible cardinalité (pinné à N=25 en
+test) ; au-delà, prévoir un cache LRU d'empreintes inconnues avec TTL court
+en #65, sans réintroduire d'oracle temporel. Le quota de stockage (capacité du store)
 ne doit pas être présenté comme cette mitigation de débit : les deux mécanismes
 sont distincts et testés séparément. Le quota SQLite est vérifié dans la même
 transaction que l'insertion, sous `BEGIN IMMEDIATE` : le verrou d'écriture est

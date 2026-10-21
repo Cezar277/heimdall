@@ -36,11 +36,13 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   refuse la constante publique commitée hors `HEIMDALL_ENV=test`, exige
   `HEIMDALL_VAULT_API_KEY_PEPPER` en production et génère hors production un
   pepper aléatoire éphémère au démarrage avec avertissement (documenté #25).
-  Les clés opérateur trop peu diverses (`"a" * 43`, `"abcdefghijkl" * 4`) ou
-  répétitives sont refusées à l'enregistrement : alphabet base64url strict,
-  43 caractères minimum, 16 caractères distincts minimum, aucune période
-  répétitive. La valeur d'un secret est canonisée en NFC avant stockage et le
-  NUL y est interdit ; elle n'est jamais journalisée (décision #62).
+  Les clés opérateur trop peu diverses (`"a" * 43`, `"abcdefghijkl" * 4`),
+  répétitives, séquentielles (`abcdefgh…`) ou de clavier (`qwertyuiop…`)
+  sont refusées à l'enregistrement : alphabet base64url strict, 43 caractères
+  minimum, 16 caractères distincts minimum, aucune période répétitive,
+  aucune suite monotone de 8+, aucune ligne de clavier connue. La valeur
+  d'un secret est canonisée en NFC avant stockage et le NUL y est interdit ;
+  elle n'est jamais journalisée (décision #62).
 - Gestion d'erreurs normalisée :
   - RequestValidationError -> 400 contractuel {"code": "bad_request", "message": "Requête invalide"}
     sans écho du corps ni enveloppe 422 de FastAPI.
@@ -57,6 +59,7 @@ import re
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Any, Literal
 
 import uvicorn
@@ -86,6 +89,7 @@ from heimdall.vault.crypto import (
 from heimdall.vault.database import (
     DEFAULT_DB_PATH,
     DatabaseUnavailableError,
+    _assert_not_symlink,
     resolve_db_path,
     validate_db_path,
 )
@@ -429,6 +433,15 @@ _SECRETS_GET_RESPONSES: dict[int | str, dict[str, Any]] = {
     "default": {"model": InternalError, "description": "Erreur inattendue"},
 }
 
+_SECRETS_STATE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_SECRETS_GET_RESPONSES,
+    200: {
+        "model": SecretMetadata,
+        "description": "Métadonnées courantes, sans la valeur (état seul).",
+        "headers": _NO_STORE_HEADER,
+    },
+}
+
 
 class VaultSettings(BaseSettings):
     """Configuration du serveur Vault via variables d'environnement."""
@@ -589,6 +602,24 @@ class VaultSettings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_docs_disabled_in_production(self) -> "VaultSettings":
+        """Refuse la documentation OpenAPI en production (anti-fingerprinting).
+
+        ``enable_docs=True`` expose `/docs` et `/openapi.json` (schéma, version)
+        sans authentification : comme `require_auth=False` et le backend
+        `memory`, cette exposition est refusée en production
+        (`HEIMDALL_ENV=production/prod`), réservée au développement local.
+        """
+        if self.enable_docs and _heimdall_env_mode() in _PRODUCTION_ENV_MODES:
+            raise ValueError(
+                "HEIMDALL_VAULT_ENABLE_DOCS=true est interdit en production "
+                "(HEIMDALL_ENV=production/prod) : /docs et /openapi.json "
+                "exposeraient le schéma sans authentification (fingerprinting). "
+                "La documentation est réservée au développement local."
+            )
+        return self
+
     @property
     def effective_api_key_pepper(self) -> str:
         """Pepper résolu et non vide (garanti par ``resolve_api_key_pepper``)."""
@@ -645,7 +676,12 @@ class VaultSettings(BaseSettings):
     @field_validator("ssl_certfile", "ssl_keyfile")
     @classmethod
     def validate_tls_file(cls, value: str | None) -> str | None:
-        """Valide un fichier TLS : absolu, existant, régulier, sans espace de bord."""
+        """Valide un fichier TLS : absolu, existant, régulier, sans symlink, sans espace de bord.
+
+        Les liens symboliques sont refusés via le même garde que la couche DB
+        (`_assert_not_symlink`, invariant n°3) : uvicorn suivrait sinon la cible
+        à l'ouverture, hors du chemin validé (TOCTOU).
+        """
         if value is None:
             return None
         if not value or value != value.strip():
@@ -655,6 +691,12 @@ class VaultSettings(BaseSettings):
             raise ValueError("Le chemin TLS doit être absolu.")
         if not path.is_file():
             raise ValueError("Le fichier TLS est introuvable ou n'est pas un fichier régulier.")
+        try:
+            _assert_not_symlink(path)
+        except PermissionError as exc:
+            raise ValueError(
+                "Le chemin TLS ne doit pas être un lien symbolique ni en traverser un."
+            ) from exc
         return str(path)
 
     @model_validator(mode="after")
@@ -867,6 +909,31 @@ class DatabaseAvailabilityMiddleware:
             await response(scope, receive, send)
 
 
+async def _limiter_peek(limiter: RateLimiter | SqliteRateLimiter, peer: str) -> tuple[bool, int]:
+    """Lecture seule pair/global, sans verrou d'écriture (rejet précoce)."""
+    if isinstance(limiter, SqliteRateLimiter):
+        return await asyncio.to_thread(limiter.peek, peer)
+    return limiter.peek(peer)
+
+
+async def _limiter_consume_peer(
+    limiter: RateLimiter | SqliteRateLimiter, peer: str
+) -> tuple[bool, int]:
+    """Consomme pair/global pour les requêtes sans bucket clé (401/400/santé)."""
+    if isinstance(limiter, SqliteRateLimiter):
+        return await asyncio.to_thread(limiter.check, peer)
+    return limiter.check(peer)
+
+
+async def _limiter_consume_authenticated(
+    limiter: RateLimiter | SqliteRateLimiter, peer: str, key_hash: str
+) -> tuple[bool, int]:
+    """Consomme pair/global + clé en une seule transaction (requête authentifiée)."""
+    if isinstance(limiter, SqliteRateLimiter):
+        return await asyncio.to_thread(limiter.check_authenticated, peer, key_hash)
+    return limiter.check_authenticated(peer, key_hash)
+
+
 def _register_middleware(app: FastAPI) -> None:
     """Enregistre les middlewares du serveur Vault."""
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=_MAX_BODY_SIZE)
@@ -892,25 +959,30 @@ def _register_middleware(app: FastAPI) -> None:
     async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
         """Borne le débit par clé validée, pair réseau et global (ticket #65).
 
-        Les buckets pair/global sont consommés avant tout hachage ou lookup.
-        Les 400/401 sont comptés par le bucket pair/global puisque le middleware
-        s'exécute avant le routage et les dépendances. Une clé invalide ne crée
-        aucun bucket arbitraire : seuls pair et global s'appliquent. Le choix du
+        Rejet précoce sans coût CPU : ``peek`` pair/global (lecture seule,
+        sans consommation) précède tout hachage ou lookup. Les 400/401 sont
+        comptés par le bucket pair/global puisque le middleware s'exécute
+        avant le routage et les dépendances. Une clé invalide ne crée aucun
+        bucket arbitraire : seuls pair et global s'appliquent. Le choix du
         bucket par clé emprunte le même parcours à coût comparable que
         ``verify_api_key`` (``find_api_key_project_cached``) : le résultat est
         mémoïsé dans la requête et réutilisé par l'authentification (un seul
         full-scan par requête, ticket #65) ; l'existence d'une clé n'est pas
-        observable par le temps de réponse du middleware. Avec le backend SQLite,
-        ``SqliteRateLimiter`` partage les buckets entre workers (transaction
-        ``BEGIN IMMEDIATE``) : la limite n'est jamais multipliée par le nombre
-        de processus. Le mode mémoire reste mono-processus (dev/test).
+        observable par le temps de réponse du middleware. La phase consommatrice
+        est ensuite UNIQUE : ``check_authenticated`` consomme pair/global + clé
+        en une seule transaction (mémoire : une seule section critique ;
+        SQLite : un seul ``BEGIN IMMEDIATE``), au lieu de deux transactions
+        successives (plus de fenêtre inter-transactions ni double verrou
+        d'écriture). Sémantique préservée : pair/global restent consommés même
+        quand le bucket clé est plein. Avec le backend SQLite,
+        ``SqliteRateLimiter`` partage les buckets entre workers : la limite
+        n'est jamais multipliée par le nombre de processus. Le mode mémoire
+        reste mono-processus (dev/test).
         """
         peer = request.client.host if request.client and request.client.host else "unknown"
         limiter: RateLimiter | SqliteRateLimiter = request.app.state.rate_limiter
-        if isinstance(limiter, SqliteRateLimiter):
-            allowed, retry_after = await asyncio.to_thread(limiter.check, peer)
-        else:
-            allowed, retry_after = limiter.check(peer)
+
+        allowed, retry_after = await _limiter_peek(limiter, peer)
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -920,6 +992,13 @@ def _register_middleware(app: FastAPI) -> None:
         key_hash: str | None = None
         raw_key = request.headers.get("X-Heimdall-API-Key")
         if raw_key is not None and len(raw_key) > vault_auth.MAX_API_KEY_LENGTH:
+            allowed, retry_after = await _limiter_consume_peer(limiter, peer)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content=_ERROR_PAYLOADS[429],
+                    headers={"Retry-After": str(retry_after), "Connection": "close"},
+                )
             return JSONResponse(
                 status_code=401,
                 content=_ERROR_PAYLOADS[401],
@@ -941,10 +1020,9 @@ def _register_middleware(app: FastAPI) -> None:
                     key_hash = candidate_hash
 
         if key_hash is not None:
-            if isinstance(limiter, SqliteRateLimiter):
-                allowed, retry_after = await asyncio.to_thread(limiter.check_key, key_hash)
-            else:
-                allowed, retry_after = limiter.check_key(key_hash)
+            allowed, retry_after = await _limiter_consume_authenticated(limiter, peer, key_hash)
+        else:
+            allowed, retry_after = await _limiter_consume_peer(limiter, peer)
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -1100,7 +1178,7 @@ def _register_routes(app: FastAPI) -> None:
             # transitoire : sans route DELETE dans le contrat #63, un retry
             # (même après le délai annoncé) sera refusé tant que la capacité
             # reste pleine. Le retry est donc INUTILE jusqu'à libération d'un
-            # emplacement (route DELETE + quotas par projet, TODO(#62)).
+            # emplacement (route DELETE + quotas par projet, TODO(#156)).
             raise StarletteHTTPException(
                 status_code=429,
                 detail="Trop de requêtes",
@@ -1159,6 +1237,68 @@ def _register_routes(app: FastAPI) -> None:
             value=record["value"],
         )
 
+    @app.get(
+        "/api/v1/secrets/{project}/{env}/{name}/state",
+        response_model=SecretMetadata,
+        status_code=200,
+        responses=_SECRETS_STATE_RESPONSES,
+        tags=["Secrets"],
+        summary="Lire l'état courant d'un secret sans la valeur",
+        operation_id="getSecretState",
+    )
+    async def get_secret_state(
+        project: Annotated[
+            ProjectId,
+            FastApiPath(description="Identifiant public du projet ; aucune valeur secrète."),
+        ],
+        env: Annotated[
+            EnvironmentId,
+            FastApiPath(description="Environnement autorisé ; aucune valeur secrète."),
+        ],
+        name: Annotated[
+            SecretName,
+            FastApiPath(description="Nom de variable ; aucune valeur secrète."),
+        ],
+        response: Response,
+        authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
+    ) -> SecretMetadata:
+        """Lire l'état courant d'un secret sans exposer la valeur (contrat openapi.yaml).
+
+        Même contrôle d'accès que la lecture : authentification requise,
+        isolement par projet (403), 404 si inexistant, `Cache-Control: no-store`.
+        Seules les métadonnées sont retournées, jamais la valeur.
+        """
+        settings: VaultSettings | None = getattr(app.state, "settings", None)
+        if settings is None:
+            settings = VaultSettings(require_auth=True)
+        if settings.require_auth and authenticated_project is None:
+            raise StarletteHTTPException(
+                status_code=401,
+                detail="Authentification requise",
+            )
+        if (
+            authenticated_project is not None
+            and authenticated_project != project
+        ):
+            raise StarletteHTTPException(
+                status_code=403,
+                detail="Accès interdit",
+            )
+        response.headers["Cache-Control"] = "no-store"
+        store: InMemorySecretStore = app.state.secret_store
+        record = await store.get(project=project, env=env, name=name)
+        if record is None:
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            )
+        return SecretMetadata(
+            project=record["project"],
+            env=record["env"],
+            name=record["name"],
+            status=record["status"],  # type: ignore[arg-type]
+        )
+
 
 def _configure_secret_store(
     app: FastAPI,
@@ -1214,6 +1354,10 @@ def create_app(
       Les clés brutes sont expressément refusées pour éviter toute confusion de format.
       Chaque `project_id` DOIT satisfaire `PROJECT_PATTERN` (^[a-z][a-z0-9_-]{0,63}$) :
       un identifiant hors contrat est refusé à l'enregistrement (fail-fast, sans écho).
+      Les empreintes étant opaques (HMAC irréversible), les contrôles de robustesse
+      de `_validate_raw_api_key` ne s'y appliquent pas : elles DOIVENT provenir de
+      clés générées par `generate_api_key()` (confiance placée dans le détenteur
+      du pepper, qui peut hacher n'importe quoi).
     - `api_keys` : Alias de `api_key_hashes` pour compatibilité descendante.
 
     Le pepper utilisé pour les empreintes de `register_api_key` est celui de
@@ -1273,9 +1417,13 @@ def create_app(
     def register_api_key(raw_key: str, project_id: str) -> str:
         """Enregistre une clé API brute et retourne son identifiant (ticket #64).
 
-        Les clés DOIVENT être générées par ``generate_api_key()`` (256 bits) ou
-        offrir une diversité équivalente : la longueur seule est insuffisante et
-        les motifs triviaux (``"a" * 43``, ``"abcdefghijkl" * 4``) sont refusés.
+        Les clés DOIVENT être générées par ``generate_api_key()`` (256 bits) :
+        tout contournement manuel est une faute opérationnelle (en cas de fuite
+        des empreintes et du pepper, seul un token aléatoire résiste au
+        brute-force hors ligne). Les motifs triviaux (``"a" * 43``,
+        ``"abcdefghijkl" * 4``, suites monotones 8+ comme ``abcdefgh…``/
+        ``0123456789…``, lignes de clavier comme ``qwertyuiop…``/``azerty…``)
+        sont refusés fail-fast, sans écho.
         L'identifiant de projet est validé contre ``PROJECT_PATTERN`` : une clé
         liée à un identifiant hors contrat ne pourrait jamais matcher une
         requête et provoquerait un 403 silencieux à chaque appel.
@@ -1307,7 +1455,30 @@ def create_app(
     return app
 
 
-app = create_app()
+_APP_HOLDER: dict[str, FastAPI] = {}
+_app_lock = Lock()
+
+
+def get_app() -> FastAPI:
+    """Fabrique explicite du serveur (appelée par `run_server`, jamais à l'import).
+
+    Garantie sans effet disque à l'import : ``import heimdall.vault.app`` ne
+    résout aucun backend, ne génère ni cipher ni pepper et n'appelle jamais
+    ``init_db``. Il n'existe volontairement AUCUNE variable module ``app`` :
+    `from heimdall.vault.app import app` lève `ImportError` (aucune création
+    accidentelle de `vault.db` par un import). La construction (backend SQLite,
+    ``vault.db`` 600, pepper éphémère) n'a lieu qu'à l'appel explicite de
+    cette factory, donc au démarrage du serveur via `run_server`.
+    """
+    if "app" not in _APP_HOLDER:
+        with _app_lock:
+            if "app" not in _APP_HOLDER:
+                _APP_HOLDER["app"] = create_app()
+    return _APP_HOLDER["app"]
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 
 def run_server() -> None:
@@ -1338,7 +1509,7 @@ def run_server() -> None:
             "Le HTTP en clair reste réservé au développement local."
         )
     uvicorn.run(
-        "heimdall.vault.app:app",
+        get_app(),
         host=server_settings.host,
         port=server_settings.port,
         # Épinglé par défaut : le backend mémoire est strictement mono-processus.
@@ -1373,9 +1544,9 @@ __all__ = [
     "UnauthorizedError",
     "UnavailableError",
     "VaultSettings",
-    "app",
     "create_app",
     "generate_api_key",
+    "get_app",
     "get_settings",
     "hash_api_key",
     "project_api_key_header",

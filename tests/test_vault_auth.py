@@ -229,7 +229,18 @@ class ApiKeyRegistryTests(unittest.TestCase):
     def test_trivial_key_patterns_are_refused_without_echo(self) -> None:
         """Les motifs triviaux sont refusés, sans jamais répéter la clé."""
         registry = vault_auth.ApiKeyRegistry(pepper=PEPPER)
-        for weak in ("a" * 43, "abcdefghijkl" * 4, "short", "avec espace" * 5):
+        for weak in (
+            "a" * 43,
+            "abcdefghijkl" * 4,
+            "short",
+            "avec espace" * 5,
+            # Suite monotone de 8+ caractères (5e contrôle).
+            "abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE",
+            # Ligne de clavier connue (6e contrôle).
+            "qwertyuiopZx9-plQv2Mw4Rt6Yb8Nd3Ff7Hg5Jj1Kk0Ll",
+            # `fullmatch` : un `\n` final ne doit pas passer via `$`.
+            "A" * 42 + "\n",
+        ):
             with self.subTest(weak=weak[:12]):
                 with self.assertRaises(ValueError) as ctx:
                     registry.register(weak, "demo")
