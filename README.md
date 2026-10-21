@@ -179,6 +179,8 @@ n'est jamais journalisée. La traçabilité ticket → module → preuve est dan
 ```text
 heimdall/            paquet unique (#17)
   scanner/           détection déterministe regex + entropie (#22, contrat #14)
+    interface.py     cible (diff indexé ou fichier) + scan(cible) -> list[Finding] (#53)
+    finding.py       sortie Finding conforme au schéma #14 par construction (#53)
   mcp/               serveur MCP stdio, 4 outils lecture seule (#27, contrat #16)
     prompts/         prompt système versionné du trieur (qualify_v1, #80)
   llm/               client Ollama local, sortie JSON contrainte (#80, T28.2), candidat fail-closed (#81)
@@ -194,6 +196,7 @@ openapi.yaml         contrat Vault API v1 (#15)
 
 - [Vault API v1 et vérification OpenAPI](docs/contracts/vault-api.md)
 - [Finding v1 et machine d'états du secret](docs/contracts/finding.md)
+- [Interface du scanner et sortie Finding](docs/scanner-interface.md)
 - [Outils MCP exposés au LLM (surface strictement limitée)](docs/contracts/mcp-tools.md)
 - [Serveur MCP stdio : lancement, outils, invariants (#27)](docs/mcp-server.md)
 - [ADR-001 : Finding et faux positifs](docs/adr/001-finding-et-etats.md)
