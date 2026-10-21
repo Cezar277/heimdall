@@ -45,7 +45,7 @@ def test_actions_epinglees_par_sha() -> None:
     for action in uses:
         assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", action), action
     expected = [
-        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
         "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
     ]
