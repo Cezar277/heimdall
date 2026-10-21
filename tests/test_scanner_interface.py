@@ -611,6 +611,26 @@ def test_scanner_refuses_a_moteur_without_analyser(moteur):
         Scanner(moteur)  # type: ignore[arg-type]
 
 
+def test_scanner_init_converts_a_hostile_getattr_into_scan_error():
+    """Un ``__getattr__`` hostile ne doit pas fuir hors de ``Scanner()``.
+
+    ``getattr(moteur, "analyser", None)`` appelle le ``__getattr__`` du
+    moteur : un objet hostile pourrait y lever une exception brute
+    (``RuntimeError`` avec canari) au lieu de rendre ``None``. Le contrat
+    d'erreur reste unique : ``ScanError``, message statique, sans reflet
+    (invariant 8) et sans ``__context__``.
+    """
+
+    class _MoteurHostile:
+        def __getattr__(self, name: str) -> object:
+            raise RuntimeError(f"échec getattr : {CANARY}")
+
+    with pytest.raises(ScanError) as ctx:
+        Scanner(_MoteurHostile())  # type: ignore[arg-type]
+    assert CANARY not in str(ctx.value)
+    assert ctx.value.__context__ is None
+
+
 @pytest.mark.parametrize("rendu", [None, 42, "pas une liste"])
 def test_scanner_refuses_an_engine_that_renders_nothing_usable(rendu):
     """Un moteur qui ne rend pas une liste de Findings est refusé (fail-closed)."""

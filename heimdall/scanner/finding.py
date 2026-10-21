@@ -69,9 +69,20 @@ def validate_relative_path(value: object) -> str:
 
     Graphe lexical, identique à celui du schéma : chemin **relatif** au
     dépôt, séparateurs ``/``, segments non vides, aucun segment ``.`` ou
-    ``..``, aucun caractère de contrôle, aucune fin de ligne Unicode. La
-    résolution réelle (liens symboliques) reste du ressort du consommateur :
-    ici, on refuse un chemin qu'on ne peut pas interpréter sans ambiguïté.
+    ``..``, aucun caractère de contrôle, aucune fin de ligne Unicode.
+
+    Garde lexicale seule, volontairement sans I/O : elle refuse un chemin
+    qu'on ne peut pas interpréter sans ambiguïté (``../``, absolu, ``C:``,
+    ``\\``, NUL), mais elle ne protège PAS contre les liens symboliques
+    sortants ni les TOCTOU (invariant 3). Tout consommateur qui touche au
+    système de fichiers DOIT résoudre avec une racine fixée au démarrage
+    (``root.resolve()`` puis ``candidate.resolve()`` +
+    ``is_relative_to()``) — voir l'implémentation canonique
+    ``heimdall.mcp.paths.confine`` (garde unique, avec ``O_NOFOLLOW`` +
+    contrôle dev/ino côté ``heimdall.mcp.server``). En particulier le
+    futur moteur ([T22.2] signatures #54 / [T22.3] exclusions #59) et
+    ``heimdall/mcp/gitdiff.py`` ne doivent jamais considérer cette garde
+    comme suffisante.
 
     Lève ``ValueError`` (message statique) si le chemin n'est pas conforme.
     """
