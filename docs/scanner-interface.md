@@ -43,14 +43,21 @@ findings: list[Finding] = scanner.scan(diff)
 Les deux cibles sont figées (immuables) et validées à la construction :
 
 - le chemin est **relatif au dépôt**, avec `/` comme séparateur, sans segment
-  vide, sans segment `.` ou `..`, sans caractère de contrôle : c'est la
-  grammaire lexicale du contrat #14, appliquée avant toute lecture ;
+  vide, sans segment `.` ou `..`, sans caractère Unicode de catégorie `C`
+  (contrôle, format/bidi, surrogate, usage privé, non assigné) ni fin de
+  ligne Unicode : c'est la grammaire lexicale du contrat #14, appliquée
+  avant toute lecture ;
 - les numéros de ligne d'un `DiffTarget` sont des entiers ≥ 1 **strictement
   croissants** (le parseur de diff du MCP produit déjà cette forme :
   `DiffEntry.lines`) ;
 - un conteneur de lignes ou une ligne malformée est refusé : `lines` doit
   être une suite de couples `(entier, texte)`, et le résultat est normalisé
-  en tuple de couples.
+  en tuple de couples ;
+- `FileTarget.lignes()` découpe comme Git : seul `\n` sépare deux lignes, un
+  `\r` final (CRLF) est retiré, et les autres séparateurs Unicode (`\v`,
+  `\f`, `\u2028`, `\u2029`...) restent dans le contenu de la ligne. Un
+  `Finding.line` doit désigner la ligne réelle du fichier, pas une ligne
+  artificielle créée par `str.splitlines()`.
 
 Un chemin refusé est une **erreur** (`InvalidTarget`), pas un fichier ignoré
 en silence : une cible illisible ne doit jamais devenir « aucun secret ».
@@ -132,6 +139,11 @@ Les trois dérivent de `ScanError`, lui-même de `Exception` ; `InvalidFinding`
 et `InvalidTarget` dérivent aussi de `ValueError`, pour les appelants qui
 traitent les erreurs de contrat comme des valeurs invalides.
 
+Le point d'entrée historique `find_candidates` (hors façade `Scanner`) lève
+`ScannerNotImplemented`, qui hérite à la fois de `ScanError` et de
+`NotImplementedError` : le contrat unique est respecté sans casser les
+appelants qui catchent l'erreur historique.
+
 Aucune `TypeError` ni `AttributeError` brute ne doit sortir de l'interface :
 un `status` non hashable, un conteneur de lignes malformé, une cible qui
 n'est pas une cible ou un moteur sans méthode `analyser` sont refusés par
@@ -160,6 +172,10 @@ vides, donc la traceback journalisée ne ressuscite pas le message du moteur.
 Seule exception : les `BaseException` (`KeyboardInterrupt`, `SystemExit`) ne
 sont pas capturées — une interruption doit rester une interruption.
 
+La méthode `analyser` est liée et figée à la construction de `Scanner` :
+remplacer `moteur.analyser` après coup ne change pas le moteur réellement
+appelé (défense en profondeur contre un TOCTOU).
+
 ## Ce que ce ticket ne fait pas
 
 - **Aucune I/O.** L'interface ne lit aucun fichier et n'ouvre aucun
@@ -180,13 +196,15 @@ sont pas capturées — une interruption doit rester une interruption.
 
 La validation locale reproduit la grammaire du schéma #14, et le test
 `tests/test_scanner_interface.py` compare les deux sur un corpus de cas
-valides et invalides : **accord sur tous les cas**, sauf deux écarts assumés,
-où le code est plus strict que le schéma (il refuse, il ne répare pas) :
+valides et invalides : **accord sur tous les cas**, sauf trois écarts
+assumés, où le code est plus strict que le schéma (il refuse, il ne répare
+pas) :
 
 | Cas | Schéma | Code |
 | --- | --- | --- |
 | `line: 1.0` | accepté (le draft 6 considère un flottant entier comme un entier) | refusé : une ligne de fichier est un entier |
 | `entropy: NaN` | accepté (les comparaisons de `jsonschema` sont fausses pour NaN) | refusé : NaN n'est pas du JSON |
+| chemin avec un caractère `Cf` (bidi, marque invisible) | accepté (le motif ne couvre pas les catégories Unicode) | refusé : spoofing de terminal et confusion de revue |
 
 ## Branches avec le reste du projet
 

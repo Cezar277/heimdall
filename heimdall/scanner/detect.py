@@ -17,6 +17,7 @@ reste fail-closed tant que #22 n'est pas livré : aucune liste partielle, jamais
 de verdict inventé.
 """
 
+from heimdall.scanner.errors import ScannerNotImplemented
 from heimdall.scanner.finding import Finding, FindingSource, FindingStatus
 
 __all__ = ["Finding", "FindingSource", "FindingStatus", "find_candidates"]
@@ -25,12 +26,14 @@ __all__ = ["Finding", "FindingSource", "FindingStatus", "find_candidates"]
 def find_candidates(path: str) -> list[dict[str, object]]:
     """Repère les candidats secrets sous ``path`` (diff stagé ou dépôt).
 
-    Lève ``NotImplementedError`` tant que #22 n'est pas livré (fail-closed :
-    aucun résultat partiel silencieux, jamais de verdict inventé). Message
-    statique : aucune entrée n'est reflétée (invariant 8).
+    Lève ``ScannerNotImplemented`` tant que #22 n'est pas livré : l'erreur
+    hérite à la fois de ``ScanError`` (contrat de la façade) et de
+    ``NotImplementedError`` (appelants historiques). Fail-closed : aucun
+    résultat partiel silencieux, jamais de verdict inventé. Message statique :
+    aucune entrée n'est reflétée (invariant 8).
 
     La forme de retour est celle du contrat #14 : un dictionnaire par
     candidat, exactement les sept champs de ``schemas/finding.schema.json``.
     """
     del path  # #22 utilisera ce paramètre ; en attendant, rien n'est reflété.
-    raise NotImplementedError("scanner non implémenté (voir #22)")
+    raise ScannerNotImplemented("scanner non implémenté (voir #22)")
