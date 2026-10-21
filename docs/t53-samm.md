@@ -79,25 +79,25 @@ changer le contrat de sortie ni le fail-closed.
 
 ## Résultats locaux
 
-Environnement : Linux, Python 3.14.7, venv du dépôt.
+Environnement : Linux, Python 3.14.7, venv reconstruit depuis
+`requirements.lock` (mêmes versions que la CI).
 
 ```text
-.venv/bin/python -m pytest tests/test_scanner_interface.py
+.venv-ci/bin/python -m pytest tests/test_scanner_interface.py
 148 passed
 
-.venv/bin/python -m pytest
-suite complète : 1127 passed, 1 skipped, 1 xfailed (+ 4251 subtests), code retour 0
+.venv-ci/bin/python -m pytest --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85
+suite complète : 1128 passed, 1 skipped, 1 xfailed (+ 4251 subtests), code retour 0
+couverture Heimdall : 96,31 % (seuil CI 85 %)
+heimdall/scanner/* : 100 % (branches incluses)
 
-.venv/bin/ruff check heimdall tests        # All checks passed
-.venv/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
+.venv-ci/bin/ruff check heimdall tests        # All checks passed
+.venv-ci/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
                                             # Success: no issues found in 27 source files
-.venv/bin/bandit -r heimdall -q             # code retour 0, aucun rapport
-.venv/bin/python docs/security/check_model.py
+.venv-ci/bin/bandit -r heimdall -q             # code retour 0, aucun rapport
+.venv-ci/bin/python docs/security/check_model.py
                                             # OK (48 scénarios, DFD, PNG)
 ```
-
-Couverture : non mesurée localement (`pytest-cov` absent du venv) ; la CI
-applique les seuils 85 % global et 70 % scanner.
 
 Le `xfailed` restant est celui de T21 (`tests/test_trap_acceptance.py`) : il
 attend la livraison du scanner #22 et devient un `XPASS(strict)` dès que le
