@@ -32,7 +32,11 @@ from heimdall.scanner.signatures import (
     Signature,
     SignatureMatch,
 )
-from heimdall.scanner.signatures import find_signature_matches as find_signature_matches
+
+# ``find_signature_matches`` n'est **pas** réexportée ici : son retour porte
+# la **valeur brute** des candidats (surface sensible). Elle reste importable
+# explicitement depuis ``heimdall.scanner.signatures``, et la seule surface
+# publique du paquet est celle de ``__all__`` ci-dessous.
 
 __all__ = [
     "FINDING_FIELDS",

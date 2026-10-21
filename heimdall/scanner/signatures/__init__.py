@@ -122,9 +122,11 @@ def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:
     return tuple(matches)
 
 
-# ``find_signature_matches`` reste importable explicitement, mais n'est
-# volontairement pas dans ``__all__`` : son retour contient des valeurs brutes
-# (surface sensible, réservée au moteur et aux tests).
+# ``find_signature_matches`` reste importable explicitement depuis ce module,
+# mais n'est volontairement pas dans ``__all__`` : son retour contient des
+# valeurs brutes (surface sensible, réservée au moteur et aux tests). Elle
+# n'est **pas** réexportée par ``heimdall.scanner`` : un seul point d'export,
+# pas deux politiques contradictoires.
 __all__ = [
     "FAMILIES",
     "RULES",

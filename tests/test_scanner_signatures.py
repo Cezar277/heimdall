@@ -14,6 +14,7 @@ Toutes les valeurs sont synthétiques : aucune clé réelle, aucun appel réseau
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import stat
@@ -31,7 +32,6 @@ from heimdall.scanner import (
     ScanError,
     Scanner,
     SignatureEngine,
-    find_signature_matches,
     hashing,
 )
 from heimdall.scanner import signatures as registry
@@ -42,7 +42,13 @@ from heimdall.scanner.hashing import (
     SnippetHasher,
     load_local_key,
 )
-from heimdall.scanner.signatures import FAMILIES, RULES, Rule, rules_for_family
+from heimdall.scanner.signatures import (
+    FAMILIES,
+    RULES,
+    Rule,
+    find_signature_matches,
+    rules_for_family,
+)
 from heimdall.scanner.signatures.model import ALLOWED_SECRET_TYPES
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -319,6 +325,43 @@ def test_find_signature_matches_refuses_a_non_string_line() -> None:
     """Le matcher public applique la même garde fail-closed."""
     with pytest.raises(ScanError):
         find_signature_matches(None)  # type: ignore[arg-type]
+
+
+# --- Surface d'export : une seule politique, vérifiée ----------------------
+
+
+def test_the_raw_value_matcher_is_not_reexported_by_the_scanner_package() -> None:
+    """La surface sensible n'est exportée qu'à un seul endroit.
+
+    ``find_signature_matches`` rend la **valeur brute** des candidats : elle
+    est réservée au moteur et aux tests. La réexportation par
+    ``heimdall.scanner`` élargissait cette surface au niveau le plus visible
+    du paquet, alors que le registre la tient hors de son ``__all__``. Ce
+    test verrouille une **seule** politique d'export : le matcher n'est
+    accessible que par un import explicite de ``heimdall.scanner.signatures``.
+
+    L'absence de l'attribut au niveau du paquet est ce qui fait échouer
+    ``from heimdall.scanner import find_signature_matches``.
+    """
+    scanner_module = importlib.import_module("heimdall.scanner")
+    assert "find_signature_matches" not in scanner_module.__all__
+    assert not hasattr(scanner_module, "find_signature_matches")
+    assert "find_signature_matches" not in registry.__all__
+    assert registry.find_signature_matches is find_signature_matches
+
+
+def test_the_scanner_package_still_exports_its_documented_surface() -> None:
+    """La suppression de la réexportation n'ampute pas la surface publique.
+
+    Chaque nom annoncé par ``__all__`` doit rester un attribut réel du
+    paquet : retirer l'export sensible ne doit pas casser les importations
+    des appelants légitimes.
+    """
+    scanner_module = importlib.import_module("heimdall.scanner")
+    assert scanner_module.__all__
+    assert all(hasattr(scanner_module, name) for name in scanner_module.__all__)
+    assert "SignatureEngine" in scanner_module.__all__
+    assert "find_candidates" in scanner_module.__all__
 
 
 @pytest.mark.parametrize(
