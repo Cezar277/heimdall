@@ -583,12 +583,22 @@ class VaultSettingsTests(unittest.TestCase):
             HealthResponse(status="ok", extra="unauthorized")  # type: ignore[call-arg]
 
     def test_forbidden_error_model(self) -> None:
-        """Le modèle ForbiddenError est conforme au contrat d'erreur."""
-        err = ForbiddenError()
+        """Le modèle ForbiddenError est conforme au contrat d'erreur.
+
+        `code` et `message` sont OBLIGATOIRES (aucune valeur par défaut) : le
+        schéma OpenAPI publié doit donc exposer `required: [code, message]`,
+        comme l'exige `openapi.yaml`.
+        """
+        err = ForbiddenError(code="forbidden", message="Accès interdit")
         self.assertEqual(err.code, "forbidden")
         self.assertEqual(err.message, "Accès interdit")
         with self.assertRaises(ValidationError):
             ForbiddenError(extra="unauthorized")  # type: ignore[call-arg]
+        # Sans `code` ni `message` : le modèle refuse (champs obligatoires).
+        with self.assertRaises(ValidationError):
+            ForbiddenError()  # type: ignore[call-arg]
+        with self.assertRaises(ValidationError):
+            ForbiddenError(code="forbidden")  # type: ignore[call-arg]
 
     def test_run_server_is_callable(self) -> None:
         """run_server est défini et appelable comme point d'entrée."""
@@ -614,7 +624,7 @@ class VaultSettingsTests(unittest.TestCase):
             {
                 "host": "127.0.0.1",
                 "port": 8443,
-                # Un seul worker : le backend mémoire est mono-processus (#65).
+                # Un seul worker : le backend mémoire est mono-processus (lot #63).
                 "workers": 1,
                 "ssl_certfile": None,
                 "ssl_keyfile": None,
@@ -873,13 +883,13 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(read_m.value, "secret_val")
 
-        err400 = BadRequestError()
+        err400 = BadRequestError(code="bad_request", message="Requête invalide")
         self.assertEqual(err400.code, "bad_request")
 
-        err404 = NotFoundError()
+        err404 = NotFoundError(code="not_found", message="Ressource introuvable")
         self.assertEqual(err404.code, "not_found")
 
-        err409 = ConflictError()
+        err409 = ConflictError(code="conflict", message="Secret déjà existant")
         self.assertEqual(err409.code, "conflict")
 
     async def test_post_secret_success_201(self) -> None:

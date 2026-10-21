@@ -49,6 +49,14 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   - StarletteHTTPException -> format contractuel préservant le status_code (400, 401, 403, 404,
     405, 409, 429, 503) sans fuite d'enveloppe framework {"detail": ...}.
   - Exception non gérée -> 500 {"code": "internal_error", "message": "Erreur interne"}.
+- Schéma OpenAPI publié aligné sur le contrat (openapi.yaml:412-508) : les modèles
+  d'erreur et `HealthResponse` déclarent `code`, `message` et `status` SANS valeur
+  par défaut. Un champ à valeur par défaut est omis de `required` par Pydantic :
+  le schéma publié n'exposerait alors plus `required: [code, message]` exigé par
+  le contrat (drift de contrat). Les champs restent donc OBLIGATOIRES dans le
+  modèle : les gestionnaires d'exceptions construisent les charges utiles
+  explicitement, et le schéma publié expose exactement les contraintes du
+  contrat (vérifié par `tests/test_vault_integration_testclient.py`).
 """
 
 import asyncio
@@ -133,72 +141,72 @@ class BadRequestError(BaseModel):
     """Erreur 400 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["bad_request"] = "bad_request"
-    message: Literal["Requête invalide"] = "Requête invalide"
+    code: Literal["bad_request"]
+    message: Literal["Requête invalide"]
 
 
 class UnauthorizedError(BaseModel):
     """Erreur 401 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["unauthorized"] = "unauthorized"
-    message: Literal["Authentification requise"] = "Authentification requise"
+    code: Literal["unauthorized"]
+    message: Literal["Authentification requise"]
 
 
 class ForbiddenError(BaseModel):
     """Erreur 403 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["forbidden"] = "forbidden"
-    message: Literal["Accès interdit"] = "Accès interdit"
+    code: Literal["forbidden"]
+    message: Literal["Accès interdit"]
 
 
 class NotFoundError(BaseModel):
     """Erreur 404 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["not_found"] = "not_found"
-    message: Literal["Ressource introuvable"] = "Ressource introuvable"
+    code: Literal["not_found"]
+    message: Literal["Ressource introuvable"]
 
 
 class MethodNotAllowedError(BaseModel):
     """Erreur 405 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["method_not_allowed"] = "method_not_allowed"
-    message: Literal["Méthode non autorisée"] = "Méthode non autorisée"
+    code: Literal["method_not_allowed"]
+    message: Literal["Méthode non autorisée"]
 
 
 class ConflictError(BaseModel):
     """Erreur 409 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["conflict"] = "conflict"
-    message: Literal["Secret déjà existant"] = "Secret déjà existant"
+    code: Literal["conflict"]
+    message: Literal["Secret déjà existant"]
 
 
 class RateLimitedError(BaseModel):
     """Erreur 429 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["rate_limited"] = "rate_limited"
-    message: Literal["Trop de requêtes"] = "Trop de requêtes"
+    code: Literal["rate_limited"]
+    message: Literal["Trop de requêtes"]
 
 
 class UnavailableError(BaseModel):
     """Erreur 503 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["unavailable"] = "unavailable"
-    message: Literal["Service indisponible"] = "Service indisponible"
+    code: Literal["unavailable"]
+    message: Literal["Service indisponible"]
 
 
 class InternalError(BaseModel):
     """Erreur 500 contractuelle."""
 
     model_config = ConfigDict(extra="forbid")
-    code: Literal["internal_error"] = "internal_error"
-    message: Literal["Erreur interne"] = "Erreur interne"
+    code: Literal["internal_error"]
+    message: Literal["Erreur interne"]
 
 
 # La dépendance FastAPI qui lit l'en-tête `X-Heimdall-API-Key`, la politique de
@@ -392,7 +400,7 @@ _SECRETS_POST_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": RateLimitedError,
         "description": (
             "Trop de requêtes — quota de stockage atteint (#62/#63) ou débit "
-            "clé/pair/global dépassé (#65)."
+            "clé/pair/global dépassé (#63, lot d'intégration)."
         ),
         "headers": _RETRY_AFTER_HEADER,
     },
@@ -420,7 +428,7 @@ _SECRETS_GET_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": RateLimitedError,
         "description": (
             "Trop de requêtes — quota de stockage atteint (#62/#63) ou débit "
-            "clé/pair/global dépassé (#65)."
+            "clé/pair/global dépassé (#63, lot d'intégration)."
         ),
         "headers": _RETRY_AFTER_HEADER,
     },
@@ -737,7 +745,7 @@ class HealthResponse(BaseModel):
     """Réponse minimale du endpoint de santé sans information sensible."""
 
     model_config = ConfigDict(extra="forbid")
-    status: Literal["ok"] = "ok"
+    status: Literal["ok"]
 
 
 def _pin_db_path(settings: VaultSettings) -> Path:
@@ -957,7 +965,7 @@ def _register_middleware(app: FastAPI) -> None:
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
-        """Borne le débit par clé validée, pair réseau et global (ticket #65).
+        """Borne le débit par clé validée, pair réseau et global (lot #63).
 
         Rejet précoce sans coût CPU : ``peek`` pair/global (lecture seule,
         sans consommation) précède tout hachage ou lookup. Les 400/401 sont
@@ -967,7 +975,7 @@ def _register_middleware(app: FastAPI) -> None:
         bucket par clé emprunte le même parcours à coût comparable que
         ``verify_api_key`` (``find_api_key_project_cached``) : le résultat est
         mémoïsé dans la requête et réutilisé par l'authentification (un seul
-        full-scan par requête, ticket #65) ; l'existence d'une clé n'est pas
+        full-scan par requête, lot #63) ; l'existence d'une clé n'est pas
         observable par le temps de réponse du middleware. La phase consommatrice
         est ensuite UNIQUE : ``check_authenticated`` consomme pair/global + clé
         en une seule transaction (mémoire : une seule section critique ;
@@ -1172,7 +1180,7 @@ def _register_routes(app: FastAPI) -> None:
             ) from None
         except QuotaExceededError:
             # 429 de CAPACITÉ (quota de stockage, #62) : distinct du 429 de
-            # DÉBIT (rate-limit, #65), lui transitoire.
+            # DÉBIT (rate-limit, lot #63), lui transitoire.
             # Le contrat OpenAPI impose `Retry-After` sur TOUT 429, donc
             # l'en-tête est présent même ici ; en revanche ce 429 n'est PAS
             # transitoire : sans route DELETE dans le contrat #63, un retry
@@ -1500,8 +1508,8 @@ def run_server() -> None:
     son ticket dédié.
 
     NOTE CONCURRENCE : Le stockage SQLite chiffré (#26, #62), les empreintes de
-    clés API et, avec ce même backend, les buckets de rate-limiting (#65) sont
-    partagés entre workers. Le serveur épingle toutefois workers=1 (le lanceur
+    clés API et, avec ce même backend, les buckets de rate-limiting (lot #63)
+    sont partagés entre workers. Le serveur épingle toutefois workers=1 (le lanceur
     ignore WEB_CONCURRENCY) : le mode mémoire reste strictement mono-processus
     et cette contrainte évite tout écart de configuration. Le backend SQLite
     peut être répliqué sans multiplier la limite de débit.
@@ -1520,7 +1528,7 @@ def run_server() -> None:
         host=server_settings.host,
         port=server_settings.port,
         # Épinglé par défaut : le backend mémoire est strictement mono-processus.
-        # Le backend SQLite partage ses buckets (#65), mais workers>1 reste une
+        # Le backend SQLite partage ses buckets (lot #63), mais workers>1 reste une
         # décision d'exploitation explicite hors de ce lanceur minimal.
         workers=1,
         ssl_certfile=server_settings.ssl_certfile,

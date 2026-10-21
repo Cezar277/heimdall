@@ -93,7 +93,7 @@ class InMemorySecretStore:
     capacité reste permanent (retry inutile), voir TODO(#156).
     Ce quota n'est PAS le rate-limiting : il ne borne pas le débit des requêtes.
     Le débit est borné séparément par le middleware `ratelimit.py` (buckets par
-    clé validée, pair réseau et global, 400/401 inclus, ticket #65), conformément
+    clé validée, pair réseau et global, 400/401 inclus, lot #63), conformément
     à openapi.yaml:289-294. Ce stockage en mémoire est strictement mono-processus
     (workers=1). Avec plusieurs
     workers (workers > 1), chaque worker détiendrait une instance mémoire indépendante
@@ -185,7 +185,7 @@ class SqliteSecretStore:
     n'expose aucune route DELETE, donc aucun emplacement ne peut être libéré.
     Le retry est donc INUTILE tant que la capacité est pleine ; la libération
     (route DELETE, quotas par projet) est suivie dans TODO(#156). Ce 429 de
-    capacité est distinct du 429 de débit (rate-limit, #65), lui transitoire.
+    capacité est distinct du 429 de débit (rate-limit, lot #63), lui transitoire.
 
     L'empreinte d'intégrité persistée utilise la sous-clé HKDF dédiée et le
     triplet ``(project, env, name)`` fournis par ``VaultCipher`` : jamais la KEK

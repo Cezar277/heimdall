@@ -10,8 +10,8 @@ la révocation restent suivies dans leurs tickets dédiés.
 
 La traçabilité ticket → module → preuve de ce lot est dans
 [vault-traceability.md](./vault-traceability.md) : chaque brique livrée ici
-(chiffrement #26, stockage/quota #62, authentification #64, débit #65, routes
-#63) est rattachée à son ticket et à ses tests, et le découpage en PR
+(chiffrement #26, stockage/quota #62, authentification #64, débit livré dans le
+lot #63, routes #63) est rattachée à son ticket et à ses tests, et le découpage en PR
 distinctes est décrit au même endroit.
 
 ## Routes et décisions à relire
@@ -191,7 +191,7 @@ des empreintes dupliquées, l'initialisation échoue sans suppression automatiqu
 La génération du pepper et les comparaisons sensibles sont confinées dans
 `heimdall/vault/crypto.py`.
 
-Rate-limiting débit (#65) : fenêtres fixes par clé API validée, par pair réseau
+Rate-limiting débit (lot #63) : fenêtres fixes par clé API validée, par pair réseau
 et globale. Un `peek` pair/global en lecture seule (sans consommation ni
 verrou d'écriture) précède le hachage et le parcours d'authentification ;
 leur rejet 429 ne déclenche aucun lookup de clé. Après résolution de
@@ -211,7 +211,7 @@ par le temps de réponse du middleware. Plafond opérationnel : le coût est
 linéaire en nombre de clés (N `compare_digest` + 1 SELECT complet par requête,
 même invalide) — dimensionné pour une faible cardinalité (pinné à N=25 en
 test) ; au-delà, prévoir un cache LRU d'empreintes inconnues avec TTL court
-en #65, sans réintroduire d'oracle temporel. Le quota de stockage (capacité du store)
+dans le lot #63, sans réintroduire d'oracle temporel. Le quota de stockage (capacité du store)
 ne doit pas être présenté comme cette mitigation de débit : les deux mécanismes
 sont distincts et testés séparément. Le quota SQLite est vérifié dans la même
 transaction que l'insertion, sous `BEGIN IMMEDIATE` : le verrou d'écriture est
@@ -242,7 +242,7 @@ et la clé refusée répond 401 générique — y compris pour un serveur déjà
 démarré, dont la lecture en base voit la révocation à la requête suivante.
 Ré-enregistrer une clé révoquée ne la réactive pas.
 
-Backend de débit #65 : avec le stockage SQLite, les buckets sont persistés dans
+Backend de débit (lot #63) : avec le stockage SQLite, les buckets sont persistés dans
 la base et incrémentés sous `BEGIN IMMEDIATE` : la limite (clé/pair/global) est
 partagée entre workers et n'est jamais multipliée par leur nombre. Le backend
 mémoire, réservé au développement/test, reste strictement mono-processus et
