@@ -38,7 +38,7 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
 
 | Besoin | Choix | Pourquoi / écarté |
 |---|---|---|
-| API Vault (#25) | FastAPI 0.142.2 | Contrat #15 prouvé contre cette version exacte (fixture + comparaison wire). Écarté : Flask (OpenAPI non native, plus de code de validation à prouver). Aligné au `==` près avec `tests/contracts/requirements.txt`. |
+| API Vault (#25) | FastAPI 0.143.1 | Contrat #15 prouvé contre cette version exacte (fixture + comparaison wire). Écarté : Flask (OpenAPI non native, plus de code de validation à prouver). Aligné au `==` près avec `tests/contracts/requirements.txt`. |
 | Modèles/validation | Pydantic 2.13.5 | Imposé par FastAPI ; `extra="forbid"` + `Literal` portent les erreurs `{code,message}` en `const`. |
 | Serveur Vault | Uvicorn 0.54.0 | ASGI de référence pour FastAPI, réseau privé + TLS uniquement. Écarté : Gunicorn (orienté multi-worker réseau, inutile en local). |
 | Serveur MCP (#27) | SDK `mcp` 2.3.0 | SDK officiel (stdio, registre fermé de 4 outils). Écarté : protocole maison (surface à prouver, contre l'invariant « surface minimale » de #16). |
