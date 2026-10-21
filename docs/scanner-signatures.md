@@ -62,6 +62,13 @@ La validation est **fail-closed au chargement du module** :
 - exemple positif reconnu, exemple négatif ignoré ;
 - registre non vide et identifiants uniques.
 
+À l'exécution, `Rule.matches()` applique la même logique fail-closed : une
+ligne qui n'est pas un `str` lève une `ScanError` au lieu de rendre un
+`miss` silencieux. L'interface #53 refuse déjà toute ligne non textuelle
+(`interface._check_lines`), donc cette garde est une défense en profondeur —
+mais une ligne jamais analysée ne doit pas pouvoir passer pour une ligne
+propre.
+
 Une règle qui ment sur ses exemples empêche donc l'import du scanner : le
 registre ne peut pas être silencieusement faux. `make_rule()` construit la
 règle **positionnellement** pour que le SAST (Bandit B106) ne confonde pas le
@@ -75,7 +82,7 @@ motifs ci-dessous décrivent l'ancrage et les bornes, pas un secret utilisable.
 | Règle | Famille | `type` | Ancrage et borne | Mots-clés |
 | --- | --- | --- | --- | --- |
 | `aws_access_key_id` | AWS #55 | `aws` | préfixe `AKIA`/`ASIA`/`ABIA`/`ACCA` + 16 caractères `[0-9A-Z]`, frontières alphanumériques | — |
-| `aws_secret_access_key` | AWS #55 | `aws` | paramètre `aws_secret_access_key` puis 40 caractères `[A-Za-z0-9/+=]` | `aws_secret_access_key`, `aws_secret_key`, `secret_access_key` |
+| `aws_secret_access_key` | AWS #55 | `aws` | nom de paramètre `aws_secret_access_key`, `aws_secret_key` ou `secret_access_key` (casse ignorée), puis `:` ou `=`, puis 40 caractères `[A-Za-z0-9/+=]` | `aws_secret_access_key`, `aws_secret_key`, `secret_access_key` |
 | `stripe_secret_key` | Stripe/Slack #56 | `stripe` | `sk_` ou `rk_`, puis `live`/`test`, puis 16 à 247 caractères `[A-Za-z0-9]` | — |
 | `slack_token` | Stripe/Slack #56 | `slack` | `xoxb-`, `xoxa-`, `xoxp-`, `xoxr-` ou `xoxs-` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
 | `slack_app_token` | Stripe/Slack #56 | `slack` | `xapp-` ou `xwfp-` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
@@ -89,6 +96,23 @@ Chaque motif est ancré sur un **préfixe publié** ou sur un **nom de paramètr
 explicite**. Une chaîne aléatoire de 40 caractères **sans préfixe ni nom de
 paramètre**, un UUID, un hash SHA-256 ou une image base64 ne sont jamais
 signalés par ces règles.
+
+Les mots-clés d'une règle et son motif ne peuvent pas diverger : un
+mot-clé déclaré mais absent du motif est une **couverture annoncée plus
+large que le code**, donc un faux sentiment de sécurité suivi d'un faux
+négatif. Pour la règle AWS, les trois noms acceptés
+(`aws_secret_access_key`, `aws_secret_key`, `secret_access_key`) sont donc
+présents **dans les deux**, et le test paramétré les verrouille un par un
+(voir [Verrouiller le périmètre AWS](#verrouiller-le-périmètre-aws)).
+
+Le nom du paramètre AWS est reconnu quelle que soit la forme de
+l'affectation : `aws_secret_access_key = "…"`, `AWS_SECRET_ACCESS_KEY=…`,
+`"aws_secret_access_key": "…"` (JSON/TOML) et
+`os.environ["AWS_SECRET_ACCESS_KEY"] = "…"` (Python). Le guillemet fermant
+et le crochet de subscription sont donc optionnels après le nom. En
+revanche, un nom hors périmètre (`aws_secret_access_keys`,
+`aws_secret_access_key_hash`, `access_key_secret`…) reste muet : l'ancrage
+reste sur le nom exact, jamais sur une sous-chaîne.
 
 ## Comment un candidat devient un Finding
 
@@ -174,6 +198,47 @@ unique du MCP) : le chemin est un **état local** fourni par l'opérateur
 (`XDG_DATA_HOME` / `HEIMDALL_SNIPPET_HMAC_KEY_FILE`), jamais une entrée du
 dépôt ou du LLM, et il reste vérifié fail-closed.
 
+### Scan en CI : exporter la clé, n'écrire aucun fichier
+
+Sans `HEIMDALL_SNIPPET_HMAC_KEY`, le **premier scan écrit un fichier** :
+`$XDG_DATA_HOME/heimdall/snippet-hmac.key` (créé en `0600`). C'est le
+comportement nominal en poste, mais en CI c'est un piège :
+
+- sur un runner éphémère dont le `$HOME` (ou le `$XDG_DATA_HOME`) est **en
+  lecture seule**, la création échoue et le scan se termine en `ScanError`
+  (code de sortie 2) : pas de résultat partiel, jamais un verdict « propre »
+  ;
+- sur un runner éphémère **inscriptible**, la clé est régénérée à chaque
+  run : les `snippet_hash` d'un même secret changent d'un run à l'autre, et
+  deux rapports successifs ne sont plus comparables.
+
+La CI doit donc **exporter la clé** dans l'environnement du job :
+
+```sh
+export HEIMDALL_SNIPPET_HMAC_KEY="$(openssl rand -hex 32)"  # 64 caractères hexadécimaux
+```
+
+- le scan n'écrit **aucun** fichier : la clé vient de l'environnement, le
+  chemin local n'est jamais touché ;
+- les `snippet_hash` sont **stables** d'un run à l'autre, à condition que la
+  même clé soit exportée d'un run à l'autre (à conserver comme variable
+  secrète du dépôt ; une clé régénérée à chaque run perd la comparaison
+  entre runs) ;
+- la clé reste **hors du dépôt** : elle n'est jamais committée, et la
+  variable d'environnement n'est jamais journalisée.
+
+Le comportement fail-closed est **conservé** : une clé d'environnement
+malformée (qui ne fait pas exactement 32 octets), un fichier de clé illisible
+ou un répertoire non inscriptible lèvent une `ScanError`. Aucune clé
+éphémère ne remplace une clé manquante — elle masquerait la panne et
+produirait des empreintes instables sans que l'opérateur ne le voie.
+
+Ce point est verrouillé par
+`test_ci_scan_with_an_exported_key_writes_no_file` (clé exportée,
+`XDG_DATA_HOME` en lecture seule : le scan passe et **aucun** fichier n'est
+créé) et par `test_scan_without_any_usable_key_fails_closed` (ni clé ni
+répertoire inscriptible : `ScanError`).
+
 ## Anti-ReDoS
 
 Le contenu scanné est contrôlé par un attaquant (fichier ou diff piégé). Une
@@ -193,9 +258,12 @@ payload **ancré sur le préfixe réel de chaque règle** (`AKIA`, `sk_live_`,
 `xoxb-`, `github_pat_`, `eyJ`, `-----BEGIN`, …). Sans ce troisième cas, neuf
 règles sur dix seraient rejetées dès le premier caractère et le parcours de
 leurs bornes ne serait pas exercé. Le budget est de 2 secondes par règle ; la
-mesure locale du 21 octobre 2026 donne un pire cas de **5,47 ms**
-(`pem_private_key`). Ce test est une borne d'exécution, pas une preuve
-formelle : toute nouvelle règle doit rester linéaire et passer ce budget.
+mesure locale du 21 octobre 2026 donne un pire cas de l'ordre de **quelques
+millisecondes** (≈ 1 ms pour neuf règles, ≈ 2,5 ms pour
+`aws_secret_access_key`, devenue la plus lente après l'élargissement de son
+ancrage ; l'ordre exact dépend de la machine et de la charge). Ce test est
+une borne d'exécution, pas une preuve formelle : toute nouvelle règle doit
+rester linéaire et passer ce budget.
 
 ## Faux positifs verrouillés
 
@@ -212,6 +280,30 @@ Deux limites restent assumées :
 - une chaîne synthétique qui imite exactement un préfixe publié est signalée,
   même dans une documentation. C'est le comportement attendu d'une signature :
   l'exclusion de fichiers ou de lignes relève de #59.
+
+## Verrouiller le périmètre AWS
+
+La règle `aws_secret_access_key` est le seul cas où le périmètre est
+**nommé** plutôt que déduit d'un préfixe : le périmètre est donc écrit dans
+le motif, dans les mots-clés et dans les tests, et les trois doivent dire la
+même chose.
+
+Le test `test_every_declared_aws_parameter_name_is_really_covered` vérifie
+que chacun des trois noms annoncés — et ses variantes de casse — donne
+exactement **une** correspondance, avec la valeur complète de 40 caractères.
+Le test
+`test_a_parameter_name_outside_the_announced_scope_stays_silent` vérifie
+le contraire : un nom hors périmètre (`aws_secret_access_keys`,
+`aws_secret_access_key_hash`, `aws_secret_key_rotation`,
+`secret_access_keys`, `access_key_secret`) reste muet, en affectation simple
+comme en JSON. Le test
+`test_aws_secret_is_detected_in_every_common_assignment_form` verrouille les
+formes d'écriture (`=`, `:`, JSON, subscription `os.environ[...]`).
+
+Un mot-clé déclaré sans effet dans le motif resterait invisible à ces
+tests : c'est pourquoi le test relit **aussi** la liste des mots-clés
+(`test_keywords_are_a_context_filter`) et que la règle ne déclare que des
+noms qu'elle reconnaît effectivement.
 
 ## Limites explicites
 
@@ -254,7 +346,7 @@ Deux limites restent assumées :
 ```
 
 Résultats locaux du 21 octobre 2026 (après correctifs de relecture) :
-**128 passed** pour le fichier ciblé, **1237 passed, 1 xfailed** pour la suite
+**148 passed** pour le fichier ciblé, **1259 passed, 1 xfailed** pour la suite
 complète (le `xfail` est celui de T21, qui attend le branchement réel du
 scanner #59). Les couples module + ligne et les permaliens sont dans
 [t54-samm.md](t54-samm.md).
