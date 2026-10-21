@@ -83,6 +83,10 @@ ignore = ["S101"]  # assert autorisé dans les tests
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["S101", "PLR2004"]
+# Règles de signatures (#54) : les chaînes sont des exemples **synthétiques**
+# vérifiés à l'import, jamais des secrets ; `secret_type` est un type Finding.
+"heimdall/scanner/signatures/*.py" = ["S105", "S106"]
+"tests/test_scanner_signatures.py" = ["S105", "S106"]
 # Acceptation #17 : argv figés (sys.executable, venv éphémère), jamais de shell=True.
 "tests/test_ticket17_acceptance.py" = ["S101", "PLR2004", "S603"]
 

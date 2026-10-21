@@ -25,9 +25,18 @@ from heimdall.scanner.interface import (
     Scanner,
     ScanTarget,
 )
+from heimdall.scanner.signature_engine import MoteurSignatures, SignatureEngine
+from heimdall.scanner.signatures import (
+    SIGNATURES,
+    Rule,
+    Signature,
+    SignatureMatch,
+    find_signature_matches,
+)
 
 __all__ = [
     "FINDING_FIELDS",
+    "SIGNATURES",
     "DiffTarget",
     "FileTarget",
     "Finding",
@@ -36,8 +45,14 @@ __all__ = [
     "InvalidFinding",
     "InvalidTarget",
     "Moteur",
+    "MoteurSignatures",
+    "Rule",
     "ScanError",
     "ScanTarget",
     "Scanner",
+    "Signature",
+    "SignatureEngine",
+    "SignatureMatch",
     "find_candidates",
+    "find_signature_matches",
 ]
