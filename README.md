@@ -321,12 +321,15 @@ du scanner reste explicitement en attente tant que T22 n'est pas implémenté.
 git diff --check
 ```
 
-Tests d'intégration du Vault (ticket #65) : le `TestClient` de FastAPI pilote
-l'application **en mémoire, sans port réseau**, sur une **base SQLite
-temporaire créée par test** (aucun état partagé). La suite vérifie le cas
-nominal (POST puis GET), le refus 401 d'une clé invalide, le refus 403 d'un
-secret appartenant à un autre projet, et la conformité des réponses au contrat
-`openapi.yaml`. Preuves : [`docs/t65-samm.md`](docs/t65-samm.md).
+Tests d'intégration du Vault (sous-ticket T255 de #25) : le `TestClient` de
+FastAPI pilote l'application **en mémoire, sans port réseau**, sur une **base
+SQLite temporaire créée par test** (aucun état partagé : ni base, ni registre
+de clés, ni secrets). La suite vérifie le cas nominal (POST puis GET), le refus
+401 d'une clé invalide, le refus 403 d'un secret appartenant à un autre
+projet, la conformité des réponses au contrat `openapi.yaml`, le refus 403
+d'une origine hors boucle locale, le 429 de débit avec `Retry-After` borné, et
+le refus des abus d'entrée (corps > 1 Mio, identifiants hors contrat,
+traversée de chemin). Preuves : [`docs/t255-samm.md`](docs/t255-samm.md).
 
 Règles de contribution : [CONTRIBUTING.md](CONTRIBUTING.md).
 Jamais de vrai secret dans le dépôt, même expiré ; seul `.env.example`

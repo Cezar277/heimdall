@@ -16,13 +16,16 @@ vérifiable par un fichier de test cité.
 | #64 | Authentification par clé de projet : HMAC-SHA256 + pepper, temps constant, révocation, politique opérateur | `heimdall/vault/auth.py` (`generate_project_api_key`, `hash_project_api_key`, `validate_raw_api_key`, `validate_project_id`, `verify_api_key`, `require_project_access`, `ApiKeyRegistry`, `IssuedApiKey`), `heimdall/cli/vault_keys.py` (`heimdall vault key create/list/revoke`) | `tests/test_vault_auth.py`, `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py`, `tests/security/test_vault_replay_bruteforce.py` |
 | #65 | Limitation de débit : buckets clé/pair/global, `Retry-After` borné, backend partagé SQLite | `heimdall/vault/ratelimit.py` (`RateLimiter`, `SqliteRateLimiter`), middleware de débit de `app.py` | `tests/test_vault_app.py`, `tests/test_vault_review_regressions.py` |
 | #63 | Routes `POST /api/v1/secrets` et `GET /api/v1/secrets/{project}/{env}/{name}` : validation stricte, 1 Mio, `no-store`, 201 sans `value` | `heimdall/vault/app.py` (`SecretCreate`, `SecretMetadata`, `SecretRead`, `_register_routes`), `openapi.yaml` | `tests/test_vault_app.py`, `tests/contracts/test_vault_openapi.py` |
-| #65 (tests d'intégration) | Tests d'intégration `TestClient` : cas nominal, 401 clé invalide, 403 projet étranger, conformité OpenAPI, base temporaire par test | `tests/test_vault_integration_testclient.py` | `tests/test_vault_integration_testclient.py` (21 tests), `docs/t65-samm.md` |
+| T255 | Tests d'intégration `TestClient` : cas nominal, 401 clé invalide, 403 projet étranger, conformité OpenAPI, refus de transport, 429 + `Retry-After`, abus d'entrée, base temporaire par test | `tests/test_vault_integration_testclient.py` | `tests/test_vault_integration_testclient.py` (29 tests + 1 attendu-échec), `docs/t255-samm.md` |
 
-> **Ambiguïté de numérotation signalée** : le code du Vault désigne `#65` comme
-> le ticket de limitation de débit (ligne « #65 — Limitation de débit » ci-dessus,
-> `heimdall/vault/ratelimit.py`). L'issue GitHub **#65 « Tests d'intégration
-> TestClient »** porte le même numéro : les deux lignes coexistent jusqu'à
-> renumérotation par l'équipe. Aucun code n'est impacté (libellés uniquement).
+> **Numérotation** : `#65` désigne **uniquement** la limitation de débit
+> (`heimdall/vault/ratelimit.py`), comme dans le code du Vault. Les tests
+> d'intégration `TestClient` sont le sous-ticket **T255** (branche
+> `65-t255-tests-dintégration-testclient`, sous-ticket 5 du ticket parent
+> `#25 « Vault minimal »`), et non une seconde ligne `#65` : la matrice ne
+> contient ainsi qu'un seul `#65` normatif, sans ambiguïté pour l'audit
+> SAMM/pentest. L'issue GitHub correspondante porte le libellé « Tests
+> d'intégration TestClient » ; aucun code n'est impacté.
 
 Le contrat normatif des routes reste `openapi.yaml` (ticket #15) ; sa lecture
 documentaire est `docs/contracts/vault-api.md`.

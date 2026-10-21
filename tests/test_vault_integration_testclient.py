@@ -38,7 +38,7 @@ Choix techniques :
 - la KEK et le pepper sont générés à l'exécution (`generate_encryption_key`,
   `generate_api_key`) : aucun secret, même factice, n'est commité.
 
-Preuves SAMM : module + ligne (voir `docs/t65-samm.md`).
+Preuves SAMM : module + ligne (voir `docs/t255-samm.md`).
 """
 
 import sqlite3
@@ -533,7 +533,7 @@ class VaultOpenapiContractTests(VaultIntegrationTestCase):
         d'erreur de `heimdall/vault/app.py` (`code`/`message` sans `= ...`),
         de sorte que Pydantic les déclare `required`. Ticket à ouvrir (hors
         périmètre de #65, qui est un ticket de tests) — voir §5 de
-        `docs/t65-samm.md`.
+        `docs/t255-samm.md`.
 
         Le COMPORTEMENT est déjà conforme et vérifié indépendamment : les
         réponses produites portent toujours `code` et `message`
