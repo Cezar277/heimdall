@@ -5,20 +5,23 @@ Périmètre : ticket #54 « Signatures de secrets » et ses quatre sous-tickets
 fiche fournit les couples **module + ligne**, les tests et les permaliens du
 code livré ; elle ne prétend pas modifier une feuille externe.
 
-Révision du code testé :
+Révision de livraison initiale :
 `49bafee86c8b3bceca594462773136bb7b147933` (`feat(scanner): registre de
-signatures AWS, Stripe, Slack, GitHub, JWT et PEM (#54)`).
+signatures AWS, Stripe, Slack, GitHub, JWT et PEM (#54)`). Les permaliens
+ci-dessous épinglent cette révision ; ils restent la trace de la livraison
+initiale. Les correctifs de la relecture sont appliqués dans l'arbre courant :
 
-Les permaliens épinglent la révision du **code**, pas le commit de
-documentation qui archive cette fiche. Contrôle de stabilité :
+- `repr(SignatureMatch)` masqué et `Rule.matches()` rendant des `RuleMatch`
+  au `repr` masqué (invariant 8) ;
+- jointure multi-ligne limitée aux numéros de ligne **contigus** ;
+- fenêtre de jointure mesurée en **octets UTF-8** (4096), pas en caractères ;
+- chemin de clé HMAC résolu et reconfronté au chemin demandé (aucun lien
+  symbolique, même intermédiaire) ; répertoire partagé accessible en écriture
+  au monde refusé sans chmod ;
+- chemins d'erreur POSIX de `hashing.py` désormais testés.
 
-```sh
-git diff 49bafee86c8b3bceca594462773136bb7b147933 HEAD -- heimdall tests pyproject.toml
-```
-
-La sortie est vide : les commits de documentation ne changent ni le registre,
-ni le moteur, ni les tests. La description fonctionnelle du registre et ses
-limites sont dans [scanner-signatures.md](scanner-signatures.md).
+La description fonctionnelle du registre et ses limites sont dans
+[scanner-signatures.md](scanner-signatures.md).
 
 ## Traçabilité par sous-ticket
 
@@ -43,7 +46,7 @@ limites sont dans [scanner-signatures.md](scanner-signatures.md).
 | Moteur branché sur l'interface #53, Finding conforme au schéma #14 | [signature_engine.py:31–61](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signature_engine.py#L31-L61) | [test_scanner_signatures.py:259–273](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L259-L273) | Schéma draft 2020-12 validé ; `detecte`, `regex`, ligne 1, valeur absente du JSON et du `repr` |
 | **Jamais de valeur brute ni de fuite par l'empreinte** | [signature_engine.py:77–102](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signature_engine.py#L77-L102), [hashing.py:188–200](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/hashing.py#L188-L200) | [test_scanner_signatures.py:259–273](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L259-L273), [test_scanner_signatures.py:341–348](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L341-L348) | HMAC-SHA-256 stable, 64 hexadécimaux, distinct par valeur ; aucune valeur brute sérialisée |
 | Déduplication : une valeur identique une fois, deux valeurs distinctes conservées | [signatures/__init__.py:82–107](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signatures/__init__.py#L82-L107), [signature_engine.py:43–61](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signature_engine.py#L43-L61) | [test_scanner_signatures.py:119–126](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L119-L126), [test_scanner_signatures.py:289–302](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L289-L302) | 1 Finding pour une valeur répétée, 2 Findings et 2 empreintes pour deux valeurs |
-| **Secret coupé sur deux lignes, fenêtre bornée à 4 Kio** | [signature_engine.py:27–28](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signature_engine.py#L27-L28), [signature_engine.py:63–75](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signature_engine.py#L63-L75) | [test_scanner_signatures.py:305–318](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L305-L318) | Coupure sur deux lignes détectée et attribuée à la ligne 1 ; au-delà de 4 Kio, aucune jointure |
+| **Secret coupé sur deux lignes contiguës, fenêtre bornée à 4096 octets UTF-8** | [signature_engine.py:27–28](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signature_engine.py#L27-L28), [signature_engine.py:63–75](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signature_engine.py#L63-L75) | [test_scanner_signatures.py:305–318](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L305-L318) | Coupure sur deux lignes contiguës détectée et attribuée à la ligne 1 ; au-delà de 4096 octets UTF-8 ou pour des lignes non contiguës, aucune jointure |
 | Numéros de ligne réels du diff conservés | [signature_engine.py:48–60](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signature_engine.py#L48-L60) | [test_scanner_signatures.py:276–286](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L276-L286) | Ligne 15 du diff conservée, pas la position dans la liste |
 | Ordre déterministe et stable | [interface.py:214–279](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/interface.py#L214-L279), [signature_engine.py:43–61](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/signature_engine.py#L43-L61) | [test_scanner_signatures.py:321–328](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L321-L328) | Deux scans rendent la même liste, triée par `(ligne, type, empreinte)` |
 | **Clé HMAC locale, hors dépôt, permissions durcies** | [hashing.py:29–46](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/hashing.py#L29-L46), [hashing.py:63–96](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/hashing.py#L63-L96), [hashing.py:103–156](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/heimdall/scanner/hashing.py#L103-L156) | [test_scanner_signatures.py:351–366](https://github.com/Cezar277/heimdall/blob/49bafee86c8b3bceca594462773136bb7b147933/tests/test_scanner_signatures.py#L351-L366) | Clé de 32 octets, `0600`, parent `0700`, refus des chemins relatifs et des clés courtes, `ScanError` sans repli éphémère |
@@ -57,34 +60,38 @@ Environnement : Linux, Python 3.11/3.14 selon le venv du dépôt, 21 octobre
 
 ```text
 .venv/bin/python -m pytest tests/test_scanner_signatures.py
-76 passed in 0.19s
+128 passed
 
 .venv/bin/python -m pytest
-1185 passed, 1 xfailed, 4251 subtests passed in 286.17s
+1237 passed, 1 xfailed, 4251 subtests passed
 
-.venv/bin/python -m pytest --cov=heimdall --cov-branch --cov-report=term-missing
-couverture totale : 95 % (3092 statements, 1014 branches)
-heimdall/scanner/signature_engine.py : 100 %
-heimdall/scanner/signatures/*.py      : 100 %
+.venv/bin/python -m pytest --cov=heimdall.scanner --cov-branch --cov-report=term-missing
+heimdall/scanner/hashing.py           : 96 %
+heimdall/scanner/signature_engine.py  : 100 %
+heimdall/scanner/signatures/*.py      : 100 % (model.py inclus)
 heimdall/scanner/entropy.py           : 100 %
 
 .venv/bin/ruff check heimdall tests        # All checks passed
-.venv/bin/ruff format --check …            # 10 files already formatted
+.venv/bin/ruff format --check …            # 15 files already formatted
 .venv/bin/mypy heimdall                    # Success: no issues found (35 fichiers)
 .venv/bin/bandit -r heimdall -q            # code retour 0, aucun rapport
 ```
 
 Le `xfailed` restant est celui de T21 (`tests/test_trap_acceptance.py`) : il
-attend le branchement du parcours réel #59. `heimdall/scanner/hashing.py`
-reste à 69 % de couverture de branches : les chemins d'erreur POSIX
-(propriétaire, permissions, écriture partielle, lien symbolique) ne sont pas
-tous exercés dans cet environnement ; les chemins nominaux et le refus d'une
-clé courte sont testés.
+attend le branchement du parcours réel #59. `heimdall/scanner/hashing.py` est
+passé de 69 % à 96 % de couverture : propriétaire, permissions, lien
+symbolique final et intermédiaire, chemin relatif ou avec `..`, clé hexadécimale
+invalide ou de mauvaise longueur, course `FileExists` → second `_read_key`,
+écriture partielle, `fchmod` indisponible et taille inattendue sont exercés.
+Les branches restantes sont le chemin non-POSIX, un parent non répertoire
+(court-circuité par `mkdir`) et l'échec de `unlink` après une création
+incomplète.
 
 ## Limites assumées
 
-- La jointure multi-ligne est limitée à **deux lignes et 4 Kio** ; un secret
-  sur trois lignes ou au-delà de la fenêtre n'est pas détecté.
+- La jointure multi-ligne est limitée à **deux lignes contiguës et 4096
+  octets UTF-8** ; un secret sur trois lignes, sur des lignes non contiguës
+  d'un diff ou au-delà de la fenêtre n'est pas détecté.
 - Les fournisseurs cloud autres qu'AWS ne sont pas couverts ; l'ajout se fait
   dans un fichier de famille, sans toucher au moteur.
 - PEM ne lit que l'en-tête : le corps de la clé n'est ni parsé ni conservé.

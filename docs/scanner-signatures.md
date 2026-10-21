@@ -98,7 +98,8 @@ signalés par ces règles.
    valeur répétée sur la même ligne ne produit qu'un candidat, mais deux
    valeurs distinctes du même type restent deux candidats.
 3. `SignatureEngine.analyser(cible)` analyse chaque ligne de la cible, puis
-   joint la ligne suivante **si la somme fait au plus 4 Kio** (voir ci-dessous).
+   joint la ligne suivante **si elle est contiguë et si la somme fait au plus
+   4 Kio (4096 octets UTF-8)** (voir ci-dessous).
 4. Chaque candidat devient un `Finding` #53 : `status="detecte"`,
    `source="regex"`, le type de la règle, l'entropie de Shannon du candidat et
    son empreinte HMAC-SHA-256.
@@ -113,17 +114,24 @@ confinée appartiennent à #59.
 
 Un secret peut être coupé par un retour à la ligne, par exemple un paramètre
 suivi de sa valeur entre guillemets sur la ligne suivante. Le moteur joint donc
-deux lignes consécutives, dans une fenêtre **bornée à 4 Kio** :
+deux lignes **dont les numéros se suivent**, dans une fenêtre **bornée à
+4096 octets UTF-8** :
 
-- si `len(ligne) + len(ligne_suivante) > 4096`, aucune jointure n'est faite ;
+- si `len((ligne + ligne_suivante).encode("utf-8")) > 4096`, aucune jointure
+  n'est faite (la mesure est en octets, pas en caractères : une ligne pleine
+  d'accents ne peut pas élargir la borne) ;
+- si les deux entrées ne sont pas contiguës (`numéro_suivant != numéro_courant
+  + 1`), aucune jointure n'est faite : une `DiffTarget` ne contient que les
+  lignes *ajoutées* du diff, et joindre les lignes 12 et 15 fabriquerait une
+  chaîne absente de tout fichier ;
 - une correspondance qui commence après la frontière appartient à la ligne
   suivante et est ignorée lors de la jointure, pour ne pas produire de doublon ;
 - le Finding est attribué à la ligne de **début** de la correspondance.
 
 Cette fenêtre est volontairement limitée : elle couvre les coupures de mise en
 forme courantes sans transformer le scanner en analyseur de fichier entier.
-Un secret étalé sur trois lignes ou au-delà de 4 Kio n'est pas détecté par
-cette version ; la limite est testée.
+Un secret étalé sur trois lignes ou au-delà de 4096 octets UTF-8 n'est pas
+détecté par cette version ; la limite est testée.
 
 ## Jamais de valeur brute
 
@@ -133,15 +141,38 @@ Le Finding ne contient ni `value`, ni extrait, ni `snippet` :
 - `entropy` est une métadonnée (0 à 8 bits par octet), pas une valeur ;
 - les exceptions et les `repr` ne reflètent jamais le contenu analysé.
 
+Cette règle couvre aussi les objets intermédiaires :
+
+- `SignatureMatch.value` est exclu du `repr` (`field(repr=False)`) et le
+  `repr` explicite se limite à `type`, `signature` et `start` ;
+- `Rule.matches()` rend des `RuleMatch`, qui délèguent l'API de `re.Match`
+  mais masquent le candidat dans leur `repr` (un `re.Match` brut afficherait
+  `match='...'`) ;
+- `SignatureMatch.value`, `RuleMatch.group("value")` et `RuleMatch.string`
+  restent des **données sensibles** : le moteur les hache immédiatement et
+  aucun appelant ne doit les journaliser, les sérialiser ni les transmettre à
+  un LLM. `find_signature_matches()` est volontairement absente de `__all__`
+  pour cette raison (import explicite réservé au moteur et aux tests).
+
 La clé HMAC fait 32 octets et vit **hors du dépôt** :
 `$HEIMDALL_SNIPPET_HMAC_KEY` (hexadécimal) ou, à défaut,
 `$XDG_DATA_HOME/heimdall/snippet-hmac.key` (défaut
-`~/.local/share/heimdall/snippet-hmac.key`). Le fichier est créé en `0600`,
-son répertoire parent est durci en `0700`, et une clé lisible par un autre
-utilisateur est refusée. Aucune clé éphémère ne masque une panne : une lecture
-ou une création impossible lève `ScanError`. Une même clé produit donc des
-empreintes stables entre deux exécutions, sans jamais permettre de retrouver
-la valeur.
+`~/.local/share/heimdall/snippet-hmac.key`). Le chemin doit être absolu et
+sans `..` ; après résolution, il doit être **exactement** le chemin demandé,
+donc aucun composant — même intermédiaire — ne peut être un lien symbolique.
+Le fichier est créé en `0600`, son répertoire parent est durci en `0700`, et
+une clé lisible par un autre utilisateur ou appartenant à un autre
+propriétaire est refusée. Un répertoire partagé accessible en écriture au
+monde (par exemple `/tmp`) est **refusé** plutôt que chmodé, pour ne jamais
+modifier les permissions d'un répertoire hors du périmètre de l'application.
+Aucune clé éphémère ne masque une panne : une lecture ou une création
+impossible lève `ScanError`. Une même clé produit donc des empreintes stables
+entre deux exécutions, sans jamais permettre de retrouver la valeur.
+
+Cette garde est une dérogation assumée à l'invariant 3 (garde de chemin
+unique du MCP) : le chemin est un **état local** fourni par l'opérateur
+(`XDG_DATA_HOME` / `HEIMDALL_SNIPPET_HMAC_KEY_FILE`), jamais une entrée du
+dépôt ou du LLM, et il reste vérifié fail-closed.
 
 ## Anti-ReDoS
 
@@ -156,10 +187,13 @@ donc trois contraintes :
 - **aucun quantificateur imbriqué** : les répétitions sont plates et les
   frontières `(?<!…)` / `(?!…)` sont de largeur fixe.
 
-Le test paramétré applique chaque règle à deux lignes hostiles de
-**100 000 caractères** : un remplissage sans correspondance et un préfixe PEM
-qui force le moteur à parcourir la borne. Le budget est de 2 secondes par
-règle ; la mesure locale du 21 octobre 2026 donne un pire cas de **5,47 ms**
+Le test paramétré applique chaque règle à deux lignes hostiles génériques de
+**100 000 caractères** (remplissage sans correspondance, préfixe PEM) et à un
+payload **ancré sur le préfixe réel de chaque règle** (`AKIA`, `sk_live_`,
+`xoxb-`, `github_pat_`, `eyJ`, `-----BEGIN`, …). Sans ce troisième cas, neuf
+règles sur dix seraient rejetées dès le premier caractère et le parcours de
+leurs bornes ne serait pas exercé. Le budget est de 2 secondes par règle ; la
+mesure locale du 21 octobre 2026 donne un pire cas de **5,47 ms**
 (`pem_private_key`). Ce test est une borne d'exécution, pas une preuve
 formelle : toute nouvelle règle doit rester linéaire et passer ce budget.
 
@@ -185,7 +219,7 @@ Deux limites restent assumées :
   construite (#59).
 - Pas de détection par entropie seule : `entropy` est une métadonnée du
   Finding, pas un déclencheur.
-- Jointure limitée à deux lignes et 4 Kio.
+- Jointure limitée à deux lignes **contiguës** et 4096 octets UTF-8.
 - PEM : seul l'en-tête `BEGIN … PRIVATE KEY` est reconnu ; le corps n'est pas
   parsé et un en-tête seul est signalé (c'est le signal utile).
 - Aucune validation auprès du fournisseur, aucun appel réseau, aucun checksum
@@ -219,7 +253,8 @@ Deux limites restent assumées :
 .venv/bin/bandit -r heimdall -q
 ```
 
-Résultats locaux du 21 octobre 2026 : **76 passed** pour le fichier ciblé,
-**1185 passed, 1 xfailed** pour la suite complète (le `xfail` est celui de T21,
-qui attend le branchement réel du scanner #59). Les couples module + ligne et
-les permaliens sont dans [t54-samm.md](t54-samm.md).
+Résultats locaux du 21 octobre 2026 (après correctifs de relecture) :
+**128 passed** pour le fichier ciblé, **1237 passed, 1 xfailed** pour la suite
+complète (le `xfail` est celui de T21, qui attend le branchement réel du
+scanner #59). Les couples module + ligne et les permaliens sont dans
+[t54-samm.md](t54-samm.md).
