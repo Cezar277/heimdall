@@ -280,7 +280,7 @@ payload **ancré sur le préfixe réel de chaque règle** (`AKIA`, `sk_live_`,
 règles sur dix seraient rejetées dès le premier caractère et le parcours de
 leurs bornes ne serait pas exercé. Le budget est de 2 secondes par règle ; la
 mesure locale du 21 octobre 2026 donne un pire cas de l'ordre de **quelques
-millisecondes** (≈ 1 ms pour neuf règles, ≈ 2,5 ms pour
+millisecondes** (≈ 1,7 ms pour neuf règles, ≈ 4 ms pour
 `aws_secret_access_key`, devenue la plus lente après l'élargissement de son
 ancrage ; l'ordre exact dépend de la machine et de la charge). Ce test est
 une borne d'exécution, pas une preuve formelle : toute nouvelle règle doit
