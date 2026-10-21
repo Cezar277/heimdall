@@ -4,7 +4,9 @@ Une règle est **déclarative** : identifiant stable, description, expression
 régulière, mot-clé de contexte optionnel, exemple positif et exemple négatif.
 Le registre est validé au chargement : une règle dont un exemple ne se comporte
 pas comme annoncé empêche l'import du scanner (fail-closed, jamais un registre
-silencieusement faux).
+silencieusement faux). Le registre produit aussi un **ensemble fermé** de types
+de Finding (``ALLOWED_SECRET_TYPES``) : un type non documenté est refusé au
+même titre qu'un identifiant dupliqué.
 
 Les motifs doivent rester **linéaires et bornés** : aucun quantificateur
 imbriqué, aucune borne ouverte sur un contenu arbitraire. Le contenu scanné
@@ -24,6 +26,16 @@ from heimdall.scanner.errors import ScanError
 _ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z][a-z0-9_]*")
 _MAX_IDENTIFIER_LENGTH: Final[int] = 64
 _VALUE_GROUP: Final[str] = "value"
+#: Types de Finding produits par le registre : **ensemble fermé**.
+#:
+#: Le champ ``type`` du contrat Finding v1 (#14) accepte toute chaîne
+#: ``snake_case`` ; c'est le **registre** qui borne les types qu'il sait
+#: produire, parce que ce sont les seuls documentés (voir
+#: ``docs/scanner-signatures.md``). Un type hors de cet ensemble serait un
+#: Finding que rien ne documente : il est refusé au chargement.
+ALLOWED_SECRET_TYPES: Final[frozenset[str]] = frozenset(
+    {"aws", "stripe", "slack", "pat", "jwt", "pem"}
+)
 #: Message statique : une ligne non textuelle est une violation de contrat
 #: (invariant 8 : ni l'entrée ni sa valeur ne sont jamais reflétées).
 _MSG_BAD_LINE: Final[str] = "ligne d'analyse non conforme au contrat"
@@ -122,7 +134,8 @@ class Rule:
     - ``id`` : nom stable de la règle, unique dans le registre ;
     - ``description`` : ce que la règle reconnaît, en une phrase ;
     - ``regex`` : motif compilé avec un groupe nommé ``value`` ;
-    - ``secret_type`` : valeur du champ ``type`` du Finding (#14) ;
+    - ``secret_type`` : valeur du champ ``type`` du Finding (#14), prise
+      dans l'ensemble fermé ``ALLOWED_SECRET_TYPES`` ;
     - ``keywords`` : mots-clés de contexte optionnels (casse ignorée) ;
     - ``positive_example`` / ``negative_example`` : exemples vérifiés à
       l'import, puis relus par le test paramétré du ticket.
@@ -223,7 +236,14 @@ def _check_identifier(value: object, label: str) -> None:
 
 
 def validate_rules(rules: tuple[Rule, ...]) -> tuple[Rule, ...]:
-    """Refuse un registre vide, un identifiant dupliqué ou un type incohérent."""
+    """Refuse un registre vide, un identifiant dupliqué ou un type incohérent.
+
+    Les trois contrôles sont **fail-closed au chargement du module** : un
+    registre qui ment sur lui-même (identifiant répété) ou qui produit un
+    type de Finding non documenté (hors de l'ensemble fermé
+    ``ALLOWED_SECRET_TYPES``) empêche l'import du scanner, plutôt que de
+    laisser passer des Findings dont le ``type`` n'est décrit nulle part.
+    """
     if not rules:
         raise ValueError("registre de signatures vide")
     identifiers: set[str] = set()
@@ -231,6 +251,8 @@ def validate_rules(rules: tuple[Rule, ...]) -> tuple[Rule, ...]:
         if rule.id in identifiers:
             raise ValueError(f"règle dupliquée : {rule.id}")
         identifiers.add(rule.id)
+        if rule.secret_type not in ALLOWED_SECRET_TYPES:
+            raise ValueError(f"type de Finding hors ensemble : {rule.secret_type}")
     return rules
 
 

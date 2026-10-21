@@ -8,6 +8,8 @@ Invariants :
 
 - la valeur candidate n'est jamais rendue : le Finding ne porte qu'une
   empreinte HMAC-SHA-256 et l'entropie ;
+- la valeur candidate n'est **pas conservée** au-delà de son hachage : la
+  déduplication porte sur l'empreinte, pas sur la valeur brute ;
 - une même valeur identique n'est produite qu'une fois par ligne, mais deux
   valeurs distinctes du même type restent deux Findings ;
 - la jointure de deux lignes pour un secret coupé est **bornée** à 4 Kio
@@ -44,6 +46,8 @@ class SignatureEngine:
     def analyser(self, cible: ScanTarget) -> list[Finding]:
         """Analyse la cible et rend un Finding par candidat distinct."""
         findings: list[Finding] = []
+        # Clé de déduplication : (ligne, type, **empreinte**). La valeur
+        # brute n'y entre jamais : elle est hachée à la volée puis oubliée.
         seen: set[tuple[int, str, str]] = set()
         lines = cible.lignes()
         for index, (line_number, line) in enumerate(lines):
@@ -101,7 +105,14 @@ class SignatureEngine:
         line_number: int,
         relative_path: str,
     ) -> None:
-        key = (line_number, match.secret_type, match.value)
+        # La valeur brute n'est **jamais conservée** : elle est hachée à la
+        # volée, puis abandonnée. La clé de déduplication porte l'empreinte
+        # HMAC-SHA-256, pas la valeur : deux valeurs distinctes ont deux
+        # empreintes distinctes (la collision est infaisable en pratique),
+        # donc la déduplication est inchangée — mais aucun secret en clair
+        # ne survit dans l'ensemble `seen` pendant tout le scan.
+        snippet_hash = self._get_hasher().hash(match.value)
+        key = (line_number, match.secret_type, snippet_hash)
         if key in seen:
             return
         seen.add(key)
@@ -111,7 +122,7 @@ class SignatureEngine:
                 line=line_number,
                 type=match.secret_type,
                 entropy=round(shannon_entropy(match.value.encode("utf-8")), 4),
-                snippet_hash=self._get_hasher().hash(match.value),
+                snippet_hash=snippet_hash,
             )
         )
 

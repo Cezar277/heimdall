@@ -49,7 +49,7 @@ Une règle est une dataclass figée avec exactement les champs suivants :
 | `id` | identifiant stable en `snake_case`, unique dans le registre, ≤ 64 caractères |
 | `description` | ce que la règle reconnaît, en une phrase |
 | `regex` | motif compilé, avec un groupe nommé `value` qui isole le candidat |
-| `secret_type` | valeur du champ `type` du Finding (`aws`, `stripe`, `slack`, `pat`, `jwt`, `pem`) |
+| `secret_type` | valeur du champ `type` du Finding, prise dans l'**ensemble fermé** `aws`, `stripe`, `slack`, `pat`, `jwt`, `pem` |
 | `keywords` | mots-clés de contexte optionnels, comparés sans tenir compte de la casse |
 | `positive_example` | exemple **synthétique** qui doit être reconnu |
 | `negative_example` | exemple **synthétique** qui ne doit produire aucune correspondance |
@@ -60,7 +60,11 @@ La validation est **fail-closed au chargement du module** :
 - description, motif et exemples non vides ;
 - regex compilable et contenant le groupe nommé `value` ;
 - exemple positif reconnu, exemple négatif ignoré ;
-- registre non vide et identifiants uniques.
+- registre non vide et identifiants uniques ;
+- `secret_type` de chaque règle **dans l'ensemble fermé** `aws` / `stripe` /
+  `slack` / `pat` / `jwt` / `pem` (`ALLOWED_SECRET_TYPES` dans
+  [`model.py`](../heimdall/scanner/signatures/model.py)) : un type que rien
+  ne documente ne peut pas produire de Finding.
 
 À l'exécution, `Rule.matches()` applique la même logique fail-closed : une
 ligne qui n'est pas un `str` lève une `ScanError` au lieu de rendre un
@@ -178,6 +182,15 @@ Cette règle couvre aussi les objets intermédiaires :
   un LLM. `find_signature_matches()` est volontairement absente de `__all__`
   pour cette raison (import explicite réservé au moteur et aux tests).
 
+La durée de vie de la valeur candidate est **bornée à son hachage** :
+
+- le moteur déduplique sur `(ligne, type, empreinte)`, **pas** sur
+  `(ligne, type, valeur)` : l'ensemble de déduplication ne retient donc
+  aucun secret en clair pendant toute l'analyse de la cible ;
+- la valeur n'est conservée que le temps de calculer son empreinte et son
+  entropie, puis abandonnée ;
+- elle n'est jamais sérialisée, journalisée ni rendue.
+
 La clé HMAC fait 32 octets et vit **hors du dépôt** :
 `$HEIMDALL_SNIPPET_HMAC_KEY` (hexadécimal) ou, à défaut,
 `$XDG_DATA_HOME/heimdall/snippet-hmac.key` (défaut
@@ -228,10 +241,18 @@ export HEIMDALL_SNIPPET_HMAC_KEY="$(openssl rand -hex 32)"  # 64 caractères hex
   variable d'environnement n'est jamais journalisée.
 
 Le comportement fail-closed est **conservé** : une clé d'environnement
-malformée (qui ne fait pas exactement 32 octets), un fichier de clé illisible
-ou un répertoire non inscriptible lèvent une `ScanError`. Aucune clé
-éphémère ne remplace une clé manquante — elle masquerait la panne et
-produirait des empreintes instables sans que l'opérateur ne le voie.
+malformée (qui ne fait pas exactement 32 octets **hexadécimaux, sans
+séparateur**), un fichier de clé illisible ou un répertoire non inscriptible
+lèvent une `ScanError`. Aucune clé éphémère ne remplace une clé manquante —
+elle masquerait la panne et produirait des empreintes instables sans que
+l'opérateur ne le voie.
+
+Le format de la clé d'environnement est **strict** : exactement 64 caractères
+hexadécimaux, sans espace ni saut de ligne. `bytes.fromhex` ignore ces
+séparateurs, donc une faute de frappe (`"41 42 …"`) produirait sinon une clé
+*différente* de celle que l'opérateur croyait fournir, acceptée sans bruit.
+La clé est donc refusée avant tout décodage, avec le message statique
+`clé d'empreinte locale invalide`.
 
 Ce point est verrouillé par
 `test_ci_scan_with_an_exported_key_writes_no_file` (clé exportée,
@@ -319,8 +340,13 @@ noms qu'elle reconnaît effectivement.
 - Les formats des fournisseurs évoluent : une règle peut devenir obsolète.
   Toute évolution se fait dans le fichier de famille, avec de nouveaux
   exemples et la mise à jour de ce document.
-- La valeur candidate transite en mémoire Python le temps du hachage ; elle
-  n'est jamais sérialisée, journalisée ou rendue.
+- La valeur candidate transite en mémoire Python **le temps de son hachage**
+  (empreinte + entropie), puis elle est abandonnée : la déduplication du
+  moteur porte sur l'empreinte, jamais sur la valeur. Elle n'est jamais
+  sérialisée, journalisée ou rendue.
+- Le type d'un Finding produit par le registre est **borné** à l'ensemble
+  `aws` / `stripe` / `slack` / `pat` / `jwt` / `pem` : un nouveau fournisseur
+  implique d'ajouter son type à `ALLOWED_SECRET_TYPES` et de le documenter ici.
 
 ## Ajouter ou modifier une règle
 
@@ -328,11 +354,13 @@ noms qu'elle reconnaît effectivement.
    `FAMILIES` dans `signatures/__init__.py`).
 2. Déclarer la règle avec `make_rule()`, un groupe `value`, un exemple positif
    et un exemple négatif **synthétiques**.
-3. Garder le motif ancré et borné ; ne jamais utiliser de quantificateur
+3. Si le type de Finding est nouveau, l'ajouter à `ALLOWED_SECRET_TYPES` dans
+   `signatures/model.py` et le documenter dans le tableau ci-dessus.
+4. Garder le motif ancré et borné ; ne jamais utiliser de quantificateur
    imbriqué ni de borne ouverte sur un contenu arbitraire.
-4. Lancer `pytest tests/test_scanner_signatures.py` : les exemples sont relus
+5. Lancer `pytest tests/test_scanner_signatures.py` : les exemples sont relus
    automatiquement, et la règle passe le test anti-ReDoS.
-5. Mettre à jour le tableau ci-dessus et la fiche [t54-samm.md](t54-samm.md).
+6. Mettre à jour le tableau ci-dessus et la fiche [t54-samm.md](t54-samm.md).
 
 ## Reproduire les preuves
 
@@ -345,8 +373,8 @@ noms qu'elle reconnaît effectivement.
 .venv/bin/bandit -r heimdall -q
 ```
 
-Résultats locaux du 21 octobre 2026 (après correctifs de relecture) :
-**148 passed** pour le fichier ciblé, **1259 passed, 1 xfailed** pour la suite
+Résultats locaux du 21 octobre 2026 (après les correctifs de relecture) :
+**158 passed** pour le fichier ciblé, **1269 passed, 1 xfailed** pour la suite
 complète (le `xfail` est celui de T21, qui attend le branchement réel du
 scanner #59). Les couples module + ligne et les permaliens sont dans
 [t54-samm.md](t54-samm.md).

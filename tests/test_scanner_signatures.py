@@ -43,6 +43,7 @@ from heimdall.scanner.hashing import (
     load_local_key,
 )
 from heimdall.scanner.signatures import FAMILIES, RULES, Rule, rules_for_family
+from heimdall.scanner.signatures.model import ALLOWED_SECRET_TYPES
 
 ROOT = Path(__file__).resolve().parents[1]
 FINDING_SCHEMA = json.loads((ROOT / "schemas" / "finding.schema.json").read_text(encoding="utf-8"))
@@ -277,6 +278,30 @@ def test_rule_validation_refuses_broken_patterns_and_metadata() -> None:
         registry.validate_rules((duplicate, duplicate))
 
 
+def test_validate_rules_refuses_a_secret_type_outside_the_closed_set() -> None:
+    """Un type de Finding hors de l'ensemble documenté est refusé.
+
+    ``validate_rules`` annonce ce contrôle : sans lui, une règle portant un
+    type que rien ne documente produirait un Finding dont le ``type`` est
+    inexpliqué. Le refus est fail-closed à l'import du registre.
+    """
+    hors_ensemble = Rule(
+        id="regle_hors_ensemble",
+        description="règle dont le type n'est pas documenté",
+        regex=r"(?P<value>AKIA[0-9A-Z]{16})",
+        secret_type="gcp",
+        positive_example="AKIAIOSFODNN7EXAMPLE",
+        negative_example="rien",
+    )
+    with pytest.raises(ValueError, match="type de Finding hors ensemble"):
+        registry.validate_rules((hors_ensemble,))
+
+
+def test_every_registered_secret_type_is_in_the_closed_set() -> None:
+    """Le registre livré ne produit que des types documentés."""
+    assert {rule.secret_type for rule in RULES} == set(ALLOWED_SECRET_TYPES)
+
+
 def test_matches_refuses_a_non_string_line() -> None:
     """Une entrée qui n'est pas une ligne échoue au lieu d'être ignorée.
 
@@ -477,6 +502,45 @@ def test_engine_deduplicates_an_identical_value() -> None:
     assert len(findings) == 1
 
 
+class _ConstantHasher(SnippetHasher):
+    """Hacheur de test : rend toujours la même empreinte, quelle que soit la valeur."""
+
+    def __init__(self) -> None:
+        super().__init__(b"k" * 32)
+
+    def hash(self, candidate: str) -> str:
+        del candidate
+        return "0" * 64
+
+
+def test_engine_deduplicates_on_the_fingerprint_and_keeps_no_raw_value() -> None:
+    """La clé de déduplication est l'empreinte, jamais la valeur brute.
+
+    Un hacheur constant le prouve : deux valeurs distinctes partagent la
+    même empreinte, donc le moteur les fusionne. Avec une clé de
+    déduplication portant la valeur brute, il rendrait deux Findings. La
+    valeur candidate n'est donc conservée que le temps de son hachage,
+    jamais dans l'ensemble de déduplication du moteur.
+    """
+    aws_a = "AKIA" + "F" * 16
+    aws_b = "AKIA" + "G" * 16
+    engine = SignatureEngine(_ConstantHasher())
+    findings = engine.analyser(FileTarget(path="config.py", text=f'"{aws_a}" "{aws_b}"'))
+    assert len(findings) == 1
+    assert findings[0].snippet_hash == "0" * 64
+
+
+def test_engine_keeps_no_raw_value_after_the_scan() -> None:
+    """Ni le moteur ni ses Findings ne conservent la valeur brute."""
+    aws = "AKIA" + "H" * 16
+    engine = SignatureEngine()
+    findings = engine.analyser(FileTarget(path="config.py", text=f'"{aws}"'))
+    assert len(findings) == 1
+    assert aws not in repr(findings)
+    assert aws not in repr(engine)
+    assert aws not in findings[0].snippet_hash
+
+
 def test_engine_detects_a_secret_split_across_two_lines() -> None:
     """Un secret coupé par un retour à la ligne est détecté (fenêtre bornée)."""
     secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
@@ -615,6 +679,38 @@ def test_environment_key_requires_exactly_32_bytes_of_hex(
     monkeypatch.setenv(KEY_ENV, encoded)
     with pytest.raises(ScanError):
         load_local_key()
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "41" * 31 + "4 1",  # espace au milieu
+        "41 " + "41" * 31,  # espace en tête
+        "41" * 32 + "\n",  # saut de ligne final
+        "41" * 31 + "\n41",  # saut de ligne au milieu
+        "4 1" * 16,  # une espace tous les deux octets
+    ],
+)
+def test_environment_key_refuses_separators(encoded: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Une clé d'environnement séparée est refusée fail-closed.
+
+    ``bytes.fromhex`` ignore les espaces et les sauts de ligne : sans le
+    contrôle de format, une faute de frappe (``"41 42 …"``) produirait une
+    clé acceptée, alors que l'opérateur croyait en donner une autre. Le
+    refus porte le message statique ``_KEY_ERROR``, jamais la valeur.
+    """
+    monkeypatch.setenv(KEY_ENV, encoded)
+    with pytest.raises(ScanError) as excinfo:
+        load_local_key()
+    assert str(excinfo.value) == "clé d'empreinte locale invalide"
+
+
+def test_environment_key_accepts_the_exact_hexadecimal_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Le format strict accepte les 64 caractères hexadécimaux, majuscules inclus."""
+    monkeypatch.setenv(KEY_ENV, "AB" * 32)
+    assert load_local_key() == bytes.fromhex("AB" * 32)
 
 
 def test_key_file_readable_by_others_is_refused(

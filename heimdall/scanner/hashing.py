@@ -1,8 +1,9 @@
 """Empreinte HMAC-SHA-256 d'un candidat, sans conserver sa valeur (ADR-001).
 
 La clé locale fait 32 octets et vit **hors du dépôt** :
-``$HEIMDALL_SNIPPET_HMAC_KEY`` (hexadécimal, 64 caractères) ou, à défaut, un
-fichier sous ``$XDG_DATA_HOME/heimdall/snippet-hmac.key`` (défaut
+``$HEIMDALL_SNIPPET_HMAC_KEY`` (hexadécimal, 64 caractères, **sans
+séparateur**) ou, à défaut, un fichier sous
+``$XDG_DATA_HOME/heimdall/snippet-hmac.key`` (défaut
 ``~/.local/share/heimdall/snippet-hmac.key``), créé en ``0600``. Le fichier
 doit appartenir à l'utilisateur courant et son répertoire parent est durci en
 ``0700``. Aucun composant du chemin ne peut être un lien symbolique : le
@@ -27,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import stat
 from pathlib import Path
@@ -38,6 +40,9 @@ KEY_ENV: Final[str] = "HEIMDALL_SNIPPET_HMAC_KEY"
 KEY_FILE_ENV: Final[str] = "HEIMDALL_SNIPPET_HMAC_KEY_FILE"
 KEY_BYTES: Final[int] = 32
 _KEY_ERROR: Final[str] = "clé d'empreinte locale invalide"
+#: Format **strict** de la clé d'environnement : exactement
+#: ``2 * KEY_BYTES`` caractères hexadécimaux, sans séparateur.
+_HEX_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(rf"[0-9a-fA-F]{{{2 * KEY_BYTES}}}")
 
 
 def _key_path() -> Path:
@@ -184,16 +189,23 @@ def _create_key(path: Path) -> bytes | None:
 
 
 def _environment_key() -> bytes | None:
+    """Clé d'empreinte fournie par l'environnement, ou ``None``.
+
+    Le format est **strict** : exactement ``2 * KEY_BYTES`` caractères
+    hexadécimaux, sans aucun séparateur. ``bytes.fromhex`` ignore les
+    espaces et les sauts de ligne : sans ce contrôle, une faute de frappe
+    (``"41 42 …"``, ``"41\\n42…"``) serait acceptée comme une clé valide.
+    Une clé malformée est refusée **fail-closed**, avec le message statique
+    ``_KEY_ERROR`` (jamais la valeur refusée).
+    """
     encoded = os.environ.get(KEY_ENV)
     if encoded is None:
         return None
-    try:
-        key = bytes.fromhex(encoded)
-    except ValueError:
-        raise ScanError(_KEY_ERROR) from None
-    if len(key) != KEY_BYTES:
+    if _HEX_KEY_PATTERN.fullmatch(encoded) is None:
         raise ScanError(_KEY_ERROR)
-    return key
+    # Le motif garantit 2 * KEY_BYTES caractères hexadécimaux : le décodage
+    # produit exactement KEY_BYTES octets, sans jamais lever.
+    return bytes.fromhex(encoded)
 
 
 def load_local_key() -> bytes:
