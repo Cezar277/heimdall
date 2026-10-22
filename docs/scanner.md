@@ -121,8 +121,16 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
 | clé HMAC demandée avec `..` dans le chemin | `ScanError` |
 | contenu NUL non décodable (hors binaire réellement binaire) | `ScanError` |
+| fichier ou répertoire symlinké **interne** au périmètre | ignoré par politique (non suivi, non signalé ; voir #59) |
 | fichier exclu ou binaire connu | ignoré par politique |
-| scan réussi sans signature | liste vide (réellement propre) |
+| scan réussi sans signature | liste vide (réellement propre **hors exclusions** — voir limites) |
+
+> **Garde d'usage (hook/CI) :** ne pas utiliser ce `Scanner` bibliothèque tel
+> quel pour un hook ou une CI. Un `[]` sur dépôt complet peut masquer un secret
+> présent dans un chemin exclu (`vendor/`, `*.lock`, binaire) ou coupé au-delà
+> de la fenêtre 4 Kio. #29 doit scanner tout blob stagé **sans exclusion** et
+> prouver 0/1/2 end-to-end ; en attendant, aucun usage CI du scan réel n'est
+> autorisé (la CLI reste en stub, sortie 2). Voir limites ci-dessous.
 
 Un scan incomplet ne devient donc jamais une liste vide ou partielle. Quand
 #29 branchera la CLI, `ScanError` devra produire le code 2 (erreur d'outillage),
@@ -155,13 +163,18 @@ jamais 0 ou 1.
   (rappel 0,625 sur `all`, 1,0 sur le périmètre `core`). Le décodage/entropie
   relève de #23 et l'allowlist de #24.
 - Les fichiers binaires, lockfiles et répertoires tiers sont ignorés par
-  politique : un secret qui y serait copié n'est pas signalé.
+  politique : un secret qui y serait copié n'est pas signalé. En mode dépôt
+  complet, `[]` vaut donc « propre hors exclusions », jamais « propre absolu ».
+  Bloquant #29 : scanner les blobs stagés sans exclusion (ou `ScanError` /
+  flag `truncated` explicite en mode dépôt) ; bloquant #59 pour le mode dépôt.
+- La jointure multi-ligne est bornée à 4 Kio : un secret coupé par un retour
+  à la ligne n'est recherché que si la fenêtre des deux lignes tient dans
+  cette borne. Au-delà, la coupure n'est pas détectée (`[]`). Padding
+  volontaire = évasion connue : bloquant #23 (`ScanError` statique ou Finding
+  `tronqué` sur affectation sans valeur + fenêtre dépassée).
 - La charge d'un JWT est bornée à 64 Kio et l'en-tête à 1 Kio : un jeton
   conforme est détecté, un jeton hors de ces bornes ne l'est pas. Les autres
   préfixes AWS (au-delà de `AKIA`/`ASIA`/`ABIA`/`ACCA`) ne sont pas couverts.
-- La jointure multi-ligne est bornée à 4 Kio : un secret coupé par un retour
-  à la ligne n'est recherché que si la fenêtre des deux lignes tient dans
-  cette borne. Au-delà, la coupure n'est pas détectée.
 - Seules les familles de jetons Slack publiées par Slack sont couvertes
   (`xoxb-`, `xoxp-`, `xapp-`, `xwfp-`, `xoxe.` et les historiques `xoxa-`,
   `xoxr-`, `xoxs-`) : une famille ajoutée par Slack n'est pas couverte avant
@@ -172,6 +185,9 @@ jamais 0 ou 1.
 - Le scan est fichier par fichier, sans snapshot Git : le branchement diff/index
   et la protection contre les attributs Git (`textconv`) restent à faire avec
   #29/#30.
+- La CLI `heimdall scan` reste en stub (sortie 2, « voir #29 ») : aucun usage
+  CI du scan réel n'est autorisé avant #29, qui devra prouver propre => 0,
+  secret avéré => 1, erreur => 2, sans écriture.
 
 ## Preuves locales
 
