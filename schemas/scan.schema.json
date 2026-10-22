@@ -26,7 +26,7 @@
     "count": {
       "type": "integer",
       "minimum": 0,
-      "description": "Nombre de Findings. DOIT valoir la longueur de `findings` (vérifié par le test, inexprimable en JSON Schema)."
+      "description": "Nombre de Findings. Un parseur CI DOIT refuser le document si `count` diffère de `len(findings)` : cette égalité est inexprimable en JSON Schema et doit être vérifiée en plus de la validation du schéma."
     },
     "findings": {
       "type": "array",

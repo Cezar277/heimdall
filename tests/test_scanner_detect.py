@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -27,6 +28,7 @@ from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
     Finding,
     ScanError,
+    _validate_relative_path,
     find_candidates,
     scan,
 )
@@ -36,6 +38,7 @@ from heimdall.scanner.exclusions import (
     is_excluded,
     is_excluded_directory,
 )
+from heimdall.scanner.finding import validate_relative_path
 from heimdall.scanner.hashing import KEY_ENV, KEY_FILE_ENV, SnippetHasher, load_local_key
 from heimdall.scanner.signatures import SIGNATURES, find_signature_matches
 
@@ -316,6 +319,31 @@ def test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries() -> None:
     assert not is_excluded_directory("env")
     assert not is_excluded_directory("src")
     assert not is_excluded("")
+    # Revue (LOW) : en strict, un suffixe binaire n'exclut plus à lui seul ;
+    # le contenu décide (un texte mal nommé doit être scanné).
+    assert not is_excluded("image.png", strict=True)
+    assert is_excluded(".coverage", strict=True)
+    assert is_excluded("node_modules/pkg/index.js", strict=True)
+
+
+def test_detect_path_guard_is_the_finding_contract() -> None:
+    """Revue (LOW) : la garde de chemin du scanner est celle du contrat #14.
+
+    Fuzz court sur les caractères qui distinguent les deux grammaires : toute
+    divergence future (nouveau caractère interdit, longueur, segments) casse
+    ce test au lieu de produire un ``FileTarget``/``Finding`` incohérent.
+    """
+    alphabet = ("a", "/", ".", ":", "\\", "\x00", "\x7f", "\u2028")
+    for length in range(4):
+        for characters in itertools.product(alphabet, repeat=length):
+            chemin = "".join(characters)
+            try:
+                attendu = validate_relative_path(chemin)
+            except ValueError:
+                with pytest.raises(ScanError):
+                    _validate_relative_path(chemin)
+            else:
+                assert _validate_relative_path(chemin) == attendu
 
 
 def test_scan_skips_excluded_files_but_scans_env_and_pem(tmp_path: Path) -> None:

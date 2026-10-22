@@ -36,14 +36,24 @@ from typing import Final
 
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.errors import ScanError
-from heimdall.scanner.exclusions import decode_text, is_excluded, is_excluded_directory
-from heimdall.scanner.finding import Finding, FindingSource, FindingStatus
+from heimdall.scanner.exclusions import (
+    decode_text,
+    has_technical_suffix,
+    is_excluded,
+    is_excluded_directory,
+)
+from heimdall.scanner.finding import (
+    MAX_PATH_LENGTH,
+    Finding,
+    FindingSource,
+    FindingStatus,
+    validate_relative_path,
+)
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.signature_engine import MAX_FINDINGS
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
 MAX_FILE_BYTES: Final[int] = 1_048_576
-MAX_PATH_LENGTH: Final[int] = 4096
 MULTILINE_WINDOW: Final[int] = 4096
 #: Plafond du nombre de fichiers analysés en une passe (#29). Au-delà, le
 #: scan est **refusé** (``ScanError``) : un dépôt adverse avec 100 000 petits
@@ -56,9 +66,6 @@ MAX_TOTAL_BYTES: Final[int] = 256 * 1024 * 1024
 # réexporté ici (compatibilité : `detect.MAX_FINDINGS` reste patchable par
 # les tests et documenté comme borne du mode arbre).
 _READ_CHUNK: Final[int] = 65_536
-_FIRST_CONTROL: Final[int] = 0x20
-_DELETE: Final[int] = 0x7F
-_UNICODE_LINE_SEPARATORS: Final[frozenset[int]] = frozenset({0x2028, 0x2029})
 _SCAN_ERROR: Final[str] = "scan impossible : entrée non analysable"
 _BOUNDS_ERROR: Final[str] = "bornes de scan hors contrat"
 
@@ -96,22 +103,33 @@ __all__ = [
 
 
 def _validate_relative_path(relative: str) -> str:
-    """Refuse un chemin qui violerait le contrat Finding v1."""
-    if not relative or len(relative) > MAX_PATH_LENGTH or relative.endswith("/"):
-        raise ScanError(_SCAN_ERROR)
-    for character in relative:
-        code = ord(character)
-        if (
-            character in "\\:"
-            or code < _FIRST_CONTROL
-            or code == _DELETE
-            or code in _UNICODE_LINE_SEPARATORS
-        ):
-            raise ScanError(_SCAN_ERROR)
-    parts = relative.split("/")
-    if any(part in ("", ".", "..") for part in parts):
-        raise ScanError(_SCAN_ERROR)
-    return relative
+    """Valide via la **garde unique** du contrat Finding v1 (#14).
+
+    Aucune grammaire locale : la seule différence avec
+    :func:`heimdall.scanner.finding.validate_relative_path` est la
+    traduction de ``ValueError`` en ``ScanError`` (fail-closed du scanner).
+    Une divergence future entre les deux couches est ainsi impossible.
+    """
+    try:
+        return validate_relative_path(relative)
+    except ValueError:
+        raise ScanError(_SCAN_ERROR) from None
+
+
+def _decode_data(data: bytes, *, allow_binary_suffix: bool) -> str | None:
+    """Décode le contenu ; un suffixe binaire connu sert de repli.
+
+    Le repli n'est armé qu'en mode strict pour un nom à suffixe technique :
+    un binaire réel à signature inconnue est alors exclu par politique au
+    lieu de faire échouer tout le scan. Un texte mal nommé est rendu et
+    scanné ; sans repli, ``decode_text`` reste fail-closed.
+    """
+    try:
+        return decode_text(data)
+    except ScanError:
+        if allow_binary_suffix:
+            return None
+        raise
 
 
 def _open_flags() -> int:
@@ -233,7 +251,14 @@ class Scanner:
             count += 1
             if count > self._max_files:
                 raise ScanError(_SCAN_ERROR)
-            text, size = self._read_text(path)
+            # En strict, un suffixe binaire n'exclut plus à lui seul : on lit
+            # d'abord le contenu, et le suffixe ne sert de repli qu'en cas
+            # d'échec de décodage (binaire réel). Un texte nommé `evil.png`
+            # est donc scanné comme en `--staged`.
+            text, size = self._read_text(
+                path,
+                allow_binary_suffix=self._strict and has_technical_suffix(relative),
+            )
             total += size
             if total > self._max_bytes:
                 raise ScanError(_SCAN_ERROR)
@@ -285,11 +310,22 @@ class Scanner:
                     raise ScanError(_SCAN_ERROR) from None
                 yield path, _validate_relative_path(relative)
 
-    def _read_text(self, path: Path) -> tuple[str | None, int]:
+    def _read_text(
+        self,
+        path: Path,
+        *,
+        allow_binary_suffix: bool = False,
+    ) -> tuple[str | None, int]:
         """Lit un fichier borné ; ``(None, taille)`` signifie binaire exclu.
 
         La taille lue est rendue pour que ``scan()`` borne le **volume total**
         analysé (#29), pas seulement chaque fichier.
+
+        ``allow_binary_suffix`` n'est vrai qu'en mode strict pour un fichier
+        dont le nom porte un suffixe binaire connu. Le contenu est alors
+        prioritaire : un texte mal nommé est rendu et scanné ; seul un échec
+        de décodage (binaire réel à signature inconnue) est converti en
+        exclusion technique, au lieu de faire échouer tout le scan.
         """
         try:
             resolved = path.resolve(strict=True)
@@ -331,7 +367,10 @@ class Scanner:
             raise ScanError(_SCAN_ERROR) from None
         finally:
             os.close(descriptor)
-        return decode_text(data), len(data)
+        return (
+            _decode_data(data, allow_binary_suffix=allow_binary_suffix),
+            len(data),
+        )
 
     def _scan_text(self, text: str, relative: str) -> list[Finding]:
         findings: list[Finding] = []

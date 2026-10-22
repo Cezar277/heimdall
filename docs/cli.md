@@ -201,7 +201,9 @@ duplication : toute dérive du Finding casse la validation). Les deux `$id`
 sont alignés sur la même base (`https://github.com/Cezar277/heimdall/schemas/`),
 donc le `$ref` relatif se résout sans registre câblé, depuis le filesystem.
 La cohérence `count == len(findings)`, inexprimable en JSON Schema pur, est
-vérifiée par le test. Un parseur CI DOIT refuser tout document invalide.
+vérifiée par le test. Un parseur CI DOIT valider le schéma **puis** refuser le
+document si `count != len(findings)` (contrainte explicitée dans la
+`description` du schéma, pas seulement dans les tests).
 
 ## Invariants
 

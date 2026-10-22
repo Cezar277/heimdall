@@ -171,12 +171,21 @@ def is_excluded_directory(name: str, *, strict: bool = False) -> bool:
     return not strict and folded in TEXT_DIRECTORIES
 
 
+def has_technical_suffix(name: str) -> bool:
+    """Vrai si le nom (casse ignorée) porte un suffixe binaire connu."""
+    folded = name.casefold()
+    return any(folded.endswith(suffix) for suffix in TECHNICAL_SUFFIXES)
+
+
 def is_excluded(relative_path: str | PurePosixPath, *, strict: bool = False) -> bool:
     """Vrai si le chemin relatif (séparateurs ``/``) est exclu du scan.
 
     En mode ``strict`` (#29), les exclusions de **contenu texte** (lockfiles,
     fichiers de contrôle) sont levées ; les exclusions techniques (binaires)
-    restent.
+    restent. Un suffixe binaire n'est toutefois plus un verdict à lui seul en
+    strict : le contenu est lu, et le suffixe ne sert de repli qu'après un
+    échec de ``decode_text`` (un fichier texte mal nommé ``evil.png`` doit
+    être scanné, comme en ``--staged``). Voir ``Scanner._read_text``.
     """
     path = (
         relative_path
@@ -192,8 +201,10 @@ def is_excluded(relative_path: str | PurePosixPath, *, strict: bool = False) -> 
         return True
     if not strict and name in TEXT_FILES:
         return True
-    if any(name.endswith(suffix) for suffix in TECHNICAL_SUFFIXES):
-        return True
+    if has_technical_suffix(name):
+        # En strict, le contenu décide en premier ; le suffixe ne redevient
+        # une exclusion qu'après échec de décodage (voir `_read_text`).
+        return not strict
     return not strict and any(name.endswith(suffix) for suffix in TEXT_SUFFIXES)
 
 

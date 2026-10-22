@@ -106,6 +106,11 @@ la politique #59 seule laissait passer un secret posé dans `vendor/evil.py`,
 sans jamais le signaler. Le mode strict est le comportement par défaut de la
 CLI `heimdall scan` (voir [cli.md](cli.md)).
 
+En strict, l'extension binaire ne prime plus sur le contenu : un fichier texte
+nommé `evil.png` est lu et scanné, comme en `--staged`. Un vrai binaire reste
+exclu — soit par sa signature connue, soit par le suffixe en repli lorsque
+`decode_text` ne peut pas décider (binaire réel à signature inconnue).
+
 ### Encodage des fichiers lus
 
 Les fichiers texte sont décodés, pas ignorés :

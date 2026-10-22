@@ -93,6 +93,18 @@ def _retrieve_local(uri: str) -> Resource[object]:
     return Resource(contents=document, specification=DRAFT202012)
 
 
+def _validate_scan_document(document: dict[str, object]) -> None:
+    """Validation recommandée aux parseurs : schéma **puis** cohérence `count`.
+
+    L'égalité `count == len(findings)` est inexprimable en JSON Schema ; un
+    parseur qui ne valide que le schéma accepte un document incohérent.
+    """
+    _scan_validator().validate(document)
+    findings = document["findings"]
+    if not isinstance(findings, list) or document["count"] != len(findings):
+        raise ValueError("count incohérent avec findings")
+
+
 def _scan_validator_from_filesystem() -> Draft202012Validator:
     """Validateur résolu depuis l'arborescence, sans contenu câblé en dur.
 
@@ -408,6 +420,35 @@ def test_scan_tree_keeps_technical_exclusions(tmp_path: Path) -> None:
     """Les exclusions **techniques** restent (binaire, répertoire généré)."""
     racine = _arbre(tmp_path, {"node_modules/pkg/evil.js": f'"{FAKE_AWS_KEY}"\n'})
     resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_CLEAN
+
+
+def test_scan_tree_strict_scans_text_with_binary_suffix(git_repo: GitRepo) -> None:
+    """Revue (LOW) : en strict, le contenu prime sur le suffixe binaire.
+
+    ``evil.png`` est du texte clair portant un candidat : l'arbre strict doit
+    le signaler comme ``--staged``, au lieu de le sauter sur l'extension.
+    """
+    git_repo.write("evil.png", f'AWS = "{FAKE_AWS_KEY}"\n')
+    resultat = _run("scan", str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert "evil.png:1" in resultat.stdout
+    git_repo.stage("evil.png")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert "evil.png:1" in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.output
+
+
+def test_scan_tree_strict_still_skips_real_binary_suffix(git_repo: GitRepo) -> None:
+    """Revue (LOW) : un vrai binaire garde l'exclusion technique par suffixe.
+
+    Le contenu est lu d'abord, mais un PNG réel (magie + majorité binaire)
+    reste écarté sans faire échouer le scan ; le suffixe sert de repli si le
+    décodeur ne peut pas trancher.
+    """
+    git_repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 512)
+    resultat = _run("scan", str(git_repo.root))
     assert resultat.exit_code == EXIT_CLEAN
 
 
@@ -1131,6 +1172,23 @@ def test_scan_schema_refuses_invalid_documents() -> None:
     # `count` cohérent avec `findings` : inexprimable en JSON Schema pur,
     # vérifié côté test (`test_scan_json_output_validates_against_the_schema`).
     assert base["count"] == len(base["findings"])
+
+
+def test_scan_count_mismatch_is_refused_by_the_recommended_validator(
+    tmp_path: Path,
+) -> None:
+    """Revue (LOW) : le schéma seul laisse passer un `count` incohérent.
+
+    Le helper recommandé aux parseurs valide le schéma puis refuse
+    `count != len(findings)` ; ce test fige les deux étages.
+    """
+    racine = _arbre(tmp_path, {"config.py": f'AWS = "{FAKE_AWS_KEY}"\n'})
+    document = json.loads(_run("scan", "--json", str(racine)).stdout)
+    _validate_scan_document(document)
+    document["count"] = 0
+    assert _scan_validator().is_valid(document)
+    with pytest.raises(ValueError):
+        _validate_scan_document(document)
 
 
 def test_scan_ci_summarises_on_stderr(tmp_path: Path) -> None:
