@@ -96,6 +96,14 @@ motifs ci-dessous décrivent l'ancrage et les bornes, pas un secret utilisable.
 | `jwt` | GitHub/JWT #57 | `jwt` | en-tête `eyJ` puis trois segments base64url bornés (1024 / 65 536 / 1024) | — |
 | `pem_private_key` | PEM #58 | `pem` | `-----BEGIN` + qualificatif ≤ 64 caractères + `PRIVATE KEY-----` (ou `PRIVATE KEY BLOCK-----`) | — |
 
+La frontière gauche des trois règles Slack est `(?<![A-Za-z0-9-])` : le point
+n'est **pas** une frontière de mot, donc un jeton collé à un préfixe de
+domaine ou à une concaténation (`foo.xapp-…`, `foo.xoxe.…`) reste détecté.
+En revanche, le préfixe rotatif `xoxe.` est traité comme un préfixe : le jeton
+qu'il contient porte une garde `(?<!xoxe\.)` et n'est signalé **qu'une fois**
+(une seule empreinte, donc une seule entrée Vault à révoquer, pour un seul
+secret).
+
 Chaque motif est ancré sur un **préfixe publié** ou sur un **nom de paramètre
 explicite**. Une chaîne aléatoire de 40 caractères **sans préfixe ni nom de
 paramètre**, un UUID, un hash SHA-256 ou une image base64 ne sont jamais
@@ -129,8 +137,9 @@ reste sur le nom exact, jamais sur une sous-chaîne.
    valeur répétée sur la même ligne ne produit qu'un candidat, mais deux
    valeurs distinctes du même type restent deux candidats.
 3. `SignatureEngine.analyser(cible)` analyse chaque ligne de la cible, puis
-   joint la ligne suivante **si elle est contiguë et si la somme fait au plus
-   4 Kio (4096 octets UTF-8)** (voir ci-dessous).
+   joint les lignes suivantes **si elles sont contiguës et si la somme fait au
+   plus 4 Kio (4096 octets UTF-8)** — au plus **trois lignes** jointes au
+   total (voir ci-dessous).
 4. Chaque candidat devient un `Finding` #53 : `status="detecte"`,
    `source="regex"`, le type de la règle, l'entropie de Shannon du candidat et
    son empreinte HMAC-SHA-256.
@@ -141,28 +150,34 @@ Le moteur ne lit **aucun fichier** : la cible `DiffTarget` ou `FileTarget` a
 déjà été validée par #53. Le parcours du dépôt, les exclusions et la lecture
 confinée appartiennent à #59.
 
-### Secret coupé sur deux lignes
+### Secret coupé sur deux ou trois lignes
 
 Un secret peut être coupé par un retour à la ligne, par exemple un paramètre
-suivi de sa valeur entre guillemets sur la ligne suivante. Le moteur joint donc
-deux lignes **dont les numéros se suivent**, dans une fenêtre **bornée à
-4096 octets UTF-8** :
+suivi de sa valeur entre guillemets sur la ligne suivante — ou **par une ligne
+vide intercalée**. Le moteur joint donc jusqu'à **trois lignes dont les numéros
+se suivent**, dans une fenêtre **bornée à 4096 octets UTF-8** :
 
-- si `len((ligne + ligne_suivante).encode("utf-8")) > 4096`, aucune jointure
-  n'est faite (la mesure est en octets, pas en caractères : une ligne pleine
-  d'accents ne peut pas élargir la borne) ;
-- si les deux entrées ne sont pas contiguës (`numéro_suivant != numéro_courant
-  + 1`), aucune jointure n'est faite : une `DiffTarget` ne contient que les
-  lignes *ajoutées* du diff, et joindre les lignes 12 et 15 fabriquerait une
-  chaîne absente de tout fichier ;
+- si `len((ligne + ligne_suivante [+ ligne_suivant2]).encode("utf-8")) > 4096`,
+  la jointure s'arrête à la fenêtre la plus courte qui tient dans la borne
+  (la mesure est en octets, pas en caractères : une ligne pleine d'accents ne
+  peut pas élargir la borne) ;
+- si les entrées ne sont pas contiguës (`numéro_suivant != numéro_courant + 1`),
+  aucune jointure n'est faite : une `DiffTarget` ne contient que les lignes
+  *ajoutées* du diff, et joindre les lignes 12 et 15 fabriquerait une chaîne
+  absente de tout fichier ;
 - une correspondance qui commence après la frontière appartient à la ligne
   suivante et est ignorée lors de la jointure, pour ne pas produire de doublon ;
 - le Finding est attribué à la ligne de **début** de la correspondance.
 
+La troisième ligne couvre le cas `aws_secret_access_key =` / *ligne vide* /
+`"valeur"` : sans elle, un secret coupé par plus d'un `\n` disparaissait
+silencieusement.
+
 Cette fenêtre est volontairement limitée : elle couvre les coupures de mise en
 forme courantes sans transformer le scanner en analyseur de fichier entier.
-Un secret étalé sur trois lignes ou au-delà de 4096 octets UTF-8 n'est pas
-détecté par cette version ; la limite est testée.
+Un secret étalé sur **plus de trois lignes** (deux `\n` consécutifs ou plus) ou
+au-delà de 4096 octets UTF-8 n'est pas détecté par cette version ; la limite est
+testée.
 
 ## Jamais de valeur brute
 

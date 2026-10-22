@@ -280,13 +280,24 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   symlinké est refusé au lieu d'être suivi ; une signature binaire ne suffit
   pas à faire ignorer un fichier dont le contenu est majoritairement textuel
   (le refus est alors explicite) ; un secret coupé par un retour à la ligne
-  est recherché dans une fenêtre multi-ligne bornée à 4 Kio ; la clé HMAC
+  est recherché dans une fenêtre multi-ligne bornée à 4 Kio et à trois lignes
+  jointes (une ligne vide intercalée est couverte) ; la clé HMAC
   locale est durcie (fichier `0600`, propriétaire vérifié, parent `0700`,
   parent symlink refusé, `..` refusé) et son indisponibilité lève `ScanError`
   au lieu d'une clé éphémère.
+  Durcissement post-2ᵉ relecture : **aucun nom de fichier n'exclut un fichier
+  du scan** — une extension binaire, un lockfile ou un répertoire de tiers ne
+  peuvent plus cacher un secret (le contenu décide : lu et scanné s'il est
+  textuel) ; tout ce qui n'a pas pu être analysé est **tracé** (chemin
+  journalisé sur `stderr`, sans valeur, et compteur dans le rapport de scan),
+  de sorte qu'un dépôt propre ne soit jamais confondu avec un dépôt
+  partiellement lu ; le verdict « propre » n'est fondé que si le rapport est
+  complet.
   Preuves : `tests/test_scanner_detect.py`,
-  `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean` et
-  la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
+  `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean`,
+  `tests/security/test_scanner_bypass.py::test_named_exclusions_cannot_hide_a_secret`,
+  `tests/security/test_scanner_bypass.py::test_a_binary_ignored_is_traced_and_never_leaks`
+  et la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
   Limites connues documentées par T21 : base64, concaténation et flux de
   variables ne sont pas décodés ; leur traitement relève de #23/#24 et ne
   produit jamais un verdict propre sans les contrôles CI de #29/#19.

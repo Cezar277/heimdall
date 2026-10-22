@@ -9,13 +9,15 @@ bibliothèque et par les tests d'acceptation T21.
 ## API
 
 ```python
-from heimdall.scanner import Finding, Scanner, find_candidates
+from heimdall.scanner import Finding, RapportScan, ScannerRacine, find_candidates
 
-findings: list[Finding] = Scanner(".").scan()
+scanner = ScannerRacine(".")
+findings: list[Finding] = scanner.scan()
+rapport: RapportScan = scanner.analyser()   # Findings + ce qui n'a pas été lu
 payload: list[dict[str, object]] = find_candidates(".")  # contrat #14
 ```
 
-`Scanner` accepte un répertoire ou un fichier régulier explicite. `root` est
+`ScannerRacine` accepte un répertoire ou un fichier régulier explicite. `root` est
 résolu une fois, **sans suivre de lien symbolique** : la racine elle-même et
 chacun de ses ancêtres sont vérifiés par `lstat`, et un lien dans ce chemin
 lève `ScanError` (la cible n'est pas lue à la place de la racine). Chaque
@@ -25,6 +27,30 @@ sous la racine, refus des liens symboliques).
 Un Finding contient exactement : `file`, `line`, `type`, `entropy`,
 `snippet_hash`, `status` (`detecte`) et `source` (`regex`). **La valeur brute
 n'est jamais conservée** : seule une empreinte HMAC-SHA-256 est produite.
+
+### Le rapport de scan : ce qui a été lu, ce qui ne l'a pas été
+
+`ScannerRacine.analyser()` rend un `RapportScan` : les Findings **et** les
+compteurs de ce que le scan n'a pas pu analyser. Un verdict « propre » n'est
+fondé que si `RapportScan.complet` est vrai.
+
+| Champ | Signification |
+| --- | --- |
+| `findings` | les Findings détectés, triés |
+| `binaires_ignores` | fichiers au contenu binaire connu : ignorés par politique, **tracés** |
+| `non_analyses` | fichiers du périmètre que le scan n'a pas pu lire (illisibles, hors borne, modifiés) |
+| `hors_perimetre` | répertoires non parcourus (base VCS) |
+| `liens_ignores` | liens symboliques non suivis |
+
+Chaque élément ignoré est **journalisé sur `stderr`** (une ligne par fichier :
+le chemin seul, jamais de contenu ; les caractères de contrôle du nom sont
+neutralisés pour ne pas injecter de fausse ligne de journal). La trace est
+injectable (`ScannerRacine(root, journal=...)`) et le verdict sort sur `stdout`,
+jamais sur `stderr`.
+
+Règle pour #29 (à implémenter avec le branchement CLI) : **code 2** si le scan
+n'est pas `complet` ou si le moteur échoue, **jamais 0** ; les compteurs du
+rapport sont affichés à l'auditeur.
 
 ## Signatures (#54)
 
@@ -52,12 +78,22 @@ consultées le 2026-10-20) : `xoxb-` (bot), `xoxp-` (user), `xapp-` (app-level),
 `xoxa-`, `xoxr-`, `xoxs-`. Une famille ajoutée ultérieurement par Slack ne
 serait pas couverte avant #23/#24.
 
+Le point (`foo.xapp-…`, `foo.xoxe.…`) n'est **pas** un frontière de mot : un
+jeton collé à un préfixe de domaine ou à une concaténation reste détecté. En
+revanche, le préfixe rotatif `xoxe.` est traité comme un préfixe : le jeton
+qu'il contient n'est signalé qu'une fois (une seule empreinte, donc une seule
+entrée Vault à révoquer).
+
 **Fenêtre multi-ligne bornée.** Chaque ligne est analysée seule, puis
-jointure avec la ligne suivante (sans séparateur) si la fenêtre totale ne
-dépasse pas **4 Kio**. Un secret coupé par un retour à la ligne
-(`aws_secret_access_key =` puis la valeur à la ligne suivante) est donc
-détecté, et le Finding porte la ligne où la correspondance commence. Au-delà
-de 4 Kio, la jointure n'est pas faite : c'est une limite documentée.
+jointure avec les lignes **suivantes et contiguës** (au plus trois lignes
+jointes, sans séparateur) si la fenêtre totale ne dépasse pas **4 Kio**. Un
+secret coupé par un retour à la ligne (`aws_secret_access_key =` puis la
+valeur à la ligne suivante) est donc détecté, et le Finding porte la ligne où
+la correspondance commence. Une **ligne vide intercalée** est couverte de la
+même façon (`aws_secret_access_key =`, ligne vide, puis la valeur) : la
+fenêtre joint trois lignes. Au-delà de 4 Kio, ou au-delà de trois lignes
+jointes, la jointure n'est pas faite : c'est une limite documentée et figée
+par un test.
 
 Une ligne peut produire plusieurs Findings de types différents. Deux **valeurs
 distinctes** du même type sur la même ligne produisent **deux** Findings
@@ -65,22 +101,37 @@ distinctes** du même type sur la même ligne produisent **deux** Findings
 pas de colonne, mais un candidat ne doit jamais disparaître. Seule une valeur
 strictement identique, déjà vue sur la même ligne, est dédupliquée.
 
-## Exclusions (#59)
+## Périmètre et politique de contenu (#59)
 
-Politique explicite, jamais une heuristique :
+**Aucun nom de fichier n'exclut un fichier du scan.** Une exclusion nominale
+est un contournement trivial : il suffit de renommer le fichier
+(`evil.png`, `package-lock.json`, `vendor/secret.txt`…) pour qu'un secret ne
+soit ni signalé ni refusé. C'est le **contenu** qui décide :
 
-- fichiers de contrôle : `.gitignore`, `.gitattributes`, `.dockerignore`,
-  `.npmignore`, `.coverage` ;
-- répertoires : `.git`, `.hg`, `.svn`, environnements virtuels (`.venv`, `venv`,
-  `virtualenv`), `vendor`, `node_modules`, `third_party`, `build`, `dist`,
-  `target`, caches Python ;
-- lockfiles : suffixe `.lock`, `package-lock.json`, `yarn.lock`,
-  `pnpm-lock.yaml`, `go.sum`, `bun.lockb` ;
-- binaires : extension connue, ou signature magique connue **et** contenu
-  majoritairement binaire (ELF, PNG, PDF, ZIP…).
+| Contenu | Traitement |
+| --- | --- |
+| texte (UTF-8, UTF-16, UTF-32, avec ou sans BOM) | décodé puis **scanné** |
+| binaire connu (signature magique **et** contenu majoritairement binaire) | ignoré par politique, **tracé** (chemin journalisé + compteur) |
+| contenu NUL non décodable, BOM invalide | `ScanError` (fail-closed) dans le périmètre strict, tracé ailleurs |
 
-Un répertoire nommé `env/` n'est **pas** exclu : seuls les environnements
-virtuels connus le sont. Un dossier de sources `env/` est donc scanné.
+Un `evil.png` qui contient du texte est donc lu, décodé et scanné ; un vrai
+PNG est ignoré, mais il laisse une trace : un dépôt propre et un dépôt dont
+un binaire n'a pas été lu ne sont jamais confondus.
+
+Les répertoires sont classés en trois régimes :
+
+| Régime | Répertoires | Traitement |
+| --- | --- | --- |
+| **strict** | le contenu du dépôt | un fichier non analysable **interrompt** le scan (`ScanError`) |
+| **tiers** | `.venv`, `venv`, `virtualenv`, `__pycache__`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.tox`, `.nox`, `htmlcov`, `node_modules`, `bower_components`, `vendor`, `third-party`, `third_party`, `build`, `dist`, `target` | **parcourus** (un secret y est un secret) ; un fichier non analysable est **tracé**, pas fatal |
+| **hors périmètre** | `.git`, `.hg`, `.svn` | base VCS : ce n'est pas le contenu du dépôt ; **non parcourue**, mais **tracée** (compteur `hors_perimetre`) |
+
+Le nom du répertoire ne sert donc qu'à qualifier la **conséquence** d'un échec
+de lecture (interrompre le scan ou le tracer) : il ne dispense jamais de lire
+le fichier.
+
+Un répertoire nommé `env/` n'est **pas** un cas particulier : seuls les
+environnements virtuels connus sont des arbres de tiers, et ils sont lus.
 
 `.env`, `.env.example`, `requirements.txt`, les fichiers sans extension et les
 `.pem`/`.key` sont scannés. Les mocks de `tests/` ne sont **pas** exclus
@@ -95,9 +146,9 @@ Les fichiers texte sont décodés, pas ignorés :
 | UTF-8 (avec ou sans BOM) | décodage strict avec BOM, remplacement sans BOM |
 | UTF-16 / UTF-32 avec BOM | décodage strict, fichier scanné |
 | UTF-16 / UTF-32 sans BOM | heuristique bornée (proportion ASCII puis caractères imprimables), fichier scanné |
-| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | ignoré par politique |
-| signature binaire suivie de texte clair | `ScanError` (fail-closed) |
-| contenu NUL non décodable | `ScanError` (fail-closed) |
+| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | ignoré par politique, tracé |
+| signature binaire suivie de texte clair | refus (`ScanError` strict, tracé ailleurs) |
+| contenu NUL non décodable | refus (`ScanError` strict, tracé ailleurs) |
 
 Un secret encodé en UTF-16/UTF-32 est donc détecté ; il n'est plus sauté
 silencieusement. Quatre octets de signature binaire (`PK\x03\x04`, en-tête
@@ -115,27 +166,29 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | racine absente, non régulière ou illisible | `ScanError` |
 | racine ou fichier unique symlinké (ou ancêtre symlinké) | `ScanError` |
 | racine non canonique (ex. `/tmp` symlinké vers `/private/tmp` sur macOS) | `ScanError` — passer un chemin canonique (sans lien) |
-| fichier non régulier (FIFO, device) | `ScanError` |
-| fichier > 1 Mio | `ScanError` |
-| fichier modifié pendant la lecture | `ScanError` |
-| nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` |
+| fichier non régulier (FIFO, device) | `ScanError` (tracé dans un arbre de tiers) |
+| fichier > 1 Mio | `ScanError` (tracé dans un arbre de tiers) |
+| fichier modifié pendant la lecture | `ScanError` (tracé dans un arbre de tiers) |
+| nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` (tracé dans un arbre de tiers) |
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
 | clé HMAC demandée avec `..` dans le chemin | `ScanError` |
-| contenu NUL non décodable (hors binaire réellement binaire) | `ScanError` |
-| fichier ou répertoire symlinké **interne** au périmètre | ignoré par politique (non suivi, non signalé ; voir #59) |
-| fichier exclu ou binaire connu | ignoré par politique |
-| scan réussi sans signature | liste vide (réellement propre **hors exclusions** — voir limites) |
-
-> **Garde d'usage (hook/CI) :** ne pas utiliser ce `Scanner` bibliothèque tel
-> quel pour un hook ou une CI. Un `[]` sur dépôt complet peut masquer un secret
-> présent dans un chemin exclu (`vendor/`, `*.lock`, binaire) ou coupé au-delà
-> de la fenêtre 4 Kio. #29 doit scanner tout blob stagé **sans exclusion** et
-> prouver 0/1/2 end-to-end ; en attendant, aucun usage CI du scan réel n'est
-> autorisé (la CLI reste en stub, sortie 2). Voir limites ci-dessous.
+| contenu NUL non décodable (hors binaire réellement binaire) | `ScanError` (tracé dans un arbre de tiers) |
+| binaire connu | ignoré par politique, **tracé** (compteur `binaires_ignores`) |
+| lien symbolique | jamais suivi, **tracé** (compteur `liens_ignores`) |
+| base VCS (`.git/`, `.hg/`, `.svn/`) | non parcourue, **tracée** (compteur `hors_perimetre`) |
+| scan réussi sans signature | liste vide (réellement propre) |
 
 Un scan incomplet ne devient donc jamais une liste vide ou partielle. Quand
 #29 branchera la CLI, `ScanError` devra produire le code 2 (erreur d'outillage),
 jamais 0 ou 1.
+
+> **Garde d'usage (hook/CI) :** ne pas utiliser ce scanner bibliothèque tel
+> quel pour un hook ou une CI. Un `[]` sur dépôt complet peut masquer un secret
+> contenu dans un **binaire** (contenu non lu, tracé mais pas signalé) ou
+> coupé au-delà de la fenêtre 4 Kio ; dans un arbre de tiers, un fichier non
+> analysable est tracé, pas fatal. #29 doit scanner tout blob stagé et
+> prouver 0/1/2 end-to-end ; en attendant, aucun usage CI du scan réel n'est
+> autorisé (la CLI reste en stub, sortie 2). Voir limites ci-dessous.
 
 ## Empreinte et entropie
 
@@ -163,16 +216,21 @@ jamais 0 ou 1.
   des variables : les six cas obfusqués de T21 restent des `limite_connue`
   (rappel 0,625 sur `all`, 1,0 sur le périmètre `core`). Le décodage/entropie
   relève de #23 et l'allowlist de #24.
-- Les fichiers binaires, lockfiles et répertoires tiers sont ignorés par
-  politique : un secret qui y serait copié n'est pas signalé. En mode dépôt
-  complet, `[]` vaut donc « propre hors exclusions », jamais « propre absolu ».
-  Bloquant #29 : scanner les blobs stagés sans exclusion (ou `ScanError` /
-  flag `truncated` explicite en mode dépôt) ; bloquant #59 pour le mode dépôt.
-- La jointure multi-ligne est bornée à 4 Kio : un secret coupé par un retour
-  à la ligne n'est recherché que si la fenêtre des deux lignes tient dans
-  cette borne. Au-delà, la coupure n'est pas détectée (`[]`). Padding
-  volontaire = évasion connue : bloquant #23 (`ScanError` statique ou Finding
-  `tronqué` sur affectation sans valeur + fenêtre dépassée).
+- Un **binaire** n'est pas analysé : un secret glissé dans un commentaire ZIP
+  ou PNG n'est pas signalé. Le fichier est **tracé** (chemin journalisé,
+  compteur `binaires_ignores`), donc l'auditeur le voit, mais le contenu n'est
+  pas lu. C'est la seule catégorie de contenu non analysable tolérée.
+- La **base VCS** (`.git/`, `.hg/`, `.svn/`) n'est pas parcourue : ses objets
+  sont compressés et l'historique n'est pas le contenu du dépôt (c'est le
+  travail de #29/#30, sur le diff indexé). Le répertoire est **tracé**
+  (compteur `hors_perimetre`).
+- Un fichier **non analysable** dans un arbre de tiers (`.venv`,
+  `node_modules`, `vendor`…) est tracé, pas fatal : ces arbres sont massifs et
+  tiers. Un secret y placed dans un binaire ou un fichier hors borne n'est donc
+  pas signalé — c'est le prix de la robustesse sur des arbres non audités.
+- La jointure multi-ligne est bornée à 4 Kio et à **trois lignes jointes** : un
+  secret coupé par plus de deux retours à la ligne consécutifs n'est pas
+  recherché. C'est une limite figée par un test.
 - La charge d'un JWT est bornée à 64 Kio et l'en-tête à 1 Kio : un jeton
   conforme est détecté, un jeton hors de ces bornes ne l'est pas. Les autres
   préfixes AWS (au-delà de `AKIA`/`ASIA`/`ABIA`/`ACCA`) ne sont pas couverts.
@@ -194,14 +252,16 @@ jamais 0 ou 1.
 
 ```sh
 .venv/bin/python -m pytest tests/test_scanner_detect.py \
+  tests/test_scanner_interface.py tests/test_scanner_signatures.py \
   tests/test_trap_acceptance.py tests/security/test_scanner_bypass.py \
   --cov=heimdall.scanner --cov-branch --cov-report=term-missing \
   --cov-fail-under=85
 .venv/bin/python tests/measure_trap.py
 ```
 
-Résultats de la livraison : **122 tests passés**, couverture du paquet
-`heimdall/scanner` **91,31 %** (branches incluses), suite complète **936 tests
-passés**, couverture globale **96,69 %**, mesure T21 `core` précision **1,00**,
-rappel **1,00**, aucune fausse alerte sur les 18 non-leaks.
+Résultats de la livraison : **445 tests passés**, couverture du paquet
+`heimdall/scanner` **98,36 %** (branches incluses), suite complète **1 455 tests
+passés** (+ 4 317 sous-tests), couverture globale **96,59 %**, mesure T21
+`core` précision **1,00**, rappel **1,00**, aucune fausse alerte sur les 18
+non-leaks.
 Les liens permanents et la fiche SAMM sont dans [t22-samm.md](t22-samm.md).

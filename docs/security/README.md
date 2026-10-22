@@ -23,7 +23,7 @@ l'état observé. Les évolutions après ce commit nécessitent une nouvelle rev
 | Source | Observation, et limite de la preuve |
 | --- | --- |
 | [CLI](../../heimdall/cli/main.py) | `scan`, y compris `--ci`, refuse actuellement avec le code 2 ; pas de scan opérationnel. |
-| [Scanner](../../heimdall/scanner/detect.py) | Squelette ; `find_candidates` lève `NotImplementedError`. |
+| [Scanner](../../heimdall/scanner/detect.py) | Scanner déterministe livré (#22) : périmètre piloté par le **contenu** (aucun nom de fichier n'exclut un fichier), lectures confinées (`lstat`, `O_NOFOLLOW`, `fstat` dev/ino/mtime), `ScanError` fail-closed et rapport des fichiers non analysés ; la **commande** CLI reste non branchée (#29). |
 | [MCP](../../heimdall/mcp/server.py) | Registre de quatre outils ; démarrage stdio non implémenté. |
 | [Client Vault](../../heimdall/vault/client.py) | Validation d'URL HTTPS loopback et de credential ; pas de client HTTP opérationnel. |
 | [Crypto Vault](../../heimdall/vault/crypto.py) | Chiffrement/déchiffrement non implémentés. |
