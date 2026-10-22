@@ -39,6 +39,7 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text, is_excluded, is_excluded_directory
 from heimdall.scanner.finding import Finding, FindingSource, FindingStatus
 from heimdall.scanner.hashing import SnippetHasher
+from heimdall.scanner.signature_engine import MAX_FINDINGS
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
 MAX_FILE_BYTES: Final[int] = 1_048_576
@@ -51,14 +52,9 @@ MAX_FILES: Final[int] = 50_000
 #: Plafond du volume total lu en une passe, en octets (#29). Sans lui,
 #: ``MAX_FILES`` fichiers de 1 Mio feraient 50 Gio de lecture.
 MAX_TOTAL_BYTES: Final[int] = 256 * 1024 * 1024
-#: Plafond du nombre de Findings rendus en une passe (#29). Les bornes
-#: d'entrée ne suffisent pas : un dépôt adverse dense en candidats (un millier
-#: de blobs bourrés de matches) ferait gonfler la liste et le tri final en
-#: mémoire et en temps CI. Au-delà, le scan est **refusé** (``ScanError``),
-#: jamais tronqué : un rapport partiel présenté comme complet serait un
-#: faux « propre ». 10 000 Findings sont déjà inexploitables par un humain
-#: comme par un journal CI : le refus force le triage, pas le silence.
-MAX_FINDINGS: Final[int] = 10_000
+# NOTE : `MAX_FINDINGS` est défini dans `signature_engine` (couche core) et
+# réexporté ici (compatibilité : `detect.MAX_FINDINGS` reste patchable par
+# les tests et documenté comme borne du mode arbre).
 _READ_CHUNK: Final[int] = 65_536
 _FIRST_CONTROL: Final[int] = 0x20
 _DELETE: Final[int] = 0x7F

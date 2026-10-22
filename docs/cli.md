@@ -80,9 +80,11 @@ ni 1.
 
 La **racine elle-même est re-contrôlée** après l'analyse, dans les deux
 périmètres : la garde unique (refus symlink, égalité du résolu) est rejouée
-sur le chemin demandé et comparée à la forme figée à l'entrée. Un lien
-remplacé pendant le scan — qui ferait lire une autre cible à `git -C`
-— refuse le verdict au lieu de juger le mauvais périmètre.
+sur le chemin demandé et comparée à la forme figée à l'entrée — chemin
+résolu **et** identité (`st_dev`, `st_ino` épinglés à la construction). Un
+lien remplacé pendant le scan, comme un dossier remplacé par un autre au
+même chemin (même résolu, autre identité), refuse le verdict au lieu de
+juger le mauvais périmètre.
 
 Les suppressions et les **gitlinks** (sous-modules, mode `160000`) sont
 ignorés : une suppression n'a plus de blob à scanner, et le SHA d'un gitlink

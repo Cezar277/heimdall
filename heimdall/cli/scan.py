@@ -120,16 +120,18 @@ def collect(root: Path, *, staged: bool) -> ScanReport:
 def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
     """Refuse si la racine a été échangée pendant le scan (TOCTOU).
 
-    `access` fige la racine résolue à l'entrée ; une reconstruction fraîche
-    refait la garde unique (refus symlink compris). Toute différence —
-    remplacement par un lien, déplacement, suppression — refuse le verdict :
-    le périmètre analysé n'est plus celui demandé. Pur `lstat`, aucun `git`.
+    `access` fige la racine résolue ET son identité à l'entrée ; une
+    reconstruction fraîche refait la garde unique (refus symlink compris).
+    Toute différence — chemin résolu différent, identité (`st_dev`,
+    `st_ino`) différente — refuse le verdict : un dossier remplacé par un
+    autre au même chemin a le même résolu mais pas la même identité. Pur
+    `lstat`/`stat`, aucun `git`.
     """
     try:
-        current = GitAccess(root).root
+        current = GitAccess(root)
     except ToolFailure:
         raise ScanError(_MSG_ROOT_CHANGED) from None
-    if current != access.root:
+    if current.root != access.root or current.root_id != access.root_id:
         raise ScanError(_MSG_ROOT_CHANGED)
 
 

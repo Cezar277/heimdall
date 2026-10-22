@@ -634,6 +634,42 @@ def test_scan_staged_root_swapped_mid_scan_exits_two(
     assert "scan impossible" in resultat.stderr
 
 
+def test_scan_staged_root_replaced_same_path_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : dossier remplacé à chemin identique -> 2 (identité).
+
+    Le sosie porte un index IDENTIQUE (même blob) : le re-contrôle d'index
+    passe, seul le re-contrôle d'identité (`st_dev`, `st_ino`) refuse. Sans
+    lui, le résolu serait le même et ce serait 0 sur un périmètre échangé.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
+    sosie = git_repo.root.parent / "sosie-29"
+    sosie.mkdir()
+    (sosie / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _git(sosie, "init", "-q")
+    _git(sosie, "add", "app.py")
+    original_octets = GitAccess.blob_bytes
+    appels = 0
+
+    def lit_puis_remplace(self: GitAccess, blob: str) -> bytes:
+        nonlocal appels
+        appels += 1
+        data = original_octets(self, blob)
+        if appels == 1:
+            cache = git_repo.root.parent / "orig-29"
+            git_repo.root.rename(cache)
+            sosie.rename(git_repo.root)
+        return data
+
+    monkeypatch.setattr(GitAccess, "blob_bytes", lit_puis_remplace)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert appels == 1
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
 def test_scan_tree_root_swapped_mid_scan_exits_two(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -658,6 +694,35 @@ def test_scan_tree_root_swapped_mid_scan_exits_two(
         return trouvailles
 
     monkeypatch.setattr(TreeScanner, "scan", scan_puis_echange)
+    resultat = _run("scan", str(git_repo.root))
+    assert echange[0]
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
+def test_scan_tree_root_replaced_same_path_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : idem en mode arbre — même chemin, autre dossier -> 2.
+
+    Ici le sosie est un dossier vide quelconque : le résolu est identique,
+    seule l'identité diffère. Sans le re-contrôle d'identité, le verdict
+    serait 0 sur un périmètre mélangé.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    original_scan = TreeScanner.scan
+    echange = [False]
+
+    def scan_puis_remplace(self: TreeScanner) -> list[object]:
+        trouvailles = original_scan(self)
+        if not echange[0]:
+            echange[0] = True
+            cache = git_repo.root.parent / "orig-29"
+            git_repo.root.rename(cache)
+            git_repo.root.mkdir()
+        return trouvailles
+
+    monkeypatch.setattr(TreeScanner, "scan", scan_puis_remplace)
     resultat = _run("scan", str(git_repo.root))
     assert echange[0]
     assert resultat.exit_code == EXIT_ERROR
@@ -778,6 +843,21 @@ def test_signature_engine_stops_at_cap() -> None:
     with pytest.raises(ScanError):
         moteur.analyser(cible)
     assert compteur.compte == 6
+
+
+def test_signature_engine_bounded_by_default() -> None:
+    """Revue (LOW) : `SignatureEngine()` sans argument reste fail-closed.
+
+    Le défaut est le plafond partagé : un appelant qui analyserait un blob
+    dense sans renseigner `max_findings` refuse au-delà de 10 000 au lieu
+    d'accumuler sans borne. `None` explicite garde l'historique non borné.
+    """
+    moteur = SignatureEngine(hasher=_HasherCompteur())
+    charge = FileTarget(path="dense.py", text=_cles_denses(11_000) + "\n")
+    with pytest.raises(ScanError):
+        moteur.analyser(charge)
+    libre = SignatureEngine(hasher=_HasherCompteur(), max_findings=None)
+    assert len(libre.analyser(charge)) == 11_000
 
 
 def test_scan_staged_dense_blob_refuses(

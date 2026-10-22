@@ -31,6 +31,17 @@ from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 #: Fenêtre maximale de jointure de deux lignes, en **octets UTF-8** (4 Kio).
 MULTILINE_WINDOW: Final[int] = 4096
 
+#: Plafond du nombre de Findings rendus en une passe (#29). Les bornes
+#: d'entrée ne suffisent pas : un dépôt adverse dense en candidats (un millier
+#: de blobs bourrés de matches) ferait gonfler la liste et le tri final en
+#: mémoire et en temps CI. Au-delà, le scan est **refusé** (``ScanError``),
+#: jamais tronqué : un rapport partiel présenté comme complet serait un
+#: faux « propre ». 10 000 Findings sont déjà inexploitables par un humain
+#: comme par un journal CI : le refus force le triage, pas le silence.
+#: Source unique : ``heimdall.scanner.detect`` la réexporte (compatibilité
+#: des appelants qui patchent `detect.MAX_FINDINGS`).
+MAX_FINDINGS: Final[int] = 10_000
+
 #: Refus statique du plafond Findings : même libellé que le scanner
 #: bibliothèque (`detect.py`), invariant 8 (aucune entrée reflétée).
 _MAX_FINDINGS_ERROR: Final[str] = "scan impossible : entrée non analysable"
@@ -43,9 +54,11 @@ class SignatureEngine:
     moteur ne crée aucun fichier et ne touche pas au stockage local.
 
     ``max_findings`` borne le nombre de Findings rendus (**par candidat**,
-    dans ``_append``) : au-delà, ``ScanError``. ``None`` (défaut) conserve le
-    comportement historique non borné ; la CLI ``heimdall scan --staged``
-    (#29) le renseigne pour couper fail-fast sur un blob dense.
+    dans ``_append``) : au-delà, ``ScanError``. Le défaut est le plafond
+    partagé (:data:`MAX_FINDINGS`) : un appelant qui analyserait un blob
+    dense sans le renseigner reste fail-closed au lieu d'accumuler sans
+    borne (#29). La CLI ``--staged`` renseigne explicitement sa propre
+    constante (même valeur, knob documenté côté CLI).
     """
 
     __slots__ = ("_hasher", "_max_findings")
@@ -54,7 +67,7 @@ class SignatureEngine:
         self,
         hasher: SnippetHasher | None = None,
         *,
-        max_findings: int | None = None,
+        max_findings: int | None = MAX_FINDINGS,
     ) -> None:
         self._hasher = hasher
         self._max_findings = max_findings
@@ -156,4 +169,4 @@ class SignatureEngine:
 #: Alias français, pour les appelants qui parlent du « moteur » de #53.
 MoteurSignatures = SignatureEngine
 
-__all__ = ["MULTILINE_WINDOW", "MoteurSignatures", "SignatureEngine"]
+__all__ = ["MAX_FINDINGS", "MULTILINE_WINDOW", "MoteurSignatures", "SignatureEngine"]

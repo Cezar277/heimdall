@@ -242,7 +242,7 @@ class GitAccess:
     usages (`-C`, plafond, comparaisons) partent de cette forme.
     """
 
-    __slots__ = ("_git", "_root")
+    __slots__ = ("_git", "_root", "_root_id")
 
     def __init__(self, root: Path) -> None:
         try:
@@ -254,6 +254,19 @@ class GitAccess:
             # `ScanError` ne traverse jamais la frontière : le message, qui
             # pourrait refléter l'entrée, est remplacé par le statique.
             raise ToolFailure("INTERNAL") from None
+        try:
+            # Identité du dossier (device + inode), suivie après refus des
+            # liens : un `lstat` aurait la même course que le `resolve`, mais
+            # `is_symlink` refuse un lien planté entre les deux, et tout
+            # remplacement (lien, autre dossier, suppression) change
+            # l'identité ou fait échouer le `stat` — le re-contrôle de fin
+            # de scan refuse alors le verdict (#29).
+            if self._root.is_symlink():
+                raise ToolFailure("INTERNAL")
+            metadata = os.stat(self._root)
+        except OSError:
+            raise ToolFailure("INTERNAL") from None
+        self._root_id = (metadata.st_dev, metadata.st_ino)
         # Jamais le PATH hérité : un PATH compromis (poste, CI, direnv)
         # détournerait le binaire exécuté à chaque outil. `os.defpath`
         # (`/bin:/usr/bin` sur POSIX) est le défaut système sûr, pas une
@@ -281,6 +294,11 @@ class GitAccess:
     def root(self) -> Path:
         """Racine figée sous forme résolue (refusée symlink à la construction)."""
         return self._root
+
+    @property
+    def root_id(self) -> tuple[int, int]:
+        """Identité du dossier racine (`st_dev`, `st_ino`) à la construction."""
+        return self._root_id
 
     def execute(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
         """Exécute une commande git figée (argv, jamais de shell).
