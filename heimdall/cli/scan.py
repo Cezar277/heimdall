@@ -64,11 +64,17 @@ JSON_SCHEMA: Final[str] = "heimdall.scan.v1"
 MAX_STAGED_FILES: Final[int] = 1000
 #: Plafond du volume total de blobs indexés lus (octets).
 MAX_STAGED_BYTES: Final[int] = 32 * 1024 * 1024
+#: Plafond du nombre de Findings rendus en une passe `--staged`. Les bornes
+#: d'entrée ne suffisent pas : un millier de blobs denses en candidats
+#: ferait gonfler la liste et le tri final. Au-delà, refus (code 2), jamais
+#: un rapport tronqué présenté comme complet (même valeur que le mode arbre).
+MAX_STAGED_FINDINGS: Final[int] = 10_000
 
 #: Messages d'erreur **statiques** (invariant 8 : aucune entrée reflétée).
 _MSG_NOT_A_REPO: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_MANY_FILES: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_LARGE: Final[str] = "scan impossible : entrée non analysable"
+_MSG_TOO_MANY_FINDINGS: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 
 #: Libellés du périmètre, affichés à l'humain.
@@ -159,7 +165,23 @@ def _collect_staged(root: Path) -> ScanReport:
         # contrat ne sait pas représenter est une erreur, pas un fichier
         # ignoré en silence.
         targets.append(FileTarget(path=change.path, text=text))
-    findings = TargetScanner(SignatureEngine()).scan_all(targets)
+    moteur = TargetScanner(SignatureEngine())
+    findings: list[Finding] = []
+    for target in targets:
+        # Cible par cible, pas `scan_all` : le compteur coupe la croissance
+        # fail-fast, et le tri final ne porte jamais sur un volume non
+        # borné. L'ordre de sortie reste celui de `scan_all` (même clé).
+        findings.extend(moteur.scan(target))
+        if len(findings) > MAX_STAGED_FINDINGS:
+            raise ScanError(_MSG_TOO_MANY_FINDINGS)
+    findings.sort(
+        key=lambda finding: (
+            finding.file,
+            finding.line,
+            finding.type,
+            finding.snippet_hash,
+        )
+    )
     if access.staged_changes() != changes:
         # L'index a bougé pendant le scan : le snapshot analysé ne décrit
         # plus ce qui sera committé. Refus, pas de verdict périmé.
@@ -220,6 +242,7 @@ __all__ = [
     "JSON_SCHEMA",
     "MAX_STAGED_BYTES",
     "MAX_STAGED_FILES",
+    "MAX_STAGED_FINDINGS",
     "SCOPE_STAGED",
     "SCOPE_TREE",
     "ScanReport",

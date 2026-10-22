@@ -51,6 +51,14 @@ MAX_FILES: Final[int] = 50_000
 #: Plafond du volume total lu en une passe, en octets (#29). Sans lui,
 #: ``MAX_FILES`` fichiers de 1 Mio feraient 50 Gio de lecture.
 MAX_TOTAL_BYTES: Final[int] = 256 * 1024 * 1024
+#: Plafond du nombre de Findings rendus en une passe (#29). Les bornes
+#: d'entrée ne suffisent pas : un dépôt adverse dense en candidats (un millier
+#: de blobs bourrés de matches) ferait gonfler la liste et le tri final en
+#: mémoire et en temps CI. Au-delà, le scan est **refusé** (``ScanError``),
+#: jamais tronqué : un rapport partiel présenté comme complet serait un
+#: faux « propre ». 10 000 Findings sont déjà inexploitables par un humain
+#: comme par un journal CI : le refus force le triage, pas le silence.
+MAX_FINDINGS: Final[int] = 10_000
 _READ_CHUNK: Final[int] = 65_536
 _FIRST_CONTROL: Final[int] = 0x20
 _DELETE: Final[int] = 0x7F
@@ -63,6 +71,7 @@ __all__ = [
     "FindingStatus",
     "MAX_FILES",
     "MAX_FILE_BYTES",
+    "MAX_FINDINGS",
     "MAX_PATH_LENGTH",
     "MAX_TOTAL_BYTES",
     "MULTILINE_WINDOW",
@@ -148,9 +157,17 @@ class Scanner:
     reste la politique #59 inchangée.
     """
 
-    __slots__ = ("_hasher", "_max_bytes", "_max_files", "_root", "_single", "_strict")
+    __slots__ = (
+        "_hasher",
+        "_max_bytes",
+        "_max_files",
+        "_max_findings",
+        "_root",
+        "_single",
+        "_strict",
+    )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - bornes nommées explicites, cf. MAX_*.
         self,
         root: str | os.PathLike[str],
         *,
@@ -158,6 +175,7 @@ class Scanner:
         strict: bool = False,
         max_files: int | None = None,
         max_bytes: int | None = None,
+        max_findings: int | None = None,
     ) -> None:
         resolved = _resolve_root(root)
         if resolved.is_dir():
@@ -172,15 +190,17 @@ class Scanner:
         self._strict = strict
         self._max_files = MAX_FILES if max_files is None else max_files
         self._max_bytes = MAX_TOTAL_BYTES if max_bytes is None else max_bytes
+        self._max_findings = MAX_FINDINGS if max_findings is None else max_findings
 
     def scan(self) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.
 
         Toute erreur de lecture interrompt le scan : aucun résultat partiel
-        n'est retourné. Le nombre de fichiers (:data:`MAX_FILES`) et le volume
-        total lu (:data:`MAX_TOTAL_BYTES`) sont **bornés** : au-delà, le scan
-        est refusé (``ScanError``) au lieu de durer indéfiniment sur un dépôt
-        adverse (#29).
+        n'est retourné. Le nombre de fichiers (:data:`MAX_FILES`), le volume
+        total lu (:data:`MAX_TOTAL_BYTES`) et le nombre de Findings
+        (:data:`MAX_FINDINGS`) sont **bornés** : au-delà, le scan est refusé
+        (``ScanError``) au lieu de durer indéfiniment ou de gonfler en
+        mémoire sur un dépôt adverse (#29).
         """
         # Pas de `list()` sur le périmètre : un dépôt adverse avec un très
         # grand nombre de fichiers ne doit pas OOM le hook/CI. Le tri final
@@ -204,6 +224,10 @@ class Scanner:
             if text is None:
                 continue
             findings.extend(self._scan_text(text, relative))
+            if len(findings) > self._max_findings:
+                # Refus fail-fast : la liste ne grandit plus, et le tri
+                # final ne porte jamais sur un volume non borné.
+                raise ScanError(_SCAN_ERROR)
         findings.sort(
             key=lambda finding: (
                 finding.file,

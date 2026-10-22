@@ -74,15 +74,31 @@ scanné). L'index est donc **relu après l'analyse**, et toute divergence
 refuse le scan (code 2) : un verdict sur un snapshot périmé ne vaut ni 0
 ni 1.
 
+Les suppressions et les **gitlinks** (sous-modules, mode `160000`) sont
+ignorés : une suppression n'a plus de blob à scanner, et le SHA d'un gitlink
+désigne un **commit**, pas un blob — aucun texte à analyser (`cat-file blob`
+échouerait). C'est une impossibilité technique documentée, pas une
+exclusion de chemin : un `submodule add` stagé ne fait pas échouer le scan,
+et un secret voisin reste signalé. Seul le mode **indexé** compte : un
+passage gitlink → fichier (`T` vers `100644`) porte un vrai blob et reste
+scanné.
+
 ## Bornes
 
 Le scan est **borné** dans les deux périmètres : au-delà, il est refusé
 (code 2), jamais tronqué ni présenté comme complet.
 
-| Périmètre | Borne par fichier | Nombre de fichiers | Volume total |
-| --- | --- | --- | --- |
-| `working-tree` | 1 Mio ([`MAX_FILE_BYTES`](../heimdall/scanner/detect.py)) | 50 000 ([`MAX_FILES`](../heimdall/scanner/detect.py)) | 256 Mio ([`MAX_TOTAL_BYTES`](../heimdall/scanner/detect.py)) |
-| `staged` | 1 Mio | 1 000 ([`MAX_STAGED_FILES`](../heimdall/cli/scan.py)) | 32 Mio ([`MAX_STAGED_BYTES`](../heimdall/cli/scan.py)) |
+| Périmètre | Borne par fichier | Nombre de fichiers | Volume total | Findings |
+| --- | --- | --- | --- | --- |
+| `working-tree` | 1 Mio ([`MAX_FILE_BYTES`](../heimdall/scanner/detect.py)) | 50 000 ([`MAX_FILES`](../heimdall/scanner/detect.py)) | 256 Mio ([`MAX_TOTAL_BYTES`](../heimdall/scanner/detect.py)) | 10 000 ([`MAX_FINDINGS`](../heimdall/scanner/detect.py)) |
+| `staged` | 1 Mio | 1 000 ([`MAX_STAGED_FILES`](../heimdall/cli/scan.py)) | 32 Mio ([`MAX_STAGED_BYTES`](../heimdall/cli/scan.py)) | 10 000 ([`MAX_STAGED_FINDINGS`](../heimdall/cli/scan.py)) |
+
+Les bornes d'entrée ne suffisent pas : des blobs denses en candidats
+feraient gonfler la liste des Findings et le tri final en mémoire et en
+temps CI. Le compteur coupe fail-fast (pendant la boucle en mode arbre,
+cible par cible en `--staged`, avec le même ordre de tri) : au-delà,
+refus (code 2), jamais un rapport tronqué présenté comme complet. 10 000
+Findings sont déjà inexploitables par un humain comme par un journal CI.
 
 Les deux bornes totales protègent la CI d'un dépôt adverse (100 000 petits
 fichiers, ou 50 000 fichiers de 1 Mio) : sans elles, le job durerait sans
@@ -148,6 +164,14 @@ Le document porte le périmètre (`scope`), le nombre de Findings (`count`) et
 les Findings eux-mêmes, avec **exactement les sept champs** du contrat
 Finding v1 (#14). Il n'y a rien d'autre : pas de valeur de secret, pas de
 champ libre, pas d'extrait de ligne.
+
+Le contrat machine est figé par [`schemas/scan.schema.json`](../schemas/scan.schema.json)
+(draft 2020-12) : objet fermé (`additionalProperties: false`), `schema` en
+constante `heimdall.scan.v1`, `scope` en enum, `count` entier ≥ 0, et chaque
+élément de `findings` validé contre le contrat Finding v1 par `$ref` (sans
+duplication : toute dérive du Finding casse la validation). La cohérence
+`count == len(findings)`, inexprimable en JSON Schema pur, est vérifiée par
+le test. Un parseur CI DOIT refuser tout document invalide.
 
 ## Invariants
 

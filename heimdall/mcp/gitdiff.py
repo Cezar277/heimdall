@@ -382,6 +382,8 @@ class GitAccess:
         Utilisé par la CLI ``heimdall scan --staged`` (#29) : l'index est la
         source de vérité de « ce que le commit va contenir », et le contenu
         indexé est lu **blob par blob**, sans aucune exclusion de chemin.
+        Les suppressions et les gitlinks (sous-modules : leur SHA désigne
+        un commit, pas un blob) sont ignorés — aucun texte à scanner.
 
         L'index est non résolu (conflit de fusion) ou la sortie est illisible
         → ``ToolFailure`` : le scan ne peut alors pas prétendre avoir tout vu.
@@ -467,7 +469,9 @@ def parse_staged_raw(raw: bytes) -> list[StagedChange]:
 
     Rend la liste des fichiers **ajoutés ou modifiés** dans l'index (les
     suppressions sont ignorées : il n'y a plus de blob à scanner), avec le
-    SHA du blob indexé.
+    SHA du blob indexé. Les entrées gitlink (sous-modules, mode ``160000``)
+    sont ignorées de la même façon : leur SHA désigne un commit, pas un
+    blob, donc aucun texte à scanner.
 
     Sortie illisible, statut inconnu ou index non résolu (conflit de fusion,
     statut ``U``) → ``ToolFailure`` : mieux vaut une panne qu'un verdict
@@ -509,6 +513,14 @@ def _staged_change(header: bytes, path_bytes: bytes) -> StagedChange | None:
         return None
     if code not in _SCAN_STATUSES:
         raise ToolFailure("INTERNAL")
+    if fields[1] == b"160000":
+        # Entrée gitlink (sous-module) : le SHA indexé désigne un **commit**,
+        # pas un blob — il n'y a aucun texte à scanner (`cat-file blob`
+        # échouerait avec `bad file`). Ignoré comme les suppressions, pas une
+        # erreur : un sous-module stagé ne doit pas faire échouer tout le
+        # scan (#29). Seul le mode **indexé** compte : un passage gitlink →
+        # fichier (`T` vers 100644) porte un vrai blob et reste scanné.
+        return None
     try:
         blob = fields[3].decode("ascii")
     except UnicodeDecodeError:

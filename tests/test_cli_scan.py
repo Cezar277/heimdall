@@ -20,6 +20,9 @@ from pathlib import Path
 
 import pytest
 import typer
+from jsonschema import Draft202012Validator
+from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT202012
 from support.git_repo import GitRepo
 from typer.testing import CliRunner
 
@@ -27,6 +30,45 @@ from heimdall.cli.main import app
 from heimdall.cli.scan import EXIT_CLEAN, EXIT_ERROR, EXIT_FINDINGS, JSON_SCHEMA
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess, StagedChange, parse_staged_raw
+
+#: Racine du dépôt (les schémas vivent dans `schemas/`, hors paquet).
+REPO = Path(__file__).resolve().parents[1]
+
+#: Contrat de sortie `--json`, résolu avec le contrat Finding v1 (#14).
+SCAN_SCHEMA = json.loads((REPO / "schemas/scan.schema.json").read_text(encoding="utf-8"))
+FINDING_SCHEMA = json.loads((REPO / "schemas/finding.schema.json").read_text(encoding="utf-8"))
+
+
+def _scan_validator() -> Draft202012Validator:
+    """Validateur du contrat `heimdall.scan.v1`, Finding v1 résolu par registre.
+
+    `findings[].items` référence `finding.schema.json` par `$ref` relatif :
+    le registre fournit les deux documents, sans toucher au réseau ni
+    dupliquer le contrat #14 (toute dérive du Finding casse ce test).
+    """
+    registry = Registry().with_resources(
+        [
+            (
+                "https://heimdall.local/schemas/finding.schema.json",
+                Resource(contents=FINDING_SCHEMA, specification=DRAFT202012),
+            ),
+            (
+                "https://heimdall.local/schemas/scan.schema.json",
+                Resource(contents=SCAN_SCHEMA, specification=DRAFT202012),
+            ),
+        ]
+    )
+    return Draft202012Validator(SCAN_SCHEMA, registry=registry)
+
+
+def _refuse_non_finite(value: str) -> object:
+    """Refuse les constantes non finies d'un document JSON (`allow_nan`).
+
+    `render_json` sérialise avec `allow_nan=False` : un NaN ne doit jamais
+    arriver jusqu'ici. Relire en refusant `NaN`/`Infinity` fige ce contrat
+    sur la sortie réelle.
+    """
+    raise ValueError(f"constante non finie refusée : {value}")
 
 #: Exemple de clé AWS (documentation AWS) : jamais une clé fonctionnelle.
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
@@ -357,6 +399,37 @@ def test_scan_staged_skips_a_binary_blob(git_repo: GitRepo) -> None:
     assert resultat.exit_code == EXIT_CLEAN
 
 
+def test_scan_staged_skips_a_staged_gitlink(git_repo: GitRepo) -> None:
+    """Revue (LOW) : un gitlink stagé (sous-module) ne fait pas échouer le scan.
+
+    Le SHA indexé d'une entrée 160000 désigne un commit, pas un blob :
+    aucun texte à scanner. Ignoré (documenté), pas une erreur — sinon tout
+    `submodule add` sortirait en 2.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
+    git_repo.commit_all("base")
+    head = git_repo.git_output("rev-parse", "HEAD").strip()
+    git_repo.git("update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_CLEAN
+
+
+def test_scan_staged_gitlink_does_not_hide_other_secrets(git_repo: GitRepo) -> None:
+    """Le gitlink est sauté, mais un secret voisin reste signalé."""
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
+    git_repo.commit_all("base")
+    head = git_repo.git_output("rev-parse", "HEAD").strip()
+    git_repo.git("update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+    git_repo.write("config.py", f'AWS = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage("config.py")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert "config.py:1" in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.output
+
+
 def test_scan_staged_polyglot_binary_header_is_scanned(git_repo: GitRepo) -> None:
     """Revue #166 : en-tête binaire + texte clair (sans NUL) -> **scanné**.
 
@@ -414,6 +487,37 @@ def test_scan_staged_refuses_too_many_files(
     assert resultat.exit_code == EXIT_ERROR
 
 
+def test_scan_staged_refuses_too_many_findings(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : rafale de candidats -> refus 2, jamais de rapport tronqué.
+
+    Les bornes d'entrée ne suffisent pas : des blobs denses en candidats
+    feraient gonfler la liste et le tri final. Au-delà du plafond, refus.
+    """
+    monkeypatch.setattr("heimdall.cli.scan.MAX_STAGED_FINDINGS", 1)
+    git_repo.write("a.py", f'A = "{FAKE_AWS_KEY}"\n')
+    git_repo.write("b.py", f'B = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage("a.py", "b.py")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
+def test_scan_tree_refuses_too_many_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Idem en mode arbre : le compteur coupe fail-fast pendant la boucle."""
+    monkeypatch.setattr("heimdall.scanner.detect.MAX_FINDINGS", 1)
+    racine = _arbre(
+        tmp_path,
+        {"a.py": f'A = "{FAKE_AWS_KEY}"\n', "b.py": f'B = "{FAKE_AWS_KEY}"\n'},
+    )
+    resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
 def test_blob_access_refuses_a_name_that_is_not_a_sha(git_repo: GitRepo) -> None:
     """Un nom d'objet qui n'est pas un SHA est refusé avant l'argv.
 
@@ -467,6 +571,47 @@ def test_scan_json_output_on_a_clean_repository(tmp_path: Path) -> None:
     document = json.loads(resultat.stdout)
     assert document["count"] == 0
     assert document["findings"] == []
+
+
+def test_scan_schema_is_a_valid_draft_2020_12_schema() -> None:
+    """Revue (LOW) : `schemas/scan.schema.json` est un schéma 2020-12 valide."""
+    assert SCAN_SCHEMA["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    Draft202012Validator.check_schema(SCAN_SCHEMA)
+
+
+def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
+    """Revue (LOW) : la sortie `--json` est valide contre son schéma.
+
+    Champs exacts, `count` cohérent avec `findings`, et aucun NaN : le
+    document est relu en refusant les constantes non finies (`allow_nan`
+    refusé, figé ici sur la sortie réelle).
+    """
+    racine = _arbre(tmp_path, {"config.py": f'AWS = "{FAKE_AWS_KEY}"\n'})
+    resultat = _run("scan", "--json", str(racine))
+    assert resultat.exit_code == EXIT_FINDINGS
+    document = json.loads(resultat.stdout, parse_constant=_refuse_non_finite)
+    _scan_validator().validate(document)
+    assert document["count"] == len(document["findings"]) == 1
+    assert set(document) == {"schema", "scope", "count", "findings"}
+
+
+def test_scan_schema_refuses_invalid_documents() -> None:
+    """Le schéma fige le contrat : valeur, enum, fermeture et items Finding."""
+    validator = _scan_validator()
+    base = {"schema": "heimdall.scan.v1", "scope": "staged", "count": 0, "findings": []}
+    assert validator.is_valid(base)
+    for invalide in (
+        dict(base, schema="heimdall.scan.v2"),
+        dict(base, scope="historique"),
+        dict(base, count="1"),
+        dict(base, count=-1),
+        dict(base, findings=[{"file": "x.py"}]),  # Finding incomplet
+        dict(base, extra=True),  # contrat fermé
+    ):
+        assert not validator.is_valid(invalide), invalide
+    # `count` cohérent avec `findings` : inexprimable en JSON Schema pur,
+    # vérifié côté test (`test_scan_json_output_validates_against_the_schema`).
+    assert base["count"] == len(base["findings"])
 
 
 def test_scan_ci_summarises_on_stderr(tmp_path: Path) -> None:
@@ -529,6 +674,25 @@ def test_parse_staged_raw_accepts_sha256_objects() -> None:
     brut = b":000000 100644 " + b"0" * 64 + b" " + b"a" * 64 + b" A\x00vendor/x.py\x00"
     changements = parse_staged_raw(brut)
     assert [(c.path, c.blob) for c in changements] == [("vendor/x.py", "a" * 64)]
+
+
+def test_parse_staged_raw_skips_gitlinks() -> None:
+    """Revue (LOW) : un mode 160000 (sous-module) n'a aucun blob à scanner.
+
+    Le SHA indexé désigne un commit, pas un blob : ignoré. En revanche, un
+    passage gitlink → fichier (`T` vers 100644) porte un vrai blob et reste
+    scanné.
+    """
+    brut = (
+        b":000000 160000 " + b"0" * 40 + b" " + b"a" * 40 + b" A\x00sub\x00"
+        b":160000 100644 " + b"c" * 40 + b" " + b"d" * 40 + b" T\x00converti.py\x00"
+        b":000000 100644 0000000 " + b"b" * 40 + b" A\x00app.py\x00"
+    )
+    changements = parse_staged_raw(brut)
+    assert [(c.path, c.blob) for c in changements] == [
+        ("converti.py", "d" * 40),
+        ("app.py", "b" * 40),
+    ]
 
 
 @pytest.mark.parametrize(
