@@ -107,7 +107,13 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
         for candidate in (absolute, *absolute.parents):
             if candidate.is_symlink():
                 raise ScanError(_SCAN_ERROR)
-        return absolute.resolve(strict=True)
+        resolved = absolute.resolve(strict=True)
+        # Course symlink (check-then-resolve) : si un composant a été remplacé
+        # entre le `lstat` et le `resolve`, le résolu diffère du demandé et la
+        # racine serait détournée hors périmètre — refus au lieu de suivre.
+        if resolved != absolute:
+            raise ScanError(_SCAN_ERROR)
+        return resolved
     except (OSError, RuntimeError):
         raise ScanError(_SCAN_ERROR) from None
 
