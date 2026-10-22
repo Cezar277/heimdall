@@ -158,7 +158,14 @@ est vérifiée sur l'entropie décodée (KEK brute vs pepper UTF-8) : deux
 représentations d'une même clé sont refusées, pas seulement la copie exacte des
 chaînes (invariant 5). Chaque ciphertext
 est lié par AAD au triplet `(project, env, name)` ; la contrainte SQLite
-`UNIQUE(project_id, env, name)` assure l'anti-écrasement entre workers. Le backend
+`UNIQUE(project_id, env, name)` assure l'anti-écrasement entre workers. Le nonce
+AES-GCM de 96 bits est tiré de l'aléatoire du système (`os.urandom`) **à chaque
+chiffrement** (ticket #67) : il n'est ni un compteur ni dérivé de l'heure, donc
+jamais réutilisé avec la même clé, et le blob stocké contient
+`nonce + ciphertext + tag` (l'étiquette GCM de 16 octets est déjà en fin de
+ciphertext). Deux chiffremens de la même valeur donnent donc deux blobs
+différents, et un blob copié sur un autre secret échoue à l'authentification
+(AAD différent). Le backend
 mémoire, réservé aux tests/développement, chiffre aussi son dictionnaire avec une
 KEK éphémère mais reste strictement mono-processus (`workers=1`). Aucune KEK
 éphémère n'est acceptée pour des données SQLite persistées : démarrage fail-closed.
