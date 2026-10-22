@@ -15,10 +15,12 @@ docs/security/requirements.md), `4ffbf8515eaccb0a3e4595d5c2d06d64d231ce31`
 (ADR-001/ADR-002).
 
 Les permaliens de code épinglent `b38dec1…` ; ceux de documentation épinglent
-`f4dc3c8…` (ADR-002) et `81a67df…` (ADR-001). Aucun fichier de production ni
-de test ne change après `b38dec1…` : contrôle effectué avec
-`git diff b38dec179de6baf22fefd50056014e8ea26fc185 HEAD -- heimdall tests`
-(sortie vide au moment de l'archivage de cette fiche).
+`f4dc3c8…` (ADR-002) et `81a67df…` (ADR-001). Cette fiche décrit la révision
+`b38dec1…` **avant** l'intégration `main` et la restauration post-merge
+(`11ff992`, `420ec98`, `c6b04ea`) : après ces commits, `heimdall/scanner`
+suit l'architecture #53/#54 (`finding.py`, `interface.py`,
+`signatures/` en paquet) et `git diff b38dec1… HEAD -- heimdall tests`
+n'est plus vide. Re-pinner sur le SHA final du merge avant clôture SAMM.
 
 | Exigence vérifiée | Implémentation (module + ligne) | Test et preuve permanente | Résultat local |
 |---|---|---|---|
