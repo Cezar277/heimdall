@@ -19,13 +19,14 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+import typer
 from support.git_repo import GitRepo
 from typer.testing import CliRunner
 
 from heimdall.cli.main import app
 from heimdall.cli.scan import EXIT_CLEAN, EXIT_ERROR, EXIT_FINDINGS, JSON_SCHEMA
 from heimdall.mcp.errors import ToolFailure
-from heimdall.mcp.gitdiff import GitAccess, parse_staged_raw
+from heimdall.mcp.gitdiff import GitAccess, StagedChange, parse_staged_raw
 
 #: Exemple de clé AWS (documentation AWS) : jamais une clé fonctionnelle.
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
@@ -126,6 +127,36 @@ def test_scan_render_failure_exits_two_not_one(
     resultat = _run("scan", str(racine))
     assert resultat.exit_code == EXIT_ERROR
     assert "erreur inattendue" in resultat.stderr
+
+
+def test_scan_broken_stderr_still_exits_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue #166 (LOW) : stderr fermé -> 2 garanti, jamais 1 ni traceback.
+
+    Tout ``echo(..., err=True)`` lève ``BrokenPipeError``, y compris dans
+    les handlers d'erreur : l'écriture de secours est best-effort, et le
+    code 2 reste garanti (invariant 11).
+    """
+    original_echo = typer.echo
+
+    def echo_sans_stderr(message: object, err: bool = False, **kwargs: object) -> None:
+        if err:
+            raise BrokenPipeError("stderr fermé")
+        original_echo(message, err=err, **kwargs)
+
+    monkeypatch.setattr(typer, "echo", echo_sans_stderr)
+    # 1. Chemin d'erreur : racine absente -> handler best-effort -> 2.
+    resultat = _run("scan", str(tmp_path / "absent-epipe"))
+    assert resultat.exit_code == EXIT_ERROR
+    # 2. Chemin nominal --ci : le résumé stderr échoue -> 2, pas 0. Le
+    # verdict n'a pas pu être consigné : fail-closed, pas de 0.
+    racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
+    resultat = _run("scan", "--ci", str(racine))
+    assert resultat.exit_code == EXIT_ERROR
+    # 3. Sans --ci, stdout suffit : stderr cassé n'empêche pas le 0.
+    resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_CLEAN
 
 
 def test_scan_tree_refuses_too_many_files(
@@ -324,6 +355,51 @@ def test_scan_staged_skips_a_binary_blob(git_repo: GitRepo) -> None:
     git_repo.stage("image.png", "app.py")
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_CLEAN
+
+
+def test_scan_staged_polyglot_binary_header_is_scanned(git_repo: GitRepo) -> None:
+    """Revue #166 : en-tête binaire + texte clair (sans NUL) -> **scanné**.
+
+    ``decode_text`` ne saute un blob que sur signature binaire **et**
+    contenu majoritairement binaire : un faux PNG qui porte un secret en
+    clair est analysé, pas ignoré en silence.
+    """
+    git_repo.write_bytes(
+        "faux.png", b"\x89PNG\r\n\x1a\n" + f'AWS = "{FAKE_AWS_KEY}"\n'.encode()
+    )
+    git_repo.stage("faux.png")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert "faux.png:" in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.output
+
+
+def test_scan_staged_concurrent_index_change_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue #166 (LOW) : index modifié pendant le scan -> 2, jamais 0/1.
+
+    Un ``git add`` concurrent après le snapshot ne figure pas dans la liste
+    mais sera committé : le re-contrôle final refuse le verdict périmé.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
+    original = GitAccess.staged_changes
+    appels = 0
+
+    def snapshot_changeant(self: GitAccess) -> list[StagedChange]:
+        nonlocal appels
+        appels += 1
+        changes = original(self)
+        if appels > 1:
+            # Fichier ajouté après le snapshot : la liste finale diverge.
+            return [*changes, StagedChange(path="concurrent.py", blob="e" * 40)]
+        return changes
+
+    monkeypatch.setattr(GitAccess, "staged_changes", snapshot_changeant)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
 
 
 def test_scan_staged_refuses_too_many_files(

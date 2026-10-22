@@ -67,6 +67,13 @@ fichier et laissé tel quel reste signalé. Les dépôts **SHA-1 et SHA-256**
 (`--object-format=sha256`) sont supportés : les noms d'objets de 40 ou 64
 caractères hexadécimaux sont acceptés.
 
+Les lectures sont adressées par SHA : un `git add` concurrent ne peut pas
+corrompre un blob déjà lu, mais la **liste** figée au départ peut devenir
+périmée (un fichier ajouté après le snapshot serait committé sans avoir été
+scanné). L'index est donc **relu après l'analyse**, et toute divergence
+refuse le scan (code 2) : un verdict sur un snapshot périmé ne vaut ni 0
+ni 1.
+
 ## Bornes
 
 Le scan est **borné** dans les deux périmètres : au-delà, il est refusé
@@ -91,11 +98,14 @@ dépôt réel tout en restant déterministes.
 | `2` | erreur d'outillage : le périmètre n'a **pas** pu être analysé en entier |
 
 Le code 2 est le refus par défaut : racine absente ou illisible, index en
-conflit de fusion, blob illisible ou trop gros, clé d'empreinte indisponible,
-git absent, erreur inattendue. **Jamais 0 après une erreur** : en CI, un scan
-raté ne doit pas laisser passer le pipeline (REQ-SEC-07, invariant 11). Le
-code 1 est réservé aux secrets avérés : une panne d'outillage ne sort jamais
-en 1.
+conflit de fusion, blob illisible ou trop gros, index modifié pendant le
+scan, clé d'empreinte indisponible, git absent, erreur inattendue. **Jamais
+0 après une erreur** : en CI, un scan raté ne doit pas laisser passer le
+pipeline (REQ-SEC-07, invariant 11). Le code 1 est réservé aux secrets
+avérés : une panne d'outillage ne sort jamais en 1 — y compris quand
+l'écriture du rapport ou du résumé échoue elle-même (EPIPE, stderr fermé) :
+les messages d'erreur sont écrits en best-effort et le code 2 reste
+garanti.
 
 ## Sortie
 

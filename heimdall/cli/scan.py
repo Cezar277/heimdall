@@ -69,6 +69,7 @@ MAX_STAGED_BYTES: Final[int] = 32 * 1024 * 1024
 _MSG_NOT_A_REPO: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_MANY_FILES: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_LARGE: Final[str] = "scan impossible : entrée non analysable"
+_MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 
 #: Libellés du périmètre, affichés à l'humain.
 _SCOPE_LABELS: Final[dict[str, str]] = {
@@ -127,6 +128,13 @@ def _collect_staged(root: Path) -> ScanReport:
     qui est jugé, quel que soit son chemin (``vendor/evil.py``,
     ``package-lock.json``…). Un blob binaire connu est ignoré (rien à
     analyser) ; un blob illisible ou trop gros est une **erreur** (code 2).
+
+    Les lectures sont adressées par SHA : un ``git add`` concurrent ne peut
+    pas corrompre un blob déjà lu, mais la **liste** figée au départ peut
+    devenir périmée (un fichier ajouté après le snapshot sera committé sans
+    avoir été scanné). L'index est donc relu après l'analyse, et toute
+    divergence refuse le scan (code 2) : un verdict sur un snapshot périmé
+    ne vaut ni 0 ni 1.
     """
     access = GitAccess(root)
     if not access.is_repository():
@@ -152,6 +160,10 @@ def _collect_staged(root: Path) -> ScanReport:
         # ignoré en silence.
         targets.append(FileTarget(path=change.path, text=text))
     findings = TargetScanner(SignatureEngine()).scan_all(targets)
+    if access.staged_changes() != changes:
+        # L'index a bougé pendant le scan : le snapshot analysé ne décrit
+        # plus ce qui sera committé. Refus, pas de verdict périmé.
+        raise ScanError(_MSG_INDEX_CHANGED)
     return ScanReport(scope=SCOPE_STAGED, findings=tuple(findings))
 
 

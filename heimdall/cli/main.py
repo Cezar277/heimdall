@@ -43,6 +43,21 @@ app = typer.Typer(
 app.add_typer(vault_app, name="vault")
 
 
+def _echo_stderr_best_effort(message: str) -> None:
+    """Écrit un message sur stderr sans jamais lever.
+
+    En CI, stderr peut être fermé : un ``typer.echo(..., err=True)`` qui lève
+    (``BrokenPipeError``, ``OSError``) dans un handler d'erreur ferait sortir
+    une traceback Typer en exit 1 — réservé aux secrets avérés (invariant
+    11). L'écriture de secours est donc best-effort : en cas d'échec, elle
+    est abandonnée en silence, et l'appelant sort en 2.
+    """
+    try:
+        typer.echo(message, err=True)
+    except Exception:  # noqa: S110 - best-effort volontaire, voir la docstring.
+        pass
+
+
 @app.callback()
 def _root(
     version: bool = typer.Option(False, "--version", help="Affiche la version et sort."),
@@ -108,13 +123,15 @@ def scan(
             )
     except (ScanError, ToolFailure):
         # Erreur d'outillage : le périmètre n'a pas été analysé en entier.
-        # Jamais 0, jamais 1 : c'est 2 (REQ-SEC-07).
-        typer.echo("heimdall scan : scan impossible (erreur d'outillage).", err=True)
+        # Jamais 0, jamais 1 : c'est 2 (REQ-SEC-07). L'écriture est
+        # best-effort (stderr fermé en CI) : elle ne doit pas lever à son
+        # tour, sinon la traceback sortirait en 1.
+        _echo_stderr_best_effort("heimdall scan : scan impossible (erreur d'outillage).")
         raise typer.Exit(code=2) from None
     except Exception:
-        # Panne inattendue (collecte ou rendu) : même contrat, message
-        # statique (invariant 8).
-        typer.echo("heimdall scan : erreur inattendue pendant le scan.", err=True)
+        # Panne inattendue (collecte, rendu ou résumé --ci) : même contrat,
+        # message statique (invariant 8), écriture best-effort.
+        _echo_stderr_best_effort("heimdall scan : erreur inattendue pendant le scan.")
         raise typer.Exit(code=2) from None
     raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
 

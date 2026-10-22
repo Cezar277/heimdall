@@ -85,10 +85,11 @@ GIT_CONFIG_OVERRIDES: Final[tuple[str, ...]] = ("-c", "core.fsmonitor=false")
 #: Options de l'énumération de l'index (#29) : la liste des fichiers **ajoutés
 #: ou modifiés** dans l'index, avec le SHA du blob indexé. `--raw -z` : un
 #: en-tête et un chemin, tous deux NUL-terminés. `--no-abbrev` impose le SHA
-#: **complet** (40 caractères) : un SHA abrégé ne désigne pas un objet de façon
-#: univoque et ne peut donc pas être relu. `--no-renames` rend la sortie
-#: déterministe (un renommage devient une suppression + un ajout : pas de
-#: score de similarité, donc pas de cas ambigu à parser).
+#: **complet** (40 caractères en SHA-1, 64 en SHA-256) : un SHA abrégé ne
+#: désigne pas un objet de façon univoque et ne peut donc pas être relu.
+#: `--no-renames` rend la sortie déterministe (un renommage devient une
+#: suppression + un ajout : pas de score de similarité, donc pas de cas
+#: ambigu à parser).
 STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
     "diff",
     "--cached",
@@ -210,9 +211,10 @@ def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
 class StagedChange:
     """Un fichier ajouté ou modifié dans l'index, et le blob qui le porte.
 
-    ``blob`` est le SHA de l'objet **indexé** (40 caractères hexadécimaux) :
-    c'est lui que la CLI scanne (#29). Le contenu n'est jamais rangé ici :
-    il vit dans le dépôt d'objets, et l'appelant n'en tire qu'une empreinte.
+    ``blob`` est le SHA de l'objet **indexé** (40 caractères en SHA-1, 64 en
+    SHA-256) : c'est lui que la CLI scanne (#29). Le contenu n'est jamais
+    rangé ici : il vit dans le dépôt d'objets, et l'appelant n'en tire
+    qu'une empreinte.
     """
 
     path: str
