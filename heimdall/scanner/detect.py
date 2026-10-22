@@ -14,7 +14,9 @@ Invariants :
 - les chemins sont relatifs, en ``/``, sans ``..`` ni segment vide ;
 - les liens symboliques ne sont jamais suivis, ni dans le périmètre, ni dans
   le chemin de la racine, et les fichiers restent confinés à la racine résolue ;
-- les lectures sont bornées (1 Mio) et les regex sont linéaires et bornées.
+- les lectures sont bornées (1 Mio) et les regex sont linéaires et bornées ;
+- en mode strict (#29), seules les exclusions **techniques** de #59 restent :
+  les répertoires et fichiers tiers textuels sont parcourus.
 
 L'interface est figée par #53 : ``Finding`` est l'unique classe canonique de
 ``heimdall.scanner.finding`` (réexportée ici pour compatibilité historique),
@@ -128,15 +130,23 @@ class Scanner:
 
     Toute erreur de lecture interrompt le scan en ``ScanError`` (fail-closed) :
     aucun résultat partiel n'est jamais retourné.
+
+    ``strict=True`` (mode strict, livré par #29 pour la CLI ``heimdall
+    scan``) ne conserve que les exclusions **techniques** de #59 : les
+    répertoires et fichiers tiers **textuels** (``vendor/``,
+    ``third_party/``, lockfiles, ``.gitignore``…) sont alors parcourus, parce
+    qu'un secret y est un secret. Le comportement par défaut (``strict=False``)
+    reste la politique #59 inchangée.
     """
 
-    __slots__ = ("_hasher", "_root", "_single")
+    __slots__ = ("_hasher", "_root", "_single", "_strict")
 
     def __init__(
         self,
         root: str | os.PathLike[str],
         *,
         hasher: SnippetHasher | None = None,
+        strict: bool = False,
     ) -> None:
         resolved = _resolve_root(root)
         if resolved.is_dir():
@@ -148,6 +158,7 @@ class Scanner:
         else:
             raise ScanError(_SCAN_ERROR)
         self._hasher = SnippetHasher() if hasher is None else hasher
+        self._strict = strict
 
     def scan(self) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.
@@ -190,7 +201,8 @@ class Scanner:
             directories[:] = sorted(
                 name
                 for name in directories
-                if not is_excluded_directory(name) and not (current_path / name).is_symlink()
+                if not is_excluded_directory(name, strict=self._strict)
+                and not (current_path / name).is_symlink()
             )
             for name in sorted(filenames):
                 path = current_path / name
@@ -198,7 +210,7 @@ class Scanner:
                     relative = path.relative_to(self._root).as_posix()
                 except ValueError:
                     raise ScanError(_SCAN_ERROR) from None
-                if is_excluded(relative):
+                if is_excluded(relative, strict=self._strict):
                     continue
                 try:
                     if path.is_symlink():
@@ -318,9 +330,19 @@ class Scanner:
         )
 
 
-def scan(root: str | os.PathLike[str], *, hasher: SnippetHasher | None = None) -> list[Finding]:
-    """Analyse ``root`` et retourne des objets :class:`Finding`."""
-    return Scanner(root, hasher=hasher).scan()
+def scan(
+    root: str | os.PathLike[str],
+    *,
+    hasher: SnippetHasher | None = None,
+    strict: bool = False,
+) -> list[Finding]:
+    """Analyse ``root`` et retourne des objets :class:`Finding`.
+
+    ``strict=True`` (mode strict de #29) ne conserve que les exclusions
+    techniques de #59 : ``vendor/``, lockfiles et fichiers de contrôle sont
+    alors parcourus.
+    """
+    return Scanner(root, hasher=hasher, strict=strict).scan()
 
 
 def find_candidates(path: str) -> list[dict[str, object]]:

@@ -14,6 +14,10 @@ verrouillé :
   parent de la racine : git n'y entre jamais, donc aucun dépôt au-dessus de
   la racine n'est découvert — le refus vient de git, pas seulement de
   ``is_repository()`` (invariant 3) ;
+- **aucun fetch différé**. ``GIT_NO_LAZY_FETCH`` vaut ``1`` : dans un clone
+  partiel, ``git cat-file`` irait chercher l'objet manquant **sur le
+  réseau** — interdit ici (invariant « 100 % local »). L'objet manquant est
+  alors une erreur, jamais un download ;
 - **stdin fermé**. ``stdin=subprocess.DEVNULL`` sur chaque appel : le fils
   n'hérite pas du pipe JSON-RPC du serveur, donc aucune sous-commande
   future ne peut en consommer les octets ni s'y bloquer ;
@@ -34,6 +38,12 @@ verrouillé :
   caractères par ligne) : au-delà, la sortie est tronquée et le drapeau
   ``truncated`` est posé, jamais un résultat partiel présenté comme
   complet.
+
+Depuis #29, ce module expose aussi la lecture **des blobs de l'index**
+(``staged_changes``/``blob_size``/``blob_bytes``) : c'est ce que la CLI
+``heimdall scan --staged`` analyse, sans aucune exclusion de chemin. Les
+mêmes garanties s'appliquent : argv figé (seul le SHA, validé hexadécimal,
+varie), environnement confiné, stdin fermé, aucun fetch.
 """
 
 import os
@@ -71,6 +81,24 @@ DIFF_ARGUMENTS: Final[tuple[str, ...]] = (
 # aucun override pager — pas de surface ajoutée.
 GIT_CONFIG_OVERRIDES: Final[tuple[str, ...]] = ("-c", "core.fsmonitor=false")
 
+#: Options de l'énumération de l'index (#29) : la liste des fichiers **ajoutés
+#: ou modifiés** dans l'index, avec le SHA du blob indexé. `--raw -z` : un
+#: en-tête et un chemin, tous deux NUL-terminés. `--no-abbrev` impose le SHA
+#: **complet** (40 caractères) : un SHA abrégé ne désigne pas un objet de façon
+#: univoque et ne peut donc pas être relu. `--no-renames` rend la sortie
+#: déterministe (un renommage devient une suppression + un ajout : pas de
+#: score de similarité, donc pas de cas ambigu à parser).
+STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
+    "diff",
+    "--cached",
+    "--raw",
+    "-z",
+    "--no-abbrev",
+    "--no-renames",
+    "--no-ext-diff",
+    "--no-textconv",
+)
+
 
 # Environnement minimal du sous-processus git. Aucune variable de
 # redirection de dépôt (GIT_DIR, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY…),
@@ -88,6 +116,10 @@ def confined_environment(root: Path) -> dict[str, str]:
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",  # aucun verrou optionnel pris dans .git/
+        # Clone partiel : sans cette variable, `git cat-file` irait chercher
+        # l'objet manquant SUR LE RÉSEAU. Heimdall est 100 % local : l'objet
+        # manquant doit être une erreur, jamais un download.
+        "GIT_NO_LAZY_FETCH": "1",
         # Plafond de découverte = le PREMIER dossier que git ascendererait,
         # c'est-à-dire le PARENT de la racine : git refuse d'y entrer, donc
         # aucun dépôt au-dessus de la racine n'est découvert (invariant 3).
@@ -171,6 +203,19 @@ def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
         proc.wait()
     except (subprocess.TimeoutExpired, OSError):
         pass
+
+
+@dataclass(frozen=True)
+class StagedChange:
+    """Un fichier ajouté ou modifié dans l'index, et le blob qui le porte.
+
+    ``blob`` est le SHA de l'objet **indexé** (40 caractères hexadécimaux) :
+    c'est lui que la CLI scanne (#29). Le contenu n'est jamais rangé ici :
+    il vit dans le dépôt d'objets, et l'appelant n'en tire qu'une empreinte.
+    """
+
+    path: str
+    blob: str
 
 
 class GitAccess:
@@ -328,6 +373,48 @@ class GitAccess:
 
         return raw, False
 
+    def staged_changes(self) -> list[StagedChange]:
+        """Fichiers **ajoutés ou modifiés** dans l'index, et leur blob.
+
+        Utilisé par la CLI ``heimdall scan --staged`` (#29) : l'index est la
+        source de vérité de « ce que le commit va contenir », et le contenu
+        indexé est lu **blob par blob**, sans aucune exclusion de chemin.
+
+        L'index est non résolu (conflit de fusion) ou la sortie est illisible
+        → ``ToolFailure`` : le scan ne peut alors pas prétendre avoir tout vu.
+        """
+        completed = self.execute(STAGED_RAW_ARGUMENTS)
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        return parse_staged_raw(completed.stdout)
+
+    def blob_size(self, blob: str) -> int:
+        """Taille en octets d'un objet git, **sans** le lire.
+
+        L'appelant borne ainsi la lecture : un blob géant ne doit jamais
+        être chargé en mémoire (déni de service).
+        """
+        completed = self.execute(("cat-file", "-s", _checked_object(blob)))
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        try:
+            return int(completed.stdout.strip())
+        except ValueError:
+            raise ToolFailure("INTERNAL") from None
+
+    def blob_bytes(self, blob: str) -> bytes:
+        """Contenu **brut** d'un blob (celui de l'index, pas de la copie de
+        travail).
+
+        Aucun filtre ``textconv``, aucune conversion ``CRLF`` : c'est le
+        contenu que git a indexé, octet pour octet. Le secret y figure —
+        l'appelant ne le **montre** jamais (il n'en garde qu'une empreinte).
+        """
+        completed = self.execute(("cat-file", "blob", _checked_object(blob)))
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        return completed.stdout
+
 
 @dataclass(frozen=True)
 class DiffEntry:
@@ -342,6 +429,93 @@ class DiffEntry:
     binary: bool
     lines: tuple[tuple[int, str], ...]
     line_overflow: bool = False
+
+
+#: En-tête du format « raw » de git : ``:mode mode sha sha statut``.
+_RAW_HEADER_FIELDS: Final[int] = 5
+#: SHA « nul » de git : l'objet n'existe pas (ajout ou suppression).
+_NULL_OBJECT: Final[str] = "0" * 40
+#: Un nom d'objet git : 40 caractères hexadécimaux (SHA-1).
+_OBJECT_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{40}")
+#: Statuts de `--raw` dont le blob indexé doit être scanné : ajout,
+#: modification, changement de type (le nouveau contenu est scanné).
+_SCAN_STATUSES: Final[frozenset[str]] = frozenset({"A", "M", "T"})
+
+
+def _checked_object(blob: str) -> str:
+    """Valide un nom d'objet git avant de le mettre dans l'argv.
+
+    Un SHA est hexadécimal : cette garde interdit qu'une chaîne venue d'une
+    sortie git (ou d'un appelant) soit interprétée comme une option par git
+    (``--upload-pack=…``), et qu'une valeur inattendue parte en argument.
+    """
+    if _OBJECT_PATTERN.fullmatch(blob) is None:
+        raise ToolFailure("INTERNAL")
+    return blob
+
+
+def parse_staged_raw(raw: bytes) -> list[StagedChange]:
+    """Analyse la sortie de ``git diff --cached --raw -z``.
+
+    Rend la liste des fichiers **ajoutés ou modifiés** dans l'index (les
+    suppressions sont ignorées : il n'y a plus de blob à scanner), avec le
+    SHA du blob indexé.
+
+    Sortie illisible, statut inconnu ou index non résolu (conflit de fusion,
+    statut ``U``) → ``ToolFailure`` : mieux vaut une panne qu'un verdict
+    « propre » sur un index qu'on n'a pas su lire (invariant 1).
+    """
+    text = raw[:-1] if raw.endswith(b"\0") else raw
+    if not text:
+        return []
+    parts = text.split(b"\0")
+    if len(parts) % 2 != 0:
+        # En-tête et chemin doivent s'alterner : une sortie tronquée est
+        # illisible, et une liste partielle ne vaut pas verdict propre.
+        raise ToolFailure("INTERNAL")
+    changes: list[StagedChange] = []
+    for position in range(0, len(parts), 2):
+        change = _staged_change(parts[position], parts[position + 1])
+        if change is not None:
+            changes.append(change)
+    return changes
+
+
+def _staged_change(header: bytes, path_bytes: bytes) -> StagedChange | None:
+    """Un changement de l'index, ou ``None`` pour un fichier supprimé."""
+    fields = header.split(b" ")
+    if len(fields) != _RAW_HEADER_FIELDS or not fields[0].startswith(b":"):
+        raise ToolFailure("INTERNAL")
+    try:
+        status = fields[4].decode("ascii")
+    except UnicodeDecodeError:
+        raise ToolFailure("INTERNAL") from None
+    if not status:
+        raise ToolFailure("INTERNAL")
+    code = status[0]
+    if code == "U":
+        # Index non résolu (conflit de fusion) : git n'en montre aucun
+        # contenu, et l'index ne correspond à aucun commit. Refus.
+        raise ToolFailure("INTERNAL")
+    if code == "D":
+        return None
+    if code not in _SCAN_STATUSES:
+        raise ToolFailure("INTERNAL")
+    try:
+        blob = fields[3].decode("ascii")
+    except UnicodeDecodeError:
+        raise ToolFailure("INTERNAL") from None
+    if blob == _NULL_OBJECT or _OBJECT_PATTERN.fullmatch(blob) is None:
+        raise ToolFailure("INTERNAL")
+    try:
+        path = path_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ToolFailure("INTERNAL") from None
+    if not is_rel_path(path):
+        # Un nom de fichier que le contrat ne sait pas représenter ne peut
+        # pas être montré ni rejoué : la sortie est refusée, pas tronquée.
+        raise ToolFailure("INTERNAL")
+    return StagedChange(path=path, blob=blob)
 
 
 @dataclass

@@ -5,6 +5,7 @@ import os
 import pickle
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from typer.testing import CliRunner
@@ -50,8 +51,8 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(version.exit_code, 0)
         self.assertIn(heimdall.__version__, version.output)
 
-    def test_scan_is_fail_closed_until_29(self) -> None:
-        """Scanner #22 livré mais commande non branchée (#29) : exit 2."""
+    def test_scan_is_wired_and_writes_nothing(self) -> None:
+        """#29 livré : la commande scan est branchée et reste en lecture seule."""
         runner = CliRunner()
         previous = os.getcwd()
         for argv in (["scan"], ["scan", "--ci"]):
@@ -62,16 +63,19 @@ class PackageSmokeTests(unittest.TestCase):
                         result = runner.invoke(heimdall.cli.main.app, argv)
                     finally:
                         os.chdir(previous)
-                    self.assertEqual(result.exit_code, 2)
-                    self.assertIn("#29", result.output)
-                    # Invariant 11 : 2 = panne d'outillage, jamais 1 (secrets).
-                    # Le stub n'écrit aucun fichier.
+                    # Un dépôt vide est réellement propre : 0, pas 2.
+                    self.assertEqual(result.exit_code, 0)
+                    # Le scan est une lecture : aucun fichier n'est écrit.
                     self.assertEqual(os.listdir(tmp), [])
 
     def test_scan_reports_on_stderr(self) -> None:
-        result = CliRunner().invoke(heimdall.cli.main.app, ["scan"])
+        """Erreur d'outillage : message sur stderr, code 2 (jamais 0, jamais 1)."""
+        result = CliRunner().invoke(
+            heimdall.cli.main.app,
+            ["scan", str(Path(tempfile.gettempdir()) / "heimdall-absent-29")],
+        )
         self.assertEqual(result.exit_code, 2)
-        self.assertIn("#29", result.stderr)
+        self.assertIn("scan impossible", result.stderr)
 
     def test_cli_mcp_handles_broken_pipe_and_exception(self) -> None:
         """CLI `heimdall mcp` : BrokenPipeError -> 0, exception inattendue -> 2 sans fuite."""

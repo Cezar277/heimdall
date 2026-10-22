@@ -61,7 +61,10 @@ def test_incomplete_scan_never_clean(tmp_path: Path) -> None:
     assert "fail-closed" in src
     assert "NotImplementedError" not in src
 
-    # 5. CLI : codes 0 propre / 1 secret / 2 erreur ; non branché (#29) => 2.
+    # 5. CLI : codes 0 propre / 1 secret / 2 erreur. Le contrat est figé
+    #    dans la docstring de la commande (invariant 11) ; la preuve
+    #    d'exécution (propre => 0, secret => 1, racine absente => 2, aucune
+    #    écriture) est dans `tests/test_cli_scan.py`.
     cli_src = CLI_MAIN.read_text(encoding="utf-8")
     assert "0 propre, 1 secrets détectés, 2 erreur" in cli_src
     assert "raise typer.Exit(code=2)" in cli_src

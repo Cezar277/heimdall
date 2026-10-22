@@ -1,0 +1,218 @@
+"""Scan de la CLI ``heimdall scan`` (#29).
+
+Ce module porte la **logique** du scan ; ``heimdall/cli/main.py`` ne fait que
+traduire le résultat en code de sortie et en affichage. Il ne fait aucune
+écriture : un scan est une lecture, jamais une remédiation (celle-ci arrive
+avec #32, et seulement après validation humaine Y/N/E).
+
+Deux périmètres, un seul verdict :
+
+- ``working-tree`` (par défaut) : l'arbre de travail, en **mode strict** —
+  seules les exclusions *techniques* de #59 restent (binaires, répertoires
+  générés) ; ``vendor/``, ``third_party/``, les lockfiles et les fichiers de
+  contrôle sont parcourus, parce qu'un secret y est un secret ;
+- ``staged`` (``--staged``) : les blobs **ajoutés ou modifiés** dans l'index
+  git, lus blob par blob, **sans aucune exclusion de chemin**. C'est ce que
+  le commit va contenir, donc ce que le hook et la CI doivent juger.
+
+Invariant 8 : **aucun secret n'est jamais affiché**. Un ``Finding`` ne porte
+qu'une empreinte HMAC-SHA-256 et une entropie ; la sortie de la CLI ne fait
+que relire ces champs. Les messages d'erreur sont **statiques** : ni le
+chemin fourni, ni le contenu analysé ne sont reflétés.
+
+Invariant fail-closed (REQ-SEC-07) : une entrée non analysable (racine
+absente, blob illisible, index en conflit, fichier modifié pendant la
+lecture) est une **erreur** — code 2 — jamais un verdict « propre ». Un
+résultat partiel n'est jamais présenté comme complet.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Final
+
+from heimdall.mcp.errors import ToolFailure
+from heimdall.mcp.gitdiff import GitAccess
+from heimdall.scanner.detect import MAX_FILE_BYTES
+from heimdall.scanner.detect import Scanner as TreeScanner
+from heimdall.scanner.errors import ScanError
+from heimdall.scanner.exclusions import decode_text
+from heimdall.scanner.finding import Finding
+from heimdall.scanner.interface import FileTarget
+from heimdall.scanner.interface import Scanner as TargetScanner
+from heimdall.scanner.signature_engine import SignatureEngine
+
+#: Codes de sortie (invariant 11, REQ-SEC-07).
+#: 0 = aucun secret détecté, 1 = secrets détectés, 2 = erreur d'outillage.
+EXIT_CLEAN: Final[int] = 0
+EXIT_FINDINGS: Final[int] = 1
+EXIT_ERROR: Final[int] = 2
+
+#: Périmètre « arbre de travail ».
+SCOPE_TREE: Final[str] = "working-tree"
+#: Périmètre « index git ».
+SCOPE_STAGED: Final[str] = "staged"
+
+#: Version du contrat de sortie JSON (``--json``).
+JSON_SCHEMA: Final[str] = "heimdall.scan.v1"
+
+#: Plafond du nombre de blobs indexés analysés en une passe. Au-delà, le
+#: scan est **refusé** (code 2) : un résultat tronqué ne vaut pas verdict
+#: propre.
+MAX_STAGED_FILES: Final[int] = 1000
+#: Plafond du volume total de blobs indexés lus (octets).
+MAX_STAGED_BYTES: Final[int] = 32 * 1024 * 1024
+
+#: Messages d'erreur **statiques** (invariant 8 : aucune entrée reflétée).
+_MSG_NOT_A_REPO: Final[str] = "scan impossible : entrée non analysable"
+_MSG_TOO_MANY_FILES: Final[str] = "scan impossible : entrée non analysable"
+_MSG_TOO_LARGE: Final[str] = "scan impossible : entrée non analysable"
+
+#: Libellés du périmètre, affichés à l'humain.
+_SCOPE_LABELS: Final[dict[str, str]] = {
+    SCOPE_TREE: "arbre de travail (mode strict : exclusions techniques seules)",
+    SCOPE_STAGED: "index git (blobs ajoutés ou modifiés, aucune exclusion de chemin)",
+}
+
+#: Rappel du contrat de codes de sortie, affiché à l'humain.
+_CODES_LINE: Final[str] = (
+    "Codes de sortie : 0 = aucun secret, 1 = secrets détectés, 2 = erreur d'outillage."
+)
+
+#: Longueur de l'empreinte affichée à l'humain (le reste est dans le JSON).
+_HASH_PREFIX: Final[int] = 12
+
+
+@dataclass(frozen=True, slots=True)
+class ScanReport:
+    """Le résultat d'un scan : un périmètre et des Findings.
+
+    Les Findings ne contiennent aucun secret (contrat #14) : les reporter
+    tels quels, y compris dans le JSON, ne fuit rien.
+    """
+
+    scope: str
+    findings: tuple[Finding, ...]
+
+
+def collect(root: Path, *, staged: bool) -> ScanReport:
+    """Analyse ``root`` et rend ses Findings.
+
+    Lève ``ScanError`` (ou ``ToolFailure``) si le périmètre n'a pas pu être
+    analysé **en entier** : l'appelant transforme cela en code 2, jamais en
+    code 0.
+    """
+    if staged:
+        return _collect_staged(root)
+    return _collect_tree(root)
+
+
+def _collect_tree(root: Path) -> ScanReport:
+    """Scanne l'arbre de travail, en mode strict (#29).
+
+    ``strict=True`` ne conserve que les exclusions **techniques** de #59
+    (binaires, répertoires générés) : ``vendor/``, les lockfiles et les
+    fichiers de contrôle sont parcourus. Un secret y est un secret.
+    """
+    findings = TreeScanner(root, strict=True).scan()
+    return ScanReport(scope=SCOPE_TREE, findings=tuple(findings))
+
+
+def _collect_staged(root: Path) -> ScanReport:
+    """Scanne les blobs **ajoutés ou modifiés** de l'index git.
+
+    Aucune exclusion de chemin : c'est le contenu que le commit va contenir
+    qui est jugé, quel que soit son chemin (``vendor/evil.py``,
+    ``package-lock.json``…). Un blob binaire connu est ignoré (rien à
+    analyser) ; un blob illisible ou trop gros est une **erreur** (code 2).
+    """
+    access = GitAccess(root)
+    if not access.is_repository():
+        raise ScanError(_MSG_NOT_A_REPO)
+    changes = access.staged_changes()
+    if len(changes) > MAX_STAGED_FILES:
+        raise ScanError(_MSG_TOO_MANY_FILES)
+    targets: list[FileTarget] = []
+    total = 0
+    for change in changes:
+        size = access.blob_size(change.blob)
+        total += size
+        if size > MAX_FILE_BYTES or total > MAX_STAGED_BYTES:
+            raise ScanError(_MSG_TOO_LARGE)
+        data = access.blob_bytes(change.blob)
+        text = decode_text(data)
+        if text is None:
+            # Binaire reconnu : aucun texte à analyser. Ce n'est pas une
+            # exclusion de chemin, c'est une impossibilité technique.
+            continue
+        # `FileTarget` valide le chemin (contrat #14) : un chemin que le
+        # contrat ne sait pas représenter est une erreur, pas un fichier
+        # ignoré en silence.
+        targets.append(FileTarget(path=change.path, text=text))
+    findings = TargetScanner(SignatureEngine()).scan_all(targets)
+    return ScanReport(scope=SCOPE_STAGED, findings=tuple(findings))
+
+
+def render_json(report: ScanReport) -> str:
+    """Rend le rapport au format JSON (contrat machine ``--json``).
+
+    Le document contient le périmètre, le nombre de Findings et les Findings
+    eux-mêmes (les sept champs du contrat #14). Aucun secret : un Finding ne
+    porte qu'une empreinte et une entropie.
+    """
+    payload = {
+        "schema": JSON_SCHEMA,
+        "scope": report.scope,
+        "count": len(report.findings),
+        "findings": [finding.as_dict() for finding in report.findings],
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    )
+
+
+def render_text(report: ScanReport) -> str:
+    """Rend le rapport pour un humain.
+
+    Jamais la valeur d'un secret : ni le contenu analysé, ni un extrait de
+    ligne — seulement le chemin, le numéro de ligne, le type, l'entropie et
+    un début d'empreinte (qui permet de rapprocher deux scans du même
+    candidat sans le révéler).
+    """
+    lines = [f"heimdall scan : périmètre {_SCOPE_LABELS[report.scope]}"]
+    if not report.findings:
+        lines.append("Aucun secret détecté.")
+    else:
+        lines.append(f"{len(report.findings)} secret(s) détecté(s) :")
+        for finding in report.findings:
+            lines.append(
+                f"  {finding.file}:{finding.line}  type={finding.type}  "
+                f"entropie={finding.entropy}  "
+                f"empreinte={finding.snippet_hash[:_HASH_PREFIX]}…  "
+                f"source={finding.source}"
+            )
+    lines.append(_CODES_LINE)
+    return "\n".join(lines)
+
+
+__all__ = [
+    "EXIT_CLEAN",
+    "EXIT_ERROR",
+    "EXIT_FINDINGS",
+    "JSON_SCHEMA",
+    "MAX_STAGED_BYTES",
+    "MAX_STAGED_FILES",
+    "SCOPE_STAGED",
+    "SCOPE_TREE",
+    "ScanReport",
+    "ToolFailure",
+    "collect",
+    "render_json",
+    "render_text",
+]

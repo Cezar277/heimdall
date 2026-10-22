@@ -1,20 +1,37 @@
 """Point d'entrée ``heimdall`` — squelette du ticket #17.
 
 Les sous-commandes réelles arrivent avec leurs tickets :
-``scan`` (#29 branche le scanner #22 et #32 la validation Y/N/E),
-``vault`` (#25/#26/#64), ``mcp`` (#27). En attendant, comportement fail-closed :
-``scan`` bloque avec un message explicite au lieu d'inventer un verdict.
+``scan`` (#29 branche le scanner #22),
+``vault`` (#25/#26/#64), ``mcp`` (#27). La validation Y/N/E (#32) et le
+remplacement du secret arrivent plus tard : ``scan`` est aujourd'hui une
+lecture seule, sans dialogue.
 
 Codes de sortie (invariant 11) : 0 propre, 1 secrets détectés, 2 erreur
 d'outillage. Une commande non branchée est une panne d'outillage, donc 2 —
-jamais 1, réservé aux secrets avérés.
+jamais 1, réservé aux secrets avérés. Et **jamais 0 après une erreur** : un
+scan raté ne doit pas laisser passer un pipeline (c'est le piège du ticket
+#29, et l'exigence REQ-SEC-07).
+
+Invariant 8 : aucun message d'erreur ne reflète une entrée (chemin, contenu,
+candidat). Les messages sont statiques.
 """
+
+from pathlib import Path
 
 import typer
 
 import heimdall
+from heimdall.cli.scan import (
+    EXIT_CLEAN,
+    EXIT_FINDINGS,
+    ToolFailure,
+    collect,
+    render_json,
+    render_text,
+)
 from heimdall.cli.vault_keys import vault_app
 from heimdall.mcp.server import run_stdio
+from heimdall.scanner.errors import ScanError
 
 app = typer.Typer(
     name="heimdall",
@@ -38,12 +55,62 @@ def _root(
 @app.command()
 def scan(
     path: str = typer.Argument(".", help="Chemin du dépôt à analyser."),
-    ci: bool = typer.Option(False, "--ci", help="Mode CI : échoue si un secret reste en clair."),
+    ci: bool = typer.Option(
+        False,
+        "--ci",
+        help="Mode CI headless : verdict déterministe porté par le code de sortie.",
+    ),
+    staged: bool = typer.Option(
+        False,
+        "--staged",
+        help="Analyse les blobs de l'index (ajoutés ou modifiés) au lieu de l'arbre de travail.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Sortie JSON sur stdout (contrat machine heimdall.scan.v1).",
+    ),
 ) -> None:
-    """Scanne le diff (ou le dépôt) à la recherche de secrets."""
-    del path, ci  # #29 branchera le scanner réel ici.
-    typer.echo("heimdall scan: commande non branchée (voir #29) — refus par défaut.", err=True)
-    raise typer.Exit(code=2)
+    """Scanne le dépôt à la recherche de secrets (#29).
+
+    Par défaut, l'arbre de travail est analysé en **mode strict** : seules
+    les exclusions techniques de #59 restent (binaires, répertoires générés),
+    ``vendor/`` et les lockfiles sont donc parcourus. Avec ``--staged``, ce
+    sont les blobs **ajoutés ou modifiés** dans l'index git qui sont
+    analysés, sans aucune exclusion de chemin.
+
+    ``--ci`` active le mode headless : aucun dialogue, aucun LLM, aucun
+    réseau — le verdict est le code de sortie, et un résumé déterministe est
+    écrit sur stderr. ``--json`` remplace le rapport humain par le document
+    JSON du contrat ``heimdall.scan.v1``.
+
+    En cas de doute, **refus par défaut** : une entrée non analysable (racine
+    absente, index en conflit, fichier illisible) sort en 2, jamais en 0.
+    """
+    try:
+        report = collect(Path(path), staged=staged)
+    except (ScanError, ToolFailure):
+        # Erreur d'outillage : le périmètre n'a pas été analysé en entier.
+        # Jamais 0, jamais 1 : c'est 2 (REQ-SEC-07).
+        typer.echo("heimdall scan : scan impossible (erreur d'outillage).", err=True)
+        raise typer.Exit(code=2) from None
+    except Exception:
+        # Panne inattendue : même contrat, message statique (invariant 8).
+        typer.echo("heimdall scan : erreur inattendue pendant le scan.", err=True)
+        raise typer.Exit(code=2) from None
+    if json_output:
+        typer.echo(render_json(report))
+    else:
+        typer.echo(render_text(report))
+    if ci:
+        # Résumé déterministe sur stderr : le journal CI montre toujours le
+        # verdict, même si stdout est consommé par un parseur.
+        typer.echo(
+            f"heimdall scan : périmètre {report.scope}, "
+            f"{len(report.findings)} secret(s) détecté(s).",
+            err=True,
+        )
+    raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
 
 
 @app.command()

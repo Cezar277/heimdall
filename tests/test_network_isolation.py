@@ -403,13 +403,17 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
 def test_scan_ci_never_attempts_external_traffic(
     loopback_only: NetworkLedger, tmp_path: Path
 ) -> None:
-    """Une tentative externe reste visible même si la CLI la capture."""
+    """Une tentative externe reste visible même si la CLI la capture.
+
+    Depuis #29, la commande exécute un **scan réel** : le dépôt vide est
+    propre, donc le code de sortie est 0. Le point du test reste le même :
+    aucune connexion hors boucle locale n'est tentée sur ce chemin.
+    """
     result = CliRunner().invoke(app, ["scan", "--ci", str(tmp_path)])
 
-    # Le scanner #22 n'est pas branché sur la CLI (#29) : son refus code 2 est attendu.
-    assert result.exit_code in (0, 2), result.output
-    if result.exit_code == 2:
-        assert "commande non branchée (voir #29)" in result.stderr
+    # Scan opérationnel sur un dépôt vide : propre => 0 (jamais 2, qui reste
+    # réservé à l'erreur d'outillage).
+    assert result.exit_code == 0, result.output
     assert loopback_only.blocked == []
     assert all(
         not attempt.blocked
