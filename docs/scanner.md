@@ -114,6 +114,7 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | --- | --- |
 | racine absente, non régulière ou illisible | `ScanError` |
 | racine ou fichier unique symlinké (ou ancêtre symlinké) | `ScanError` |
+| racine non canonique (ex. `/tmp` symlinké vers `/private/tmp` sur macOS) | `ScanError` — passer un chemin canonique (sans lien) |
 | fichier non régulier (FIFO, device) | `ScanError` |
 | fichier > 1 Mio | `ScanError` |
 | fichier modifié pendant la lecture | `ScanError` |
