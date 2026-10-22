@@ -1,12 +1,12 @@
 """Point d'entrée ``heimdall`` — squelette du ticket #17.
 
 Les sous-commandes réelles arrivent avec leurs tickets :
-``scan`` (#22 scanner + #32 validation Y/N/E), ``vault`` (#25/#26/#64),
-``mcp`` (#27). En attendant, comportement fail-closed : ``scan`` bloque
-avec un message explicite au lieu d'inventer un verdict.
+``scan`` (#29 branche le scanner #22 et #32 la validation Y/N/E),
+``vault`` (#25/#26/#64), ``mcp`` (#27). En attendant, comportement fail-closed :
+``scan`` bloque avec un message explicite au lieu d'inventer un verdict.
 
 Codes de sortie (invariant 11) : 0 propre, 1 secrets détectés, 2 erreur
-d'outillage. Un scanner non implémenté est une panne d'outillage, donc 2 —
+d'outillage. Une commande non branchée est une panne d'outillage, donc 2 —
 jamais 1, réservé aux secrets avérés.
 """
 
@@ -41,8 +41,8 @@ def scan(
     ci: bool = typer.Option(False, "--ci", help="Mode CI : échoue si un secret reste en clair."),
 ) -> None:
     """Scanne le diff (ou le dépôt) à la recherche de secrets."""
-    del path, ci  # #22 branchera le scanner réel ici.
-    typer.echo("heimdall scan: scanner non implémenté (voir #22) — refus par défaut.", err=True)
+    del path, ci  # #29 branchera le scanner réel ici.
+    typer.echo("heimdall scan: commande non branchée (voir #29) — refus par défaut.", err=True)
     raise typer.Exit(code=2)
 
 
