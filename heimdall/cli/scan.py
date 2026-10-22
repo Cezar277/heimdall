@@ -148,7 +148,8 @@ def _collect_staged(root: Path) -> ScanReport:
     changes = access.staged_changes()
     if len(changes) > MAX_STAGED_FILES:
         raise ScanError(_MSG_TOO_MANY_FILES)
-    targets: list[FileTarget] = []
+    moteur = TargetScanner(SignatureEngine(max_findings=MAX_STAGED_FINDINGS))
+    findings: list[Finding] = []
     total = 0
     for change in changes:
         size = access.blob_size(change.blob)
@@ -157,6 +158,10 @@ def _collect_staged(root: Path) -> ScanReport:
             raise ScanError(_MSG_TOO_LARGE)
         data = access.blob_bytes(change.blob)
         text = decode_text(data)
+        # Le texte n'est jamais retenu : chaque blob est lu, décodé, scanné
+        # puis oublié avant le suivant — au plus un blob (1 Mio) vit en
+        # mémoire, pas les 32 Mio du périmètre. `text`, `data` et `target`
+        # sont réassignés à chaque tour ; rien ne les accumule.
         if text is None:
             # Binaire reconnu : aucun texte à analyser. Ce n'est pas une
             # exclusion de chemin, c'est une impossibilité technique.
@@ -164,13 +169,12 @@ def _collect_staged(root: Path) -> ScanReport:
         # `FileTarget` valide le chemin (contrat #14) : un chemin que le
         # contrat ne sait pas représenter est une erreur, pas un fichier
         # ignoré en silence.
-        targets.append(FileTarget(path=change.path, text=text))
-    moteur = TargetScanner(SignatureEngine())
-    findings: list[Finding] = []
-    for target in targets:
-        # Cible par cible, pas `scan_all` : le compteur coupe la croissance
-        # fail-fast, et le tri final ne porte jamais sur un volume non
-        # borné. L'ordre de sortie reste celui de `scan_all` (même clé).
+        target = FileTarget(path=change.path, text=text)
+        # Cible par cible, pas `scan_all` : le plafond Findings est vérifié
+        # par candidat dans le moteur (un seul blob dense ne fait jamais
+        # gonfler la liste), et ici entre cibles (l'accumulation sur tout
+        # l'index reste bornée). L'ordre de sortie reste celui de `scan_all`
+        # (même clé de tri ci-dessous).
         findings.extend(moteur.scan(target))
         if len(findings) > MAX_STAGED_FINDINGS:
             raise ScanError(_MSG_TOO_MANY_FINDINGS)

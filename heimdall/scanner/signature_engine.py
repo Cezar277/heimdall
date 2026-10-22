@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Final
 
 from heimdall.scanner.entropy import shannon_entropy
+from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import ScanTarget
@@ -30,18 +31,33 @@ from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 #: Fenêtre maximale de jointure de deux lignes, en **octets UTF-8** (4 Kio).
 MULTILINE_WINDOW: Final[int] = 4096
 
+#: Refus statique du plafond Findings : même libellé que le scanner
+#: bibliothèque (`detect.py`), invariant 8 (aucune entrée reflétée).
+_MAX_FINDINGS_ERROR: Final[str] = "scan impossible : entrée non analysable"
+
 
 class SignatureEngine:
     """Moteur déterministe : signatures du registre, puis Finding v1.
 
     La clé HMAC est chargée **paresseusement** au premier scan : instancier le
     moteur ne crée aucun fichier et ne touche pas au stockage local.
+
+    ``max_findings`` borne le nombre de Findings rendus (**par candidat**,
+    dans ``_append``) : au-delà, ``ScanError``. ``None`` (défaut) conserve le
+    comportement historique non borné ; la CLI ``heimdall scan --staged``
+    (#29) le renseigne pour couper fail-fast sur un blob dense.
     """
 
-    __slots__ = ("_hasher",)
+    __slots__ = ("_hasher", "_max_findings")
 
-    def __init__(self, hasher: SnippetHasher | None = None) -> None:
+    def __init__(
+        self,
+        hasher: SnippetHasher | None = None,
+        *,
+        max_findings: int | None = None,
+    ) -> None:
         self._hasher = hasher
+        self._max_findings = max_findings
 
     def analyser(self, cible: ScanTarget) -> list[Finding]:
         """Analyse la cible et rend un Finding par candidat distinct."""
@@ -125,6 +141,11 @@ class SignatureEngine:
                 snippet_hash=snippet_hash,
             )
         )
+        if self._max_findings is not None and len(findings) > self._max_findings:
+            # Compteur vérifié **par candidat** : un seul blob dense ne fait
+            # jamais gonfler la liste avant le refus (#29). `ScanError`
+            # traverse la façade `Scanner` tel quel (contrat #53).
+            raise ScanError(_MAX_FINDINGS_ERROR)
 
     def _get_hasher(self) -> SnippetHasher:
         if self._hasher is None:

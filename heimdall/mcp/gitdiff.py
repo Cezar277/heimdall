@@ -90,6 +90,14 @@ GIT_CONFIG_OVERRIDES: Final[tuple[str, ...]] = ("-c", "core.fsmonitor=false")
 #: `--no-renames` rend la sortie déterministe (un renommage devient une
 #: suppression + un ajout : pas de score de similarité, donc pas de cas
 #: ambigu à parser).
+#: Plafond de la sortie brute de l'énumération de l'index (#29). Le pire cas
+#: légitime tient large : ``MAX_STAGED_FILES`` entrées de ~128 octets
+#: d'en-tête + chemin (4096 au plus, contrat Finding v1), soit de l'ordre de
+#: 4 Mio. Au-delà, le flux est coupé et l'index est refusé — un index adverse
+#: de 100 000 entrées ne fait jamais bufferiser des dizaines de Mo avant le
+#: contrôle du nombre de fichiers.
+MAX_STAGED_RAW_BYTES: Final[int] = 8 * 1024 * 1024
+
 STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
     "diff",
     "--cached",
@@ -207,6 +215,29 @@ def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _refuse_symlinked_root(root: Path) -> None:
+    """Refuse une racine contenant un lien symbolique, comme `_resolve_root` (#22).
+
+    La racine elle-même et chacun de ses ancêtres sont vérifiés par `lstat`
+    (`is_symlink` ne suit pas les liens) : un lien dans ce chemin lève
+    `ToolFailure` au lieu de faire lire la cible. Parité avec le mode arbre
+    (`Scanner`), qui refuse ces mêmes racines : `scan` et `scan --staged`
+    disent la même chose sur la même entrée.
+
+    Ni `resolve()` ni existence exigées ici : une racine absente reste un
+    diagnostic (`NOT_A_GIT_REPO` côté MCP, code 2 côté CLI), pas une panne
+    de construction — seul le lien symbolique est refusé. Limite assumée :
+    le contrôle vaut à la construction ; un lien échangé ensuite (TOCTOU)
+    serait relu par git lui-même, et `is_repository()` compare des chemins
+    résolus.
+    """
+    absolute = root.absolute()
+    candidates: tuple[Path, ...] = (absolute, *absolute.parents)
+    for candidate in candidates:
+        if candidate.is_symlink():
+            raise ToolFailure("INTERNAL")
+
+
 @dataclass(frozen=True)
 class StagedChange:
     """Un fichier ajouté ou modifié dans l'index, et le blob qui le porte.
@@ -227,6 +258,7 @@ class GitAccess:
     __slots__ = ("_git", "_root")
 
     def __init__(self, root: Path) -> None:
+        _refuse_symlinked_root(root)
         self._root = root
         # Jamais le PATH hérité : un PATH compromis (poste, CI, direnv)
         # détournerait le binaire exécuté à chaque outil. `os.defpath`
@@ -385,13 +417,67 @@ class GitAccess:
         Les suppressions et les gitlinks (sous-modules : leur SHA désigne
         un commit, pas un blob) sont ignorés — aucun texte à scanner.
 
+        La sortie est lue en **flux borné** (:data:`MAX_STAGED_RAW_BYTES`),
+        comme ``staged_diff`` : un index adverse de 100 000 entrées est
+        coupé avant d'être bufferisé, puis refusé. Pas de coupe « propre »
+        ici (contrairement au diff paginé du MCP) : une énumération
+        incomplète ne vaut pas verdict, donc c'est ``ToolFailure``.
+
         L'index est non résolu (conflit de fusion) ou la sortie est illisible
         → ``ToolFailure`` : le scan ne peut alors pas prétendre avoir tout vu.
         """
-        completed = self.execute(STAGED_RAW_ARGUMENTS)
-        if completed.returncode != 0:
+        raw = self._read_capped(STAGED_RAW_ARGUMENTS, MAX_STAGED_RAW_BYTES)
+        return parse_staged_raw(raw)
+
+    def _read_capped(self, arguments: Sequence[str], max_bytes: int) -> bytes:
+        """Sortie d'une commande git figée, lue en flux borné à ``max_bytes``.
+
+        Même motif que ``staged_diff`` (argv figé, ``stdin=DEVNULL``,
+        environnement confiné, délai) : le flux stdout est lu jusqu'à au
+        plus ``max_bytes + 1`` octets. Au-delà, le sous-processus est tué et
+        c'est ``ToolFailure`` — ici aucune coupe partielle n'est rendue :
+        l'appelant ne sait exploiter qu'une énumération **complète**.
+        """
+        try:
+            proc = subprocess.Popen(  # noqa: S603 # nosec B603
+                [self._git, *GIT_CONFIG_OVERRIDES, "-C", str(self._root), *arguments],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=confined_environment(self._root),
+            )
+        except OSError:
+            raise ToolFailure("INTERNAL") from None
+
+        timer = threading.Timer(GIT_TIMEOUT_SECONDS, proc.kill)
+        timer.daemon = True
+        timer.start()
+        try:
+            raw = b""
+            if proc.stdout is not None:
+                raw = proc.stdout.read(max_bytes + 1)
+        except OSError:
+            _terminate_process(proc)
+            raise ToolFailure("INTERNAL") from None
+        finally:
+            timer.cancel()
+            if proc.stdout is not None:
+                proc.stdout.close()
+
+        if len(raw) > max_bytes:
+            _terminate_process(proc)
             raise ToolFailure("INTERNAL")
-        return parse_staged_raw(completed.stdout)
+
+        try:
+            ret = proc.wait(timeout=GIT_TIMEOUT_SECONDS)
+        except (subprocess.TimeoutExpired, OSError):
+            _terminate_process(proc)
+            raise ToolFailure("INTERNAL") from None
+
+        if ret != 0:
+            raise ToolFailure("INTERNAL")
+
+        return raw
 
     def blob_size(self, blob: str) -> int:
         """Taille en octets d'un objet git, **sans** le lire.

@@ -95,10 +95,17 @@ Le scan est **borné** dans les deux périmètres : au-delà, il est refusé
 
 Les bornes d'entrée ne suffisent pas : des blobs denses en candidats
 feraient gonfler la liste des Findings et le tri final en mémoire et en
-temps CI. Le compteur coupe fail-fast (pendant la boucle en mode arbre,
-cible par cible en `--staged`, avec le même ordre de tri) : au-delà,
+temps CI. Le compteur est vérifié à deux granularités — **par candidat**
+(un seul fichier ou blob dense ne fait jamais gonfler la liste) **et entre
+fichiers** (l'accumulation sur tout le périmètre reste bornée) : au-delà,
 refus (code 2), jamais un rapport tronqué présenté comme complet. 10 000
 Findings sont déjà inexploitables par un humain comme par un journal CI.
+
+L'énumération de l'index elle-même est lue en **flux borné** (8 Mio,
+[`MAX_STAGED_RAW_BYTES`](../heimdall/mcp/gitdiff.py)) : un index adverse de
+100 000 entrées est coupé avant d'être bufferisé, puis refusé. Le pire cas
+légitime (1 000 entrées × ~128 octets d'en-tête + chemin) tient large sous
+ce plafond.
 
 Les deux bornes totales protègent la CI d'un dépôt adverse (100 000 petits
 fichiers, ou 50 000 fichiers de 1 Mio) : sans elles, le job durerait sans
@@ -169,9 +176,11 @@ Le contrat machine est figé par [`schemas/scan.schema.json`](../schemas/scan.sc
 (draft 2020-12) : objet fermé (`additionalProperties: false`), `schema` en
 constante `heimdall.scan.v1`, `scope` en enum, `count` entier ≥ 0, et chaque
 élément de `findings` validé contre le contrat Finding v1 par `$ref` (sans
-duplication : toute dérive du Finding casse la validation). La cohérence
-`count == len(findings)`, inexprimable en JSON Schema pur, est vérifiée par
-le test. Un parseur CI DOIT refuser tout document invalide.
+duplication : toute dérive du Finding casse la validation). Les deux `$id`
+sont alignés sur la même base (`https://github.com/Cezar277/heimdall/schemas/`),
+donc le `$ref` relatif se résout sans registre câblé, depuis le filesystem.
+La cohérence `count == len(findings)`, inexprimable en JSON Schema pur, est
+vérifiée par le test. Un parseur CI DOIT refuser tout document invalide.
 
 ## Invariants
 
@@ -187,6 +196,10 @@ le test. Un parseur CI DOIT refuser tout document invalide.
 - **Aucune exécution du contenu analysé** : le dépôt scanné ne peut pas
   faire exécuter une commande (les options git `--no-ext-diff` et
   `--no-textconv` neutralisent `diff.external` et les filtres `textconv`).
+- **Racine sans lien symbolique, dans les deux périmètres** : comme le mode
+  arbre (`Scanner._resolve_root`), `--staged` refuse une racine qui est ou
+  contient un lien symbolique — parité de disponibilité, même contenu
+  après résolution.
 
 ## Limites connues (honnêtes)
 

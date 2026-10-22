@@ -223,10 +223,12 @@ class Scanner:
                 raise ScanError(_SCAN_ERROR)
             if text is None:
                 continue
+            # Le plafond Findings est vérifié à deux granularités : par
+            # candidat dans `_append` (un seul fichier dense ne fait jamais
+            # gonfler la liste), et ici entre fichiers (l'accumulation sur
+            # tout le périmètre reste bornée).
             findings.extend(self._scan_text(text, relative))
             if len(findings) > self._max_findings:
-                # Refus fail-fast : la liste ne grandit plus, et le tri
-                # final ne porte jamais sur un volume non borné.
                 raise ScanError(_SCAN_ERROR)
         findings.sort(
             key=lambda finding: (
@@ -380,6 +382,12 @@ class Scanner:
                 snippet_hash=snippet_hash,
             )
         )
+        if len(findings) > self._max_findings:
+            # Compteur vérifié **par candidat**, pas par fichier : un seul
+            # fichier dense (une ligne d'1 Mio bourrée de matches) ne fait
+            # jamais gonfler la liste avant le refus (#29). Fail-fast : la
+            # liste est abandonnée avec le scan, jamais triée ni rendue.
+            raise ScanError(_SCAN_ERROR)
 
 
 def scan(

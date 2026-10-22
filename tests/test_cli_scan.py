@@ -30,6 +30,11 @@ from heimdall.cli.main import app
 from heimdall.cli.scan import EXIT_CLEAN, EXIT_ERROR, EXIT_FINDINGS, JSON_SCHEMA
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess, StagedChange, parse_staged_raw
+from heimdall.scanner.detect import Scanner as TreeScanner
+from heimdall.scanner.errors import ScanError
+from heimdall.scanner.hashing import SnippetHasher
+from heimdall.scanner.interface import FileTarget
+from heimdall.scanner.signature_engine import SignatureEngine
 
 #: Racine du dépôt (les schémas vivent dans `schemas/`, hors paquet).
 REPO = Path(__file__).resolve().parents[1]
@@ -49,15 +54,45 @@ def _scan_validator() -> Draft202012Validator:
     registry = Registry().with_resources(
         [
             (
-                "https://heimdall.local/schemas/finding.schema.json",
+                "https://github.com/Cezar277/heimdall/schemas/finding.schema.json",
                 Resource(contents=FINDING_SCHEMA, specification=DRAFT202012),
             ),
             (
-                "https://heimdall.local/schemas/scan.schema.json",
+                "https://github.com/Cezar277/heimdall/schemas/scan.schema.json",
                 Resource(contents=SCAN_SCHEMA, specification=DRAFT202012),
             ),
         ]
     )
+    return Draft202012Validator(SCAN_SCHEMA, registry=registry)
+
+
+def _retrieve_local(uri: str) -> Resource[object]:
+    """Récupération filesystem des schémas Heimdall, sans aucun réseau.
+
+    Tout `$id` sous `https://github.com/Cezar277/heimdall/schemas/` est servi
+    par le fichier homonyme de `schemas/` ; toute autre URI est refusée
+    (fail-closed : jamais de fetch, même si un `$ref` devenait distant).
+    C'est ce qui rend le `$ref` relatif de `scan.schema.json` résolvable par
+    un outillage standard muni d'un miroir local, sans registre câblé.
+    """
+    prefix = "https://github.com/Cezar277/heimdall/schemas/"
+    if not uri.startswith(prefix):
+        raise ValueError(f"schéma hors périmètre : {uri}")
+    name = uri[len(prefix):]
+    if "/" in name or not name.endswith(".schema.json"):
+        raise ValueError(f"schéma hors périmètre : {uri}")
+    document = json.loads((REPO / "schemas" / name).read_text(encoding="utf-8"))
+    return Resource(contents=document, specification=DRAFT202012)
+
+
+def _scan_validator_from_filesystem() -> Draft202012Validator:
+    """Validateur résolu depuis l'arborescence, sans contenu câblé en dur.
+
+    Seul le document racine est chargé explicitement ; `finding.schema.json`
+    est atteint par son `$id` déclaré, via `_retrieve_local`. Si les deux
+    `$id` divergeaient ou si le `$ref` ne suivait plus, ce test casserait.
+    """
+    registry = Registry(retrieve=_retrieve_local)
     return Draft202012Validator(SCAN_SCHEMA, registry=registry)
 
 
@@ -69,6 +104,31 @@ def _refuse_non_finite(value: str) -> object:
     sur la sortie réelle.
     """
     raise ValueError(f"constante non finie refusée : {value}")
+
+
+class _HasherCompteur(SnippetHasher):
+    """SnippetHasher qui compte les hachages : preuve du refus fail-fast.
+
+    Un compteur qui s'arrête au plafond + 1 prouve que le refus coupe le
+    travail en cours, au lieu d'accumuler puis trier avant de refuser.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(key=bytes(32))
+        self.compte = 0
+
+    def hash(self, candidate: str) -> str:
+        self.compte += 1
+        return super().hash(candidate)
+
+
+def _cles_denses(nombre: int) -> str:
+    """`nombre` clés AWS distinctes sur UNE ligne : un seul blob dense.
+
+    Chaque clé donne exactement un match (vérifié) : `nombre` clés sur une
+    ligne = `nombre` Findings, sans l'artefact de la fenêtre multi-ligne.
+    """
+    return " ".join(f'"AKIA{chr(65 + (i % 26))}{i:015d}"' for i in range(nombre))
 
 #: Exemple de clé AWS (documentation AWS) : jamais une clé fonctionnelle.
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
@@ -415,6 +475,19 @@ def test_scan_staged_skips_a_staged_gitlink(git_repo: GitRepo) -> None:
     assert resultat.exit_code == EXIT_CLEAN
 
 
+def test_scan_staged_symlinked_root_exits_two(git_repo: GitRepo) -> None:
+    """Revue (LOW) : racine symlinkée refusée en `--staged` comme en arbre.
+
+    Parité avec `Scanner._resolve_root` : les deux périmètres disent la
+    même chose sur la même entrée (code 2, jamais de scan de la cible).
+    """
+    git_repo.write("app.py", "x = 1\n")
+    lien = git_repo.root.parent / "lien-29"
+    lien.symlink_to(git_repo.root, target_is_directory=True)
+    assert _run("scan", "--staged", str(lien)).exit_code == EXIT_ERROR
+    assert _run("scan", str(lien)).exit_code == EXIT_ERROR
+
+
 def test_scan_staged_gitlink_does_not_hide_other_secrets(git_repo: GitRepo) -> None:
     """Le gitlink est sauté, mais un secret voisin reste signalé."""
     git_repo.write("app.py", "x = 1\n")
@@ -487,6 +560,39 @@ def test_scan_staged_refuses_too_many_files(
     assert resultat.exit_code == EXIT_ERROR
 
 
+def test_scan_staged_raw_output_capped(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : le flux d'énumération est coupé avant d'être bufferisé.
+
+    Plafond ridicule (50 octets) pour 2 fichiers (~200 octets de sortie) :
+    le sous-processus est tué et c'est 2, sans jamais parser la sortie.
+    Sans ce flux borné, un index de 100 000 entrées serait bufferisé en
+    entier avant le contrôle du nombre de fichiers.
+    """
+    monkeypatch.setattr("heimdall.mcp.gitdiff.MAX_STAGED_RAW_BYTES", 50)
+    git_repo.write("a.py", "x = 1\n")
+    git_repo.write("b.py", "y = 2\n")
+    git_repo.stage("a.py", "b.py")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
+def test_scan_staged_many_entries_refuses(git_repo: GitRepo) -> None:
+    """Revue (LOW) : 1 100 entrées stagées -> 2 (compteur, sortie < 8 Mio).
+
+    La sortie brute (~120 Kio) tient sous le plafond de flux : c'est le
+    contrôle du nombre de fichiers qui refuse, après parse complet.
+    """
+    for i in range(1100):
+        git_repo.write(f"f{i:04d}.py", "x = 1\n")
+    git_repo.git("add", "-A")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
 def test_scan_staged_refuses_too_many_findings(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -514,6 +620,45 @@ def test_scan_tree_refuses_too_many_findings(
         {"a.py": f'A = "{FAKE_AWS_KEY}"\n', "b.py": f'B = "{FAKE_AWS_KEY}"\n'},
     )
     resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
+def test_scan_tree_dense_single_file_refuses_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un seul fichier dense coupe fail-fast, sans tout hacher.
+
+    300 candidats sur une seule ligne pour un plafond à 100 : le compteur
+    `_append` refuse au 101e hachage. L'ancien contrôle (après `extend`)
+    aurait haché les 300 puis trié avant de refuser.
+    """
+    monkeypatch.setattr("heimdall.scanner.detect.MAX_FINDINGS", 100)
+    racine = _arbre(tmp_path, {"dense.py": _cles_denses(300) + "\n"})
+    compteur = _HasherCompteur()
+    with pytest.raises(ScanError):
+        TreeScanner(racine, hasher=compteur).scan()
+    assert compteur.compte == 101
+
+
+def test_signature_engine_stops_at_cap() -> None:
+    """Même compteur côté moteur `--staged` : refus au 6e candidat (plafond 5)."""
+    compteur = _HasherCompteur()
+    moteur = SignatureEngine(hasher=compteur, max_findings=5)
+    cible = FileTarget(path="dense.py", text=_cles_denses(50) + "\n")
+    with pytest.raises(ScanError):
+        moteur.analyser(cible)
+    assert compteur.compte == 6
+
+
+def test_scan_staged_dense_blob_refuses(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un seul blob dense en `--staged` -> 2 (le moteur coupe, pas la boucle)."""
+    monkeypatch.setattr("heimdall.cli.scan.MAX_STAGED_FINDINGS", 10)
+    git_repo.write("dense.py", _cles_denses(50) + "\n")
+    git_repo.stage("dense.py")
+    resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert "scan impossible" in resultat.stderr
 
@@ -584,13 +729,19 @@ def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
 
     Champs exacts, `count` cohérent avec `findings`, et aucun NaN : le
     document est relu en refusant les constantes non finies (`allow_nan`
-    refusé, figé ici sur la sortie réelle).
+    refusé, figé ici sur la sortie réelle). La résolution passe par les
+    `$id` déclarés et le filesystem, pas par un registre câblé.
     """
     racine = _arbre(tmp_path, {"config.py": f'AWS = "{FAKE_AWS_KEY}"\n'})
     resultat = _run("scan", "--json", str(racine))
     assert resultat.exit_code == EXIT_FINDINGS
     document = json.loads(resultat.stdout, parse_constant=_refuse_non_finite)
     _scan_validator().validate(document)
+    _scan_validator_from_filesystem().validate(document)
+    assert SCAN_SCHEMA["$id"] == "https://github.com/Cezar277/heimdall/schemas/scan.schema.json"
+    assert FINDING_SCHEMA["$id"] == (
+        "https://github.com/Cezar277/heimdall/schemas/finding.schema.json"
+    )
     assert document["count"] == len(document["findings"]) == 1
     assert set(document) == {"schema", "scope", "count", "findings"}
 
