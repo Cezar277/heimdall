@@ -57,8 +57,10 @@ class SignatureEngine:
     dans ``_append``) : au-delà, ``ScanError``. Le défaut est le plafond
     partagé (:data:`MAX_FINDINGS`) : un appelant qui analyserait un blob
     dense sans le renseigner reste fail-closed au lieu d'accumuler sans
-    borne (#29). La CLI ``--staged`` renseigne explicitement sa propre
-    constante (même valeur, knob documenté côté CLI).
+    borne (#29). ``None`` explicite retombe sur ce même défaut borné — il
+    n'existe **aucun** opt-out non borné, comme pour ``Scanner``. La CLI
+    ``--staged`` renseigne explicitement sa propre constante (même valeur,
+    knob documenté côté CLI).
     """
 
     __slots__ = ("_hasher", "_max_findings")
@@ -70,7 +72,10 @@ class SignatureEngine:
         max_findings: int | None = MAX_FINDINGS,
     ) -> None:
         self._hasher = hasher
-        self._max_findings = max_findings
+        # `None` ne doit jamais désactiver la borne : on retombe sur le
+        # défaut, y compris pour un appelant non typé qui passerait `None`
+        # en croyant conserver l'ancien mode non borné.
+        self._max_findings = MAX_FINDINGS if max_findings is None else max_findings
 
     def analyser(self, cible: ScanTarget) -> list[Finding]:
         """Analyse la cible et rend un Finding par candidat distinct."""
@@ -154,7 +159,7 @@ class SignatureEngine:
                 snippet_hash=snippet_hash,
             )
         )
-        if self._max_findings is not None and len(findings) > self._max_findings:
+        if len(findings) > self._max_findings:
             # Compteur vérifié **par candidat** : un seul blob dense ne fait
             # jamais gonfler la liste avant le refus (#29). `ScanError`
             # traverse la façade `Scanner` tel quel (contrat #53).

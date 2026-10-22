@@ -75,6 +75,7 @@ _MSG_NOT_A_REPO: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_MANY_FILES: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_LARGE: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_MANY_FINDINGS: Final[str] = "scan impossible : entrée non analysable"
+_MSG_BLOB_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 
@@ -182,10 +183,24 @@ def _collect_staged(root: Path) -> ScanReport:
     total = 0
     for change in changes:
         size = access.blob_size(change.blob)
+        # Plancher explicite : même si un `GitAccess` dérivé rendait une
+        # taille négative, `total` ne doit jamais reculer (la borne de
+        # volume serait sinon contournable). Zéro reste valide : un blob
+        # vide ne porte aucun candidat.
+        if size < 0 or size > MAX_FILE_BYTES:
+            raise ScanError(_MSG_TOO_LARGE)
         total += size
-        if size > MAX_FILE_BYTES or total > MAX_STAGED_BYTES:
+        if total > MAX_STAGED_BYTES:
             raise ScanError(_MSG_TOO_LARGE)
         data = access.blob_bytes(change.blob)
+        # La taille annoncée par `cat-file -s` est un oracle, pas une
+        # garantie : le contenu relu doit faire exactement cette taille.
+        # Un écart (store incohérent, objet remplacé) refuserait sinon un
+        # scan partiel ou ferait lire un blob au-delà de la borne 1 Mio.
+        if len(data) != size:
+            raise ScanError(_MSG_BLOB_CHANGED)
+        if len(data) > MAX_FILE_BYTES:
+            raise ScanError(_MSG_TOO_LARGE)
         text = decode_text(data)
         # Le texte n'est jamais retenu : chaque blob est lu, décodé, scanné
         # puis oublié avant le suivant — au plus un blob (1 Mio) vit en

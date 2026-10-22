@@ -17,6 +17,7 @@ candidat). Les messages sont statiques.
 """
 
 from pathlib import Path
+from typing import Final
 
 import typer
 
@@ -32,6 +33,11 @@ from heimdall.cli.scan import (
 from heimdall.cli.vault_keys import vault_app
 from heimdall.mcp.server import run_stdio
 from heimdall.scanner.errors import ScanError
+
+#: Libellé **unique** du code 2 : une panne anticipée (`ScanError`,
+#: `ToolFailure`) et une panne inattendue ne doivent pas être distinguables
+#: par un observateur du canal stderr (invariant 8, oracle minimal).
+_SCAN_ERROR_MESSAGE: Final[str] = "heimdall scan : scan impossible (erreur d'outillage)."
 
 app = typer.Typer(
     name="heimdall",
@@ -127,12 +133,14 @@ def scan(
         # Jamais 0, jamais 1 : c'est 2 (REQ-SEC-07). L'écriture est
         # best-effort (stderr fermé en CI) : elle ne doit pas lever à son
         # tour, sinon la traceback sortirait en 1.
-        _echo_stderr_best_effort("heimdall scan : scan impossible (erreur d'outillage).")
+        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
     except Exception:
         # Panne inattendue (collecte, rendu ou résumé --ci) : même contrat,
-        # message statique (invariant 8), écriture best-effort.
-        _echo_stderr_best_effort("heimdall scan : erreur inattendue pendant le scan.")
+        # **même libellé** que ci-dessus (un observateur ne doit pas
+        # distinguer une panne anticipée d'une panne inattendue), écriture
+        # best-effort (invariant 8).
+        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
     raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
 

@@ -105,6 +105,13 @@ Le scan est **borné** dans les deux périmètres : au-delà, il est refusé
 | `working-tree` | 1 Mio ([`MAX_FILE_BYTES`](../heimdall/scanner/detect.py)) | 50 000 ([`MAX_FILES`](../heimdall/scanner/detect.py)) | 256 Mio ([`MAX_TOTAL_BYTES`](../heimdall/scanner/detect.py)) | 10 000 ([`MAX_FINDINGS`](../heimdall/scanner/detect.py)) |
 | `staged` | 1 Mio | 1 000 ([`MAX_STAGED_FILES`](../heimdall/cli/scan.py)) | 32 Mio ([`MAX_STAGED_BYTES`](../heimdall/cli/scan.py)) | 10 000 ([`MAX_STAGED_FINDINGS`](../heimdall/cli/scan.py)) |
 
+En `--staged`, la taille annoncée par `git cat-file -s` est un oracle
+**re-vérifié après lecture** : le contenu relu doit faire exactement cette
+taille (et rester sous 1 Mio). Un écart — store incohérent, objet échangé —
+est refusé (code 2) avant tout décodage, jamais scanné partiellement. Une
+taille négative est également refusée ; zéro reste valide (blob vide, aucun
+candidat).
+
 Les bornes d'entrée ne suffisent pas : des blobs denses en candidats
 feraient gonfler la liste des Findings et le tri final en mémoire et en
 temps CI. Le compteur est vérifié à deux granularités — **par candidat**
@@ -112,6 +119,8 @@ temps CI. Le compteur est vérifié à deux granularités — **par candidat**
 fichiers** (l'accumulation sur tout le périmètre reste bornée) : au-delà,
 refus (code 2), jamais un rapport tronqué présenté comme complet. 10 000
 Findings sont déjà inexploitables par un humain comme par un journal CI.
+Il n'existe pas d'opt-out non borné : `SignatureEngine(max_findings=None)`
+retombe sur le plafond par défaut, comme `Scanner`.
 
 L'énumération de l'index elle-même est lue en **flux borné** (8 Mio,
 [`MAX_STAGED_RAW_BYTES`](../heimdall/mcp/gitdiff.py)) : un index adverse de

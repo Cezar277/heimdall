@@ -12,7 +12,8 @@ revue APPROVE WITH COMMENTS), ses premiers durcissements (`ae0b1c7`), les
 correctifs de la seconde revue (`593021c`, run 39838145119), ceux de la
 troisième revue (`251fd18`, run 39841323251) et la présente passe
 (run 39844814050). Les permaliens ci-dessous épinglent ce SHA : un lien vers
-la branche changerait de lignes au fil des commits.
+la branche changerait de lignes au fil des commits. La septième passe
+(courante, voir plus bas) sera re-pinnée sur le SHA final du squash/merge.
 
 Base : `aa875a1` (fusion de #165, `main` au moment de la livraison), qui
 contient le scanner #22 (`2ba3ebf…`) et l'accès git confiné #27. Le diff
@@ -56,15 +57,15 @@ Environnement : Linux, Python 3.14.8, venv du dépôt.
 
 ```text
 .venv/bin/python -m pytest tests/test_cli_scan.py -q
-64 passed
+70 passed
 
 .venv/bin/python -m pytest
-1503 passed, 4321 subtests passed
+1509 passed, 4321 subtests passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch \
   --cov-report=term-missing --cov-fail-under=85
-Total coverage: 95,87 % (seuil 85 % atteint)
-heimdall/cli/scan.py : 100 % ; heimdall/cli/main.py : 98 % ;
+Total coverage: 95,84 % (seuil 85 % atteint)
+heimdall/cli/scan.py : 98 % ; heimdall/cli/main.py : 98 % ;
 heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 91 % ;
 heimdall/scanner/signature_engine.py : 100 %
 
@@ -152,9 +153,21 @@ de CI devra les traiter par allowlist (#24).
 | Remarque | Correctif | Preuve |
 |---|---|---|
 | LOW — racine épinglée par chemin résolu seul, pas par identité | `GitAccess` fige (`st_dev`, `st_ino`) via `os.stat` après `_resolve_root` (avec refus `is_symlink` entre les deux) et l'expose ; `_verify_root_unchanged` compare chemin résolu ET identité en fin des deux collectes : un dossier remplacé par un autre au même chemin refuse le verdict | [gitdiff.py:269](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/heimdall/mcp/gitdiff.py#L269-L269), [299–301](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/heimdall/mcp/gitdiff.py#L299-L301), [scan.py:134–135](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/heimdall/cli/scan.py#L134-L135) + [test_cli_scan.py:637–670](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/tests/test_cli_scan.py#L637-L670), [703–729](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/tests/test_cli_scan.py#L703-L729) |
-| LOW — SignatureEngine non borné par défaut | la constante `MAX_FINDINGS` vit dans le moteur (couche core, pas d'inversion), `detect.py` la réexporte (compatibilité) ; défaut `max_findings=MAX_FINDINGS`, `None` explicite garde l'historique : tout futur appelant direct est fail-closed | [signature_engine.py:43](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/heimdall/scanner/signature_engine.py#L43-L43), [70](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/heimdall/scanner/signature_engine.py#L70-L70) + [test_cli_scan.py:848–860](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/tests/test_cli_scan.py#L848-L860) |
+| LOW — SignatureEngine non borné par défaut | la constante `MAX_FINDINGS` vit dans le moteur (couche core, pas d'inversion), `detect.py` la réexporte (compatibilité) ; défaut `max_findings=MAX_FINDINGS` (la septième revue ferme l'échappatoire `None`) : tout futur appelant direct est fail-closed | [signature_engine.py:43](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/heimdall/scanner/signature_engine.py#L43-L43), [70](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/heimdall/scanner/signature_engine.py#L70-L70) + [test_cli_scan.py:848–860](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/tests/test_cli_scan.py#L848-L860) |
 | Tests manquants — remplacement à chemin identique | sosie à index identique (isole le re-contrôle d'identité) puis dossier vide, dans les deux périmètres → 2 | [test_cli_scan.py:637–670](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/tests/test_cli_scan.py#L637-L670), [703–729](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/tests/test_cli_scan.py#L703-L729) |
-| Tests manquants — moteur sans argument sur blob dense | blob de 11 000 candidats → refus ; `None` explicite rend 11 000 | [test_cli_scan.py:848–860](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/tests/test_cli_scan.py#L848-L860) |
+| Tests manquants — moteur sans argument sur blob dense | blob de 11 000 candidats → refus ; `None` explicite retombe désormais sur le défaut borné (septième revue, ci-dessous) | [test_cli_scan.py:848–860](https://github.com/Cezar277/heimdall/blob/0bb1136148066de02986ff0042656893686af66d/tests/test_cli_scan.py#L848-L860) |
+
+## Correctifs de la septième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge
+(comme pour les passes précédentes).
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — taille du blob non re-vérifiée après lecture en `--staged` | après `blob_bytes`, `len(data)` doit être **exactement** la taille annoncée par `cat-file -s` (sinon refus avant décodage) et rester sous 1 Mio ; la taille négative est refusée avant d'incrémenter `total` | `heimdall/cli/scan.py` (`_collect_staged`), `tests/test_cli_scan.py::test_scan_staged_refuses_blob_size_mismatch`, `::test_scan_staged_refuses_negative_blob_size` |
+| LOW — `blob_size` sans plancher | `GitAccess.blob_size` refuse une taille négative (`ToolFailure`) ; zéro reste valide (blob vide, aucun candidat) | `heimdall/mcp/gitdiff.py` (`blob_size`), `tests/test_cli_scan.py::test_blob_size_refuses_negative_git_output`, `::test_blob_size_accepts_empty_blob` |
+| LOW — deux libellés stderr pour le code 2 | un seul message statique (`_SCAN_ERROR_MESSAGE`) pour `ScanError`/`ToolFailure` et pour toute panne inattendue : l'observateur ne distingue plus une panne anticipée d'une panne inattendue | `heimdall/cli/main.py`, `tests/test_cli_scan.py::test_scan_tool_failure_uses_the_same_static_message`, `::test_scan_render_failure_exits_two_not_one` |
+| LOW — `max_findings=None` désactivait la borne | `None` retombe sur `MAX_FINDINGS` ; il n'existe **aucun** opt-out non borné, comme pour `Scanner` | `heimdall/scanner/signature_engine.py`, `tests/test_cli_scan.py::test_signature_engine_bounded_by_default` |
 
 ## Limites assumées
 
@@ -182,8 +195,9 @@ de CI devra les traiter par allowlist (#24).
   COMMENTS (run 39844814050), 5 points LOW et 4 tests manquants corrigés par
   `43d63c9` ; cinquième revue APPROVE WITH COMMENTS (run 39844814050), 2 points
   LOW et 2 tests manquants corrigés par `e691984` ; sixième revue APPROVE WITH
-  COMMENTS, 2 points LOW et 2 tests manquants corrigés par `0bb1136` (voir les
-  six tableaux ci-dessus).
+  COMMENTS, 2 points LOW et 2 tests manquants corrigés par `0bb1136` ; septième
+  revue APPROVE WITH COMMENTS, 4 points LOW et leurs tests de non-régression
+  ajoutés dans la passe courante (voir les sept tableaux ci-dessus).
 - La feuille SAMM externe n'est pas accessible depuis le dépôt : reporter les
   lignes ci-dessus avec le lien de la PR et le SHA final du squash/merge
   (**re-pinner les permaliens sur ce SHA final** si le squash crée un SHA

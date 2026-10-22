@@ -144,6 +144,10 @@ FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 #: Clé HMAC locale de test : empreinte déterministe, aucun fichier créé.
 TEST_HMAC_KEY = "00" * 32
 
+#: Libellé unique du code 2 : panne anticipée et panne inattendue ne sont
+#: pas distinguables sur stderr (revue, oracle minimal).
+SCAN_ERROR_MESSAGE = "heimdall scan : scan impossible (erreur d'outillage)."
+
 
 @pytest.fixture(autouse=True)
 def _cle_hmac(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -230,7 +234,7 @@ def test_scan_missing_root_exits_two(tmp_path: Path) -> None:
     """Racine absente => 2 (erreur d'outillage), jamais 0 ni 1."""
     resultat = _run("scan", str(tmp_path / "absent-29"))
     assert resultat.exit_code == EXIT_ERROR
-    assert "scan impossible" in resultat.stderr
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
     # L'entrée refusée n'est jamais reflétée (invariant 8).
     assert "absent-29" not in resultat.output
 
@@ -259,7 +263,28 @@ def test_scan_render_failure_exits_two_not_one(
     monkeypatch.setattr("heimdall.cli.main.render_text", rendu_casse)
     resultat = _run("scan", str(racine))
     assert resultat.exit_code == EXIT_ERROR
-    assert "erreur inattendue" in resultat.stderr
+    # Même libellé que `ScanError`/`ToolFailure` : un observateur ne peut
+    # pas distinguer une panne anticipée d'une panne inattendue.
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+def test_scan_tool_failure_uses_the_same_static_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `ToolFailure` et panne inattendue ont le même stderr.
+
+    Le test de rendu couvre `Exception`, celui-ci `ToolFailure` : les deux
+    chemins doivent produire exactement le libellé de `ScanError`.
+    """
+    racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
+
+    def collecte_en_panne(*_arguments: object, **_options: object) -> None:
+        raise ToolFailure("INTERNAL")
+
+    monkeypatch.setattr("heimdall.cli.main.collect", collecte_en_panne)
+    resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
 def test_scan_broken_stderr_still_exits_two(
@@ -754,6 +779,91 @@ def test_scan_staged_refuses_too_many_files(
     assert resultat.exit_code == EXIT_ERROR
 
 
+def test_scan_staged_refuses_too_many_bytes(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Le volume total des blobs relus reste borné (refus, jamais tronqué)."""
+    monkeypatch.setattr("heimdall.cli.scan.MAX_STAGED_BYTES", 1)
+    git_repo.write("a.py", "x = 1\n")
+    git_repo.stage("a.py")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+def test_scan_staged_refuses_blob_size_mismatch(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : taille annoncée != taille relue -> 2, jamais de scan.
+
+    Le blob porte un secret et l'oracle (`cat-file -s`) l'annonce un octet
+    trop court : le contenu relu dépasse la taille annoncée. Sans
+    re-contrôle après lecture, ce surplus serait scanné et le verdict
+    serait 1 ; le re-contrôle refuse avant tout décodage.
+    """
+    git_repo.write("config.py", f'AWS = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage("config.py")
+    original_taille = GitAccess.blob_size
+
+    def taille_mensongere(self: GitAccess, blob: str) -> int:
+        return original_taille(self, blob) - 1
+
+    monkeypatch.setattr(GitAccess, "blob_size", taille_mensongere)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+    assert FAKE_AWS_KEY not in resultat.output
+
+
+def test_scan_staged_refuses_negative_blob_size(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : une taille négative simulée -> 2, `total` ne recule pas."""
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
+
+    def taille_negative(self: GitAccess, blob: str) -> int:
+        return -1
+
+    monkeypatch.setattr(GitAccess, "blob_size", taille_negative)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+def test_blob_size_refuses_negative_git_output(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `blob_size` refuse une sortie git négative.
+
+    La garde vit dans `GitAccess` (bibliothèque), pas seulement dans la CLI.
+    """
+    access = GitAccess(git_repo.root)
+
+    def execute_negatif(self: GitAccess, arguments: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout=b"-1\n")
+
+    monkeypatch.setattr(GitAccess, "execute", execute_negatif)
+    with pytest.raises(ToolFailure):
+        access.blob_size("a" * 40)
+
+
+def test_blob_size_accepts_empty_blob(git_repo: GitRepo) -> None:
+    """Revue (LOW) : un blob vide (taille 0) reste valide et ne fait pas 2.
+
+    Le plancher refuse le négatif, pas zéro : un blob vide ne porte aucun
+    candidat et le scan rend un verdict propre.
+    """
+    git_repo.write("vide.py", "")
+    git_repo.stage("vide.py")
+    access = GitAccess(git_repo.root)
+    changes = access.staged_changes()
+    assert len(changes) == 1
+    assert access.blob_size(changes[0].blob) == 0
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_CLEAN
+
+
 def test_scan_staged_raw_output_capped(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -846,18 +956,20 @@ def test_signature_engine_stops_at_cap() -> None:
 
 
 def test_signature_engine_bounded_by_default() -> None:
-    """Revue (LOW) : `SignatureEngine()` sans argument reste fail-closed.
+    """Revue (LOW) : `SignatureEngine()` et `max_findings=None` sont bornés.
 
     Le défaut est le plafond partagé : un appelant qui analyserait un blob
     dense sans renseigner `max_findings` refuse au-delà de 10 000 au lieu
-    d'accumuler sans borne. `None` explicite garde l'historique non borné.
+    d'accumuler sans borne. `None` explicite ne rouvre **pas** l'ancien
+    mode non borné : il retombe sur ce même défaut, comme `Scanner`.
     """
-    moteur = SignatureEngine(hasher=_HasherCompteur())
     charge = FileTarget(path="dense.py", text=_cles_denses(11_000) + "\n")
-    with pytest.raises(ScanError):
-        moteur.analyser(charge)
-    libre = SignatureEngine(hasher=_HasherCompteur(), max_findings=None)
-    assert len(libre.analyser(charge)) == 11_000
+    for moteur in (
+        SignatureEngine(hasher=_HasherCompteur()),
+        SignatureEngine(hasher=_HasherCompteur(), max_findings=None),
+    ):
+        with pytest.raises(ScanError):
+            moteur.analyser(charge)
 
 
 def test_scan_staged_dense_blob_refuses(

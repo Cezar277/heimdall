@@ -500,15 +500,21 @@ class GitAccess:
         """Taille en octets d'un objet git, **sans** le lire.
 
         L'appelant borne ainsi la lecture : un blob géant ne doit jamais
-        être chargé en mémoire (déni de service).
+        être chargé en mémoire (déni de service). Une taille négative est
+        refusée (panne d'outillage) : la comptabilité de volume de
+        l'appelant ne doit jamais pouvoir reculer. Zéro reste valide — un
+        blob vide ne porte aucun candidat.
         """
         completed = self.execute(("cat-file", "-s", _checked_object(blob)))
         if completed.returncode != 0:
             raise ToolFailure("INTERNAL")
         try:
-            return int(completed.stdout.strip())
+            size = int(completed.stdout.strip())
         except ValueError:
             raise ToolFailure("INTERNAL") from None
+        if size < 0:
+            raise ToolFailure("INTERNAL")
+        return size
 
     def blob_bytes(self, blob: str) -> bytes:
         """Contenu **brut** d'un blob (celui de l'index, pas de la copie de
