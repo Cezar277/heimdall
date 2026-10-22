@@ -255,6 +255,19 @@ def test_slack_token_families_are_detected(tmp_path: Path, prefix: str) -> None:
 def test_slack_rotating_token_is_detected(tmp_path: Path) -> None:
     token = "xoxe." + fake_token("xapp-", 24)
     findings = _scan_lines(tmp_path, f'SLACK = "{token}"')
+    # Le registre #54 signale les deux formes emboîtées (rotatif + app) :
+    # doublon acceptable (même ligne, même type), jamais un manqué. Exclure
+    # le `.` devant `xapp-` créerait une évasion par préfixe (`.xapp-…`).
+    assert [(finding["line"], finding["type"]) for finding in findings] == [
+        (1, "slack"),
+        (1, "slack"),
+    ]
+
+
+def test_dot_prefixed_app_token_is_still_detected(tmp_path: Path) -> None:
+    """Non-régression évasion par préfixe : `.xapp-…` reste signalé."""
+    token = fake_token("xapp-", 24)
+    findings = _scan_lines(tmp_path, f'SLACK = "evil.{token}"')
     assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "slack")]
 
 

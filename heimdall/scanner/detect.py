@@ -279,7 +279,9 @@ class Scanner:
         if index + 1 >= len(lines):
             return None
         following = lines[index + 1]
-        if len(line) + len(following) > MULTILINE_WINDOW:
+        # Fenêtre en octets UTF-8 (doc 4 Kio), pas en caractères : l'écart
+        # doc/implantation sur UTF-8 multioctets serait une borne contournable.
+        if len((line + following).encode("utf-8")) > MULTILINE_WINDOW:
             return None
         return line + following, len(line)
 
