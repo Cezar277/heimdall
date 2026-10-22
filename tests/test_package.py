@@ -3,6 +3,8 @@
 import copy
 import os
 import pickle
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,6 +55,10 @@ class PackageSmokeTests(unittest.TestCase):
 
     def test_scan_is_wired_and_writes_nothing(self) -> None:
         """#29 livré : la commande scan est branchée et reste en lecture seule."""
+        git = shutil.which("git", path=os.defpath)
+        if git is None:  # pragma: no cover - garde-fou d'environnement de test.
+            raise unittest.SkipTest("git requis")
+        assert git is not None
         runner = CliRunner()
         previous = os.getcwd()
         for argv in (["scan"], ["scan", "--ci"]):
@@ -60,13 +66,29 @@ class PackageSmokeTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory(prefix="heimdall-scan-") as tmp:
                     os.chdir(tmp)
                     try:
+                        # Le mode arbre exige une racine de dépôt (#29) : le
+                        # dossier est initialisé avant le scan.
+                        for args in (
+                            ["init", "-q"],
+                            ["config", "user.email", "test@example.invalid"],
+                            ["config", "user.name", "Heimdall Test"],
+                        ):
+                            completed = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+                                [git, *args],
+                                capture_output=True,
+                                text=True,
+                                timeout=60,
+                                check=False,
+                            )
+                            self.assertEqual(completed.returncode, 0, completed.stderr)
                         result = runner.invoke(heimdall.cli.main.app, argv)
                     finally:
                         os.chdir(previous)
                     # Un dépôt vide est réellement propre : 0, pas 2.
                     self.assertEqual(result.exit_code, 0)
-                    # Le scan est une lecture : aucun fichier n'est écrit.
-                    self.assertEqual(os.listdir(tmp), [])
+                    # Le scan est une lecture : seul `.git` (créé par le test)
+                    # est présent, rien d'autre n'a été écrit.
+                    self.assertEqual(sorted(os.listdir(tmp)), [".git"])
 
     def test_scan_reports_on_stderr(self) -> None:
         """Erreur d'outillage : message sur stderr, code 2 (jamais 0, jamais 1)."""

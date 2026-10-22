@@ -58,6 +58,8 @@ from typing import Final
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.paths import is_rel_path
+from heimdall.scanner.detect import _resolve_root
+from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import validate_relative_path
 
 # Options NON négociables (contrat 4.1) — voir le tableau du contrat pour la
@@ -215,29 +217,6 @@ def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _refuse_symlinked_root(root: Path) -> None:
-    """Refuse une racine contenant un lien symbolique, comme `_resolve_root` (#22).
-
-    La racine elle-même et chacun de ses ancêtres sont vérifiés par `lstat`
-    (`is_symlink` ne suit pas les liens) : un lien dans ce chemin lève
-    `ToolFailure` au lieu de faire lire la cible. Parité avec le mode arbre
-    (`Scanner`), qui refuse ces mêmes racines : `scan` et `scan --staged`
-    disent la même chose sur la même entrée.
-
-    Ni `resolve()` ni existence exigées ici : une racine absente reste un
-    diagnostic (`NOT_A_GIT_REPO` côté MCP, code 2 côté CLI), pas une panne
-    de construction — seul le lien symbolique est refusé. Limite assumée :
-    le contrôle vaut à la construction ; un lien échangé ensuite (TOCTOU)
-    serait relu par git lui-même, et `is_repository()` compare des chemins
-    résolus.
-    """
-    absolute = root.absolute()
-    candidates: tuple[Path, ...] = (absolute, *absolute.parents)
-    for candidate in candidates:
-        if candidate.is_symlink():
-            raise ToolFailure("INTERNAL")
-
-
 @dataclass(frozen=True)
 class StagedChange:
     """Un fichier ajouté ou modifié dans l'index, et le blob qui le porte.
@@ -253,13 +232,28 @@ class StagedChange:
 
 
 class GitAccess:
-    """Accès git en lecture seule, confiné à une racine de dépôt."""
+    """Accès git en lecture seule, confiné à une racine de dépôt.
+
+    La racine est validée par la garde unique de l'invariant 3
+    (`Scanner._resolve_root`, #22) : `lstat` des ancêtres, refus des liens,
+    égalité du résolu. Le mode arbre et le mode `--staged` partagent donc
+    exactement la même définition d'une racine acceptable — pas de seconde
+    garde divergente. La racine est figée sous forme résolue et tous les
+    usages (`-C`, plafond, comparaisons) partent de cette forme.
+    """
 
     __slots__ = ("_git", "_root")
 
     def __init__(self, root: Path) -> None:
-        _refuse_symlinked_root(root)
-        self._root = root
+        try:
+            self._root = _resolve_root(root)
+        except ScanError:
+            # Racine symlinkée, absente ou non canonique : panne
+            # d'outillage ici (`INTERNAL`), diagnostic affiné par l'appelant
+            # (`is_repository` → `NOT_A_GIT_REPO` côté MCP, code 2 côté CLI).
+            # `ScanError` ne traverse jamais la frontière : le message, qui
+            # pourrait refléter l'entrée, est remplacé par le statique.
+            raise ToolFailure("INTERNAL") from None
         # Jamais le PATH hérité : un PATH compromis (poste, CI, direnv)
         # détournerait le binaire exécuté à chaque outil. `os.defpath`
         # (`/bin:/usr/bin` sur POSIX) est le défaut système sûr, pas une
@@ -282,6 +276,11 @@ class GitAccess:
         if resolved.is_relative_to(root.resolve()) or resolved.parent == Path.cwd().resolve():
             raise ToolFailure("INTERNAL")
         self._git = binary
+
+    @property
+    def root(self) -> Path:
+        """Racine figée sous forme résolue (refusée symlink à la construction)."""
+        return self._root
 
     def execute(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
         """Exécute une commande git figée (argv, jamais de shell).

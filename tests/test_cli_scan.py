@@ -15,19 +15,27 @@ d'exemple de la documentation AWS, jamais une clé fonctionnelle.
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import typer
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
-from support.git_repo import GitRepo
+from support.git_repo import GIT, GitRepo
 from typer.testing import CliRunner
 
 from heimdall.cli.main import app
-from heimdall.cli.scan import EXIT_CLEAN, EXIT_ERROR, EXIT_FINDINGS, JSON_SCHEMA
+from heimdall.cli.scan import (
+    EXIT_CLEAN,
+    EXIT_ERROR,
+    EXIT_FINDINGS,
+    JSON_SCHEMA,
+    _verify_root_unchanged,
+)
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess, StagedChange, parse_staged_raw
 from heimdall.scanner.detect import Scanner as TreeScanner
@@ -158,14 +166,37 @@ def _run(*arguments: str) -> object:
     return CliRunner().invoke(app, list(arguments))
 
 
+def _git(cible: Path, *arguments: str) -> None:
+    """Commande git d'aide au test (dépôt jetable, argv figé, sans shell)."""
+    assert GIT is not None
+    termine = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+        [GIT, "-C", str(cible), *arguments],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert termine.returncode == 0, termine.stderr
+
+
 def _arbre(tmp_path: Path, contenu: dict[str, str]) -> Path:
-    """Écrit un petit dépôt (hors dépôt Heimdall) et rend sa racine."""
+    """Écrit un petit dépôt git (hors dépôt Heimdall) et rend sa racine.
+
+    Le mode arbre exige une racine de dépôt (#29) : chaque arbre de test
+    est donc initialisé (`git init`, sans commit — `is_repository` n'en
+    demande pas). Sans git : `skip`, jamais de repli.
+    """
+    if GIT is None:  # pragma: no cover - garde-fou d'environnement de test.
+        pytest.skip("git requis")
     racine = tmp_path / "repo"
     racine.mkdir()
     for relatif, texte in contenu.items():
         chemin = racine / relatif
         chemin.parent.mkdir(parents=True, exist_ok=True)
         chemin.write_text(texte, encoding="utf-8")
+    _git(racine, "init", "-q")
+    _git(racine, "config", "user.email", "test@example.invalid")
+    _git(racine, "config", "user.name", "Heimdall Test")
     return racine
 
 
@@ -417,10 +448,28 @@ def test_scan_staged_ignores_deleted_file(git_repo: GitRepo) -> None:
 
 def test_scan_staged_outside_a_repository_exits_two(tmp_path: Path) -> None:
     """Hors dépôt git, le mode ``--staged`` est une erreur, pas un verdict."""
-    racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
+    racine = tmp_path / "plaine"
+    racine.mkdir()
+    (racine / "app.py").write_text("x = 1\n", encoding="utf-8")
     resultat = _run("scan", "--staged", str(racine))
     assert resultat.exit_code == EXIT_ERROR
     assert "scan impossible" in resultat.stderr
+
+
+def test_scan_tree_outside_a_repository_exits_two(tmp_path: Path) -> None:
+    """Revue (LOW) : le mode arbre exige lui aussi une racine de dépôt.
+
+    Une CI mal configurée (mauvais chemin, répertoire vide) obtient un 2
+    loud, jamais un 0 « propre » silencieux. Idem pour un fichier isolé :
+    le scan unitaire reste possible en bibliothèque, hors contrat hook/CI.
+    """
+    plaine = tmp_path / "plaine"
+    plaine.mkdir()
+    (plaine / "app.py").write_text("x = 1\n", encoding="utf-8")
+    assert _run("scan", str(plaine)).exit_code == EXIT_ERROR
+    isole = tmp_path / "isole.py"
+    isole.write_text("x = 1\n", encoding="utf-8")
+    assert _run("scan", str(isole)).exit_code == EXIT_ERROR
 
 
 def test_scan_staged_with_unmerged_index_exits_two(git_repo: GitRepo) -> None:
@@ -546,6 +595,86 @@ def test_scan_staged_concurrent_index_change_exits_two(
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert "scan impossible" in resultat.stderr
+
+
+def test_scan_staged_root_swapped_mid_scan_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : racine échangée pendant le scan -> 2 (re-contrôle final).
+
+    L'index de remplacement est IDENTIQUE (même blob) : le re-contrôle
+    d'index passe, seul le re-contrôle racine refuse. Sans lui, ce serait 0
+    sur un périmètre qui n'est plus celui demandé.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
+    evil = GitRepo("heimdall-t29-evil-")
+    try:
+        evil.write("app.py", "x = 1\n")
+        evil.stage("app.py")
+        original_octets = GitAccess.blob_bytes
+        appels = 0
+
+        def lit_puis_echange(self: GitAccess, blob: str) -> bytes:
+            nonlocal appels
+            appels += 1
+            data = original_octets(self, blob)
+            if appels == 1:
+                cache = git_repo.root.parent / "orig-29"
+                git_repo.root.rename(cache)
+                git_repo.root.symlink_to(evil.root, target_is_directory=True)
+            return data
+
+        monkeypatch.setattr(GitAccess, "blob_bytes", lit_puis_echange)
+        resultat = _run("scan", "--staged", str(git_repo.root))
+    finally:
+        evil.close()
+    assert appels == 1
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
+def test_scan_tree_root_swapped_mid_scan_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : idem en mode arbre — le re-contrôle final refuse.
+
+    Sans re-contrôle, le verdict serait 0 (dépôt propre) sur un périmètre
+    échangé après l'entrée. L'échange a lieu après l'analyse (sinon c'est
+    le refus à l'usage, déjà couvert) : seule la reconstruction fraîche
+    du re-contrôle lève, donc 2.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    original_scan = TreeScanner.scan
+    echange = [False]
+
+    def scan_puis_echange(self: TreeScanner) -> list[object]:
+        trouvailles = original_scan(self)
+        if not echange[0]:
+            echange[0] = True
+            cache = git_repo.root.parent / "orig-29"
+            git_repo.root.rename(cache)
+            git_repo.root.symlink_to(cache, target_is_directory=True)
+        return trouvailles
+
+    monkeypatch.setattr(TreeScanner, "scan", scan_puis_echange)
+    resultat = _run("scan", str(git_repo.root))
+    assert echange[0]
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
+def test_verify_root_unchanged_refuses_divergent_resolution(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Le re-contrôle compare, pas seulement construit : divergence -> 2."""
+    access = GitAccess(git_repo.root)
+    ailleurs = git_repo.root.parent / "ailleurs-29"
+    monkeypatch.setattr(
+        "heimdall.cli.scan.GitAccess", lambda racine: SimpleNamespace(root=ailleurs)
+    )
+    with pytest.raises(ScanError):
+        _verify_root_unchanged(access, git_repo.root)
 
 
 def test_scan_staged_refuses_too_many_files(

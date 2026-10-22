@@ -76,6 +76,7 @@ _MSG_TOO_MANY_FILES: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_LARGE: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_MANY_FINDINGS: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
+_MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 
 #: Libellés du périmètre, affichés à l'humain.
 _SCOPE_LABELS: Final[dict[str, str]] = {
@@ -116,14 +117,40 @@ def collect(root: Path, *, staged: bool) -> ScanReport:
     return _collect_tree(root)
 
 
+def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
+    """Refuse si la racine a été échangée pendant le scan (TOCTOU).
+
+    `access` fige la racine résolue à l'entrée ; une reconstruction fraîche
+    refait la garde unique (refus symlink compris). Toute différence —
+    remplacement par un lien, déplacement, suppression — refuse le verdict :
+    le périmètre analysé n'est plus celui demandé. Pur `lstat`, aucun `git`.
+    """
+    try:
+        current = GitAccess(root).root
+    except ToolFailure:
+        raise ScanError(_MSG_ROOT_CHANGED) from None
+    if current != access.root:
+        raise ScanError(_MSG_ROOT_CHANGED)
+
+
 def _collect_tree(root: Path) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29).
 
     ``strict=True`` ne conserve que les exclusions **techniques** de #59
     (binaires, répertoires générés) : ``vendor/``, les lockfiles et les
     fichiers de contrôle sont parcourus. Un secret y est un secret.
+
+    Le périmètre contractuel est la **racine d'un dépôt git** : hors dépôt
+    (répertoire quelconque, fichier isolé), pas de verdict « propre » mais
+    une erreur — une CI mal configurée (mauvais chemin) doit échouer loud,
+    pas rendre 0 en silence. Le scan de fichier isolé reste possible en
+    bibliothèque (`Scanner`, #22), hors contrat hook/CI.
     """
+    access = GitAccess(root)
+    if not access.is_repository():
+        raise ScanError(_MSG_NOT_A_REPO)
     findings = TreeScanner(root, strict=True).scan()
+    _verify_root_unchanged(access, root)
     return ScanReport(scope=SCOPE_TREE, findings=tuple(findings))
 
 
@@ -190,6 +217,7 @@ def _collect_staged(root: Path) -> ScanReport:
         # L'index a bougé pendant le scan : le snapshot analysé ne décrit
         # plus ce qui sera committé. Refus, pas de verdict périmé.
         raise ScanError(_MSG_INDEX_CHANGED)
+    _verify_root_unchanged(access, root)
     return ScanReport(scope=SCOPE_STAGED, findings=tuple(findings))
 
 

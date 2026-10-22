@@ -345,6 +345,9 @@ class ConfinedEnvironmentTests(unittest.TestCase):
         self.assertEqual(env["PATH"], "")
         self.assertEqual(env["HOME"], tmp)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        # Clone partiel : sans elle, `git cat-file` irait chercher l'objet
+        # manquant sur le réseau — interdit (100 % local).
+        self.assertEqual(env["GIT_NO_LAZY_FETCH"], "1")
 
     def test_discovery_ceiling_is_the_parent_of_the_root(self) -> None:
         """Plafond = le parent, parce que c'est lui que git ascendererait.

@@ -37,8 +37,12 @@ heimdall scan --json [CHEMIN]       # rapport JSON sur stdout
 | `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr |
 | `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; les erreurs restent sur stderr |
 
-`CHEMIN` vaut `.` par défaut. Il doit être la **racine** d'un dépôt git en
-mode `--staged` (sinon : erreur, code 2).
+`CHEMIN` vaut `.` par défaut. Il doit être la **racine** d'un dépôt git,
+dans les deux périmètres (sinon : erreur, code 2) : hors dépôt —
+répertoire quelconque, fichier isolé — il n'y a pas de verdict « propre »,
+pour qu'une CI mal configurée (mauvais chemin) échoue loud au lieu de
+rendre 0 en silence. Le scan de fichier isolé reste possible en
+bibliothèque (`Scanner`, #22), hors contrat hook/CI.
 
 ## Les deux périmètres
 
@@ -73,6 +77,12 @@ périmée (un fichier ajouté après le snapshot serait committé sans avoir ét
 scanné). L'index est donc **relu après l'analyse**, et toute divergence
 refuse le scan (code 2) : un verdict sur un snapshot périmé ne vaut ni 0
 ni 1.
+
+La **racine elle-même est re-contrôlée** après l'analyse, dans les deux
+périmètres : la garde unique (refus symlink, égalité du résolu) est rejouée
+sur le chemin demandé et comparée à la forme figée à l'entrée. Un lien
+remplacé pendant le scan — qui ferait lire une autre cible à `git -C`
+— refuse le verdict au lieu de juger le mauvais périmètre.
 
 Les suppressions et les **gitlinks** (sous-modules, mode `160000`) sont
 ignorés : une suppression n'a plus de blob à scanner, et le SHA d'un gitlink
@@ -196,10 +206,10 @@ vérifiée par le test. Un parseur CI DOIT refuser tout document invalide.
 - **Aucune exécution du contenu analysé** : le dépôt scanné ne peut pas
   faire exécuter une commande (les options git `--no-ext-diff` et
   `--no-textconv` neutralisent `diff.external` et les filtres `textconv`).
-- **Racine sans lien symbolique, dans les deux périmètres** : comme le mode
-  arbre (`Scanner._resolve_root`), `--staged` refuse une racine qui est ou
-  contient un lien symbolique — parité de disponibilité, même contenu
-  après résolution.
+- **Racine sans lien symbolique, dans les deux périmètres** : une seule
+  garde (celle du mode arbre, `Scanner._resolve_root`), rejouée à
+  l'entrée comme en fin de scan. `scan` et `scan --staged` disent la même
+  chose sur la même entrée — jamais de verdict sur un périmètre échangé.
 
 ## Limites connues (honnêtes)
 
