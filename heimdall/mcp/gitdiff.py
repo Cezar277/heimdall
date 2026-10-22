@@ -286,7 +286,10 @@ class GitAccess:
         # `os.defpath` est absolu donc ce refus est un filet dormant, mais il
         # couvre aussi un `defpath` vide ou relatif. Refus fail-closed,
         # avant tout usage du binaire : il n'est jamais exécuté.
-        if resolved.is_relative_to(root.resolve()) or resolved.parent == Path.cwd().resolve():
+        # Comparaison à la forme **figée** (`self._root`), jamais au
+        # paramètre brut : une seule référence canonique, donc une seule
+        # fenêtre TOCTOU et aucune divergence si la garde de racine évolue.
+        if resolved.is_relative_to(self._root) or resolved.parent == Path.cwd().resolve():
             raise ToolFailure("INTERNAL")
         self._git = binary
 

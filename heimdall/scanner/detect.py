@@ -60,6 +60,24 @@ _FIRST_CONTROL: Final[int] = 0x20
 _DELETE: Final[int] = 0x7F
 _UNICODE_LINE_SEPARATORS: Final[frozenset[int]] = frozenset({0x2028, 0x2029})
 _SCAN_ERROR: Final[str] = "scan impossible : entrée non analysable"
+_BOUNDS_ERROR: Final[str] = "bornes de scan hors contrat"
+
+
+def _checked_bound(value: int | None, default: int) -> int:
+    """Normalise une borne explicite sans permettre de la désactiver.
+
+    ``None`` retombe sur ``default`` (la constante du module, patchable par
+    les tests). Une valeur explicite doit être un entier strictement positif
+    et **inférieur ou égal** au plafond par défaut : un entier géant
+    (``10**12``) ne peut donc pas rouvrir un scan non borné. Refus loud
+    (``ValueError``) plutôt que borne silencieusement ignorée.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= default:
+        raise ValueError(_BOUNDS_ERROR)
+    return value
+
 
 __all__ = [
     "Finding",
@@ -173,6 +191,11 @@ class Scanner:
         max_bytes: int | None = None,
         max_findings: int | None = None,
     ) -> None:
+        # Les bornes sont validées avant tout accès disque : une surcharge
+        # explicite ne peut ni annuler ni relever les plafonds par défaut.
+        self._max_files = _checked_bound(max_files, MAX_FILES)
+        self._max_bytes = _checked_bound(max_bytes, MAX_TOTAL_BYTES)
+        self._max_findings = _checked_bound(max_findings, MAX_FINDINGS)
         resolved = _resolve_root(root)
         if resolved.is_dir():
             self._root = resolved
@@ -184,9 +207,6 @@ class Scanner:
             raise ScanError(_SCAN_ERROR)
         self._hasher = SnippetHasher() if hasher is None else hasher
         self._strict = strict
-        self._max_files = MAX_FILES if max_files is None else max_files
-        self._max_bytes = MAX_TOTAL_BYTES if max_bytes is None else max_bytes
-        self._max_findings = MAX_FINDINGS if max_findings is None else max_findings
 
     def scan(self) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.

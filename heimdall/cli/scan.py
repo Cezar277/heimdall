@@ -152,7 +152,11 @@ def _collect_tree(root: Path) -> ScanReport:
     access = GitAccess(root)
     if not access.is_repository():
         raise ScanError(_MSG_NOT_A_REPO)
-    findings = TreeScanner(root, strict=True).scan()
+    # `access.root` est la forme **figée** (résolue, symlink refusé) : le
+    # scanner ne re-résout pas l'entrée brute, donc une seule résolution et
+    # une seule course possible, alignée sur l'identité épinglée par
+    # `GitAccess`.
+    findings = TreeScanner(access.root, strict=True).scan()
     _verify_root_unchanged(access, root)
     return ScanReport(scope=SCOPE_TREE, findings=tuple(findings))
 

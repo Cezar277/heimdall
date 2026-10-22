@@ -346,6 +346,46 @@ def test_scan_tree_refuses_too_many_bytes(
     assert resultat.exit_code == EXIT_ERROR
 
 
+def test_collect_tree_uses_the_pinned_root(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `TreeScanner` reçoit `access.root`, pas l'entrée brute.
+
+    Une entrée avec ``..`` prouve qu'une seule résolution est faite : le
+    scanner ne re-résout pas le chemin demandé après la garde de `GitAccess`.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    seen: list[tuple[Path, bool]] = []
+
+    class ScannerEspion:
+        def __init__(self, root: Path, *, strict: bool) -> None:
+            seen.append((Path(root), strict))
+
+        def scan(self) -> list[object]:
+            return []
+
+    monkeypatch.setattr("heimdall.cli.scan.TreeScanner", ScannerEspion)
+    racine = git_repo.root / ".." / git_repo.root.name
+    resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_CLEAN
+    assert seen == [(git_repo.root.resolve(), True)]
+
+
+@pytest.mark.parametrize("borne", ["max_files", "max_bytes", "max_findings"])
+@pytest.mark.parametrize("valeur", [0, -1, 10**12])
+def test_scanner_refuses_invalid_explicit_bounds(
+    tmp_path: Path, borne: str, valeur: int
+) -> None:
+    """Revue (LOW) : une surcharge explicite ne relève pas les bornes.
+
+    ``None`` retombe sur le défaut ; zéro, négatif ou entier géant sont
+    refusés à la construction (``ValueError``), jamais acceptés en silence.
+    """
+    racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
+    with pytest.raises(ValueError):
+        TreeScanner(racine, **{borne: valeur})
+
+
 # --- mode strict : les exclusions de contenu texte tombent -----------------
 
 
@@ -970,6 +1010,13 @@ def test_signature_engine_bounded_by_default() -> None:
     ):
         with pytest.raises(ScanError):
             moteur.analyser(charge)
+
+
+@pytest.mark.parametrize("valeur", [0, -1, 10**12])
+def test_signature_engine_refuses_invalid_explicit_cap(valeur: int) -> None:
+    """Revue (LOW) : un plafond explicite hors `1..MAX_FINDINGS` est refusé."""
+    with pytest.raises(ValueError):
+        SignatureEngine(max_findings=valeur)
 
 
 def test_scan_staged_dense_blob_refuses(

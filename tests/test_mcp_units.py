@@ -509,6 +509,24 @@ class GitAccessDirectTests(unittest.TestCase):
                         gitdiff.GitAccess(self.repo.root)
         self.assertEqual(ctx.exception.code, "INTERNAL")
 
+    def test_git_binary_under_the_pinned_root_is_refused_with_dotdot_input(self) -> None:
+        """Revue (LOW) : la garde binaire compare à la forme figée.
+
+        L'entrée brute contient ``..`` ; le binaire piégé est sous la racine
+        résolue. Le refus doit partir de `self._root`, pas de `root.resolve()`
+        rejoué sur le paramètre : une seule forme canonique.
+        """
+        planted = self.repo.root / "git.exe"
+        planted.write_text("factice, jamais exécutable", encoding="utf-8")
+        raw = self.repo.root / ".." / self.repo.root.name
+        with mock.patch.object(gitdiff.shutil, "which", return_value=str(planted)):
+            with mock.patch.object(
+                gitdiff.subprocess, "run", side_effect=AssertionError("exécuté !")
+            ):
+                with self.assertRaises(ToolFailure) as ctx:
+                    gitdiff.GitAccess(raw)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+
     def test_git_binary_under_the_cwd_is_refused(self) -> None:
         """Binaire piégé sous le répertoire courant (hors racine) : refusé aussi."""
         with tempfile.TemporaryDirectory(prefix="heimdall-fakebin-") as bindir:

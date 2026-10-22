@@ -12,8 +12,9 @@ revue APPROVE WITH COMMENTS), ses premiers durcissements (`ae0b1c7`), les
 correctifs de la seconde revue (`593021c`, run 39838145119), ceux de la
 troisième revue (`251fd18`, run 39841323251) et la présente passe
 (run 39844814050). Les permaliens ci-dessous épinglent ce SHA : un lien vers
-la branche changerait de lignes au fil des commits. La septième passe
-(courante, voir plus bas) sera re-pinnée sur le SHA final du squash/merge.
+la branche changerait de lignes au fil des commits. Les septième et huitième
+passes (courantes, voir plus bas) seront re-pinnées sur le SHA final du
+squash/merge.
 
 Base : `aa875a1` (fusion de #165, `main` au moment de la livraison), qui
 contient le scanner #22 (`2ba3ebf…`) et l'accès git confiné #27. Le diff
@@ -57,16 +58,16 @@ Environnement : Linux, Python 3.14.8, venv du dépôt.
 
 ```text
 .venv/bin/python -m pytest tests/test_cli_scan.py -q
-70 passed
+83 passed
 
 .venv/bin/python -m pytest
-1509 passed, 4321 subtests passed
+1523 passed, 4321 subtests passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch \
   --cov-report=term-missing --cov-fail-under=85
-Total coverage: 95,84 % (seuil 85 % atteint)
+Total coverage: 95,82 % (seuil 85 % atteint)
 heimdall/cli/scan.py : 98 % ; heimdall/cli/main.py : 98 % ;
-heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 91 % ;
+heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 90 % ;
 heimdall/scanner/signature_engine.py : 100 %
 
 .venv/bin/ruff check heimdall tests        # All checks passed!
@@ -169,6 +170,16 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge
 | LOW — deux libellés stderr pour le code 2 | un seul message statique (`_SCAN_ERROR_MESSAGE`) pour `ScanError`/`ToolFailure` et pour toute panne inattendue : l'observateur ne distingue plus une panne anticipée d'une panne inattendue | `heimdall/cli/main.py`, `tests/test_cli_scan.py::test_scan_tool_failure_uses_the_same_static_message`, `::test_scan_render_failure_exits_two_not_one` |
 | LOW — `max_findings=None` désactivait la borne | `None` retombe sur `MAX_FINDINGS` ; il n'existe **aucun** opt-out non borné, comme pour `Scanner` | `heimdall/scanner/signature_engine.py`, `tests/test_cli_scan.py::test_signature_engine_bounded_by_default` |
 
+## Correctifs de la huitième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — confinement binaire comparé à l'entrée brute | `GitAccess` compare le binaire résolu à `self._root` (forme figée), plus à `root.resolve()` : une seule référence canonique, pas de seconde fenêtre TOCTOU | `heimdall/mcp/gitdiff.py` (`GitAccess.__init__`), `tests/test_mcp_units.py::GitAccessDirectTests::test_git_binary_under_the_pinned_root_is_refused_with_dotdot_input` |
+| LOW — `_collect_tree` re-résout la racine | `TreeScanner(access.root, strict=True)` : le scanner reçoit la forme déjà figée par `GitAccess`, une seule résolution et une seule identité épinglée | `heimdall/cli/scan.py` (`_collect_tree`), `tests/test_cli_scan.py::test_collect_tree_uses_the_pinned_root` |
+| LOW — bornes `Scanner` désactivables par entier géant | `None` retombe sur le plafond courant ; une borne explicite doit être un entier dans `1..plafond` (`ValueError` sinon). Même validation pour `SignatureEngine(max_findings=...)` | `heimdall/scanner/detect.py` (`_checked_bound`), `heimdall/scanner/signature_engine.py` ; `tests/test_cli_scan.py::test_scanner_refuses_invalid_explicit_bounds`, `::test_signature_engine_refuses_invalid_explicit_cap` |
+
 ## Limites assumées
 
 - La validation humaine Y/N/E et le remplacement du secret ne sont pas dans ce
@@ -197,7 +208,9 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge
   LOW et 2 tests manquants corrigés par `e691984` ; sixième revue APPROVE WITH
   COMMENTS, 2 points LOW et 2 tests manquants corrigés par `0bb1136` ; septième
   revue APPROVE WITH COMMENTS, 4 points LOW et leurs tests de non-régression
-  ajoutés dans la passe courante (voir les sept tableaux ci-dessus).
+  ajoutés ; huitième revue APPROVE WITH COMMENTS, 3 points LOW et leurs tests
+  de non-régression ajoutés dans la passe courante (voir les huit tableaux
+  ci-dessus).
 - La feuille SAMM externe n'est pas accessible depuis le dépôt : reporter les
   lignes ci-dessus avec le lien de la PR et le SHA final du squash/merge
   (**re-pinner les permaliens sur ce SHA final** si le squash crée un SHA

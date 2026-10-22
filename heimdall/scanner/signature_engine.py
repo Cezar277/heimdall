@@ -45,6 +45,8 @@ MAX_FINDINGS: Final[int] = 10_000
 #: Refus statique du plafond Findings : même libellé que le scanner
 #: bibliothèque (`detect.py`), invariant 8 (aucune entrée reflétée).
 _MAX_FINDINGS_ERROR: Final[str] = "scan impossible : entrée non analysable"
+#: Refus statique d'un plafond explicite hors contrat (0, négatif, géant).
+_MAX_FINDINGS_INVALID: Final[str] = "plafond de findings hors contrat"
 
 
 class SignatureEngine:
@@ -58,7 +60,9 @@ class SignatureEngine:
     partagé (:data:`MAX_FINDINGS`) : un appelant qui analyserait un blob
     dense sans le renseigner reste fail-closed au lieu d'accumuler sans
     borne (#29). ``None`` explicite retombe sur ce même défaut borné — il
-    n'existe **aucun** opt-out non borné, comme pour ``Scanner``. La CLI
+    n'existe **aucun** opt-out non borné, comme pour ``Scanner``. Un
+    ``max_findings`` explicite doit rester dans ``1..MAX_FINDINGS`` : un
+    entier géant ne peut pas relever la borne (``ValueError``). La CLI
     ``--staged`` renseigne explicitement sa propre constante (même valeur,
     knob documenté côté CLI).
     """
@@ -69,13 +73,23 @@ class SignatureEngine:
         self,
         hasher: SnippetHasher | None = None,
         *,
-        max_findings: int | None = MAX_FINDINGS,
+        max_findings: int | None = None,
     ) -> None:
         self._hasher = hasher
         # `None` ne doit jamais désactiver la borne : on retombe sur le
         # défaut, y compris pour un appelant non typé qui passerait `None`
-        # en croyant conserver l'ancien mode non borné.
-        self._max_findings = MAX_FINDINGS if max_findings is None else max_findings
+        # en croyant conserver l'ancien mode non borné. Un entier explicite
+        # ne peut pas non plus relever le plafond (même refus loud que la
+        # couche scanner).
+        if max_findings is None:
+            max_findings = MAX_FINDINGS
+        if (
+            isinstance(max_findings, bool)
+            or not isinstance(max_findings, int)
+            or not 1 <= max_findings <= MAX_FINDINGS
+        ):
+            raise ValueError(_MAX_FINDINGS_INVALID)
+        self._max_findings = max_findings
 
     def analyser(self, cible: ScanTarget) -> list[Finding]:
         """Analyse la cible et rend un Finding par candidat distinct."""

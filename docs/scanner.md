@@ -138,6 +138,7 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | fichier non régulier (FIFO, device) | `ScanError` |
 | fichier > 1 Mio | `ScanError` |
 | plus de 50 000 fichiers, ou plus de 256 Mio lus au total | `ScanError` (bornes #29) |
+| borne explicite `max_files`/`max_bytes`/`max_findings` hors de `1..plafond` | `ValueError` à la construction (surcharge jamais silencieuse) |
 | fichier modifié pendant la lecture | `ScanError` |
 | nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` |
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
