@@ -14,6 +14,7 @@ from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
     ScanError,
     find_candidates,
+    scan,
     scan_rapport,
 )
 
@@ -117,6 +118,58 @@ def test_a_binary_ignored_is_traced_and_never_leaks(tmp_path: Path, capsys) -> N
     trace = capsys.readouterr().err
     assert "image.png" in trace
     assert "AKIA" not in trace
+
+
+def test_an_unanalysable_tier_file_never_yields_a_clean_verdict(tmp_path: Path) -> None:
+    """REQ-SEC-07 : un fichier non analysable n'est JAMAIS un verdict propre.
+
+    Les compteurs du rapport étaient jetés par `scan()` : un fichier
+    illisible, hors borne, non régulier ou mal nommé dans `vendor/` rendait
+    une liste **vide** — un verdict propre inventé alors qu'une partie du
+    périmètre n'avait pas été lue. Les deux API lèvent désormais
+    `ScanError`.
+    """
+    secret = "AKIA" + "IOSFODNN7EXAMPLE"  # exemple officiel AWS, pas une clé réelle
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "secret.txt").write_text(f'AWS = "{secret}"\n', encoding="utf-8")
+    (tmp_path / "vendor" / "huge.txt").write_bytes(b"A" * (MAX_FILE_BYTES + 1))
+    for api in (scan, find_candidates):
+        try:
+            api(str(tmp_path))
+        except ScanError as exc:
+            assert str(exc) == "scan impossible : entrée non analysable"
+        else:
+            raise AssertionError("fichier non analysable : verdict propre inventé")
+    # Seul le rapport expose le bilan partiel, avec son compteur.
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.non_analyses == 1
+    assert rapport.complet is False
+
+
+def test_a_grounded_clean_verdict_requires_a_complete_report(tmp_path: Path) -> None:
+    """REQ-SEC-07 : un verdict propre n'est fondé que si le rapport est complet.
+
+    Binaire ignoré, lien non suivi, base VCS non parcourue : dans les trois
+    cas, du contenu n'a pas été lu. `RapportScan.complet` est donc faux, et
+    #29 doit refuser (code 2) au lieu d'annoncer un dépôt propre.
+    """
+    (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.binaires_ignores == 1
+    assert rapport.complet is False
+
+    (tmp_path / "image.png").unlink()
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.hors_perimetre == 1
+    assert rapport.complet is False
+
+    (tmp_path / ".git" / "config").unlink()
+    (tmp_path / ".git").rmdir()
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.complet is True
 
 
 def test_obfuscation_corpus_is_mandatory() -> None:

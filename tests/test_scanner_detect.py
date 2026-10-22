@@ -28,6 +28,7 @@ from heimdall.scanner.detect import (
     Finding,
     RapportScan,
     ScanError,
+    ScannerRacine,
     find_candidates,
     scan,
     scan_rapport,
@@ -318,6 +319,76 @@ def test_a_rotating_bot_token_is_reported_once(tmp_path: Path) -> None:
     assert findings[0]["type"] == "slack"
 
 
+def test_an_inner_slack_token_copied_alone_is_still_detected(tmp_path: Path) -> None:
+    """Non-régression LOW : l'« inner » d'un jeton rotatif reste détecté seul.
+
+    La garde `xoxe.` neutralise le **second** signalement d'un même secret
+    (une empreinte, une entrée Vault). Elle ne doit jamais neutraliser un
+    jeton qui apparaît ailleurs : le secret est alors une autre occurrence,
+    avec sa propre empreinte.
+    """
+    inner = fake_token("xapp-", 24)
+    _write(tmp_path, "rotatif.txt", f'SLACK = "xoxe.{inner}"')
+    _write(tmp_path, "copie.txt", f'SLACK = "{inner}"')
+    findings = find_candidates(str(tmp_path))
+    assert [(finding["file"], finding["type"]) for finding in findings] == [
+        ("copie.txt", "slack"),
+        ("rotatif.txt", "slack"),
+    ]
+    # Deux occurrences distinctes du même secret : deux empreintes distinctes.
+    assert len({finding["snippet_hash"] for finding in findings}) == 2
+
+
+def test_a_padded_rotating_prefix_does_not_hide_the_inner_token(tmp_path: Path) -> None:
+    """Non-régression LOW : un préfixe rotatif bourré ne masque pas le secret.
+
+    `xxoxe.xapp-…` n'est pas un jeton rotatif (le préfixe `xoxe.` n'est pas
+    ancré) : le jeton app-level qu'il contient reste un vrai secret et doit
+    être signalé. La garde `xoxe.` ne neutralise le jeton interne que si la
+    règle rotative le reconnaît elle-même.
+    """
+    inner = fake_token("xapp-", 24)
+    _write(tmp_path, "bourrage.txt", f'SLACK = "xxoxe.{inner}"')
+    findings = find_candidates(str(tmp_path))
+    assert [(finding["file"], finding["type"]) for finding in findings] == [
+        ("bourrage.txt", "slack"),
+    ]
+
+
+@pytest.mark.parametrize("prefixe", ["xapp-", "xoxb-"])
+@pytest.mark.parametrize("charge", [0, 4, 5, 9, 10, 100, 245, 250, 251])
+def test_the_rotating_prefix_never_hides_a_token_under_the_threshold(
+    prefixe: str, charge: int
+) -> None:
+    """Le préfixe `xoxe.` ne peut jamais faire disparaître un jeton detectable.
+
+    Un jeton interne detectable seul doit rester detectable une fois
+    préfixé par `xoxe.` (faux négatif interdit) ; un jeton interne déjà
+    trop court pour la fenêtre n'est pas (non plus) pretexté. Le bourrage du
+    préfixe (`xxoxe.`) est transparent : il ne correspond pas à la forme
+    rotative, donc le jeton interne est signalé tel quel.
+    """
+    interne = prefixe + "a" * charge
+    seul = find_signature_matches(interne)
+    compose = find_signature_matches("xoxe." + interne)
+    compose_bourre = find_signature_matches("xxoxe." + interne)
+    # Jamais de faux négatif : ce qui est detectable seul l'est aussi préfixé.
+    if seul:
+        assert compose
+    # Le bourrage du préfixe est transparent : même résultat que le jeton seul.
+    assert bool(compose_bourre) == bool(seul)
+    if not seul:
+        return
+    # « Un secret, une empreinte, une entrée Vault » : le jeton interne n'est
+    # pas signalé une seconde fois quand le préfixe rotatif est reconnu…
+    assert len(compose) == 1
+    assert compose[0].signature == "slack_rotating_token"
+    # … mais il l'est dès que le préfixe rotatif est bourré (le jeton interne
+    # est alors le seul secret présent).
+    assert len(compose_bourre) == 1
+    assert compose_bourre[0].signature in {"slack_app_token", "slack_token"}
+
+
 def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:
     """Un secret coupé par un retour à la ligne reste détecté (fenêtre 4 Kio)."""
     secret = fake_token("", 40)
@@ -465,7 +536,10 @@ def test_a_real_binary_is_traced_and_counted_without_leaking_content(
     rapport = scan_rapport(str(tmp_path))
     assert rapport.binaires_ignores == 1
     assert rapport.non_analyses == 0
-    assert rapport.complet is True
+    # Un binaire n'est pas lu : son contenu peut cacher un secret. Le verdict
+    # « propre » n'est donc **pas** fondé (`complet` faux) tant qu'il
+    # subsiste, même si le fichier est apparemment inoffensif.
+    assert rapport.complet is False
     assert [finding.file for finding in rapport.findings] == ["app.py"]
     trace = capsys.readouterr().err
     assert "image.png" in trace
@@ -541,6 +615,154 @@ def test_an_invalid_name_in_a_tier_tree_is_traced_not_fatal(tmp_path: Path) -> N
     assert rapport.findings == ()
 
 
+# --- Verdict propre partiel : fail-closed strict ------------------------------
+
+
+def _arbre_de_tiers_avec_un_fichier_illisible(tmp_path: Path) -> Path:
+    """Prépare un arbre de tiers contenant un fichier illisible."""
+    _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"')
+    bloque = _write(tmp_path, "vendor/bloque.txt", "contenu")
+    bloque.chmod(0o000)
+    return bloque
+
+
+def test_a_tier_failure_never_becomes_a_clean_list(tmp_path: Path) -> None:
+    """Un fichier non analysable en arbre de tiers n'est jamais un `[]` propre.
+
+    `scan()` et `find_candidates()` jetaient les compteurs : un fichier
+    illisible, hors borne, non régulier ou mal nommé dans `vendor/` rendait
+    une liste vide — un **verdict propre inventé** alors qu'une partie du
+    périmètre n'avait pas été lue. Les deux API lèvent désormais
+    `ScanError` ; seul `scan_rapport()` expose le bilan partiel.
+    """
+    _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"')
+    _write(tmp_path, "vendor/broken.bin", b"\x00\x01\x02not-decodable")
+    with pytest.raises(ScanError) as context:
+        scan(tmp_path)
+    assert str(context.value) == "scan impossible : entrée non analysable"
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.non_analyses == 1
+    assert [finding.file for finding in rapport.findings] == ["vendor/secret.txt"]
+
+
+def test_an_oversized_tier_file_never_becomes_a_clean_list(tmp_path: Path) -> None:
+    """Un fichier hors borne en arbre de tiers n'est jamais un `[]` propre."""
+    _write(tmp_path, "vendor/huge.txt", b"A" * (MAX_FILE_BYTES + 1))
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
+
+
+def test_a_fifo_in_a_tier_tree_never_becomes_a_clean_list(tmp_path: Path) -> None:
+    """Un fichier non régulier en arbre de tiers n'est jamais un `[]` propre."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo indisponible")
+    (tmp_path / "vendor").mkdir()
+    os.mkfifo(tmp_path / "vendor" / "pipe")
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
+
+
+def test_an_invalid_name_in_a_tier_tree_never_becomes_a_clean_list(tmp_path: Path) -> None:
+    """Un nom hors contrat en arbre de tiers n'est jamais un `[]` propre."""
+    _write(tmp_path, "vendor/bad:name.txt", f'AWS = "{_aws("vendor")}"')
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="permissions POSIX")
+def test_an_unreadable_tier_file_never_becomes_a_clean_list(tmp_path: Path) -> None:
+    """Un fichier illisible en arbre de tiers n'est jamais un `[]` propre."""
+    bloque = _arbre_de_tiers_avec_un_fichier_illisible(tmp_path)
+    try:
+        with pytest.raises(ScanError):
+            scan(tmp_path)
+        with pytest.raises(ScanError):
+            find_candidates(str(tmp_path))
+        rapport = scan_rapport(str(tmp_path))
+    finally:
+        bloque.chmod(0o600)
+    assert rapport.non_analyses == 1
+    assert [finding.file for finding in rapport.findings] == ["vendor/secret.txt"]
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="permissions POSIX")
+def test_a_walk_error_in_a_tier_tree_never_becomes_a_clean_list(tmp_path: Path) -> None:
+    """Une erreur de parcours en arbre de tiers n'est jamais un `[]` propre.
+
+    Le chemin `_on_walk_error` (répertoire illisible) est le même que celui
+    d'un fichier illisible : le compteur était jeté par `scan()`, donc un
+    dépôt dont un sous-arbre n'a pas été parcouru rendait une liste vide.
+    """
+    bloque = tmp_path / "vendor" / "bloque"
+    bloque.mkdir(parents=True)
+    (bloque / "secret.txt").write_text("x", encoding="utf-8")
+    bloque.chmod(0o000)
+    try:
+        with pytest.raises(ScanError):
+            scan(tmp_path)
+        with pytest.raises(ScanError):
+            find_candidates(str(tmp_path))
+        rapport = scan_rapport(str(tmp_path))
+    finally:
+        bloque.chmod(0o700)
+    assert rapport.non_analyses == 1
+
+
+def test_the_report_is_not_complete_when_a_binary_was_left_aside(tmp_path: Path) -> None:
+    """Un binaire non lu rend le verdict « propre » non fondé."""
+    _write(tmp_path, "image.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.binaires_ignores == 1
+    assert rapport.complet is False
+
+
+def test_the_report_is_not_complete_when_a_link_was_left_aside(tmp_path: Path) -> None:
+    """Un lien symbolique non suivi rend le verdict « propre » non fondé."""
+    if not hasattr(os, "symlink"):
+        pytest.skip("liens symboliques indisponibles")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write(outside, "leak.py", f'AWS = "{_aws("outside")}"')
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    try:
+        (repository / "link.py").symlink_to(outside / "leak.py")
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Création de liens symboliques non autorisée sous Windows")
+        raise
+    rapport = scan_rapport(str(repository))
+    assert rapport.liens_ignores == 1
+    assert rapport.complet is False
+
+
+def test_the_report_is_not_complete_when_the_vcs_base_was_left_aside(tmp_path: Path) -> None:
+    """Une base VCS non parcourue rend le verdict « propre » non fondé."""
+    _write(tmp_path, ".git/config", f'AWS = "{_aws("git")}"')
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.hors_perimetre == 1
+    assert rapport.complet is False
+
+
+def test_a_complete_scan_is_the_only_one_that_is_founded(tmp_path: Path) -> None:
+    """Un dépôt entièrement lu (rien de laissé de côté) est `complet`."""
+    _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.complet is True
+    assert rapport.binaires_ignores == 0
+    assert rapport.non_analyses == 0
+    assert rapport.liens_ignores == 0
+    assert rapport.hors_perimetre == 0
+
+
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="liens symboliques indisponibles")
 def test_a_symlinked_directory_is_traced_and_never_followed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -577,6 +799,43 @@ def test_the_trace_neutralises_control_characters_in_paths(
     assert "vendor/binaire?FAUSSE LIGNE.png" in trace
     assert "\nFAUSSE LIGNE" not in trace
     assert trace.count("\n") == 1
+
+
+@pytest.mark.parametrize(
+    "separateur",
+    [
+        pytest.param("\u2028", id="U+2028"),
+        pytest.param("\u2029", id="U+2029"),
+        pytest.param("\u0085", id="U+0085"),
+        pytest.param("\u202e", id="U+202E"),
+    ],
+)
+def test_the_trace_neutralises_unicode_separators_in_paths(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], separateur: str
+) -> None:
+    """Un séparateur Unicode ne doit pas injecter de fausse ligne de journal.
+
+    U+2028/U+2029 séparent les lignes pour un lecteur Markdown ou JSON ;
+    U+0085 est un « next line » ; U+202E inverse l'affichage. Aucun de ces
+    caractères ne doit survivre dans la trace : le journal reste une ligne
+    logique par fichier.
+    """
+    _write(
+        tmp_path,
+        f"vendor/binaire{separateur}FAUSSE LIGNE.png",
+        b"\x89PNG\r\n\x1a\n" + bytes(range(256)),
+    )
+    rapport = scan_rapport(str(tmp_path))
+    # Selon le caractère, le nom est hors contrat (U+2028/U+2029 : fichier non
+    # analysé) ou valide (U+0085/U+202E : fichier lu, binaire ignoré). Dans
+    # les deux cas, le fichier laisse **une** trace et une seule.
+    assert rapport.non_analyses + rapport.binaires_ignores == 1
+    trace = capsys.readouterr().err
+    assert separateur not in trace
+    assert "vendor/binaire?FAUSSE LIGNE.png" in trace
+    assert trace.count("\n") == 1
+    # Une seule ligne logique : aucun séparateur Unicode ne subsiste.
+    assert trace.splitlines() == [trace.rstrip("\n")]
 
 
 def test_the_trace_truncates_an_absurdly_long_path(
@@ -811,6 +1070,56 @@ def test_file_changed_during_read_is_fail_closed(
     monkeypatch.setattr("heimdall.scanner.detect.os.fstat", altered_fstat)
     with pytest.raises(ScanError) as context:
         scan(path)
+    assert str(context.value) == "scan impossible : entrée non analysable"
+
+
+def test_a_file_truncated_between_the_stat_and_the_open_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Une troncature entre le `stat` et l'`open` n'est jamais un scan partiel.
+
+    Le fichier garde la même identité (dev/ino) : seule la comparaison
+    ``before``/``after`` (taille et date de modification) peut le voir. Sans
+    elle, le scan ne portait que sur le **préfixe** restant : un secret
+    placé dans la partie tronquée disparaissait et le verdict « propre »
+    était inventé.
+    """
+    secret = _aws("tronque")
+    path = _write(tmp_path, "changing.txt", f'AWS = "{secret}"\n')
+    real_fstat = os.fstat
+    calls = 0
+
+    def truncated_fstat(descriptor: int) -> object:
+        nonlocal calls
+        metadata = real_fstat(descriptor)
+        calls += 1
+        if calls == 1:
+            # Le fichier a été tronqué après le `stat` : même inode, taille
+            # réduite, date de modification inchangée.
+            return types.SimpleNamespace(
+                st_mode=metadata.st_mode,
+                st_size=metadata.st_size // 2,
+                st_mtime_ns=metadata.st_mtime_ns,
+                st_dev=metadata.st_dev,
+                st_ino=metadata.st_ino,
+            )
+        return metadata
+
+    monkeypatch.setattr("heimdall.scanner.detect.os.fstat", truncated_fstat)
+    with pytest.raises(ScanError) as context:
+        scan(path)
+    assert str(context.value) == "scan impossible : entrée non analysable"
+
+
+def test_a_root_with_a_nul_byte_is_fail_closed() -> None:
+    """Une racine avec un octet NUL est un `ScanError`, pas une `ValueError` nue.
+
+    `Path(root)` puis `resolve()` lèvent `ValueError` sur un octet NUL : sans
+    conversion, l'exception brute traversait le contrat d'erreur (message
+    statique, code 2 côté CLI).
+    """
+    with pytest.raises(ScanError) as context:
+        ScannerRacine("a\x00b")
     assert str(context.value) == "scan impossible : entrée non analysable"
 
 

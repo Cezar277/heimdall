@@ -16,7 +16,11 @@ façade ``Scanner`` de #53 »).
 Invariants :
 
 - un scan incomplet lève ``ScanError`` (fail-closed, jamais une liste
-  partielle) ;
+  partielle) : ``scan()`` et ``find_candidates()`` refusent dès qu'un
+  fichier du périmètre n'a pas pu être analysé ;
+- un verdict « propre » n'est fondé que si ``RapportScan.complet`` est
+  vrai : le rapport expose **tout** ce qui n'a pas été lu (binaire, lien
+  non suivi, base VCS non parcourue, fichier illisible) ;
 - un Finding ne contient jamais la valeur candidate, seulement son empreinte
   HMAC-SHA-256 et son entropie ;
 - les chemins sont relatifs, en ``/``, sans ``..`` ni segment vide ;
@@ -43,6 +47,7 @@ from __future__ import annotations
 import os
 import stat
 import sys
+import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,9 +91,13 @@ _MOT_HORS_PERIMETRE: Final[str] = "répertoire hors périmètre (non analysé)"
 #: fiable (longueur, caractères de contrôle) — il ne doit ni noyer le journal
 #: ni y injecter de fausses lignes.
 _TRACE_PATH_MAX: Final[int] = 256
-#: Premier caractère de contrôle (U+0020 est l'espace) et caractère d'effacement.
-_CONTROL_MIN: Final[int] = 0x20
-_DELETE: Final[int] = 0x7F
+#: Catégories Unicode neutralisées dans le journal : ``Cc`` (contrôle, dont
+#: U+0085), ``Cf`` (format, dont l'override bidirectionnel U+202E), ``Zl``
+#: et ``Zp`` (séparateurs de ligne, dont U+2028/U+2029). Un séparateur de
+#: ligne Unicode ne se voit pas dans un terminal classique, mais il casse
+#: l'affichage ligne à ligne des journaux et des consoles d'audit : un nom
+#: adverse ne doit jamais pouvoir insérer une fausse ligne de journal.
+_UNSAFE_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 __all__ = [
     "MAX_FILE_BYTES",
@@ -109,12 +118,15 @@ def _safe_path(relative: str) -> str:
     """Chien de garde du journal : caractères de contrôle neutralisés.
 
     Un nom de fichier est une donnée **non fiable** : il peut contenir un
-    retour à la ligne (injection de fausses lignes de journal) ou être
-    absurdement long. Les caractères de contrôle sont remplacés, la longueur
-    est bornée.
+    retour à la ligne (injection de fausses lignes de journal), un
+    séparateur de ligne Unicode (U+2028), un séparateur de paragraphe
+    (U+2029), un « next line » (U+0085) ou un override bidirectionnel
+    (U+202E). Les caractères de contrôle (``Cc``), de format (``Cf``) et les
+    séparateurs de ligne (``Zl``/``Zp``) sont remplacés ; la longueur est
+    bornée.
     """
     nettoye = "".join(
-        "?" if ord(character) < _CONTROL_MIN or ord(character) == _DELETE else character
+        "?" if unicodedata.category(character) in _UNSAFE_CATEGORIES else character
         for character in relative
     )
     if len(nettoye) > _TRACE_PATH_MAX:
@@ -149,8 +161,11 @@ class RapportScan:
     - ``hors_perimetre`` : répertoires non parcourus (base VCS) ;
     - ``liens_ignores`` : liens symboliques non suivis.
 
-    ``complet`` est vrai quand aucun fichier du périmètre n'a été laissé de
-    côté : c'est la condition pour qu'un verdict « propre » soit fondé.
+    ``complet`` est vrai quand **rien** n'a été laissé de côté : c'est la
+    condition pour qu'un verdict « propre » soit fondé. Un binaire ignoré,
+    un lien non suivi ou une base VCS non parcourue sont autant de
+    contenus **non lus** : un secret peut y dormir, donc le verdict ne
+    serait pas fondé.
     """
 
     findings: tuple[Finding, ...] = ()
@@ -161,8 +176,18 @@ class RapportScan:
 
     @property
     def complet(self) -> bool:
-        """Vrai si aucun fichier du périmètre n'a échoué à l'analyse."""
-        return self.non_analyses == 0
+        """Vrai si rien n'a été laissé de côté pendant le scan.
+
+        Un verdict « propre » n'est fondé que si cette propriété est vraie :
+        le moindre compteur non nul signifie qu'une partie du périmètre
+        n'a pas été lue (binaire, lien, base VCS, fichier illisible).
+        """
+        return (
+            self.non_analyses == 0
+            and self.binaires_ignores == 0
+            and self.liens_ignores == 0
+            and self.hors_perimetre == 0
+        )
 
 
 def _validate_relative_path(relative: str) -> str:
@@ -196,6 +221,10 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
     (``ScanError``) au lieu d'être suivi en silence. La promesse « les liens
     symboliques ne sont jamais suivis » vaut donc aussi pour la racine et
     pour le fichier unique.
+
+    Une racine invalide — chemin vide, octet NUL, racine absente — est
+    refusée par ``ScanError`` au message statique : jamais une
+    ``ValueError`` nue qui court-circuiterait le contrat d'erreur.
     """
     try:
         absolute = Path(os.path.abspath(Path(root).expanduser()))
@@ -209,7 +238,7 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
         if resolved != absolute:
             raise ScanError(_SCAN_ERROR)
         return resolved
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         raise ScanError(_SCAN_ERROR) from None
 
 
@@ -273,6 +302,12 @@ class ScannerRacine:
         Toute erreur de lecture **du périmètre strict** interrompt le scan :
         aucun résultat partiel n'est retourné. Ce qui est ignoré dans les
         arbres de tiers ou la base VCS est compté et journalisé.
+
+        Le rapport rendu par cette méthode est la seule source de vérité
+        sur ce qui n'a pas été lu : ``RapportScan.complet`` est vrai quand
+        rien n'a été laissé de côté. C'est cette API que #29 doit
+        consommer — un verdict « propre » n'est fondé que si ``complet``
+        est vrai.
         """
         self._binaires = 0
         self._non_analyses = 0
@@ -306,8 +341,22 @@ class ScannerRacine:
         )
 
     def scan(self) -> list[Finding]:
-        """Analyse tout le périmètre et retourne les Findings triés."""
-        return list(self.analyser().findings)
+        """Analyse tout le périmètre et retourne les Findings triés.
+
+        **Fail-closed** : dès qu'un fichier du périmètre n'a pas pu être
+        analysé, ``ScanError`` est levé. Un scan incomplet ne devient
+        jamais une liste vide ou partielle — sans quoi l'appelant
+        confondrait un dépôt propre et un dépôt partiellement lu.
+
+        Les exclusions de politique (binaire connu, lien symbolique, base
+        VCS) ne sont pas des échecs de lecture : elles sont comptées et
+        journalisées par ``analyser()``. Pour un verdict « propre » fondé,
+        il faut ``analyser()`` **et** ``RapportScan.complet``.
+        """
+        rapport = self.analyser()
+        if rapport.non_analyses:
+            raise ScanError(_SCAN_ERROR)
+        return list(rapport.findings)
 
     def _iter_files(self) -> Iterator[tuple[Path, str, Perimetre]]:
         """Parcourt la racine sans jamais suivre un lien symbolique.
@@ -448,15 +497,32 @@ class ScannerRacine:
     def _lire_borne(self, descriptor: int, before: os.stat_result) -> bytes:
         """Lit le descripteur et vérifie que le fichier n'a pas changé.
 
-        L'identité (dev/ino), la taille et la date de modification sont
-        comparées avant et après lecture : un fichier remplacé ou modifié
-        pendant le scan n'est pas analysable (fail-closed).
+        Trois comparaisons, toutes nécessaires :
+
+        - l'identité (``dev``/``ino``) : le descripteur doit désigner le
+          même fichier que le ``stat`` ;
+        - l'état **avant** (``stat``) contre l'état **après ouverture**
+          (``fstat``) : un fichier tronqué ou réécrit entre les deux
+          appels donnerait un ``after`` plus petit que le contenu lu, et
+          le scan porterait sur un **préfixe** — un verdict « propre »
+          partiel, obtenu sans le moindre secret détecté ;
+        - l'état après lecture contre l'état à l'ouverture : le fichier
+          ne doit pas avoir changé pendant la lecture.
+
+        La taille et la date de modification (en nanosecondes) sont
+        comparées à chaque fois : un fichier remplacé ou modifié pendant
+        le scan n'est pas analysable (fail-closed).
         """
         try:
             after = os.fstat(descriptor)
             if not stat.S_ISREG(after.st_mode) or after.st_size > MAX_FILE_BYTES:
                 raise _RefusInterne from None
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise _RefusInterne from None
+            # Troncature (ou réécriture) entre le `stat` et l'`open` : la
+            # lecture ne porterait que sur un préfixe du fichier, et le
+            # secret placé dans la partie tronquée disparaîtrait du scan.
+            if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
                 raise _RefusInterne from None
             chunks: list[bytes] = []
             remaining = MAX_FILE_BYTES + 1
@@ -495,7 +561,12 @@ def scan(
     hasher: SnippetHasher | None = None,
     journal: Callable[[str], None] | None = None,
 ) -> list[Finding]:
-    """Analyse ``root`` et retourne des objets :class:`Finding`."""
+    """Analyse ``root`` et retourne des objets :class:`Finding`.
+
+    **Fail-closed** : ``ScanError`` dès qu'un fichier du périmètre n'a pas
+    pu être analysé. Un scan incomplet ne devient jamais une liste vide
+    ou partielle.
+    """
     return ScannerRacine(root, hasher=hasher, journal=journal).scan()
 
 
@@ -508,7 +579,8 @@ def scan_rapport(
     """Analyse ``root`` et retourne le bilan complet (Findings + compteurs).
 
     C'est l'API que #29 doit consommer : un verdict « propre » n'est fondé
-    que si ``RapportScan.complet`` est vrai.
+    que si ``RapportScan.complet`` est vrai — c'est-à-dire si **rien** n'a
+    été laissé de côté (binaire, lien, base VCS, fichier illisible).
     """
     return ScannerRacine(root, hasher=hasher, journal=journal).analyser()
 
@@ -517,7 +589,13 @@ def find_candidates(path: str) -> list[dict[str, object]]:
     """Repère les candidats secrets sous ``path`` (dépôt ou fichier).
 
     Retourne des dictionnaires conformes au contrat Finding v1 (#14). Lève
-    ``ScanError`` dès qu'une partie du périmètre ne peut pas être analysée :
+    ``ScanError`` dès qu'un fichier du périmètre ne peut pas être analysé :
     un scan incomplet ne devient jamais une liste vide ou partielle.
+
+    Les exclusions de politique (binaire connu, lien symbolique, base VCS)
+    ne sont pas des échecs de lecture : elles sont comptées et journalisées
+    par ``scan_rapport()``. Pour un verdict « propre » **fondé**, il faut
+    ``scan_rapport()`` et ``RapportScan.complet`` — cette fonction seule ne
+    peut pas dire ce qui n'a pas été lu.
     """
     return [finding.as_dict() for finding in scan(path)]
