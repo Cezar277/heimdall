@@ -21,3 +21,14 @@ class InvalidFinding(ScanError, ValueError):
 
 class InvalidTarget(ScanError, ValueError):
     """Une cible d'analyse ne respecte pas le contrat (chemin, lignes)."""
+
+
+class ScanIncomplet(UserWarning):
+    """Des contenus ont été laissés de côté : le verdict « propre » n'est pas fondé.
+
+    Ce n'est **pas** une erreur : ``scan()`` reste utilisable pour lister les
+    Findings lus. Mais un appelant qui conclut « dépôt propre » à partir d'une
+    liste vide doit savoir que des contenus (binaire, lien symbolique, base
+    VCS) n'ont pas été lus : le rapport (``RapportScan.complet``) et l'API
+    stricte (``scan_complet()``) portent la réponse exacte.
+    """

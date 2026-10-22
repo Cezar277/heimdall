@@ -21,6 +21,10 @@ Invariants :
 - un verdict « propre » n'est fondé que si ``RapportScan.complet`` est
   vrai : le rapport expose **tout** ce qui n'a pas été lu (binaire, lien
   non suivi, base VCS non parcourue, fichier illisible) ;
+- un verdict « propre » ne peut pas être **inventé** par un appelant :
+  l'API stricte ``scan_complet()`` (et ``exiger_complet()``) refuse un
+  rapport incomplet, et ``scan()`` avertit (``ScanIncomplet``) quand une
+  liste vide signifie seulement « rien trouvé dans ce qui a été lu » ;
 - un Finding ne contient jamais la valeur candidate, seulement son empreinte
   HMAC-SHA-256 et son entropie ;
 - les chemins sont relatifs, en ``/``, sans ``..`` ni segment vide ;
@@ -48,12 +52,13 @@ import os
 import stat
 import sys
 import unicodedata
+import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from heimdall.scanner.errors import ScanError
+from heimdall.scanner.errors import ScanError, ScanIncomplet
 from heimdall.scanner.exclusions import (
     Perimetre,
     classer_chemin,
@@ -78,6 +83,17 @@ _READ_CHUNK: Final[int] = 65_536
 #: Message statique : ni chemin, ni extrait, ni valeur candidate n'est
 #: jamais reflété (invariant 8).
 _SCAN_ERROR: Final[str] = "scan impossible : entrée non analysable"
+#: Message statique du refus « rapport incomplet » : c'est la sortie 2
+#: d'outillage attendue par #29 (jamais 0, jamais 1).
+_SCAN_INCOMPLET: Final[str] = "scan incomplet : verdict propre non fondé"
+#: Avertissement statique émis quand des contenus ont été laissés de côté
+#: alors que le scan n'a pas échoué : un ``[]`` ne signifie donc pas
+#: « dépôt propre », et l'appelant est invité à consommer l'API stricte.
+_SCAN_INCOMPLET_AVERTISSEMENT: Final[str] = (
+    "scan incomplet : des contenus n'ont pas été lus (binaire, lien symbolique, "
+    "base VCS) ; le verdict « propre » n'est pas fondé — utiliser scan_complet() "
+    "pour un usage hook/CI"
+)
 
 #: Préfixe des traces : le journal ne porte **jamais** de contenu, seulement
 #: un chemin relatif déjà assaini.
@@ -107,9 +123,12 @@ __all__ = [
     "Perimetre",
     "RapportScan",
     "ScanError",
+    "ScanIncomplet",
     "ScannerRacine",
+    "exiger_complet",
     "find_candidates",
     "scan",
+    "scan_complet",
     "scan_rapport",
 ]
 
@@ -188,6 +207,24 @@ class RapportScan:
             and self.liens_ignores == 0
             and self.hors_perimetre == 0
         )
+
+
+def exiger_complet(rapport: RapportScan) -> RapportScan:
+    """Garde **programmatique** : un rapport incomplet ne fonde aucun verdict.
+
+    C'est la garde d'usage que #29 doit appliquer : tant que le rapport
+    n'est pas complet, un dépôt peut cacher un secret dans un binaire, un
+    lien symbolique ou une base VCS — donc « aucun candidat » ne veut pas
+    dire « dépôt propre ». La garde est ici **exécutable** (et non laissée à
+    une simple consigne de documentation) : elle refuse par ``ScanError``,
+    message statique, sans chemin ni valeur.
+
+    Le refus est l'erreur d'outillage attendue par la CLI (code 2, jamais 0
+    ni 1) : un verdict « propre » inventé ne peut pas sortir d'ici.
+    """
+    if not rapport.complet:
+        raise ScanError(_SCAN_INCOMPLET)
+    return rapport
 
 
 def _validate_relative_path(relative: str) -> str:
@@ -340,6 +377,16 @@ class ScannerRacine:
             liens_ignores=self._liens,
         )
 
+    def analyser_complet(self) -> RapportScan:
+        """Analyse et **refuse** un rapport incomplet (``ScanError``).
+
+        C'est l'API stricte : elle rend un bilan seulement si rien n'a été
+        laissé de côté. Un appelant qui veut annoncer un verdict « propre »
+        (hook, CI) consomme celle-ci : il ne peut pas obtenir un bilan
+        partiel qu'il confondrait avec un dépôt propre.
+        """
+        return exiger_complet(self.analyser())
+
     def scan(self) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.
 
@@ -351,11 +398,24 @@ class ScannerRacine:
         Les exclusions de politique (binaire connu, lien symbolique, base
         VCS) ne sont pas des échecs de lecture : elles sont comptées et
         journalisées par ``analyser()``. Pour un verdict « propre » fondé,
-        il faut ``analyser()`` **et** ``RapportScan.complet``.
+        il faut ``analyser()`` **et** ``RapportScan.complet`` — ou, mieux,
+        ``analyser_complet()`` (ou ``scan_complet()``), qui **refusent** un
+        rapport incomplet au lieu de le rendre.
+
+        Une liste vide n'est donc **pas** la preuve d'un dépôt propre : si
+        des contenus ont été laissés de côté, un avertissement
+        ``ScanIncomplet`` est émis (message statique, jamais de chemin ni de
+        valeur).
         """
         rapport = self.analyser()
         if rapport.non_analyses:
             raise ScanError(_SCAN_ERROR)
+        if not rapport.complet:
+            warnings.warn(
+                _SCAN_INCOMPLET_AVERTISSEMENT,
+                ScanIncomplet,
+                stacklevel=2,
+            )
         return list(rapport.findings)
 
     def _iter_files(self) -> Iterator[tuple[Path, str, Perimetre]]:
@@ -566,6 +626,12 @@ def scan(
     **Fail-closed** : ``ScanError`` dès qu'un fichier du périmètre n'a pas
     pu être analysé. Un scan incomplet ne devient jamais une liste vide
     ou partielle.
+
+    ⚠️ Une liste vide n'est **pas** la preuve d'un dépôt propre : des
+    contenus peuvent avoir été laissés de côté (binaire, lien symbolique,
+    base VCS). Un avertissement ``ScanIncomplet`` est alors émis. Pour un
+    usage hook/CI, consommer ``scan_complet()`` : il **refuse** (code 2
+    attendu) tout rapport incomplet.
     """
     return ScannerRacine(root, hasher=hasher, journal=journal).scan()
 
@@ -578,11 +644,32 @@ def scan_rapport(
 ) -> RapportScan:
     """Analyse ``root`` et retourne le bilan complet (Findings + compteurs).
 
-    C'est l'API que #29 doit consommer : un verdict « propre » n'est fondé
-    que si ``RapportScan.complet`` est vrai — c'est-à-dire si **rien** n'a
-    été laissé de côté (binaire, lien, base VCS, fichier illisible).
+    Un verdict « propre » n'est fondé que si ``RapportScan.complet`` est
+    vrai — c'est-à-dire si **rien** n'a été laissé de côté (binaire, lien,
+    base VCS, fichier illisible). Le bilan est donc à contrôler par
+    l'appelant : ``exiger_complet()`` (ou ``scan_complet()``) le fait à sa
+    place.
     """
     return ScannerRacine(root, hasher=hasher, journal=journal).analyser()
+
+
+def scan_complet(
+    root: str | os.PathLike[str],
+    *,
+    hasher: SnippetHasher | None = None,
+    journal: Callable[[str], None] | None = None,
+) -> RapportScan:
+    """Analyse ``root`` et rend un bilan **seulement s'il est complet**.
+
+    API stricte, destinée au hook et à la CI : si un contenu n'a pas pu
+    être lu (binaire, lien symbolique, base VCS, fichier illisible), le
+    scan **refuse** par ``ScanError`` (message statique) au lieu de rendre
+    un bilan partiel qu'un appelant confondrait avec un dépôt propre.
+
+    Le refus est l'erreur d'outillage attendue par la CLI : code 2, jamais
+    0 ni 1. Un dépôt réellement propre rend un rapport complet et vide.
+    """
+    return ScannerRacine(root, hasher=hasher, journal=journal).analyser_complet()
 
 
 def find_candidates(path: str) -> list[dict[str, object]]:
@@ -592,10 +679,10 @@ def find_candidates(path: str) -> list[dict[str, object]]:
     ``ScanError`` dès qu'un fichier du périmètre ne peut pas être analysé :
     un scan incomplet ne devient jamais une liste vide ou partielle.
 
-    Les exclusions de politique (binaire connu, lien symbolique, base VCS)
-    ne sont pas des échecs de lecture : elles sont comptées et journalisées
-    par ``scan_rapport()``. Pour un verdict « propre » **fondé**, il faut
-    ``scan_rapport()`` et ``RapportScan.complet`` — cette fonction seule ne
-    peut pas dire ce qui n'a pas été lu.
+    ⚠️ Cette fonction **ne dit pas** ce qui a été laissé de côté : une
+    liste vide n'est pas la preuve d'un dépôt propre (un avertissement
+    ``ScanIncomplet`` est émis dans ce cas). Pour un verdict « propre »
+    **fondé**, consommer ``scan_complet()`` (qui refuse un rapport
+    incomplet) ou ``scan_rapport()`` avec ``RapportScan.complet``.
     """
     return [finding.as_dict() for finding in scan(path)]

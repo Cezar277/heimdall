@@ -42,6 +42,14 @@ from heimdall.scanner.exclusions import (
 )
 from heimdall.scanner.hashing import KEY_ENV, KEY_FILE_ENV, SnippetHasher, load_local_key
 from heimdall.scanner.signatures import SIGNATURES, find_signature_matches
+from heimdall.scanner.signatures.stripe_slack import (
+    ROTATING_PAYLOAD_MAX,
+    ROTATING_PAYLOAD_MIN,
+    SLACK_PAYLOAD_MAX,
+    SLACK_PREFIX_MAX,
+    SLACK_TOKEN_MAX,
+    SLACK_TOKEN_MIN,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 FINDING_SCHEMA = ROOT / "schemas" / "finding.schema.json"
@@ -387,6 +395,61 @@ def test_the_rotating_prefix_never_hides_a_token_under_the_threshold(
     # est alors le seul secret présent).
     assert len(compose_bourre) == 1
     assert compose_bourre[0].signature in {"slack_app_token", "slack_token"}
+
+
+def test_the_slack_bounds_are_coupled_by_construction() -> None:
+    """Non-régression LOW : le couplage des bornes Slack est structurel.
+
+    La forme rotative `xoxe.` *porte* le jeton qu'elle enveloppe : sa
+    charge doit donc couvrir le jeton interne **en entier**. Les deux
+    bornes ne sont pas écrites l'une à côté de l'autre : elles dérivent des
+    mêmes constantes. Si une seule évoluait, un secret préfixé
+    disparaîtrait **des deux** règles (la garde neutralise le jeton interne
+    sans vérifier la longueur de la charge).
+    """
+    # La borne rotative couvre le jeton interne, préfixe compris.
+    assert ROTATING_PAYLOAD_MAX >= SLACK_TOKEN_MAX
+    assert ROTATING_PAYLOAD_MAX == SLACK_TOKEN_MAX == 255
+    assert SLACK_TOKEN_MAX == SLACK_PREFIX_MAX + SLACK_PAYLOAD_MAX
+    # La borne rotative n'exclut pas non plus les jetsons les plus courts
+    # que la forme rotative ne pourrait pas porter.
+    assert ROTATING_PAYLOAD_MIN <= SLACK_TOKEN_MIN
+
+
+@pytest.mark.parametrize("prefixe", ["xapp-", "xoxb-"])
+def test_a_maximal_inner_token_stays_detectable_once_prefixed(prefixe: str) -> None:
+    """Non-régression LOW : aux bornes exactes, un jeton préfixé reste vu.
+
+    Le jeton interne est à sa charge **maximale** : c'est le cas limite où
+    la forme rotative pourrait dépasser sa propre borne et où le jeton
+    interne deviendrait invisible des deux règles. Le couplage des bornes
+    l'interdit : exactement un finding, et c'est la forme rotative (« un
+    secret, une empreinte, une entrée Vault »).
+    """
+    interne = prefixe + "a" * SLACK_PAYLOAD_MAX
+    assert len(interne) == SLACK_TOKEN_MAX
+    seul = find_signature_matches(interne)
+    compose = find_signature_matches("xoxe." + interne)
+    # Le jeton interne, seul, est detectable…
+    assert len(seul) == 1
+    # … et il ne disparaît pas une fois préfixé : la forme rotative le
+    # porte (une seule fois, pas deux).
+    assert len(compose) == 1
+    assert compose[0].signature == "slack_rotating_token"
+    assert compose[0].value == "xoxe." + interne
+
+
+def test_an_oversized_inner_token_is_a_documented_limit() -> None:
+    """Limite figée : au-delà de la charge maximale, rien n'est détecté.
+
+    Un jeton plus long que la borne documentée n'est detectable **ni seul
+    ni préfixé** : la limite est écrite (et non un secret perdu en
+    silence par la garde `xoxe.`). Le comportement est figé ici.
+    """
+    interne = "xapp-" + "a" * (SLACK_PAYLOAD_MAX + 1)
+    assert len(interne) == SLACK_TOKEN_MAX + 1
+    assert find_signature_matches(interne) == ()
+    assert find_signature_matches("xoxe." + interne) == ()
 
 
 def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:

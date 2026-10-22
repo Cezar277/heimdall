@@ -8,13 +8,21 @@ des limites connues du scanner de signatures T21/T22 (tickets #23/#24).
 """
 
 import base64
+import warnings
 from pathlib import Path
 
+from typer.testing import CliRunner
+
+from heimdall.cli.main import app
 from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
+    RapportScan,
     ScanError,
+    ScanIncomplet,
+    exiger_complet,
     find_candidates,
     scan,
+    scan_complet,
     scan_rapport,
 )
 
@@ -170,6 +178,101 @@ def test_a_grounded_clean_verdict_requires_a_complete_report(tmp_path: Path) -> 
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
     rapport = scan_rapport(str(tmp_path))
     assert rapport.complet is True
+
+
+def test_an_incomplete_report_never_founds_a_clean_verdict(tmp_path: Path) -> None:
+    """REQ-SEC-07 : le garde-fou du verdict propre est *exécutable*.
+
+    La relecture (MEDIUM) a montré que `scan()`/`find_candidates()` rendent
+    `[]` quand un binaire, un lien symbolique ou une base VCS ont été
+    laissés de côté : une consigne de documentation ne suffit pas à
+    empêcher un futur appelant (#29) de confondre `[]` et « dépôt propre ».
+    L'API stricte `scan_complet()` **refuse** donc un rapport incomplet
+    (`ScanError`, message statique) — l'erreur d'outillage que la CLI doit
+    traduire par le code 2, jamais 0 ni 1.
+    """
+    cas = {
+        "binaire": lambda racine: (racine / "image.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n" + bytes(range(256))
+        ),
+        "lien_symbolique": lambda racine: (racine / "lien").symlink_to(racine / "app.py"),
+        "base_vcs": lambda racine: (racine / ".git").mkdir(),
+        "non_analysable": lambda racine: (
+            (racine / "vendor").mkdir(),
+            (racine / "vendor" / "huge.txt").write_bytes(b"A" * (MAX_FILE_BYTES + 1)),
+        ),
+    }
+    for nom, amenagement in cas.items():
+        racine = tmp_path / nom
+        racine.mkdir()
+        (racine / "app.py").write_text("x = 1\n", encoding="utf-8")
+        amenagement(racine)
+        # Le rapport expose ce qui n'a pas été lu…
+        rapport = scan_rapport(str(racine))
+        assert rapport.complet is False, nom
+        # … et la garde stricte refuse : aucun verdict « propre » possible.
+        try:
+            scan_complet(str(racine))
+        except ScanError as exc:
+            assert str(exc) == "scan incomplet : verdict propre non fondé", nom
+        else:
+            raise AssertionError(f"{nom} : verdict propre inventé")
+
+
+def test_an_incomplete_scan_warns_instead_of_claiming_a_clean_verdict(tmp_path: Path) -> None:
+    """REQ-SEC-07 : une liste vide n'est pas silencieusement « propre ».
+
+    `scan()` reste utilisable (listes les findings lus) mais **avertit**
+    quand des contenus ont été laissés de côté : le misuse « `[]` ⇒ dépôt
+    propre » devient visible dans les journaux au lieu d'être une faute
+    invisible.
+    """
+    (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
+    with warnings.catch_warnings(record=True) as captures:
+        warnings.simplefilter("always")
+        assert scan(str(tmp_path)) == []
+    assert any(issubclass(captor.category, ScanIncomplet) for captor in captures)
+    # Aucun avertissement sur un périmètre réellement complet.
+    (tmp_path / "image.png").unlink()
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    with warnings.catch_warnings(record=True) as captures:
+        warnings.simplefilter("always")
+        assert scan(str(tmp_path)) == []
+    assert not captures
+
+
+def test_the_strict_guard_refuses_an_incomplete_report() -> None:
+    """REQ-SEC-07 : `exiger_complet()` est la garde, exécutable et testable.
+
+    Elle refuse un rapport incomplet quel que soit le compteur (binaire,
+    lien, base VCS, fichier illisible) et rend un rapport complet tel quel :
+    un appelant hook/CI ne peut pas obtenir un bilan partiel qu'il
+    confondrait avec un dépôt propre.
+    """
+    for compteur in ("binaires_ignores", "liens_ignores", "hors_perimetre", "non_analyses"):
+        rapport = RapportScan(**{compteur: 1})
+        try:
+            exiger_complet(rapport)
+        except ScanError as exc:
+            assert str(exc) == "scan incomplet : verdict propre non fondé"
+        else:
+            raise AssertionError(f"{compteur} : rapport incomplet accepté")
+    complet = RapportScan()
+    assert exiger_complet(complet) is complet
+
+
+def test_the_cli_never_announces_a_clean_verdict(tmp_path: Path) -> None:
+    """REQ-SEC-07 : la sortie 2 (erreur d'outillage) reste la règle.
+
+    La CLI `heimdall scan` n'est pas encore branchée (#29) : elle refuse
+    par défaut (code 2), donc aucun verdict « propre » — donc aucun code 0
+    — ne peut sortir du CLI tant que #29 n'a pas branché le scan sur
+    l'API stricte (`scan_complet()`), qui refuse elle aussi un rapport
+    incomplet.
+    """
+    resultat = CliRunner().invoke(app, ["scan", str(tmp_path)])
+    assert resultat.exit_code == 2
+    assert resultat.exit_code != 0
 
 
 def test_obfuscation_corpus_is_mandatory() -> None:

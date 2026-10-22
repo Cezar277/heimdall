@@ -13,11 +13,13 @@ candidats ; en CI il n'a aucun pouvoir et un secret en clair bloque.
 from heimdall.scanner.detect import (
     RapportScan,
     ScannerRacine,
+    exiger_complet,
     find_candidates,
     scan,
+    scan_complet,
     scan_rapport,
 )
-from heimdall.scanner.errors import InvalidFinding, InvalidTarget, ScanError
+from heimdall.scanner.errors import InvalidFinding, InvalidTarget, ScanError, ScanIncomplet
 from heimdall.scanner.finding import (
     FINDING_FIELDS,
     Finding,
@@ -59,13 +61,16 @@ __all__ = [
     "RapportScan",
     "Rule",
     "ScanError",
+    "ScanIncomplet",
     "ScanTarget",
     "Scanner",
     "ScannerRacine",
     "Signature",
     "SignatureEngine",
     "SignatureMatch",
+    "exiger_complet",
     "find_candidates",
     "scan",
+    "scan_complet",
     "scan_rapport",
 ]
