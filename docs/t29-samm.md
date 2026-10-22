@@ -67,6 +67,11 @@ $ echo $?
 1
 ```
 
+Sur le dépôt Heimdall lui-même, le scan signale **17 candidats**, tous
+synthétiques (clé d'exemple AWS, en-têtes PEM et jetons d'exemple des
+corpus de test) : le détecteur fait son travail sur un vrai dépôt, et un job
+de CI devra les traiter par allowlist (#24).
+
 ## Limites assumées
 
 - La validation humaine Y/N/E et le remplacement du secret ne sont pas dans ce

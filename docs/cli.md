@@ -143,6 +143,12 @@ champ libre, pas d'extrait de ligne.
 - Le scanner de signatures ne décode ni base64 ni concaténation de chaînes :
   ces obfuscations restent des `limite_connue` (#23/#24), comme documenté dans
   [scanner.md](scanner.md#limites-connues-honnêtes).
+- Le corpus de test du projet Heimdall lui-même contient des valeurs
+  **synthétiques** à forme réaliste (clé d'exemple AWS `AKIA…EXAMPLE`,
+  en-tête PEM, jetons d'exemple Slack) : un scan du dépôt Heimdall les
+  signale, comme il le doit. Un job de CI sur ce dépôt devra donc traiter ces
+  fixtures (allowlist, #24) — sinon il échouerait à chaque exécution. C'est un
+  choix assumé : mieux vaut un faux positif visible qu'un secret caché.
 - La validation humaine (Y/N/E) et le remplacement du secret ne sont pas
   dans ce ticket : `scan` signale, il ne répare pas (#32).
 
