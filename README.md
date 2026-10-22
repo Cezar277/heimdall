@@ -315,6 +315,7 @@ du scanner reste explicitement en attente tant que T22 n'est pas implémenté.
 .venv/bin/python -m pytest                      # squelette + contrats
 .venv/bin/python -m unittest discover -s tests/contracts -v   # contrats seuls
 .venv/bin/python -m pytest tests/test_vault_integration_testclient.py -q   # Vault (TestClient)
+.venv/bin/python -m pytest tests/test_vault_crypto.py -q               # Vault (AES-256-GCM, nonce unique)
 .venv/bin/ruff check heimdall tests
 .venv/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
 .venv/bin/bandit -r heimdall -q
@@ -335,6 +336,15 @@ le refus 403 d'une origine hors boucle locale, le 429 de débit avec
 `Retry-After` borné, et le refus des abus d'entrée (corps > 1 Mio, identifiants
 hors contrat, traversée de chemin). Preuves :
 [`docs/t255-samm.md`](docs/t255-samm.md).
+
+Chiffrement au repos (sous-ticket T67 de #26, via #66 « Module crypto isolé ») :
+le nonce AES-GCM de 96 bits est tiré de `os.urandom` **à chaque** chiffrement
+(jamais un compteur, jamais l'heure), le blob stocké contient
+`nonce + ciphertext + tag`, et l'AAD est l'identifiant du secret
+(`project/env/name`) : un blob copié sur un autre secret échoue à
+l'authentification. Deux chiffrements du même texte donnent donc deux blobs
+différents — c'est la preuve archivée pour le rapport. Preuves :
+[`docs/t67-samm.md`](docs/t67-samm.md).
 
 Règles de contribution : [CONTRIBUTING.md](CONTRIBUTING.md).
 Jamais de vrai secret dans le dépôt, même expiré ; seul `.env.example`
