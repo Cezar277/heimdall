@@ -1,8 +1,7 @@
-"""Entropie de Shannon du contrat Finding (#14).
+"""Entropie de Shannon d'un candidat, métadonnée du Finding (#14).
 
-La mesure porte sur les octets UTF-8 du candidat, en bits par octet (0 à 8).
-Ce module fournit la métadonnée ``entropy`` ; il ne déclenche aucun Finding :
-la détection par seuil d'entropie appartient au ticket #23.
+La mesure porte sur les octets UTF-8, en bits par octet (0 à 8). Ce module ne
+déclenche aucun Finding : il fournit seulement le champ ``entropy``.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ _MAX_ENTROPY: Final[float] = 8.0
 
 
 def shannon_entropy(data: bytes) -> float:
-    """Entropie de Shannon de ``data`` en bits par octet.
+    """Entropie de Shannon de ``data``, en bits par octet (0 à 8).
 
     Une entrée vide a une entropie nulle. Le résultat est borné à 8 bits par
     octet, y compris face à un arrondi flottant.
