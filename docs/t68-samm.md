@@ -33,7 +33,7 @@ inchangé jusqu'à la livraison : contrôle effectué avec
 | **Mauvais AAD → erreur** | [heimdall/vault/crypto.py:256–264](https://github.com/Cezar277/heimdall/blob/0eb561043fd98e1ba7ed9508d807a2e9a2b0e52e/heimdall/vault/crypto.py#L256-L264) (`VaultCipher.aad` = triplet `project/env/name`), [heimdall/vault/crypto.py:281–306](https://github.com/Cezar277/heimdall/blob/0eb561043fd98e1ba7ed9508d807a2e9a2b0e52e/heimdall/vault/crypto.py#L281-L306) (AAD authentifié avec le ciphertext) | [tests/test_vault_falsification.py:91–98](https://github.com/Cezar277/heimdall/blob/0eb561043fd98e1ba7ed9508d807a2e9a2b0e52e/tests/test_vault_falsification.py#L91-L98) (autre secret et AAD absent) | Réussi |
 | **Jeton vide, base64 invalide, blob tronqué ou étendu → erreur** (gardes de format/longueur, remarque de revue) | [heimdall/vault/crypto.py:289–300](https://github.com/Cezar277/heimdall/blob/0eb561043fd98e1ba7ed9508d807a2e9a2b0e52e/heimdall/vault/crypto.py#L289-L300) (refus du jeton vide, du base64 invalide et des longueurs < `nonce + tag` avant GCM) | [tests/test_vault_falsification.py:100–121](https://github.com/Cezar277/heimdall/blob/0eb561043fd98e1ba7ed9508d807a2e9a2b0e52e/tests/test_vault_falsification.py#L100-L121) (6 sous-cas : vide, base64 invalide, tronqué sous le minimum, dernier caractère base64 altéré, tronqué d'un caractère, étendu) | Réussi |
 | Une exception est levée, **jamais une valeur fausse renvoyée** | [heimdall/vault/crypto.py:59–60](https://github.com/Cezar277/heimdall/blob/0eb561043fd98e1ba7ed9508d807a2e9a2b0e52e/heimdall/vault/crypto.py#L59-L60) (`VaultCipherError`), [heimdall/vault/crypto.py:306](https://github.com/Cezar277/heimdall/blob/0eb561043fd98e1ba7ed9508d807a2e9a2b0e52e/heimdall/vault/crypto.py#L306) (message générique) | les tests utilisent `assertRaises(VaultCipherError)` et commencent par le contrôle du cas nominal (blob intact, bonne clé, bon AAD) | Réussi |
-| **Fait quand** : les 3 tests de la checklist passent | — | `tests/test_vault_falsification.py` (4 tests, 62 sous-cas) | Réussi |
+| **Fait quand** : les 4 tests (3 de la checklist + 1 gardes format/longueur) passent | — | `tests/test_vault_falsification.py` (4 tests, 62 sous-cas) | Réussi |
 
 ## 2. Checklist du ticket
 
@@ -43,7 +43,7 @@ inchangé jusqu'à la livraison : contrôle effectué avec
 | Mauvaise clé → erreur | `tests/test_vault_falsification.py::BlobTamperingTests::test_decryption_with_wrong_key_is_rejected` |
 | Mauvais AAD → erreur | `tests/test_vault_falsification.py::BlobTamperingTests::test_decryption_with_wrong_aad_is_rejected` |
 | Robustesse format/longueur (revue) | `tests/test_vault_falsification.py::BlobTamperingTests::test_malformed_truncated_or_extended_blob_is_rejected` |
-| **Fait quand** : les 3 tests de la checklist passent | `python -m pytest tests/test_vault_falsification.py -q` → `4 passed, 62 subtests passed` |
+| **Fait quand** : les 4 tests (3 de la checklist + 1 gardes format/longueur) passent | `python -m pytest tests/test_vault_falsification.py -q` → `4 passed, 62 subtests passed` |
 
 ## 3. Preuve à garder pour le rapport
 
