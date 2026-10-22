@@ -45,7 +45,7 @@ RULES: Final[tuple[Rule, ...]] = (
         id="slack_app_token",
         description="Jeton app-level Slack (xapp-) ou workflow (xwfp-).",
         regex=(
-            r"(?P<value>(?<![A-Za-z0-9-])(?:xapp|xwfp)-[A-Za-z0-9-]{10,250}"
+            r"(?P<value>(?<![A-Za-z0-9.-])(?:xapp|xwfp)-[A-Za-z0-9-]{10,250}"
             r"(?![A-Za-z0-9-]))"
         ),
         finding_type="slack",
