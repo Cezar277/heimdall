@@ -315,6 +315,7 @@ du scanner reste explicitement en attente tant que T22 n'est pas implémenté.
 .venv/bin/python -m pytest                      # squelette + contrats
 .venv/bin/python -m unittest discover -s tests/contracts -v   # contrats seuls
 .venv/bin/python -m pytest tests/test_vault_integration_testclient.py -q   # Vault (TestClient)
+.venv/bin/python -m pytest tests/test_vault_falsification.py -q           # Vault (falsification AES-GCM)
 .venv/bin/ruff check heimdall tests
 .venv/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
 .venv/bin/bandit -r heimdall -q
@@ -335,6 +336,14 @@ le refus 403 d'une origine hors boucle locale, le 429 de débit avec
 `Retry-After` borné, et le refus des abus d'entrée (corps > 1 Mio, identifiants
 hors contrat, traversée de chemin). Preuves :
 [`docs/t255-samm.md`](docs/t255-samm.md).
+
+Falsification du chiffrement au repos (sous-ticket T68 de #26, via #66
+« Module crypto isolé ») : un seul octet modifié du blob (nonce, ciphertext ou
+étiquette), une mauvaise clé ou un mauvais AAD font lever `VaultCipherError` —
+jamais une valeur fausse. La suite utilise un vecteur figé (aucun tirage
+aléatoire à l'exécution), vérifie le cas nominal avant chaque falsification et
+couvre les 54 octets du blob un par un. Preuves :
+[`docs/t68-samm.md`](docs/t68-samm.md).
 
 Règles de contribution : [CONTRIBUTING.md](CONTRIBUTING.md).
 Jamais de vrai secret dans le dépôt, même expiré ; seul `.env.example`
