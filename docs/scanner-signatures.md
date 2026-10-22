@@ -90,7 +90,7 @@ motifs ci-dessous décrivent l'ancrage et les bornes, pas un secret utilisable.
 | `stripe_secret_key` | Stripe/Slack #56 | `stripe` | `sk_` ou `rk_`, puis `live`/`test`, puis 16 à 247 caractères `[A-Za-z0-9]` | — |
 | `slack_token` | Stripe/Slack #56 | `slack` | `xoxb-`, `xoxa-`, `xoxp-`, `xoxr-` ou `xoxs-` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
 | `slack_app_token` | Stripe/Slack #56 | `slack` | `xapp-` ou `xwfp-` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
-| `slack_rotating_token` | Stripe/Slack #56 | `slack` | `xoxe.` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
+| `slack_rotating_token` | Stripe/Slack #56 | `slack` | `xoxe.` + 10 à 255 caractères `[A-Za-z0-9-]` (250 + les 5 caractères du préfixe) | — |
 | `github_classic_pat` | GitHub/JWT #57 | `pat` | `ghp_`, `gho_`, `ghu_`, `ghs_` ou `ghr_` + exactement 36 caractères `[A-Za-z0-9]` | — |
 | `github_fine_grained_pat` | GitHub/JWT #57 | `pat` | `github_pat_` + 22 à 255 caractères `[A-Za-z0-9_]` | — |
 | `jwt` | GitHub/JWT #57 | `jwt` | en-tête `eyJ` puis trois segments base64url bornés (1024 / 65 536 / 1024) | — |
@@ -100,9 +100,18 @@ La frontière gauche des trois règles Slack est `(?<![A-Za-z0-9-])` : le point
 n'est **pas** une frontière de mot, donc un jeton collé à un préfixe de
 domaine ou à une concaténation (`foo.xapp-…`, `foo.xoxe.…`) reste détecté.
 En revanche, le préfixe rotatif `xoxe.` est traité comme un préfixe : le jeton
-qu'il contient porte une garde `(?<!xoxe\.)` et n'est signalé **qu'une fois**
-(une seule empreinte, donc une seule entrée Vault à révoquer, pour un seul
-secret).
+qu'il contient porte une garde `(?<!(?<![A-Za-z0-9-])xoxe\.)` et n'est signalé
+**qu'une fois** (une seule empreinte, donc une seule entrée Vault à révoquer,
+pour un seul secret).
+
+La neutralisation est **conditionnelle** : elle ne porte que si le préfixe
+`xoxe.` est lui-même ancré, c'est-à-dire si la règle rotative le reconnaît. Un
+préfixe **bourré** (`xxoxe.xapp-…`) n'est pas une forme rotative : le jeton
+qu'il contient reste un vrai secret et est signalé. La borne de charge de la
+forme rotative (255 = 250 + 5) est le couplage qui garantit qu'un jeton
+détectable seul le reste une fois préfixé : le préfixe ne peut pas faire
+disparaître le secret en portant la charge au-delà de la borne. Ces trois
+propriétés sont figées par un test.
 
 Chaque motif est ancré sur un **préfixe publié** ou sur un **nom de paramètre
 explicite**. Une chaîne aléatoire de 40 caractères **sans préfixe ni nom de

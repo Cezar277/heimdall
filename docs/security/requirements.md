@@ -293,10 +293,23 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   de sorte qu'un dépôt propre ne soit jamais confondu avec un dépôt
   partiellement lu ; le verdict « propre » n'est fondé que si le rapport est
   complet.
+  Durcissement post-3ᵉ relecture : **aucun verdict propre partiel**. Les
+  compteurs ne sont plus jetés par `scan()`/`find_candidates()` : un fichier
+  du périmètre qui n'a pas pu être analysé (y compris dans un arbre de tiers)
+  lève `ScanError` au lieu de rendre une liste vide ; `RapportScan.complet`
+  est vrai seulement si **rien** n'a été laissé de côté (binaire ignoré, lien
+  non suivi, base VCS non parcourue, fichier illisible) ; un fichier tronqué
+  entre le `stat` et l'`open` (même inode) est refusé ; une racine contenant
+  un octet NUL est refusée par `ScanError` et non par une `ValueError` nue ;
+  les séparateurs de ligne Unicode (U+2028/U+2029/U+0085) et l'override
+  U+202E sont neutralisés dans le journal, qui reste une ligne logique par
+  fichier.
   Preuves : `tests/test_scanner_detect.py`,
   `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean`,
   `tests/security/test_scanner_bypass.py::test_named_exclusions_cannot_hide_a_secret`,
-  `tests/security/test_scanner_bypass.py::test_a_binary_ignored_is_traced_and_never_leaks`
+  `tests/security/test_scanner_bypass.py::test_a_binary_ignored_is_traced_and_never_leaks`,
+  `tests/security/test_scanner_bypass.py::test_an_unanalysable_tier_file_never_yields_a_clean_verdict`,
+  `tests/security/test_scanner_bypass.py::test_a_grounded_clean_verdict_requires_a_complete_report`
   et la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
   Limites connues documentées par T21 : base64, concaténation et flux de
   variables ne sont pas décodés ; leur traitement relève de #23/#24 et ne
