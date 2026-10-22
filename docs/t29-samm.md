@@ -59,11 +59,11 @@ Environnement : Linux, Python 3.14.8, venv du dépôt.
 64 passed
 
 .venv/bin/python -m pytest
-1488 passed, 4317 subtests passed
+1503 passed, 4321 subtests passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch \
   --cov-report=term-missing --cov-fail-under=85
-Total coverage: 95,88 % (seuil 85 % atteint)
+Total coverage: 95,87 % (seuil 85 % atteint)
 heimdall/cli/scan.py : 100 % ; heimdall/cli/main.py : 98 % ;
 heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 91 % ;
 heimdall/scanner/signature_engine.py : 100 %
