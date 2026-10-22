@@ -41,7 +41,10 @@ def scan(
     ci: bool = typer.Option(False, "--ci", help="Mode CI : échoue si un secret reste en clair."),
 ) -> None:
     """Scanne le diff (ou le dépôt) à la recherche de secrets."""
-    del path, ci  # #29 branchera le scanner réel ici.
+    # Le scanner (#22) est livré comme bibliothèque ; c'est le *branchement* de
+    # la commande qui reste à faire (#29). En attendant, la commande refuse :
+    # un verdict « propre » inventé serait pire qu'une panne d'outillage.
+    del path, ci
     typer.echo("heimdall scan: commande non branchée (voir #29) — refus par défaut.", err=True)
     raise typer.Exit(code=2)
 

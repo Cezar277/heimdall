@@ -12,8 +12,8 @@ Invariants :
   déduplication porte sur l'empreinte, pas sur la valeur brute ;
 - une même valeur identique n'est produite qu'une fois par ligne, mais deux
   valeurs distinctes du même type restent deux Findings ;
-- la jointure de deux lignes pour un secret coupé est **bornée** à 4 Kio
-  (4096 octets UTF-8) et n'a lieu qu'entre lignes **contiguës** ;
+- la jointure de deux ou trois lignes pour un secret coupé est **bornée** à
+  4 Kio (4096 octets UTF-8) et n'a lieu qu'entre lignes **contiguës** ;
 - les regex du registre sont linéaires et bornées (anti-ReDoS).
 """
 
@@ -27,8 +27,12 @@ from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import ScanTarget
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
-#: Fenêtre maximale de jointure de deux lignes, en **octets UTF-8** (4 Kio).
+#: Fenêtre maximale de jointure de lignes, en **octets UTF-8** (4 Kio).
 MULTILINE_WINDOW: Final[int] = 4096
+#: Nombre de lignes jointes au maximum (la ligne courante comprise).
+MULTILINE_LINES: Final[int] = 3
+#: Nombre minimal de lignes jointes pour qu'une fenêtre existe.
+MULTILINE_MIN_LINES: Final[int] = 2
 
 
 class SignatureEngine:
@@ -71,29 +75,45 @@ class SignatureEngine:
         lines: tuple[tuple[int, str], ...],
         index: int,
     ) -> tuple[str, int] | None:
-        """Jointure bornée de deux lignes **contiguës**, pour un secret coupé.
+        """Jointure bornée de deux ou trois lignes **contiguës**.
+
+        Une clé peut être coupée par un retour à la ligne, et même par une
+        ligne vide intercalée (``aws_secret_access_key =`` / ligne vide /
+        ``"valeur"``). La fenêtre joint donc jusqu'à trois lignes
+        consécutives : sans elle, un secret coupé par plus d'un ``\\n``
+        disparaissait silencieusement.
 
         ``DiffTarget`` ne contient que les lignes *ajoutées* du diff : deux
         entrées voisines de la liste peuvent porter des numéros distants
         (12 puis 15). Les joindre fabriquerait une chaîne qui n'existe dans
         aucun fichier et attribuerait le Finding à la mauvaise ligne. La
-        jointure exige donc ``numéro_suivant == numéro_courant + 1``.
+        jointure exige donc ``numéro_suivant == numéro_courant + 1`` (et
+        ``+ 2`` pour la troisième ligne).
 
         La borne est mesurée en octets UTF-8, conformément à la fenêtre de
-        4 Kio documentée.
+        4 Kio documentée. Une ligne qui ferait dépasser la borne est
+        **écartée mais pas fatale** : la jointure plus courte reste valable.
         """
-        if index + 1 >= len(lines):
-            return None
         current_number, _current = lines[index]
-        following_number, following = lines[index + 1]
-        if following_number != current_number + 1:
-            return None
-        joined = line + following
-        if len(joined) > MULTILINE_WINDOW:
-            return None
-        # Le nombre de caractères minore le nombre d'octets UTF-8 : le premier
-        # contrôle évite d'encoder les lignes déjà trop longues.
-        if not joined.isascii() and len(joined.encode("utf-8")) > MULTILINE_WINDOW:
+        joined = ""
+        jointes = 0
+        for offset in range(MULTILINE_LINES):
+            position = index + offset
+            if position >= len(lines):
+                break
+            number, text = lines[position]
+            if number != current_number + offset:
+                break
+            candidate = joined + text
+            if len(candidate) > MULTILINE_WINDOW:
+                break
+            # Le nombre de caractères minore le nombre d'octets UTF-8 : le
+            # premier contrôle évite d'encoder les lignes déjà trop longues.
+            if not candidate.isascii() and len(candidate.encode("utf-8")) > MULTILINE_WINDOW:
+                break
+            joined = candidate
+            jointes += 1
+        if jointes < MULTILINE_MIN_LINES:
             return None
         return joined, len(line)
 

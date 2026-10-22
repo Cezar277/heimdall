@@ -1,9 +1,17 @@
 """Détection déterministe des candidats secrets (#22).
 
-Le scanner parcourt un dépôt (ou un fichier explicite), applique les
-signatures de ``signatures`` et les exclusions de ``exclusions``, puis produit
-des Findings conformes au contrat #14. Aucun appel réseau, aucune dépendance
-LLM ou crypto, aucune exécution du contenu analysé.
+Ce module fait deux choses, et les deux sont **fail-closed** :
+
+- il parcourt une racine confinée (dépôt ou fichier explicite) en appliquant
+  la politique de périmètre (``exclusions``) ;
+- il délègue la détection au moteur de signatures (``signature_engine``),
+  appelé par la façade ``interface.Scanner`` avec une cible ``FileTarget``.
+
+La sortie est conforme au contrat Finding v1 (#14) : la classe ``Finding``
+vient de ``heimdall.scanner.finding``, source de vérité unique — c'est la
+réconciliation annoncée par ``docs/scanner-interface.md`` (« l'épic importe
+``Finding`` au lieu de le redéclarer ; le moteur de l'épic est appelé par la
+façade ``Scanner`` de #53 »).
 
 Invariants :
 
@@ -14,83 +22,170 @@ Invariants :
 - les chemins sont relatifs, en ``/``, sans ``..`` ni segment vide ;
 - les liens symboliques ne sont jamais suivis, ni dans le périmètre, ni dans
   le chemin de la racine, et les fichiers restent confinés à la racine résolue ;
-- les lectures sont bornées (1 Mio) et les regex sont linéaires et bornées.
+- les lectures sont bornées (1 Mio) et les regex sont linéaires et bornées ;
+- **aucun nom de fichier n'exclut un fichier du scan** : le contenu décide.
+  Un ``evil.png``, un ``package-lock.json`` ou un ``vendor/secret.txt`` dont le
+  contenu est du texte est lu et scanné ; seul un contenu réellement binaire
+  est ignoré, et il est **tracé** (chemin journalisé, compteur dans le
+  rapport) pour qu'un dépôt propre ne soit jamais confondu avec un dépôt dont
+  une partie n'a pas été analysée.
 
-L'interface est figée par #53 : ``Finding`` est l'unique classe canonique de
-``heimdall.scanner.finding`` (réexportée ici pour compatibilité historique),
-et la façade ``Scanner`` de ``heimdall.scanner.interface`` reste la surface
-contractuelle. Ce module est la couche système de fichiers (#22 + #59) : il
-marche sur le dépôt, applique les exclusions, lit de façon bornée puis
-délègue la détection ligne à ligne au registre de signatures (#54).
+Deux classes portent le nom « scanner » et ne doivent jamais être confondues :
+
+- ``heimdall.scanner.interface.Scanner`` : la façade contractuelle (#53), qui
+  délègue à un moteur injecté et garantit la forme de la sortie ;
+- ``heimdall.scanner.detect.ScannerRacine`` : le parcours d'une racine (#22),
+  qui construit les cibles et fait appel à cette façade.
 """
 
 from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Iterator
+import sys
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.errors import ScanError
-from heimdall.scanner.exclusions import decode_text, is_excluded, is_excluded_directory
-from heimdall.scanner.finding import Finding, FindingSource, FindingStatus
+from heimdall.scanner.exclusions import (
+    Perimetre,
+    classer_chemin,
+    classer_repertoire,
+    decode_text,
+)
+from heimdall.scanner.finding import (
+    Finding,
+    FindingSource,
+    FindingStatus,
+    validate_relative_path,
+)
 from heimdall.scanner.hashing import SnippetHasher
-from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
+from heimdall.scanner.interface import FileTarget, Scanner
+from heimdall.scanner.signature_engine import SignatureEngine
 
+#: Taille maximale d'un fichier analysé (1 Mio). Un fichier plus large est
+#: **refusé** (``ScanError``), jamais tronqué en silence.
 MAX_FILE_BYTES: Final[int] = 1_048_576
-MAX_PATH_LENGTH: Final[int] = 4096
-MULTILINE_WINDOW: Final[int] = 4096
+#: Taille de lecture par ``os.read`` : borne de mémoire, pas de sémantique.
 _READ_CHUNK: Final[int] = 65_536
-_FIRST_CONTROL: Final[int] = 0x20
-_DELETE: Final[int] = 0x7F
-_UNICODE_LINE_SEPARATORS: Final[frozenset[int]] = frozenset({0x2028, 0x2029})
+#: Message statique : ni chemin, ni extrait, ni valeur candidate n'est
+#: jamais reflété (invariant 8).
 _SCAN_ERROR: Final[str] = "scan impossible : entrée non analysable"
 
+#: Préfixe des traces : le journal ne porte **jamais** de contenu, seulement
+#: un chemin relatif déjà assaini.
+_TRACE_PREFIX: Final[str] = "heimdall scanner :"
+#: Motifs de trace (statiques : aucune donnée d'entrée n'y figure).
+_MOT_BINAIRE: Final[str] = "binaire ignoré (contenu non textuel)"
+_MOT_NON_ANALYSE: Final[str] = "non analysable (illisible, hors borne ou modifié)"
+_MOT_LIEN: Final[str] = "lien symbolique non suivi"
+_MOT_HORS_PERIMETRE: Final[str] = "répertoire hors périmètre (non analysé)"
+#: Longueur maximale d'un chemin tracé : un nom de fichier est une donnée non
+#: fiable (longueur, caractères de contrôle) — il ne doit ni noyer le journal
+#: ni y injecter de fausses lignes.
+_TRACE_PATH_MAX: Final[int] = 256
+#: Premier caractère de contrôle (U+0020 est l'espace) et caractère d'effacement.
+_CONTROL_MIN: Final[int] = 0x20
+_DELETE: Final[int] = 0x7F
+
 __all__ = [
+    "MAX_FILE_BYTES",
     "Finding",
     "FindingSource",
     "FindingStatus",
-    "MAX_FILE_BYTES",
-    "MAX_PATH_LENGTH",
-    "MULTILINE_WINDOW",
+    "Perimetre",
+    "RapportScan",
     "ScanError",
+    "ScannerRacine",
     "find_candidates",
     "scan",
+    "scan_rapport",
 ]
 
 
+def _safe_path(relative: str) -> str:
+    """Chien de garde du journal : caractères de contrôle neutralisés.
+
+    Un nom de fichier est une donnée **non fiable** : il peut contenir un
+    retour à la ligne (injection de fausses lignes de journal) ou être
+    absurdement long. Les caractères de contrôle sont remplacés, la longueur
+    est bornée.
+    """
+    nettoye = "".join(
+        "?" if ord(character) < _CONTROL_MIN or ord(character) == _DELETE else character
+        for character in relative
+    )
+    if len(nettoye) > _TRACE_PATH_MAX:
+        return nettoye[: _TRACE_PATH_MAX - 1] + "…"
+    return nettoye
+
+
+def _journal_stderr(message: str) -> None:
+    """Trace par défaut : ``stderr``, jamais ``stdout`` (le verdict sort à part)."""
+    sys.stderr.write(message + "\n")
+
+
+class _RefusInterne(Exception):
+    """Refus interne : le fichier n'a pas pu être analysé.
+
+    La décision — interrompre le scan (``ScanError``) ou tracer l'ignorance —
+    appartient à l'appelant, qui connaît le régime de périmètre du fichier.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class RapportScan:
+    """Bilan d'un scan : les Findings et ce qui n'a pas pu être analysé.
+
+    Les compteurs sont la preuve qu'un verdict « propre » est fondé :
+
+    - ``binaires_ignores`` : fichiers au contenu binaire connu, ignorés par
+      politique et journalisés ;
+    - ``non_analyses`` : fichiers du périmètre que le scan n'a pas pu lire
+      (illisibles, hors borne, modifiés) — un fichier du périmètre strict
+      est fatal, donc ce compteur reste nul dans un scan complet ;
+    - ``hors_perimetre`` : répertoires non parcourus (base VCS) ;
+    - ``liens_ignores`` : liens symboliques non suivis.
+
+    ``complet`` est vrai quand aucun fichier du périmètre n'a été laissé de
+    côté : c'est la condition pour qu'un verdict « propre » soit fondé.
+    """
+
+    findings: tuple[Finding, ...] = ()
+    binaires_ignores: int = 0
+    non_analyses: int = 0
+    hors_perimetre: int = 0
+    liens_ignores: int = 0
+
+    @property
+    def complet(self) -> bool:
+        """Vrai si aucun fichier du périmètre n'a échoué à l'analyse."""
+        return self.non_analyses == 0
+
+
 def _validate_relative_path(relative: str) -> str:
-    """Refuse un chemin qui violerait le contrat Finding v1."""
-    if not relative or len(relative) > MAX_PATH_LENGTH or relative.endswith("/"):
-        raise ScanError(_SCAN_ERROR)
-    for character in relative:
-        code = ord(character)
-        if (
-            character in "\\:"
-            or code < _FIRST_CONTROL
-            or code == _DELETE
-            or code in _UNICODE_LINE_SEPARATORS
-        ):
-            raise ScanError(_SCAN_ERROR)
-    parts = relative.split("/")
-    if any(part in ("", ".", "..") for part in parts):
-        raise ScanError(_SCAN_ERROR)
-    return relative
+    """Refuse un chemin qui violerait le contrat Finding v1.
+
+    La grammaire est celle de ``finding.validate_relative_path`` (source de
+    vérité unique) ; l'échec devient un ``ScanError`` au message statique du
+    scanner, jamais une ``ValueError`` nue.
+    """
+    try:
+        return validate_relative_path(relative)
+    except ValueError:
+        raise ScanError(_SCAN_ERROR) from None
 
 
 def _open_flags() -> int:
+    """Descripteur de lecture : un lien symbolique n'est jamais suivi."""
     return (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_BINARY", 0)
     )
-
-
-def _raise_walk_error(_error: OSError) -> None:
-    raise ScanError(_SCAN_ERROR)
 
 
 def _resolve_root(root: str | os.PathLike[str]) -> Path:
@@ -118,25 +213,41 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
         raise ScanError(_SCAN_ERROR) from None
 
 
-class Scanner:
-    """Scanner déterministe d'une racine confinée (couche système #22/#59).
+class ScannerRacine:
+    """Scanner déterministe d'une racine confinée (#22).
 
     ``root`` peut être un répertoire ou un fichier régulier explicite. La
     racine est résolue une fois, sans suivre de lien symbolique ; chaque
     fichier est ensuite vérifié à l'usage (identité de descripteur, chemin
     résolu sous la racine, refus des liens).
 
-    Toute erreur de lecture interrompt le scan en ``ScanError`` (fail-closed) :
-    aucun résultat partiel n'est jamais retourné.
+    La détection n'est pas implémentée ici : chaque fichier lu devient une
+    cible ``FileTarget``, analysée par la façade #53 branchée sur le moteur de
+    signatures #54. Une seule implémentation de la détection existe donc dans
+    le paquet, et la garantie de forme de la sortie reste celle de #53.
+
+    Ce qui n'a pas pu être analysé est **tracé** : ``journal`` reçoit une
+    ligne par fichier ignoré (chemin seul, jamais de contenu) et le rapport
+    rendu par ``analyser()`` porte les compteurs.
     """
 
-    __slots__ = ("_hasher", "_root", "_single")
+    __slots__ = (
+        "_binaires",
+        "_journal",
+        "_liens",
+        "_moteur",
+        "_non_analyses",
+        "_hors_perimetre",
+        "_root",
+        "_single",
+    )
 
     def __init__(
         self,
         root: str | os.PathLike[str],
         *,
         hasher: SnippetHasher | None = None,
+        journal: Callable[[str], None] | None = None,
     ) -> None:
         resolved = _resolve_root(root)
         if resolved.is_dir():
@@ -147,28 +258,37 @@ class Scanner:
             self._single = resolved
         else:
             raise ScanError(_SCAN_ERROR)
-        self._hasher = SnippetHasher() if hasher is None else hasher
+        # La clé HMAC est chargée paresseusement par le moteur : instancier le
+        # scanner ne crée aucun fichier et ne touche pas au stockage local.
+        self._moteur = Scanner(SignatureEngine(hasher))
+        self._journal = _journal_stderr if journal is None else journal
+        self._binaires = 0
+        self._non_analyses = 0
+        self._hors_perimetre = 0
+        self._liens = 0
 
-    def scan(self) -> list[Finding]:
-        """Analyse tout le périmètre et retourne les Findings triés.
+    def analyser(self) -> RapportScan:
+        """Analyse tout le périmètre et retourne le bilan complet.
 
-        Toute erreur de lecture interrompt le scan : aucun résultat partiel
-        n'est retourné.
+        Toute erreur de lecture **du périmètre strict** interrompt le scan :
+        aucun résultat partiel n'est retourné. Ce qui est ignoré dans les
+        arbres de tiers ou la base VCS est compté et journalisé.
         """
+        self._binaires = 0
+        self._non_analyses = 0
+        self._hors_perimetre = 0
+        self._liens = 0
+        findings: list[Finding] = []
         # Pas de `list()` sur le périmètre : un dépôt adverse avec un très
         # grand nombre de fichiers ne doit pas OOM le hook/CI. Le tri final
         # porte sur les findings, pas sur les chemins.
         files = (
-            [(self._single, _validate_relative_path(self._single.name))]
+            [(self._single, self._single.name, Perimetre.STRICT)]
             if self._single is not None
             else self._iter_files()
         )
-        findings: list[Finding] = []
-        for path, relative in files:
-            text = self._read_text(path)
-            if text is None:
-                continue
-            findings.extend(self._scan_text(text, relative))
+        for path, relative, perimetre in files:
+            findings.extend(self._analyser_fichier(path, relative, perimetre))
         findings.sort(
             key=lambda finding: (
                 finding.file,
@@ -177,58 +297,168 @@ class Scanner:
                 finding.snippet_hash,
             )
         )
-        return findings
+        return RapportScan(
+            findings=tuple(findings),
+            binaires_ignores=self._binaires,
+            non_analyses=self._non_analyses,
+            hors_perimetre=self._hors_perimetre,
+            liens_ignores=self._liens,
+        )
 
-    def _iter_files(self) -> Iterator[tuple[Path, str]]:
+    def scan(self) -> list[Finding]:
+        """Analyse tout le périmètre et retourne les Findings triés."""
+        return list(self.analyser().findings)
+
+    def _iter_files(self) -> Iterator[tuple[Path, str, Perimetre]]:
+        """Parcourt la racine sans jamais suivre un lien symbolique.
+
+        Aucun répertoire n'est exclu *par son nom* : les répertoires de tiers
+        sont parcourus (un secret y est un secret) et la base VCS est écartée
+        mais **tracée**.
+        """
         for current, directories, filenames in os.walk(
             self._root,
             topdown=True,
-            onerror=_raise_walk_error,
+            onerror=self._on_walk_error,
             followlinks=False,
         ):
             current_path = Path(current)
-            directories[:] = sorted(
-                name
-                for name in directories
-                if not is_excluded_directory(name) and not (current_path / name).is_symlink()
-            )
+            kept: list[str] = []
+            for name in sorted(directories):
+                regime = classer_repertoire(name)
+                if regime is Perimetre.HORS_PERIMETRE:
+                    self._hors_perimetre += 1
+                    self._tracer(_MOT_HORS_PERIMETRE, self._relatif(current_path / name))
+                    continue
+                if self._est_lien(current_path / name):
+                    self._liens += 1
+                    self._tracer(_MOT_LIEN, self._relatif(current_path / name))
+                    continue
+                kept.append(name)
+            directories[:] = kept
             for name in sorted(filenames):
                 path = current_path / name
-                try:
-                    relative = path.relative_to(self._root).as_posix()
-                except ValueError:
-                    raise ScanError(_SCAN_ERROR) from None
-                if is_excluded(relative):
+                relative = self._relatif(path)
+                if self._est_lien(path):
+                    self._liens += 1
+                    self._tracer(_MOT_LIEN, relative)
                     continue
-                try:
-                    if path.is_symlink():
-                        continue
-                except OSError:
-                    raise ScanError(_SCAN_ERROR) from None
-                yield path, _validate_relative_path(relative)
+                yield path, relative, classer_chemin(relative)
+
+    def _est_lien(self, path: Path) -> bool:
+        """Vrai si le chemin est un lien symbolique (jamais suivi)."""
+        try:
+            return path.is_symlink()
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+
+    def _relatif(self, path: Path) -> str:
+        """Chemin relatif à la racine (jamais absolu, jamais hors racine)."""
+        try:
+            return path.relative_to(self._root).as_posix()
+        except ValueError:
+            raise ScanError(_SCAN_ERROR) from None
+
+    def _on_walk_error(self, error: OSError) -> None:
+        """Une erreur de parcours interrompt le scan, sauf en arbre de tiers."""
+        nom = error.filename or ""
+        regime = Perimetre.STRICT
+        if nom:
+            try:
+                relatif = Path(nom).relative_to(self._root).as_posix()
+            except ValueError:
+                relatif = nom
+            regime = classer_chemin(relatif)
+        if regime is Perimetre.STRICT:
+            raise ScanError(_SCAN_ERROR) from None
+        self._non_analyses += 1
+        self._tracer(_MOT_NON_ANALYSE, nom or "")
+
+    def _analyser_fichier(
+        self,
+        path: Path,
+        relative: str,
+        perimetre: Perimetre,
+    ) -> list[Finding]:
+        """Analyse un fichier du périmètre et applique la règle du régime.
+
+        Dans le périmètre **strict**, tout ce qui n'est pas analysable est
+        fatal (``ScanError``) : un verdict « propre » doit être fondé. Dans un
+        arbre de tiers, le même cas est **tracé** et compté.
+        """
+        try:
+            chemin = _validate_relative_path(relative)
+        except ScanError:
+            if perimetre is Perimetre.STRICT:
+                raise
+            self._non_analyses += 1
+            self._tracer(_MOT_NON_ANALYSE, relative)
+            return []
+        try:
+            texte = self._read_text(path)
+        except _RefusInterne:
+            if perimetre is Perimetre.STRICT:
+                raise ScanError(_SCAN_ERROR) from None
+            self._non_analyses += 1
+            self._tracer(_MOT_NON_ANALYSE, relative)
+            return []
+        if texte is None:
+            # Binaire connu : ignoré par politique, mais **tracé** — un dépôt
+            # propre et un dépôt dont un binaire n'a pas été lu ne doivent
+            # jamais être confondus.
+            self._binaires += 1
+            self._tracer(_MOT_BINAIRE, relative)
+            return []
+        return self._scan_text(texte, chemin)
 
     def _read_text(self, path: Path) -> str | None:
-        """Lit un fichier borné ; ``None`` signifie binaire exclu."""
+        """Lit un fichier borné ; ``None`` signifie « binaire connu ».
+
+        Lève ``_RefusInterne`` si le fichier n'a pas pu être analysé et
+        ``ScanError`` si le chemin sort de la racine (rupture de
+        confinement : ce n'est pas un simple fichier illisible).
+        """
         try:
             resolved = path.resolve(strict=True)
-            if not resolved.is_relative_to(self._root):
-                raise ScanError(_SCAN_ERROR)
-            before = os.stat(path, follow_symlinks=False)
         except (OSError, RuntimeError):
+            raise _RefusInterne from None
+        if not resolved.is_relative_to(self._root):
             raise ScanError(_SCAN_ERROR) from None
+        try:
+            before = os.stat(path, follow_symlinks=False)
+        except OSError:
+            raise _RefusInterne from None
         if not stat.S_ISREG(before.st_mode):
-            raise ScanError(_SCAN_ERROR)
+            raise _RefusInterne from None
         try:
             descriptor = os.open(path, _open_flags())
         except OSError:
-            raise ScanError(_SCAN_ERROR) from None
-        chunks: list[bytes] = []
+            raise _RefusInterne from None
+        try:
+            data = self._lire_borne(descriptor, before)
+        finally:
+            os.close(descriptor)
+        try:
+            return decode_text(data)
+        except ScanError:
+            # Contenu ambigu (NUL non décodable, BOM invalide) : le fichier
+            # n'est pas analysable. L'appelant décide si c'est fatal.
+            raise _RefusInterne from None
+
+    def _lire_borne(self, descriptor: int, before: os.stat_result) -> bytes:
+        """Lit le descripteur et vérifie que le fichier n'a pas changé.
+
+        L'identité (dev/ino), la taille et la date de modification sont
+        comparées avant et après lecture : un fichier remplacé ou modifié
+        pendant le scan n'est pas analysable (fail-closed).
+        """
         try:
             after = os.fstat(descriptor)
             if not stat.S_ISREG(after.st_mode) or after.st_size > MAX_FILE_BYTES:
-                raise ScanError(_SCAN_ERROR)
+                raise _RefusInterne from None
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                raise ScanError(_SCAN_ERROR)
+                raise _RefusInterne from None
+            chunks: list[bytes] = []
             remaining = MAX_FILE_BYTES + 1
             while remaining > 0:
                 chunk = os.read(descriptor, min(_READ_CHUNK, remaining))
@@ -244,83 +474,43 @@ class Scanner:
                 and len(data) == after.st_size
             )
             if not unchanged or len(data) > MAX_FILE_BYTES:
-                raise ScanError(_SCAN_ERROR)
+                raise _RefusInterne from None
         except OSError:
-            raise ScanError(_SCAN_ERROR) from None
-        finally:
-            os.close(descriptor)
-        return decode_text(data)
+            raise _RefusInterne from None
+        return data
 
     def _scan_text(self, text: str, relative: str) -> list[Finding]:
-        findings: list[Finding] = []
-        # Déduplication sur l'empreinte HMAC, jamais sur la valeur brute : la
-        # valeur candidate est hachée à la volée puis oubliée. Deux valeurs
-        # distinctes du même type restent deux Findings (un secret ne doit
-        # jamais en masquer un autre) ; seule une valeur strictement
-        # identique, déjà émise sur la même ligne, est dédupliquée.
-        seen: set[tuple[int, str, str]] = set()
-        lines = text.splitlines()
-        for index, line in enumerate(lines):
-            line_number = index + 1
-            for match in find_signature_matches(line):
-                self._append(findings, seen, match, line_number, relative)
-            following = self._joined_window(line, lines, index)
-            if following is None:
-                continue
-            joined, limit = following
-            for match in find_signature_matches(joined):
-                # Seule une correspondance qui commence dans la ligne courante
-                # est retenue : une valeur située après la jonction appartient
-                # à la ligne suivante et y est déjà signalée.
-                if match.start >= limit:
-                    continue
-                self._append(findings, seen, match, line_number, relative)
-        return findings
+        """Analyse un fichier déjà lu et borné, via la façade #53."""
+        cible = FileTarget(path=relative, text=text)
+        return self._moteur.scan(cible)
 
-    def _joined_window(
-        self, line: str, lines: list[str], index: int
-    ) -> tuple[str, int] | None:
-        """Jointure bornée de deux lignes, pour les secrets coupés par un ``\\n``.
-
-        La fenêtre est limitée à :data:`MULTILINE_WINDOW` octets : au-delà, un
-        secret coupé n'est pas recherché (limite documentée).
-        """
-        if index + 1 >= len(lines):
-            return None
-        following = lines[index + 1]
-        # Fenêtre en octets UTF-8 (doc 4 Kio), pas en caractères : l'écart
-        # doc/implantation sur UTF-8 multioctets serait une borne contournable.
-        if len((line + following).encode("utf-8")) > MULTILINE_WINDOW:
-            return None
-        return line + following, len(line)
-
-    def _append(
-        self,
-        findings: list[Finding],
-        seen: set[tuple[int, str, str]],
-        match: SignatureMatch,
-        line_number: int,
-        relative: str,
-    ) -> None:
-        snippet_hash = self._hasher.hash(match.value)
-        key = (line_number, match.secret_type, snippet_hash)
-        if key in seen:
-            return
-        seen.add(key)
-        findings.append(
-            Finding(
-                file=relative,
-                line=line_number,
-                type=match.secret_type,
-                entropy=round(shannon_entropy(match.value.encode("utf-8")), 4),
-                snippet_hash=snippet_hash,
-            )
-        )
+    def _tracer(self, motif: str, chemin: str) -> None:
+        """Journalise ce qui n'a pas été analysé (chemin seul, sans contenu)."""
+        self._journal(f"{_TRACE_PREFIX} {motif} : {_safe_path(chemin)}")
 
 
-def scan(root: str | os.PathLike[str], *, hasher: SnippetHasher | None = None) -> list[Finding]:
+def scan(
+    root: str | os.PathLike[str],
+    *,
+    hasher: SnippetHasher | None = None,
+    journal: Callable[[str], None] | None = None,
+) -> list[Finding]:
     """Analyse ``root`` et retourne des objets :class:`Finding`."""
-    return Scanner(root, hasher=hasher).scan()
+    return ScannerRacine(root, hasher=hasher, journal=journal).scan()
+
+
+def scan_rapport(
+    root: str | os.PathLike[str],
+    *,
+    hasher: SnippetHasher | None = None,
+    journal: Callable[[str], None] | None = None,
+) -> RapportScan:
+    """Analyse ``root`` et retourne le bilan complet (Findings + compteurs).
+
+    C'est l'API que #29 doit consommer : un verdict « propre » n'est fondé
+    que si ``RapportScan.complet`` est vrai.
+    """
+    return ScannerRacine(root, hasher=hasher, journal=journal).analyser()
 
 
 def find_candidates(path: str) -> list[dict[str, object]]:

@@ -32,8 +32,13 @@ RULES: Final[tuple[Rule, ...]] = (
     make_rule(
         id="slack_token",
         description="Jeton Slack bot/utilisateur historique (xoxb-, xoxa-, xoxp-, xoxr-, xoxs-).",
+        # `(?<!xoxe\.)` : un jeton rotatif `xoxe.xoxb-…` contient déjà un jeton
+        # bot. Sans cette garde, la même clé serait signalée deux fois, sous
+        # deux empreintes différentes — deux entrées Vault pour un seul secret
+        # à révoquer. La garde est *précise* : elle ne vise que le préfixe
+        # rotatif, pas tout point qui précéderait le jeton.
         regex=(
-            r"(?P<value>(?<![A-Za-z0-9-])xox[abprs]-[A-Za-z0-9-]{10,250}"
+            r"(?P<value>(?<![A-Za-z0-9-])(?<!xoxe\.)xox[abprs]-[A-Za-z0-9-]{10,250}"
             r"(?![A-Za-z0-9-]))"
         ),
         finding_type="slack",
@@ -43,21 +48,35 @@ RULES: Final[tuple[Rule, ...]] = (
     ),
     make_rule(
         id="slack_app_token",
-        description="Jeton app-level Slack (xapp-) ou workflow (xwfp-).",
+        description=(
+            "Jeton app-level Slack (xapp-) ou workflow (xwfp-). "
+            "Un jeton déjà couvert par le préfixe rotatif `xoxe.` n'est pas "
+            "signalé une seconde fois : c'est le même secret, pas deux."
+        ),
+        # `(?<!xoxe\.)` : le jeton rotatif `xoxe.xapp-…` contient un jeton
+        # app-level. Sans cette garde, la même clé serait signalée deux fois,
+        # sous deux empreintes différentes — deux entrées Vault pour un seul
+        # secret à révoquer. La garde est *précise* : elle ne vise que le
+        # préfixe rotatif, pas tout point qui précéderait le jeton.
         regex=(
-            r"(?P<value>(?<![A-Za-z0-9-])(?:xapp|xwfp)-[A-Za-z0-9-]{10,250}"
+            r"(?P<value>(?<![A-Za-z0-9-])(?<!xoxe\.)(?:xapp|xwfp)-[A-Za-z0-9-]{10,250}"
             r"(?![A-Za-z0-9-]))"
         ),
         finding_type="slack",
         keywords=(),
         positive=f'SLACK_APP_TOKEN = "{_SLACK_APP_TOKEN}"',
-        negative='SLACK_APP_TOKEN = "xapp-short"',
+        negative=f'SLACK_APP_TOKEN = "{_SLACK_ROTATING_TOKEN}"',
     ),
     make_rule(
         id="slack_rotating_token",
         description="Jeton app-level rotatif Slack (préfixe xoxe.).",
+        # Le lookbehind reste `(?<![A-Za-z0-9-])` : le point est un séparateur
+        # légitime (`foo.xoxe.…`, un jeton collé à un préfixe de domaine ou
+        # à une concaténation). Élargir la classe au point ferait perdre un
+        # vrai secret après un `.` : c'est un faux négatif, pas un faux
+        # positif — le motif reste ancré sur le préfixe publié `xoxe.`.
         regex=(
-            r"(?P<value>(?<![A-Za-z0-9.-])xoxe\.[A-Za-z0-9-]{10,250}"
+            r"(?P<value>(?<![A-Za-z0-9-])xoxe\.[A-Za-z0-9-]{10,250}"
             r"(?![A-Za-z0-9-]))"
         ),
         finding_type="slack",

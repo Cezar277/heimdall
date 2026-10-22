@@ -10,7 +10,12 @@ des limites connues du scanner de signatures T21/T22 (tickets #23/#24).
 import base64
 from pathlib import Path
 
-from heimdall.scanner.detect import MAX_FILE_BYTES, ScanError, find_candidates
+from heimdall.scanner.detect import (
+    MAX_FILE_BYTES,
+    ScanError,
+    find_candidates,
+    scan_rapport,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 CLI_MAIN = REPO / "heimdall" / "cli" / "main.py"
@@ -72,6 +77,46 @@ def test_incomplete_scan_never_clean(tmp_path: Path) -> None:
     assert CANARY_B64 in req
     assert "concaténation" in req
     assert "JAMAIS 0" in req
+
+
+def test_named_exclusions_cannot_hide_a_secret(tmp_path: Path) -> None:
+    """REQ-SEC-07 : un nom « exclu » ne doit jamais cacher un secret.
+
+    Contournement vérifié par exécution avant correctif : `evil.png`,
+    `evil.lock`, `package-lock.json` et `vendor/s.txt` étaient ignorés sur
+    leur seul nom ; le scan rendait une liste vide, donc un **verdict
+    propre inventé**. Le contenu décide désormais : ces fichiers sont lus
+    et scannés.
+    """
+    secret = "AKIA" + "IOSFODNN7EXAMPLE"  # exemple officiel AWS, pas une clé réelle
+    for chemin in ("evil.png", "evil.lock", "package-lock.json", "vendor/s.txt"):
+        cible = tmp_path / chemin
+        cible.parent.mkdir(parents=True, exist_ok=True)
+        cible.write_text(f'AWS = "{secret}"\n', encoding="utf-8")
+    findings = find_candidates(str(tmp_path))
+    assert findings, "un secret dans un fichier « exclu » a disparu"
+    assert {finding["file"] for finding in findings} == {
+        "evil.lock",
+        "evil.png",
+        "package-lock.json",
+        "vendor/s.txt",
+    }
+    assert all(finding["type"] == "aws" for finding in findings)
+
+
+def test_a_binary_ignored_is_traced_and_never_leaks(tmp_path: Path, capsys) -> None:
+    """REQ-SEC-07 : un binaire ignoré doit rester visible, sans rien fuir.
+
+    Avant correctif, un binaire était ignoré **sans trace** : un dépôt
+    propre et un dépôt dont un binaire n'a pas été lu étaient indiscernables.
+    """
+    (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.binaires_ignores == 1
+    assert rapport.non_analyses == 0
+    trace = capsys.readouterr().err
+    assert "image.png" in trace
+    assert "AKIA" not in trace
 
 
 def test_obfuscation_corpus_is_mandatory() -> None:

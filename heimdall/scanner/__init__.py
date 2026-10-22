@@ -10,7 +10,13 @@ AUCUNE dépendance LLM ou crypto. Le LLM (via MCP) ne fait que trier les
 candidats ; en CI il n'a aucun pouvoir et un secret en clair bloque.
 """
 
-from heimdall.scanner.detect import find_candidates
+from heimdall.scanner.detect import (
+    RapportScan,
+    ScannerRacine,
+    find_candidates,
+    scan,
+    scan_rapport,
+)
 from heimdall.scanner.errors import InvalidFinding, InvalidTarget, ScanError
 from heimdall.scanner.finding import (
     FINDING_FIELDS,
@@ -50,12 +56,16 @@ __all__ = [
     "InvalidTarget",
     "Moteur",
     "MoteurSignatures",
+    "RapportScan",
     "Rule",
     "ScanError",
     "ScanTarget",
     "Scanner",
+    "ScannerRacine",
     "Signature",
     "SignatureEngine",
     "SignatureMatch",
     "find_candidates",
+    "scan",
+    "scan_rapport",
 ]

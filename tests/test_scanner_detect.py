@@ -26,15 +26,18 @@ from heimdall.scanner import hashing
 from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
     Finding,
+    RapportScan,
     ScanError,
     find_candidates,
     scan,
+    scan_rapport,
 )
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.exclusions import (
+    Perimetre,
+    classer_chemin,
+    classer_repertoire,
     decode_text,
-    is_excluded,
-    is_excluded_directory,
 )
 from heimdall.scanner.hashing import KEY_ENV, KEY_FILE_ENV, SnippetHasher, load_local_key
 from heimdall.scanner.signatures import SIGNATURES, find_signature_matches
@@ -253,15 +256,18 @@ def test_slack_token_families_are_detected(tmp_path: Path, prefix: str) -> None:
 
 
 def test_slack_rotating_token_is_detected(tmp_path: Path) -> None:
+    r"""Un jeton rotatif est détecté, forme emboîtée `xoxe.xapp-…` comprise.
+
+    Le registre #54 signalait les deux formes emboîtées (rotatif + app) et
+    tolérait le doublon (« doublon acceptable, jamais un manqué »). La garde
+    `(?<!xoxe\.)` de ce Correctif le supprime : un seul secret, une seule
+    empreinte, une seule entrée Vault à révoquer. « Jamais un manqué » reste
+    vrai — l'évasion par préfixe (`.xapp-…`) reste couverte par
+    `test_dot_prefixed_app_token_is_still_detected`.
+    """
     token = "xoxe." + fake_token("xapp-", 24)
     findings = _scan_lines(tmp_path, f'SLACK = "{token}"')
-    # Le registre #54 signale les deux formes emboîtées (rotatif + app) :
-    # doublon acceptable (même ligne, même type), jamais un manqué. Exclure
-    # le `.` devant `xapp-` créerait une évasion par préfixe (`.xapp-…`).
-    assert [(finding["line"], finding["type"]) for finding in findings] == [
-        (1, "slack"),
-        (1, "slack"),
-    ]
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "slack")]
 
 
 def test_dot_prefixed_app_token_is_still_detected(tmp_path: Path) -> None:
@@ -275,6 +281,41 @@ def test_unknown_slack_family_is_not_reported(tmp_path: Path) -> None:
     """Limite documentée : une famille Slack non publiée n'est pas couverte."""
     token = fake_token("xoxo-", 24)
     assert _scan_lines(tmp_path, f'SLACK = "{token}"') == []
+
+
+def test_slack_token_after_a_dot_is_detected(tmp_path: Path) -> None:
+    """Non-régression LOW : un point ne doit pas masquer un jeton Slack.
+
+    Le lookbehind était élargi à `.` : un jeton collé à un préfixe de domaine
+    ou à une concaténation (`foo.xapp-…`) disparaissait. Un faux négatif
+    n'est jamais acceptable pour laisser passer un secret.
+    """
+    token = fake_token("xapp-", 24)
+    findings = _scan_lines(tmp_path, f'foo.{token}')
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "slack")]
+
+
+def test_slack_rotating_token_after_a_dot_is_detected(tmp_path: Path) -> None:
+    """Un jeton rotatif derrière un point reste détecté (faux négatif interdit)."""
+    token = "xoxe." + fake_token("xapp-", 24)
+    findings = _scan_lines(tmp_path, f'foo.{token}')
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "slack")]
+
+
+def test_a_rotating_token_is_reported_once(tmp_path: Path) -> None:
+    """Un jeton rotatif est un seul secret : un seul Finding, une seule empreinte."""
+    token = "xoxe." + fake_token("xapp-", 24)
+    findings = _scan_lines(tmp_path, f'SLACK = "{token}"')
+    assert len(findings) == 1
+    assert findings[0]["type"] == "slack"
+
+
+def test_a_rotating_bot_token_is_reported_once(tmp_path: Path) -> None:
+    """`xoxe.xoxb-…` est un seul secret, pas deux (une entrée Vault, pas deux)."""
+    token = "xoxe." + fake_token("xoxb-", 24)
+    findings = _scan_lines(tmp_path, f'SLACK = "{token}"')
+    assert len(findings) == 1
+    assert findings[0]["type"] == "slack"
 
 
 def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:
@@ -292,40 +333,87 @@ def test_split_secret_beyond_the_window_is_a_documented_limit(tmp_path: Path) ->
     assert find_candidates(str(tmp_path)) == []
 
 
+def test_secret_split_by_a_blank_line_is_detected(tmp_path: Path) -> None:
+    """Non-régression MEDIUM : une ligne vide intercalée ne fait plus perdre le secret.
+
+    La fenêtre joint jusqu'à trois lignes contiguës : `aws_secret_access_key =`,
+    une ligne vide, puis la valeur. Avant, la jointure ne portait que sur deux
+    lignes et le secret disparaissait sans laisser de trace.
+    """
+    secret = fake_token("", 40)
+    _write(tmp_path, "blank.py", f'aws_secret_access_key =\n\n"{secret}"\n')
+    findings = find_candidates(str(tmp_path))
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+
+
+def test_secret_split_over_three_lines_is_detected(tmp_path: Path) -> None:
+    """La fenêtre de trois lignes couvre un secret réparti sur trois lignes."""
+    secret = fake_token("", 40)
+    _write(tmp_path, "three.py", f'aws_secret_access_key = "{secret[:20]}\n{secret[20:]}"\n')
+    findings = find_candidates(str(tmp_path))
+    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+
+
+def test_secret_split_by_more_than_two_newlines_is_a_documented_limit(tmp_path: Path) -> None:
+    """Limite figée : au-delà de trois lignes jointes, la coupure n'est pas vue."""
+    secret = fake_token("", 40)
+    _write(tmp_path, "gap.py", f'aws_secret_access_key =\n\n\n"{secret}"\n')
+    assert find_candidates(str(tmp_path)) == []
+
+
 # --- Exclusions (#59) -------------------------------------------------------
 
 
-def test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries() -> None:
-    for path in (
-        ".coverage",
-        ".gitignore",
-        ".git/config",
-        "package-lock.json",
-        "poetry.lock",
-        "vendor/lib.py",
-        "node_modules/pkg/index.js",
-        "Vendor/lib.py",
-        "image.png",
-        "archive.zip",
-    ):
-        assert is_excluded(path), path
-    for path in (".env", "app.py", "deploy.pem", "requirements.txt", "notes"):
-        assert not is_excluded(path), path
-    assert is_excluded_directory("VENDOR")
-    assert is_excluded_directory(".venv")
-    assert not is_excluded_directory("env")
-    assert not is_excluded_directory("src")
-    assert not is_excluded("")
+def test_perimetre_classifie_les_repertoires_sans_exclure_de_fichier() -> None:
+    """Le nom ne qualifie que la *conséquence* d'un échec de lecture."""
+    assert classer_repertoire("vendor") is Perimetre.TIERS
+    assert classer_repertoire("VENDOR") is Perimetre.TIERS
+    assert classer_repertoire("node_modules") is Perimetre.TIERS
+    assert classer_repertoire(".venv") is Perimetre.TIERS
+    assert classer_repertoire(".git") is Perimetre.HORS_PERIMETRE
+    assert classer_repertoire(".hg") is Perimetre.HORS_PERIMETRE
+    assert classer_repertoire("src") is Perimetre.STRICT
+    assert classer_repertoire("env") is Perimetre.STRICT
+    assert classer_repertoire("") is Perimetre.STRICT
+    assert classer_chemin("vendor/lib.py") is Perimetre.TIERS
+    assert classer_chemin("src/vendor/lib.py") is Perimetre.TIERS
+    assert classer_chemin(".git/config") is Perimetre.HORS_PERIMETRE
+    assert classer_chemin("src/app.py") is Perimetre.STRICT
+    assert classer_chemin("app.py") is Perimetre.STRICT
 
 
-def test_scan_skips_excluded_files_but_scans_env_and_pem(tmp_path: Path) -> None:
+def test_a_nom_exclu_ne_cache_plus_aucon_secret(tmp_path: Path) -> None:
+    """Non-régression HIGH : un nom « exclu » ne dispense jamais de lire.
+
+    `evil.png`, `evil.lock`, `package-lock.json` et `vendor/s.txt` étaient
+    ignorés sur leur seul nom : un secret y passait inaperçu et le verdict
+    « dépôt propre » était faux. Le contenu décide : ces fichiers sont lus,
+    décodés et scannés.
+    """
+    secret = _aws("nom")
+    _write(tmp_path, "evil.png", f'AWS = "{secret}"')
+    _write(tmp_path, "evil.lock", f'AWS = "{secret}"')
+    _write(tmp_path, "package-lock.json", f'AWS = "{secret}"')
+    _write(tmp_path, "vendor/s.txt", f'AWS = "{secret}"')
+    _write(tmp_path, "node_modules/pkg/index.js", f'AWS = "{secret}"')
+    findings = find_candidates(str(tmp_path))
+    assert [(finding["file"], finding["type"]) for finding in findings] == [
+        ("evil.lock", "aws"),
+        ("evil.png", "aws"),
+        ("node_modules/pkg/index.js", "aws"),
+        ("package-lock.json", "aws"),
+        ("vendor/s.txt", "aws"),
+    ]
+
+
+def test_scan_covers_the_named_files_and_skips_only_real_binaries(tmp_path: Path) -> None:
+    """Les fichiers « exclus » par nom sont scannés ; seul le binaire est ignoré."""
     _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
     _write(tmp_path, ".env", f'STRIPE = "{_stripe()}"')
     _write(tmp_path, "deploy.pem", _pem_header())
     _write(tmp_path, "requirements.txt", f'AWS = "{_aws("req")}"')
     _write(tmp_path, "vendor/lib.py", f'AWS = "{_aws("vendor")}"')
     _write(tmp_path, "node_modules/pkg/index.js", f'AWS = "{_aws("node")}"')
-    _write(tmp_path, ".git/config", f'AWS = "{_aws("git")}"')
     _write(tmp_path, "package-lock.json", f'AWS = "{_aws("lock")}"')
     _write(tmp_path, ".gitignore", f'AWS = "{_aws("ignore")}"')
     _write(tmp_path, "image.png", f'AWS = "{_aws("image")}"')
@@ -335,23 +423,172 @@ def test_scan_skips_excluded_files_but_scans_env_and_pem(tmp_path: Path) -> None
     findings = find_candidates(str(tmp_path))
     assert [(finding["file"], finding["type"]) for finding in findings] == [
         (".env", "stripe"),
+        (".gitignore", "aws"),
         ("app.py", "aws"),
+        ("blob.bin", "aws"),
         ("deploy.pem", "pem"),
+        ("image.png", "aws"),
+        ("node_modules/pkg/index.js", "aws"),
+        ("package-lock.json", "aws"),
         ("requirements.txt", "aws"),
         ("script", "aws"),
+        ("vendor/lib.py", "aws"),
     ]
 
 
-def test_env_directory_is_scanned_but_virtualenvs_are_excluded(tmp_path: Path) -> None:
-    """"env" n'est pas un virtualenv par convention : ne jamais le sauter."""
+def test_virtualenv_is_a_tier_tree_and_is_still_scanned(tmp_path: Path) -> None:
+    """``.venv`` n'est plus un trou : c'est un arbre de tiers, donc scanné."""
     _write(tmp_path, "env/app.py", f'AWS = "{_aws("env")}"')
     _write(tmp_path, ".venv/lib.py", f'AWS = "{_aws("dotvenv")}"')
     _write(tmp_path, "venv/lib.py", f'AWS = "{_aws("venv")}"')
     _write(tmp_path, "virtualenv/lib.py", f'AWS = "{_aws("virtualenv")}"')
     findings = find_candidates(str(tmp_path))
-    assert [(finding["file"], finding["type"]) for finding in findings] == [
-        ("env/app.py", "aws")
+    assert [finding["file"] for finding in findings] == [
+        ".venv/lib.py",
+        "env/app.py",
+        "venv/lib.py",
+        "virtualenv/lib.py",
     ]
+
+
+def test_a_real_binary_is_traced_and_counted_without_leaking_content(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Non-régression MEDIUM : un binaire ignoré reste *visible*.
+
+    Le binaire est le seul contenu non analysable toléré ; il doit laisser une
+    trace (chemin journalisé + compteur) sans jamais laisser fuir une
+    valeur.
+    """
+    _write(tmp_path, "image.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
+    _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.binaires_ignores == 1
+    assert rapport.non_analyses == 0
+    assert rapport.complet is True
+    assert [finding.file for finding in rapport.findings] == ["app.py"]
+    trace = capsys.readouterr().err
+    assert "image.png" in trace
+    assert "binaire" in trace
+    # Aucune valeur de secret ne fuit dans la trace.
+    assert _aws() not in trace
+
+
+def test_the_report_exposes_what_was_not_analysed(tmp_path: Path) -> None:
+    """Le rapport distingue un dépôt propre d'un dépôt partiellement lu."""
+    _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
+    rapport = scan_rapport(str(tmp_path))
+    assert isinstance(rapport, RapportScan)
+    assert rapport.binaires_ignores == 0
+    assert rapport.non_analyses == 0
+    assert rapport.liens_ignores == 0
+    assert rapport.hors_perimetre == 0
+    assert rapport.complet is True
+
+
+def test_the_vcs_database_is_not_walked_but_is_traced(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``.git/`` n'est pas le contenu du dépôt : il n'est pas parcouru, mais tracé."""
+    _write(tmp_path, ".git/config", f'AWS = "{_aws("git")}"')
+    _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.hors_perimetre == 1
+    assert [finding.file for finding in rapport.findings] == ["app.py"]
+    assert ".git" in capsys.readouterr().err
+
+
+def test_a_file_ignored_in_a_tier_tree_does_not_break_the_scan(tmp_path: Path) -> None:
+    """Un fichier illisible dans un arbre de tiers est tracé, pas fatal."""
+    _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"')
+    _write(tmp_path, "vendor/broken.bin", b"\x00\x01\x02not-decodable")
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.non_analyses == 1
+    assert [finding.file for finding in rapport.findings] == ["vendor/secret.txt"]
+
+
+def test_a_broken_file_in_the_strict_perimeter_is_fail_closed(tmp_path: Path) -> None:
+    """Dans le contenu du dépôt, un fichier illisible reste fatal."""
+    _write(tmp_path, "broken.bin", b"\x00\x01\x02not-decodable")
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
+
+
+def test_an_oversized_file_in_a_tier_tree_is_traced_not_fatal(tmp_path: Path) -> None:
+    """Dans un arbre de tiers, un fichier hors borne est tracé, pas fatal."""
+    _write(tmp_path, "vendor/huge.txt", b"A" * (MAX_FILE_BYTES + 1))
+    _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"')
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.non_analyses == 1
+    assert [finding.file for finding in rapport.findings] == ["vendor/secret.txt"]
+
+
+def test_a_fifo_in_a_tier_tree_is_traced_not_fatal(tmp_path: Path) -> None:
+    """Un fichier non régulier dans un arbre de tiers est tracé, pas fatal."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo indisponible")
+    (tmp_path / "vendor").mkdir()
+    os.mkfifo(tmp_path / "vendor" / "pipe")
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.non_analyses == 1
+
+
+def test_an_invalid_name_in_a_tier_tree_is_traced_not_fatal(tmp_path: Path) -> None:
+    """Un nom hors contrat dans un arbre de tiers est tracé, pas fatal."""
+    _write(tmp_path, "vendor/bad:name.txt", f'AWS = "{_aws("vendor")}"')
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.non_analyses == 1
+    assert rapport.findings == ()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="liens symboliques indisponibles")
+def test_a_symlinked_directory_is_traced_and_never_followed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Un répertoire symlinké n'est jamais suivi : il est compté et tracé."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write(outside, "leak.py", f'AWS = "{_aws("outside")}"')
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _write(repository, "app.py", f'AWS = "{_aws()}"')
+    try:
+        (repository / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Création de liens symboliques non autorisée sous Windows")
+        raise
+    rapport = scan_rapport(str(repository))
+    assert rapport.liens_ignores == 1
+    assert [finding.file for finding in rapport.findings] == ["app.py"]
+    assert "linked" in capsys.readouterr().err
+
+
+def test_the_trace_neutralises_control_characters_in_paths(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Un nom de fichier ne peut pas injecter de fausse ligne de journal."""
+    _write(tmp_path, "vendor/binaire\nFAUSSE LIGNE.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
+    rapport = scan_rapport(str(tmp_path))
+    # Le nom est hors contrat : le fichier n'est pas analysable, mais il est
+    # tracé — sur une seule ligne, sans le retour à la ligne injecté.
+    assert rapport.non_analyses == 1
+    trace = capsys.readouterr().err
+    assert "vendor/binaire?FAUSSE LIGNE.png" in trace
+    assert "\nFAUSSE LIGNE" not in trace
+    assert trace.count("\n") == 1
+
+
+def test_the_trace_truncates_an_absurdly_long_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Un chemin démesuré ne noie pas le journal."""
+    _write(tmp_path, "vendor/" + "/".join("d" * 200 for _ in range(12)) + "/b.png",
+           b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
+    rapport = scan_rapport(str(tmp_path))
+    assert rapport.binaires_ignores == 1
+    trace = capsys.readouterr().err
+    assert len(trace) < 512
 
 
 def test_utf16_utf32_without_bom_is_scanned(tmp_path: Path) -> None:
@@ -435,10 +672,14 @@ def test_extensionless_ambiguous_nul_is_fail_closed(tmp_path: Path) -> None:
         find_candidates(str(tmp_path))
 
 
-def test_case_insensitive_excluded_directory(tmp_path: Path) -> None:
+def test_case_insensitive_tier_directory(tmp_path: Path) -> None:
+    """``VENDOR/`` est un arbre de tiers (scanné), quelle que soit sa casse."""
     _write(tmp_path, "VENDOR/lib.py", f'AWS = "{_aws("upper")}"')
     _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
-    assert [finding["file"] for finding in find_candidates(str(tmp_path))] == ["app.py"]
+    assert [finding["file"] for finding in find_candidates(str(tmp_path))] == [
+        "VENDOR/lib.py",
+        "app.py",
+    ]
 
 
 def test_symlinked_root_is_refused(tmp_path: Path) -> None:
@@ -587,6 +828,189 @@ def test_report_is_deterministic_and_sorted(tmp_path: Path) -> None:
 def test_crlf_line_numbers_are_preserved(tmp_path: Path) -> None:
     _write(tmp_path, "windows.py", f"header\r\nAWS = \"{_aws()}\"\r\n")
     assert [finding["line"] for finding in find_candidates(str(tmp_path))] == [2]
+
+
+# --- Fail-closed : les défenses de lecture -----------------------------------
+
+
+def test_a_root_that_is_neither_a_file_nor_a_directory_is_refused(tmp_path: Path) -> None:
+    """Une racine non régulière est refusée, jamais lue."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo indisponible")
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    with pytest.raises(ScanError):
+        scan(fifo)
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="permissions POSIX")
+def test_an_unreadable_directory_is_fail_closed(tmp_path: Path) -> None:
+    """Un répertoire illisible dans le périmètre strict interrompt le scan."""
+    bloque = tmp_path / "bloque"
+    bloque.mkdir()
+    (bloque / "secret.txt").write_text("x", encoding="utf-8")
+    bloque.chmod(0o000)
+    try:
+        with pytest.raises(ScanError):
+            scan(tmp_path)
+    finally:
+        bloque.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="permissions POSIX")
+def test_an_unreadable_directory_in_a_tier_tree_is_traced(tmp_path: Path) -> None:
+    """Dans un arbre de tiers, un répertoire illisible est tracé, pas fatal."""
+    bloque = tmp_path / "vendor" / "bloque"
+    bloque.mkdir(parents=True)
+    (bloque / "secret.txt").write_text("x", encoding="utf-8")
+    bloque.chmod(0o000)
+    try:
+        rapport = scan_rapport(str(tmp_path))
+    finally:
+        bloque.chmod(0o700)
+    assert rapport.non_analyses == 1
+
+
+def test_a_file_removed_before_being_read_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un fichier disparu entre le parcours et la lecture n'est pas analysable."""
+    _write(tmp_path, "gone.txt", f'AWS = "{_aws()}"')
+    real_resolve = Path.resolve
+
+    def broken_resolve(self: Path, *args: object, **kwargs: object) -> Path:
+        if self.name == "gone.txt":
+            raise OSError("disparu")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", broken_resolve)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+
+
+def test_a_file_resolving_outside_the_root_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un fichier dont la résolution sort de la racine rompt le confinement."""
+    _write(tmp_path, "escape.txt", "x")
+    real_resolve = Path.resolve
+    outside = tmp_path.parent / "outside.txt"
+
+    def escaping_resolve(self: Path, *args: object, **kwargs: object) -> Path:
+        if self.name == "escape.txt":
+            return outside
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", escaping_resolve)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+
+
+def test_a_file_that_cannot_be_stated_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un ``stat`` impossible rend le fichier non analysable (fail-closed)."""
+    _write(tmp_path, "stat.txt", "x")
+    real_stat = os.stat
+
+    def broken_stat(path: object, *args: object, **kwargs: object) -> object:
+        if str(path).endswith("stat.txt"):
+            raise OSError("panne")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr("heimdall.scanner.detect.os.stat", broken_stat)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+
+
+def test_a_file_that_cannot_be_opened_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un ``open`` impossible rend le fichier non analysable (fail-closed)."""
+    _write(tmp_path, "open.txt", "x")
+    real_open = os.open
+
+    def broken_open(path: object, *args: object, **kwargs: object) -> int:
+        if str(path).endswith("open.txt"):
+            raise OSError("panne")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("heimdall.scanner.detect.os.open", broken_open)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+
+
+def test_a_file_replaced_before_being_read_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un descripteur qui ne désigne plus le même fichier est refusé."""
+    _write(tmp_path, "swap.txt", "x")
+    real_fstat = os.fstat
+
+    def altered_fstat(descriptor: int) -> object:
+        metadata = real_fstat(descriptor)
+        return types.SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_size=metadata.st_size,
+            st_mtime_ns=metadata.st_mtime_ns,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino + 1,
+        )
+
+    monkeypatch.setattr("heimdall.scanner.detect.os.fstat", altered_fstat)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+
+
+def test_a_file_that_cannot_be_read_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Une lecture impossible rend le fichier non analysable (fail-closed)."""
+    _write(tmp_path, "read.txt", "x")
+    real_read = os.read
+
+    def broken_read(descriptor: int, size: int) -> bytes:
+        if size > 0:
+            raise OSError("panne")
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr("heimdall.scanner.detect.os.read", broken_read)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+
+
+def test_a_path_that_cannot_be_inspected_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un ``lstat`` impossible est fail-closed, jamais un ``continue``."""
+    _write(tmp_path, "link.txt", "x")
+    real_is_symlink = Path.is_symlink
+
+    def broken_is_symlink(self: Path) -> bool:
+        if self.name == "link.txt":
+            raise OSError("panne")
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", broken_is_symlink)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+
+
+def test_a_path_outside_the_root_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un chemin qui ne peut pas être rendu relatif est fail-closed."""
+    _write(tmp_path, "app.py", "x")
+    real_relative_to = Path.relative_to
+
+    def broken_relative_to(self: Path, *args: object, **kwargs: object) -> Path:
+        if self.name == "app.py":
+            raise ValueError("hors racine")
+        return real_relative_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "relative_to", broken_relative_to)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
 
 
 # --- Entropie et empreinte --------------------------------------------------
