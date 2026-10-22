@@ -54,7 +54,8 @@ def _echo_stderr_best_effort(message: str) -> None:
     """
     try:
         typer.echo(message, err=True)
-    except Exception:  # noqa: S110 - best-effort volontaire, voir la docstring.
+    # Best-effort volontaire (voir la docstring) : l'échec est abandonné.
+    except Exception:  # noqa: S110 # nosec B110
         pass
 
 
