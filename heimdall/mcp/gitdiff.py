@@ -58,6 +58,7 @@ from typing import Final
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.paths import is_rel_path
+from heimdall.scanner.finding import validate_relative_path
 
 # Options NON négociables (contrat 4.1) — voir le tableau du contrat pour la
 # justification de chacune. `-C` place git dans la racine sans dépendre du
@@ -433,13 +434,18 @@ class DiffEntry:
 
 #: En-tête du format « raw » de git : ``:mode mode sha sha statut``.
 _RAW_HEADER_FIELDS: Final[int] = 5
-#: SHA « nul » de git : l'objet n'existe pas (ajout ou suppression).
-_NULL_OBJECT: Final[str] = "0" * 40
-#: Un nom d'objet git : 40 caractères hexadécimaux (SHA-1).
-_OBJECT_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{40}")
+#: Un nom d'objet git : 40 caractères (dépôt SHA-1) ou 64 (dépôt SHA-256).
+#: Les deux formats sont acceptés : un dépôt `--object-format=sha256` est
+#: parfaitement valide, et le refuser rendrait `--staged` inutilisable (#29).
+_OBJECT_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 #: Statuts de `--raw` dont le blob indexé doit être scanné : ajout,
 #: modification, changement de type (le nouveau contenu est scanné).
 _SCAN_STATUSES: Final[frozenset[str]] = frozenset({"A", "M", "T"})
+
+
+def _is_null_object(blob: str) -> bool:
+    """True pour le SHA « nul » de git (40 ou 64 zéros) : l'objet n'existe pas."""
+    return bool(blob) and set(blob) == {"0"}
 
 
 def _checked_object(blob: str) -> str:
@@ -505,16 +511,22 @@ def _staged_change(header: bytes, path_bytes: bytes) -> StagedChange | None:
         blob = fields[3].decode("ascii")
     except UnicodeDecodeError:
         raise ToolFailure("INTERNAL") from None
-    if blob == _NULL_OBJECT or _OBJECT_PATTERN.fullmatch(blob) is None:
+    if _is_null_object(blob) or _OBJECT_PATTERN.fullmatch(blob) is None:
         raise ToolFailure("INTERNAL")
     try:
         path = path_bytes.decode("utf-8")
     except UnicodeDecodeError:
         raise ToolFailure("INTERNAL") from None
-    if not is_rel_path(path):
+    try:
+        # Contrat Finding v1 (#14) : 4096 caractères, segments non vides,
+        # sans `.`/`..`, sans `\`, `:` ni caractère de contrôle. C'est la
+        # **seule** limite de chemin de la CLI : `FileTarget` revalide avec
+        # exactement la même fonction, donc aucune divergence 1024/4096.
+        validate_relative_path(path)
+    except ValueError:
         # Un nom de fichier que le contrat ne sait pas représenter ne peut
         # pas être montré ni rejoué : la sortie est refusée, pas tronquée.
-        raise ToolFailure("INTERNAL")
+        raise ToolFailure("INTERNAL") from None
     return StagedChange(path=path, blob=blob)
 
 

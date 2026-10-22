@@ -45,7 +45,14 @@ mode `--staged` (sinon : erreur, code 2).
 | Périmètre | Ce qui est analysé | Exclusions |
 | --- | --- | --- |
 | `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **techniques** seulement : binaires, répertoires générés (`.git`, `node_modules`, `.venv`, `build`, `dist`…) |
-| `staged` (`--staged`) | le contenu **indexé** de chaque fichier ajouté ou modifié | **aucune** : `vendor/`, `third_party/`, `package-lock.json`, `.gitignore`… sont analysés |
+| `staged` (`--staged`) | le contenu **indexé** de chaque fichier ajouté ou modifié | **aucune exclusion de chemin** : `vendor/`, `third_party/`, `package-lock.json`, `.gitignore`… sont analysés |
+
+« Aucune exclusion de **chemin** » ne veut pas dire « aucune exclusion du
+tout » : les blobs dont le contenu est **binaire** (signature magique connue
+et contenu majoritairement binaire : PNG, PDF, ZIP, ELF…) n'ont pas de texte
+à analyser et sont sautés — un secret placé dans un binaire reste donc un
+faux négatif, dans les **deux** périmètres. C'est une impossibilité technique,
+pas une politique de chemin ; elle est tracée dans les limites ci-dessous.
 
 Le mode strict est une correction issue de la revue de #165 (point HIGH) :
 la politique #59 excluait `vendor/` et les lockfiles, donc un secret posé
@@ -56,7 +63,24 @@ les scanner n'y gagnerait rien et lèverait parfois une erreur de décodage.
 En mode `--staged`, c'est le **blob indexé** qui est lu, pas la copie de
 travail : c'est ce que le commit va contenir qui est jugé. Le blob entier est
 analysé, pas seulement les lignes modifiées — un secret déjà présent dans le
-fichier et laissé tel quel reste signalé.
+fichier et laissé tel quel reste signalé. Les dépôts **SHA-1 et SHA-256**
+(`--object-format=sha256`) sont supportés : les noms d'objets de 40 ou 64
+caractères hexadécimaux sont acceptés.
+
+## Bornes
+
+Le scan est **borné** dans les deux périmètres : au-delà, il est refusé
+(code 2), jamais tronqué ni présenté comme complet.
+
+| Périmètre | Borne par fichier | Nombre de fichiers | Volume total |
+| --- | --- | --- | --- |
+| `working-tree` | 1 Mio ([`MAX_FILE_BYTES`](../heimdall/scanner/detect.py)) | 50 000 ([`MAX_FILES`](../heimdall/scanner/detect.py)) | 256 Mio ([`MAX_TOTAL_BYTES`](../heimdall/scanner/detect.py)) |
+| `staged` | 1 Mio | 1 000 ([`MAX_STAGED_FILES`](../heimdall/cli/scan.py)) | 32 Mio ([`MAX_STAGED_BYTES`](../heimdall/cli/scan.py)) |
+
+Les deux bornes totales protègent la CI d'un dépôt adverse (100 000 petits
+fichiers, ou 50 000 fichiers de 1 Mio) : sans elles, le job durerait sans
+rendre de verdict. Les constantes sont volontairement généreuses pour un
+dépôt réel tout en restant déterministes.
 
 ## Codes de sortie
 
@@ -134,12 +158,18 @@ champ libre, pas d'extrait de ligne.
 
 - Les exclusions **techniques** restent : un secret dans `node_modules/`,
   `build/`, `dist/`, `.venv/` ou dans un fichier binaire n'est pas signalé.
-  C'est un choix assumé (contenu généré, lecture binaire), pas un oubli.
+  C'est un choix assumé (contenu généré, lecture binaire), pas un oubli. En
+  particulier, un blob **binaire** est sauté dans les deux périmètres : un
+  secret placé dans un commentaire PNG ou une archive n'est pas détecté.
 - La fenêtre multi-ligne reste bornée à 4 Kio : un secret coupé par un
   retour à la ligne au-delà de cette borne n'est pas recherché.
 - Le mode `--staged` analyse l'**index**, pas l'historique : un secret déjà
-  commité n'est pas re-detecté par `--staged` (c'est le rôle de
+  commité n'est pas re-détecté par `--staged` (c'est le rôle de
   `heimdall scan` sur l'arbre de travail, et du job de CI de #37).
+- Un chemin de fichier doit être représentable dans le contrat
+  [Finding v1](contracts/finding.md) : au-delà de **4096 caractères**, le
+  scan est refusé (code 2), jamais un chemin tronqué. Les noms contenant une
+  espace ou des caractères Unicode sont, eux, parfaitement acceptés.
 - Le scanner de signatures ne décode ni base64 ni concaténation de chaînes :
   ces obfuscations restent des `limite_connue` (#23/#24), comme documenté dans
   [scanner.md](scanner.md#limites-connues-honnêtes).

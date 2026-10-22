@@ -21,9 +21,19 @@ GIT = shutil.which("git", path=os.defpath)
 
 
 class GitRepo:
-    """Dépôt git jetable, prêt à recevoir des modifications indexées."""
+    """Dépôt git jetable, prêt à recevoir des modifications indexées.
 
-    def __init__(self, prefix: str, test: unittest.TestCase | None = None) -> None:
+    ``object_format`` permet de créer un dépôt SHA-256
+    (``--object-format=sha256``) : les noms d'objets y font 64 caractères.
+    """
+
+    def __init__(
+        self,
+        prefix: str,
+        test: unittest.TestCase | None = None,
+        *,
+        object_format: str = "sha1",
+    ) -> None:
         if GIT is None:  # pragma: no cover - garde-fou d'environnement de test.
             raise unittest.SkipTest("git requis")
         self._tmp = tempfile.TemporaryDirectory(prefix=prefix)
@@ -31,7 +41,10 @@ class GitRepo:
             test.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name) / "repo"
         self.root.mkdir()
-        self.git("init", "-q")
+        init = ["init", "-q"]
+        if object_format != "sha1":
+            init.append(f"--object-format={object_format}")
+        self.git(*init)
         self.git("config", "user.email", "test@example.invalid")
         self.git("config", "user.name", "Heimdall Test")
 

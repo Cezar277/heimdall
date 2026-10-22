@@ -89,27 +89,33 @@ def scan(
     """
     try:
         report = collect(Path(path), staged=staged)
+        # Le **rendu** et le résumé --ci sont dans le même try que la
+        # collecte : un échec de rendu (bug futur, panne mémoire, écriture
+        # refusée) est une erreur d'outillage, jamais l'exit 1 réservé aux
+        # secrets avérés (invariant 11). Un try qui ne couvrirait que
+        # `collect()` laisserait une traceback Typer sortir en 1.
+        if json_output:
+            typer.echo(render_json(report))
+        else:
+            typer.echo(render_text(report))
+        if ci:
+            # Résumé déterministe sur stderr : le journal CI montre toujours
+            # le verdict, même si stdout est consommé par un parseur.
+            typer.echo(
+                f"heimdall scan : périmètre {report.scope}, "
+                f"{len(report.findings)} secret(s) détecté(s).",
+                err=True,
+            )
     except (ScanError, ToolFailure):
         # Erreur d'outillage : le périmètre n'a pas été analysé en entier.
         # Jamais 0, jamais 1 : c'est 2 (REQ-SEC-07).
         typer.echo("heimdall scan : scan impossible (erreur d'outillage).", err=True)
         raise typer.Exit(code=2) from None
     except Exception:
-        # Panne inattendue : même contrat, message statique (invariant 8).
+        # Panne inattendue (collecte ou rendu) : même contrat, message
+        # statique (invariant 8).
         typer.echo("heimdall scan : erreur inattendue pendant le scan.", err=True)
         raise typer.Exit(code=2) from None
-    if json_output:
-        typer.echo(render_json(report))
-    else:
-        typer.echo(render_text(report))
-    if ci:
-        # Résumé déterministe sur stderr : le journal CI montre toujours le
-        # verdict, même si stdout est consommé par un parseur.
-        typer.echo(
-            f"heimdall scan : périmètre {report.scope}, "
-            f"{len(report.findings)} secret(s) détecté(s).",
-            err=True,
-        )
     raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
 
 

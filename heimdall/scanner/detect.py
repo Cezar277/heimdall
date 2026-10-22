@@ -44,6 +44,13 @@ from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 MAX_FILE_BYTES: Final[int] = 1_048_576
 MAX_PATH_LENGTH: Final[int] = 4096
 MULTILINE_WINDOW: Final[int] = 4096
+#: Plafond du nombre de fichiers analysés en une passe (#29). Au-delà, le
+#: scan est **refusé** (``ScanError``) : un dépôt adverse avec 100 000 petits
+#: fichiers ne doit pas faire durer une CI sans rendre de verdict.
+MAX_FILES: Final[int] = 50_000
+#: Plafond du volume total lu en une passe, en octets (#29). Sans lui,
+#: ``MAX_FILES`` fichiers de 1 Mio feraient 50 Gio de lecture.
+MAX_TOTAL_BYTES: Final[int] = 256 * 1024 * 1024
 _READ_CHUNK: Final[int] = 65_536
 _FIRST_CONTROL: Final[int] = 0x20
 _DELETE: Final[int] = 0x7F
@@ -54,8 +61,10 @@ __all__ = [
     "Finding",
     "FindingSource",
     "FindingStatus",
+    "MAX_FILES",
     "MAX_FILE_BYTES",
     "MAX_PATH_LENGTH",
+    "MAX_TOTAL_BYTES",
     "MULTILINE_WINDOW",
     "ScanError",
     "find_candidates",
@@ -139,7 +148,7 @@ class Scanner:
     reste la politique #59 inchangée.
     """
 
-    __slots__ = ("_hasher", "_root", "_single", "_strict")
+    __slots__ = ("_hasher", "_max_bytes", "_max_files", "_root", "_single", "_strict")
 
     def __init__(
         self,
@@ -147,6 +156,8 @@ class Scanner:
         *,
         hasher: SnippetHasher | None = None,
         strict: bool = False,
+        max_files: int | None = None,
+        max_bytes: int | None = None,
     ) -> None:
         resolved = _resolve_root(root)
         if resolved.is_dir():
@@ -159,12 +170,17 @@ class Scanner:
             raise ScanError(_SCAN_ERROR)
         self._hasher = SnippetHasher() if hasher is None else hasher
         self._strict = strict
+        self._max_files = MAX_FILES if max_files is None else max_files
+        self._max_bytes = MAX_TOTAL_BYTES if max_bytes is None else max_bytes
 
     def scan(self) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.
 
         Toute erreur de lecture interrompt le scan : aucun résultat partiel
-        n'est retourné.
+        n'est retourné. Le nombre de fichiers (:data:`MAX_FILES`) et le volume
+        total lu (:data:`MAX_TOTAL_BYTES`) sont **bornés** : au-delà, le scan
+        est refusé (``ScanError``) au lieu de durer indéfiniment sur un dépôt
+        adverse (#29).
         """
         # Pas de `list()` sur le périmètre : un dépôt adverse avec un très
         # grand nombre de fichiers ne doit pas OOM le hook/CI. Le tri final
@@ -175,8 +191,16 @@ class Scanner:
             else self._iter_files()
         )
         findings: list[Finding] = []
+        count = 0
+        total = 0
         for path, relative in files:
-            text = self._read_text(path)
+            count += 1
+            if count > self._max_files:
+                raise ScanError(_SCAN_ERROR)
+            text, size = self._read_text(path)
+            total += size
+            if total > self._max_bytes:
+                raise ScanError(_SCAN_ERROR)
             if text is None:
                 continue
             findings.extend(self._scan_text(text, relative))
@@ -219,8 +243,12 @@ class Scanner:
                     raise ScanError(_SCAN_ERROR) from None
                 yield path, _validate_relative_path(relative)
 
-    def _read_text(self, path: Path) -> str | None:
-        """Lit un fichier borné ; ``None`` signifie binaire exclu."""
+    def _read_text(self, path: Path) -> tuple[str | None, int]:
+        """Lit un fichier borné ; ``(None, taille)`` signifie binaire exclu.
+
+        La taille lue est rendue pour que ``scan()`` borne le **volume total**
+        analysé (#29), pas seulement chaque fichier.
+        """
         try:
             resolved = path.resolve(strict=True)
             if not resolved.is_relative_to(self._root):
@@ -261,7 +289,7 @@ class Scanner:
             raise ScanError(_SCAN_ERROR) from None
         finally:
             os.close(descriptor)
-        return decode_text(data)
+        return decode_text(data), len(data)
 
     def _scan_text(self, text: str, relative: str) -> list[Finding]:
         findings: list[Finding] = []

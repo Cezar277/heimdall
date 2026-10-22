@@ -109,6 +109,54 @@ def test_scan_does_not_write_anything(tmp_path: Path) -> None:
     assert sorted(p.name for p in tmp_path.iterdir()) == avant
 
 
+def test_scan_render_failure_exits_two_not_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue #166 (LOW) : un échec de **rendu** sort en 2, jamais en 1.
+
+    L'exit 1 est réservé aux secrets avérés (invariant 11) : une panne de
+    rendu ne doit pas faire croire à une détection.
+    """
+    racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
+
+    def rendu_casse(_report: object) -> str:
+        raise RuntimeError("panne de rendu")
+
+    monkeypatch.setattr("heimdall.cli.main.render_text", rendu_casse)
+    resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_ERROR
+    assert "erreur inattendue" in resultat.stderr
+
+
+def test_scan_tree_refuses_too_many_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue #166 (LOW) : l'arbre est borné en **nombre de fichiers**.
+
+    Un dépôt adverse avec des milliers de petits fichiers ne doit pas faire
+    durer la CI sans verdict : au-delà du plafond, refus (code 2).
+    """
+    monkeypatch.setattr("heimdall.scanner.detect.MAX_FILES", 1)
+    racine = _arbre(tmp_path, {"a.py": "x = 1\n", "b.py": "y = 2\n"})
+    resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
+def test_scan_tree_refuses_too_many_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue #166 (LOW) : l'arbre est borné en **volume total lu**.
+
+    La borne par fichier (1 Mio) ne suffit pas : 50 000 fichiers feraient
+    50 Gio. Au-delà du plafond total, refus (code 2).
+    """
+    monkeypatch.setattr("heimdall.scanner.detect.MAX_TOTAL_BYTES", 10)
+    racine = _arbre(tmp_path, {"a.py": "x = 1\n" * 10})
+    resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_ERROR
+
+
 # --- mode strict : les exclusions de contenu texte tombent -----------------
 
 
@@ -154,6 +202,48 @@ def test_scan_staged_detects_secret_in_lockfile(git_repo: GitRepo) -> None:
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_FINDINGS
     assert "package-lock.json:1" in resultat.stdout
+
+
+def test_scan_staged_accepts_space_and_unicode_paths(git_repo: GitRepo) -> None:
+    """Un chemin légitime (espace, unicode) est analysé et publié tel quel."""
+    chemin = "dossier avec espace/éàü.py"
+    git_repo.write(chemin, f'KEY = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage(chemin)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert f"{chemin}:1" in resultat.stdout
+
+
+def test_scan_staged_accepts_a_long_path(git_repo: GitRepo) -> None:
+    """Revue #166 (LOW) : au-delà de 1024 caractères, le contrat #14 fait foi.
+
+    ``Finding.file`` autorise 4096 caractères ; l'ancienne garde ``is_rel_path``
+    (1024, contrat MCP) refusait un chemin pourtant représentable. Le chemin
+    est désormais validé par ``validate_relative_path`` (4096).
+    """
+    chemin = "/".join(["d" * 200] * 6) + "/secret.py"  # ~1216 caractères
+    assert len(chemin) > 1024
+    git_repo.write(chemin, f'KEY = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage(chemin)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert f"{chemin}:1" in resultat.stdout
+
+
+def test_scan_staged_with_a_sha256_repository() -> None:
+    """Revue #166 (LOW) : un dépôt SHA-256 (blobs de 64 hexa) est supporté."""
+    try:
+        repo = GitRepo("heimdall-t29-sha256-", object_format="sha256")
+    except AssertionError:  # pragma: no cover - git sans support SHA-256.
+        pytest.skip("git ne supporte pas --object-format=sha256")
+    try:
+        repo.write("vendor/evil.py", f'KEY = "{FAKE_AWS_KEY}"\n')
+        repo.stage("vendor/evil.py")
+        resultat = _run("scan", "--staged", str(repo.root))
+        assert resultat.exit_code == EXIT_FINDINGS
+        assert "vendor/evil.py:1" in resultat.stdout
+    finally:
+        repo.close()
 
 
 def test_scan_staged_clean_repository_exits_zero(git_repo: GitRepo) -> None:
@@ -320,6 +410,27 @@ def test_scan_ci_on_a_clean_repository_exits_zero(tmp_path: Path) -> None:
     assert "0 secret(s) détecté(s)" in resultat.stderr
 
 
+def test_scan_ci_json_staged_combines(git_repo: GitRepo) -> None:
+    """Revue #166 : ``--ci --json --staged`` combinés.
+
+    stdout doit rester un document JSON **parseable** (rien d'autre), le
+    résumé déterministe va sur stderr, et le code de sortie porte le verdict.
+    """
+    git_repo.write("vendor/evil.py", f'KEY = "{FAKE_AWS_KEY}"\n')
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("vendor/evil.py", "app.py")
+    resultat = _run("scan", "--ci", "--json", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    document = json.loads(resultat.stdout)
+    assert document["schema"] == JSON_SCHEMA
+    assert document["scope"] == "staged"
+    assert document["count"] == 1
+    assert document["findings"][0]["file"] == "vendor/evil.py"
+    assert "1 secret(s) détecté(s)" in resultat.stderr
+    assert FAKE_AWS_KEY not in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.stderr
+
+
 # --- lecture de l'index : analyse de la sortie « raw » ----------------------
 
 
@@ -337,6 +448,13 @@ def test_parse_staged_raw_reads_added_and_modified() -> None:
     ]
 
 
+def test_parse_staged_raw_accepts_sha256_objects() -> None:
+    """Revue #166 (LOW) : un dépôt SHA-256 utilise des noms de 64 hexa."""
+    brut = b":000000 100644 " + b"0" * 64 + b" " + b"a" * 64 + b" A\x00vendor/x.py\x00"
+    changements = parse_staged_raw(brut)
+    assert [(c.path, c.blob) for c in changements] == [("vendor/x.py", "a" * 64)]
+
+
 @pytest.mark.parametrize(
     "brut",
     [
@@ -346,7 +464,9 @@ def test_parse_staged_raw_reads_added_and_modified() -> None:
         b":100644 100644 0000000 " + b"a" * 40 + b" U\x00conflit.py\x00",  # index non résolu
         b":100644 100644 0000000 " + b"a" * 40 + b" R100\x00a.py\x00b.py\x00",  # renommage
         b":100644 100644 0000000 pas-un-sha A\x00x.py\x00",  # SHA invalide
+        b":100644 100644 0000000 " + b"a" * 43 + b" A\x00x.py\x00",  # ni 40 ni 64
         b":100644 100644 0000000 " + b"a" * 40 + b" A\x00../evasion.py\x00",  # traversée
+        b":100644 100644 0000000 " + b"a" * 40 + b" A\x00d/" * 2100 + b"f.py\x00",  # > 4096
         b"pas-un-en-tete\x00x.py\x00",  # en-tête illisible
     ],
 )
