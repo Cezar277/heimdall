@@ -201,11 +201,6 @@ def test_generation_refuses_target_symlink_escape(tmp_path, monkeypatch):
     assert not list(outside.iterdir())
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError,
-    reason="Scanner T22 non livré; aucune métrique inventée",
-    strict=True,
-)
 def test_scanner_precision_and_recall(tmp_path):
     report = scan_corpus(tmp_path)
     print(json.dumps(report, indent=2))
