@@ -512,6 +512,46 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         self.assertEqual((moved_parent / ".env").read_text(encoding="utf-8"), "SECRET=1\n")
         self.assertFalse((outside / ".env").exists())
 
+    def test_write_file_atomic_rejects_intermediate_parent_symlink_swap(self) -> None:
+        """Un échange d'un parent intermédiaire contre symlink avant ouverture est refusé."""
+        base = self.tmp_dir / "inter_base"
+        base.mkdir()
+        inter_dir = base / "component"
+        inter_dir.mkdir()
+        parent = inter_dir / "leaf"
+        parent.mkdir()
+        target = parent / ".env"
+
+        outside = self.tmp_dir / "outside_hijack"
+        outside.mkdir()
+        outside_leaf = outside / "leaf"
+        outside_leaf.mkdir()
+
+        real_open = os.open
+        swapped = False
+
+        def fake_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            if (
+                not swapped
+                and os.fspath(path) == os.fspath(parent)
+                and flags & getattr(os, "O_DIRECTORY", 0)
+            ):
+                swapped = True
+                # Remplacement du parent intermédiaire par un symlink vers outside
+                inter_moved = base / "component_moved"
+                inter_dir.rename(inter_moved)
+                os.symlink(outside, inter_dir)
+            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+        with patch("heimdall.vault.atomic.os.open", side_effect=fake_open):
+            with self.assertRaises(ValueError) as ctx:
+                write_file_atomic(target, "SECRET=1\n")
+            self.assertIn("lien symbolique", str(ctx.exception))
+
+        self.assertTrue(swapped)
+        self.assertFalse((outside_leaf / ".env").exists())
+
     def test_backup_file_creation_and_mode_600(self) -> None:
         """backup_file crée une copie .bak en droits 0600 avec assertion de mode."""
         target = self.tmp_dir / ".env"
@@ -923,6 +963,13 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         """Le paramètre transport est strictement interdit hors environnement de test."""
         fake_transport = MagicMock()
         with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "", "HEIMDALL_ENV": "production"}):
+            with patch.dict(sys.modules, {"pytest": None}):
+                with self.assertRaises(ValueError) as ctx:
+                    VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)
+                self.assertIn("réservé exclusivement aux tests", str(ctx.exception))
+
+        # Rejet strict invariant même si HEIMDALL_ENV=test est positionné hors pytest
+        with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "", "HEIMDALL_ENV": "test"}):
             with patch.dict(sys.modules, {"pytest": None}):
                 with self.assertRaises(ValueError) as ctx:
                     VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)

@@ -286,13 +286,12 @@ def _filter_secrets(
     return filtered
 
 
-def _push_single_secret(  # noqa: PLR0913, PLR0917
+def _push_single_secret(
     client: VaultClient,
     proj: str,
     env: str,
     name: str,
     value: str,
-    force: bool,
 ) -> None:
     """Envoie un secret unique au Vault et gère les erreurs contractuelles."""
     try:
@@ -372,7 +371,7 @@ def vault_push(  # noqa: PLR0913, PLR0917
     client = _init_client(vault_url, ca_cert)
     with client:
         for name, value in to_push.items():
-            _push_single_secret(client, proj, env, name, value, False)
+            _push_single_secret(client, proj, env, name, value)
 
     typer.echo(f"{len(to_push)} secret(s) traités pour le projet '{proj}' ({env}).")
 

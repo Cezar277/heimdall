@@ -172,9 +172,18 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
     except OSError as exc:
         raise ValueError(f"Impossible d'ouvrir le répertoire parent : {exc}") from exc
 
-    data = content.encode("utf-8") if isinstance(content, str) else content
-
     try:
+        # Contrôle post-ouverture : aucun composant parent intermédiaire ne doit
+        # être un lien symbolique (protection contre substitution TOCTOU avant open)
+        for parent_part in path.parent.parents:
+            if os.path.islink(parent_part):
+                raise ValueError(
+                    "Écriture refusée : le répertoire parent "
+                    f"'{parent_part}' est un lien symbolique."
+                )
+
+        data = content.encode("utf-8") if isinstance(content, str) else content
+
         if os.name == "posix":
             _write_file_atomic_dir_fd(parent_fd, path.name, data, mode)
         else:  # pragma: no cover - dépend de la plateforme

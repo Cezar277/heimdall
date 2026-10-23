@@ -535,7 +535,12 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
 
 
 class VaultClient:
-    """Client HTTPS du Vault (boucle locale uniquement). Non héritable."""
+    """Client HTTPS du Vault (boucle locale uniquement). Non héritable.
+
+    Le paramètre ``transport`` est un hook strictement réservé aux tests unitaires
+    (ex: injecter un ``httpx.MockTransport`` ou ``SyncASGITransport`` dans pytest)
+    et est rejeté en environnement normal pour garantir le transit TLS loopback.
+    """
 
     __slots__ = (
         "_base_url",
@@ -571,7 +576,6 @@ class VaultClient:
         if transport is not None and not (
             bool(os.environ.get("PYTEST_CURRENT_TEST"))
             or bool(sys.modules.get("pytest"))
-            or os.environ.get("HEIMDALL_ENV") == "test"
         ):
             raise ValueError(
                 "Le paramètre 'transport' est réservé exclusivement aux tests unitaires."
