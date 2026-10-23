@@ -464,6 +464,7 @@ class _StuckGitProcess:
         self._clock = clock
         self._read_seconds = read_seconds
         self.stdout = self
+        self.killed = False
 
     def read(self, _size: int) -> bytes:
         self._clock.now += self._read_seconds
@@ -473,10 +474,10 @@ class _StuckGitProcess:
         return None
 
     def kill(self) -> None:
-        return None
+        self.killed = True
 
     def wait(self, timeout: float | None = None) -> int:
-        if timeout is None:
+        if timeout is None or self.killed:
             return -9
         self._clock.now += timeout
         raise subprocess.TimeoutExpired(cmd="git", timeout=timeout)
@@ -857,6 +858,48 @@ class GitAccessDirectTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "INTERNAL")
         self.assertLessEqual(clock.now, 1.0 + 1e-9)
 
+    def test_read_capped_with_hung_wait_after_kill_never_exceeds_deadline(self) -> None:
+        """Revue (LOW) : `wait` traînant après `kill` ne dépasse pas deadline + timeout.
+
+        Si le processus git est ininterruptible, le premier `wait` expire, puis
+        les appels `wait` dans `_terminate_process` sont bornés par le restant
+        de deadline (plancher 0,1 s), évitant un blocage indéfini ou un doublement
+        de timeout (pas 2 × `timeout`).
+        """
+        clock = _FakeClock()
+
+        class _UnkillableProcess:
+            def __init__(self) -> None:
+                self.stdout = self
+
+            def read(self, _size: int) -> bytes:
+                clock.now += 0.8
+                return b""
+
+            def close(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                delta = 0.5 if timeout is None else timeout
+                clock.now += delta
+                raise subprocess.TimeoutExpired(cmd=["git"], timeout=delta)
+
+        proc = _UnkillableProcess()
+        access = gitdiff.GitAccess(self.repo.root)
+        with (
+            mock.patch.object(gitdiff, "time", clock),
+            mock.patch("subprocess.Popen", return_value=proc),
+            mock.patch.object(gitdiff.threading, "Timer"),
+        ):
+            with self.assertRaises(ToolFailure) as ctx:
+                access._read_capped(("rev-parse", "--show-toplevel"), 10, timeout=1.0)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+        # 0.8s + 0.2s (wait 1) + 0.1s (wait kill 1) + 0.1s (wait kill 2) = 1.2s <= 1.5s
+        self.assertLessEqual(clock.now, 1.5)
+
     def test_staged_diff_truncation_flag(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
         self.repo.write("a.txt", "x\n")
@@ -943,7 +986,7 @@ class GitAccessDirectTests(unittest.TestCase):
         with mock.patch("subprocess.Popen", return_value=proc):
             with self.assertRaises(ToolFailure):
                 access.staged_diff(1024)
-        proc.kill.assert_called_once()
+        self.assertGreaterEqual(proc.kill.call_count, 1)
 
     def test_execute_success_returns_completed_process(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)

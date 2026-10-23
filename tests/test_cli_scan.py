@@ -20,6 +20,7 @@ import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import typer
@@ -852,6 +853,56 @@ def test_scan_staged_concurrent_index_change_exits_two(
     assert "scan impossible" in resultat.stderr
 
 
+def test_nested_file_mutation_between_walk_and_read_text(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : swap fichier imbriqué walk->open : 0 assumé en arbre vs 2 en staged.
+
+    Fige le comportement documenté dans docs/cli.md :
+    - En mode arbre : un fichier imbriqué nettoyé entre `os.walk` et `_read_text`
+      ne modifie pas l'identité (dev, ino, ctime) de la racine ; le scan lit le
+      contenu propre et rend 0 (best-effort non atomique assumé).
+    - En `--staged` : l'index modifié après le snapshot refuse en code 2 (atomique).
+    """
+    nested = git_repo.root / "sub"
+    nested.mkdir()
+    target_file = nested / "app.py"
+    target_file.write_text(f'AWS = "{FAKE_AWS_KEY}"\n', encoding="utf-8")
+    git_repo.stage("sub/app.py")
+
+    # 1. En mode arbre : substitution entre os.walk et lecture
+    original_iter = TreeScanner._iter_files
+
+    def iter_puis_nettoie(self: TreeScanner) -> Any:
+        for p, rel in original_iter(self):
+            if rel == "sub/app.py":
+                # Le fichier est nettoyé avant son ouverture _read_text
+                target_file.write_text("x = 1\n", encoding="utf-8")
+            yield p, rel
+
+    monkeypatch.setattr(TreeScanner, "_iter_files", iter_puis_nettoie)
+    resultat_tree = _run("scan", str(git_repo.root))
+    assert resultat_tree.exit_code == EXIT_CLEAN
+
+    # 2. En mode --staged : si l'index mute pendant le scan -> code 2
+    original_staged = GitAccess.staged_changes
+    tours = 0
+
+    def staged_changeant(self: GitAccess, **options: Any) -> list[StagedChange]:
+        nonlocal tours
+        tours += 1
+        res = original_staged(self, **options)
+        if tours > 1:
+            # Simulation d'index restagé pendant le scan
+            return []
+        return res
+
+    monkeypatch.setattr(GitAccess, "staged_changes", staged_changeant)
+    resultat_staged = _run("scan", "--staged", str(git_repo.root))
+    assert resultat_staged.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat_staged.stderr
+
+
 def test_scan_staged_accepts_a_reordered_second_enumeration(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1065,6 +1116,54 @@ def _instantane(racine: Path) -> dict[str, bytes | None]:
         chemin.relative_to(racine).as_posix(): (chemin.read_bytes() if chemin.is_file() else None)
         for chemin in sorted(racine.rglob("*"))
     }
+
+
+@pytest.mark.parametrize("arguments", [[], ["--staged"]], ids=["arbre", "index"])
+def test_scan_root_swap_between_resolve_and_stat_exits_two(
+    git_repo: GitRepo, arguments: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : échange dossier->symlink->dossier : le re-contrôle final refuse (code 2).
+
+    Fige le comportement documenté dans docs/cli.md :
+    Une course résiduelle entre `_resolve_root` et `os.stat` (remplacement par un autre dossier)
+    est interceptée en fin de passe par `_verify_root_unchanged`, garantissant le code 2
+    dans les deux périmètres (arbre et --staged).
+    """
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
+    autre_dossier = git_repo.root.parent / "autre-root"
+    autre_dossier.mkdir()
+
+    original_stat = os.stat
+    tours = 0
+
+    def stat_piege(path: object, *args: Any, **kwargs: Any) -> Any:
+        nonlocal tours
+        st = original_stat(path, *args, **kwargs)
+        if Path(str(path)).resolve() == git_repo.root.resolve():
+            tours += 1
+            if tours == 1:
+                # Simule un ctime/ino modifié (autre dossier) capturé à la construction
+                return os.stat_result(
+                    (
+                        st.st_mode,
+                        st.st_ino + 9999,
+                        st.st_dev,
+                        st.st_nlink,
+                        st.st_uid,
+                        st.st_gid,
+                        st.st_size,
+                        st.st_atime,
+                        st.st_mtime,
+                        st.st_ctime + 100,
+                    )
+                )
+        return st
+
+    monkeypatch.setattr(os, "stat", stat_piege)
+    resultat = _run("scan", *arguments, str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
 
 
 @pytest.mark.parametrize("arguments", [[], ["--staged"]], ids=["arbre", "index"])

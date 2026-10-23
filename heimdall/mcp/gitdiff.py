@@ -219,16 +219,27 @@ _UNMERGED_PATH: Final[str] = "* Unmerged path "
 _BINARY_UNAMBIGUOUS_PARTS: Final[int] = 2
 
 
-def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
-    """Interrompt un sous-processus et attend sa fin sans bloquer ni lever."""
+def _terminate_process(
+    proc: subprocess.Popen[bytes],
+    *,
+    timeout: float = 0.5,
+) -> None:
+    """Interrompt un sous-processus et attend sa fin sans bloquer au-delà d'un délai."""
     try:
         proc.kill()
     except OSError:
         pass
     try:
-        proc.wait()
+        proc.wait(timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
-        pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=0.1)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
 
 @dataclass(frozen=True)
@@ -544,7 +555,7 @@ class GitAccess:
             if proc.stdout is not None:
                 raw = proc.stdout.read(max_bytes + 1)
         except OSError:
-            _terminate_process(proc)
+            _terminate_process(proc, timeout=max(0.1, deadline - time.monotonic()))
             raise ToolFailure("INTERNAL") from None
         finally:
             timer.cancel()
@@ -552,13 +563,13 @@ class GitAccess:
                 proc.stdout.close()
 
         if len(raw) > max_bytes:
-            _terminate_process(proc)
+            _terminate_process(proc, timeout=max(0.1, deadline - time.monotonic()))
             raise ToolFailure("INTERNAL")
 
         try:
             ret = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         except (subprocess.TimeoutExpired, OSError):
-            _terminate_process(proc)
+            _terminate_process(proc, timeout=max(0.1, deadline - time.monotonic()))
             raise ToolFailure("INTERNAL") from None
 
         if ret != 0:

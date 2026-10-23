@@ -293,6 +293,24 @@ document si `count != len(findings)` (contrainte explicitée dans la
   signale, comme il le doit. Un job de CI sur ce dépôt devra donc traiter ces
   fixtures (allowlist, #24) — sinon il échouerait à chaque exécution. C'est un
   choix assumé : mieux vaut un faux positif visible qu'un secret caché.
+- **Non-atomicité assumée du mode arbre (`working-tree`) vs atomicité stricte de `--staged`** :
+  L'arbre de travail est un parcours direct du système de fichiers (`os.walk`), par nature
+  **non atomique** (best-effort). Le re-contrôle final d'identité racine (`st_dev`, `st_ino`,
+  `st_ctime_ns`) détecte tout remplacement ou altération des entrées directes de la racine,
+  mais la mutation d'un fichier imbriqué (ex. substitution walk -> open où un processus
+  concurrent remplace un fichier piégé par un fichier propre avant sa lecture) ne modifie pas
+  le `ctime` racine et aboutit à un verdict propre (0 mélangé). En revanche, le mode
+  `--staged` est **strictement atomique** : il lit des objets immuables dans le dépôt git,
+  adressés par SHA (`cat-file blob <sha>`), et re-vérifie l'état complet de l'index avant de
+  rendre son verdict (toute modification concurrente refuse en code 2). Seul `--staged` est
+  atomique et fait donc foi pour les barrières de sécurité bloquantes (hook de pré-commit et CI).
+- **Course résiduelle à l'initialisation de la racine (re-contrôle final garant)** :
+  Dans `GitAccess.__init__`, entre `_resolve_root` et `os.stat`, un échange rapide
+  `dossier` -> `symlink` -> `autre dossier` à la racine pourrait théoriquement échapper
+  au `is_symlink` immédiat si le lien est retiré avant le `stat`. Cette fenêtre résiduelle est
+  assumée : le nouveau dossier porte une identité (`st_ctime_ns` / `st_ino`) différente, et
+  le re-contrôle d'identité final en fin de passe (`_verify_root_unchanged`) refuse
+  systématiquement en code 2 dans les deux périmètres (`working-tree` et `--staged`).
 - La validation humaine (Y/N/E) et le remplacement du secret ne sont pas
   dans ce ticket : `scan` signale, il ne répare pas (#32).
 
