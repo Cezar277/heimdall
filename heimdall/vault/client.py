@@ -568,6 +568,15 @@ class VaultClient:
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > _MAX_TIMEOUT_SECONDS:
             raise ValueError("timeout invalide (nombre positif <= 300 secondes requis)")
 
+        if transport is not None and not (
+            bool(os.environ.get("PYTEST_CURRENT_TEST"))
+            or bool(sys.modules.get("pytest"))
+            or os.environ.get("HEIMDALL_ENV") == "test"
+        ):
+            raise ValueError(
+                "Le paramètre 'transport' est réservé exclusivement aux tests unitaires."
+            )
+
         ca_context: ssl.SSLContext | None = None
         if ca_cert is not None:
             if not isinstance(ca_cert, (str, Path)):
@@ -683,10 +692,10 @@ class VaultClient:
                 if resp.status_code == expected_status:
                     return _parse_and_validate_json_dict(resp, endpoint)
                 self._handle_error_response(resp)
-        except httpx.RequestError as exc:
+        except VaultClientError:
+            raise
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
-        except ValueError as exc:
-            raise VaultClientError(f"Erreur de requête HTTP vers le Vault : {exc}") from exc
 
     def health(self) -> dict[str, object]:
         """Vérifie la santé minimale du Vault (/api/v1/health)."""

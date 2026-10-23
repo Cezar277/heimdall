@@ -11,11 +11,12 @@ import json
 import os
 import pickle
 import stat
+import sys
 import tempfile
 import unittest
 from http import HTTPStatus
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 
@@ -909,6 +910,23 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 with self.assertRaises(VaultClientError) as ctx:
                     client.get_secret("demo", "dev", "MY_KEY")
                 self.assertIn("Identifiant non conforme", str(ctx.exception))
+
+    def test_stream_closed_raises_vault_unavailable_error(self) -> None:
+        """httpx.StreamError (RuntimeError) est converti en VaultUnavailableError sans traceback."""
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(httpx.Client, "stream", side_effect=httpx.StreamClosed()):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("Erreur de communication avec le Vault", str(ctx.exception))
+
+    def test_transport_parameter_rejected_outside_test_environment(self) -> None:
+        """Le paramètre transport est strictement interdit hors environnement de test."""
+        fake_transport = MagicMock()
+        with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "", "HEIMDALL_ENV": "production"}):
+            with patch.dict(sys.modules, {"pytest": None}):
+                with self.assertRaises(ValueError) as ctx:
+                    VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)
+                self.assertIn("réservé exclusivement aux tests", str(ctx.exception))
 
 
 if __name__ == "__main__":

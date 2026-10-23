@@ -19,6 +19,7 @@ from heimdall.vault.atomic import check_file_mode_600, parse_env_file
 from heimdall.vault.client import (
     VaultAuthError,
     VaultClientError,
+    VaultConflictError,
     VaultForbiddenError,
     VaultRateLimitError,
 )
@@ -1271,6 +1272,29 @@ class VaultRunCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 2)
         self.assertNotIn("SHOULD_NOT_RUN", result.output)
         self.assertIn("Aucun secret", result.output)
+
+    def test_push_on_conflict_409_does_not_reference_nonexistent_force_flag(self) -> None:
+        """Sur 409 Conflict, le message n'indique pas un drapeau --force inexistant."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.create_secret.side_effect = VaultConflictError("Conflict")
+                mock_init.return_value = client_instance
+
+                dummy_env = Path(tempfile.mkdtemp()) / "conflict.env"
+                dummy_env.write_text("MY_VAR=secret\n", encoding="utf-8")
+                try:
+                    result = self.runner.invoke(
+                        app,
+                        ["vault", "push", "--project", "demo", "--file", str(dummy_env)],
+                    )
+                    self.assertEqual(result.exit_code, 0)
+                    self.assertIn("409 Conflict", result.output)
+                    self.assertNotIn("--force", result.output)
+                finally:
+                    if dummy_env.exists():
+                        dummy_env.unlink()
 
 
 if __name__ == "__main__":

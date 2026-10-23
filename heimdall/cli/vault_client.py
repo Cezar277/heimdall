@@ -299,17 +299,11 @@ def _push_single_secret(  # noqa: PLR0913, PLR0917
         client.create_secret(proj, env, name, value)
         typer.echo(f"Secret '{name}' poussé vers le Vault ({proj}/{env}) [statut: vaulte].")
     except VaultConflictError:
-        if force:
-            typer.echo(
-                f"Secret '{name}' existe déjà dans le Vault ({proj}/{env}) (mode --force).",
-                err=True,
-            )
-        else:
-            typer.echo(
-                f"Secret '{name}' existe déjà dans le Vault ({proj}/{env}) "
-                "(409 Conflict, utilisez --force pour forcer).",
-                err=True,
-            )
+        typer.echo(
+            f"Avertissement : le secret '{name}' existe déjà dans le Vault ({proj}/{env}) "
+            "(409 Conflict).",
+            err=True,
+        )
     except VaultAuthError:
         typer.echo(
             "Erreur 401 : Authentification requise ou clé API invalide.",
