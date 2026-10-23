@@ -453,7 +453,13 @@ def _pull_secrets_from_vault(
     env: str,
     target_names: list[str],
 ) -> dict[str, str]:
-    """Récupère les valeurs de chaque secret depuis le Vault."""
+    """Récupère les valeurs de chaque secret depuis le Vault.
+
+    Échec franc (``Exit(1)``) dès qu'un secret demandé est introuvable
+    (404) : jamais de ``.env`` partiel ni d'injection partielle. Un nom
+    manquant (faute de frappe, secret révoqué) sort en erreur au lieu de
+    laisser croire à une configuration complète (invariant 11).
+    """
     retrieved: dict[str, str] = {}
     for name in target_names:
         if not _SECRET_NAME_PATTERN.match(name):
@@ -486,9 +492,10 @@ def _pull_secrets_from_vault(
             retrieved[name] = val
         except VaultNotFoundError:
             typer.echo(
-                f"Avertissement : secret '{name}' introuvable dans le Vault ({proj}/{env}).",
+                f"Erreur : secret '{name}' introuvable dans le Vault ({proj}/{env}).",
                 err=True,
             )
+            raise typer.Exit(code=1) from None
         except VaultAuthError:
             typer.echo(
                 "Erreur 401 : Authentification requise ou clé API invalide.",

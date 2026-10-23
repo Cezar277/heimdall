@@ -24,6 +24,7 @@ from heimdall.vault.client import (
     VaultClientError,
     VaultConflictError,
     VaultForbiddenError,
+    VaultNotFoundError,
     VaultRateLimitError,
 )
 
@@ -421,6 +422,90 @@ class VaultPullCliTests(unittest.TestCase):
                 self.assertTrue(bak_file.is_file())
                 self.assertEqual(bak_file.read_text(encoding="utf-8"), "OLD_KEY=old_val\n")
                 self.assertTrue(check_file_mode_600(bak_file))
+
+    def test_pull_missing_named_secret_exits_1_without_partial_file(self) -> None:
+        """404 sur un nom explicite → Exit(1), aucun .env partiel écrit."""
+        output_file = self.tmp_dir / ".env"
+
+        def fake_get_secret(project: str, env: str, name: str) -> dict[str, str]:
+            if name == "MISSING_KEY":
+                raise VaultNotFoundError("Ressource introuvable dans le Vault (404)")
+            return {
+                "project": project,
+                "env": env,
+                "name": name,
+                "status": "vaulte",
+                "value": "found_val",
+            }
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.side_effect = fake_get_secret
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--env",
+                        "dev",
+                        "--name",
+                        "FOUND_KEY",
+                        "--name",
+                        "MISSING_KEY",
+                        "--output",
+                        str(output_file),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("introuvable", result.output)
+                self.assertFalse(output_file.exists())
+
+    def test_run_missing_named_secret_exits_1_without_executing_child(self) -> None:
+        """404 sur un nom explicite → Exit(1), l'enfant n'est jamais exécuté."""
+
+        def fake_get_secret(project: str, env: str, name: str) -> dict[str, str]:
+            if name == "MISSING_VAR":
+                raise VaultNotFoundError("Ressource introuvable dans le Vault (404)")
+            return {
+                "project": project,
+                "env": env,
+                "name": name,
+                "status": "actif",
+                "value": "found_val",
+            }
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.side_effect = fake_get_secret
+                mock_init.return_value = client_instance
+
+                with patch("heimdall.cli.vault_client.subprocess.run") as mock_run:
+                    result = self.runner.invoke(
+                        app,
+                        [
+                            "run",
+                            "--project",
+                            "demo",
+                            "--name",
+                            "FOUND_VAR",
+                            "--name",
+                            "MISSING_VAR",
+                            "--",
+                            "echo",
+                            "test",
+                        ],
+                    )
+                    self.assertEqual(result.exit_code, 1)
+                    self.assertIn("introuvable", result.output)
+                    mock_run.assert_not_called()
 
     def test_pull_rejects_newline_in_secret_value(self) -> None:
         """Refus strict d'écrire un secret contenant un saut de ligne dans .env (§HIGH 2)."""
