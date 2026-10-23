@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import pickle
+import socket
 import stat
 import tempfile
 import unittest
@@ -43,6 +44,7 @@ from heimdall.vault.client import (
     VaultRateLimitError,
     VaultUnavailableError,
     _check_localhost_resolution,
+    _pin_loopback_ip,
     _read_and_check_key_file,
     _validate_identifier,
     detect_project,
@@ -122,6 +124,42 @@ class VaultClientUnitTests(unittest.TestCase):
         self.assertIsNotNone(c1)
         self.assertIsNotNone(c2)
         self.assertIsNotNone(c3)
+
+    def test_localhost_is_pinned_to_loopback_ip_at_construction(self) -> None:
+        """`localhost` est stocké épinglé : plus aucun nom à résoudre à la connexion."""
+        client = VaultClient("https://localhost:8443", _VALID_KEY)
+        pinned_host = urlparse(client._base_url).hostname
+        self.assertIn(pinned_host, ("127.0.0.1", "::1"))
+        self.assertNotIn("localhost", client._base_url)
+        client.close()
+
+    def test_pin_loopback_ip_prefers_ipv4_and_rejects_outsiders(self) -> None:
+        """Épinglage déterministe : 127.0.0.1 préféré, hors-boucle et pannes refusés."""
+
+        def entry(ip: str) -> tuple:
+            family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+            return (family, socket.SOCK_STREAM, 6, "", (ip, 0))
+
+        with patch("socket.getaddrinfo", return_value=[entry("::1"), entry("127.0.0.1")]):
+            self.assertEqual(_pin_loopback_ip("localhost"), "127.0.0.1")
+        with patch("socket.getaddrinfo", return_value=[entry("::1")]):
+            self.assertEqual(_pin_loopback_ip("localhost"), "::1")
+        with patch("socket.getaddrinfo", return_value=[entry("127.0.0.1")]):
+            self.assertEqual(_pin_loopback_ip("localhost"), "127.0.0.1")
+        with patch(
+            "socket.getaddrinfo", return_value=[entry("127.0.0.1"), entry("93.184.216.34")]
+        ):
+            with self.assertRaises(ValueError):
+                _pin_loopback_ip("localhost")
+        with patch("socket.getaddrinfo", return_value=[]):
+            with self.assertRaises(ValueError):
+                _pin_loopback_ip("localhost")
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("nope")):
+            with self.assertRaises(ValueError):
+                _pin_loopback_ip("localhost")
+        # Les littéraux sont retournés inchangés, sans résolution.
+        self.assertEqual(_pin_loopback_ip("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(_pin_loopback_ip("::1"), "::1")
 
     def test_ca_cert_symlink_is_rejected(self) -> None:
         """Un bundle CA pointé par un lien symbolique est refusé (invariant 3)."""

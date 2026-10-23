@@ -3,7 +3,9 @@
 Parle au Vault EXCLUSIVEMENT en HTTPS vers une adresse de boucle locale
 (invariant 12 ; allowlist : ``127.0.0.1``, ``::1``, ``localhost``), avec
 vérification TLS obligatoire (chaîne + SAN, CA interne explicitement
-approuvée). Interdit : ``verify=False``, ``-k``, contexte SSL non vérifié,
+approuvée). ``localhost`` est épinglé vers l'IP de boucle locale résolue à
+la construction : le client ne résout plus aucun nom à la connexion, aucune
+fenêtre de rebinding DNS. Interdit : ``verify=False``, ``-k``, contexte SSL non vérifié,
 repli non vérifié, credentials dans l'URL, espaces ou caractères de contrôle
 dans l'URL, formes encodées ``%XX`` (``%3F``/``%23`` contourneraient le rejet
 de query/fragment), ports hors 1-65535 (concaténation ``f"{base_url}/..."``
@@ -255,9 +257,8 @@ def resolve_vault_url(url: str | None = None) -> str:
     """Résout l'URL canonique du Vault depuis l'argument, l'environnement ou le défaut.
 
     Le défaut est ``https://127.0.0.1:8443`` (littéral IP, aucune résolution
-    DNS) : ``localhost`` reste accepté par compatibilité mais impose une
-    résolution à la construction puis à chaque connexion (fenêtre de
-    rebinding documentée dans ``_check_localhost_resolution``).
+    DNS) : ``localhost`` reste accepté par compatibilité mais est épinglé vers
+    l'IP de boucle locale à la validation (voir ``_pin_loopback_ip``).
     """
     if url is not None and url.strip():
         return url.strip()
@@ -335,32 +336,57 @@ def detect_project(start_dir: Path | None = None) -> str:
     return "default"
 
 
+def _pin_loopback_ip(host: str) -> str:
+    """Épingle ``localhost`` vers l'IP de boucle locale résolue (anti-rebinding).
+
+    Résolution unique à la validation : le client stocke un littéral IP et
+    ``httpx`` ne résout plus aucun nom à la connexion, ce qui ferme la
+    fenêtre d'empoisonnement du résolveur local entre construction et
+    requêtes. Choix déterministe : ``127.0.0.1`` si présent, sinon ``::1``.
+    Toute adresse hors boucle, toute absence de résolution ou tout échec
+    (``gaierror``) lève ``ValueError`` fail-closed. Les littéraux
+    ``127.0.0.1``/``::1`` sont retournés inchangés.
+    """
+    if host in ("127.0.0.1", "::1"):
+        return host
+    try:
+        addr_info = socket.getaddrinfo("localhost", None)
+    except socket.gaierror as exc:
+        raise ValueError(
+            "Sécurité : localhost ne résout vers aucune adresse de boucle locale"
+        ) from exc
+    ips = {str(entry[4][0]) for entry in addr_info}
+    outsiders = sorted(ips - {"127.0.0.1", "::1"})
+    if outsiders:
+        raise ValueError(
+            f"Sécurité : localhost résout vers une IP hors boucle locale ({outsiders[0]})"
+        )
+    if "127.0.0.1" in ips:
+        return "127.0.0.1"
+    if "::1" in ips:
+        return "::1"
+    raise ValueError("Sécurité : localhost ne résout vers aucune adresse de boucle locale")
+
+
 def _check_localhost_resolution(host: str) -> None:
     """Vérifie que localhost résout strictement vers une boucle locale.
 
-    Fenêtre connue (LOW) : contrôle à la construction, puis `httpx` résout à
-    nouveau à la connexion. Un empoisonnement du résolveur local entre les
-    deux pourrait diriger la clé hors boucle en HTTPS. Le défaut reste
-    `https://127.0.0.1:8443` (pas de résolution DNS) ; `localhost` est accepté
-    par compatibilité mais `127.0.0.1` est recommandé.
+    Contrôle à la construction relayé par ``_pin_loopback_ip`` : `localhost`
+    est accepté par compatibilité mais `127.0.0.1` reste le défaut sans
+    résolution (aucune fenêtre de rebinding sur le défaut).
     """
     if host != "localhost":
         return
-    try:
-        addr_info = socket.getaddrinfo("localhost", None)
-        for entry in addr_info:
-            sockaddr = entry[4]
-            ip = sockaddr[0]
-            if ip not in ("127.0.0.1", "::1"):
-                raise ValueError(
-                    f"Sécurité : localhost résout vers une IP hors boucle locale ({ip})"
-                )
-    except socket.gaierror:
-        pass
+    _pin_loopback_ip(host)
 
 
-def _validate_loopback_url(base_url: str) -> str:
-    """Vérifie l'URL du Vault (HTTPS, boucle locale, forme canonique)."""
+def _validate_loopback_url(base_url: str) -> str:  # noqa: PLR0912
+    """Vérifie l'URL du Vault (HTTPS, boucle locale, forme canonique).
+
+    ``localhost`` est accepté en entrée mais stocké épinglé vers l'IP de
+    boucle locale (voir ``_pin_loopback_ip``) : la forme canonique stockée ne
+    contient plus jamais de nom à résoudre.
+    """
     if not isinstance(base_url, str) or not base_url:
         raise ValueError("URL du Vault requise (chaîne non vide)")
     if re.search(r"\s|[\x00-\x09\x0e-\x1f\x7f]", base_url):
@@ -379,20 +405,25 @@ def _validate_loopback_url(base_url: str) -> str:
         raise ValueError(
             "le Vault n'est joignable que sur boucle locale (127.0.0.1, ::1, localhost)"
         )
-    _check_localhost_resolution(host)
     try:
         port = parsed.port
     except ValueError:
         raise ValueError("port invalide dans l'URL du Vault (1-65535)") from None
     if port is not None and not 1 <= port <= _MAX_PORT:
         raise ValueError("port invalide dans l'URL du Vault (1-65535)")
-    authority = f"[{host}]" if ":" in host else host
+    raw_authority = f"[{host}]" if ":" in host else host
     if port is not None:
-        authority = f"{authority}:{port}"
-    canonical = f"{parsed.scheme}://{authority}"
-    if base_url != canonical:
+        raw_authority = f"{raw_authority}:{port}"
+    raw_canonical = f"{parsed.scheme}://{raw_authority}"
+    if base_url != raw_canonical:
         raise ValueError("URL du Vault non canonique (attendu : scheme://hôte[:port])")
-    return canonical
+    pinned = _pin_loopback_ip(host)
+    if pinned == host:
+        return raw_canonical
+    pinned_authority = f"[{pinned}]" if ":" in pinned else pinned
+    if port is not None:
+        pinned_authority = f"{pinned_authority}:{port}"
+    return f"{parsed.scheme}://{pinned_authority}"
 
 
 def _read_bounded_body(resp: Any, endpoint: str) -> bytes:

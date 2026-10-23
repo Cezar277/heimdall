@@ -140,6 +140,16 @@ class VaultTlsTransportTests(unittest.TestCase):
         ) as client:
             self.assertEqual(client.health()["status"], "ok")
 
+    def test_vault_client_localhost_url_is_pinned_and_verified(self) -> None:
+        """URL `localhost` épinglée vers l'IP à la construction, TLS vérifié sur SAN IP."""
+        with VaultClient(
+            f"https://localhost:{self.port}",
+            "synthetic_tls_client_api_key",
+            ca_cert=self.certfile,
+        ) as client:
+            self.assertNotIn("localhost", client._base_url)
+            self.assertEqual(client.health()["status"], "ok")
+
     def test_untrusted_client_is_rejected_without_fallback(self) -> None:
         """Sans confiance explicite, la connexion est rompue : aucun repli non vérifié."""
         context = ssl.create_default_context()  # magasin CA public : ne connaît pas notre CA
