@@ -35,6 +35,7 @@ from heimdall.vault.atomic import (
 )
 from heimdall.vault.client import (
     _PROJECT_ID_PATTERN,
+    _STREAM_CHUNK_SIZE,
     VaultAuthError,
     VaultClient,
     VaultClientError,
@@ -829,7 +830,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             status_code = HTTPStatus.OK
             headers: dict[str, str] = {}
 
-            def iter_bytes(self) -> object:
+            def iter_bytes(self, chunk_size: int | None = None) -> object:
                 while True:
                     yield b"x" * 65_536
 
@@ -841,6 +842,38 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             with self.assertRaises(VaultClientError) as ctx:
                 client.health()
             self.assertIn("trop volumineuse", str(ctx.exception))
+
+    def test_streaming_read_uses_bounded_chunks(self) -> None:
+        """Aucun chunk géant alloué avant contrôle : chunk_size exigé, 2 Mo rejeté."""
+        seen: dict[str, object] = {}
+
+        class _SingleGiantChunkResponse:
+            status_code = HTTPStatus.OK
+            headers: dict[str, str] = {}
+
+            def iter_bytes(self, chunk_size: int | None = None) -> object:
+                seen["chunk_size"] = chunk_size
+                yield b"y" * (2 * 1024 * 1024)
+
+            def close(self) -> None:
+                pass
+
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(httpx.Client, "send", return_value=_SingleGiantChunkResponse()):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("trop volumineuse", str(ctx.exception))
+        self.assertEqual(seen.get("chunk_size"), _STREAM_CHUNK_SIZE)
+        self.assertEqual(_STREAM_CHUNK_SIZE, 64 * 1024)
+
+    def test_ca_cert_path_is_truncated_in_errors(self) -> None:
+        """Le chemin --ca-cert n'est jamais recopié en entier (messages bornés)."""
+        long_path = "A" * 200
+        with self.assertRaises(ValueError) as ctx:
+            VaultClient(_VALID_URL, _VALID_KEY, ca_cert=long_path)
+        message = str(ctx.exception)
+        self.assertIn("A" * 32, message)
+        self.assertNotIn("A" * 200, message)
 
     def test_response_content_length_header_rejection(self) -> None:
         """Rejet précoce si Content-Length dépasse 1 Mo."""
@@ -864,7 +897,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 self.status_code = status_code
                 self.headers = {"content-length": str(100 * 1024 * 1024)}
 
-            def iter_bytes(self) -> object:
+            def iter_bytes(self, chunk_size: int | None = None) -> object:
                 raise AssertionError("le corps ne doit pas être lu")
 
             def close(self) -> None:

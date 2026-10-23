@@ -71,6 +71,12 @@ _MAX_API_KEY_FILE_BYTES: Final[int] = 4096
 _MAX_CA_CERT_BYTES: Final[int] = 1_048_576
 _MAX_STATUS_LEN: Final[int] = 64
 _GROUP_OTHER_PERMS_MASK: Final[int] = 0o077
+#: Taille des morceaux de lecture HTTP : aucun chunk alloué au-delà avant le
+#: contrôle du compteur (miroir de ``os.read(fd, MAX + 1)`` côté fichiers).
+_STREAM_CHUNK_SIZE: Final[int] = 64 * 1024
+#: Longueur maximale d'un extrait d'entrée recopié dans un message d'erreur
+#: (invariant 8 : messages bornés, jamais de valeur recopiée en entier).
+_PREVIEW_LEN: Final[int] = 32
 
 _PROJECT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _ENV_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -139,7 +145,7 @@ def _validate_identifier(value: str, label: str, pattern: re.Pattern[str]) -> No
     volumineux ne doit pas être recopié en entier dans les logs (invariant 8).
     """
     if not isinstance(value, str) or not pattern.match(value):
-        preview = value[:32] if isinstance(value, str) else f"<{type(value).__name__}>"
+        preview = value[:_PREVIEW_LEN] if isinstance(value, str) else f"<{type(value).__name__}>"
         raise ValueError(f"Identifiant de {label} invalide : {preview!r}")
 
 
@@ -431,7 +437,9 @@ def _read_bounded_body(resp: Any, endpoint: str) -> bytes:
 
     ``Content-Length`` est vérifié avant lecture ; le compteur d'octets
     effectivement reçus protège aussi contre un en-tête absent, mensonger ou
-    une réponse compressée qui se décompresserait au-delà de la limite.
+    une réponse compressée qui se décompresserait au-delà de la limite. La
+    lecture se fait par morceaux de ``_STREAM_CHUNK_SIZE`` : aucun chunk
+    géant n'est alloué avant le contrôle du compteur.
     """
     content_length_header = resp.headers.get("content-length")
     if content_length_header:
@@ -448,7 +456,7 @@ def _read_bounded_body(resp: Any, endpoint: str) -> bytes:
     chunks: list[bytes] = []
     total = 0
     try:
-        for chunk in resp.iter_bytes():
+        for chunk in resp.iter_bytes(chunk_size=_STREAM_CHUNK_SIZE):
             total += len(chunk)
             if total > _MAX_RESPONSE_BYTES:
                 raise VaultClientError(
@@ -525,7 +533,9 @@ def _validate_metadata_response(data: Any, label: str) -> dict[str, Any]:
             ) from None
         status = data.get("status")
         if not isinstance(status, str) or not (1 <= len(status) <= _MAX_STATUS_LEN):
-            status_preview = status[:32] if isinstance(status, str) else type(status).__name__
+            status_preview = (
+                status[:_PREVIEW_LEN] if isinstance(status, str) else type(status).__name__
+            )
             raise VaultClientError(f"Statut non conforme dans {label} : {status_preview!r}")
     return data
 
@@ -569,7 +579,7 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
 
     status_val = data.get("status")
     if status_val not in ("actif", "revoque", "vaulte"):
-        status_preview = str(status_val)[:32]
+        status_preview = str(status_val)[:_PREVIEW_LEN]
         raise VaultClientError(f"Statut de secret non conforme : {status_preview!r}")
 
     return data
@@ -666,7 +676,8 @@ class VaultClient:
             ca_content = read_file_secure_no_follow(ca_path, max_bytes=_MAX_CA_CERT_BYTES)
             if ca_content is None:
                 raise ValueError(
-                    f"fichier de certificat CA introuvable ou non sécurisé : {ca_cert}"
+                    "fichier de certificat CA introuvable ou non sécurisé : "
+                    f"{str(ca_cert)[:_PREVIEW_LEN]!r}"
                 )
             try:
                 ca_context = ssl.create_default_context()
@@ -674,7 +685,10 @@ class VaultClient:
                 ca_context.verify_mode = ssl.CERT_REQUIRED
                 ca_context.load_verify_locations(cadata=ca_content)
             except (ssl.SSLError, ValueError):
-                raise ValueError(f"certificat CA invalide : {ca_cert}") from None
+                raise ValueError(
+                    "certificat CA invalide : "
+                    f"{str(ca_cert)[:_PREVIEW_LEN]!r}"
+                ) from None
 
         self._base_url = canonical
         self._api_key = api_key
