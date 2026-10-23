@@ -29,6 +29,7 @@ résultat partiel n'est jamais présenté comme complet.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -69,6 +70,12 @@ MAX_STAGED_BYTES: Final[int] = 32 * 1024 * 1024
 #: ferait gonfler la liste et le tri final. Au-delà, refus (code 2), jamais
 #: un rapport tronqué présenté comme complet (même valeur que le mode arbre).
 MAX_STAGED_FINDINGS: Final[int] = 10_000
+#: Deadline globale d'une passe `--staged`, en secondes. Les bornes de volume
+#: ne bornent pas le nombre d'appels `git cat-file` (deux par blob, 2 000 au
+#: plus) ni leur durée cumulée : un index adverse ferait durer la CI sans
+#: verdict. Au-delà, refus (code 2). Chaque appel git garde son timeout
+#: unitaire (30 s) ; la deadline empêche d'en lancer de nouveaux.
+MAX_STAGED_SECONDS: Final[float] = 120.0
 
 #: Messages d'erreur **statiques** (invariant 8 : aucune entrée reflétée).
 _MSG_NOT_A_REPO: Final[str] = "scan impossible : entrée non analysable"
@@ -78,6 +85,7 @@ _MSG_TOO_MANY_FINDINGS: Final[str] = "scan impossible : entrée non analysable"
 _MSG_BLOB_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
+_MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
 
 #: Libellés du périmètre, affichés à l'humain.
 _SCOPE_LABELS: Final[dict[str, str]] = {
@@ -174,8 +182,11 @@ def _collect_staged(root: Path) -> ScanReport:
     devenir périmée (un fichier ajouté après le snapshot sera committé sans
     avoir été scanné). L'index est donc relu après l'analyse, et toute
     divergence refuse le scan (code 2) : un verdict sur un snapshot périmé
-    ne vaut ni 0 ni 1.
+    ne vaut ni 0 ni 1. Une **deadline globale** (:data:`MAX_STAGED_SECONDS`)
+    borne aussi la durée cumulée des appels git : un index adverse ne peut
+    pas enchaîner 2 000 lectures jusqu'à épuisement du job CI.
     """
+    deadline = time.monotonic() + MAX_STAGED_SECONDS
     access = GitAccess(root)
     if not access.is_repository():
         raise ScanError(_MSG_NOT_A_REPO)
@@ -186,6 +197,8 @@ def _collect_staged(root: Path) -> ScanReport:
     findings: list[Finding] = []
     total = 0
     for change in changes:
+        if time.monotonic() > deadline:
+            raise ScanError(_MSG_TIMEOUT)
         size = access.blob_size(change.blob)
         # Plancher explicite : même si un `GitAccess` dérivé rendait une
         # taille négative, `total` ne doit jamais reculer (la borne de
@@ -234,6 +247,8 @@ def _collect_staged(root: Path) -> ScanReport:
             finding.snippet_hash,
         )
     )
+    if time.monotonic() > deadline:
+        raise ScanError(_MSG_TIMEOUT)
     if access.staged_changes() != changes:
         # L'index a bougé pendant le scan : le snapshot analysé ne décrit
         # plus ce qui sera committé. Refus, pas de verdict périmé.
@@ -296,6 +311,7 @@ __all__ = [
     "MAX_STAGED_BYTES",
     "MAX_STAGED_FILES",
     "MAX_STAGED_FINDINGS",
+    "MAX_STAGED_SECONDS",
     "SCOPE_STAGED",
     "SCOPE_TREE",
     "ScanReport",

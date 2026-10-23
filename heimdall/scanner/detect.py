@@ -41,6 +41,7 @@ from heimdall.scanner.exclusions import (
     has_technical_suffix,
     is_excluded,
     is_excluded_directory,
+    is_known_binary,
 )
 from heimdall.scanner.finding import (
     MAX_PATH_LENGTH,
@@ -119,15 +120,16 @@ def _validate_relative_path(relative: str) -> str:
 def _decode_data(data: bytes, *, allow_binary_suffix: bool) -> str | None:
     """Décode le contenu ; un suffixe binaire connu sert de repli.
 
-    Le repli n'est armé qu'en mode strict pour un nom à suffixe technique :
-    un binaire réel à signature inconnue est alors exclu par politique au
-    lieu de faire échouer tout le scan. Un texte mal nommé est rendu et
-    scanné ; sans repli, ``decode_text`` reste fail-closed.
+    Le repli n'est armé qu'en mode strict pour un nom à suffixe technique,
+    et seulement pour un binaire **connu** (magie connue + ratio binaire
+    ≥ 0,5). Un binaire inconnu (NUL + texte) reste fail-closed comme en
+    ``--staged`` : le suffixe ne masque jamais un doute. Un texte mal nommé
+    est rendu et scanné ; sans repli, ``decode_text`` reste fail-closed.
     """
     try:
         return decode_text(data)
     except ScanError:
-        if allow_binary_suffix:
+        if allow_binary_suffix and is_known_binary(data):
             return None
         raise
 

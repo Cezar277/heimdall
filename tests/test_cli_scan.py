@@ -423,6 +423,34 @@ def test_scan_tree_keeps_technical_exclusions(tmp_path: Path) -> None:
     assert resultat.exit_code == EXIT_CLEAN
 
 
+def test_scan_tree_strict_scans_build_outputs(tmp_path: Path) -> None:
+    """Revue (LOW) : les sorties de build textuelles ne sont plus un angle mort.
+
+    ``build/``, ``dist/``, ``target/``, ``bower_components/`` et ``htmlcov/``
+    sont exclus par la politique #59 seule ; en strict, un secret y est un
+    secret, comme en ``--staged``.
+    """
+    contenu = {
+        "build/output.js": f'AWS = "{FAKE_AWS_KEY}"\n',
+        "dist/bundle.js": f'AWS = "{FAKE_AWS_KEY}"\n',
+        "target/app.js": f'AWS = "{FAKE_AWS_KEY}"\n',
+        "bower_components/lib.js": f'AWS = "{FAKE_AWS_KEY}"\n',
+        "htmlcov/index.html": f'AWS = "{FAKE_AWS_KEY}"\n',
+    }
+    racine = _arbre(tmp_path, contenu)
+    resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_FINDINGS
+    for chemin in contenu:
+        assert f"{chemin}:1" in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.output
+    _git(racine, "add", "-A")
+    resultat = _run("scan", "--staged", str(racine))
+    assert resultat.exit_code == EXIT_FINDINGS
+    for chemin in contenu:
+        assert f"{chemin}:1" in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.output
+
+
 def test_scan_tree_strict_scans_text_with_binary_suffix(git_repo: GitRepo) -> None:
     """Revue (LOW) : en strict, le contenu prime sur le suffixe binaire.
 
@@ -450,6 +478,23 @@ def test_scan_tree_strict_still_skips_real_binary_suffix(git_repo: GitRepo) -> N
     git_repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 512)
     resultat = _run("scan", str(git_repo.root))
     assert resultat.exit_code == EXIT_CLEAN
+
+
+def test_scan_tree_strict_refuses_unknown_binary_suffix(git_repo: GitRepo) -> None:
+    """Revue (LOW) : un binaire inconnu à suffixe technique reste fail-closed.
+
+    NUL + magie inconnue + candidat ASCII : le suffixe ne doit pas convertir
+    le doute en skip silencieux. L'arbre strict et ``--staged`` refusent tous
+    deux (code 2), pas 0 d'un côté et 2 de l'autre.
+    """
+    git_repo.write_bytes("evil.png", b"\x00\x01" + f'AWS = "{FAKE_AWS_KEY}"\n'.encode())
+    resultat = _run("scan", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+    git_repo.stage("evil.png")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
 # --- mode ``--staged`` : les blobs de l'index, sans exclusion --------------
@@ -867,6 +912,22 @@ def test_scan_staged_refuses_too_many_bytes(
     monkeypatch.setattr("heimdall.cli.scan.MAX_STAGED_BYTES", 1)
     git_repo.write("a.py", "x = 1\n")
     git_repo.stage("a.py")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+def test_scan_staged_refuses_global_deadline(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : une deadline globale borne les lectures séquentielles.
+
+    Sans elle, 1 000 blobs × 2 `git cat-file` pouvaient enchaîner 2 000
+    processus avant verdict. Deadline déjà expirée -> refus 2, pas de scan.
+    """
+    monkeypatch.setattr("heimdall.cli.scan.MAX_STAGED_SECONDS", -1.0)
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE

@@ -48,7 +48,7 @@ bibliothèque (`Scanner`, #22), hors contrat hook/CI.
 
 | Périmètre | Ce qui est analysé | Exclusions |
 | --- | --- | --- |
-| `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **techniques** seulement : binaires, répertoires générés (`.git`, `node_modules`, `.venv`, `build`, `dist`…) |
+| `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **techniques** seulement : binaires, caches et environnements (`.git`, `node_modules`, `.venv`, `__pycache__`…). `vendor/`, les lockfiles et les sorties de build textuelles (`build/`, `dist/`, `target/`) sont analysés |
 | `staged` (`--staged`) | le contenu **indexé** de chaque fichier ajouté ou modifié | **aucune exclusion de chemin** : `vendor/`, `third_party/`, `package-lock.json`, `.gitignore`… sont analysés |
 
 « Aucune exclusion de **chemin** » ne veut pas dire « aucune exclusion du
@@ -111,6 +111,13 @@ taille (et rester sous 1 Mio). Un écart — store incohérent, objet échangé 
 est refusé (code 2) avant tout décodage, jamais scanné partiellement. Une
 taille négative est également refusée ; zéro reste valide (blob vide, aucun
 candidat).
+
+La durée totale d'une passe `--staged` est bornée par une **deadline
+globale** de 120 s ([`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py)) : chaque
+blob coûte deux appels `git cat-file` séquentiels, et 1 000 blobs
+représenteraient 2 000 processus. Au-delà de la deadline, refus (code 2),
+jamais un job CI qui s'éternise sans verdict ; chaque appel git garde son
+timeout unitaire de 30 s.
 
 Les bornes d'entrée ne suffisent pas : des blobs denses en candidats
 feraient gonfler la liste des Findings et le tri final en mémoire et en
@@ -227,10 +234,13 @@ document si `count != len(findings)` (contrainte explicitée dans la
 ## Limites connues (honnêtes)
 
 - Les exclusions **techniques** restent : un secret dans `node_modules/`,
-  `build/`, `dist/`, `.venv/` ou dans un fichier binaire n'est pas signalé.
-  C'est un choix assumé (contenu généré, lecture binaire), pas un oubli. En
-  particulier, un blob **binaire** est sauté dans les deux périmètres : un
-  secret placé dans un commentaire PNG ou une archive n'est pas détecté.
+  `.venv/`, `__pycache__/` ou dans un fichier binaire n'est pas signalé.
+  C'est un choix assumé (dépendances, environnements, lecture binaire), pas
+  un oubli. En particulier, un blob **binaire** est sauté dans les deux
+  périmètres : un secret placé dans un commentaire PNG ou une archive n'est
+  pas détecté. Les sorties de build textuelles (`build/`, `dist/`,
+  `target/`, `bower_components/`, `htmlcov/`) sont désormais scannées en
+  strict, comme en `--staged`.
 - La fenêtre multi-ligne reste bornée à 4 Kio : un secret coupé par un
   retour à la ligne au-delà de cette borne n'est pas recherché.
 - Le mode `--staged` analyse l'**index**, pas l'historique : un secret déjà

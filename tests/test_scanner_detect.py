@@ -324,6 +324,19 @@ def test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries() -> None:
     assert not is_excluded("image.png", strict=True)
     assert is_excluded(".coverage", strict=True)
     assert is_excluded("node_modules/pkg/index.js", strict=True)
+    # Revue (LOW) : les sorties de build textuelles ne sont plus techniques.
+    for path in (
+        "build/output.js",
+        "dist/bundle.js",
+        "target/app.js",
+        "bower_components/lib.js",
+        "htmlcov/index.html",
+    ):
+        assert is_excluded(path), path
+        assert not is_excluded(path, strict=True), path
+    assert is_excluded_directory("build")
+    assert not is_excluded_directory("build", strict=True)
+    assert is_excluded_directory("node_modules", strict=True)
 
 
 def test_detect_path_guard_is_the_finding_contract() -> None:

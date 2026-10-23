@@ -77,7 +77,7 @@ Politique explicite, jamais une heuristique :
   `.npmignore`, `.coverage` ;
 - répertoires : `.git`, `.hg`, `.svn`, environnements virtuels (`.venv`, `venv`,
   `virtualenv`), `vendor`, `node_modules`, `third_party`, `build`, `dist`,
-  `target`, caches Python ;
+  `target`, `bower_components`, `htmlcov`, caches Python ;
 - lockfiles : suffixe `.lock`, `package-lock.json`, `yarn.lock`,
   `pnpm-lock.yaml`, `go.sum`, `bun.lockb` ;
 - binaires : extension connue, ou signature magique connue **et** contenu
@@ -97,8 +97,8 @@ répartition fonde le mode **strict** livré par #29 (`heimdall scan`) :
 
 | Famille | Contenu | Mode strict |
 | --- | --- | --- |
-| **technique** | binaires, répertoires générés (`.git`, `node_modules`, `.venv`, `build`, `dist`, caches…), `.coverage`, `bun.lockb` | **exclus** (ils sont illisibles ou illisibles par des expressions de texte) |
-| **contenu texte** | `vendor/`, `third_party/`, `third-party/`, lockfiles, `.gitignore` et autres fichiers de contrôle | **analysés** (un secret y est un secret) |
+| **technique** | binaires, dépendances et environnements (`.git`, `node_modules`, `.venv`, `__pycache__`, caches…), `.coverage`, `bun.lockb` | **exclus** (ils sont illisibles ou illisibles par des expressions de texte) |
+| **contenu texte** | `vendor/`, `third_party/`, `third-party/`, sorties de build (`build/`, `dist/`, `target/`, `bower_components/`, `htmlcov/`), lockfiles, `.gitignore` et autres fichiers de contrôle | **analysés** (un secret y est un secret) |
 
 `Scanner(root, strict=True)` (et `scan(root, strict=True)`) ne conserve que la
 première famille. C'est la correction du point HIGH relevé à la revue de #165 :
@@ -108,8 +108,9 @@ CLI `heimdall scan` (voir [cli.md](cli.md)).
 
 En strict, l'extension binaire ne prime plus sur le contenu : un fichier texte
 nommé `evil.png` est lu et scanné, comme en `--staged`. Un vrai binaire reste
-exclu — soit par sa signature connue, soit par le suffixe en repli lorsque
-`decode_text` ne peut pas décider (binaire réel à signature inconnue).
+exclu par sa signature **connue** (magie + majorité binaire). Un binaire
+inconnu (NUL + texte) reste fail-closed comme en `--staged` : le suffixe ne
+convertit jamais un doute en skip silencieux.
 
 ### Encodage des fichiers lus
 

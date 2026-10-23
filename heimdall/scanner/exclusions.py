@@ -34,10 +34,13 @@ from typing import Final
 
 from heimdall.scanner.errors import ScanError
 
-#: Répertoires exclus pour raison **technique** : contenu binaire, généré ou
-#: non analysable. Les scanner n'apporterait rien (et lèverait parfois un
-#: ``ScanError`` sur un binaire à signature inconnue) : ils restent hors
-#: périmètre, y compris en mode strict (#29).
+#: Répertoires exclus pour raison **technique** : contenu binaire, cache ou
+#: environnement non analysable. Les scanner n'apporterait rien (et lèverait
+#: parfois un ``ScanError`` sur un binaire à signature inconnue) : ils restent
+#: hors périmètre, y compris en mode strict (#29). Les sorties de build
+#: (`build`, `dist`, `target`), `bower_components` et `htmlcov` sont
+#: **textuelles** : elles rejoignent les répertoires tiers, donc scannées en
+#: strict (un secret y est un secret), exclues par la politique #59 seule.
 TECHNICAL_DIRECTORIES: Final[frozenset[str]] = frozenset(
     {
         ".git",
@@ -50,21 +53,22 @@ TECHNICAL_DIRECTORIES: Final[frozenset[str]] = frozenset(
         ".pytest_cache",
         ".ruff_cache",
         "__pycache__",
-        "bower_components",
-        "build",
-        "dist",
-        "htmlcov",
         "node_modules",
-        "target",
         "venv",
         "virtualenv",
     }
 )
 
-#: Répertoires tiers **textuels** : la politique #59 les exclut pour limiter
-#: le bruit, mais un secret y est un secret. Le mode strict (#29) les scanne.
+#: Répertoires tiers ou **générés textuels** : la politique #59 les exclut
+#: pour limiter le bruit (ou les sorties de build), mais un secret y est un
+#: secret. Le mode strict (#29) les scanne.
 TEXT_DIRECTORIES: Final[frozenset[str]] = frozenset(
     {
+        "bower_components",
+        "build",
+        "dist",
+        "htmlcov",
+        "target",
         "third-party",
         "third_party",
         "vendor",
@@ -162,8 +166,9 @@ def is_excluded_directory(name: str, *, strict: bool = False) -> bool:
     """Vrai si un nom de répertoire est hors périmètre (casse ignorée).
 
     En mode ``strict`` (#29), seules les exclusions **techniques** restent :
-    ``vendor/`` et ``third_party/`` sont alors parcourus, parce qu'un secret
-    y est un secret.
+    ``vendor/``, ``third_party/``, ``build/``, ``dist/``, ``target/`` et les
+    autres répertoires textuels sont alors parcourus, parce qu'un secret y
+    est un secret.
     """
     folded = name.casefold()
     if folded in TECHNICAL_DIRECTORIES:
@@ -328,6 +333,19 @@ def _decode_utf16_or_32(data: bytes) -> str | None:
     return None if best is None else best[1]
 
 
+def is_known_binary(data: bytes) -> bool:
+    """Vrai si le contenu est un binaire **connu** et majoritairement binaire.
+
+    Même critère que ``decode_text`` pour rendre ``None`` : une signature
+    magique connue **et** un ratio d'octets binaires ≥ 0,5. Sert de repli
+    explicite au scanner pour un fichier à suffixe technique, sans transformer
+    un binaire inconnu (NUL + texte) en skip silencieux.
+    """
+    return any(data.startswith(magic) for magic in _BINARY_MAGIC) and (
+        _binary_byte_ratio(data) >= _BINARY_RATIO_MIN
+    )
+
+
 def decode_text(data: bytes) -> str | None:
     """Décode un fichier texte ou identifie un binaire connu.
 
@@ -355,7 +373,6 @@ def decode_text(data: bytes) -> str | None:
     decoded = _decode_utf16_or_32(data)
     if decoded is not None:
         return decoded
-    if any(data.startswith(magic) for magic in _BINARY_MAGIC):
-        if _binary_byte_ratio(data) >= _BINARY_RATIO_MIN:
-            return None
+    if is_known_binary(data):
+        return None
     raise ScanError(_DECODE_ERROR)

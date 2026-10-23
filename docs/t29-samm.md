@@ -12,7 +12,7 @@ revue APPROVE WITH COMMENTS), ses premiers durcissements (`ae0b1c7`), les
 correctifs de la seconde revue (`593021c`, run 39838145119), ceux de la
 troisième revue (`251fd18`, run 39841323251) et la présente passe
 (run 39844814050). Les permaliens ci-dessous épinglent ce SHA : un lien vers
-la branche changerait de lignes au fil des commits. Les septième à neuvième
+la branche changerait de lignes au fil des commits. Les septième à dixième
 passes (courantes, voir plus bas) seront re-pinnées sur le SHA final du
 squash/merge.
 
@@ -58,15 +58,15 @@ Environnement : Linux, Python 3.14.8, venv du dépôt.
 
 ```text
 .venv/bin/python -m pytest tests/test_cli_scan.py -q
-86 passed
+89 passed
 
 .venv/bin/python -m pytest
-1527 passed, 4321 subtests passed
+1530 passed, 4321 subtests passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch \
   --cov-report=term-missing --cov-fail-under=85
-Total coverage: 95,86 % (seuil 85 % atteint)
-heimdall/cli/scan.py : 98 % ; heimdall/cli/main.py : 98 % ;
+Total coverage: 95,83 % (seuil 85 % atteint)
+heimdall/cli/scan.py : 97 % ; heimdall/cli/main.py : 98 % ;
 heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 91 % ;
 heimdall/scanner/exclusions.py : 95 % ;
 heimdall/scanner/signature_engine.py : 100 %
@@ -191,13 +191,25 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
 | LOW — suffixe binaire prioritaire sur le contenu en strict | en strict, `is_excluded` ne tranche plus sur le suffixe seul : le contenu est lu d'abord ; le suffixe ne sert de repli qu'après échec de `decode_text` (binaire réel). Un texte `evil.png` est scanné comme en `--staged` | `heimdall/scanner/exclusions.py` (`has_technical_suffix`, `is_excluded`), `heimdall/scanner/detect.py` (`_decode_data`, `_read_text`) ; `tests/test_cli_scan.py::test_scan_tree_strict_scans_text_with_binary_suffix`, `::test_scan_tree_strict_still_skips_real_binary_suffix`, `tests/test_scanner_detect.py::test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries` |
 | LOW — `count == len(findings)` non opposable aux parseurs | la `description` de `count` impose au parseur CI de refuser un document incohérent ; `docs/cli.md` explicite les deux étages (schéma puis égalité). Test avec le helper de validation recommandé | `schemas/scan.schema.json`, `docs/cli.md`, `tests/test_cli_scan.py::test_scan_count_mismatch_is_refused_by_the_recommended_validator` |
 
+## Correctifs de la dixième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — `build/`, `dist/`, `target/` textuels exclus en strict | `build`, `dist`, `target`, `bower_components` et `htmlcov` rejoignent les répertoires **textuels** : exclus par la politique #59 seule, scannés en strict comme `--staged`. Les exclusions techniques restent limitées aux métadonnées, caches, environnements et `node_modules` | `heimdall/scanner/exclusions.py` (`TECHNICAL_DIRECTORIES`, `TEXT_DIRECTORIES`), `tests/test_cli_scan.py::test_scan_tree_strict_scans_build_outputs`, `tests/test_scanner_detect.py::test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries` |
+| LOW — binaire inconnu à suffixe technique sauté en strict | le repli `_decode_data` n'est armé que pour un binaire **connu** (`is_known_binary` : magie connue + ratio ≥ 0,5). NUL + magie inconnue + texte reste `ScanError` en arbre strict comme en `--staged` (code 2) | `heimdall/scanner/exclusions.py` (`is_known_binary`), `heimdall/scanner/detect.py` (`_decode_data`) ; `tests/test_cli_scan.py::test_scan_tree_strict_refuses_unknown_binary_suffix` |
+| LOW — durée totale non bornée en `--staged` | deadline globale `MAX_STAGED_SECONDS` (120 s) : refus code 2 avant de lancer de nouvelles lectures au-delà ; chaque appel git garde son timeout unitaire de 30 s | `heimdall/cli/scan.py` (`_collect_staged`), `docs/cli.md` ; `tests/test_cli_scan.py::test_scan_staged_refuses_global_deadline` |
+
 ## Limites assumées
 
 - La validation humaine Y/N/E et le remplacement du secret ne sont pas dans ce
   ticket : `scan` signale, il ne répare pas (#32).
-- Les exclusions **techniques** restent (binaires, `node_modules/`, `build/`,
-  `dist/`, `.venv/`) : un secret qui y est copié n'est pas signalé. Un blob
-  binaire reconnu est sauté dans les **deux** périmètres (limite documentée).
+- Les exclusions **techniques** restent (binaires, `node_modules/`, `.venv/`,
+  `__pycache__/`, caches) : un secret qui y est copié n'est pas signalé. Les
+  sorties de build textuelles (`build/`, `dist/`, `target/`) sont scannées en
+  strict. Un blob binaire reconnu est sauté dans les **deux** périmètres
+  (limite documentée).
 - `--staged` analyse l'index, pas l'historique : un secret déjà commité n'est
   pas re-détecté par ce mode.
 - La trace `strace` d'un scan opérationnel reste à archiver côté CI
@@ -221,8 +233,9 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
   revue APPROVE WITH COMMENTS, 4 points LOW et leurs tests de non-régression
   ajoutés ; huitième revue APPROVE WITH COMMENTS, 3 points LOW et leurs tests
   de non-régression ajoutés ; neuvième revue APPROVE WITH COMMENTS, 3 points
+  LOW et leurs tests ajoutés ; dixième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests de non-régression ajoutés dans la passe courante (voir
-  les neuf tableaux ci-dessus).
+  les dix tableaux ci-dessus).
 - La feuille SAMM externe n'est pas accessible depuis le dépôt : reporter les
   lignes ci-dessus avec le lien de la PR et le SHA final du squash/merge
   (**re-pinner les permaliens sur ce SHA final** si le squash crée un SHA
