@@ -1434,6 +1434,82 @@ def test_scan_staged_dense_blob_refuses(
     assert "scan impossible" in resultat.stderr
 
 
+def test_signature_engine_checks_deadline_inside_one_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue (LOW) : la deadline est vue **dans** une cible, pas seulement entre cibles.
+
+    L'horloge n'expire qu'au second contrôle : une cible de 600 lignes vides
+    (contrôle tous les 256 lignes) doit être refusée pendant la boucle.
+    """
+    appels = [0]
+
+    def monotonic() -> float:
+        appels[0] += 1
+        return 0.0 if appels[0] == 1 else 2.0
+
+    monkeypatch.setattr("heimdall.scanner.signature_engine.time.monotonic", monotonic)
+    moteur = SignatureEngine(max_findings=10, deadline=1.0)
+    with pytest.raises(ScanError):
+        moteur.analyser(FileTarget(path="vide.py", text="\n" * 600))
+    assert appels[0] >= 2
+
+
+def test_signature_engine_deadline_refuses_before_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue (LOW) : sur un blob dense, le refus précède le HMAC du premier candidat.
+
+    Même motif que le test arbre `test_scan_text_checks_deadline_intra_file` :
+    le compteur de hachages doit rester à zéro quand la deadline expire.
+    """
+    appels = [0]
+
+    def monotonic() -> float:
+        appels[0] += 1
+        return 0.0 if appels[0] == 1 else 2.0
+
+    monkeypatch.setattr("heimdall.scanner.signature_engine.time.monotonic", monotonic)
+    compteur = _HasherCompteur()
+    moteur = SignatureEngine(hasher=compteur, max_findings=10_000, deadline=1.0)
+    with pytest.raises(ScanError):
+        moteur.analyser(FileTarget(path="dense.py", text=_cles_denses(300) + "\n"))
+    assert compteur.compte == 0
+
+
+def test_scan_staged_dense_blob_stops_at_the_deadline_inside_the_blob(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un blob `--staged` dense n'échappe pas à la deadline globale.
+
+    1 Mio de lignes dont 9 000 candidats (sous le plafond de 10 000, donc aucun
+    refus par compteur) : le moteur met plusieurs secondes, la deadline 1,5 s.
+    Sans contrôle intra-blob, le moteur rend son résultat après l'échéance et
+    seule la relecture finale refuse. Preuve : c'est le moteur qui lève, à
+    l'intérieur du blob.
+    """
+    monkeypatch.setattr("heimdall.cli.scan.MAX_STAGED_SECONDS", 1.5)
+    corps = f'K = "{FAKE_AWS_KEY}"\n' * 9000
+    corps += "\n" * (MAX_FILE_BYTES - len(corps))
+    git_repo.write("dense.py", corps)
+    git_repo.stage("dense.py")
+    levees: list[ScanError] = []
+    analyser_reel = SignatureEngine.analyser
+
+    def analyser_espion(self: SignatureEngine, cible: object) -> object:
+        try:
+            return analyser_reel(self, cible)
+        except ScanError as exc:
+            levees.append(exc)
+            raise
+
+    monkeypatch.setattr(SignatureEngine, "analyser", analyser_espion)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert len(levees) == 1
+    assert FAKE_AWS_KEY not in resultat.output
+
+
 def test_blob_access_refuses_a_name_that_is_not_a_sha(git_repo: GitRepo) -> None:
     """Un nom d'objet qui n'est pas un SHA est refusé avant l'argv.
 

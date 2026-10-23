@@ -240,7 +240,9 @@ def _collect_staged(root: Path) -> ScanReport:
     changes = access.staged_changes(timeout=_call_timeout(deadline))
     if len(changes) > MAX_STAGED_FILES:
         raise ScanError(_MSG_TOO_MANY_FILES)
-    moteur = TargetScanner(SignatureEngine(max_findings=MAX_STAGED_FINDINGS))
+    # Même échéance que la passe : un blob dense est interrompu à l'intérieur,
+    # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).
+    moteur = TargetScanner(SignatureEngine(max_findings=MAX_STAGED_FINDINGS, deadline=deadline))
     findings: list[Finding] = []
     total = 0
     for change in changes:

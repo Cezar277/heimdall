@@ -274,8 +274,27 @@ l'appel, affichage brut) : chacun est attrapé par le test indiqué.
 | LOW — `is_repository()` peut lever hors contrat | reproduit : `Path.resolve()` lève `RuntimeError` sur une boucle de liens en Python 3.10, plancher supporté (non levé en 3.14, d'où le test par injection). Le `resolve()` du `top` est enveloppé : `OSError`/`RuntimeError`/`ValueError` → `ToolFailure("INTERNAL")`. La comparaison se fait à la racine figée : un dépôt substitué n'est plus accepté | `heimdall/mcp/gitdiff.py` (`is_repository`) ; `tests/test_mcp_units.py::GitAccessDirectTests::test_unresolvable_toplevel_is_a_tool_failure_not_a_raw_error` (échoue sans le correctif), `::test_swapped_root_is_not_a_repository_any_more` ; `tests/test_cli_scan.py::test_scan_unresolvable_toplevel_exits_two` (le test CLI seul ne discrimine pas : le `except Exception` de `main.py` masquait l'exception en code 2) |
 | LOW — spoofing bidirectionnel du chemin affiché | reproduit en arbre et en `--staged` : `vendor/\u202egp.yvne:1` s'affichait brut. Le schéma Finding v1 autorise ces noms : on ne refuse pas le chemin (un tel nom bloquerait tout scan, donc un DoS), on l'échappe **à l'affichage**. `_visible()` échappe les catégories Cc/Cf/Zl/Zp dans `render_text` ; le JSON ne change pas | `heimdall/cli/scan.py` (`_visible`, `render_text`) ; `tests/test_cli_scan.py::test_scan_shows_bidi_paths_escaped_never_raw` (RLO, RLM, LRI × arbre, index) |
 
+## Correctifs de la dix-huitième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+Une remarque LOW, reproduite avant correction. Mesures sur la machine de
+développement : un blob d'1 Mio « sans match » prend 0,1 s dans le moteur, un
+blob d'1 Mio de sauts de ligne 9,7 s. Avec une deadline `--staged` de 2 s, le
+refus arrivait à 7,6 s, après la fin du moteur : seule la relecture finale
+(`_call_timeout`) le voyait.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — deadline `--staged` non opposable à l'intérieur d'un blob | `SignatureEngine(deadline=...)` : vérifiée toutes les 256 lignes et tous les 256 Findings (avant le HMAC), comme `Scanner._scan_text` en arbre. `_collect_staged` passe son échéance au moteur. Refus à 2,02 s au lieu de 7,6 s sur la reproduction | `heimdall/scanner/signature_engine.py` (`analyser`, `_append`), `heimdall/cli/scan.py` (`_collect_staged`) ; `tests/test_cli_scan.py::test_signature_engine_checks_deadline_inside_one_target`, `::test_signature_engine_deadline_refuses_before_hashing`, `::test_scan_staged_dense_blob_stops_at_the_deadline_inside_the_blob` (espion sur `analyser` : c'est le moteur qui lève) |
+
+Mutants réinjectés (CLI sans échéance, contrôle par ligne désactivé, contrôle
+par candidat désactivé) : chacun est attrapé par au moins un test.
+
 ## Limites assumées
 
+- Un `SignatureEngine(deadline=...)` est lié à une passe : le réutiliser après
+  son échéance refuse, en fail-closed. La CLI en crée un par passe `--staged`.
 - `git -C <racine>` résout encore le chemin à chaque appel : pendant une
   substitution, `rev-parse` répond le dépôt substitué. Le plafond reste figé et
   la comparaison se fait à la racine figée, donc ce dépôt n'est pas accepté comme

@@ -19,6 +19,7 @@ Invariants :
 
 from __future__ import annotations
 
+import time
 from typing import Final
 
 from heimdall.scanner.entropy import shannon_entropy
@@ -47,6 +48,8 @@ MAX_FINDINGS: Final[int] = 10_000
 _MAX_FINDINGS_ERROR: Final[str] = "scan impossible : entrée non analysable"
 #: Refus statique d'un plafond explicite hors contrat (0, négatif, géant).
 _MAX_FINDINGS_INVALID: Final[str] = "plafond de findings hors contrat"
+#: Refus statique de l'échéance dépassée (même libellé que les autres refus).
+_DEADLINE_ERROR: Final[str] = "scan impossible : entrée non analysable"
 
 
 class SignatureEngine:
@@ -65,16 +68,25 @@ class SignatureEngine:
     entier géant ne peut pas relever la borne (``ValueError``). La CLI
     ``--staged`` renseigne explicitement sa propre constante (même valeur,
     knob documenté côté CLI).
+
+    ``deadline`` (``time.monotonic()``, optionnelle) borne la durée de la
+    passe **à l'intérieur** d'une cible : vérifiée toutes les 256 lignes et
+    tous les 256 Findings, comme ``Scanner._scan_text`` en arbre. Sans elle,
+    un blob d'1 Mio de lignes vides coûte ~10 s de moteur, et la deadline
+    ``--staged`` ne serait vue qu'entre blobs. Au-delà : ``ScanError``. Un
+    moteur construit pour une passe ne se réutilise pas après son échéance.
     """
 
-    __slots__ = ("_hasher", "_max_findings")
+    __slots__ = ("_deadline", "_hasher", "_max_findings")
 
     def __init__(
         self,
         hasher: SnippetHasher | None = None,
         *,
         max_findings: int | None = None,
+        deadline: float | None = None,
     ) -> None:
+        self._deadline = deadline
         self._hasher = hasher
         # `None` ne doit jamais désactiver la borne : on retombe sur le
         # défaut, y compris pour un appelant non typé qui passerait `None`
@@ -99,6 +111,14 @@ class SignatureEngine:
         seen: set[tuple[int, str, str]] = set()
         lines = cible.lignes()
         for index, (line_number, line) in enumerate(lines):
+            # Contrôle périodique intra-cible (cf. `deadline`) : sans lui, la
+            # deadline `--staged` n'est vue qu'après la fin du blob.
+            if (
+                index % 256 == 0
+                and self._deadline is not None
+                and time.monotonic() > self._deadline
+            ):
+                raise ScanError(_DEADLINE_ERROR)
             for match in find_signature_matches(line):
                 self._append(findings, seen, match, line_number, cible.path)
             following = self._joined_window(line, lines, index)
@@ -159,6 +179,14 @@ class SignatureEngine:
         # empreintes distinctes (la collision est infaisable en pratique),
         # donc la déduplication est inchangée — mais aucun secret en clair
         # ne survit dans l'ensemble `seen` pendant tout le scan.
+        # Un blob dense peut porter des milliers de candidats : la deadline est
+        # revue aussi tous les 256 Findings, avant le hachage HMAC.
+        if (
+            self._deadline is not None
+            and len(findings) % 256 == 0
+            and time.monotonic() > self._deadline
+        ):
+            raise ScanError(_DEADLINE_ERROR)
         snippet_hash = self._get_hasher().hash(match.value)
         key = (line_number, match.secret_type, snippet_hash)
         if key in seen:

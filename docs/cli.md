@@ -128,7 +128,10 @@ candidat).
 Les deux périmètres ont aussi une **deadline globale** de 120 s :
 [`MAX_TREE_SECONDS`](../heimdall/cli/scan.py) en arbre (vérifiée entre chaque
 fichier, périodiquement à l'intérieur d'un fichier dense, et avant le rendu),
-[`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py) en `--staged`. En arbre, les plafonds de volume ne bornent pas le temps de
+[`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py) en `--staged` (vérifiée entre
+blobs **et** à l'intérieur d'un blob, toutes les 256 lignes et 256 candidats,
+comme en arbre : un blob d'1 Mio de lignes vides coûte ~10 s de moteur). En
+arbre, les plafonds de volume ne bornent pas le temps de
 regex + HMAC ; en `--staged`, chaque blob coûte deux appels `git cat-file`
 séquentiels, et 1 000 blobs représenteraient 2 000 processus. Au-delà de la
 deadline, refus (code 2), jamais un job CI qui s'éternise sans verdict. En
