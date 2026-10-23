@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
@@ -113,6 +114,12 @@ _CODES_LINE: Final[str] = (
 
 #: Longueur de l'empreinte affichée à l'humain (le reste est dans le JSON).
 _HASH_PREFIX: Final[int] = 12
+
+#: Catégories Unicode jamais affichées brutes à l'humain : contrôles (Cc),
+#: caractères de format (Cf : marques directionnelles U+202A-E, U+2066-9,
+#: U+200E-F, espaces de largeur nulle U+200B-D, U+FEFF…), séparateurs de
+#: ligne et de paragraphe (Zl, Zp).
+_ESCAPED_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,13 +332,31 @@ def render_json(report: ScanReport) -> str:
     )
 
 
+def _visible(chemin: str) -> str:
+    """Chemin tel qu'il s'affiche : caractères invisibles ou directionnels échappés.
+
+    Un nom de fichier peut porter U+202E (RLO), qui inverse l'ordre visuel de
+    ce qui suit : affiché brut, le nom ment sur le fichier où se trouve le
+    secret, au moment même où l'opérateur valide (Y/N/E). Le contrat Finding v1
+    autorise ces caractères (son schéma ne les exclut pas) : le chemin n'est donc
+    pas refusé, il est échappé **à l'affichage seulement**. Le JSON garde le
+    chemin exact.
+    """
+    return "".join(
+        caractere.encode("unicode_escape").decode("ascii")
+        if unicodedata.category(caractere) in _ESCAPED_CATEGORIES
+        else caractere
+        for caractere in chemin
+    )
+
+
 def render_text(report: ScanReport) -> str:
     """Rend le rapport pour un humain.
 
     Jamais la valeur d'un secret : ni le contenu analysé, ni un extrait de
     ligne — seulement le chemin, le numéro de ligne, le type, l'entropie et
     un début d'empreinte (qui permet de rapprocher deux scans du même
-    candidat sans le révéler).
+    candidat sans le révéler). Le chemin est affiché échappé (:func:`_visible`).
     """
     lines = [f"heimdall scan : périmètre {_SCOPE_LABELS[report.scope]}"]
     if not report.findings:
@@ -340,7 +365,7 @@ def render_text(report: ScanReport) -> str:
         lines.append(f"{len(report.findings)} secret(s) détecté(s) :")
         for finding in report.findings:
             lines.append(
-                f"  {finding.file}:{finding.line}  type={finding.type}  "
+                f"  {_visible(finding.file)}:{finding.line}  type={finding.type}  "
                 f"entropie={finding.entropy}  "
                 f"empreinte={finding.snippet_hash[:_HASH_PREFIX]}…  "
                 f"source={finding.source}"

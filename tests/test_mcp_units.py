@@ -336,10 +336,18 @@ class ForbiddenPathTests(unittest.TestCase):
                 self.assertFalse(server.is_forbidden_path(path))
 
 
+def _ceiling_passed_to_git(access: gitdiff.GitAccess) -> str:
+    """Plafond que `execute` transmet réellement à git (sans lancer git)."""
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
+    with mock.patch("subprocess.run", return_value=completed) as run:
+        access.execute(("rev-parse", "--show-toplevel"))
+    return run.call_args.kwargs["env"]["GIT_CEILING_DIRECTORIES"]
+
+
 class ConfinedEnvironmentTests(unittest.TestCase):
     def test_minimal_and_redirection_free(self) -> None:
         with tempfile.TemporaryDirectory(prefix="heimdall-env-") as tmp:
-            env = gitdiff.confined_environment(_Path(tmp))
+            env = gitdiff.confined_environment(tmp)
         for forbidden in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY"):
             self.assertNotIn(forbidden, env)
         self.assertEqual(env["PATH"], "")
@@ -362,8 +370,28 @@ class ConfinedEnvironmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="heimdall-ceil-") as tmp:
             root = _Path(tmp) / "racine"
             root.mkdir()
-            env = gitdiff.confined_environment(root)
-            self.assertEqual(env["GIT_CEILING_DIRECTORIES"], str(root.resolve().parent))
+            access = gitdiff.GitAccess(root)
+            self.assertEqual(_ceiling_passed_to_git(access), str(root.resolve().parent))
+
+    def test_discovery_ceiling_is_frozen_at_construction(self) -> None:
+        """Revue (LOW) : le plafond ne suit pas une racine échangée après coup.
+
+        La racine est remplacée par un lien vers un autre dossier entre la
+        construction et l'appel. Un `resolve()` à l'appel aurait déplacé le
+        plafond vers la cible adverse ; figé à la construction, il reste celui
+        de la racine d'origine.
+        """
+        with tempfile.TemporaryDirectory(prefix="heimdall-figee-") as tmp:
+            base = _Path(tmp)
+            root = base / "racine"
+            root.mkdir()
+            access = gitdiff.GitAccess(root)
+            origine = str(root.resolve().parent)
+            ailleurs = base / "ailleurs" / "racine"
+            ailleurs.mkdir(parents=True)
+            root.rename(base / "racine-ancienne")
+            root.symlink_to(ailleurs, target_is_directory=True)
+            self.assertEqual(_ceiling_passed_to_git(access), origine)
 
 
 class RepositoryCeilingTests(unittest.TestCase):
@@ -522,6 +550,49 @@ class GitAccessDirectTests(unittest.TestCase):
         self.assertTrue(gitdiff.GitAccess(self.repo.root).is_repository())
         with tempfile.TemporaryDirectory(prefix="heimdall-nogit-") as tmp:
             self.assertFalse(gitdiff.GitAccess(_Path(tmp)).is_repository())
+
+    def test_unresolvable_toplevel_is_a_tool_failure_not_a_raw_error(self) -> None:
+        """Revue (LOW) : `resolve()` qui lève reste dans le contrat.
+
+        Boucle de liens ou composant illisible : `Path.resolve()` peut lever
+        (RuntimeError en Python 3.10). `is_repository` rend un `bool` ou une
+        `ToolFailure`, jamais une exception brute hors contrat.
+        """
+        access = gitdiff.GitAccess(self.repo.root)
+        boucle = self.repo.root.parent / "boucle"
+        sortie = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f"{boucle}\n".encode(), stderr=b""
+        )
+        resolve_reel = _Path.resolve
+
+        def resolve_piege(chemin: _Path, *args: Any, **options: Any) -> _Path:
+            if chemin == boucle:
+                raise RuntimeError("Symlink loop")
+            return resolve_reel(chemin, *args, **options)
+
+        with (
+            mock.patch.object(gitdiff.GitAccess, "execute", return_value=sortie),
+            mock.patch.object(_Path, "resolve", resolve_piege),
+        ):
+            with self.assertRaises(ToolFailure) as ctx:
+                access.is_repository()
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+
+    def test_swapped_root_is_not_a_repository_any_more(self) -> None:
+        """Revue (LOW) : la comparaison se fait à la racine figée.
+
+        La racine est remplacée par un lien vers un AUTRE dépôt : `rev-parse`
+        (qui suit le lien) répond ce dépôt-là. Comparé à la racine figée, ce
+        n'est pas le périmètre demandé ; comparé au `resolve()` de la racine à
+        l'appel, il aurait passé pour le bon.
+        """
+        autre = GitRepo("heimdall-autre-", self)
+        access = gitdiff.GitAccess(self.repo.root)
+        self.assertTrue(access.is_repository())
+        racine = self.repo.root
+        racine.rename(racine.parent / "repo-ancien")
+        racine.symlink_to(autre.root, target_is_directory=True)
+        self.assertFalse(access.is_repository())
 
     def test_git_binary_under_the_root_is_refused_never_executed(self) -> None:
         """Binaire piégé SOUS la racine : refusé avant tout usage.

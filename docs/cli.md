@@ -192,6 +192,13 @@ Finding ne porte qu'une empreinte HMAC-SHA-256 et une entropie. L'empreinte
 affiche un préfixe de 12 caractères (le JSON porte la valeur complète) : elle
 permet de rapprocher deux scans du même candidat sans le révéler.
 
+Le **chemin** affiché à l'humain est échappé : les caractères de contrôle et
+les caractères invisibles ou directionnels (U+202A-E, U+2066-9, U+200B-F,
+U+FEFF…) s'affichent en `\uXXXX`. Un nom contenant U+202E (RLO) ne peut donc
+pas faire lire `vendor/evil.py` là où le secret est dans un autre fichier.
+Le contrat autorise ces noms : le chemin n'est pas refusé, seul son affichage
+change. Le JSON garde le chemin exact.
+
 ### JSON (`--json`, stdout)
 
 ```json

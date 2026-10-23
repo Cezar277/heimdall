@@ -260,8 +260,28 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
 | LOW — `_read_capped` peut dépasser la deadline (jusqu'à 2 ×) | lecture et attente partagent le même instant de référence : `wait` ne reçoit que `deadline - now`, le minuteur étant annulé avant `wait` | `heimdall/mcp/gitdiff.py` (`_read_capped`) ; `tests/test_mcp_units.py::GitAccessDirectTests::test_read_capped_never_outlives_its_deadline` (horloge simulée), `::test_execute_and_read_capped_propagate_the_remaining_timeout` |
 | LOW — `HOME` = racine : le dépôt scanné fournit son `~/.config/git/` | **vérifié par exécution** : avec `HOME` = racine, `check-ignore` ignorait `secret.txt` via `<racine>/.config/git/ignore` (rc=0) ; avec `HOME` = `os.devnull`, rc=1 et `rev-parse` fonctionne. Le dépôt ne peut plus se masquer | `heimdall/mcp/gitdiff.py` (`confined_environment`) ; `tests/test_mcp_units.py::GitAccessDirectTests::test_repository_cannot_supply_its_own_user_excludes`, `::ConfinedEnvironmentTests::test_minimal_and_redirection_free` ; `tests/test_cli_scan.py::test_scan_never_reads_or_writes_a_hostile_repository_config` |
 
+## Correctifs de la dix-septième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+Trois remarques LOW, chacune reproduite avant correction. Mutants réinjectés
+(plafond recalculé à l'appel, `is_repository` sans garde, racine résolue à
+l'appel, affichage brut) : chacun est attrapé par le test indiqué.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — plafond de découverte recalculé à chaque appel | reproduit : après un échange de la racine par un lien, `GIT_CEILING_DIRECTORIES` passait de `…/rep` à `…/evil`. `GitAccess.__init__` calcule `_ceiling` (parent de la racine figée) une fois ; `confined_environment(ceiling)` ne fait plus de `resolve()` à l'appel | `heimdall/mcp/gitdiff.py` (`GitAccess.__init__`, `confined_environment`) ; `tests/test_mcp_units.py::ConfinedEnvironmentTests::test_discovery_ceiling_is_frozen_at_construction` |
+| LOW — `is_repository()` peut lever hors contrat | reproduit : `Path.resolve()` lève `RuntimeError` sur une boucle de liens en Python 3.10, plancher supporté (non levé en 3.14, d'où le test par injection). Le `resolve()` du `top` est enveloppé : `OSError`/`RuntimeError`/`ValueError` → `ToolFailure("INTERNAL")`. La comparaison se fait à la racine figée : un dépôt substitué n'est plus accepté | `heimdall/mcp/gitdiff.py` (`is_repository`) ; `tests/test_mcp_units.py::GitAccessDirectTests::test_unresolvable_toplevel_is_a_tool_failure_not_a_raw_error` (échoue sans le correctif), `::test_swapped_root_is_not_a_repository_any_more` ; `tests/test_cli_scan.py::test_scan_unresolvable_toplevel_exits_two` (le test CLI seul ne discrimine pas : le `except Exception` de `main.py` masquait l'exception en code 2) |
+| LOW — spoofing bidirectionnel du chemin affiché | reproduit en arbre et en `--staged` : `vendor/\u202egp.yvne:1` s'affichait brut. Le schéma Finding v1 autorise ces noms : on ne refuse pas le chemin (un tel nom bloquerait tout scan, donc un DoS), on l'échappe **à l'affichage**. `_visible()` échappe les catégories Cc/Cf/Zl/Zp dans `render_text` ; le JSON ne change pas | `heimdall/cli/scan.py` (`_visible`, `render_text`) ; `tests/test_cli_scan.py::test_scan_shows_bidi_paths_escaped_never_raw` (RLO, RLM, LRI × arbre, index) |
+
 ## Limites assumées
 
+- `git -C <racine>` résout encore le chemin à chaque appel : pendant une
+  substitution, `rev-parse` répond le dépôt substitué. Le plafond reste figé et
+  la comparaison se fait à la racine figée, donc ce dépôt n'est pas accepté comme
+  périmètre ; c'est le re-contrôle d'identité final qui refuse le verdict (code 2).
+  Fermer complètement cette fenêtre demanderait d'ouvrir la racine par descripteur,
+  hors périmètre de cette passe.
 - Sous POSIX, ajouter ou supprimer une entrée **directe** de la racine pendant
   un scan refuse le verdict (code 2) : l'identité racine épingle le `ctime`,
   seul champ qu'un `utime` ne peut pas forger, pour détecter un dossier neuf

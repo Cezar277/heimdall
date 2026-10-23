@@ -309,7 +309,7 @@ def test_scan_report_refuses_an_unknown_scope() -> None:
     ferait un `KeyError` dans `_SCOPE_LABELS`.
     """
     with pytest.raises(ScanError):
-        ScanReport(scope="invalide", findings=())  # type: ignore[arg-type]
+        ScanReport(scope="invalide", findings=())
 
 
 def test_scan_broken_stderr_still_exits_two(
@@ -1074,6 +1074,65 @@ def test_scan_never_reads_or_writes_a_hostile_repository_config(
     assert resultat.exit_code == EXIT_FINDINGS
     assert "secret.txt:1" in resultat.stdout
     assert _instantane(git_repo.root) == avant
+
+
+def test_scan_unresolvable_toplevel_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un top que `resolve()` ne sait pas lire -> 2, message statique.
+
+    Le contrat `is_repository` reste un bool ou une `ToolFailure` : l'exception
+    brute ne doit jamais sortir (le `except Exception` de la CLI la masquerait
+    en code 2 sans rien prouver). Le test unitaire, lui, distingue les deux.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    boucle = git_repo.root.parent / "boucle-29"
+    execute_reel = GitAccess.execute
+    resolve_reel = Path.resolve
+
+    def execute_boucle(self: GitAccess, arguments: object, **options: object) -> object:
+        if tuple(arguments) == ("rev-parse", "--show-toplevel"):
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{boucle}\n".encode(), stderr=b""
+            )
+        return execute_reel(self, arguments, **options)
+
+    def resolve_boucle(self: Path, *args: object, **options: object) -> Path:
+        if self == boucle:
+            raise RuntimeError("Symlink loop")
+        return resolve_reel(self, *args, **options)
+
+    monkeypatch.setattr(GitAccess, "execute", execute_boucle)
+    monkeypatch.setattr(Path, "resolve", resolve_boucle)
+    resultat = _run("scan", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+@pytest.mark.parametrize(
+    ("caractere", "echappe"),
+    [("\u202e", "\\u202e"), ("\u200f", "\\u200f"), ("\u2066", "\\u2066")],
+    ids=["rlo", "rlm", "lri"],
+)
+@pytest.mark.parametrize("arguments", [[], ["--staged"]], ids=["arbre", "index"])
+def test_scan_shows_bidi_paths_escaped_never_raw(
+    git_repo: GitRepo, arguments: list[str], caractere: str, echappe: str
+) -> None:
+    """Revue (LOW) : un nom à contrôle bidi ne s'affiche jamais brut.
+
+    Affiché brut, U+202E inverse l'ordre visuel du chemin et fait croire que le
+    secret est dans un autre fichier. Le contrat autorise ces noms : le scan
+    les analyse et les rend échappés. Le caractère brut n'apparaît ni dans
+    stdout ni dans stderr, dans les deux périmètres.
+    """
+    chemin = f"vendor/evil{caractere}gp.yvne"
+    git_repo.write(chemin, f'KEY = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage(chemin)
+    resultat = _run("scan", *arguments, str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert caractere not in resultat.output
+    assert f"vendor/evil{echappe}gp.yvne:1" in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.output
 
 
 def test_verify_root_unchanged_refuses_divergent_resolution(

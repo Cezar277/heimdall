@@ -119,7 +119,7 @@ STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
 # aucune variable de configuration (GIT_CONFIG_*), aucun PATH : git est
 # appelé par chemin absolu, donc rien ne peut être trouvé par recherche de
 # binaire, et GIT_TERMINAL_PROMPT coupe toute invite interactive.
-def confined_environment(root: Path) -> dict[str, str]:
+def confined_environment(ceiling: str) -> dict[str, str]:
     return {
         "PATH": "",
         # Ni le ~ du développeur, ni la racine scannée : git y lit
@@ -141,6 +141,9 @@ def confined_environment(root: Path) -> dict[str, str]:
         # Plafond de découverte = le PREMIER dossier que git ascendererait,
         # c'est-à-dire le PARENT de la racine : git refuse d'y entrer, donc
         # aucun dépôt au-dessus de la racine n'est découvert (invariant 3).
+        # Il est calculé UNE fois, à la construction de `GitAccess` : un
+        # `resolve()` à chaque appel suivrait un lien posé entre-temps à la
+        # place de la racine et élargirait le plafond vers la cible adverse.
         #
         # Ne pas « corriger » en mettant la racine elle-même : git n'exclut
         # que l'entrée dans un dossier plafond, et il est DÉJÀ dans la
@@ -158,7 +161,7 @@ def confined_environment(root: Path) -> dict[str, str]:
         #
         # Prouvé aussi qu'un worktree lié répond sa propre racine (le `.git`
         # y est un fichier), donc un dépôt à la racine reste découvert.
-        "GIT_CEILING_DIRECTORIES": str(root.resolve().parent),
+        "GIT_CEILING_DIRECTORIES": ceiling,
     }
 
 
@@ -253,7 +256,7 @@ class GitAccess:
     usages (`-C`, plafond, comparaisons) partent de cette forme.
     """
 
-    __slots__ = ("_git", "_root", "_root_id")
+    __slots__ = ("_ceiling", "_git", "_root", "_root_id")
 
     def __init__(self, root: Path) -> None:
         try:
@@ -284,6 +287,8 @@ class GitAccess:
         except OSError:
             raise ToolFailure("INTERNAL") from None
         self._root_id = (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns)
+        # Plafond figé avec la racine (lexical, sans I/O) : voir `confined_environment`.
+        self._ceiling = str(self._root.parent)
         # Jamais le PATH hérité : un PATH compromis (poste, CI, direnv)
         # détournerait le binaire exécuté à chaque outil. `os.defpath`
         # (`/bin:/usr/bin` sur POSIX) est le défaut système sûr, pas une
@@ -355,7 +360,7 @@ class GitAccess:
                 capture_output=True,
                 check=False,
                 timeout=timeout,
-                env=confined_environment(self._root),
+                env=confined_environment(self._ceiling),
             )
         except (OSError, subprocess.TimeoutExpired):
             # Panne d'outillage (binaire absent, délai dépassé) : message
@@ -367,14 +372,24 @@ class GitAccess:
 
         Un code de retour non nul (« not a git repository ») ou une racine
         qui pointe vers un dépôt parent n'est PAS une panne : c'est le diagnostic
-        attendu, traduit en ``NOT_A_GIT_REPO`` par l'appelant. ``timeout`` est
-        le délai restant transmis par une deadline globale.
+        attendu, traduit en ``NOT_A_GIT_REPO`` par l'appelant. Un chemin
+        ``top`` que ``resolve()`` ne sait pas résoudre (boucle de liens,
+        composant illisible) EST une panne : ``ToolFailure``, jamais une
+        exception brute hors contrat. ``timeout`` est le délai restant transmis
+        par une deadline globale.
         """
         completed = self.execute(("rev-parse", "--show-toplevel"), timeout=timeout)
         if completed.returncode != 0:
             return False
         top = completed.stdout.strip().decode("utf-8", errors="replace")
-        return Path(top).resolve() == self._root.resolve()
+        try:
+            # Comparé à la racine **figée** : une racine échangée depuis la
+            # construction ne peut pas redevenir « un dépôt » par resolve().
+            return Path(top).resolve() == self._root
+        except (OSError, RuntimeError, ValueError):
+            # Selon la version de Python, `resolve()` lève sur une boucle de
+            # liens (RuntimeError en 3.10) : ni « pas un dépôt », ni « dépôt ».
+            raise ToolFailure("INTERNAL") from None
 
     def is_ignored(self, relative_path: str) -> bool:
         """True si le chemin est ignoré par les .gitignore du dépôt.
@@ -419,7 +434,7 @@ class GitAccess:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env=confined_environment(self._root),
+                env=confined_environment(self._ceiling),
             )
         except OSError:
             raise ToolFailure("INTERNAL") from None
@@ -512,7 +527,7 @@ class GitAccess:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env=confined_environment(self._root),
+                env=confined_environment(self._ceiling),
             )
         except OSError:
             raise ToolFailure("INTERNAL") from None
