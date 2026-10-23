@@ -62,6 +62,17 @@ _DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
     "GIT_",
     "BASH_FUNC",
     "SYSTEMD_",
+    "JAVA_",
+    "JDK_",
+    "_JAVA_",
+    "MAVEN_",
+    "GRADLE_",
+    "DOTNET_",
+    "COMPOSE_",
+    "DOCKER_",
+    "AWS_",
+    "TF_",
+    "XDG_",
 )
 _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "PATH",
@@ -74,6 +85,9 @@ _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "PAGER",
     "EDITOR",
     "VISUAL",
+    "KUBECONFIG",
+    "HOME",
+    "TMPDIR",
 })
 
 _MAX_ERROR_MSG_LEN: Final[int] = 150
@@ -171,10 +185,23 @@ def _validate_project_and_env(project: str | None, env: str) -> str:
 
 def _read_input_secrets(input_file: Path) -> dict[str, str]:
     """Lit les secrets locaux depuis un fichier d'entrée."""
+    if os.path.islink(input_file):
+        typer.echo(
+            f"Erreur de sécurité : le fichier source '{input_file}' est un lien symbolique.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     if not input_file.is_file():
         typer.echo(f"Fichier d'entrée introuvable : {input_file}", err=True)
         raise typer.Exit(code=2)
     secrets = parse_env_file(input_file)
+    if secrets is None:
+        typer.echo(
+            f"Erreur lors de la lecture du fichier '{input_file}' : "
+            "fichier illisible ou non sécurisé.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     if not secrets:
         typer.echo(f"Aucun secret trouvé dans le fichier {input_file}.", err=True)
         raise typer.Exit(code=0)
@@ -289,7 +316,8 @@ def _resolve_pull_names(
         if from_example:
             return from_example
     if output.is_file():
-        from_existing = list(parse_env_file(output).keys())
+        parsed = parse_env_file(output)
+        from_existing = list((parsed or {}).keys())
         if from_existing:
             return from_existing
     typer.echo(
@@ -438,7 +466,8 @@ def _resolve_run_names(
             return from_example
     dot_env = Path(".env")
     if dot_env.is_file():
-        from_env = list(parse_env_file(dot_env).keys())
+        parsed = parse_env_file(dot_env)
+        from_env = list((parsed or {}).keys())
         if from_env:
             return from_env
     return []

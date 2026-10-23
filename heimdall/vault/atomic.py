@@ -30,15 +30,16 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
     Refuse strictement les liens symboliques (cible ou répertoire parent)
     afin de prévenir tout écrasement ou détournement de cible.
     """
+    # Vérification anti-symlink sur la cible et toute l'arborescence parente
     if os.path.islink(path):
         raise ValueError(f"Écriture refusée : la cible '{path}' est un lien symbolique.")
+    for parent_part in path.parents:
+        if os.path.islink(parent_part):
+            raise ValueError(
+                f"Écriture refusée : le répertoire parent '{parent_part}' est un lien symbolique."
+            )
 
     parent = path.parent
-    if os.path.islink(parent):
-        raise ValueError(
-            f"Écriture refusée : le répertoire parent '{parent}' est un lien symbolique."
-        )
-
     parent.mkdir(parents=True, exist_ok=True)
     if os.path.islink(parent):
         raise ValueError(
@@ -138,14 +139,22 @@ def backup_file(path: Path) -> Path | None:
     return backup_path
 
 
-def _read_file_secure_no_follow(path: Path) -> str | None:
-    """Lit un fichier de manière sécurisée sans suivre les liens symboliques (anti-TOCTOU)."""
+def read_file_secure_no_follow(path: Path, max_bytes: int = 1_048_576) -> str | None:
+    """Lit un fichier de manière sécurisée sans suivre les liens symboliques (anti-TOCTOU).
+
+    Retourne None si le fichier n'existe pas ou ne peut pas être lu
+    (symlink, non-régulier, trop gros).
+    """
+    if os.path.islink(path):
+        return None
+
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
 
+    fd = -1
     try:
         fd = os.open(path, flags)
     except OSError:
@@ -154,6 +163,8 @@ def _read_file_secure_no_follow(path: Path) -> str | None:
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_size > max_bytes:
             return None
         with os.fdopen(fd, "r", encoding="utf-8") as f:
             fd = -1
@@ -166,18 +177,19 @@ def _read_file_secure_no_follow(path: Path) -> str | None:
                 os.close(fd)
             except OSError:  # noqa: S110
                 pass
-    return None
 
 
-def parse_env_file(path: Path) -> dict[str, str]:
+def parse_env_file(path: Path) -> dict[str, str] | None:
     """Parse un fichier .env en extrayant les paires clé=valeur.
 
     Ignore les commentaires (#...) et les lignes vides.
     Refuse de suivre les liens symboliques (anti-exfiltration).
+    Retourne None si le fichier ne peut pas être lu (symlink, permission, non-régulier).
+    Retourne un dictionnaire (éventuellement vide) si le fichier a été lu avec succès.
     """
-    content = _read_file_secure_no_follow(path)
+    content = read_file_secure_no_follow(path)
     if content is None:
-        return {}
+        return None
     secrets: dict[str, str] = {}
     for raw_line in content.splitlines():
         line = raw_line.strip()
@@ -200,7 +212,12 @@ def parse_example_names(path: Path) -> list[str]:
 
     Refuse de suivre les liens symboliques.
     """
-    content = _read_file_secure_no_follow(path)
+    if not path.exists() and not os.path.islink(path):
+        return []
+    try:
+        content = read_file_secure_no_follow(path)
+    except Exception:
+        return []
     if content is None:
         return []
     names: list[str] = []
@@ -307,5 +324,6 @@ __all__ = [
     "is_git_tracked",
     "parse_env_file",
     "parse_example_names",
+    "read_file_secure_no_follow",
     "write_file_atomic",
 ]

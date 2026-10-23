@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -32,6 +33,8 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NoReturn
 from urllib.parse import urlparse
+
+from heimdall.vault.atomic import read_file_secure_no_follow
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -60,6 +63,7 @@ _MAX_PORT: Final[int] = 65535
 _MAX_TIMEOUT_SECONDS: Final[float] = 300.0
 _MAX_SECRET_VALUE_LEN: Final[int] = 65536
 _MAX_RESPONSE_BYTES: Final[int] = 1_048_576
+_MAX_STATUS_LEN: Final[int] = 64
 _GROUP_OTHER_PERMS_MASK: Final[int] = 0o077
 
 _PROJECT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -101,13 +105,25 @@ class VaultUnavailableError(VaultClientError):
 
 if BaseModel is not None:
 
+    class _HealthResponseModel(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        status: str = Field(min_length=1, max_length=_MAX_STATUS_LEN)
+        version: str | None = Field(default=None, max_length=_MAX_STATUS_LEN)
+
     class _SecretResponseModel(BaseModel):
         model_config = ConfigDict(extra="forbid")
         project: str = Field(min_length=1, max_length=64, pattern=_PROJECT_ID_PATTERN.pattern)
         env: str = Field(min_length=1, max_length=64, pattern=_ENV_ID_PATTERN.pattern)
         name: str = Field(min_length=2, max_length=64, pattern=_SECRET_NAME_PATTERN.pattern)
-        status: str
+        status: str = Field(min_length=1, max_length=_MAX_STATUS_LEN, pattern=r"^[a-z0-9_-]+$")
         value: str = Field(min_length=1, max_length=_MAX_SECRET_VALUE_LEN)
+
+    class _SecretMetadataResponseModel(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        project: str = Field(min_length=1, max_length=64, pattern=_PROJECT_ID_PATTERN.pattern)
+        env: str = Field(min_length=1, max_length=64, pattern=_ENV_ID_PATTERN.pattern)
+        name: str = Field(min_length=2, max_length=64, pattern=_SECRET_NAME_PATTERN.pattern)
+        status: str = Field(min_length=1, max_length=_MAX_STATUS_LEN, pattern=r"^[a-z0-9_-]+$")
 
 
 def _validate_identifier(value: str, label: str, pattern: re.Pattern[str]) -> None:
@@ -239,21 +255,22 @@ def _detect_from_git(start_dir: Path) -> str | None:
 
 
 def _detect_from_pyproject(start_dir: Path) -> str | None:
-    """Détecte l'identifiant du projet depuis pyproject.toml."""
+    """Détecte l'identifiant du projet depuis pyproject.toml de façon bornée et sans symlink."""
     pyproject = start_dir / "pyproject.toml"
-    if not pyproject.is_file() or pyproject.is_symlink():
+    if tomllib is None:
         return None
-    if tomllib is not None:
-        try:
-            content = pyproject.read_text(encoding="utf-8")
-            data = tomllib.loads(content)
-            name = data.get("project", {}).get("name")
-            if isinstance(name, str):
-                candidate = name.lower()
-                if candidate and candidate[0].isalpha() and _PROJECT_ID_PATTERN.match(candidate):
-                    return candidate
-        except Exception:  # noqa: S110
-            pass
+    try:
+        content = read_file_secure_no_follow(pyproject, max_bytes=65536)
+        if not content:
+            return None
+        data = tomllib.loads(content)
+        name = data.get("project", {}).get("name")
+        if isinstance(name, str):
+            candidate = name.lower()
+            if candidate and candidate[0].isalpha() and _PROJECT_ID_PATTERN.match(candidate):
+                return candidate
+    except Exception:  # noqa: S110
+        pass
     return None
 
 
@@ -283,6 +300,23 @@ def detect_project(start_dir: Path | None = None) -> str:
     return "default"
 
 
+def _check_localhost_resolution(host: str) -> None:
+    """Vérifie que localhost résout strictement vers une boucle locale."""
+    if host != "localhost":
+        return
+    try:
+        addr_info = socket.getaddrinfo("localhost", None)
+        for entry in addr_info:
+            sockaddr = entry[4]
+            ip = sockaddr[0]
+            if ip not in ("127.0.0.1", "::1"):
+                raise ValueError(
+                    f"Sécurité : localhost résout vers une IP hors boucle locale ({ip})"
+                )
+    except socket.gaierror:
+        pass
+
+
 def _validate_loopback_url(base_url: str) -> str:
     """Vérifie l'URL du Vault (HTTPS, boucle locale, forme canonique)."""
     if not isinstance(base_url, str) or not base_url:
@@ -303,6 +337,7 @@ def _validate_loopback_url(base_url: str) -> str:
         raise ValueError(
             "le Vault n'est joignable que sur boucle locale (127.0.0.1, ::1, localhost)"
         )
+    _check_localhost_resolution(host)
     try:
         port = parsed.port
     except ValueError:
@@ -320,17 +355,79 @@ def _validate_loopback_url(base_url: str) -> str:
 
 def _parse_and_validate_json_dict(resp: Any, endpoint: str) -> dict[str, Any]:
     """Parse et valide qu'une réponse est un dictionnaire JSON de taille bornée."""
+    content_length_header = resp.headers.get("content-length")
+    if content_length_header:
+        try:
+            cl = int(content_length_header)
+            if cl > _MAX_RESPONSE_BYTES:
+                raise VaultClientError(
+                    f"Réponse {endpoint} trop volumineuse ({cl} octets, max {_MAX_RESPONSE_BYTES})."
+                )
+        except ValueError:
+            pass
+
     content = getattr(resp, "content", b"")
     if len(content) > _MAX_RESPONSE_BYTES:
-        raise VaultClientError(
-            f"Réponse {endpoint} trop volumineuse ({len(content)} octets)."
+        msg = (
+            f"Réponse {endpoint} trop volumineuse "
+            f"({len(content)} octets, max {_MAX_RESPONSE_BYTES})."
         )
+        raise VaultClientError(msg)
     try:
         data = resp.json()
     except Exception as exc:
         raise VaultClientError(f"Réponse JSON invalide pour {endpoint} : {exc}") from None
     if not isinstance(data, dict):
         raise VaultClientError(f"Format de réponse {endpoint} invalide : attendu un objet JSON.")
+    return data
+
+
+def _validate_health_response(data: Any) -> dict[str, Any]:
+    """Valide strictement la réponse health."""
+    if not isinstance(data, dict):
+        raise VaultClientError("Format de réponse health invalide : attendu un objet JSON.")
+    if BaseModel is not None:
+        try:
+            _HealthResponseModel.model_validate(data)
+        except ValidationError as exc:
+            rejected = {str(err.get("loc", ("inconnu",))[-1]) for err in exc.errors()}
+            rejected_str = ", ".join(sorted(rejected))
+            raise VaultClientError(
+                f"Réponse health non conforme au schéma (champs rejetés : {rejected_str})"
+            ) from None
+    else:
+        if not set(data.keys()).issubset({"status", "version"}) or "status" not in data:
+            raise VaultClientError("Réponse health non conforme : schéma inattendu.")
+        if not isinstance(data["status"], str) or not (1 <= len(data["status"]) <= _MAX_STATUS_LEN):
+            raise VaultClientError("Réponse health non conforme : statut invalide.")
+    return data
+
+
+def _validate_metadata_response(data: Any, label: str) -> dict[str, Any]:
+    """Valide strictement la réponse metadata (create ou state) sans valeur."""
+    if not isinstance(data, dict):
+        raise VaultClientError(f"Format de réponse {label} invalide : attendu un objet JSON.")
+    if BaseModel is not None:
+        try:
+            _SecretMetadataResponseModel.model_validate(data)
+        except ValidationError as exc:
+            rejected = {str(err.get("loc", ("inconnu",))[-1]) for err in exc.errors()}
+            rejected_str = ", ".join(sorted(rejected))
+            raise VaultClientError(
+                f"Réponse {label} non conforme au schéma (champs rejetés : {rejected_str})"
+            ) from None
+    else:
+        expected = {"project", "env", "name", "status"}
+        if set(data.keys()) != expected:
+            raise VaultClientError(
+                f"Réponse {label} non conforme : clés inattendues ou manquantes."
+            )
+        _validate_identifier(str(data["project"]), "projet", _PROJECT_ID_PATTERN)
+        _validate_identifier(str(data["env"]), "environnement", _ENV_ID_PATTERN)
+        _validate_identifier(str(data["name"]), "nom de secret", _SECRET_NAME_PATTERN)
+        status = data.get("status")
+        if not isinstance(status, str) or not (1 <= len(status) <= _MAX_STATUS_LEN):
+            raise VaultClientError(f"Statut non conforme dans {label} : {status!r}")
     return data
 
 
@@ -494,9 +591,7 @@ class VaultClient:
             raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
         if resp.status_code == HTTPStatus.OK:
             data = _parse_and_validate_json_dict(resp, "health")
-            if "status" not in data or not isinstance(data["status"], str):
-                raise VaultClientError("Réponse health non conforme : champ 'status' manquant.")
-            return data
+            return _validate_health_response(data)
         self._handle_error_response(resp)
 
     def create_secret(
@@ -528,10 +623,7 @@ class VaultClient:
 
         if resp.status_code == HTTPStatus.CREATED:
             data = _parse_and_validate_json_dict(resp, "secrets")
-            expected_keys = {"project", "env", "name", "status"}
-            if not expected_keys.issubset(data.keys()):
-                raise VaultClientError("Réponse création secret non conforme : champs manquants.")
-            return data
+            return _validate_metadata_response(data, "création secret")
         self._handle_error_response(resp)
 
     def get_secret(
@@ -577,12 +669,9 @@ class VaultClient:
 
         if resp.status_code == HTTPStatus.OK:
             data = _parse_and_validate_json_dict(resp, "state")
-            expected_keys = {"project", "env", "name", "status"}
-            if not expected_keys.issubset(data.keys()):
-                raise VaultClientError("Réponse état secret non conforme : champs manquants.")
             if "value" in data:
                 raise VaultClientError("L'endpoint state ne doit jamais renvoyer de valeur.")
-            return data
+            return _validate_metadata_response(data, "état secret")
         self._handle_error_response(resp)
 
     def close(self) -> None:

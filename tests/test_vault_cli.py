@@ -87,6 +87,21 @@ class VaultPushCliTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 2)
             self.assertIn("introuvable", result.output)
 
+    def test_push_on_symlink_or_unreadable_file_exits_2(self) -> None:
+        """Exit 2 si le fichier source est un lien symbolique ou illisible."""
+        real_file = self.tmp_dir / "real.env"
+        real_file.write_text("FOO=bar\n", encoding="utf-8")
+        symlink_file = self.tmp_dir / "symlink.env"
+        symlink_file.symlink_to(real_file)
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            result = self.runner.invoke(
+                app,
+                ["vault", "push", "--file", str(symlink_file), "--project", "demo"],
+            )
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn("lien symbolique", result.output)
+
     def test_push_rejects_invalid_project_or_env(self) -> None:
         """Validation fail-closed des formats de projet et d'environnement."""
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
@@ -620,6 +635,19 @@ class VaultRunCliTests(unittest.TestCase):
             "GIT_SSH_COMMAND",
             "EDITOR",
             "PAGER",
+            "JAVA_TOOL_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "MAVEN_OPTS",
+            "GRADLE_OPTS",
+            "DOTNET_STARTUP_HOOKS",
+            "COMPOSE_FILE",
+            "DOCKER_HOST",
+            "AWS_SECRET_ACCESS_KEY",
+            "TF_CLI_CONFIG_FILE",
+            "KUBECONFIG",
+            "HOME",
+            "TMPDIR",
+            "XDG_CONFIG_HOME",
         ]
         for var_name in dangerous_names:
             with self.subTest(var_name=var_name):

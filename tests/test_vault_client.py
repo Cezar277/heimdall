@@ -378,6 +378,20 @@ class VaultConfigResolutionTests(unittest.TestCase):
             detected = detect_project(self.tmp_dir)
             self.assertEqual(detected, "my-special-project")
 
+    def test_detect_project_ignores_pyproject_symlink(self) -> None:
+        """pyproject.toml sous forme de lien symbolique est ignoré."""
+        real_pyproject = self.tmp_dir / "real_pyproject.toml"
+        real_pyproject.write_text(
+            '[project]\nname = "my-special-project"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        symlink_pyproject = self.tmp_dir / "pyproject.toml"
+        symlink_pyproject.symlink_to(real_pyproject)
+
+        with patch.dict(os.environ, {"HEIMDALL_PROJECT": ""}):
+            detected = detect_project(self.tmp_dir)
+            self.assertNotEqual(detected, "my-special-project")
+
 
 class VaultAtomicOperationsTests(unittest.TestCase):
     """Tests des fonctions atomiques et sécurisées de manipulation de fichiers."""
@@ -526,8 +540,8 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             os.symlink(victim, symlink_env)
         except OSError:
             self.skipTest("Symlinks non supportés")
-        # Refuse de lire la cible du symlink
-        self.assertEqual(parse_env_file(symlink_env), {})
+        # Refuse de lire la cible du symlink (distinction None erreur/symlink vs {} vide)
+        self.assertIsNone(parse_env_file(symlink_env))
 
     def test_parse_example_names_rejects_symlink(self) -> None:
         """parse_example_names refuse les symlinks avec O_NOFOLLOW."""
@@ -575,6 +589,66 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             with self.assertRaises(VaultClientError) as ctx:
                 client.health()
             self.assertIn("trop volumineuse", str(ctx.exception))
+
+    def test_response_content_length_header_rejection(self) -> None:
+        """Rejet précoce si Content-Length dépasse 1 Mo."""
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        resp = httpx.Response(
+            HTTPStatus.OK,
+            headers={"Content-Length": "2000000"},
+            content=b'{"status":"ok"}',
+            request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
+        )
+        with patch.object(httpx.Client, "get", return_value=resp):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("trop volumineuse", str(ctx.exception))
+
+    def test_health_and_create_secret_schema_validation(self) -> None:
+        """Validation stricte Pydantic extra=forbid sur endpoints Vault."""
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+
+        # Health : rejet si champ inattendu
+        resp_bad_health = httpx.Response(
+            HTTPStatus.OK,
+            json={"status": "ok", "extra_bad": "malicious"},
+            request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
+        )
+        with patch.object(httpx.Client, "get", return_value=resp_bad_health):
+            with self.assertRaises(VaultClientError):
+                client.health()
+
+        # Create secret : rejet si champ inattendu
+        resp_bad_create = httpx.Response(
+            HTTPStatus.CREATED,
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "DB_PASS",
+                "status": "vaulte",
+                "extra": 123,
+            },
+            request=httpx.Request("POST", f"{_VALID_URL}/api/v1/secrets"),
+        )
+        with patch.object(httpx.Client, "post", return_value=resp_bad_create):
+            with self.assertRaises(VaultClientError):
+                client.create_secret("demo", "dev", "DB_PASS", "val")
+
+        # Get secret state : rejet si 'value' renvoyée
+        resp_state_with_value = httpx.Response(
+            HTTPStatus.OK,
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "DB_PASS",
+                "status": "vaulte",
+                "value": "leak",
+            },
+            request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS/state"),
+        )
+        with patch.object(httpx.Client, "get", return_value=resp_state_with_value):
+            with self.assertRaises(VaultClientError):
+                client.get_secret_state("demo", "dev", "DB_PASS")
 
     def test_detect_project_fallback(self) -> None:
         """detect_project utilise le nom de dossier si rien d'autre."""
