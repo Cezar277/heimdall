@@ -171,6 +171,8 @@ def _read_and_check_key_file(path: Path) -> str:  # noqa: PLR0912
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
 
     try:
         fd = os.open(path, flags)
@@ -232,18 +234,24 @@ def resolve_api_key(key_file: Path | None = None) -> str:
     """
     env_key = _key_from_env()
     if env_key is not None:
-        return env_key
+        key = env_key
+    else:
+        candidate_path = _find_key_file(key_file)
+        if candidate_path is None or not candidate_path.exists():
+            raise VaultClientError(
+                "Clé API du Vault requise. "
+                "Définir la variable d'environnement HEIMDALL_API_KEY "
+                "ou placer la clé dans un fichier en permissions 0600 "
+                "(HEIMDALL_API_KEY_FILE ou ~/.config/heimdall/vault.key)."
+            )
+        key = _read_and_check_key_file(candidate_path)
 
-    candidate_path = _find_key_file(key_file)
-    if candidate_path is None or not candidate_path.exists():
+    if re.search(r"[\r\n\x00]", key):
         raise VaultClientError(
-            "Clé API du Vault requise. "
-            "Définir la variable d'environnement HEIMDALL_API_KEY "
-            "ou placer la clé dans un fichier en permissions 0600 "
-            "(HEIMDALL_API_KEY_FILE ou ~/.config/heimdall/vault.key)."
+            "Clé API du Vault invalide : sauts de ligne ou octets nuls interdits."
         )
 
-    return _read_and_check_key_file(candidate_path)
+    return key
 
 
 def resolve_vault_url(url: str | None = None) -> str:
@@ -542,6 +550,8 @@ class VaultClient:
     ) -> None:
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("clé API requise (chaîne non vide, non blanche)")
+        if re.search(r"[\r\n\x00]", api_key):
+            raise ValueError("clé API invalide (retours ligne et octets nuls interdits)")
 
         canonical = _validate_loopback_url(base_url)
 
@@ -665,6 +675,8 @@ class VaultClient:
                 self._handle_error_response(resp)
         except httpx.RequestError as exc:
             raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
+        except ValueError as exc:
+            raise VaultClientError(f"Erreur de requête HTTP vers le Vault : {exc}") from exc
 
     def health(self) -> dict[str, object]:
         """Vérifie la santé minimale du Vault (/api/v1/health)."""

@@ -155,10 +155,11 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
 
     parent = path.parent
     parent.mkdir(parents=True, exist_ok=True)
-    if os.path.islink(parent):
-        raise ValueError(
-            f"Écriture refusée : le répertoire parent '{parent}' est un lien symbolique."
-        )
+    for parent_part in path.parents:
+        if os.path.islink(parent_part):
+            raise ValueError(
+                f"Écriture refusée : le répertoire parent '{parent_part}' est un lien symbolique."
+            )
 
     parent_flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -283,7 +284,7 @@ def backup_file(path: Path) -> Path | None:  # noqa: PLR0912
     return backup_path
 
 
-def read_file_secure_no_follow(  # noqa: PLR0911
+def read_file_secure_no_follow(  # noqa: PLR0911, PLR0912
     path: Path,
     max_bytes: int = 1_048_576,
 ) -> str | None:
@@ -300,6 +301,8 @@ def read_file_secure_no_follow(  # noqa: PLR0911
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
 
     fd = -1
     try:

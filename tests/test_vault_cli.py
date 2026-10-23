@@ -1180,6 +1180,31 @@ class VaultRunCliTests(unittest.TestCase):
         self.assertLess(len(result.output), 200)
         self.assertNotIn("a" * 100, result.output)
 
+    def test_pull_and_push_with_newline_in_api_key_exits_2(self) -> None:
+        """Une clé API contenant un saut de ligne sort en 2 proprement sans traceback."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": "line1\nline2"}):
+            result_pull = self.runner.invoke(
+                app,
+                ["vault", "pull", "--project", "demo", "--name", "SEC"],
+            )
+            self.assertEqual(result_pull.exit_code, 2)
+            self.assertNotIn("Traceback", result_pull.output)
+            self.assertIn("sauts de ligne", result_pull.output)
+
+            dummy_env = Path(tempfile.mkdtemp()) / "test.env"
+            dummy_env.write_text("SEC=1\n", encoding="utf-8")
+            try:
+                result_push = self.runner.invoke(
+                    app,
+                    ["vault", "push", "--project", "demo", "--file", str(dummy_env)],
+                )
+                self.assertEqual(result_push.exit_code, 2)
+                self.assertNotIn("Traceback", result_push.output)
+                self.assertIn("sauts de ligne", result_push.output)
+            finally:
+                if dummy_env.exists():
+                    dummy_env.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

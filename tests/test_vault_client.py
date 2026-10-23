@@ -850,6 +850,44 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 self.assertLess(len(err_msg), 200)
                 self.assertNotIn("s" * 100, err_msg)
 
+    def test_read_file_secure_no_follow_on_fifo_returns_none(self) -> None:
+        """read_file_secure_no_follow ne bloque pas sur un FIFO (O_NONBLOCK) et retourne None."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("mkfifo non supporté")
+        fifo_path = self.tmp_dir / "secure_fifo"
+        try:
+            os.mkfifo(fifo_path)
+        except OSError:
+            self.skipTest("Impossible de créer un FIFO")
+        self.assertIsNone(read_file_secure_no_follow(fifo_path))
+
+    def test_read_and_check_key_file_on_fifo_raises_vault_client_error(self) -> None:
+        """_read_and_check_key_file ne bloque pas sur un FIFO et lève VaultClientError."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("mkfifo non supporté")
+        fifo_path = self.tmp_dir / "key_fifo"
+        try:
+            os.mkfifo(fifo_path)
+        except OSError:
+            self.skipTest("Impossible de créer un FIFO")
+        with self.assertRaises(VaultClientError) as ctx:
+            _read_and_check_key_file(fifo_path)
+        self.assertIn("fichier régulier", str(ctx.exception))
+
+    def test_write_file_atomic_rejects_symlinked_intermediate_parent(self) -> None:
+        """write_file_atomic refuse d'écrire si un parent intermédiaire est un symlink."""
+        sub_dir = self.tmp_dir / "real_dir" / "nested"
+        sub_dir.mkdir(parents=True)
+        link_dir = self.tmp_dir / "link_dir"
+        try:
+            os.symlink(self.tmp_dir / "real_dir", link_dir)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        target = link_dir / "nested" / "output.env"
+        with self.assertRaises(ValueError) as ctx:
+            write_file_atomic(target, "SECRET=1\n")
+        self.assertIn("lien symbolique", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
