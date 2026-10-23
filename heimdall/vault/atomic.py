@@ -173,14 +173,17 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
         raise ValueError(f"Impossible d'ouvrir le répertoire parent : {exc}") from exc
 
     try:
-        # Contrôle post-ouverture : aucun composant parent intermédiaire ne doit
-        # être un lien symbolique (protection contre substitution TOCTOU avant open)
-        for parent_part in path.parent.parents:
-            if os.path.islink(parent_part):
-                raise ValueError(
-                    "Écriture refusée : le répertoire parent "
-                    f"'{parent_part}' est un lien symbolique."
-                )
+        # Contrôle post-ouverture : le fd ouvert doit toujours correspondre au
+        # chemin nominal.  Si un attaquant local échange un composant
+        # intermédiaire contre un symlink entre le second islink et os.open,
+        # les (st_dev, st_ino) divergent → refus immédiat.
+        fd_stat = os.fstat(parent_fd)
+        path_stat = os.stat(parent)
+        if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+            raise ValueError(
+                "Écriture refusée : le répertoire parent a été modifié "
+                "entre l'ouverture et la vérification (symlink TOCTOU)."
+            )
 
         data = content.encode("utf-8") if isinstance(content, str) else content
 

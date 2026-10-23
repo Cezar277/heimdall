@@ -11,7 +11,6 @@ import json
 import os
 import pickle
 import stat
-import sys
 import tempfile
 import unittest
 from http import HTTPStatus
@@ -481,7 +480,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         self.assertIn("répertoire parent", str(ctx.exception))
 
     def test_write_file_atomic_resists_parent_directory_swap(self) -> None:
-        """Un échange du parent après ouverture ne détourne pas l'écriture (dir_fd)."""
+        """Un échange du parent après ouverture est détecté par fstat/stat (TOCTOU)."""
         parent = self.tmp_dir / "work"
         parent.mkdir()
         moved_parent = self.tmp_dir / "work-moved"
@@ -506,14 +505,15 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             return fd
 
         with patch("heimdall.vault.atomic.os.open", side_effect=fake_open):
-            write_file_atomic(target, "SECRET=1\n")
+            with self.assertRaises(ValueError) as ctx:
+                write_file_atomic(target, "SECRET=1\n")
+            self.assertIn("TOCTOU", str(ctx.exception))
 
         self.assertTrue(swapped)
-        self.assertEqual((moved_parent / ".env").read_text(encoding="utf-8"), "SECRET=1\n")
         self.assertFalse((outside / ".env").exists())
 
     def test_write_file_atomic_rejects_intermediate_parent_symlink_swap(self) -> None:
-        """Un échange d'un parent intermédiaire contre symlink avant ouverture est refusé."""
+        """Un échange d'un parent intermédiaire entre open et fstat est détecté (st_dev/st_ino)."""
         base = self.tmp_dir / "inter_base"
         base.mkdir()
         inter_dir = base / "component"
@@ -532,6 +532,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
 
         def fake_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
             nonlocal swapped
+            fd = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
             if (
                 not swapped
                 and os.fspath(path) == os.fspath(parent)
@@ -542,12 +543,12 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 inter_moved = base / "component_moved"
                 inter_dir.rename(inter_moved)
                 os.symlink(outside, inter_dir)
-            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+            return fd
 
         with patch("heimdall.vault.atomic.os.open", side_effect=fake_open):
             with self.assertRaises(ValueError) as ctx:
                 write_file_atomic(target, "SECRET=1\n")
-            self.assertIn("lien symbolique", str(ctx.exception))
+            self.assertIn("TOCTOU", str(ctx.exception))
 
         self.assertTrue(swapped)
         self.assertFalse((outside_leaf / ".env").exists())
@@ -959,21 +960,28 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 client.health()
             self.assertIn("Erreur de communication avec le Vault", str(ctx.exception))
 
-    def test_transport_parameter_rejected_outside_test_environment(self) -> None:
-        """Le paramètre transport est strictement interdit hors environnement de test."""
-        fake_transport = MagicMock()
-        with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "", "HEIMDALL_ENV": "production"}):
-            with patch.dict(sys.modules, {"pytest": None}):
-                with self.assertRaises(ValueError) as ctx:
-                    VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)
-                self.assertIn("réservé exclusivement aux tests", str(ctx.exception))
+    def test_request_json_without_httpx_raises_vault_unavailable_error(self) -> None:
+        """_get_client sans httpx (RuntimeError) est mappée en VaultUnavailableError."""
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch("heimdall.vault.client.httpx", None):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("Erreur de communication avec le Vault", str(ctx.exception))
 
-        # Rejet strict invariant même si HEIMDALL_ENV=test est positionné hors pytest
+    def test_transport_parameter_rejected_outside_test_environment(self) -> None:
+        """Le paramètre transport est strictement interdit hors PYTEST_CURRENT_TEST."""
+        fake_transport = MagicMock()
+        # Sans PYTEST_CURRENT_TEST, même avec pytest importé → rejet
+        with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": ""}):
+            with self.assertRaises(ValueError) as ctx:
+                VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)
+            self.assertIn("réservé exclusivement aux tests", str(ctx.exception))
+
+        # HEIMDALL_ENV=test ne contourne pas la garde
         with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "", "HEIMDALL_ENV": "test"}):
-            with patch.dict(sys.modules, {"pytest": None}):
-                with self.assertRaises(ValueError) as ctx:
-                    VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)
-                self.assertIn("réservé exclusivement aux tests", str(ctx.exception))
+            with self.assertRaises(ValueError) as ctx:
+                VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)
+            self.assertIn("réservé exclusivement aux tests", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -573,10 +573,7 @@ class VaultClient:
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > _MAX_TIMEOUT_SECONDS:
             raise ValueError("timeout invalide (nombre positif <= 300 secondes requis)")
 
-        if transport is not None and not (
-            bool(os.environ.get("PYTEST_CURRENT_TEST"))
-            or bool(sys.modules.get("pytest"))
-        ):
+        if transport is not None and not bool(os.environ.get("PYTEST_CURRENT_TEST")):
             raise ValueError(
                 "Le paramètre 'transport' est réservé exclusivement aux tests unitaires."
             )
@@ -685,7 +682,10 @@ class VaultClient:
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Exécute une requête en streaming et parse une réponse JSON bornée."""
-        client = self._get_client()
+        try:
+            client = self._get_client()
+        except RuntimeError as exc:
+            raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
         try:
             with client.stream(
                 method,
