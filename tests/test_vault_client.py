@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 
 from heimdall.vault.atomic import (
+    _write_file_atomic_fallback,
     backup_file,
     check_file_mode_600,
     is_git_ignored,
@@ -637,6 +638,58 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         with patch("heimdall.vault.atomic._get_git_toplevel", return_value=top_mock):
             self.assertFalse(is_git_tracked(target))
             self.assertFalse(is_git_ignored(target))
+
+    def test_git_helpers_return_false_on_symlink_loop(self) -> None:
+        """Boucle symlink : `resolve()` en échec → `False` fail-closed, sans traceback."""
+        loop = self.tmp_dir / "loop"
+        try:
+            os.symlink(loop, loop)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        # Boucle réelle : ne doit jamais lever (couvre ELOOP/OSError/RuntimeError
+        # selon la version Python, `strict=False` ne lève pas toujours).
+        with patch(
+            "heimdall.vault.atomic._get_git_toplevel", return_value=self.tmp_dir
+        ):
+            self.assertFalse(is_git_tracked(loop))
+            self.assertFalse(is_git_ignored(loop))
+        # Injection directe du cas revue : `resolve()` lève RuntimeError
+        # (boucle symlink) ou OSError (ELOOP strict=True) → `False`.
+        target = self.tmp_dir / ".env"
+        target.write_text("x=1\n", encoding="utf-8")
+        with patch(
+            "heimdall.vault.atomic._get_git_toplevel", return_value=self.tmp_dir
+        ):
+            with patch.object(Path, "resolve", side_effect=RuntimeError("Symlink loop")):
+                self.assertFalse(is_git_tracked(target))
+                self.assertFalse(is_git_ignored(target))
+            with patch.object(
+                Path, "resolve", side_effect=OSError(40, "Too many levels of symbolic links")
+            ):
+                self.assertFalse(is_git_tracked(target))
+                self.assertFalse(is_git_ignored(target))
+
+    def test_fallback_refuses_symlink_target_and_reverifies_after_replace(self) -> None:
+        """Repli Windows (best-effort) : symlink avant/après `replace` → refus."""
+        parent = self.tmp_dir / "fallback_parent"
+        parent.mkdir()
+        victim = self.tmp_dir / "fallback_victim.txt"
+        victim.write_text("VICTIM\n", encoding="utf-8")
+        # Cible symlink pré-replace → refus, victime intacte.
+        link_target = parent / ".env"
+        try:
+            os.symlink(victim, link_target)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        with self.assertRaises(ValueError) as ctx:
+            _write_file_atomic_fallback(parent, link_target, b"EVIL\n", 0o600)
+        self.assertIn("lien symbolique", str(ctx.exception))
+        self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM\n")
+        link_target.unlink()
+        # Nominal : le repli écrit puis revérifie via lstat (fichier régulier).
+        plain_target = parent / "plain.env"
+        _write_file_atomic_fallback(parent, plain_target, b"OK=1\n", 0o600)
+        self.assertEqual(plain_target.read_bytes(), b"OK=1\n")
 
     def test_parse_env_file(self) -> None:
         """Parsing correct des paires clé=valeur en ignorant commentaires et vides."""

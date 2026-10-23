@@ -99,7 +99,15 @@ def _write_file_atomic_fallback(
     data: bytes,
     mode: int,
 ) -> None:
-    """Repli portable pour les plateformes sans ``dir_fd`` (Windows)."""
+    """Repli portable pour les plateformes sans ``dir_fd`` (Windows).
+
+    Garantie POSIX-only : l'anti-symlink fort (marcheur ``openat`` +
+    ``O_NOFOLLOW`` + ``dir_fd``) n'existe que sur POSIX. Ce repli reste en
+    check-then-use par construction (pas de ``dir_fd``) : il refuse tout
+    symlink avant ``replace`` et revérifie par ``lstat`` après ``replace``
+    (fail-closed), sans prétendre à la même résistance aux courses que la
+    voie POSIX.
+    """
     prefix = f".{path.name}.tmp."
     temp_fd, temp_path_str = tempfile.mkstemp(prefix=prefix, dir=parent)
     temp_path = Path(temp_path_str)
@@ -115,6 +123,22 @@ def _write_file_atomic_fallback(
         if os.path.islink(path):
             raise ValueError(f"Écriture refusée : la cible '{path}' est un lien symbolique.")
         os.replace(temp_path, path)
+        # Revérification post-replace sans suivre le lien (défense en
+        # profondeur du repli check-then-use) : un symlink replanté après
+        # le contrôle pré-replace fait échouer l'appel au lieu de passer
+        # sous silence.
+        try:
+            final_st = os.lstat(path)
+        except OSError as exc:
+            raise ValueError(f"Impossible de vérifier le fichier : {exc}") from exc
+        if stat.S_ISLNK(final_st.st_mode):
+            raise ValueError(
+                f"Écriture refusée : la cible '{path}' est un lien symbolique."
+            )
+        if not stat.S_ISREG(final_st.st_mode):
+            raise ValueError(
+                f"Écriture refusée : la cible '{path}' n'est pas un fichier régulier."
+            )
         if os.name == "posix":
             os.chmod(path, mode)
     except Exception:
@@ -597,7 +621,7 @@ def is_git_tracked(path: Path) -> bool:
         return False
     try:
         rel = path.resolve().relative_to(top.resolve())
-    except ValueError:
+    except (ValueError, RuntimeError, OSError):
         return False
     try:
         res = subprocess.run(  # noqa: S603
@@ -622,7 +646,7 @@ def is_git_ignored(path: Path) -> bool:
         return False
     try:
         rel = path.resolve().relative_to(top.resolve())
-    except ValueError:
+    except (ValueError, RuntimeError, OSError):
         return False
     try:
         res = subprocess.run(  # noqa: S603
