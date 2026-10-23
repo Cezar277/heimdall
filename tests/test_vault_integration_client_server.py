@@ -90,7 +90,7 @@ class VaultClientServerIntegrationTests(unittest.TestCase):
         self.other_project_api_key = issued_other.raw_key
 
         self.transport = SyncASGITransport(self.app)
-        self.client = VaultClient(
+        self.client = VaultClient.create_for_tests(
             "https://127.0.0.1:8443",
             self.valid_api_key,
             transport=self.transport,
@@ -130,7 +130,7 @@ class VaultClientServerIntegrationTests(unittest.TestCase):
     def test_invalid_api_key_returns_401(self) -> None:
         """Une clé API invalide déclenche HTTP 401 (VaultAuthError)."""
         invalid_key = generate_api_key()  # clé non enregistrée
-        unauthorized_client = VaultClient(
+        unauthorized_client = VaultClient.create_for_tests(
             "https://127.0.0.1:8443",
             invalid_key,
             transport=self.transport,
@@ -143,7 +143,7 @@ class VaultClientServerIntegrationTests(unittest.TestCase):
 
     def test_cross_project_access_returns_403(self) -> None:
         """Une clé valide d'un autre projet reçoit HTTP 403 (VaultForbiddenError)."""
-        other_client = VaultClient(
+        other_client = VaultClient.create_for_tests(
             "https://127.0.0.1:8443",
             self.other_project_api_key,
             transport=self.transport,
@@ -250,7 +250,9 @@ def vault_test_server(tmp_path: Path):
     application = create_app(settings)
     issued = vault_auth.issue_api_key(db_file, "fixtureproj", _PEPPER)
     transport = SyncASGITransport(application)
-    client = VaultClient("https://127.0.0.1:8443", issued.raw_key, transport=transport)
+    client = VaultClient.create_for_tests(
+        "https://127.0.0.1:8443", issued.raw_key, transport=transport
+    )
     yield client
     client.close()
 

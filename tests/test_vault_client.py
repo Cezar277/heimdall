@@ -7,6 +7,7 @@ ni argon2.
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import os
 import pickle
@@ -488,23 +489,19 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         outside.mkdir()
         target = parent / ".env"
 
-        real_open = os.open
+        real_stat = os.stat
         swapped = False
+        parent_abs = os.path.abspath(str(parent))
 
-        def fake_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        def fake_stat(path: object, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
             nonlocal swapped
-            fd = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
-            if (
-                not swapped
-                and os.fspath(path) == os.fspath(parent)
-                and flags & getattr(os, "O_DIRECTORY", 0)
-            ):
+            if not swapped and os.fspath(path) == parent_abs:
                 swapped = True
                 parent.rename(moved_parent)
                 os.symlink(outside, parent)
-            return fd
+            return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
 
-        with patch("heimdall.vault.atomic.os.open", side_effect=fake_open):
+        with patch("heimdall.vault.atomic.os.stat", side_effect=fake_stat):
             with self.assertRaises(ValueError) as ctx:
                 write_file_atomic(target, "SECRET=1\n")
             self.assertIn("TOCTOU", str(ctx.exception))
@@ -513,7 +510,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         self.assertFalse((outside / ".env").exists())
 
     def test_write_file_atomic_rejects_intermediate_parent_symlink_swap(self) -> None:
-        """Un échange d'un parent intermédiaire entre open et fstat est détecté (st_dev/st_ino)."""
+        """Un échange d'un parent intermédiaire pendant le marcheur est refusé (ELOOP)."""
         base = self.tmp_dir / "inter_base"
         base.mkdir()
         inter_dir = base / "component"
@@ -532,23 +529,23 @@ class VaultAtomicOperationsTests(unittest.TestCase):
 
         def fake_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
             nonlocal swapped
-            fd = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
             if (
                 not swapped
-                and os.fspath(path) == os.fspath(parent)
-                and flags & getattr(os, "O_DIRECTORY", 0)
+                and isinstance(path, str)
+                and path == "component"
+                and (flags & getattr(os, "O_NOFOLLOW", 0))
             ):
                 swapped = True
                 # Remplacement du parent intermédiaire par un symlink vers outside
                 inter_moved = base / "component_moved"
                 inter_dir.rename(inter_moved)
                 os.symlink(outside, inter_dir)
-            return fd
+            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
 
         with patch("heimdall.vault.atomic.os.open", side_effect=fake_open):
             with self.assertRaises(ValueError) as ctx:
                 write_file_atomic(target, "SECRET=1\n")
-            self.assertIn("TOCTOU", str(ctx.exception))
+            self.assertIn("lien symbolique", str(ctx.exception))
 
         self.assertTrue(swapped)
         self.assertFalse((outside_leaf / ".env").exists())
@@ -969,19 +966,112 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             self.assertIn("Erreur de communication avec le Vault", str(ctx.exception))
 
     def test_transport_parameter_rejected_outside_test_environment(self) -> None:
-        """Le paramètre transport est strictement interdit hors PYTEST_CURRENT_TEST."""
+        """Le constructeur prod n'expose aucun hook transport (fail-closed)."""
         fake_transport = MagicMock()
-        # Sans PYTEST_CURRENT_TEST, même avec pytest importé → rejet
-        with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": ""}):
-            with self.assertRaises(ValueError) as ctx:
-                VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)
-            self.assertIn("réservé exclusivement aux tests", str(ctx.exception))
+        # Même avec PYTEST_CURRENT_TEST posée, le constructeur refuse tout
+        # transport : seule la fabrique test-only l'autorise.
+        with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "1"}):
+            with self.assertRaises(TypeError):
+                VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)  # type: ignore[call-arg]
+        # Sans variable d'environnement non plus.
+        with patch.dict(os.environ, {}, clear=False):
+            with self.assertRaises(TypeError):
+                VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)  # type: ignore[call-arg]
 
-        # HEIMDALL_ENV=test ne contourne pas la garde
-        with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "", "HEIMDALL_ENV": "test"}):
+    def test_create_for_tests_accepts_transport_hook(self) -> None:
+        """La fabrique test-only injecte le transport sans contournement env."""
+        fake_transport = MagicMock()
+        with patch.dict(os.environ, {}, clear=False):
+            client = VaultClient.create_for_tests(
+                _VALID_URL, _VALID_KEY, transport=fake_transport
+            )
+        self.assertIs(client._transport, fake_transport)
+        client.close()
+
+    def test_prod_constructor_exposes_no_transport_hook(self) -> None:
+        """Garde anti-contournement env : transport absent de prod, présent en test-only."""
+        self.assertNotIn("transport", inspect.signature(VaultClient.__init__).parameters)
+        self.assertIn(
+            "transport", inspect.signature(VaultClient.create_for_tests).parameters
+        )
+        # Aucun appelant prod ne renseigne transport (discipline d'appel).
+        cli_path = Path(__file__).resolve().parent.parent / "heimdall" / "cli" / "vault_client.py"
+        cli_source = cli_path.read_text(encoding="utf-8")
+        self.assertNotIn("transport=", cli_source)
+
+    def test_write_file_atomic_refuses_symlinked_intermediate_with_missing_leaf(self) -> None:
+        """mkdir intermédiaire ne doit jamais suivre un symlink (LOW revue).
+
+        ``out/sub`` est un symlink vers ``outside`` et ``leaf`` n'existe pas :
+        l'ancien ``mkdir(parents=True)`` suivait le lien et créait
+        ``outside/leaf/.env`` (détournement). Le marcheur ``openat`` doit
+        refuser (ELOOP) sans rien créer côté cible.
+        """
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("O_NOFOLLOW requis")
+        base = self.tmp_dir / "out"
+        base.mkdir()
+        outside = self.tmp_dir / "evil_target"
+        outside.mkdir()
+        inter = base / "sub"
+        try:
+            os.symlink(outside, inter)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        target = inter / "leaf" / ".env"
+        with self.assertRaises(ValueError) as ctx:
+            write_file_atomic(target, "SECRET=1\n")
+        self.assertIn("lien symbolique", str(ctx.exception))
+        self.assertFalse((outside / "leaf" / ".env").exists())
+        self.assertFalse((outside / "leaf").exists())
+
+    def test_write_file_atomic_refuses_concurrent_intermediate_swap(self) -> None:
+        """Échange concurrent d'un composant intermédiaire juste avant openat → refus.
+
+        Simule un attaquant local avec écriture sur ``base`` qui remplace
+        ``victim_mid`` (répertoire réel) par un symlink vers ``outside``
+        entre deux pas du marcheur sécurisé. L'``openat`` suivant avec
+        ``O_NOFOLLOW`` lève ``ELOOP`` → ``ValueError`` fail-closed, aucune
+        écriture détournée.
+        """
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("O_NOFOLLOW requis")
+        base = self.tmp_dir / "race_base"
+        victim_mid = base / "victim_mid"
+        leaf = victim_mid / "leaf"
+        leaf.mkdir(parents=True)
+        outside = self.tmp_dir / "race_outside"
+        outside.mkdir()
+        target = leaf / ".env"
+
+        real_open = os.open
+        swapped = False
+
+        def fake_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            if (
+                not swapped
+                and isinstance(path, str)
+                and path == "victim_mid"
+                and (flags & getattr(os, "O_NOFOLLOW", 0))
+            ):
+                swapped = True
+                moved = base / "victim_mid_moved"
+                victim_mid.rename(moved)
+                try:
+                    os.symlink(outside, victim_mid)
+                except OSError:
+                    pass
+            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+        with patch("heimdall.vault.atomic.os.open", side_effect=fake_open):
             with self.assertRaises(ValueError) as ctx:
-                VaultClient(_VALID_URL, _VALID_KEY, transport=fake_transport)
-            self.assertIn("réservé exclusivement aux tests", str(ctx.exception))
+                write_file_atomic(target, "SECRET=1\n")
+            self.assertIn("lien symbolique", str(ctx.exception))
+
+        self.assertTrue(swapped)
+        self.assertFalse((outside / "leaf" / ".env").exists())
+        self.assertFalse((outside / ".env").exists())
 
 
 if __name__ == "__main__":

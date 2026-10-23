@@ -537,9 +537,11 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
 class VaultClient:
     """Client HTTPS du Vault (boucle locale uniquement). Non héritable.
 
-    Le paramètre ``transport`` est un hook strictement réservé aux tests unitaires
-    (ex: injecter un ``httpx.MockTransport`` ou ``SyncASGITransport`` dans pytest)
-    et est rejeté en environnement normal pour garantir le transit TLS loopback.
+    Aucun hook ``transport`` n'est exposé en production : le constructeur
+    crée toujours un ``httpx.Client`` TLS vérifié vers la boucle locale.
+    L'injection d'un transport (``httpx.MockTransport``,
+    ``SyncASGITransport``) est strictement réservée aux tests unitaires via
+    la fabrique dédiée :meth:`VaultClient.create_for_tests`.
     """
 
     __slots__ = (
@@ -561,7 +563,49 @@ class VaultClient:
         *,
         timeout: float = 10.0,
         ca_cert: str | Path | None = None,
+    ) -> None:
+        self._init_state(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            ca_cert=ca_cert,
+            transport=None,
+        )
+
+    @classmethod
+    def create_for_tests(
+        cls,
+        base_url: str,
+        api_key: str,
+        *,
+        timeout: float = 10.0,
+        ca_cert: str | Path | None = None,
         transport: Any = None,
+    ) -> VaultClient:
+        """Fabrique test-only : identique au constructeur + transport injecté.
+
+        Ne doit jamais être appelée par le code de production
+        (``heimdall/cli/vault_client.py`` ne la référence pas) : elle
+        court-circuite le TLS loopback vérifié au profit du transport fourni.
+        """
+        instance = cls.__new__(cls)
+        instance._init_state(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            ca_cert=ca_cert,
+            transport=transport,
+        )
+        return instance
+
+    def _init_state(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        timeout: float,
+        ca_cert: str | Path | None,
+        transport: Any,
     ) -> None:
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("clé API requise (chaîne non vide, non blanche)")
@@ -572,11 +616,6 @@ class VaultClient:
 
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > _MAX_TIMEOUT_SECONDS:
             raise ValueError("timeout invalide (nombre positif <= 300 secondes requis)")
-
-        if transport is not None and not bool(os.environ.get("PYTEST_CURRENT_TEST")):
-            raise ValueError(
-                "Le paramètre 'transport' est réservé exclusivement aux tests unitaires."
-            )
 
         ca_context: ssl.SSLContext | None = None
         if ca_cert is not None:

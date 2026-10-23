@@ -9,6 +9,7 @@ ni argon2.
 
 from __future__ import annotations
 
+import errno
 import os
 import secrets
 import shutil
@@ -131,6 +132,173 @@ def _write_file_atomic_fallback(
                 pass
 
 
+def _open_parent_dir_secure(parent: Path) -> int:  # noqa: PLR0912, PLR0915
+    """Ouvre le répertoire parent sans jamais suivre de lien symbolique.
+
+    Marche composant par composant depuis ``/`` avec ``openat`` +
+    ``O_NOFOLLOW`` (``dir_fd``) : chaque composant existant est ouvert avec
+    ``O_DIRECTORY | O_NOFOLLOW`` (un symlink lève ``ELOOP`` — ou ``ENOTDIR``
+    quand combiné à ``O_DIRECTORY`` sur Linux — → refus), chaque
+    composant manquant est créé par ``mkdirat`` (``0o700``) puis ré-ouvert
+    avec ``O_NOFOLLOW``. Contrairement à ``Path.mkdir(parents=True)`` qui
+    suit les liens intermédiaires, un échange d'un composant intermédiaire
+    (``out/sub`` → symlink) est donc détecté au lieu d'être traversé.
+
+    Retourne un descripteur ouvert sur le répertoire parent (à fermer par
+    l'appelant). Lève ``ValueError`` fail-closed en cas de symlink, de
+    composant non-répertoire ou de divergence ``fstat`` vs ``stat``.
+    """
+    abs_str = os.path.abspath(str(parent))
+    if "\x00" in abs_str:
+        raise ValueError("Écriture refusée : octet nul dans le chemin parent.")
+    abs_path = Path(abs_str)
+    if not abs_path.is_absolute():
+        raise ValueError(f"Écriture refusée : chemin parent non absolu : '{parent}'.")
+    parts = abs_path.parts
+    if not parts or parts[0] != "/":
+        raise ValueError(f"Écriture refusée : racine inattendue pour '{parent}'.")
+
+    open_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        open_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        open_flags |= os.O_CLOEXEC
+
+    try:
+        cur_fd = os.open("/", open_flags)
+    except OSError as exc:
+        raise ValueError(f"Impossible d'ouvrir le répertoire parent : {exc}") from exc
+
+    try:
+        for comp in parts[1:]:
+            if comp in ("", ".", ".."):
+                raise ValueError(
+                    f"Écriture refusée : composant parent invalide '{comp}'."
+                )
+            if "/" in comp or "\x00" in comp:
+                raise ValueError(
+                    f"Écriture refusée : composant parent invalide '{comp}'."
+                )
+            try:
+                child_fd = os.open(comp, open_flags, dir_fd=cur_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(comp, 0o700, dir_fd=cur_fd)
+                except FileExistsError:
+                    pass  # Course bénigne : un tiers l'a créé, on ré-ouvre.
+                except OSError as exc:
+                    raise ValueError(
+                        f"Impossible de créer le répertoire parent '{comp}' : {exc}"
+                    ) from exc
+                try:
+                    child_fd = os.open(comp, open_flags, dir_fd=cur_fd)
+                except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise ValueError(
+                            f"Écriture refusée : le composant parent '{comp}' "
+                            "est un lien symbolique."
+                        ) from exc
+                    if exc.errno == errno.ENOTDIR:
+                        # O_DIRECTORY|O_NOFOLLOW sur un symlink vers un
+                        # répertoire donne ENOTDIR sur Linux (pas ELOOP) :
+                        # distinguer via lstat sans suivre le lien.
+                        try:
+                            link_st = os.stat(
+                                comp, dir_fd=cur_fd, follow_symlinks=False
+                            )
+                            is_link = stat.S_ISLNK(link_st.st_mode)
+                        except OSError:
+                            is_link = False
+                        if is_link:
+                            raise ValueError(
+                                f"Écriture refusée : le composant parent '{comp}' "
+                                "est un lien symbolique."
+                            ) from exc
+                        raise ValueError(
+                            f"Écriture refusée : le composant parent '{comp}' "
+                            "n'est pas un répertoire."
+                        ) from exc
+                    raise ValueError(
+                        f"Écriture refusée : composant parent '{comp}' "
+                        f"non sécurisé ({exc})."
+                    ) from exc
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise ValueError(
+                        f"Écriture refusée : le composant parent '{comp}' "
+                        "est un lien symbolique."
+                    ) from exc
+                if exc.errno == errno.ENOTDIR:
+                    try:
+                        link_st = os.stat(comp, dir_fd=cur_fd, follow_symlinks=False)
+                        is_link = stat.S_ISLNK(link_st.st_mode)
+                    except OSError:
+                        is_link = False
+                    if is_link:
+                        raise ValueError(
+                            f"Écriture refusée : le composant parent '{comp}' "
+                            "est un lien symbolique."
+                        ) from exc
+                    raise ValueError(
+                        f"Écriture refusée : le composant parent '{comp}' "
+                        "n'est pas un répertoire."
+                    ) from exc
+                raise ValueError(
+                    f"Écriture refusée : composant parent '{comp}' "
+                    f"non sécurisé ({exc})."
+                ) from exc
+            try:
+                st = os.fstat(child_fd)
+            except OSError as exc:
+                try:
+                    os.close(child_fd)
+                except OSError:  # noqa: S110
+                    pass
+                raise ValueError(
+                    f"Écriture refusée : impossible de vérifier '{comp}' : {exc}"
+                ) from exc
+            if not stat.S_ISDIR(st.st_mode):
+                try:
+                    os.close(child_fd)
+                except OSError:  # noqa: S110
+                    pass
+                raise ValueError(
+                    f"Écriture refusée : le composant parent '{comp}' "
+                    "n'est pas un répertoire."
+                )
+            try:
+                os.close(cur_fd)
+            except OSError:  # noqa: S110
+                pass
+            cur_fd = child_fd
+
+        # Défense en profondeur : le fd obtenu doit désigner le même inode
+        # que le chemin nominal. Un swap post-ouverture diverge ici.
+        try:
+            fd_stat = os.fstat(cur_fd)
+            path_stat = os.stat(abs_str)
+        except OSError as exc:
+            raise ValueError(
+                f"Impossible de vérifier le répertoire parent : {exc}"
+            ) from exc
+        if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+            raise ValueError(
+                "Écriture refusée : le répertoire parent a été modifié "
+                "entre l'ouverture et la vérification (symlink TOCTOU)."
+            )
+        owned_fd = cur_fd
+        cur_fd = -1
+        return owned_fd
+    finally:
+        if cur_fd >= 0:
+            try:
+                os.close(cur_fd)
+            except OSError:  # noqa: S110
+                pass
+
+
 def write_file_atomic(  # noqa: PLR0912, PLR0915
     path: Path,
     content: str | bytes,
@@ -140,11 +308,21 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
 
     Refuse strictement les liens symboliques (cible ou répertoire parent)
     afin de prévenir tout écrasement ou détournement de cible. Sur POSIX,
-    toutes les opérations après l'ouverture du parent passent par son
-    descripteur (``dir_fd``), ce qui neutralise une course sur le chemin du
-    répertoire parent.
+    les répertoires parents sont créés et ouverts composant par composant
+    avec ``openat`` + ``O_NOFOLLOW`` (voir ``_open_parent_dir_secure``) puis
+    toutes les opérations passent par le descripteur du parent (``dir_fd``),
+    ce qui neutralise un échange d'un composant intermédiaire contre un
+    symlink avant ou pendant l'ouverture.
     """
-    # Vérification anti-symlink sur la cible et toute l'arborescence parente
+    target_name = path.name
+    if not target_name or target_name in (".", ".."):
+        raise ValueError(f"Écriture refusée : nom de fichier invalide '{path}'.")
+    if "/" in target_name or "\x00" in target_name:
+        raise ValueError(f"Écriture refusée : nom de fichier invalide '{path}'.")
+    if os.sep in target_name and os.sep != "/":
+        raise ValueError(f"Écriture refusée : nom de fichier invalide '{path}'.")
+    # Vérification anti-symlink précoce (message clair, défense en profondeur ;
+    # la garantie réelle vient de l'ouverture O_NOFOLLOW ci-dessous).
     if os.path.islink(path):
         raise ValueError(f"Écriture refusée : la cible '{path}' est un lien symbolique.")
     for parent_part in path.parents:
@@ -154,43 +332,31 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
             )
 
     parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    for parent_part in path.parents:
-        if os.path.islink(parent_part):
-            raise ValueError(
-                f"Écriture refusée : le répertoire parent '{parent_part}' est un lien symbolique."
-            )
 
-    parent_flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        parent_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        parent_flags |= os.O_NOFOLLOW
+    if os.name != "posix":  # pragma: no cover - dépend de la plateforme
+        parent.mkdir(parents=True, exist_ok=True)
+        for parent_part in path.parents:
+            if os.path.islink(parent_part):
+                raise ValueError(
+                    "Écriture refusée : le répertoire parent "
+                    f"'{parent_part}' est un lien symbolique."
+                )
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        try:
+            _write_file_atomic_fallback(parent, path, data, mode)
+        except OSError as exc:
+            raise ValueError(f"Impossible d'écrire le fichier : {exc}") from exc
+        return
 
     try:
-        parent_fd = os.open(parent, parent_flags)
+        parent_fd = _open_parent_dir_secure(parent)
     except OSError as exc:
-        raise ValueError(f"Impossible d'ouvrir le répertoire parent : {exc}") from exc
+        raise ValueError(f"Impossible d'écrire le fichier : {exc}") from exc
 
     try:
-        # Contrôle post-ouverture : le fd ouvert doit toujours correspondre au
-        # chemin nominal.  Si un attaquant local échange un composant
-        # intermédiaire contre un symlink entre le second islink et os.open,
-        # les (st_dev, st_ino) divergent → refus immédiat.
-        fd_stat = os.fstat(parent_fd)
-        path_stat = os.stat(parent)
-        if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
-            raise ValueError(
-                "Écriture refusée : le répertoire parent a été modifié "
-                "entre l'ouverture et la vérification (symlink TOCTOU)."
-            )
-
         data = content.encode("utf-8") if isinstance(content, str) else content
 
-        if os.name == "posix":
-            _write_file_atomic_dir_fd(parent_fd, path.name, data, mode)
-        else:  # pragma: no cover - dépend de la plateforme
-            _write_file_atomic_fallback(parent, path, data, mode)
+        _write_file_atomic_dir_fd(parent_fd, target_name, data, mode)
     except OSError as exc:
         raise ValueError(f"Impossible d'écrire le fichier : {exc}") from exc
     finally:
