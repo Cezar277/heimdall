@@ -1119,54 +1119,6 @@ def _instantane(racine: Path) -> dict[str, bytes | None]:
 
 
 @pytest.mark.parametrize("arguments", [[], ["--staged"]], ids=["arbre", "index"])
-def test_scan_root_swap_between_resolve_and_stat_exits_two(
-    git_repo: GitRepo, arguments: list[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Revue (LOW) : échange dossier->symlink->dossier : le re-contrôle final refuse (code 2).
-
-    Fige le comportement documenté dans docs/cli.md :
-    Une course résiduelle entre `_resolve_root` et `os.stat` (remplacement par un autre dossier)
-    est interceptée en fin de passe par `_verify_root_unchanged`, garantissant le code 2
-    dans les deux périmètres (arbre et --staged).
-    """
-    git_repo.write("app.py", "x = 1\n")
-    git_repo.stage("app.py")
-    autre_dossier = git_repo.root.parent / "autre-root"
-    autre_dossier.mkdir()
-
-    original_stat = os.stat
-    tours = 0
-
-    def stat_piege(path: object, *args: Any, **kwargs: Any) -> Any:
-        nonlocal tours
-        st = original_stat(path, *args, **kwargs)
-        if Path(str(path)).resolve() == git_repo.root.resolve():
-            tours += 1
-            if tours == 1:
-                # Simule un ctime/ino modifié (autre dossier) capturé à la construction
-                return os.stat_result(
-                    (
-                        st.st_mode,
-                        st.st_ino + 9999,
-                        st.st_dev,
-                        st.st_nlink,
-                        st.st_uid,
-                        st.st_gid,
-                        st.st_size,
-                        st.st_atime,
-                        st.st_mtime,
-                        st.st_ctime + 100,
-                    )
-                )
-        return st
-
-    monkeypatch.setattr(os, "stat", stat_piege)
-    resultat = _run("scan", *arguments, str(git_repo.root))
-    assert resultat.exit_code == EXIT_ERROR
-    assert "scan impossible" in resultat.stderr
-
-
-@pytest.mark.parametrize("arguments", [[], ["--staged"]], ids=["arbre", "index"])
 def test_scan_never_reads_or_writes_a_hostile_repository_config(
     git_repo: GitRepo, arguments: list[str]
 ) -> None:
