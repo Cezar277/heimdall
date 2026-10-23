@@ -72,6 +72,7 @@ include = ["heimdall*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["llm: preuve manuelle avec Ollama local (HEIMDALL_RUN_LLM_TESTS=1)"]
 
 # --- ruff: lint + format ---
 [tool.ruff]

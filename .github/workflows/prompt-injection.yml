@@ -1,0 +1,26 @@
+name: Prompt injection corpus
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  corpus:
+    # Python 3 préinstallé sur le runner Linux self-hosted du projet.
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install locked dependencies
+        run: |
+          python3 -m venv --clear .venv-injection
+          .venv-injection/bin/python -m pip install --require-hashes -r requirements.lock
+          .venv-injection/bin/python -m pip install -e . --no-deps --no-build-isolation
+      - name: Corpus déterministe (aucun Ollama)
+        run: .venv-injection/bin/python -m pytest tests/test_prompt_injection_corpus.py -m 'not llm'
