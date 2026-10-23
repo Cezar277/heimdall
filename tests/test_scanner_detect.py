@@ -565,6 +565,30 @@ def test_scanner_refuses_an_expired_deadline(tmp_path: Path) -> None:
         Scanner(tmp_path).scan(deadline=time.monotonic() - 1)
 
 
+def test_scan_text_checks_deadline_intra_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un seul fichier dense ne peut pas ignorer la deadline.
+
+    L'horloge expire au premier candidat : `_append` doit refuser avant le
+    hachage HMAC, pas attendre le plafond de 10 000 Findings.
+    """
+    _write(tmp_path, "dense.py", "x = 1\n")
+    appels = [0]
+
+    def monotonic() -> float:
+        appels[0] += 1
+        return 0.0 if appels[0] == 1 else 2.0
+
+    monkeypatch.setattr("heimdall.scanner.detect.time.monotonic", monotonic)
+    with pytest.raises(ScanError):
+        Scanner(tmp_path)._scan_text(
+            f'AWS = "{_aws()}"',
+            "dense.py",
+            deadline=1.0,
+        )
+
+
 def test_invalid_utf8_is_scanned_with_replacement(tmp_path: Path) -> None:
     _write(tmp_path, "latin1.py", f'AWS = "{_aws()}"'.encode("ascii") + b" \xff\n")
     assert [finding["file"] for finding in find_candidates(str(tmp_path))] == ["latin1.py"]

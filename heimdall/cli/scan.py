@@ -170,10 +170,13 @@ def _collect_tree(root: Path) -> ScanReport:
     access = GitAccess(root)
     if not access.is_repository(timeout=_call_timeout(deadline)):
         raise ScanError(_MSG_NOT_A_REPO)
-    # `access.root` est la forme **figée** (résolue, symlink refusé) : le
-    # scanner ne re-résout pas l'entrée brute, donc une seule résolution et
-    # une seule course possible, alignée sur l'identité épinglée par
-    # `GitAccess`. La deadline est vérifiée dans la boucle du scanner.
+    # `access.root` est la forme **figée** (résolue, symlink refusé).
+    # `TreeScanner` rejoue sa garde unique sur cette forme canonique
+    # (idempotente) : une substitution entre les deux résolutions est
+    # refusée par `_verify_root_unchanged` (identité `st_dev`/`st_ino`).
+    # On préfère ce second contrôle à un mode « racine déjà résolue » qui
+    # contournerait la garde du scanner. La deadline est vérifiée dans la
+    # boucle du scanner.
     findings = TreeScanner(access.root, strict=True).scan(deadline=deadline)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
@@ -276,9 +279,12 @@ def _collect_staged(root: Path) -> ScanReport:
             finding.snippet_hash,
         )
     )
-    if access.staged_changes(timeout=_call_timeout(deadline)) != changes:
+    if set(access.staged_changes(timeout=_call_timeout(deadline))) != set(changes):
         # L'index a bougé pendant le scan : le snapshot analysé ne décrit
-        # plus ce qui sera committé. Refus, pas de verdict périmé.
+        # plus ce qui sera committé. Refus, pas de verdict périmé. La
+        # comparaison est **insensible à l'ordre** : `diff --cached --raw`
+        # n'offre pas d'ordre contractuel, et une permutation à contenu
+        # identique ne doit pas faire échouer un scan sain.
         raise ScanError(_MSG_INDEX_CHANGED)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)

@@ -88,7 +88,10 @@ sur le chemin demandé et comparée à la forme figée à l'entrée — chemin
 résolu **et** identité (`st_dev`, `st_ino` épinglés à la construction). Un
 lien remplacé pendant le scan, comme un dossier remplacé par un autre au
 même chemin (même résolu, autre identité), refuse le verdict au lieu de
-juger le mauvais périmètre.
+juger le mauvais périmètre. Le scanner d'arbre rejoue sa garde sur la forme
+canonique déjà figée (opération idempotente) ; ce second passage n'ouvre pas
+de bypass : toute substitution entre les deux est rattrapée par le
+re-contrôle d'identité final.
 
 Les suppressions et les **gitlinks** (sous-modules, mode `160000`) sont
 ignorés : une suppression n'a plus de blob à scanner, et le SHA d'un gitlink
@@ -118,8 +121,8 @@ candidat).
 
 Les deux périmètres ont aussi une **deadline globale** de 120 s :
 [`MAX_TREE_SECONDS`](../heimdall/cli/scan.py) en arbre (vérifiée entre chaque
-fichier et avant le rendu), [`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py) en
-`--staged`. En arbre, les plafonds de volume ne bornent pas le temps de
+fichier, périodiquement à l'intérieur d'un fichier dense, et avant le rendu),
+[`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py) en `--staged`. En arbre, les plafonds de volume ne bornent pas le temps de
 regex + HMAC ; en `--staged`, chaque blob coûte deux appels `git cat-file`
 séquentiels, et 1 000 blobs représenteraient 2 000 processus. Au-delà de la
 deadline, refus (code 2), jamais un job CI qui s'éternise sans verdict. En

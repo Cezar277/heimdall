@@ -400,6 +400,23 @@ def test_collect_tree_uses_the_pinned_root(
     assert seen == [(git_repo.root.resolve(), True)]
 
 
+def test_tree_scanner_resolves_the_same_root_from_raw_or_pinned(
+    git_repo: GitRepo,
+) -> None:
+    """Revue (LOW) : `access.root` et l'entrée brute convergent.
+
+    La seconde résolution est idempotente ; une substitution entre les deux
+    est couverte par le re-contrôle d'identité final.
+    """
+    access = GitAccess(git_repo.root)
+    raw = git_repo.root / ".." / git_repo.root.name
+    assert (
+        TreeScanner(access.root, strict=True)._root
+        == TreeScanner(raw, strict=True)._root
+        == git_repo.root.resolve()
+    )
+
+
 @pytest.mark.parametrize("borne", ["max_files", "max_bytes", "max_findings"])
 @pytest.mark.parametrize("valeur", [0, -1, 10**12])
 def test_scanner_refuses_invalid_explicit_bounds(
@@ -788,6 +805,34 @@ def test_scan_staged_concurrent_index_change_exits_two(
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert "scan impossible" in resultat.stderr
+
+
+def test_scan_staged_accepts_a_reordered_second_enumeration(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : l'ordre de `diff --cached --raw` n'est pas contractuel.
+
+    Une seconde énumération identique sur le fond mais permutée doit rendre
+    le verdict normal (0), pas un faux 2 d'instabilité.
+    """
+    git_repo.write("a.py", "x = 1\n")
+    git_repo.write("b.py", "y = 2\n")
+    git_repo.stage("a.py", "b.py")
+    original = GitAccess.staged_changes
+    appels = 0
+
+    def snapshot_permute(
+        self: GitAccess, **options: object
+    ) -> list[StagedChange]:
+        nonlocal appels
+        appels += 1
+        changes = original(self, **options)
+        return list(reversed(changes)) if appels > 1 else changes
+
+    monkeypatch.setattr(GitAccess, "staged_changes", snapshot_permute)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_CLEAN
+    assert appels == 2
 
 
 def test_scan_staged_root_swapped_mid_scan_exits_two(

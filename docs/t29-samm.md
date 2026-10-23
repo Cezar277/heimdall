@@ -12,7 +12,7 @@ revue APPROVE WITH COMMENTS), ses premiers durcissements (`ae0b1c7`), les
 correctifs de la seconde revue (`593021c`, run 39838145119), ceux de la
 troisième revue (`251fd18`, run 39841323251) et la présente passe
 (run 39844814050). Les permaliens ci-dessous épinglent ce SHA : un lien vers
-la branche changerait de lignes au fil des commits. Les septième à treizième
+la branche changerait de lignes au fil des commits. Les septième à quatorzième
 passes (courantes, voir plus bas) seront re-pinnées sur le SHA final du
 squash/merge.
 
@@ -58,16 +58,16 @@ Environnement : Linux, Python 3.14.8, venv du dépôt.
 
 ```text
 .venv/bin/python -m pytest tests/test_cli_scan.py -q
-94 passed
+96 passed
 
 .venv/bin/python -m pytest
-1541 passed, 4321 subtests passed
+1544 passed, 4321 subtests passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch \
   --cov-report=term-missing --cov-fail-under=85
-Total coverage: 95,87 % (seuil 85 % atteint)
+Total coverage: 95,84 % (seuil 85 % atteint)
 heimdall/cli/scan.py : 99 % ; heimdall/cli/main.py : 98 % ;
-heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 90 % ;
+heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 89 % ;
 heimdall/scanner/exclusions.py : 95 % ;
 heimdall/scanner/signature_engine.py : 100 %
 
@@ -231,6 +231,16 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
 | LOW — garde réseau de test allowlist trop lâche | `_git_argv_ok` compare désormais l'**argv complet** : `rev-parse --show-toplevel`, `DIFF_ARGUMENTS`, `STAGED_RAW_ARGUMENTS`, `check-ignore -q -- <chemin>`, `cat-file (-s|blob) -- <sha 40/64>`. Toute option supplémentaire ou sous-commande non listée est refusée | `tests/test_network_isolation.py` (`_git_argv_ok`), `tests/test_network_isolation.py::test_git_allowlist_accepts_only_exact_product_argv` |
 | LOW — README « lecture seule » sans l'exception clé HMAC | README aligné sur `docs/cli.md` : lecture seule **sur le dépôt**, seule écriture autorisée = clé locale hors dépôt (`0600`), HOME/FS en lecture seule → code 2, jamais 0 | `README.md`, `docs/cli.md` ; tests `tests/test_cli_scan.py::test_scan_ci_creates_the_local_key_outside_the_repository`, `::test_scan_ci_fails_closed_when_the_local_key_cannot_be_created` |
 
+## Correctifs de la quatorzième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — deadline aveugle intra-fichier | `Scanner._scan_text` reçoit la deadline et la vérifie tous les 256 tours de lignes ; `_append` la vérifie aussi tous les 256 Findings, avant le hachage HMAC. Un seul fichier de 1 Mio dense ne peut donc plus ignorer l'échéance | `heimdall/scanner/detect.py` (`_scan_text`, `_append`), `tests/test_scanner_detect.py::test_scan_text_checks_deadline_intra_file` |
+| LOW — relecture d'index sensible à l'ordre | la seconde énumération est comparée par **ensemble** (`set` de `StagedChange`) : une permutation à contenu identique ne provoque plus un faux 2 ; une divergence réelle reste refusée | `heimdall/cli/scan.py` (`_collect_staged`), `tests/test_cli_scan.py::test_scan_staged_accepts_a_reordered_second_enumeration` |
+| LOW — double résolution de racine persistante | documenté : `TreeScanner` rejoue la garde unique sur la forme canonique `access.root` (idempotente) ; toute substitution entre les deux est rattrapée par `_verify_root_unchanged` (`st_dev`/`st_ino`). Pas de mode « racine déjà résolue » qui contournerait la garde | `heimdall/cli/scan.py` (commentaire `_collect_tree`), `docs/cli.md` ; `tests/test_cli_scan.py::test_tree_scanner_resolves_the_same_root_from_raw_or_pinned` |
+
 ## Limites assumées
 
 - La validation humaine Y/N/E et le remplacement du secret ne sont pas dans ce
@@ -267,8 +277,9 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
   LOW et leurs tests ajoutés ; onzième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests ajoutés ; douzième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests ajoutés ; treizième revue APPROVE WITH COMMENTS, 3 points
-  LOW et leurs tests de non-régression ajoutés dans la passe courante (voir
-  les treize tableaux ci-dessus).
+  LOW et leurs tests ajoutés ; quatorzième revue APPROVE WITH COMMENTS,
+  3 points LOW et leurs tests de non-régression ajoutés dans la passe
+  courante (voir les quatorze tableaux ci-dessus).
 - La feuille SAMM externe n'est pas accessible depuis le dépôt : reporter les
   lignes ci-dessus avec le lien de la PR et le SHA final du squash/merge
   (**re-pinner les permaliens sur ce SHA final** si le squash crée un SHA

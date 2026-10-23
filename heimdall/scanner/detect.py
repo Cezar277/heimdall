@@ -280,7 +280,7 @@ class Scanner:
             # candidat dans `_append` (un seul fichier dense ne fait jamais
             # gonfler la liste), et ici entre fichiers (l'accumulation sur
             # tout le périmètre reste bornée).
-            findings.extend(self._scan_text(text, relative))
+            findings.extend(self._scan_text(text, relative, deadline=deadline))
             if len(findings) > self._max_findings:
                 raise ScanError(_SCAN_ERROR)
         if deadline is not None and time.monotonic() > deadline:
@@ -386,7 +386,13 @@ class Scanner:
             len(data),
         )
 
-    def _scan_text(self, text: str, relative: str) -> list[Finding]:
+    def _scan_text(
+        self,
+        text: str,
+        relative: str,
+        *,
+        deadline: float | None = None,
+    ) -> list[Finding]:
         findings: list[Finding] = []
         # Déduplication sur l'empreinte HMAC, jamais sur la valeur brute : la
         # valeur candidate est hachée à la volée puis oubliée. Deux valeurs
@@ -396,9 +402,21 @@ class Scanner:
         seen: set[tuple[int, str, str]] = set()
         lines = text.splitlines()
         for index, line in enumerate(lines):
+            # Contrôle périodique **intra-fichier** : un seul fichier de
+            # 1 Mio dense (beaucoup de lignes ou de matches) ne doit pas
+            # ignorer la deadline globale du mode arbre.
+            if index % 256 == 0 and deadline is not None and time.monotonic() > deadline:
+                raise ScanError(_SCAN_ERROR)
             line_number = index + 1
             for match in find_signature_matches(line):
-                self._append(findings, seen, match, line_number, relative)
+                self._append(
+                    findings,
+                    seen,
+                    match,
+                    line_number,
+                    relative,
+                    deadline=deadline,
+                )
             following = self._joined_window(line, lines, index)
             if following is None:
                 continue
@@ -409,7 +427,14 @@ class Scanner:
                 # à la ligne suivante et y est déjà signalée.
                 if match.start >= limit:
                     continue
-                self._append(findings, seen, match, line_number, relative)
+                self._append(
+                    findings,
+                    seen,
+                    match,
+                    line_number,
+                    relative,
+                    deadline=deadline,
+                )
         return findings
 
     def _joined_window(
@@ -429,14 +454,25 @@ class Scanner:
             return None
         return line + following, len(line)
 
-    def _append(
+    def _append(  # noqa: PLR0913 - contexte de scan explicite (findings, seen…).
         self,
         findings: list[Finding],
         seen: set[tuple[int, str, str]],
         match: SignatureMatch,
         line_number: int,
         relative: str,
+        *,
+        deadline: float | None = None,
     ) -> None:
+        # Une seule ligne peut porter des milliers de matches : le contrôle
+        # par ligne ne suffit pas, on vérifie aussi périodiquement par
+        # candidat (tous les 256) avant le hachage HMAC.
+        if (
+            deadline is not None
+            and len(findings) % 256 == 0
+            and time.monotonic() > deadline
+        ):
+            raise ScanError(_SCAN_ERROR)
         snippet_hash = self._hasher.hash(match.value)
         key = (line_number, match.secret_type, snippet_hash)
         if key in seen:
