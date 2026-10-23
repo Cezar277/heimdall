@@ -18,6 +18,7 @@ from heimdall.cli.main import app
 from heimdall.vault.atomic import check_file_mode_600
 from heimdall.vault.client import (
     VaultAuthError,
+    VaultClientError,
     VaultForbiddenError,
     VaultRateLimitError,
 )
@@ -415,6 +416,62 @@ class VaultPullCliTests(unittest.TestCase):
                 self.assertIn("lien symbolique", result.output)
                 self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM_DATA\n")
 
+    def test_pull_rejects_glibc_tunables_and_git_ssh_command(self) -> None:
+        """Refus strict de pull des variables système sensibles (Looney Tunables, Git hijack)."""
+        dangerous = ["GLIBC_TUNABLES", "GIT_SSH_COMMAND"]
+        for var_name in dangerous:
+            with self.subTest(var_name=var_name):
+                with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+                    with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                        client_instance = MagicMock()
+                        client_instance.__enter__.return_value = client_instance
+                        mock_init.return_value = client_instance
+
+                        out_file = self.tmp_dir / ".env"
+                        result = self.runner.invoke(
+                            app,
+                            [
+                                "vault",
+                                "pull",
+                                "--project",
+                                "demo",
+                                "--name",
+                                var_name,
+                                "--output",
+                                str(out_file),
+                            ],
+                        )
+                        self.assertEqual(result.exit_code, 1)
+                        self.assertIn("variable système interdite", result.output)
+                        self.assertFalse(out_file.exists())
+
+    def test_pull_malformed_response_never_leaks_secret_value_on_stderr(self) -> None:
+        """Une réponse malformée ne divulgue jamais la valeur secrète sur stderr (Invariant 8)."""
+        canary_probe = "CANARY_TOKEN_MUST_NOT_APPEAR"  # noqa: S105
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+
+                client_instance.get_secret.side_effect = VaultClientError(
+                    "Réponse du Vault non conforme au schéma (champs rejetés : value)"
+                )
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "MY_SECRET",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertNotIn(canary_probe, result.output)
+
     def test_pull_rejects_invalid_project_or_env(self) -> None:
         """Validation fail-closed des formats de projet et d'environnement pour pull."""
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
@@ -553,7 +610,17 @@ class VaultRunCliTests(unittest.TestCase):
 
     def test_run_rejects_dangerous_env_vars(self) -> None:
         """Interdiction formelle d'injecter des variables système sensibles (§HIGH 3)."""
-        dangerous_names = ["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "NODE_OPTIONS"]
+        dangerous_names = [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+            "GLIBC_TUNABLES",
+            "GIT_SSH_COMMAND",
+            "EDITOR",
+            "PAGER",
+        ]
         for var_name in dangerous_names:
             with self.subTest(var_name=var_name):
                 with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
@@ -583,7 +650,10 @@ class VaultRunCliTests(unittest.TestCase):
                             ],
                         )
                         self.assertEqual(result.exit_code, 1)
-                        self.assertIn("injection refusée", result.output)
+                        self.assertTrue(
+                            "variable système" in result.output
+                            or "injection refusée" in result.output
+                        )
 
     def test_run_resolves_binary_before_injection(self) -> None:
         """La commande cible est résolue avant injection des variables (§HIGH 3)."""

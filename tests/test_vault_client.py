@@ -517,6 +517,65 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         names = parse_example_names(example_file)
         self.assertEqual(names, ["DATABASE_URL", "API_TOKEN", "EMPTY_VAR"])
 
+    def test_parse_env_file_rejects_symlink(self) -> None:
+        """parse_env_file refuse les symlinks avec O_NOFOLLOW (anti-exfiltration)."""
+        victim = self.tmp_dir / "victim.env"
+        victim.write_text("SENSITIVE_LEAKED_VAR=stolen\n", encoding="utf-8")
+        symlink_env = self.tmp_dir / "symlink.env"
+        try:
+            os.symlink(victim, symlink_env)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        # Refuse de lire la cible du symlink
+        self.assertEqual(parse_env_file(symlink_env), {})
+
+    def test_parse_example_names_rejects_symlink(self) -> None:
+        """parse_example_names refuse les symlinks avec O_NOFOLLOW."""
+        victim = self.tmp_dir / "victim.example"
+        victim.write_text("SENSITIVE_VAR=\n", encoding="utf-8")
+        symlink_example = self.tmp_dir / "symlink.example"
+        try:
+            os.symlink(victim, symlink_example)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        self.assertEqual(parse_example_names(symlink_example), [])
+
+    def test_get_secret_schema_validation_never_leaks_value(self) -> None:
+        """La validation du schéma ne divulgue jamais la valeur fautive (Invariant 8)."""
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        canary_probe = "TOP_SECRET_CANARY_VALUE_MUST_NEVER_LEAK"  # noqa: S105
+        resp_invalid = httpx.Response(
+            HTTPStatus.OK,
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "SECRET_PASS",
+                "status": "actif",
+                "value": canary_probe * 2000,  # Dépasse 65536
+            },
+            request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/SECRET_PASS"),
+        )
+        with patch.object(httpx.Client, "get", return_value=resp_invalid):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.get_secret("demo", "dev", "SECRET_PASS")
+            # Invariant 8 absolu : la valeur secrète ne doit JAMAIS figurer dans le message d'erreur
+            self.assertNotIn(canary_probe, str(ctx.exception))
+            self.assertIn("champs rejetés", str(ctx.exception))
+
+    def test_health_and_create_secret_reject_giant_json_response(self) -> None:
+        """health et create_secret rejettent les charges > 1 Mo sans DoS mémoire."""
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        giant_content = b"{" + b'"status":"ok",' * 100_000 + b'"end":true}'
+        resp_giant = httpx.Response(
+            HTTPStatus.OK,
+            content=giant_content,
+            request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
+        )
+        with patch.object(httpx.Client, "get", return_value=resp_giant):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("trop volumineuse", str(ctx.exception))
+
     def test_detect_project_fallback(self) -> None:
         """detect_project utilise le nom de dossier si rien d'autre."""
         with patch.dict(os.environ, {"HEIMDALL_PROJECT": "custom-proj"}):

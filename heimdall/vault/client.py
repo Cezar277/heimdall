@@ -59,6 +59,7 @@ _ALLOWED_LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "::1", 
 _MAX_PORT: Final[int] = 65535
 _MAX_TIMEOUT_SECONDS: Final[float] = 300.0
 _MAX_SECRET_VALUE_LEN: Final[int] = 65536
+_MAX_RESPONSE_BYTES: Final[int] = 1_048_576
 _GROUP_OTHER_PERMS_MASK: Final[int] = 0o077
 
 _PROJECT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -317,8 +318,24 @@ def _validate_loopback_url(base_url: str) -> str:
     return canonical
 
 
+def _parse_and_validate_json_dict(resp: Any, endpoint: str) -> dict[str, Any]:
+    """Parse et valide qu'une réponse est un dictionnaire JSON de taille bornée."""
+    content = getattr(resp, "content", b"")
+    if len(content) > _MAX_RESPONSE_BYTES:
+        raise VaultClientError(
+            f"Réponse {endpoint} trop volumineuse ({len(content)} octets)."
+        )
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise VaultClientError(f"Réponse JSON invalide pour {endpoint} : {exc}") from None
+    if not isinstance(data, dict):
+        raise VaultClientError(f"Format de réponse {endpoint} invalide : attendu un objet JSON.")
+    return data
+
+
 def _validate_secret_read_response(data: Any) -> dict[str, Any]:
-    """Valide strictement le schéma du secret retourné par le Vault."""
+    """Valide strictement le schéma du secret retourné par le Vault sans fuite de valeur."""
     if not isinstance(data, dict):
         raise VaultClientError("Format de réponse Vault invalide : attendu un objet JSON.")
 
@@ -326,9 +343,12 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
         try:
             _SecretResponseModel.model_validate(data)
         except ValidationError as exc:
+            # Invariant 8 : ne jamais inclure l'input ou str(exc) qui contiendrait la valeur
+            rejected = {str(err.get("loc", ("inconnu",))[-1]) for err in exc.errors()}
+            rejected_str = ", ".join(sorted(rejected))
             raise VaultClientError(
-                f"Réponse du Vault non conforme au schéma : {exc}"
-            ) from exc
+                f"Réponse du Vault non conforme au schéma (champs rejetés : {rejected_str})"
+            ) from None
     else:
         expected = {"project", "env", "name", "status", "value"}
         if set(data.keys()) != expected:
@@ -339,7 +359,7 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
         val = data.get("value")
         if not isinstance(val, str) or not (1 <= len(val) <= _MAX_SECRET_VALUE_LEN):
             raise VaultClientError(
-                "Valeur de secret non conforme au schéma (chaîne de 1 à 65536 caractères attendue)."
+                "Valeur de secret non conforme au schéma (champ 'value' rejeté)."
             )
         _validate_identifier(str(data["project"]), "projet", _PROJECT_ID_PATTERN)
         _validate_identifier(str(data["env"]), "environnement", _ENV_ID_PATTERN)
@@ -473,7 +493,10 @@ class VaultClient:
         except httpx.RequestError as exc:
             raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
         if resp.status_code == HTTPStatus.OK:
-            return resp.json()  # type: ignore[no-any-return]
+            data = _parse_and_validate_json_dict(resp, "health")
+            if "status" not in data or not isinstance(data["status"], str):
+                raise VaultClientError("Réponse health non conforme : champ 'status' manquant.")
+            return data
         self._handle_error_response(resp)
 
     def create_secret(
@@ -504,7 +527,11 @@ class VaultClient:
             raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
 
         if resp.status_code == HTTPStatus.CREATED:
-            return resp.json()  # type: ignore[no-any-return]
+            data = _parse_and_validate_json_dict(resp, "secrets")
+            expected_keys = {"project", "env", "name", "status"}
+            if not expected_keys.issubset(data.keys()):
+                raise VaultClientError("Réponse création secret non conforme : champs manquants.")
+            return data
         self._handle_error_response(resp)
 
     def get_secret(
@@ -526,10 +553,7 @@ class VaultClient:
             raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
 
         if resp.status_code == HTTPStatus.OK:
-            try:
-                data = resp.json()
-            except Exception as exc:
-                raise VaultClientError(f"Réponse JSON invalide du Vault : {exc}") from exc
+            data = _parse_and_validate_json_dict(resp, "secrets")
             return _validate_secret_read_response(data)
         self._handle_error_response(resp)
 
@@ -552,7 +576,13 @@ class VaultClient:
             raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
 
         if resp.status_code == HTTPStatus.OK:
-            return resp.json()  # type: ignore[no-any-return]
+            data = _parse_and_validate_json_dict(resp, "state")
+            expected_keys = {"project", "env", "name", "status"}
+            if not expected_keys.issubset(data.keys()):
+                raise VaultClientError("Réponse état secret non conforme : champs manquants.")
+            if "value" in data:
+                raise VaultClientError("L'endpoint state ne doit jamais renvoyer de valeur.")
+            return data
         self._handle_error_response(resp)
 
     def close(self) -> None:

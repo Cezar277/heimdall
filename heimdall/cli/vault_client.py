@@ -59,6 +59,9 @@ _DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
     "NODE_",
     "RUBY",
     "PERL",
+    "GIT_",
+    "BASH_FUNC",
+    "SYSTEMD_",
 )
 _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "PATH",
@@ -66,7 +69,15 @@ _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "IFS",
     "BASH_ENV",
     "ENV",
+    "GLIBC_TUNABLES",
+    "CORE_PAGER",
+    "PAGER",
+    "EDITOR",
+    "VISUAL",
 })
+
+_MAX_ERROR_MSG_LEN: Final[int] = 150
+_TRUNCATE_MSG_LEN: Final[int] = 147
 
 
 def is_dangerous_env_var(name: str) -> bool:
@@ -304,6 +315,12 @@ def _pull_secrets_from_vault(
                 err=True,
             )
             continue
+        if is_dangerous_env_var(name):
+            typer.echo(
+                f"Erreur de sécurité : le secret '{name}' est une variable système interdite.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
         try:
             record = client.get_secret(proj, env, name)
             val = record.get("value")
@@ -338,7 +355,10 @@ def _pull_secrets_from_vault(
             typer.echo(msg, err=True)
             raise typer.Exit(code=1) from None
         except VaultClientError as exc:
-            typer.echo(f"Erreur lors de la récupération de '{name}' : {exc}", err=True)
+            msg = str(exc)
+            if len(msg) > _MAX_ERROR_MSG_LEN:
+                msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+            typer.echo(f"Erreur lors de la récupération de '{name}' : {msg}", err=True)
             raise typer.Exit(code=1) from None
     return retrieved
 

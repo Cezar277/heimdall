@@ -138,15 +138,47 @@ def backup_file(path: Path) -> Path | None:
     return backup_path
 
 
+def _read_file_secure_no_follow(path: Path) -> str | None:
+    """Lit un fichier de manière sécurisée sans suivre les liens symboliques (anti-TOCTOU)."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = -1
+            return f.read()
+    except Exception:
+        return None
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:  # noqa: S110
+                pass
+    return None
+
+
 def parse_env_file(path: Path) -> dict[str, str]:
     """Parse un fichier .env en extrayant les paires clé=valeur.
 
     Ignore les commentaires (#...) et les lignes vides.
+    Refuse de suivre les liens symboliques (anti-exfiltration).
     """
-    if not path.is_file() or os.path.islink(path):
+    content = _read_file_secure_no_follow(path)
+    if content is None:
         return {}
     secrets: dict[str, str] = {}
-    content = path.read_text(encoding="utf-8")
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -164,11 +196,14 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
 
 def parse_example_names(path: Path) -> list[str]:
-    """Extrait les noms de variables déclarés dans un .env.example."""
-    if not path.is_file() or os.path.islink(path):
+    """Extrait les noms de variables déclarés dans un .env.example.
+
+    Refuse de suivre les liens symboliques.
+    """
+    content = _read_file_secure_no_follow(path)
+    if content is None:
         return []
     names: list[str] = []
-    content = path.read_text(encoding="utf-8")
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
