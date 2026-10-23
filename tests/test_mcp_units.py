@@ -571,6 +571,30 @@ class GitAccessDirectTests(unittest.TestCase):
             with self.assertRaises(ToolFailure):
                 access.execute(("rev-parse", "--verify", "objet-inexistant-xyz"))
 
+    def test_blob_access_uses_end_of_options_and_a_capped_read(self) -> None:
+        """Revue (LOW) : argv `cat-file` figé et lecture de blob bornée.
+
+        Le `--` interdit toute interprétation d'option même si la garde SHA
+        évoluait ; `blob_bytes` passe par `_read_capped`, jamais par
+        `execute(capture_output=True)`.
+        """
+        access = gitdiff.GitAccess(self.repo.root)
+        blob = "a" * 40
+        self.assertEqual(
+            gitdiff._cat_file_arguments("-s", blob),
+            ("cat-file", "-s", "--", blob),
+        )
+        self.assertEqual(
+            gitdiff._cat_file_arguments("blob", blob),
+            ("cat-file", "blob", "--", blob),
+        )
+        with mock.patch.object(gitdiff.GitAccess, "_read_capped", return_value=b"x") as read:
+            self.assertEqual(access.blob_bytes(blob), b"x")
+        read.assert_called_once_with(
+            ("cat-file", "blob", "--", blob),
+            gitdiff.MAX_FILE_BYTES,
+        )
+
     def test_staged_diff_truncation_flag(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
         self.repo.write("a.txt", "x\n")

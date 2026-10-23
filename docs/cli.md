@@ -2,8 +2,10 @@
 
 Statut : livré par le ticket #29 (sous-ticket de l'épic #6 « CLI, hook et CI
 headless »). La commande est **branchée** sur le scanner déterministe #22 et
-sur l'accès git confiné #27. Elle est **en lecture seule** : elle signale, elle
-ne répare rien (la remédiation et la validation Y/N/E arrivent avec #32).
+sur l'accès git confiné #27. Elle est **en lecture seule sur le dépôt** :
+elle signale, elle ne répare rien (la remédiation et la validation Y/N/E
+arrivent avec #32). La seule écriture autorisée est la clé d'empreinte locale
+hors dépôt, créée au premier run (voir Invariants).
 
 Références :
 
@@ -214,9 +216,13 @@ document si `count != len(findings)` (contrainte explicitée dans la
 
 ## Invariants
 
-- **Lecture seule** : un scan n'écrit rien (ni dans le dépôt, ni à côté). La
-  clé d'empreinte locale vit hors dépôt (`$XDG_DATA_HOME/heimd/`), comme
-  documenté dans [scanner.md](scanner.md#empreinte-et-entropie).
+- **Lecture seule sur le dépôt** : un scan n'écrit rien dans le dépôt ni à
+  côté. La seule écriture autorisée est la clé d'empreinte locale hors dépôt
+  (`$XDG_DATA_HOME/heimdall/snippet-hmac.key`, `0600`, créée au premier
+  run), comme documenté dans
+  [scanner.md](scanner.md#empreinte-et-entropie). Si sa création ou sa
+  lecture est impossible (HOME/FS en lecture seule, clé invalide), le scan
+  est refusé en code 2 — jamais un verdict 0.
 - **Aucun secret en clair** : ni dans la sortie, ni dans un message d'erreur,
   ni dans une traceback (invariant 8).
 - **Messages d'erreur statiques** : le chemin fourni n'est jamais reflété.

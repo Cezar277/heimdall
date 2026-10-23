@@ -38,6 +38,7 @@ from heimdall.cli.scan import (
 )
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess, StagedChange, parse_staged_raw
+from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.hashing import SnippetHasher
@@ -648,6 +649,27 @@ def test_scan_staged_rejects_oversized_blob(git_repo: GitRepo) -> None:
     git_repo.stage("gros.txt")
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
+
+
+def test_scan_staged_caps_blob_bytes_before_buffering(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `blob_bytes` est lu en flux borné, jamais bufferisé entier.
+
+    L'oracle `cat-file -s` annonce 1 octet alors que le blob réel dépasse
+    1 Mio : `_read_capped` tue le processus au-delà de ``MAX_FILE_BYTES``
+    et rend 2, sans attendre le contrôle `len(data) != size`.
+    """
+    git_repo.write("gros.txt", "A" * (MAX_FILE_BYTES + 1))
+    git_repo.stage("gros.txt")
+
+    def taille_mensongere(self: GitAccess, blob: str) -> int:
+        return 1
+
+    monkeypatch.setattr(GitAccess, "blob_size", taille_mensongere)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
 def test_scan_staged_skips_a_binary_blob(git_repo: GitRepo) -> None:
@@ -1267,6 +1289,42 @@ def test_scan_ci_on_a_clean_repository_exits_zero(tmp_path: Path) -> None:
     resultat = _run("scan", "--ci", str(racine))
     assert resultat.exit_code == EXIT_CLEAN
     assert "0 secret(s) détecté(s)" in resultat.stderr
+
+
+def test_scan_ci_creates_the_local_key_outside_the_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : la seule écriture est la clé HMAC hors dépôt.
+
+    Un premier scan sur un HOME/XDG inscriptible crée
+    ``$XDG_DATA_HOME/heimdall/snippet-hmac.key`` en 0600, jamais dans le
+    dépôt scanné.
+    """
+    monkeypatch.delenv("HEIMDALL_SNIPPET_HMAC_KEY", raising=False)
+    monkeypatch.delenv("HEIMDALL_SNIPPET_HMAC_KEY_FILE", raising=False)
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
+    resultat = _run("scan", "--ci", str(racine))
+    assert resultat.exit_code == EXIT_CLEAN
+    key_path = xdg / "heimdall" / "snippet-hmac.key"
+    assert key_path.is_file()
+    assert not (racine / "snippet-hmac.key").exists()
+
+
+def test_scan_ci_fails_closed_when_the_local_key_cannot_be_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : HOME/XDG en lecture seule -> 2, jamais un 0 silencieux."""
+    monkeypatch.delenv("HEIMDALL_SNIPPET_HMAC_KEY", raising=False)
+    monkeypatch.delenv("HEIMDALL_SNIPPET_HMAC_KEY_FILE", raising=False)
+    blocked = tmp_path / "xdg-bloque"
+    blocked.write_text("pas un répertoire", encoding="utf-8")
+    monkeypatch.setenv("XDG_DATA_HOME", str(blocked))
+    racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
+    resultat = _run("scan", "--ci", str(racine))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
 def test_scan_ci_json_staged_combines(git_repo: GitRepo) -> None:

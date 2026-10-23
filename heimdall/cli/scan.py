@@ -1,9 +1,13 @@
 """Scan de la CLI ``heimdall scan`` (#29).
 
 Ce module porte la **logique** du scan ; ``heimdall/cli/main.py`` ne fait que
-traduire le résultat en code de sortie et en affichage. Il ne fait aucune
-écriture : un scan est une lecture, jamais une remédiation (celle-ci arrive
-avec #32, et seulement après validation humaine Y/N/E).
+traduire le résultat en code de sortie et en affichage. Il n'écrit **rien
+dans le dépôt scanné** : un scan est une lecture, jamais une remédiation
+(celle-ci arrive avec #32, et seulement après validation humaine Y/N/E). La
+seule écriture possible est la clé d'empreinte locale, hors dépôt
+(``$XDG_DATA_HOME/heimdall/snippet-hmac.key``, créée en 0600 au premier
+run) ; son indisponibilité est une erreur d'outillage (code 2), jamais un
+verdict propre.
 
 Deux périmètres, un seul verdict :
 

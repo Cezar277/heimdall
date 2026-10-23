@@ -12,7 +12,7 @@ revue APPROVE WITH COMMENTS), ses premiers durcissements (`ae0b1c7`), les
 correctifs de la seconde revue (`593021c`, run 39838145119), ceux de la
 troisième revue (`251fd18`, run 39841323251) et la présente passe
 (run 39844814050). Les permaliens ci-dessous épinglent ce SHA : un lien vers
-la branche changerait de lignes au fil des commits. Les septième à dixième
+la branche changerait de lignes au fil des commits. Les septième à onzième
 passes (courantes, voir plus bas) seront re-pinnées sur le SHA final du
 squash/merge.
 
@@ -58,14 +58,14 @@ Environnement : Linux, Python 3.14.8, venv du dépôt.
 
 ```text
 .venv/bin/python -m pytest tests/test_cli_scan.py -q
-89 passed
+92 passed
 
 .venv/bin/python -m pytest
-1530 passed, 4321 subtests passed
+1534 passed, 4321 subtests passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch \
   --cov-report=term-missing --cov-fail-under=85
-Total coverage: 95,83 % (seuil 85 % atteint)
+Total coverage: 95,86 % (seuil 85 % atteint)
 heimdall/cli/scan.py : 97 % ; heimdall/cli/main.py : 98 % ;
 heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 91 % ;
 heimdall/scanner/exclusions.py : 95 % ;
@@ -201,6 +201,16 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
 | LOW — binaire inconnu à suffixe technique sauté en strict | le repli `_decode_data` n'est armé que pour un binaire **connu** (`is_known_binary` : magie connue + ratio ≥ 0,5). NUL + magie inconnue + texte reste `ScanError` en arbre strict comme en `--staged` (code 2) | `heimdall/scanner/exclusions.py` (`is_known_binary`), `heimdall/scanner/detect.py` (`_decode_data`) ; `tests/test_cli_scan.py::test_scan_tree_strict_refuses_unknown_binary_suffix` |
 | LOW — durée totale non bornée en `--staged` | deadline globale `MAX_STAGED_SECONDS` (120 s) : refus code 2 avant de lancer de nouvelles lectures au-delà ; chaque appel git garde son timeout unitaire de 30 s | `heimdall/cli/scan.py` (`_collect_staged`), `docs/cli.md` ; `tests/test_cli_scan.py::test_scan_staged_refuses_global_deadline` |
 
+## Correctifs de la onzième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — `blob_bytes` bufferisé sans borne avant contrôle | `blob_bytes` passe par `_read_capped(..., MAX_FILE_BYTES)` : lecture streamée, processus tué au-delà de 1 Mio, `ToolFailure` → code 2. Le contrôle `len(data) == size` reste en place | `heimdall/mcp/gitdiff.py` (`blob_bytes`, `_read_capped`), `tests/test_cli_scan.py::test_scan_staged_caps_blob_bytes_before_buffering`, `tests/test_mcp_units.py::GitAccessDirectTests::test_blob_access_uses_end_of_options_and_a_capped_read` |
+| LOW — `cat-file` sans marqueur de fin d'options | construction centralisée `_cat_file_arguments` : `cat-file <mode> -- <sha validé>`, donc aucune valeur ne peut être relue comme option même si la garde SHA évolue | `heimdall/mcp/gitdiff.py` (`_cat_file_arguments`, `blob_size`, `blob_bytes`), `tests/test_mcp_units.py::GitAccessDirectTests::test_blob_access_uses_end_of_options_and_a_capped_read` |
+| LOW — « lecture seule » contredit par la clé HMAC | docstring et `docs/cli.md` précisent : lecture seule **sur le dépôt**, seule écriture autorisée = clé locale hors dépôt (`$XDG_DATA_HOME/heimdall/snippet-hmac.key`, 0600). HOME/FS en lecture seule → code 2, jamais 0 | `heimdall/cli/scan.py` (docstring), `docs/cli.md` ; `tests/test_cli_scan.py::test_scan_ci_creates_the_local_key_outside_the_repository`, `::test_scan_ci_fails_closed_when_the_local_key_cannot_be_created` |
+
 ## Limites assumées
 
 - La validation humaine Y/N/E et le remplacement du secret ne sont pas dans ce
@@ -234,8 +244,9 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
   ajoutés ; huitième revue APPROVE WITH COMMENTS, 3 points LOW et leurs tests
   de non-régression ajoutés ; neuvième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests ajoutés ; dixième revue APPROVE WITH COMMENTS, 3 points
+  LOW et leurs tests ajoutés ; onzième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests de non-régression ajoutés dans la passe courante (voir
-  les dix tableaux ci-dessus).
+  les onze tableaux ci-dessus).
 - La feuille SAMM externe n'est pas accessible depuis le dépôt : reporter les
   lignes ci-dessus avec le lien de la PR et le SHA final du squash/merge
   (**re-pinner les permaliens sur ce SHA final** si le squash crée un SHA

@@ -58,7 +58,7 @@ from typing import Final
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.paths import is_rel_path
-from heimdall.scanner.detect import _resolve_root
+from heimdall.scanner.detect import MAX_FILE_BYTES, _resolve_root
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import validate_relative_path
 
@@ -508,7 +508,7 @@ class GitAccess:
         l'appelant ne doit jamais pouvoir reculer. Zéro reste valide — un
         blob vide ne porte aucun candidat.
         """
-        completed = self.execute(("cat-file", "-s", _checked_object(blob)))
+        completed = self.execute(_cat_file_arguments("-s", blob))
         if completed.returncode != 0:
             raise ToolFailure("INTERNAL")
         try:
@@ -526,11 +526,13 @@ class GitAccess:
         Aucun filtre ``textconv``, aucune conversion ``CRLF`` : c'est le
         contenu que git a indexé, octet pour octet. Le secret y figure —
         l'appelant ne le **montre** jamais (il n'en garde qu'une empreinte).
+
+        La lecture est **streamée et bornée** à :data:`MAX_FILE_BYTES` via
+        ``_read_capped`` : si l'oracle ``cat-file -s`` mentait (store
+        incohérent, objet remplacé), le surplus n'est jamais bufferisé. Le
+        sous-processus est tué au-delà de la borne et c'est ``ToolFailure``.
         """
-        completed = self.execute(("cat-file", "blob", _checked_object(blob)))
-        if completed.returncode != 0:
-            raise ToolFailure("INTERNAL")
-        return completed.stdout
+        return self._read_capped(_cat_file_arguments("blob", blob), MAX_FILE_BYTES)
 
 
 @dataclass(frozen=True)
@@ -574,6 +576,17 @@ def _checked_object(blob: str) -> str:
     if _OBJECT_PATTERN.fullmatch(blob) is None:
         raise ToolFailure("INTERNAL")
     return blob
+
+
+def _cat_file_arguments(mode: str, blob: str) -> tuple[str, ...]:
+    """Argv ``cat-file`` figé : mode, **fin d'options**, SHA validé.
+
+    Le ``--`` est une défense en profondeur : même si la validation du SHA
+    évoluait (nouveau format, SHA abrégé), aucune valeur ne pourrait être
+    interprétée comme une option de git. La construction est centralisée
+    pour que ``blob_size`` et ``blob_bytes`` ne puissent pas diverger.
+    """
+    return ("cat-file", mode, "--", _checked_object(blob))
 
 
 def parse_staged_raw(raw: bytes) -> list[StagedChange]:
