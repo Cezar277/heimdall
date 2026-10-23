@@ -1054,6 +1054,18 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             write_file_atomic(target, "SECRET=1\n")
         self.assertIn("lien symbolique", str(ctx.exception))
 
+    def test_write_file_atomic_refuses_file_as_intermediate_component(self) -> None:
+        """Un composant parent qui est un fichier régulier → refus (pas un répertoire)."""
+        base = self.tmp_dir / "file_base"
+        base.mkdir()
+        blocking_file = base / "sub"
+        blocking_file.write_text("je suis un fichier, pas un dossier\n", encoding="utf-8")
+        target = blocking_file / "output.env"
+        with self.assertRaises(ValueError) as ctx:
+            write_file_atomic(target, "SECRET=1\n")
+        self.assertIn("pas un répertoire", str(ctx.exception))
+        self.assertFalse((base / "sub").is_dir())
+
     def test_read_file_secure_no_follow_refuses_symlinked_intermediate(self) -> None:
         """Lecture insensible aux symlinks intermédiaires : `out/sub` → lien → None."""
         if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
