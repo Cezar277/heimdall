@@ -106,7 +106,8 @@ def _write_file_atomic_fallback(
     check-then-use par construction (pas de ``dir_fd``) : il refuse tout
     symlink avant ``replace`` et revérifie par ``lstat`` après ``replace``
     (fail-closed), sans prétendre à la même résistance aux courses que la
-    voie POSIX.
+    voie POSIX. Cible de confinement : Linux/POSIX uniquement (CI
+    self-hosted Linux) ; Windows n'est couvert qu'en best-effort.
     """
     prefix = f".{path.name}.tmp."
     temp_fd, temp_path_str = tempfile.mkstemp(prefix=prefix, dir=parent)

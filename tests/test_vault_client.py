@@ -17,6 +17,7 @@ import unittest
 from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import httpx
 
@@ -41,10 +42,12 @@ from heimdall.vault.client import (
     VaultNotFoundError,
     VaultRateLimitError,
     VaultUnavailableError,
+    _check_localhost_resolution,
     _read_and_check_key_file,
     _validate_identifier,
     detect_project,
     resolve_api_key,
+    resolve_vault_url,
 )
 
 _VALID_URL = "https://127.0.0.1:8443"
@@ -1013,6 +1016,25 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             self.skipTest("Symlinks non supportés")
         with self.assertRaises(VaultClientError):
             _read_and_check_key_file(inter / "vault.key")
+
+    def test_default_vault_url_avoids_dns_and_rebinding_is_documented(self) -> None:
+        """Non-régression : défaut `127.0.0.1` (aucune résolution) + risque documenté."""
+        with patch.dict(os.environ, {}, clear=False):
+            with patch.dict(os.environ, {"HEIMDALL_VAULT_URL": ""}):
+                self.assertEqual(resolve_vault_url(None), "https://127.0.0.1:8443")
+        host = urlparse(resolve_vault_url(None)).hostname
+        self.assertEqual(host, "127.0.0.1")
+        # Si le défaut change vers `localhost`, ce test casse volontairement :
+        # le risque de rebinding doit rester documenté.
+        doc = _check_localhost_resolution.__doc__ or ""
+        self.assertIn("127.0.0.1", doc)
+        self.assertIn("localhost", doc)
+
+    def test_windows_fallback_posix_only_guarantee_is_documented(self) -> None:
+        """Non-régression : le repli check-then-use reste documenté POSIX-only."""
+        doc = _write_file_atomic_fallback.__doc__ or ""
+        self.assertIn("POSIX", doc)
+        self.assertIn("lstat", doc)
 
     def test_get_secret_without_pydantic_raises_vault_client_error_on_invalid_identifiers(
         self,

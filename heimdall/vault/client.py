@@ -252,7 +252,13 @@ def resolve_api_key(key_file: Path | None = None) -> str:
 
 
 def resolve_vault_url(url: str | None = None) -> str:
-    """Résout l'URL canonique du Vault depuis l'argument, l'environnement ou le défaut."""
+    """Résout l'URL canonique du Vault depuis l'argument, l'environnement ou le défaut.
+
+    Le défaut est ``https://127.0.0.1:8443`` (littéral IP, aucune résolution
+    DNS) : ``localhost`` reste accepté par compatibilité mais impose une
+    résolution à la construction puis à chaque connexion (fenêtre de
+    rebinding documentée dans ``_check_localhost_resolution``).
+    """
     if url is not None and url.strip():
         return url.strip()
     env_url = os.environ.get("HEIMDALL_VAULT_URL")
