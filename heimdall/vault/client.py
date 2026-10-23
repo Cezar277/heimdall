@@ -474,9 +474,14 @@ def _validate_metadata_response(data: Any, label: str) -> dict[str, Any]:
             raise VaultClientError(
                 f"Réponse {label} non conforme : clés inattendues ou manquantes."
             )
-        _validate_identifier(str(data["project"]), "projet", _PROJECT_ID_PATTERN)
-        _validate_identifier(str(data["env"]), "environnement", _ENV_ID_PATTERN)
-        _validate_identifier(str(data["name"]), "nom de secret", _SECRET_NAME_PATTERN)
+        try:
+            _validate_identifier(str(data["project"]), "projet", _PROJECT_ID_PATTERN)
+            _validate_identifier(str(data["env"]), "environnement", _ENV_ID_PATTERN)
+            _validate_identifier(str(data["name"]), "nom de secret", _SECRET_NAME_PATTERN)
+        except ValueError as exc:
+            raise VaultClientError(
+                f"Identifiant non conforme dans {label} (champ rejeté) : {exc}"
+            ) from None
         status = data.get("status")
         if not isinstance(status, str) or not (1 <= len(status) <= _MAX_STATUS_LEN):
             status_preview = status[:32] if isinstance(status, str) else type(status).__name__
@@ -512,9 +517,14 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
             raise VaultClientError(
                 "Valeur de secret non conforme au schéma (champ 'value' rejeté)."
             )
-        _validate_identifier(str(data["project"]), "projet", _PROJECT_ID_PATTERN)
-        _validate_identifier(str(data["env"]), "environnement", _ENV_ID_PATTERN)
-        _validate_identifier(str(data["name"]), "nom de secret", _SECRET_NAME_PATTERN)
+        try:
+            _validate_identifier(str(data["project"]), "projet", _PROJECT_ID_PATTERN)
+            _validate_identifier(str(data["env"]), "environnement", _ENV_ID_PATTERN)
+            _validate_identifier(str(data["name"]), "nom de secret", _SECRET_NAME_PATTERN)
+        except ValueError as exc:
+            raise VaultClientError(
+                f"Identifiant non conforme dans le secret (champ rejeté) : {exc}"
+            ) from None
 
     status_val = data.get("status")
     if status_val not in ("actif", "revoque", "vaulte"):

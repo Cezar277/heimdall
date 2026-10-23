@@ -888,6 +888,28 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             write_file_atomic(target, "SECRET=1\n")
         self.assertIn("lien symbolique", str(ctx.exception))
 
+    def test_get_secret_without_pydantic_raises_vault_client_error_on_invalid_identifiers(
+        self,
+    ) -> None:
+        """get_secret sans pydantic (BaseModel=None) lève VaultClientError (pas ValueError)."""
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        resp_invalid_id = httpx.Response(
+            HTTPStatus.OK,
+            json={
+                "project": "INVALID/PROJECT!",
+                "env": "dev",
+                "name": "MY_KEY",
+                "status": "actif",
+                "value": "secret",
+            },
+            request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/MY_KEY"),
+        )
+        with patch("heimdall.vault.client.BaseModel", None):
+            with patch.object(httpx.Client, "send", return_value=resp_invalid_id):
+                with self.assertRaises(VaultClientError) as ctx:
+                    client.get_secret("demo", "dev", "MY_KEY")
+                self.assertIn("Identifiant non conforme", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -865,21 +865,51 @@ class VaultRunCliTests(unittest.TestCase):
             with patch("heimdall.cli.vault_client._init_client") as mock_init:
                 client_instance = MagicMock()
                 client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "SAFE_VAR",
+                    "status": "actif",
+                    "value": "secret_val",
+                }
                 mock_init.return_value = client_instance
 
-                result = self.runner.invoke(app, ["run", "--project", "demo", "--", "true"])
+                result = self.runner.invoke(
+                    app, ["run", "--project", "demo", "--name", "SAFE_VAR", "--", "true"]
+                )
                 self.assertEqual(result.exit_code, 0)
 
     def test_run_permission_error(self) -> None:
         """Exit 126 si l'exécution déclenche une PermissionError."""
-        with patch("shutil.which", return_value="/bin/echo"):
-            with patch("subprocess.run", side_effect=PermissionError):
-                result = self.runner.invoke(
-                    app,
-                    ["run", "--project", "demo", "--", "echo", "hello"],
-                )
-                self.assertEqual(result.exit_code, 126)
-                self.assertIn("permission refusée", result.output)
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "SAFE_VAR",
+                    "status": "actif",
+                    "value": "secret_val",
+                }
+                mock_init.return_value = client_instance
+                with patch("shutil.which", return_value="/bin/echo"):
+                    with patch("subprocess.run", side_effect=PermissionError):
+                        result = self.runner.invoke(
+                            app,
+                            [
+                                "run",
+                                "--project",
+                                "demo",
+                                "--name",
+                                "SAFE_VAR",
+                                "--",
+                                "echo",
+                                "hello",
+                            ],
+                        )
+                        self.assertEqual(result.exit_code, 126)
+                        self.assertIn("permission refusée", result.output)
 
     def test_run_resolves_names_from_dot_env(self) -> None:
         """Récupération des variables depuis .env si ni --name ni .env.example ne sont fournis."""
@@ -887,6 +917,13 @@ class VaultRunCliTests(unittest.TestCase):
             with patch("heimdall.cli.vault_client._init_client") as mock_init:
                 client_instance = MagicMock()
                 client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "RESOLVED_FROM_ENV",
+                    "status": "actif",
+                    "value": "val",
+                }
                 mock_init.return_value = client_instance
 
                 # On écrit un .env local
@@ -962,6 +999,13 @@ class VaultRunCliTests(unittest.TestCase):
             with patch("heimdall.cli.vault_client._init_client") as mock_init:
                 client_instance = MagicMock()
                 client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "SAFE_VAR",
+                    "status": "actif",
+                    "value": "val",
+                }
                 mock_init.return_value = client_instance
 
                 result = self.runner.invoke(
@@ -970,6 +1014,8 @@ class VaultRunCliTests(unittest.TestCase):
                         "run",
                         "--project",
                         "demo",
+                        "--name",
+                        "SAFE_VAR",
                         "--",
                         "python",
                         "-c",
@@ -1204,6 +1250,27 @@ class VaultRunCliTests(unittest.TestCase):
             finally:
                 if dummy_env.exists():
                     dummy_env.unlink()
+
+    def test_run_without_names_or_env_files_exits_2(self) -> None:
+        """run sans --name ni .env.example/.env sort en 2 (fail-closed)."""
+        empty_dir = Path(tempfile.mkdtemp())
+        result = self.runner.invoke(
+            app,
+            [
+                "run",
+                "--project",
+                "demo",
+                "--example-file",
+                str(empty_dir / ".env.example"),
+                "--",
+                "python",
+                "-c",
+                "print('SHOULD_NOT_RUN')",
+            ],
+        )
+        self.assertEqual(result.exit_code, 2)
+        self.assertNotIn("SHOULD_NOT_RUN", result.output)
+        self.assertIn("Aucun secret", result.output)
 
 
 if __name__ == "__main__":

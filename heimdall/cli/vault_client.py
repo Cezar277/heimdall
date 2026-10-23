@@ -458,20 +458,19 @@ def _pull_secrets_from_vault(
         try:
             record = client.get_secret(proj, env, name)
             val = record.get("value")
-            if val is None:
+            if not isinstance(val, str):
                 typer.echo(
                     f"Erreur : valeur de type inattendu pour '{name}' dans le Vault.",
                     err=True,
                 )
                 raise typer.Exit(code=1)
-            val_str = str(val)
-            if "\x00" in val_str:
+            if "\x00" in val:
                 typer.echo(
                     f"Erreur de sécurité : le secret '{name}' contient un octet nul interdit.",
                     err=True,
                 )
                 raise typer.Exit(code=1)
-            retrieved[name] = val_str
+            retrieved[name] = val
         except VaultNotFoundError:
             typer.echo(
                 f"Avertissement : secret '{name}' introuvable dans le Vault ({proj}/{env}).",
@@ -613,7 +612,12 @@ def _resolve_run_names(
         from_env = list(parsed.keys())
         if from_env:
             return from_env
-    return []
+    typer.echo(
+        "Erreur : Aucun secret spécifié ou découvert. "
+        "Utilisez --name, fournissez un .env.example ou pointez vers un .env existant.",
+        err=True,
+    )
+    raise typer.Exit(code=2)
 
 
 def vault_run(  # noqa: PLR0913, PLR0917
@@ -647,14 +651,22 @@ def vault_run(  # noqa: PLR0913, PLR0917
         )
         raise typer.Exit(code=2)
 
+    # Résolution préalable de l'exécutable dans le PATH actuel sans influence de variables injectées
+    executable = shutil.which(cmd[0])
+    if executable is None and not Path(cmd[0]).is_file():
+        typer.echo(f"Erreur : commande introuvable : '{cmd[0]}'", err=True)
+        raise typer.Exit(code=127)
+
     proj = _validate_project_and_env(project, env)
     target_names = _resolve_run_names(names, example_file)
 
-    injected_secrets: dict[str, str] = {}
-    if target_names:
-        client = _init_client(vault_url, ca_cert)
-        with client:
-            injected_secrets = _pull_secrets_from_vault(client, proj, env, target_names)
+    client = _init_client(vault_url, ca_cert)
+    with client:
+        injected_secrets = _pull_secrets_from_vault(client, proj, env, target_names)
+
+    if not injected_secrets:
+        typer.echo("Erreur : Aucun secret récupéré depuis le Vault pour injection.", err=True)
+        raise typer.Exit(code=1)
 
     # Allowlist locale : `injected_secrets` est indexé par les noms demandés
     # localement (jamais par `record["name"]` renvoyé par le Vault).
@@ -666,12 +678,6 @@ def vault_run(  # noqa: PLR0913, PLR0917
                 err=True,
             )
             raise typer.Exit(code=1)
-
-    # Résolution préalable de l'exécutable dans le PATH actuel sans influence de variables injectées
-    executable = shutil.which(cmd[0])
-    if executable is None and not Path(cmd[0]).is_file():
-        typer.echo(f"Erreur : commande introuvable : '{cmd[0]}'", err=True)
-        raise typer.Exit(code=127)
 
     target_cmd = [executable if executable is not None else cmd[0], *cmd[1:]]
     child_env = {**os.environ, **injected_secrets}
