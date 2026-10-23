@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -27,6 +28,8 @@ from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
     Finding,
     ScanError,
+    Scanner,
+    _validate_relative_path,
     find_candidates,
     scan,
 )
@@ -36,6 +39,7 @@ from heimdall.scanner.exclusions import (
     is_excluded,
     is_excluded_directory,
 )
+from heimdall.scanner.finding import validate_relative_path
 from heimdall.scanner.hashing import KEY_ENV, KEY_FILE_ENV, SnippetHasher, load_local_key
 from heimdall.scanner.signatures import SIGNATURES, find_signature_matches
 
@@ -316,6 +320,44 @@ def test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries() -> None:
     assert not is_excluded_directory("env")
     assert not is_excluded_directory("src")
     assert not is_excluded("")
+    # Revue (LOW) : en strict, un suffixe binaire n'exclut plus à lui seul ;
+    # le contenu décide (un texte mal nommé doit être scanné).
+    assert not is_excluded("image.png", strict=True)
+    assert is_excluded(".coverage", strict=True)
+    assert is_excluded("node_modules/pkg/index.js", strict=True)
+    # Revue (LOW) : les sorties de build textuelles ne sont plus techniques.
+    for path in (
+        "build/output.js",
+        "dist/bundle.js",
+        "target/app.js",
+        "bower_components/lib.js",
+        "htmlcov/index.html",
+    ):
+        assert is_excluded(path), path
+        assert not is_excluded(path, strict=True), path
+    assert is_excluded_directory("build")
+    assert not is_excluded_directory("build", strict=True)
+    assert is_excluded_directory("node_modules", strict=True)
+
+
+def test_detect_path_guard_is_the_finding_contract() -> None:
+    """Revue (LOW) : la garde de chemin du scanner est celle du contrat #14.
+
+    Fuzz court sur les caractères qui distinguent les deux grammaires : toute
+    divergence future (nouveau caractère interdit, longueur, segments) casse
+    ce test au lieu de produire un ``FileTarget``/``Finding`` incohérent.
+    """
+    alphabet = ("a", "/", ".", ":", "\\", "\x00", "\x7f", "\u2028")
+    for length in range(4):
+        for characters in itertools.product(alphabet, repeat=length):
+            chemin = "".join(characters)
+            try:
+                attendu = validate_relative_path(chemin)
+            except ValueError:
+                with pytest.raises(ScanError):
+                    _validate_relative_path(chemin)
+            else:
+                assert _validate_relative_path(chemin) == attendu
 
 
 def test_scan_skips_excluded_files_but_scans_env_and_pem(tmp_path: Path) -> None:
@@ -502,6 +544,34 @@ def test_symlinks_are_never_followed(tmp_path: Path) -> None:
     assert [finding["file"] for finding in find_candidates(str(repository))] == ["app.py"]
 
 
+def test_directory_is_symlink_oserror_raises_scan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `os.walk` avec `is_symlink` dossier qui lève OSError -> ScanError.
+
+    En cas d'erreur système lors du contrôle d'un sous-répertoire (permission,
+    course, composant illisible), le scanner bibliothèque doit lever ScanError
+    (contrat fail-closed), jamais une OSError brute.
+    """
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subdir = repository / "sub"
+    subdir.mkdir()
+    _write(subdir, "file.py", "x = 1\n")
+    scanner = Scanner(repository)
+
+    real_is_symlink = Path.is_symlink
+
+    def failing_is_symlink(self: Path) -> bool:
+        if self == subdir:
+            raise OSError("permission denied")
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", failing_is_symlink)
+    with pytest.raises(ScanError):
+        scanner.scan()
+
+
 # --- Lecture, confinement et fail-closed ------------------------------------
 
 
@@ -510,6 +580,41 @@ def test_single_file_root_uses_a_relative_name(tmp_path: Path) -> None:
     findings = scan(path)
     assert isinstance(findings[0], Finding)
     assert [finding.file for finding in findings] == ["one.py"]
+
+
+def test_scanner_refuses_an_expired_deadline(tmp_path: Path) -> None:
+    """Revue (LOW) : la deadline arbre est fail-closed même sans fichier lu.
+
+    La CLI borne le mode arbre comme `--staged` ; le scanner bibliothèque
+    accepte une échéance optionnelle et refuse avant de rendre un résultat.
+    """
+    _write(tmp_path, "app.py", "x = 1\n")
+    with pytest.raises(ScanError):
+        Scanner(tmp_path).scan(deadline=time.monotonic() - 1)
+
+
+def test_scan_text_checks_deadline_intra_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un seul fichier dense ne peut pas ignorer la deadline.
+
+    L'horloge expire au premier candidat : `_append` doit refuser avant le
+    hachage HMAC, pas attendre le plafond de 10 000 Findings.
+    """
+    _write(tmp_path, "dense.py", "x = 1\n")
+    appels = [0]
+
+    def monotonic() -> float:
+        appels[0] += 1
+        return 0.0 if appels[0] == 1 else 2.0
+
+    monkeypatch.setattr("heimdall.scanner.detect.time.monotonic", monotonic)
+    with pytest.raises(ScanError):
+        Scanner(tmp_path)._scan_text(
+            f'AWS = "{_aws()}"',
+            "dense.py",
+            deadline=1.0,
+        )
 
 
 def test_invalid_utf8_is_scanned_with_replacement(tmp_path: Path) -> None:

@@ -3,8 +3,8 @@
 Statut : livré par le ticket #22 (sous-tickets #53 interface/Finding, #54
 signatures, #59 exclusions, #60 tests). Contrat de sortie : [Finding v1](contracts/finding.md)
 et [`schemas/finding.schema.json`](../schemas/finding.schema.json). La commande
-CLI `heimdall scan` sera branchée par #29 ; le scanner est déjà utilisable comme
-bibliothèque et par les tests d'acceptation T21.
+CLI `heimdall scan` est branchée par #29 (voir [cli.md](cli.md)) ; le scanner
+est aussi utilisable comme bibliothèque et par les tests d'acceptation T21.
 
 ## API
 
@@ -13,6 +13,10 @@ from heimdall.scanner import Finding, Scanner, find_candidates
 
 findings: list[Finding] = Scanner(".").scan()
 payload: list[dict[str, object]] = find_candidates(".")  # contrat #14
+
+# Mode strict (#29) : seules les exclusions techniques restent, les
+# répertoires et fichiers tiers textuels (vendor/, lockfiles) sont analysés.
+strict: list[Finding] = Scanner(".", strict=True).scan()
 ```
 
 `Scanner` accepte un répertoire ou un fichier régulier explicite. `root` est
@@ -73,7 +77,7 @@ Politique explicite, jamais une heuristique :
   `.npmignore`, `.coverage` ;
 - répertoires : `.git`, `.hg`, `.svn`, environnements virtuels (`.venv`, `venv`,
   `virtualenv`), `vendor`, `node_modules`, `third_party`, `build`, `dist`,
-  `target`, caches Python ;
+  `target`, `bower_components`, `htmlcov`, caches Python ;
 - lockfiles : suffixe `.lock`, `package-lock.json`, `yarn.lock`,
   `pnpm-lock.yaml`, `go.sum`, `bun.lockb` ;
 - binaires : extension connue, ou signature magique connue **et** contenu
@@ -85,6 +89,28 @@ virtuels connus le sont. Un dossier de sources `env/` est donc scanné.
 `.env`, `.env.example`, `requirements.txt`, les fichiers sans extension et les
 `.pem`/`.key` sont scannés. Les mocks de `tests/` ne sont **pas** exclus
 globalement : ils font partie du corpus de non-régression T21.
+
+### Deux familles d'exclusions, et le mode strict (#29)
+
+Les exclusions ci-dessus se répartissent en deux familles, et cette
+répartition fonde le mode **strict** livré par #29 (`heimdall scan`) :
+
+| Famille | Contenu | Mode strict |
+| --- | --- | --- |
+| **technique** | binaires, dépendances et environnements (`.git`, `node_modules`, `.venv`, `__pycache__`, caches…), `.coverage`, `bun.lockb` | **exclus** (ils sont illisibles ou illisibles par des expressions de texte) |
+| **contenu texte** | `vendor/`, `third_party/`, `third-party/`, sorties de build (`build/`, `dist/`, `target/`, `bower_components/`, `htmlcov/`), lockfiles, `.gitignore` et autres fichiers de contrôle | **analysés** (un secret y est un secret) |
+
+`Scanner(root, strict=True)` (et `scan(root, strict=True)`) ne conserve que la
+première famille. C'est la correction du point HIGH relevé à la revue de #165 :
+la politique #59 seule laissait passer un secret posé dans `vendor/evil.py`,
+sans jamais le signaler. Le mode strict est le comportement par défaut de la
+CLI `heimdall scan` (voir [cli.md](cli.md)).
+
+En strict, l'extension binaire ne prime plus sur le contenu : un fichier texte
+nommé `evil.png` est lu et scanné, comme en `--staged`. Un vrai binaire reste
+exclu par sa signature **connue** (magie + majorité binaire). Un binaire
+inconnu (NUL + texte) reste fail-closed comme en `--staged` : le suffixe ne
+convertit jamais un doute en skip silencieux.
 
 ### Encodage des fichiers lus
 
@@ -117,6 +143,8 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | racine non canonique (ex. `/tmp` symlinké vers `/private/tmp` sur macOS) | `ScanError` — passer un chemin canonique (sans lien) |
 | fichier non régulier (FIFO, device) | `ScanError` |
 | fichier > 1 Mio | `ScanError` |
+| plus de 50 000 fichiers, ou plus de 256 Mio lus au total | `ScanError` (bornes #29) |
+| borne explicite `max_files`/`max_bytes`/`max_findings` hors de `1..plafond` | `ValueError` à la construction (surcharge jamais silencieuse) |
 | fichier modifié pendant la lecture | `ScanError` |
 | nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` |
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
@@ -126,16 +154,17 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | fichier exclu ou binaire connu | ignoré par politique |
 | scan réussi sans signature | liste vide (réellement propre **hors exclusions** — voir limites) |
 
-> **Garde d'usage (hook/CI) :** ne pas utiliser ce `Scanner` bibliothèque tel
-> quel pour un hook ou une CI. Un `[]` sur dépôt complet peut masquer un secret
-> présent dans un chemin exclu (`vendor/`, `*.lock`, binaire) ou coupé au-delà
-> de la fenêtre 4 Kio. #29 doit scanner tout blob stagé **sans exclusion** et
-> prouver 0/1/2 end-to-end ; en attendant, aucun usage CI du scan réel n'est
-> autorisé (la CLI reste en stub, sortie 2). Voir limites ci-dessous.
+> **Garde d'usage (hook/CI) :** le `Scanner` bibliothèque reste en politique
+> #59 (exclusions de contenu texte comprises) : un `[]` sur dépôt complet y
+> vaut « propre **hors exclusions** ». Pour un hook ou une CI, c'est la CLI
+> `heimdall scan` qu'il faut utiliser : elle applique le **mode strict** sur
+> l'arbre de travail et analyse **sans aucune exclusion** les blobs de l'index
+> en mode `--staged` (voir [cli.md](cli.md)). Un scan incomplet y sort en 2,
+> jamais en 0.
 
-Un scan incomplet ne devient donc jamais une liste vide ou partielle. Quand
-#29 branchera la CLI, `ScanError` devra produire le code 2 (erreur d'outillage),
-jamais 0 ou 1.
+Un scan incomplet ne devient donc jamais une liste vide ou partielle. Depuis
+#29, la CLI est branchée : `ScanError` produit le code 2 (erreur d'outillage),
+jamais 0 ni 1.
 
 ## Empreinte et entropie
 
@@ -164,10 +193,12 @@ jamais 0 ou 1.
   (rappel 0,625 sur `all`, 1,0 sur le périmètre `core`). Le décodage/entropie
   relève de #23 et l'allowlist de #24.
 - Les fichiers binaires, lockfiles et répertoires tiers sont ignorés par
-  politique : un secret qui y serait copié n'est pas signalé. En mode dépôt
-  complet, `[]` vaut donc « propre hors exclusions », jamais « propre absolu ».
-  Bloquant #29 : scanner les blobs stagés sans exclusion (ou `ScanError` /
-  flag `truncated` explicite en mode dépôt) ; bloquant #59 pour le mode dépôt.
+  la politique #59 **de la bibliothèque** : un secret qui y serait copié n'est
+  pas signalé. En mode dépôt complet, `[]` vaut donc « propre hors
+  exclusions », jamais « propre absolu ». Depuis #29, la **CLI** applique le
+  mode strict (arbre de travail) ou l'analyse **sans exclusion** des blobs
+  indexés (`--staged`) : ce blocage est levé pour la CLI, il reste entier
+  pour l'usage bibliothèque, et #59 garde la main sur la politique.
 - La jointure multi-ligne est bornée à 4 Kio : un secret coupé par un retour
   à la ligne n'est recherché que si la fenêtre des deux lignes tient dans
   cette borne. Au-delà, la coupure n'est pas détectée (`[]`). Padding
@@ -185,10 +216,12 @@ jamais 0 ou 1.
   partagent l'empreinte de leur en-tête.
 - Le scan est fichier par fichier, sans snapshot Git : le branchement diff/index
   et la protection contre les attributs Git (`textconv`) restent à faire avec
-  #29/#30.
-- La CLI `heimdall scan` reste en stub (sortie 2, « voir #29 ») : aucun usage
-  CI du scan réel n'est autorisé avant #29, qui devra prouver propre => 0,
-  secret avéré => 1, erreur => 2, sans écriture.
+  #30 (le mode `--staged` de #29 lit l'index par blob, sans filtre
+  `textconv` : `git cat-file` rend le contenu brut indexé).
+- La CLI `heimdall scan` est branchée (#29) : elle prouve propre => 0, secret
+  avéré => 1, erreur => 2, **sans écriture** (voir [cli.md](cli.md)). La
+  validation humaine Y/N/E et le remplacement du secret restent à faire
+  (#32).
 
 ## Preuves locales
 

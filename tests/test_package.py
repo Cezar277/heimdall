@@ -3,8 +3,11 @@
 import copy
 import os
 import pickle
+import shutil
+import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from typer.testing import CliRunner
@@ -50,8 +53,12 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(version.exit_code, 0)
         self.assertIn(heimdall.__version__, version.output)
 
-    def test_scan_is_fail_closed_until_29(self) -> None:
-        """Scanner #22 livré mais commande non branchée (#29) : exit 2."""
+    def test_scan_is_wired_and_writes_nothing(self) -> None:
+        """#29 livré : la commande scan est branchée et reste en lecture seule."""
+        git = shutil.which("git", path=os.defpath)
+        if git is None:  # pragma: no cover - garde-fou d'environnement de test.
+            raise unittest.SkipTest("git requis")
+        assert git is not None
         runner = CliRunner()
         previous = os.getcwd()
         for argv in (["scan"], ["scan", "--ci"]):
@@ -59,19 +66,38 @@ class PackageSmokeTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory(prefix="heimdall-scan-") as tmp:
                     os.chdir(tmp)
                     try:
+                        # Le mode arbre exige une racine de dépôt (#29) : le
+                        # dossier est initialisé avant le scan.
+                        for args in (
+                            ["init", "-q"],
+                            ["config", "user.email", "test@example.invalid"],
+                            ["config", "user.name", "Heimdall Test"],
+                        ):
+                            completed = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+                                [git, *args],
+                                capture_output=True,
+                                text=True,
+                                timeout=60,
+                                check=False,
+                            )
+                            self.assertEqual(completed.returncode, 0, completed.stderr)
                         result = runner.invoke(heimdall.cli.main.app, argv)
                     finally:
                         os.chdir(previous)
-                    self.assertEqual(result.exit_code, 2)
-                    self.assertIn("#29", result.output)
-                    # Invariant 11 : 2 = panne d'outillage, jamais 1 (secrets).
-                    # Le stub n'écrit aucun fichier.
-                    self.assertEqual(os.listdir(tmp), [])
+                    # Un dépôt vide est réellement propre : 0, pas 2.
+                    self.assertEqual(result.exit_code, 0)
+                    # Le scan est une lecture : seul `.git` (créé par le test)
+                    # est présent, rien d'autre n'a été écrit.
+                    self.assertEqual(sorted(os.listdir(tmp)), [".git"])
 
     def test_scan_reports_on_stderr(self) -> None:
-        result = CliRunner().invoke(heimdall.cli.main.app, ["scan"])
+        """Erreur d'outillage : message sur stderr, code 2 (jamais 0, jamais 1)."""
+        result = CliRunner().invoke(
+            heimdall.cli.main.app,
+            ["scan", str(Path(tempfile.gettempdir()) / "heimdall-absent-29")],
+        )
         self.assertEqual(result.exit_code, 2)
-        self.assertIn("#29", result.stderr)
+        self.assertIn("scan impossible", result.stderr)
 
     def test_cli_mcp_handles_broken_pipe_and_exception(self) -> None:
         """CLI `heimdall mcp` : BrokenPipeError -> 0, exception inattendue -> 2 sans fuite."""

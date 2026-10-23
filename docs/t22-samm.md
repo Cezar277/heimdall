@@ -20,7 +20,15 @@ Les permaliens de code du tableau principal épinglent `2ba3ebf…` ; ceux de
 documentation épinglent `f4dc3c8…` (ADR-002) et `81a67df…` (ADR-001). Les
 tableaux historiques « Corrections issues de la relecture » restent épinglés
 sur leurs révisions d'origine. `git diff 2ba3ebf5a636f3095b003468cd1a98a936bdb0b5 HEAD -- heimdall tests`
-est vide (cette mise à jour ne touche que `docs/`).
+était vide après #22 (cette mise à jour ne touchait que `docs/`) ; **depuis
+#29, il ne l'est plus** : la CLI `heimdall scan` ajoute le **mode strict**
+(`Scanner(root, strict=True)`) aux exclusions de #59, qui sépare les
+exclusions *techniques* des exclusions de *contenu texte*, ainsi que des
+bornes (fichiers, volume total, Findings) activables par paramètres. Le
+comportement par défaut de la bibliothèque est **inchangé** (politique #59,
+bornes généreuses), et les
+permaliens ci-dessus restent valides pour le code #22 tel qu'il a été testé ;
+l'extension #29 est documentée dans [t29-samm.md](t29-samm.md).
 
 | Exigence vérifiée | Implémentation (module + ligne) | Test et preuve permanente | Résultat local |
 |---|---|---|---|

@@ -336,15 +336,26 @@ class ForbiddenPathTests(unittest.TestCase):
                 self.assertFalse(server.is_forbidden_path(path))
 
 
+def _ceiling_passed_to_git(access: gitdiff.GitAccess) -> str:
+    """Plafond que `execute` transmet réellement à git (sans lancer git)."""
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
+    with mock.patch("subprocess.run", return_value=completed) as run:
+        access.execute(("rev-parse", "--show-toplevel"))
+    return run.call_args.kwargs["env"]["GIT_CEILING_DIRECTORIES"]
+
+
 class ConfinedEnvironmentTests(unittest.TestCase):
     def test_minimal_and_redirection_free(self) -> None:
         with tempfile.TemporaryDirectory(prefix="heimdall-env-") as tmp:
-            env = gitdiff.confined_environment(_Path(tmp))
+            env = gitdiff.confined_environment(tmp)
         for forbidden in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY"):
             self.assertNotIn(forbidden, env)
         self.assertEqual(env["PATH"], "")
-        self.assertEqual(env["HOME"], tmp)
+        self.assertEqual(env["HOME"], os.devnull)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        # Clone partiel : sans elle, `git cat-file` irait chercher l'objet
+        # manquant sur le réseau — interdit (100 % local).
+        self.assertEqual(env["GIT_NO_LAZY_FETCH"], "1")
 
     def test_discovery_ceiling_is_the_parent_of_the_root(self) -> None:
         """Plafond = le parent, parce que c'est lui que git ascendererait.
@@ -359,8 +370,28 @@ class ConfinedEnvironmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="heimdall-ceil-") as tmp:
             root = _Path(tmp) / "racine"
             root.mkdir()
-            env = gitdiff.confined_environment(root)
-            self.assertEqual(env["GIT_CEILING_DIRECTORIES"], str(root.resolve().parent))
+            access = gitdiff.GitAccess(root)
+            self.assertEqual(_ceiling_passed_to_git(access), str(root.resolve().parent))
+
+    def test_discovery_ceiling_is_frozen_at_construction(self) -> None:
+        """Revue (LOW) : le plafond ne suit pas une racine échangée après coup.
+
+        La racine est remplacée par un lien vers un autre dossier entre la
+        construction et l'appel. Un `resolve()` à l'appel aurait déplacé le
+        plafond vers la cible adverse ; figé à la construction, il reste celui
+        de la racine d'origine.
+        """
+        with tempfile.TemporaryDirectory(prefix="heimdall-figee-") as tmp:
+            base = _Path(tmp)
+            root = base / "racine"
+            root.mkdir()
+            access = gitdiff.GitAccess(root)
+            origine = str(root.resolve().parent)
+            ailleurs = base / "ailleurs" / "racine"
+            ailleurs.mkdir(parents=True)
+            root.rename(base / "racine-ancienne")
+            root.symlink_to(ailleurs, target_is_directory=True)
+            self.assertEqual(_ceiling_passed_to_git(access), origine)
 
 
 class RepositoryCeilingTests(unittest.TestCase):
@@ -414,6 +445,42 @@ class RepositoryCeilingTests(unittest.TestCase):
         with self.assertRaises(ToolFailure) as ctx:
             access.is_ignored("nimporte.txt")
         self.assertEqual(ctx.exception.code, "INTERNAL")
+
+
+class _FakeClock:
+    """Horloge simulée : le temps ne passe que là où le faux git le dit."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _StuckGitProcess:
+    """Faux git : lit pendant `read_seconds`, ferme stdout, puis ne sort jamais."""
+
+    def __init__(self, clock: _FakeClock, read_seconds: float) -> None:
+        self._clock = clock
+        self._read_seconds = read_seconds
+        self.stdout = self
+        self.killed = False
+
+    def read(self, _size: int) -> bytes:
+        self._clock.now += self._read_seconds
+        return b""
+
+    def close(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        if timeout is None or self.killed:
+            return -9
+        self._clock.now += timeout
+        raise subprocess.TimeoutExpired(cmd="git", timeout=timeout)
 
 
 class GitAccessDirectTests(unittest.TestCase):
@@ -485,6 +552,49 @@ class GitAccessDirectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="heimdall-nogit-") as tmp:
             self.assertFalse(gitdiff.GitAccess(_Path(tmp)).is_repository())
 
+    def test_unresolvable_toplevel_is_a_tool_failure_not_a_raw_error(self) -> None:
+        """Revue (LOW) : `resolve()` qui lève reste dans le contrat.
+
+        Boucle de liens ou composant illisible : `Path.resolve()` peut lever
+        (RuntimeError en Python 3.10). `is_repository` rend un `bool` ou une
+        `ToolFailure`, jamais une exception brute hors contrat.
+        """
+        access = gitdiff.GitAccess(self.repo.root)
+        boucle = self.repo.root.parent / "boucle"
+        sortie = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f"{boucle}\n".encode(), stderr=b""
+        )
+        resolve_reel = _Path.resolve
+
+        def resolve_piege(chemin: _Path, *args: Any, **options: Any) -> _Path:
+            if chemin == boucle:
+                raise RuntimeError("Symlink loop")
+            return resolve_reel(chemin, *args, **options)
+
+        with (
+            mock.patch.object(gitdiff.GitAccess, "execute", return_value=sortie),
+            mock.patch.object(_Path, "resolve", resolve_piege),
+        ):
+            with self.assertRaises(ToolFailure) as ctx:
+                access.is_repository()
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+
+    def test_swapped_root_is_not_a_repository_any_more(self) -> None:
+        """Revue (LOW) : la comparaison se fait à la racine figée.
+
+        La racine est remplacée par un lien vers un AUTRE dépôt : `rev-parse`
+        (qui suit le lien) répond ce dépôt-là. Comparé à la racine figée, ce
+        n'est pas le périmètre demandé ; comparé au `resolve()` de la racine à
+        l'appel, il aurait passé pour le bon.
+        """
+        autre = GitRepo("heimdall-autre-", self)
+        access = gitdiff.GitAccess(self.repo.root)
+        self.assertTrue(access.is_repository())
+        racine = self.repo.root
+        racine.rename(racine.parent / "repo-ancien")
+        racine.symlink_to(autre.root, target_is_directory=True)
+        self.assertFalse(access.is_repository())
+
     def test_git_binary_under_the_root_is_refused_never_executed(self) -> None:
         """Binaire piégé SOUS la racine : refusé avant tout usage.
 
@@ -506,6 +616,24 @@ class GitAccessDirectTests(unittest.TestCase):
                         gitdiff.GitAccess(self.repo.root)
         self.assertEqual(ctx.exception.code, "INTERNAL")
 
+    def test_git_binary_under_the_pinned_root_is_refused_with_dotdot_input(self) -> None:
+        """Revue (LOW) : la garde binaire compare à la forme figée.
+
+        L'entrée brute contient ``..`` ; le binaire piégé est sous la racine
+        résolue. Le refus doit partir de `self._root`, pas de `root.resolve()`
+        rejoué sur le paramètre : une seule forme canonique.
+        """
+        planted = self.repo.root / "git.exe"
+        planted.write_text("factice, jamais exécutable", encoding="utf-8")
+        raw = self.repo.root / ".." / self.repo.root.name
+        with mock.patch.object(gitdiff.shutil, "which", return_value=str(planted)):
+            with mock.patch.object(
+                gitdiff.subprocess, "run", side_effect=AssertionError("exécuté !")
+            ):
+                with self.assertRaises(ToolFailure) as ctx:
+                    gitdiff.GitAccess(raw)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+
     def test_git_binary_under_the_cwd_is_refused(self) -> None:
         """Binaire piégé sous le répertoire courant (hors racine) : refusé aussi."""
         with tempfile.TemporaryDirectory(prefix="heimdall-fakebin-") as bindir:
@@ -524,6 +652,61 @@ class GitAccessDirectTests(unittest.TestCase):
         with mock.patch.object(gitdiff.shutil, "which", return_value=str(sibling)):
             self.assertEqual(gitdiff.GitAccess(self.repo.root)._git, str(sibling))
 
+    def test_git_binary_resolve_failure_is_a_tool_failure(self) -> None:
+        """Revue (LOW) : `Path(binary).resolve()` qui lève -> ToolFailure("INTERNAL").
+
+        Boucle de liens ou composant illisible : `Path.resolve()` peut lever
+        (OSError, RuntimeError boucle, ValueError). GitAccess lève
+        ToolFailure("INTERNAL"), jamais une exception brute hors contrat.
+        """
+        binary = gitdiff.shutil.which("git", path=os.defpath)
+        if binary is None:
+            self.skipTest("git introuvable")
+        resolve_reel = _Path.resolve
+
+        def creer_resolve_piege(err: Exception) -> Any:
+            def resolve_piege(chemin: _Path, *args: Any, **options: Any) -> _Path:
+                if str(chemin) == binary:
+                    raise err
+                return resolve_reel(chemin, *args, **options)
+
+            return resolve_piege
+
+        for exc in (
+            OSError("composant inaccessible"),
+            RuntimeError("Symlink loop"),
+            ValueError("chemin invalide"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                with mock.patch.object(_Path, "resolve", creer_resolve_piege(exc)):
+                    with self.assertRaises(ToolFailure) as ctx:
+                        gitdiff.GitAccess(self.repo.root)
+                self.assertEqual(ctx.exception.code, "INTERNAL")
+
+    def test_cwd_resolve_failure_is_a_tool_failure(self) -> None:
+        """Revue (LOW) : `Path.cwd().resolve()` qui lève -> ToolFailure("INTERNAL").
+
+        Si le répertoire courant est inaccessible ou forme une boucle de liens,
+        GitAccess lève ToolFailure("INTERNAL"), jamais une exception brute.
+        """
+        for exc in (
+            OSError("cwd inaccessible"),
+            RuntimeError("Symlink loop"),
+            ValueError("cwd invalide"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                cwd_mock = mock.MagicMock()
+                cwd_mock.resolve.side_effect = exc
+                with mock.patch.object(gitdiff.Path, "cwd", return_value=cwd_mock):
+                    with self.assertRaises(ToolFailure) as ctx:
+                        gitdiff.GitAccess(self.repo.root)
+                self.assertEqual(ctx.exception.code, "INTERNAL")
+
+        with mock.patch.object(gitdiff.Path, "cwd", side_effect=OSError("cwd supprimé")):
+            with self.assertRaises(ToolFailure) as ctx:
+                gitdiff.GitAccess(self.repo.root)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+
     def test_ignored_detection_and_unexpected_codes(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
         self.repo.write(".gitignore", "ign.txt\n")
@@ -535,6 +718,17 @@ class GitAccessDirectTests(unittest.TestCase):
             execute.return_value = mock.Mock(returncode=128, stdout=b"", stderr=b"")
             with self.assertRaises(ToolFailure):
                 access.is_ignored("keep.txt")
+
+    def test_repository_cannot_supply_its_own_user_excludes(self) -> None:
+        """Revue (LOW) : `HOME` ne pointe plus dans le dépôt scanné.
+
+        Avec `HOME` = racine, git lisait `<racine>/.config/git/ignore` : un
+        dépôt se masquait ainsi lui-même à `check-ignore`. `HOME` pointe
+        désormais vers `os.devnull`, où rien de tel n'existe.
+        """
+        self.repo.write(".config/git/ignore", "secret.txt\n")
+        access = gitdiff.GitAccess(self.repo.root)
+        self.assertFalse(access.is_ignored("secret.txt"))
 
     def test_git_access_has_no_unbounded_run_method(self) -> None:
         """Méthode morte run() supprimée.
@@ -549,6 +743,162 @@ class GitAccessDirectTests(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=OSError("echec")):
             with self.assertRaises(ToolFailure):
                 access.execute(("rev-parse", "--verify", "objet-inexistant-xyz"))
+
+    def test_blob_access_uses_end_of_options_and_a_capped_read(self) -> None:
+        """Revue (LOW) : argv `cat-file` figé et lecture de blob bornée.
+
+        Le `--` interdit toute interprétation d'option même si la garde SHA
+        évoluait ; `blob_bytes` passe par `_read_capped`, jamais par
+        `execute(capture_output=True)`.
+        """
+        access = gitdiff.GitAccess(self.repo.root)
+        blob = "a" * 40
+        self.assertEqual(
+            gitdiff._cat_file_arguments("-s", blob),
+            ("cat-file", "-s", "--", blob),
+        )
+        self.assertEqual(
+            gitdiff._cat_file_arguments("blob", blob),
+            ("cat-file", "blob", "--", blob),
+        )
+        with mock.patch.object(gitdiff.GitAccess, "_read_capped", return_value=b"x") as read:
+            self.assertEqual(access.blob_bytes(blob), b"x")
+        read.assert_called_once_with(
+            ("cat-file", "blob", "--", blob),
+            gitdiff.MAX_FILE_BYTES,
+            timeout=gitdiff.GIT_TIMEOUT_SECONDS,
+        )
+        with mock.patch.object(
+            gitdiff.GitAccess, "_read_capped", return_value=b"4\n"
+        ) as read:
+            self.assertEqual(access.blob_size(blob), 4)
+        read.assert_called_once_with(
+            ("cat-file", "-s", "--", blob),
+            gitdiff.MAX_BLOB_SIZE_OUTPUT_BYTES,
+            timeout=gitdiff.GIT_TIMEOUT_SECONDS,
+        )
+
+    def test_blob_size_refuses_an_oversized_stdout(self) -> None:
+        """Revue (LOW) : `blob_size` est lu en flux borné (64 octets).
+
+        Une sortie git anormale (ou un store compromis) ne doit pas être
+        bufferisée avant le refus ; le processus est tué au-delà.
+        """
+        access = gitdiff.GitAccess(self.repo.root)
+        proc = mock.MagicMock()
+        proc.stdout.read.return_value = b"9" * (gitdiff.MAX_BLOB_SIZE_OUTPUT_BYTES + 1)
+        with mock.patch("subprocess.Popen", return_value=proc):
+            with self.assertRaises(ToolFailure):
+                access.blob_size("a" * 40)
+        proc.kill.assert_called_once()
+
+    def test_blob_access_round_trips_with_end_of_options(self) -> None:
+        """Revue (LOW) : le git de CI accepte `--` avant le SHA.
+
+        E2e réel : `blob_size` et `blob_bytes` doivent fonctionner sur un
+        blob indexé, pas seulement en argv simulé.
+        """
+        self.repo.write("a.txt", "x\n")
+        self.repo.stage("a.txt")
+        access = gitdiff.GitAccess(self.repo.root)
+        change = access.staged_changes()[0]
+        self.assertEqual(access.blob_size(change.blob), 2)
+        self.assertEqual(access.blob_bytes(change.blob), b"x\n")
+
+    def test_execute_and_read_capped_propagate_the_remaining_timeout(self) -> None:
+        """Revue (LOW) : le restant de deadline devient le timeout git réel."""
+        access = gitdiff.GitAccess(self.repo.root)
+        with mock.patch("subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b""
+            )
+            access.execute(("rev-parse", "--show-toplevel"), timeout=1.5)
+        self.assertEqual(run.call_args.kwargs["timeout"], 1.5)
+
+        proc = mock.MagicMock()
+        proc.stdout.read.return_value = b"ok"
+        proc.wait.return_value = 0
+        timer = mock.MagicMock()
+        with mock.patch("subprocess.Popen", return_value=proc), mock.patch.object(
+            gitdiff.threading, "Timer", return_value=timer
+        ) as timer_cls:
+            self.assertEqual(
+                access._read_capped(
+                    ("rev-parse", "--show-toplevel"),
+                    10,
+                    timeout=1.5,
+                ),
+                b"ok",
+            )
+        timer_cls.assert_called_once_with(1.5, proc.kill)
+        timer.start.assert_called_once()
+        timer.cancel.assert_called_once()
+        # La lecture a été instantanée ici : `wait` reçoit le restant, au plus
+        # le délai. Le partage exact est prouvé par horloge simulée ci-dessous.
+        proc.wait.assert_called_once()
+        self.assertLessEqual(proc.wait.call_args.kwargs["timeout"], 1.5)
+
+    def test_read_capped_never_outlives_its_deadline(self) -> None:
+        """Revue (LOW) : lecture lente puis attente lente tiennent dans `timeout`.
+
+        Le git ferme stdout après 0,9 s puis ne sort jamais. Sans partage du
+        délai, `wait` repartait pour 1 s de plus : 1,9 s au total pour 1 s
+        annoncée (2 × en pire cas). Horloge simulée : déterministe.
+        """
+        clock = _FakeClock()
+        proc = _StuckGitProcess(clock, read_seconds=0.9)
+        access = gitdiff.GitAccess(self.repo.root)
+        with (
+            mock.patch.object(gitdiff, "time", clock),
+            mock.patch("subprocess.Popen", return_value=proc),
+            mock.patch.object(gitdiff.threading, "Timer"),
+        ):
+            with self.assertRaises(ToolFailure) as ctx:
+                access._read_capped(("rev-parse", "--show-toplevel"), 10, timeout=1.0)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+        self.assertLessEqual(clock.now, 1.0 + 1e-9)
+
+    def test_read_capped_with_hung_wait_after_kill_never_exceeds_deadline(self) -> None:
+        """Revue (LOW) : `wait` traînant après `kill` ne dépasse pas deadline + timeout.
+
+        Si le processus git est ininterruptible, le premier `wait` expire, puis
+        les appels `wait` dans `_terminate_process` sont bornés par le restant
+        de deadline (plancher 0,1 s), évitant un blocage indéfini ou un doublement
+        de timeout (pas 2 × `timeout`).
+        """
+        clock = _FakeClock()
+
+        class _UnkillableProcess:
+            def __init__(self) -> None:
+                self.stdout = self
+
+            def read(self, _size: int) -> bytes:
+                clock.now += 0.8
+                return b""
+
+            def close(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                delta = 0.5 if timeout is None else timeout
+                clock.now += delta
+                raise subprocess.TimeoutExpired(cmd=["git"], timeout=delta)
+
+        proc = _UnkillableProcess()
+        access = gitdiff.GitAccess(self.repo.root)
+        with (
+            mock.patch.object(gitdiff, "time", clock),
+            mock.patch("subprocess.Popen", return_value=proc),
+            mock.patch.object(gitdiff.threading, "Timer"),
+        ):
+            with self.assertRaises(ToolFailure) as ctx:
+                access._read_capped(("rev-parse", "--show-toplevel"), 10, timeout=1.0)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+        # 0.8s + 0.2s (wait 1) + 0.1s (wait kill 1) + 0.1s (wait kill 2) = 1.2s <= 1.5s
+        self.assertLessEqual(clock.now, 1.5)
 
     def test_staged_diff_truncation_flag(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
@@ -636,7 +986,7 @@ class GitAccessDirectTests(unittest.TestCase):
         with mock.patch("subprocess.Popen", return_value=proc):
             with self.assertRaises(ToolFailure):
                 access.staged_diff(1024)
-        proc.kill.assert_called_once()
+        self.assertGreaterEqual(proc.kill.call_count, 1)
 
     def test_execute_success_returns_completed_process(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)

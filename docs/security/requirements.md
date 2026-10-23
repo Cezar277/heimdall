@@ -161,6 +161,13 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   squelette, Finding : en CI une valeur en clair bloque quel que soit l'état ;
   preuve runtime due en #28).
 - Statut : exigence acceptée par #19 ; implémentation #22/#28 à prouver.
+  Depuis #29, le chemin `--ci` est **branché et opérationnel** : la commande
+  `heimdall scan --ci` ne fait aucun appel LLM (le module de scan
+  `heimdall/cli/scan.py` n'importe aucun module réseau — garde AST étendue à
+  ce module dans `tests/security/test_prompt_injection.py`), et son verdict
+  est le code de sortie (0 / 1 / 2). La preuve d'exécution est dans
+  `tests/test_cli_scan.py` ; le garde réseau (`tests/test_network_isolation.py`)
+  exerce un scan réel sous interdiction de connexion.
 
 ### REQ-SEC-03 — Écriture confinée, snapshot revérifié
 
@@ -287,6 +294,13 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   Preuves : `tests/test_scanner_detect.py`,
   `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean` et
   la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
+  Depuis #29, le contrat 0/1/2 est **exécuté** : `tests/test_cli_scan.py`
+  prouve dépôt propre => 0, secret avéré => 1, racine absente => 2, index en
+  conflit => 2, blob trop gros => 2, et **aucune écriture** pendant un scan.
+  Le mode `--staged` analyse les blobs ajoutés ou modifiés de l'index **sans
+  aucune exclusion de chemin** (`vendor/`, lockfiles compris) : c'est la
+  correction du point HIGH relevé à la revue de #165, où la politique #59
+  laissait passer un secret posé dans `vendor/evil.py`.
   Limites connues documentées par T21 : base64, concaténation et flux de
   variables ne sont pas décodés ; leur traitement relève de #23/#24 et ne
   produit jamais un verdict propre sans les contrôles CI de #29/#19.
