@@ -13,7 +13,9 @@ import os
 import pickle
 import socket
 import stat
+import subprocess
 import tempfile
+import time
 import unittest
 from http import HTTPStatus
 from pathlib import Path
@@ -23,6 +25,7 @@ from urllib.parse import urlparse
 import httpx
 
 from heimdall.vault.atomic import (
+    _get_git_toplevel,
     _write_file_atomic_fallback,
     backup_file,
     check_file_mode_600,
@@ -45,6 +48,7 @@ from heimdall.vault.client import (
     VaultRateLimitError,
     VaultUnavailableError,
     _check_localhost_resolution,
+    _detect_from_git,
     _pin_loopback_ip,
     _read_and_check_key_file,
     _validate_identifier,
@@ -710,6 +714,44 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             ):
                 self.assertFalse(is_git_tracked(target))
                 self.assertFalse(is_git_ignored(target))
+
+    def test_git_helpers_survive_hanging_git_binary(self) -> None:
+        """Binaire `git` bloqué : `TimeoutExpired` → statut inconnu, jamais de pendaison."""
+        target = self.tmp_dir / ".env"
+        target.write_text("x=1\n", encoding="utf-8")
+        with patch("heimdall.vault.atomic.shutil.which", return_value="/fake/git"):
+            with patch(
+                "heimdall.vault.atomic.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(["git"], 5),
+            ) as mock_run:
+                self.assertFalse(is_git_tracked(target))
+                self.assertFalse(is_git_ignored(target))
+                for call in mock_run.call_args_list:
+                    self.assertEqual(call.kwargs.get("timeout"), 5)
+
+    def test_git_toplevel_returns_before_timeout_with_blocked_binary(self) -> None:
+        """Binaire `git` réel qui dort 30 s : retour en < 10 s grâce au timeout."""
+        shim_dir = self.tmp_dir / "fakebin"
+        shim_dir.mkdir()
+        shim = shim_dir / "git"
+        shim.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        shim.chmod(0o700)
+        with patch.dict(
+            os.environ, {"PATH": f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
+        ):
+            start = time.monotonic()
+            self.assertIsNone(_get_git_toplevel(self.tmp_dir))
+            self.assertLess(time.monotonic() - start, 10)
+
+    def test_detect_from_git_survives_hanging_git_binary(self) -> None:
+        """Détection projet : `TimeoutExpired` → None, jamais de pendaison."""
+        with patch("heimdall.vault.client.shutil.which", return_value="/fake/git"):
+            with patch(
+                "heimdall.vault.client.subprocess.check_output",
+                side_effect=subprocess.TimeoutExpired(["git"], 5),
+            ) as mock_check:
+                self.assertIsNone(_detect_from_git(self.tmp_dir))
+                self.assertEqual(mock_check.call_args.kwargs.get("timeout"), 5)
 
     def test_fallback_refuses_symlink_target_and_reverifies_after_replace(self) -> None:
         """Repli Windows (best-effort) : symlink avant/après `replace` → refus."""

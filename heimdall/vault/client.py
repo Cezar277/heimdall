@@ -77,6 +77,10 @@ _STREAM_CHUNK_SIZE: Final[int] = 64 * 1024
 #: Longueur maximale d'un extrait d'entrée recopié dans un message d'erreur
 #: (invariant 8 : messages bornés, jamais de valeur recopiée en entier).
 _PREVIEW_LEN: Final[int] = 32
+#: Plafond d'attente des sondes `git` (détection projet informative) : un
+#: binaire bloqué ne doit jamais pendre la CLI. `git` vient du PATH de
+#: confiance de l'opérateur ; tout échec/timeout vaut absence de détection.
+_GIT_TIMEOUT_SECONDS: Final[int] = 5
 
 _PROJECT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _ENV_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -275,7 +279,11 @@ def resolve_vault_url(url: str | None = None) -> str:
 
 
 def _detect_from_git(start_dir: Path) -> str | None:
-    """Détecte l'identifiant du projet depuis le dépôt Git racine."""
+    """Détecte l'identifiant du projet depuis le dépôt Git racine.
+
+    Sonde informative bornée (``timeout``) : `git` vient du PATH de confiance
+    de l'opérateur ; tout échec/timeout vaut absence de détection (None).
+    """
     git_bin = shutil.which("git")
     if not git_bin:
         return None
@@ -285,6 +293,7 @@ def _detect_from_git(start_dir: Path) -> str | None:
             cwd=start_dir,
             stderr=subprocess.DEVNULL,
             text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
         ).strip()
         if git_root:
             name = Path(git_root).name.lower()

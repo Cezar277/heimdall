@@ -603,6 +603,7 @@ def vault_pull(  # noqa: PLR0913, PLR0917
             )
             raise typer.Exit(code=1)
 
+    bak_file: Path | None = None
     if output.exists() and backup:
         try:
             bak_file = backup_file(output)
@@ -622,29 +623,32 @@ def vault_pull(  # noqa: PLR0913, PLR0917
 
     typer.echo(f"Fichier {output} mis à jour avec {len(retrieved)} secret(s) (droits 0600).")
 
-    if is_git_tracked(output):
-        typer.echo(
-            f"ATTENTION : Le fichier {output} est suivi par Git ! "
-            f"Exécutez 'git rm --cached {output}' et ajoutez-le à .gitignore "
-            "pour éviter toute fuite.",
-            err=True,
-        )
-    elif is_git_ignored(output):
-        pass  # Ignoré avéré : rien à signaler.
-    elif _get_git_toplevel(output) is None:
-        typer.echo(
-            f"Avertissement : statut Git indéterminé pour '{output}' "
-            "(hors dépôt ou git indisponible) : impossible de vérifier "
-            "qu'il ne sera pas committé. Ajoutez-le à .gitignore et "
-            "vérifiez avec 'git status'.",
-            err=True,
-        )
-    else:
-        typer.echo(
-            f"Avertissement : Le fichier {output} n'est pas ignoré par Git. "
-            f"Pensez à ajouter '{output}' dans .gitignore.",
-            err=True,
-        )
+    # Garde-fou Git (invariant 10) : le .env ET sa sauvegarde .bak contiennent
+    # des secrets — le contrôle porte sur les deux, jamais sur output seul.
+    for guarded_path in [output] + ([bak_file] if bak_file else []):
+        if is_git_tracked(guarded_path):
+            typer.echo(
+                f"ATTENTION : Le fichier {guarded_path} est suivi par Git ! "
+                f"Exécutez 'git rm --cached {guarded_path}' et ajoutez-le à .gitignore "
+                "pour éviter toute fuite.",
+                err=True,
+            )
+        elif is_git_ignored(guarded_path):
+            pass  # Ignoré avéré : rien à signaler.
+        elif _get_git_toplevel(guarded_path) is None:
+            typer.echo(
+                f"Avertissement : statut Git indéterminé pour '{guarded_path}' "
+                "(hors dépôt ou git indisponible) : impossible de vérifier "
+                "qu'il ne sera pas committé. Ajoutez-le à .gitignore et "
+                "vérifiez avec 'git status'.",
+                err=True,
+            )
+        else:
+            typer.echo(
+                f"Avertissement : Le fichier {guarded_path} n'est pas ignoré par Git. "
+                f"Pensez à ajouter '{guarded_path}' dans .gitignore.",
+                err=True,
+            )
 
 
 def _resolve_run_names(
@@ -766,6 +770,20 @@ def vault_run(  # noqa: PLR0913, PLR0917
     target_cmd = [executable if executable is not None else cmd[0], *cmd[1:]]
     child_env = {**os.environ, **injected_secrets}
 
+    # Anti-TOCTOU which → exec : le PATH a pu changer pendant le round-trip
+    # réseau ; re-résoudre juste avant d'exécuter et refuser toute divergence
+    # (fail-closed : jamais d'exécution d'un binaire périmé).
+    if executable is None:
+        if not Path(cmd[0]).is_file():
+            typer.echo(f"Erreur : commande introuvable : '{cmd[0]}'", err=True)
+            raise typer.Exit(code=127)
+    elif shutil.which(cmd[0]) != executable:
+        typer.echo(
+            "Erreur de sécurité : commande modifiée entre résolution et exécution.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     try:
         proc = subprocess.run(target_cmd, env=child_env, check=False)  # noqa: S603
         raise typer.Exit(code=proc.returncode)
@@ -776,7 +794,10 @@ def vault_run(  # noqa: PLR0913, PLR0917
         typer.echo(f"Erreur : permission refusée pour exécuter : {cmd[0]}", err=True)
         raise typer.Exit(code=126) from None
     except (ValueError, OSError) as exc:
-        typer.echo(f"Erreur lors de l'exécution de la commande : {exc}", err=True)
+        msg = str(exc)
+        if len(msg) > _MAX_ERROR_MSG_LEN:
+            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        typer.echo(f"Erreur lors de l'exécution de la commande : {msg}", err=True)
         raise typer.Exit(code=1) from None
 
 

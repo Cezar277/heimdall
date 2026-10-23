@@ -22,6 +22,10 @@ from typing import Final
 _DEFAULT_SECURE_MODE: Final[int] = 0o600
 _MAX_BACKUP_BYTES: Final[int] = 1_048_576
 _MIN_QUOTED_LEN: Final[int] = 2
+#: Plafond d'attente des sondes `git` (gardes informatives) : un binaire
+#: bloqué ne doit jamais pendre la CLI. `git` vient du PATH de confiance de
+#: l'opérateur (jamais du Vault) ; tout échec/timeout vaut statut inconnu.
+_GIT_TIMEOUT_SECONDS: Final[int] = 5
 
 
 def _write_file_atomic_dir_fd(
@@ -657,6 +661,7 @@ def _get_git_toplevel(path: Path) -> Path | None:
             cwd=parent_dir,
             text=True,
             check=False,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
         if res.returncode == 0:
             top = res.stdout.strip()
@@ -686,6 +691,7 @@ def is_git_tracked(path: Path) -> bool:
             stderr=subprocess.DEVNULL,
             cwd=top,
             check=False,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
         return res.returncode == 0
     except Exception:  # noqa: S110
@@ -711,6 +717,7 @@ def is_git_ignored(path: Path) -> bool:
             stderr=subprocess.DEVNULL,
             cwd=top,
             check=False,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
         return res.returncode == 0
     except Exception:  # noqa: S110
