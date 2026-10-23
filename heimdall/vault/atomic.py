@@ -20,31 +20,69 @@ from typing import Final
 _DEFAULT_SECURE_MODE: Final[int] = 0o600
 
 
-def write_file_atomic(path: Path, content: str | bytes, mode: int = _DEFAULT_SECURE_MODE) -> None:
+def write_file_atomic(  # noqa: PLR0912, PLR0915
+    path: Path,
+    content: str | bytes,
+    mode: int = _DEFAULT_SECURE_MODE,
+) -> None:
     """Écrit un fichier de manière atomique avec fsync et permissions strictes.
 
-    Utilise un fichier temporaire dans le même dossier pour garantir que
-    `os.replace` reste sur le même système de fichiers (atomicité POSIX).
+    Refuse strictement les liens symboliques (cible ou répertoire parent)
+    afin de prévenir tout écrasement ou détournement de cible.
     """
-    resolved_path = path.resolve()
-    parent = resolved_path.parent
+    if os.path.islink(path):
+        raise ValueError(f"Écriture refusée : la cible '{path}' est un lien symbolique.")
+
+    parent = path.parent
+    if os.path.islink(parent):
+        raise ValueError(
+            f"Écriture refusée : le répertoire parent '{parent}' est un lien symbolique."
+        )
+
     parent.mkdir(parents=True, exist_ok=True)
+    if os.path.islink(parent):
+        raise ValueError(
+            f"Écriture refusée : le répertoire parent '{parent}' est un lien symbolique."
+        )
+
+    parent_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        parent_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        parent_flags |= os.O_NOFOLLOW
+
+    try:
+        parent_fd = os.open(parent, parent_flags)
+    except OSError as exc:
+        raise ValueError(f"Impossible d'ouvrir le répertoire parent : {exc}") from exc
 
     data = content.encode("utf-8") if isinstance(content, str) else content
+    prefix = f".{path.name}.tmp."
 
-    prefix = f".{resolved_path.name}.tmp."
-    fd, temp_path_str = tempfile.mkstemp(prefix=prefix, dir=parent)
+    temp_fd, temp_path_str = tempfile.mkstemp(prefix=prefix, dir=parent)
     temp_path = Path(temp_path_str)
+
     try:
         if os.name == "posix":
-            os.fchmod(fd, mode)
-        with os.fdopen(fd, "wb") as f:
+            os.fchmod(temp_fd, mode)
+        with os.fdopen(temp_fd, "wb") as f:
+            temp_fd = -1  # Géré désormais par f
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp_path, resolved_path)
+
+        if os.path.islink(path):
+            raise ValueError(f"Écriture refusée : la cible '{path}' est un lien symbolique.")
+
+        os.replace(temp_path, path)
+
         if os.name == "posix":
-            os.chmod(resolved_path, mode)
+            os.chmod(path, mode)
+
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            pass
     except Exception:
         if temp_path.exists():
             try:
@@ -52,14 +90,50 @@ def write_file_atomic(path: Path, content: str | bytes, mode: int = _DEFAULT_SEC
             except OSError:  # noqa: S110
                 pass
         raise
+    finally:
+        if temp_fd >= 0:
+            try:
+                os.close(temp_fd)
+            except OSError:  # noqa: S110
+                pass
+        try:
+            os.close(parent_fd)
+        except OSError:  # noqa: S110
+            pass
 
 
 def backup_file(path: Path) -> Path | None:
     """Crée une copie de sauvegarde d'un fichier existant avec droits 0600."""
+    if os.path.islink(path):
+        raise ValueError(f"Sauvegarde refusée : '{path}' est un lien symbolique.")
     if not path.is_file():
         return None
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"Impossible d'ouvrir le fichier à sauvegarder : {exc}") from exc
+
+    try:
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            content = f.read()
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:  # noqa: S110
+                pass
+
     backup_path = path.with_suffix(path.suffix + ".bak")
-    content = path.read_bytes()
+    if os.path.islink(backup_path):
+        raise ValueError(
+            f"Sauvegarde refusée : la cible backup '{backup_path}' est un lien symbolique."
+        )
+
     write_file_atomic(backup_path, content, mode=_DEFAULT_SECURE_MODE)
     return backup_path
 
@@ -69,7 +143,7 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
     Ignore les commentaires (#...) et les lignes vides.
     """
-    if not path.is_file():
+    if not path.is_file() or os.path.islink(path):
         return {}
     secrets: dict[str, str] = {}
     content = path.read_text(encoding="utf-8")
@@ -91,7 +165,7 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
 def parse_example_names(path: Path) -> list[str]:
     """Extrait les noms de variables déclarés dans un .env.example."""
-    if not path.is_file():
+    if not path.is_file() or os.path.islink(path):
         return []
     names: list[str] = []
     content = path.read_text(encoding="utf-8")
@@ -105,17 +179,48 @@ def parse_example_names(path: Path) -> list[str]:
     return names
 
 
+def _get_git_toplevel(path: Path) -> Path | None:
+    """Trouve la racine du dépôt Git contenant le chemin."""
+    git_bin = shutil.which("git")
+    if not git_bin:
+        return None
+    parent_dir = path if path.is_dir() else path.parent
+    try:
+        res = subprocess.run(  # noqa: S603
+            [git_bin, "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=parent_dir,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            top = res.stdout.strip()
+            if top:
+                return Path(top)
+    except Exception:  # noqa: S110
+        pass
+    return None
+
+
 def is_git_tracked(path: Path) -> bool:
     """Vérifie si un fichier est actuellement suivi dans Git."""
     git_bin = shutil.which("git")
     if not git_bin:
         return False
+    top = _get_git_toplevel(path)
+    if top is None:
+        return False
+    try:
+        rel = path.resolve().relative_to(top.resolve())
+    except ValueError:
+        return False
     try:
         res = subprocess.run(  # noqa: S603
-            [git_bin, "ls-files", "--error-unmatch", str(path.name)],
+            [git_bin, "ls-files", "--error-unmatch", str(rel)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            cwd=path.parent.resolve(),
+            cwd=top,
             check=False,
         )
         return res.returncode == 0
@@ -128,12 +233,19 @@ def is_git_ignored(path: Path) -> bool:
     git_bin = shutil.which("git")
     if not git_bin:
         return False
+    top = _get_git_toplevel(path)
+    if top is None:
+        return False
+    try:
+        rel = path.resolve().relative_to(top.resolve())
+    except ValueError:
+        return False
     try:
         res = subprocess.run(  # noqa: S603
-            [git_bin, "check-ignore", "-q", str(path.name)],
+            [git_bin, "check-ignore", "-q", str(rel)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            cwd=path.parent.resolve(),
+            cwd=top,
             check=False,
         )
         return res.returncode == 0

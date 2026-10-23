@@ -19,7 +19,6 @@ from heimdall.vault.atomic import check_file_mode_600
 from heimdall.vault.client import (
     VaultAuthError,
     VaultForbiddenError,
-    VaultNotFoundError,
     VaultRateLimitError,
 )
 
@@ -98,79 +97,125 @@ class VaultPushCliTests(unittest.TestCase):
             self.assertEqual(res2.exit_code, 2)
             self.assertIn("invalide", res2.output)
 
-    def test_push_skips_invalid_secret_names(self) -> None:
-        """Les noms non conformes à ^[A-Z][A-Z0-9_]{1,63}$ sont ignorés avec avertissement."""
+    def test_push_success_nominal(self) -> None:
+        """Push nominal : envoie les secrets et affiche leur statut sans valeur."""
         env_file = self.tmp_dir / ".env"
-        env_file.write_text("invalid_lower=val\nVALID_KEY=val2\n", encoding="utf-8")
+        env_file.write_text("DB_PASS=my_secret_pass\nAPI_KEY=my_token\n", encoding="utf-8")
 
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
             with patch("heimdall.cli.vault_client._init_client") as mock_init:
                 client_instance = MagicMock()
                 client_instance.__enter__.return_value = client_instance
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "push",
+                        "--file",
+                        str(env_file),
+                        "--project",
+                        "demo",
+                        "--env",
+                        "dev",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0)
+                self.assertIn("DB_PASS", result.output)
+                self.assertIn("API_KEY", result.output)
+                self.assertIn("vaulte", result.output)
+                # Invariant : JAMAIS les valeurs en clair dans la sortie
+                self.assertNotIn("my_secret_pass", result.output)
+                self.assertNotIn("my_token", result.output)
+                self.assertEqual(client_instance.create_secret.call_count, 2)
+
+    def test_push_filters_by_name(self) -> None:
+        """L'option --name ne pousse que les secrets spécifiés."""
+        env_file = self.tmp_dir / ".env"
+        env_file.write_text("FOO_A=val1\nFOO_B=val2\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "push",
+                        "--file",
+                        str(env_file),
+                        "--project",
+                        "demo",
+                        "--name",
+                        "FOO_A",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(client_instance.create_secret.call_count, 1)
+
+    def test_push_handles_auth_error_401(self) -> None:
+        """Erreur 401 mappe proprement avec sortie 1."""
+        env_file = self.tmp_dir / ".env"
+        env_file.write_text("KEY=val\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.create_secret.side_effect = VaultAuthError("401 Unauthorized")
                 mock_init.return_value = client_instance
 
                 result = self.runner.invoke(
                     app,
                     ["vault", "push", "--file", str(env_file), "--project", "demo"],
                 )
-                self.assertEqual(result.exit_code, 0)
-                self.assertIn("invalid_lower", result.output)
-                client_instance.create_secret.assert_called_once_with(
-                    "demo", "dev", "VALID_KEY", "val2"
-                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("401", result.output)
 
-    def test_push_success_never_leaks_secret_values(self) -> None:
-        """Envoi nominal : état marqué 'vaulté', valeur secrète ABSENTE de la sortie."""
+    def test_push_handles_forbidden_error_403(self) -> None:
+        """Erreur 403 mappe proprement avec sortie 1."""
         env_file = self.tmp_dir / ".env"
-        secret_val = "SUPER_SECRET_VALUE_TO_NEVER_SHOW"  # noqa: S105
-        env_file.write_text(f"API_TOKEN={secret_val}\n", encoding="utf-8")
+        env_file.write_text("KEY=val\n", encoding="utf-8")
 
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
             with patch("heimdall.cli.vault_client._init_client") as mock_init:
                 client_instance = MagicMock()
                 client_instance.__enter__.return_value = client_instance
-                client_instance.create_secret.return_value = {
-                    "project": "demo",
-                    "env": "dev",
-                    "name": "API_TOKEN",
-                    "status": "vaulte",
-                }
+                client_instance.create_secret.side_effect = VaultForbiddenError("403 Forbidden")
                 mock_init.return_value = client_instance
 
                 result = self.runner.invoke(
                     app,
-                    ["vault", "push", "--file", str(env_file), "--project", "demo", "--env", "dev"],
+                    ["vault", "push", "--file", str(env_file), "--project", "demo"],
                 )
-                self.assertEqual(result.exit_code, 0)
-                self.assertIn("vaulte", result.output)
-                self.assertNotIn(secret_val, result.output)
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("403", result.output)
 
-    def test_push_handles_401_403_429(self) -> None:
-        """Gestion distincte des erreurs 401, 403 et 429."""
+    def test_push_handles_rate_limit_429(self) -> None:
+        """Erreur 429 affiche le temps Retry-After et sort en code 1."""
         env_file = self.tmp_dir / ".env"
-        env_file.write_text("API_TOKEN=secret\n", encoding="utf-8")
+        env_file.write_text("KEY=val\n", encoding="utf-8")
 
-        cases = [
-            (VaultAuthError("401"), "401"),
-            (VaultForbiddenError("403"), "403"),
-            (VaultRateLimitError("429", retry_after=30), "429"),
-        ]
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.create_secret.side_effect = VaultRateLimitError(
+                    "429 Too Many Requests", retry_after=30
+                )
+                mock_init.return_value = client_instance
 
-        for exc, expected_text in cases:
-            with self.subTest(exc=exc):
-                with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
-                    with patch("heimdall.cli.vault_client._init_client") as mock_init:
-                        client_instance = MagicMock()
-                        client_instance.__enter__.return_value = client_instance
-                        client_instance.create_secret.side_effect = exc
-                        mock_init.return_value = client_instance
-
-                        result = self.runner.invoke(
-                            app,
-                            ["vault", "push", "--file", str(env_file), "--project", "demo"],
-                        )
-                        self.assertEqual(result.exit_code, 1)
-                        self.assertIn(expected_text, result.output)
+                result = self.runner.invoke(
+                    app,
+                    ["vault", "push", "--file", str(env_file), "--project", "demo"],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("429", result.output)
+                self.assertIn("30 secondes", result.output)
 
 
 class VaultPullCliTests(unittest.TestCase):
@@ -184,11 +229,11 @@ class VaultPullCliTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_pull_writes_env_with_0600_permissions(self) -> None:
-        """Pull récupère les secrets et écrit .env en droits 0600."""
-        output_file = self.tmp_dir / ".env"
+    def test_pull_nominal_from_example_file(self) -> None:
+        """pull extrait les noms de .env.example, récupère les secrets et écrit en 0600."""
         example_file = self.tmp_dir / ".env.example"
         example_file.write_text("DATABASE_PASSWORD=\n", encoding="utf-8")
+        output_file = self.tmp_dir / ".env"
 
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
             with patch("heimdall.cli.vault_client._init_client") as mock_init:
@@ -229,7 +274,8 @@ class VaultPullCliTests(unittest.TestCase):
         """Si un fichier .env existe déjà, un .bak est créé avec droits 0600."""
         output_file = self.tmp_dir / ".env"
         output_file.write_text("OLD_KEY=old_val\n", encoding="utf-8")
-        os.chmod(output_file, 0o600)
+        if os.name == "posix":
+            os.chmod(output_file, 0o600)
 
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
             with patch("heimdall.cli.vault_client._init_client") as mock_init:
@@ -262,6 +308,112 @@ class VaultPullCliTests(unittest.TestCase):
                 self.assertTrue(bak_file.is_file())
                 self.assertEqual(bak_file.read_text(encoding="utf-8"), "OLD_KEY=old_val\n")
                 self.assertTrue(check_file_mode_600(bak_file))
+
+    def test_pull_rejects_newline_in_secret_value(self) -> None:
+        """Refus strict d'écrire un secret contenant un saut de ligne dans .env (§HIGH 2)."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "EVIL_VAR",
+                    "status": "actif",
+                    "value": "x\ny=1",
+                }
+                mock_init.return_value = client_instance
+
+                out_file = self.tmp_dir / ".env"
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "EVIL_VAR",
+                        "--output",
+                        str(out_file),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("saut de ligne interdit", result.output)
+                self.assertFalse(out_file.exists())
+
+    def test_pull_rejects_carriage_return_in_secret_value(self) -> None:
+        """Refus strict d'écrire un secret contenant un retour chariot dans .env."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "EVIL_VAR",
+                    "status": "actif",
+                    "value": "x\ry=1",
+                }
+                mock_init.return_value = client_instance
+
+                out_file = self.tmp_dir / ".env"
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "EVIL_VAR",
+                        "--output",
+                        str(out_file),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("saut de ligne interdit", result.output)
+
+    def test_pull_rejects_symlink_output_file(self) -> None:
+        """Refus strict si le chemin de destination .env est un lien symbolique (§HIGH 1)."""
+        victim = self.tmp_dir / "victim.txt"
+        victim.write_text("VICTIM_DATA\n", encoding="utf-8")
+        symlink_out = self.tmp_dir / ".env"
+        try:
+            os.symlink(victim, symlink_out)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "SAFE_VAR",
+                    "status": "actif",
+                    "value": "safe_val",
+                }
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "SAFE_VAR",
+                        "--output",
+                        str(symlink_out),
+                        "--no-backup",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("lien symbolique", result.output)
+                self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM_DATA\n")
 
     def test_pull_rejects_invalid_project_or_env(self) -> None:
         """Validation fail-closed des formats de projet et d'environnement pour pull."""
@@ -305,34 +457,8 @@ class VaultPullCliTests(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0)
                 self.assertIn("FROM_EXISTING=pulled_val", output_file.read_text(encoding="utf-8"))
 
-    def test_pull_handles_no_secrets_found_in_vault(self) -> None:
-        """Exit 1 si aucun secret demandé n'a pu être récupéré (tous 404)."""
-        output_file = self.tmp_dir / ".env"
-        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
-            with patch("heimdall.cli.vault_client._init_client") as mock_init:
-                client_instance = MagicMock()
-                client_instance.__enter__.return_value = client_instance
-                client_instance.get_secret.side_effect = VaultNotFoundError("404")
-                mock_init.return_value = client_instance
-
-                result = self.runner.invoke(
-                    app,
-                    [
-                        "vault",
-                        "pull",
-                        "--project",
-                        "demo",
-                        "--name",
-                        "NOT_IN_VAULT",
-                        "--output",
-                        str(output_file),
-                    ],
-                )
-                self.assertEqual(result.exit_code, 1)
-                self.assertIn("Aucun secret récupéré", result.output)
-
-    def test_pull_warns_if_env_not_ignored_by_git(self) -> None:
-        """Avertissement si .env n'est pas dans .gitignore."""
+    def test_pull_warns_when_env_tracked_by_git(self) -> None:
+        """Avertissement sur stderr si le .env généré est suivi par Git."""
         output_file = self.tmp_dir / ".env"
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
             with patch("heimdall.cli.vault_client._init_client") as mock_init:
@@ -341,16 +467,13 @@ class VaultPullCliTests(unittest.TestCase):
                 client_instance.get_secret.return_value = {
                     "project": "demo",
                     "env": "dev",
-                    "name": "TEST_KEY",
+                    "name": "KEY",
                     "status": "vaulte",
                     "value": "val",
                 }
                 mock_init.return_value = client_instance
 
-                with (
-                    patch("heimdall.cli.vault_client.is_git_tracked", return_value=False),
-                    patch("heimdall.cli.vault_client.is_git_ignored", return_value=False),
-                ):
+                with patch("heimdall.cli.vault_client.is_git_tracked", return_value=True):
                     result = self.runner.invoke(
                         app,
                         [
@@ -359,17 +482,51 @@ class VaultPullCliTests(unittest.TestCase):
                             "--project",
                             "demo",
                             "--name",
-                            "TEST_KEY",
+                            "KEY",
                             "--output",
                             str(output_file),
                         ],
                     )
                     self.assertEqual(result.exit_code, 0)
-                    self.assertIn("n'est pas ignoré par Git", result.output)
+                    self.assertIn("suivi par Git", result.output)
+
+    def test_pull_warns_when_env_not_ignored(self) -> None:
+        """Avertissement si le fichier .env n'est pas ignoré par Git."""
+        output_file = self.tmp_dir / ".env"
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "KEY",
+                    "status": "vaulte",
+                    "value": "val",
+                }
+                mock_init.return_value = client_instance
+
+                with patch("heimdall.cli.vault_client.is_git_tracked", return_value=False):
+                    with patch("heimdall.cli.vault_client.is_git_ignored", return_value=False):
+                        result = self.runner.invoke(
+                            app,
+                            [
+                                "vault",
+                                "pull",
+                                "--project",
+                                "demo",
+                                "--name",
+                                "KEY",
+                                "--output",
+                                str(output_file),
+                            ],
+                        )
+                        self.assertEqual(result.exit_code, 0)
+                        self.assertIn("n'est pas ignoré", result.output)
 
 
 class VaultRunCliTests(unittest.TestCase):
-    """Tests de la commande `heimdall run -- <cmd>` (ticket #101)."""
+    """Tests des commandes `heimdall run -- <cmd>` et `heimdall vault run` (ticket #101)."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="heimdall-run-")
@@ -380,36 +537,75 @@ class VaultRunCliTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_run_requires_command(self) -> None:
-        """Exit 2 si aucune commande n'est passée après run."""
-        result = self.runner.invoke(app, ["run"])
+        """Erreur explicite (exit 2) si aucune commande n'est passée après `--`."""
+        result = self.runner.invoke(app, ["run", "--project", "demo"])
         self.assertEqual(result.exit_code, 2)
-        self.assertIn("Aucune commande spécifiée", result.output)
+        self.assertIn("Aucune commande", result.output)
 
-    def test_run_rejects_invalid_project_or_env(self) -> None:
-        """Validation fail-closed des formats de projet et d'environnement pour run."""
-        res1 = self.runner.invoke(app, ["run", "--project", "INVALID_NAME", "--", "echo", "1"])
-        self.assertEqual(res1.exit_code, 2)
-        res2 = self.runner.invoke(
-            app,
-            ["run", "--project", "valid", "--env", "DEV!", "--", "echo", "1"],
-        )
-        self.assertEqual(res2.exit_code, 2)
-
-    def test_run_command_not_found(self) -> None:
-        """Exit 2 avec message d'erreur si la commande est introuvable."""
+    def test_run_nonexistent_command(self) -> None:
+        """Exit 127 si l'exécutable spécifié est introuvable."""
         result = self.runner.invoke(
             app,
             ["run", "--project", "demo", "--", "nonexistent_binary_xyz_12345"],
         )
-        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(result.exit_code, 127)
         self.assertIn("introuvable", result.output)
 
+    def test_run_rejects_dangerous_env_vars(self) -> None:
+        """Interdiction formelle d'injecter des variables système sensibles (§HIGH 3)."""
+        dangerous_names = ["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "NODE_OPTIONS"]
+        for var_name in dangerous_names:
+            with self.subTest(var_name=var_name):
+                with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+                    with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                        client_instance = MagicMock()
+                        client_instance.__enter__.return_value = client_instance
+                        client_instance.get_secret.return_value = {
+                            "project": "demo",
+                            "env": "dev",
+                            "name": var_name,
+                            "status": "actif",
+                            "value": "/opt/evil",
+                        }
+                        mock_init.return_value = client_instance
+
+                        result = self.runner.invoke(
+                            app,
+                            [
+                                "run",
+                                "--project",
+                                "demo",
+                                "--name",
+                                var_name,
+                                "--",
+                                "echo",
+                                "test",
+                            ],
+                        )
+                        self.assertEqual(result.exit_code, 1)
+                        self.assertIn("injection refusée", result.output)
+
+    def test_run_resolves_binary_before_injection(self) -> None:
+        """La commande cible est résolue avant injection des variables (§HIGH 3)."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(app, ["run", "--project", "demo", "--", "true"])
+                self.assertEqual(result.exit_code, 0)
+
     def test_run_permission_error(self) -> None:
-        """Exit 2 si l'exécution déclenche une PermissionError."""
-        with patch("subprocess.run", side_effect=PermissionError):
-            result = self.runner.invoke(app, ["run", "--project", "demo", "--", "echo", "hello"])
-            self.assertEqual(result.exit_code, 2)
-            self.assertIn("permission refusée", result.output)
+        """Exit 126 si l'exécution déclenche une PermissionError."""
+        with patch("shutil.which", return_value="/bin/echo"):
+            with patch("subprocess.run", side_effect=PermissionError):
+                result = self.runner.invoke(
+                    app,
+                    ["run", "--project", "demo", "--", "echo", "hello"],
+                )
+                self.assertEqual(result.exit_code, 126)
+                self.assertIn("permission refusée", result.output)
 
     def test_run_resolves_names_from_dot_env(self) -> None:
         """Récupération des variables depuis .env si ni --name ni .env.example ne sont fournis."""

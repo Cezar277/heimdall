@@ -27,12 +27,33 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Final, NoReturn
+from typing import TYPE_CHECKING, Any, Final, NoReturn
 from urllib.parse import urlparse
 
-import httpx
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
+if TYPE_CHECKING:
+    import httpx
+    from pydantic import BaseModel, ConfigDict, Field, ValidationError
+else:
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover
+        httpx = None
+
+    try:
+        from pydantic import BaseModel, ConfigDict, Field, ValidationError
+    except ImportError:  # pragma: no cover
+        BaseModel = None
+        ConfigDict = None
+        Field = None
+        ValidationError = None
 
 _ALLOWED_LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "::1", "localhost"})
 _MAX_PORT: Final[int] = 65535
@@ -77,6 +98,17 @@ class VaultUnavailableError(VaultClientError):
     """Erreur 500/503 ou indisponibilité réseau du Vault."""
 
 
+if BaseModel is not None:
+
+    class _SecretResponseModel(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        project: str = Field(min_length=1, max_length=64, pattern=_PROJECT_ID_PATTERN.pattern)
+        env: str = Field(min_length=1, max_length=64, pattern=_ENV_ID_PATTERN.pattern)
+        name: str = Field(min_length=2, max_length=64, pattern=_SECRET_NAME_PATTERN.pattern)
+        status: str
+        value: str = Field(min_length=1, max_length=_MAX_SECRET_VALUE_LEN)
+
+
 def _validate_identifier(value: str, label: str, pattern: re.Pattern[str]) -> None:
     """Valide la forme d'un identifiant contractuel (projet, environnement, nom)."""
     if not isinstance(value, str) or not pattern.match(value):
@@ -107,34 +139,44 @@ def _find_key_file(key_file: Path | None) -> Path | None:
 
 
 def _read_and_check_key_file(path: Path) -> str:
-    """Valide les permissions et lit le contenu du fichier de clé API."""
-    if path.is_symlink():
-        raise VaultClientError("Le fichier de clé API ne doit pas être un lien symbolique.")
+    """Valide les permissions et lit le fichier de clé de façon atomique sans TOCTOU."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
 
     try:
-        st = path.stat()
+        fd = os.open(path, flags)
     except OSError as exc:
-        raise VaultClientError(f"Impossible de lire le fichier de clé API : {exc}") from exc
-
-    if not stat.S_ISREG(st.st_mode):
-        raise VaultClientError("Le chemin de clé API doit être un fichier régulier.")
-
-    if os.name == "posix":
-        if st.st_uid != os.getuid():
-            raise VaultClientError(
-                "Le fichier de clé API doit appartenir à l'utilisateur courant."
-            )
-        mode = stat.S_IMODE(st.st_mode)
-        if mode & _GROUP_OTHER_PERMS_MASK:
-            raise VaultClientError(
-                f"Permissions trop permissives sur le fichier de clé API ({oct(mode)}) : "
-                "droits 0600 requis (chmod 600)."
-            )
+        raise VaultClientError(f"Impossible d'ouvrir le fichier de clé API : {exc}") from exc
 
     try:
-        content = path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise VaultClientError(f"Erreur de lecture du fichier de clé API : {exc}") from exc
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise VaultClientError("Le chemin de clé API doit être un fichier régulier.")
+
+        if os.name == "posix":
+            if st.st_uid != os.getuid():
+                raise VaultClientError(
+                    "Le fichier de clé API doit appartenir à l'utilisateur courant."
+                )
+            mode = stat.S_IMODE(st.st_mode)
+            if mode & _GROUP_OTHER_PERMS_MASK:
+                raise VaultClientError(
+                    f"Permissions trop permissives sur le fichier de clé API ({oct(mode)}) : "
+                    "droits 0600 requis (chmod 600)."
+                )
+
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = -1  # Géré et fermé désormais par f
+            content = f.read().strip()
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     if not content:
         raise VaultClientError("Le fichier de clé API est vide.")
@@ -198,17 +240,19 @@ def _detect_from_git(start_dir: Path) -> str | None:
 def _detect_from_pyproject(start_dir: Path) -> str | None:
     """Détecte l'identifiant du projet depuis pyproject.toml."""
     pyproject = start_dir / "pyproject.toml"
-    if not pyproject.is_file():
+    if not pyproject.is_file() or pyproject.is_symlink():
         return None
-    try:
-        content = pyproject.read_text(encoding="utf-8")
-        match = re.search(r'name\s*=\s*["\']([a-zA-Z0-9_-]+)["\']', content)
-        if match:
-            candidate = match.group(1).lower()
-            if candidate and candidate[0].isalpha() and _PROJECT_ID_PATTERN.match(candidate):
-                return candidate
-    except Exception:  # noqa: S110
-        pass
+    if tomllib is not None:
+        try:
+            content = pyproject.read_text(encoding="utf-8")
+            data = tomllib.loads(content)
+            name = data.get("project", {}).get("name")
+            if isinstance(name, str):
+                candidate = name.lower()
+                if candidate and candidate[0].isalpha() and _PROJECT_ID_PATTERN.match(candidate):
+                    return candidate
+        except Exception:  # noqa: S110
+            pass
     return None
 
 
@@ -273,6 +317,40 @@ def _validate_loopback_url(base_url: str) -> str:
     return canonical
 
 
+def _validate_secret_read_response(data: Any) -> dict[str, Any]:
+    """Valide strictement le schéma du secret retourné par le Vault."""
+    if not isinstance(data, dict):
+        raise VaultClientError("Format de réponse Vault invalide : attendu un objet JSON.")
+
+    if BaseModel is not None:
+        try:
+            _SecretResponseModel.model_validate(data)
+        except ValidationError as exc:
+            raise VaultClientError(
+                f"Réponse du Vault non conforme au schéma : {exc}"
+            ) from exc
+    else:
+        expected = {"project", "env", "name", "status", "value"}
+        if set(data.keys()) != expected:
+            diff = set(data.keys()) ^ expected
+            raise VaultClientError(
+                f"Schéma de réponse Vault invalide : champs inattendus/manquants {diff}"
+            )
+        val = data.get("value")
+        if not isinstance(val, str) or not (1 <= len(val) <= _MAX_SECRET_VALUE_LEN):
+            raise VaultClientError(
+                "Valeur de secret non conforme au schéma (chaîne de 1 à 65536 caractères attendue)."
+            )
+        _validate_identifier(str(data["project"]), "projet", _PROJECT_ID_PATTERN)
+        _validate_identifier(str(data["env"]), "environnement", _ENV_ID_PATTERN)
+        _validate_identifier(str(data["name"]), "nom de secret", _SECRET_NAME_PATTERN)
+
+    if data.get("status") not in ("actif", "revoque", "vaulte"):
+        raise VaultClientError(f"Statut de secret non conforme : {data.get('status')!r}")
+
+    return data
+
+
 class VaultClient:
     """Client HTTPS du Vault (boucle locale uniquement). Non héritable."""
 
@@ -295,7 +373,7 @@ class VaultClient:
         *,
         timeout: float = 10.0,
         ca_cert: str | Path | None = None,
-        transport: httpx.BaseTransport | None = None,
+        transport: Any = None,
     ) -> None:
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("clé API requise (chaîne non vide, non blanche)")
@@ -317,18 +395,25 @@ class VaultClient:
         self._timeout = float(timeout)
         self._ca_cert = str(ca_cert) if ca_cert is not None else None
         self._transport = transport
-        self._client: httpx.Client | None = None
+        self._client: Any = None
 
     def __repr__(self) -> str:
         return f"VaultClient({self._base_url!r}, api_key=<REDACTED>)"
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
     def __reduce__(self) -> NoReturn:
         raise TypeError("VaultClient n'est pas sérialisable (secret en mémoire)")
 
     def _get_client(self) -> httpx.Client:
         """Initialise ou réutilise le client HTTP sous-jacent."""
+        if httpx is None:
+            raise RuntimeError(
+                "La bibliothèque 'httpx' est requise pour effectuer des requêtes HTTP."
+            )
         if self._client is not None and not self._client.is_closed:
-            return self._client
+            return self._client  # type: ignore[no-any-return]
 
         verify: bool | str = True
         if self._ca_cert is not None:
@@ -344,9 +429,9 @@ class VaultClient:
                 "Accept": "application/json",
             },
         )
-        return self._client
+        return self._client  # type: ignore[no-any-return]
 
-    def _handle_error_response(self, resp: httpx.Response) -> NoReturn:
+    def _handle_error_response(self, resp: Any) -> NoReturn:
         """Convertit une réponse HTTP d'erreur en exception typée."""
         status = resp.status_code
         retry_after: int | None = None
@@ -441,7 +526,11 @@ class VaultClient:
             raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
 
         if resp.status_code == HTTPStatus.OK:
-            return resp.json()  # type: ignore[no-any-return]
+            try:
+                data = resp.json()
+            except Exception as exc:
+                raise VaultClientError(f"Réponse JSON invalide du Vault : {exc}") from exc
+            return _validate_secret_read_response(data)
         self._handle_error_response(resp)
 
     def get_secret_state(
@@ -468,10 +557,11 @@ class VaultClient:
 
     def close(self) -> None:
         """Ferme la session HTTP sous-jacente."""
-        if self._client is not None and not self._client.is_closed:
+        if self._client is not None:
             try:
-                self._client.close()
-            except AttributeError:  # noqa: S110
+                if not getattr(self._client, "is_closed", False):
+                    self._client.close()
+            except Exception:  # noqa: S110
                 pass
             self._client = None
 
