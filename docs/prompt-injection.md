@@ -59,8 +59,10 @@ python -m pytest tests/test_prompt_injection_corpus.py -m 'not llm' -v
 ```
 
 Le workflow `Prompt injection corpus` lance cette suite sur chaque PR vers
-`main`, dans un runner GitHub éphémère sans secrets ni identifiants Git
-persistés. La CI complète existante la collecte également. Les tests
+`main`, sur le runner Linux self-hosted du projet, sans secrets injectés
+ni identifiants Git persistés. Il utilise le `python3` préinstallé et recrée
+un environnement isolé `.venv-injection`, sans `actions/setup-python` ni
+installation globale de paquets. La CI complète existante la collecte également. Les tests
 `@pytest.mark.llm` sont désactivés par défaut ; voir le README du corpus
 pour la commande manuelle avec Ollama local. Une absence du serveur lors
 de cette exécution explicite échoue plutôt que de produire une fausse preuve.
