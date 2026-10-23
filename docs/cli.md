@@ -78,7 +78,9 @@ corrompre un blob déjà lu, mais la **liste** figée au départ peut devenir
 périmée (un fichier ajouté après le snapshot serait committé sans avoir été
 scanné). L'index est donc **relu après l'analyse**, et toute divergence
 refuse le scan (code 2) : un verdict sur un snapshot périmé ne vaut ni 0
-ni 1.
+ni 1. Les appels `cat-file` sont figés (`cat-file <mode> -- <sha>`) : le
+séparateur `--` est accepté par le git de CI et figé par un test e2e
+(`tests/test_mcp_units.py`).
 
 La **racine elle-même est re-contrôlée** après l'analyse, dans les deux
 périmètres : la garde unique (refus symlink, égalité du résolu) est rejouée
@@ -118,8 +120,10 @@ La durée totale d'une passe `--staged` est bornée par une **deadline
 globale** de 120 s ([`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py)) : chaque
 blob coûte deux appels `git cat-file` séquentiels, et 1 000 blobs
 représenteraient 2 000 processus. Au-delà de la deadline, refus (code 2),
-jamais un job CI qui s'éternise sans verdict ; chaque appel git garde son
-timeout unitaire de 30 s.
+jamais un job CI qui s'éternise sans verdict. Le restant de deadline est
+propagé comme timeout à chaque appel git (borné au timeout unitaire de
+30 s), y compris la seconde énumération de l'index ; un appel lent ne peut
+donc pas dépasser la deadline de plus que son timeout unitaire.
 
 Les bornes d'entrée ne suffisent pas : des blobs denses en candidats
 feraient gonfler la liste des Findings et le tri final en mémoire et en

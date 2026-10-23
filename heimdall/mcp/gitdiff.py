@@ -160,6 +160,11 @@ def confined_environment(root: Path) -> dict[str, str]:
 # d'outillage (INTERNAL), pas une attente sans fin.
 GIT_TIMEOUT_SECONDS: Final[float] = 30.0
 
+#: Sortie maximale attendue de ``cat-file -s`` : un entier décimal. 64 octets
+#: laissent une marge très large, tout en refusant une sortie git anormale
+#: avant bufferisation (même motif que ``blob_bytes``).
+MAX_BLOB_SIZE_OUTPUT_BYTES: Final[int] = 64
+
 # Plafonds d'affichage du contrat 4.1.
 MAX_FILES: Final[int] = 200
 MAX_LINES_PER_FILE: Final[int] = 5000
@@ -303,7 +308,12 @@ class GitAccess:
         """Identité du dossier racine (`st_dev`, `st_ino`) à la construction."""
         return self._root_id
 
-    def execute(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+    def execute(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> subprocess.CompletedProcess[bytes]:
         """Exécute une commande git figée (argv, jamais de shell).
 
         Les deux suppressions (`noqa`/`nosec`) sont justifiées : la liste
@@ -322,6 +332,9 @@ class GitAccess:
         on ne laisse pas l'héritage en place. Le garde-fou est statique
         (`tests/security/test_prompt_injection.py` refuse tout appel git
         sans `stdin=subprocess.DEVNULL`), pas seulement la ligne ci-dessous.
+
+        ``timeout`` est le délai **restant** d'une éventuelle deadline
+        globale : par défaut le timeout unitaire de :data:`GIT_TIMEOUT_SECONDS`.
         """
         try:
             return subprocess.run(  # noqa: S603 # nosec B603
@@ -329,7 +342,7 @@ class GitAccess:
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 check=False,
-                timeout=GIT_TIMEOUT_SECONDS,
+                timeout=timeout,
                 env=confined_environment(self._root),
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -337,14 +350,15 @@ class GitAccess:
             # statique, jamais de chemin ni de sortie git reflétés.
             raise ToolFailure("INTERNAL") from None
 
-    def is_repository(self) -> bool:
+    def is_repository(self, *, timeout: float = GIT_TIMEOUT_SECONDS) -> bool:
         """True si la racine est un dépôt Git avec arbre de travail à cette racine exacte.
 
         Un code de retour non nul (« not a git repository ») ou une racine
         qui pointe vers un dépôt parent n'est PAS une panne : c'est le diagnostic
-        attendu, traduit en ``NOT_A_GIT_REPO`` par l'appelant.
+        attendu, traduit en ``NOT_A_GIT_REPO`` par l'appelant. ``timeout`` est
+        le délai restant transmis par une deadline globale.
         """
-        completed = self.execute(("rev-parse", "--show-toplevel"))
+        completed = self.execute(("rev-parse", "--show-toplevel"), timeout=timeout)
         if completed.returncode != 0:
             return False
         top = completed.stdout.strip().decode("utf-8", errors="replace")
@@ -428,7 +442,11 @@ class GitAccess:
 
         return raw, False
 
-    def staged_changes(self) -> list[StagedChange]:
+    def staged_changes(
+        self,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> list[StagedChange]:
         """Fichiers **ajoutés ou modifiés** dans l'index, et leur blob.
 
         Utilisé par la CLI ``heimdall scan --staged`` (#29) : l'index est la
@@ -445,11 +463,22 @@ class GitAccess:
 
         L'index est non résolu (conflit de fusion) ou la sortie est illisible
         → ``ToolFailure`` : le scan ne peut alors pas prétendre avoir tout vu.
+        ``timeout`` est le délai restant transmis par une deadline globale.
         """
-        raw = self._read_capped(STAGED_RAW_ARGUMENTS, MAX_STAGED_RAW_BYTES)
+        raw = self._read_capped(
+            STAGED_RAW_ARGUMENTS,
+            MAX_STAGED_RAW_BYTES,
+            timeout=timeout,
+        )
         return parse_staged_raw(raw)
 
-    def _read_capped(self, arguments: Sequence[str], max_bytes: int) -> bytes:
+    def _read_capped(
+        self,
+        arguments: Sequence[str],
+        max_bytes: int,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> bytes:
         """Sortie d'une commande git figée, lue en flux borné à ``max_bytes``.
 
         Même motif que ``staged_diff`` (argv figé, ``stdin=DEVNULL``,
@@ -457,6 +486,9 @@ class GitAccess:
         plus ``max_bytes + 1`` octets. Au-delà, le sous-processus est tué et
         c'est ``ToolFailure`` — ici aucune coupe partielle n'est rendue :
         l'appelant ne sait exploiter qu'une énumération **complète**.
+
+        ``timeout`` est le délai **restant** d'une éventuelle deadline
+        globale : par défaut le timeout unitaire de :data:`GIT_TIMEOUT_SECONDS`.
         """
         try:
             proc = subprocess.Popen(  # noqa: S603 # nosec B603
@@ -469,7 +501,7 @@ class GitAccess:
         except OSError:
             raise ToolFailure("INTERNAL") from None
 
-        timer = threading.Timer(GIT_TIMEOUT_SECONDS, proc.kill)
+        timer = threading.Timer(timeout, proc.kill)
         timer.daemon = True
         timer.start()
         try:
@@ -489,7 +521,7 @@ class GitAccess:
             raise ToolFailure("INTERNAL")
 
         try:
-            ret = proc.wait(timeout=GIT_TIMEOUT_SECONDS)
+            ret = proc.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, OSError):
             _terminate_process(proc)
             raise ToolFailure("INTERNAL") from None
@@ -499,7 +531,12 @@ class GitAccess:
 
         return raw
 
-    def blob_size(self, blob: str) -> int:
+    def blob_size(
+        self,
+        blob: str,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> int:
         """Taille en octets d'un objet git, **sans** le lire.
 
         L'appelant borne ainsi la lecture : un blob géant ne doit jamais
@@ -507,19 +544,31 @@ class GitAccess:
         refusée (panne d'outillage) : la comptabilité de volume de
         l'appelant ne doit jamais pouvoir reculer. Zéro reste valide — un
         blob vide ne porte aucun candidat.
+
+        La sortie est lue en flux borné à :data:`MAX_BLOB_SIZE_OUTPUT_BYTES`
+        (un entier décimal) : une sortie git anormale est refusée avant
+        bufferisation, comme pour ``blob_bytes``. ``timeout`` est le délai
+        restant d'une éventuelle deadline globale.
         """
-        completed = self.execute(_cat_file_arguments("-s", blob))
-        if completed.returncode != 0:
-            raise ToolFailure("INTERNAL")
+        raw = self._read_capped(
+            _cat_file_arguments("-s", blob),
+            MAX_BLOB_SIZE_OUTPUT_BYTES,
+            timeout=timeout,
+        )
         try:
-            size = int(completed.stdout.strip())
+            size = int(raw.strip())
         except ValueError:
             raise ToolFailure("INTERNAL") from None
         if size < 0:
             raise ToolFailure("INTERNAL")
         return size
 
-    def blob_bytes(self, blob: str) -> bytes:
+    def blob_bytes(
+        self,
+        blob: str,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> bytes:
         """Contenu **brut** d'un blob (celui de l'index, pas de la copie de
         travail).
 
@@ -531,8 +580,13 @@ class GitAccess:
         ``_read_capped`` : si l'oracle ``cat-file -s`` mentait (store
         incohérent, objet remplacé), le surplus n'est jamais bufferisé. Le
         sous-processus est tué au-delà de la borne et c'est ``ToolFailure``.
+        ``timeout`` est le délai restant d'une éventuelle deadline globale.
         """
-        return self._read_capped(_cat_file_arguments("blob", blob), MAX_FILE_BYTES)
+        return self._read_capped(
+            _cat_file_arguments("blob", blob),
+            MAX_FILE_BYTES,
+            timeout=timeout,
+        )
 
 
 @dataclass(frozen=True)

@@ -663,7 +663,9 @@ def test_scan_staged_caps_blob_bytes_before_buffering(
     git_repo.write("gros.txt", "A" * (MAX_FILE_BYTES + 1))
     git_repo.stage("gros.txt")
 
-    def taille_mensongere(self: GitAccess, blob: str) -> int:
+    def taille_mensongere(
+        self: GitAccess, blob: str, **_options: object
+    ) -> int:
         return 1
 
     monkeypatch.setattr(GitAccess, "blob_size", taille_mensongere)
@@ -755,7 +757,9 @@ def test_scan_staged_concurrent_index_change_exits_two(
     original = GitAccess.staged_changes
     appels = 0
 
-    def snapshot_changeant(self: GitAccess) -> list[StagedChange]:
+    def snapshot_changeant(
+        self: GitAccess, **_options: object
+    ) -> list[StagedChange]:
         nonlocal appels
         appels += 1
         changes = original(self)
@@ -788,7 +792,9 @@ def test_scan_staged_root_swapped_mid_scan_exits_two(
         original_octets = GitAccess.blob_bytes
         appels = 0
 
-        def lit_puis_echange(self: GitAccess, blob: str) -> bytes:
+        def lit_puis_echange(
+            self: GitAccess, blob: str, **_options: object
+        ) -> bytes:
             nonlocal appels
             appels += 1
             data = original_octets(self, blob)
@@ -826,7 +832,9 @@ def test_scan_staged_root_replaced_same_path_exits_two(
     original_octets = GitAccess.blob_bytes
     appels = 0
 
-    def lit_puis_remplace(self: GitAccess, blob: str) -> bytes:
+    def lit_puis_remplace(
+        self: GitAccess, blob: str, **_options: object
+    ) -> bytes:
         nonlocal appels
         appels += 1
         data = original_octets(self, blob)
@@ -955,6 +963,43 @@ def test_scan_staged_refuses_global_deadline(
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
+def test_scan_staged_checks_deadline_before_the_final_enumeration(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : la deadline couvre aussi la seconde énumération.
+
+    L'horloge expire juste après le blob : le re-contrôle d'index ne doit
+    pas être lancé (30 s de timeout unitaire en plus de la deadline), et le
+    scan refuse en 2 sans verdict.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
+    original_changes = GitAccess.staged_changes
+    appels: list[dict[str, object]] = []
+
+    def changes_espion(self: GitAccess, **options: object) -> list[StagedChange]:
+        appels.append(options)
+        return original_changes(self, **options)
+
+    clock = [0.0]
+    monkeypatch.setattr("heimdall.cli.scan.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(GitAccess, "staged_changes", changes_espion)
+    original_bytes = GitAccess.blob_bytes
+
+    def bytes_puis_expire(
+        self: GitAccess, blob: str, **options: object
+    ) -> bytes:
+        data = original_bytes(self, blob, **options)
+        clock[0] = 121.0  # deadline = 120, expirée après le blob
+        return data
+
+    monkeypatch.setattr(GitAccess, "blob_bytes", bytes_puis_expire)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+    assert len(appels) == 1
+
+
 def test_scan_staged_refuses_blob_size_mismatch(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -969,7 +1014,9 @@ def test_scan_staged_refuses_blob_size_mismatch(
     git_repo.stage("config.py")
     original_taille = GitAccess.blob_size
 
-    def taille_mensongere(self: GitAccess, blob: str) -> int:
+    def taille_mensongere(
+        self: GitAccess, blob: str, **_options: object
+    ) -> int:
         return original_taille(self, blob) - 1
 
     monkeypatch.setattr(GitAccess, "blob_size", taille_mensongere)
@@ -986,7 +1033,9 @@ def test_scan_staged_refuses_negative_blob_size(
     git_repo.write("app.py", "x = 1\n")
     git_repo.stage("app.py")
 
-    def taille_negative(self: GitAccess, blob: str) -> int:
+    def taille_negative(
+        self: GitAccess, blob: str, **_options: object
+    ) -> int:
         return -1
 
     monkeypatch.setattr(GitAccess, "blob_size", taille_negative)
@@ -1004,10 +1053,15 @@ def test_blob_size_refuses_negative_git_output(
     """
     access = GitAccess(git_repo.root)
 
-    def execute_negatif(self: GitAccess, arguments: object) -> subprocess.CompletedProcess[bytes]:
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout=b"-1\n")
+    def read_negatif(
+        self: GitAccess,
+        arguments: object,
+        max_bytes: int,
+        **_options: object,
+    ) -> bytes:
+        return b"-1\n"
 
-    monkeypatch.setattr(GitAccess, "execute", execute_negatif)
+    monkeypatch.setattr(GitAccess, "_read_capped", read_negatif)
     with pytest.raises(ToolFailure):
         access.blob_size("a" * 40)
 

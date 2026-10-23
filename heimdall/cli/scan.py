@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Final
 
 from heimdall.mcp.errors import ToolFailure
-from heimdall.mcp.gitdiff import GitAccess
+from heimdall.mcp.gitdiff import GIT_TIMEOUT_SECONDS, GitAccess
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.errors import ScanError
@@ -173,6 +173,20 @@ def _collect_tree(root: Path) -> ScanReport:
     return ScanReport(scope=SCOPE_TREE, findings=tuple(findings))
 
 
+def _call_timeout(deadline: float) -> float:
+    """Timeout à passer au prochain appel git, borné par la deadline globale.
+
+    Le restant de deadline est propagé comme ``timeout``, mais jamais au-delà
+    du timeout unitaire : un git bloqué ne peut donc dépasser ni les 30 s
+    unitaires ni la deadline (le prochain contrôle refuse). Deadline expirée
+    → ``ScanError`` avant de lancer l'appel.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ScanError(_MSG_TIMEOUT)
+    return min(remaining, GIT_TIMEOUT_SECONDS)
+
+
 def _collect_staged(root: Path) -> ScanReport:
     """Scanne les blobs **ajoutés ou modifiés** de l'index git.
 
@@ -192,18 +206,19 @@ def _collect_staged(root: Path) -> ScanReport:
     """
     deadline = time.monotonic() + MAX_STAGED_SECONDS
     access = GitAccess(root)
-    if not access.is_repository():
+    if not access.is_repository(timeout=_call_timeout(deadline)):
         raise ScanError(_MSG_NOT_A_REPO)
-    changes = access.staged_changes()
+    changes = access.staged_changes(timeout=_call_timeout(deadline))
     if len(changes) > MAX_STAGED_FILES:
         raise ScanError(_MSG_TOO_MANY_FILES)
     moteur = TargetScanner(SignatureEngine(max_findings=MAX_STAGED_FINDINGS))
     findings: list[Finding] = []
     total = 0
     for change in changes:
-        if time.monotonic() > deadline:
-            raise ScanError(_MSG_TIMEOUT)
-        size = access.blob_size(change.blob)
+        size = access.blob_size(
+            change.blob,
+            timeout=_call_timeout(deadline),
+        )
         # Plancher explicite : même si un `GitAccess` dérivé rendait une
         # taille négative, `total` ne doit jamais reculer (la borne de
         # volume serait sinon contournable). Zéro reste valide : un blob
@@ -213,7 +228,10 @@ def _collect_staged(root: Path) -> ScanReport:
         total += size
         if total > MAX_STAGED_BYTES:
             raise ScanError(_MSG_TOO_LARGE)
-        data = access.blob_bytes(change.blob)
+        data = access.blob_bytes(
+            change.blob,
+            timeout=_call_timeout(deadline),
+        )
         # La taille annoncée par `cat-file -s` est un oracle, pas une
         # garantie : le contenu relu doit faire exactement cette taille.
         # Un écart (store incohérent, objet remplacé) refuserait sinon un
@@ -251,12 +269,11 @@ def _collect_staged(root: Path) -> ScanReport:
             finding.snippet_hash,
         )
     )
-    if time.monotonic() > deadline:
-        raise ScanError(_MSG_TIMEOUT)
-    if access.staged_changes() != changes:
+    if access.staged_changes(timeout=_call_timeout(deadline)) != changes:
         # L'index a bougé pendant le scan : le snapshot analysé ne décrit
         # plus ce qui sera committé. Refus, pas de verdict périmé.
         raise ScanError(_MSG_INDEX_CHANGED)
+    _call_timeout(deadline)
     _verify_root_unchanged(access, root)
     return ScanReport(scope=SCOPE_STAGED, findings=tuple(findings))
 
