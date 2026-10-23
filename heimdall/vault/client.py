@@ -333,7 +333,14 @@ def detect_project(start_dir: Path | None = None) -> str:
 
 
 def _check_localhost_resolution(host: str) -> None:
-    """Vérifie que localhost résout strictement vers une boucle locale."""
+    """Vérifie que localhost résout strictement vers une boucle locale.
+
+    Fenêtre connue (LOW) : contrôle à la construction, puis `httpx` résout à
+    nouveau à la connexion. Un empoisonnement du résolveur local entre les
+    deux pourrait diriger la clé hors boucle en HTTPS. Le défaut reste
+    `https://127.0.0.1:8443` (pas de résolution DNS) ; `localhost` est accepté
+    par compatibilité mais `127.0.0.1` est recommandé.
+    """
     if host != "localhost":
         return
     try:

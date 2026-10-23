@@ -85,6 +85,9 @@ _DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
     "RUSTC_",
     "OPENSSL_",
     "MALLOC_",
+    # Shadowing credential/processus : un Vault compromis ne doit pas
+    # écraser la credential du fils via `{**os.environ, **injected}`.
+    "HEIMDALL_",
 )
 _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "PATH",
