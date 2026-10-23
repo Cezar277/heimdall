@@ -980,6 +980,40 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             write_file_atomic(target, "SECRET=1\n")
         self.assertIn("lien symbolique", str(ctx.exception))
 
+    def test_read_file_secure_no_follow_refuses_symlinked_intermediate(self) -> None:
+        """Lecture insensible aux symlinks intermédiaires : `out/sub` → lien → None."""
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("O_NOFOLLOW requis")
+        base = self.tmp_dir / "read_out"
+        base.mkdir()
+        outside = self.tmp_dir / "read_evil"
+        outside.mkdir()
+        (outside / "secret.env").write_text("OUTSIDE_SECRET=1\n", encoding="utf-8")
+        inter = base / "sub"
+        try:
+            os.symlink(outside, inter)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        # Sans marcheur, l'ouverture suivrait le lien et lirait le fichier externe.
+        self.assertIsNone(read_file_secure_no_follow(inter / "secret.env"))
+
+    def test_key_file_reader_refuses_symlinked_intermediate(self) -> None:
+        """`_read_and_check_key_file` refuse un parent intermédiaire symlinké."""
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("O_NOFOLLOW requis")
+        base = self.tmp_dir / "key_out"
+        base.mkdir()
+        outside = self.tmp_dir / "key_evil"
+        outside.mkdir()
+        (outside / "vault.key").write_text("attacker_key\n", encoding="utf-8")
+        inter = base / "sub"
+        try:
+            os.symlink(outside, inter)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        with self.assertRaises(VaultClientError):
+            _read_and_check_key_file(inter / "vault.key")
+
     def test_get_secret_without_pydantic_raises_vault_client_error_on_invalid_identifiers(
         self,
     ) -> None:

@@ -156,7 +156,7 @@ def _write_file_atomic_fallback(
                 pass
 
 
-def _open_parent_dir_secure(parent: Path) -> int:  # noqa: PLR0912, PLR0915
+def _open_parent_dir_secure(parent: Path, *, create_missing: bool = True) -> int:  # noqa: PLR0912, PLR0915
     """Ouvre le répertoire parent sans jamais suivre de lien symbolique.
 
     Marche composant par composant depuis ``/`` avec ``openat`` +
@@ -164,9 +164,11 @@ def _open_parent_dir_secure(parent: Path) -> int:  # noqa: PLR0912, PLR0915
     ``O_DIRECTORY | O_NOFOLLOW`` (un symlink lève ``ELOOP`` — ou ``ENOTDIR``
     quand combiné à ``O_DIRECTORY`` sur Linux — → refus), chaque
     composant manquant est créé par ``mkdirat`` (``0o700``) puis ré-ouvert
-    avec ``O_NOFOLLOW``. Contrairement à ``Path.mkdir(parents=True)`` qui
-    suit les liens intermédiaires, un échange d'un composant intermédiaire
-    (``out/sub`` → symlink) est donc détecté au lieu d'être traversé.
+    avec ``O_NOFOLLOW`` (sauf ``create_missing=False`` : l'absence lève
+    au lieu de créer, pour les lectures). Contrairement à
+    ``Path.mkdir(parents=True)`` qui suit les liens intermédiaires, un
+    échange d'un composant intermédiaire (``out/sub`` → symlink) est donc
+    détecté au lieu d'être traversé.
 
     Retourne un descripteur ouvert sur le répertoire parent (à fermer par
     l'appelant). Lève ``ValueError`` fail-closed en cas de symlink, de
@@ -208,6 +210,10 @@ def _open_parent_dir_secure(parent: Path) -> int:  # noqa: PLR0912, PLR0915
             try:
                 child_fd = os.open(comp, open_flags, dir_fd=cur_fd)
             except FileNotFoundError:
+                if not create_missing:
+                    raise ValueError(
+                        f"Accès refusé : le répertoire parent '{comp}' n'existe pas."
+                    ) from None
                 try:
                     os.mkdir(comp, 0o700, dir_fd=cur_fd)
                 except FileExistsError:
@@ -321,6 +327,66 @@ def _open_parent_dir_secure(parent: Path) -> int:  # noqa: PLR0912, PLR0915
                 os.close(cur_fd)
             except OSError:  # noqa: S110
                 pass
+
+
+def _open_file_read_fd(path: Path) -> int:  # noqa: PLR0912
+    """Ouvre un fichier en lecture sans suivre aucun symlink (cible + parents).
+
+    Sur POSIX, le parent est ouvert par ``_open_parent_dir_secure`` (marcheur
+    ``openat`` + ``O_NOFOLLOW``, ``create_missing=False`` : aucune création,
+    insensible à l'échange d'un composant intermédiaire contre un symlink),
+    puis la cible est ouverte par ``openat`` avec ``O_NOFOLLOW`` (refus si la
+    cible finale est un lien) et ``O_NONBLOCK`` (pas de blocage sur FIFO,
+    rejetée ensuite par le contrôle fichier régulier). Hors POSIX, repli
+    direct best-effort (pas de ``dir_fd``, voir ``_write_file_atomic_fallback``).
+
+    Retourne un descripteur ouvert (à fermer par l'appelant).
+    Lève ``ValueError`` fail-closed en cas de symlink ou de parent non sûr.
+    """
+    target_name = path.name
+    if (
+        not target_name
+        or target_name in (".", "..")
+        or "/" in target_name
+        or "\x00" in target_name
+        or (os.sep != "/" and os.sep in target_name)
+    ):
+        raise ValueError(f"Lecture refusée : nom de fichier invalide '{path}'.")
+    if os.path.islink(path):
+        raise ValueError(f"Lecture refusée : '{path}' est un lien symbolique.")
+
+    if os.name == "posix" and hasattr(os, "O_NOFOLLOW"):
+        parent_fd = _open_parent_dir_secure(path.parent, create_missing=False)
+        try:
+            read_flags = os.O_RDONLY | os.O_NOFOLLOW
+            if hasattr(os, "O_NONBLOCK"):
+                read_flags |= os.O_NONBLOCK
+            if hasattr(os, "O_CLOEXEC"):
+                read_flags |= os.O_CLOEXEC
+            return os.open(target_name, read_flags, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError(
+                    f"Lecture refusée : '{path}' est un lien symbolique."
+                ) from exc
+            raise ValueError(f"Impossible d'ouvrir le fichier : {exc}") from exc
+        finally:
+            try:
+                os.close(parent_fd)
+            except OSError:  # noqa: S110
+                pass
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        return os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"Impossible d'ouvrir le fichier : {exc}") from exc
 
 
 def write_file_atomic(  # noqa: PLR0912, PLR0915
@@ -439,16 +505,10 @@ def backup_file(path: Path) -> Path | None:  # noqa: PLR0912
     if not path.is_file():
         return None
 
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
+    # Ouverture via le parent sécurisé (marcheur anti-symlink intermédiaire).
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
+        fd = _open_file_read_fd(path)
+    except (ValueError, OSError) as exc:
         raise ValueError(f"Impossible d'ouvrir le fichier à sauvegarder : {exc}") from exc
 
     try:
@@ -492,24 +552,19 @@ def read_file_secure_no_follow(  # noqa: PLR0911, PLR0912
 ) -> str | None:
     """Lit un fichier de manière sécurisée sans suivre les liens symboliques (anti-TOCTOU).
 
+    Ni la cible ni aucun composant parent intermédiaire n'est suivi (marcheur
+    ``_open_parent_dir_secure`` + ``openat`` ``O_NOFOLLOW`` sur POSIX).
+
     Retourne None si le fichier n'existe pas ou ne peut pas être lu
     (symlink, non-régulier, trop gros).
     """
     if os.path.islink(path):
         return None
 
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
-
     fd = -1
     try:
-        fd = os.open(path, flags)
-    except OSError:
+        fd = _open_file_read_fd(path)
+    except (ValueError, OSError):
         return None
 
     try:

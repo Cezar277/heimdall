@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NoReturn
 from urllib.parse import urlparse
 
-from heimdall.vault.atomic import read_file_secure_no_follow
+from heimdall.vault.atomic import _open_file_read_fd, read_file_secure_no_follow
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -165,18 +165,15 @@ def _find_key_file(key_file: Path | None) -> Path | None:
 
 
 def _read_and_check_key_file(path: Path) -> str:  # noqa: PLR0912
-    """Valide les permissions et lit le fichier de clé de façon atomique sans TOCTOU."""
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
+    """Valide les permissions et lit le fichier de clé de façon atomique sans TOCTOU.
 
+    Ni la cible ni aucun composant parent intermédiaire n'est suivi (parent
+    ouvert par le marcheur ``_open_parent_dir_secure`` + ``openat``
+    ``O_NOFOLLOW``, voir ``heimdall.vault.atomic``).
+    """
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
+        fd = _open_file_read_fd(path)
+    except (ValueError, OSError) as exc:
         raise VaultClientError(f"Impossible d'ouvrir le fichier de clé API : {exc}") from exc
 
     try:

@@ -146,6 +146,16 @@ _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
+    # Comportement du shell enfant (LOW) : un Vault compromis ne doit pas
+    # détourner les `cd`/globs/historique des scripts enfants de `run`.
+    # La racine de confiance reste l'allowlist locale (seuls les noms listés
+    # localement sont demandés) ; la denylist n'est qu'une défense en
+    # profondeur. Tout nom listé localement (--name/.env.example/.env) est
+    # une entrée de confiance : ne pas y inscrire de variable système.
+    "CDPATH",
+    "GLOBIGNORE",
+    "HISTFILE",
+    "MAILCAPS",
 })
 
 _MAX_ERROR_MSG_LEN: Final[int] = 150
@@ -640,7 +650,10 @@ def vault_run(  # noqa: PLR0913, PLR0917
     Vault compromis ne peut donc pas introduire une variable arbitraire, il ne
     peut que fournir la valeur d'un nom déjà autorisé localement. Une denylist
     de variables d'exécution système (PATH, LD_*, BASH_*, prompt, runtimes,
-    outils de build, etc.) reste appliquée en défense en profondeur.
+    outils de build, HEIMDALL_*, CDPATH/GLOBIGNORE/HISTFILE/MAILCAPS, etc.)
+    reste appliquée en défense en profondeur. Tout nom listé localement est
+    une entrée de confiance : ne pas inscrire de variable de comportement
+    shell dans ``--name``/``.env.example``/``.env``.
 
     Limite de sécurité : les secrets sont injectés dans l'environnement du sous-processus
     sans écriture sur disque. Néanmoins, sous Linux, les variables d'un processus sont

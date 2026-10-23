@@ -854,6 +854,10 @@ class VaultRunCliTests(unittest.TestCase):
             "HOME",
             "TMPDIR",
             "XDG_CONFIG_HOME",
+            "CDPATH",
+            "GLOBIGNORE",
+            "HISTFILE",
+            "MAILCAPS",
         ]
         for var_name in dangerous_names:
             with self.subTest(var_name=var_name):
