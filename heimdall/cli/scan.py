@@ -80,6 +80,11 @@ MAX_STAGED_FINDINGS: Final[int] = 10_000
 #: verdict. Au-delà, refus (code 2). Chaque appel git garde son timeout
 #: unitaire (30 s) ; la deadline empêche d'en lancer de nouveaux.
 MAX_STAGED_SECONDS: Final[float] = 120.0
+#: Deadline globale du mode arbre, en secondes. Les plafonds de volume
+#: (50 000 fichiers, 256 Mio) ne bornent pas le temps de regex + HMAC : un
+#: dépôt adverse de petits fichiers pourrait faire durer la CI sans verdict.
+#: Au-delà, refus (code 2), vérifié entre chaque fichier et avant le rendu.
+MAX_TREE_SECONDS: Final[float] = 120.0
 
 #: Messages d'erreur **statiques** (invariant 8 : aucune entrée reflétée).
 _MSG_NOT_A_REPO: Final[str] = "scan impossible : entrée non analysable"
@@ -161,14 +166,16 @@ def _collect_tree(root: Path) -> ScanReport:
     pas rendre 0 en silence. Le scan de fichier isolé reste possible en
     bibliothèque (`Scanner`, #22), hors contrat hook/CI.
     """
+    deadline = time.monotonic() + MAX_TREE_SECONDS
     access = GitAccess(root)
-    if not access.is_repository():
+    if not access.is_repository(timeout=_call_timeout(deadline)):
         raise ScanError(_MSG_NOT_A_REPO)
     # `access.root` est la forme **figée** (résolue, symlink refusé) : le
     # scanner ne re-résout pas l'entrée brute, donc une seule résolution et
     # une seule course possible, alignée sur l'identité épinglée par
-    # `GitAccess`.
-    findings = TreeScanner(access.root, strict=True).scan()
+    # `GitAccess`. La deadline est vérifiée dans la boucle du scanner.
+    findings = TreeScanner(access.root, strict=True).scan(deadline=deadline)
+    _call_timeout(deadline)
     _verify_root_unchanged(access, root)
     return ScanReport(scope=SCOPE_TREE, findings=tuple(findings))
 
@@ -333,6 +340,7 @@ __all__ = [
     "MAX_STAGED_FILES",
     "MAX_STAGED_FINDINGS",
     "MAX_STAGED_SECONDS",
+    "MAX_TREE_SECONDS",
     "SCOPE_STAGED",
     "SCOPE_TREE",
     "ScanReport",

@@ -28,6 +28,7 @@ from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
     Finding,
     ScanError,
+    Scanner,
     _validate_relative_path,
     find_candidates,
     scan,
@@ -551,6 +552,17 @@ def test_single_file_root_uses_a_relative_name(tmp_path: Path) -> None:
     findings = scan(path)
     assert isinstance(findings[0], Finding)
     assert [finding.file for finding in findings] == ["one.py"]
+
+
+def test_scanner_refuses_an_expired_deadline(tmp_path: Path) -> None:
+    """Revue (LOW) : la deadline arbre est fail-closed même sans fichier lu.
+
+    La CLI borne le mode arbre comme `--staged` ; le scanner bibliothèque
+    accepte une échéance optionnelle et refuse avant de rendre un résultat.
+    """
+    _write(tmp_path, "app.py", "x = 1\n")
+    with pytest.raises(ScanError):
+        Scanner(tmp_path).scan(deadline=time.monotonic() - 1)
 
 
 def test_invalid_utf8_is_scanned_with_replacement(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
@@ -228,7 +229,7 @@ class Scanner:
         self._hasher = SnippetHasher() if hasher is None else hasher
         self._strict = strict
 
-    def scan(self) -> list[Finding]:
+    def scan(self, *, deadline: float | None = None) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.
 
         Toute erreur de lecture interrompt le scan : aucun résultat partiel
@@ -237,7 +238,14 @@ class Scanner:
         (:data:`MAX_FINDINGS`) sont **bornés** : au-delà, le scan est refusé
         (``ScanError``) au lieu de durer indéfiniment ou de gonfler en
         mémoire sur un dépôt adverse (#29).
+
+        ``deadline`` (optionnel) est une échéance ``time.monotonic()`` :
+        dépassée, le scan est refusé (``ScanError``) avant de traiter le
+        fichier suivant, et une dernière fois avant de rendre le résultat.
+        La CLI ``heimdall scan`` l'utilise pour borner aussi le mode arbre.
         """
+        if deadline is not None and time.monotonic() > deadline:
+            raise ScanError(_SCAN_ERROR)
         # Pas de `list()` sur le périmètre : un dépôt adverse avec un très
         # grand nombre de fichiers ne doit pas OOM le hook/CI. Le tri final
         # porte sur les findings, pas sur les chemins.
@@ -250,6 +258,8 @@ class Scanner:
         count = 0
         total = 0
         for path, relative in files:
+            if deadline is not None and time.monotonic() > deadline:
+                raise ScanError(_SCAN_ERROR)
             count += 1
             if count > self._max_files:
                 raise ScanError(_SCAN_ERROR)
@@ -273,6 +283,8 @@ class Scanner:
             findings.extend(self._scan_text(text, relative))
             if len(findings) > self._max_findings:
                 raise ScanError(_SCAN_ERROR)
+        if deadline is not None and time.monotonic() > deadline:
+            raise ScanError(_SCAN_ERROR)
         findings.sort(
             key=lambda finding: (
                 finding.file,

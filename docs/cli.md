@@ -116,14 +116,17 @@ est refusé (code 2) avant tout décodage, jamais scanné partiellement. Une
 taille négative est également refusée ; zéro reste valide (blob vide, aucun
 candidat).
 
-La durée totale d'une passe `--staged` est bornée par une **deadline
-globale** de 120 s ([`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py)) : chaque
-blob coûte deux appels `git cat-file` séquentiels, et 1 000 blobs
-représenteraient 2 000 processus. Au-delà de la deadline, refus (code 2),
-jamais un job CI qui s'éternise sans verdict. Le restant de deadline est
-propagé comme timeout à chaque appel git (borné au timeout unitaire de
-30 s), y compris la seconde énumération de l'index ; un appel lent ne peut
-donc pas dépasser la deadline de plus que son timeout unitaire.
+Les deux périmètres ont aussi une **deadline globale** de 120 s :
+[`MAX_TREE_SECONDS`](../heimdall/cli/scan.py) en arbre (vérifiée entre chaque
+fichier et avant le rendu), [`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py) en
+`--staged`. En arbre, les plafonds de volume ne bornent pas le temps de
+regex + HMAC ; en `--staged`, chaque blob coûte deux appels `git cat-file`
+séquentiels, et 1 000 blobs représenteraient 2 000 processus. Au-delà de la
+deadline, refus (code 2), jamais un job CI qui s'éternise sans verdict. En
+`--staged`, le restant de deadline est propagé comme timeout à chaque appel
+git (borné au timeout unitaire de 30 s), y compris la seconde énumération de
+l'index ; un appel lent ne peut donc pas dépasser la deadline de plus que son
+timeout unitaire.
 
 Les bornes d'entrée ne suffisent pas : des blobs denses en candidats
 feraient gonfler la liste des Findings et le tri final en mémoire et en

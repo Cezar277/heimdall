@@ -12,7 +12,7 @@ revue APPROVE WITH COMMENTS), ses premiers durcissements (`ae0b1c7`), les
 correctifs de la seconde revue (`593021c`, run 39838145119), ceux de la
 troisième revue (`251fd18`, run 39841323251) et la présente passe
 (run 39844814050). Les permaliens ci-dessous épinglent ce SHA : un lien vers
-la branche changerait de lignes au fil des commits. Les septième à douzième
+la branche changerait de lignes au fil des commits. Les septième à treizième
 passes (courantes, voir plus bas) seront re-pinnées sur le SHA final du
 squash/merge.
 
@@ -58,16 +58,16 @@ Environnement : Linux, Python 3.14.8, venv du dépôt.
 
 ```text
 .venv/bin/python -m pytest tests/test_cli_scan.py -q
-93 passed
+94 passed
 
 .venv/bin/python -m pytest
-1538 passed, 4321 subtests passed
+1541 passed, 4321 subtests passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch \
   --cov-report=term-missing --cov-fail-under=85
-Total coverage: 95,94 % (seuil 85 % atteint)
+Total coverage: 95,87 % (seuil 85 % atteint)
 heimdall/cli/scan.py : 99 % ; heimdall/cli/main.py : 98 % ;
-heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 91 % ;
+heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 90 % ;
 heimdall/scanner/exclusions.py : 95 % ;
 heimdall/scanner/signature_engine.py : 100 %
 
@@ -221,6 +221,16 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
 | LOW — `blob_size` bufferisé sans borne | `blob_size` passe par `_read_capped(..., MAX_BLOB_SIZE_OUTPUT_BYTES=64)` : une sortie git anormale est tuée/refusée avant bufferisation, puis `int()` et plancher négatif restent appliqués | `heimdall/mcp/gitdiff.py` (`blob_size`, `_read_capped`), `tests/test_mcp_units.py::GitAccessDirectTests::test_blob_access_uses_end_of_options_and_a_capped_read`, `::test_blob_size_refuses_an_oversized_stdout` |
 | LOW — compatibilité `cat-file --` non figée | test e2e réel `blob_size`+`blob_bytes` sur un blob indexé (git de CI), en plus du test d'argv ; `docs/cli.md` documente le séparateur et son test | `tests/test_mcp_units.py::GitAccessDirectTests::test_blob_access_round_trips_with_end_of_options`, `docs/cli.md` |
 
+## Correctifs de la treizième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — arbre sans deadline globale | `MAX_TREE_SECONDS` (120 s) et `Scanner.scan(deadline=...)` : contrôle avant le premier fichier, entre chaque fichier et avant le rendu ; `_collect_tree` passe la deadline, borne `is_repository` par le restant et re-contrôle avant la vérification de racine | `heimdall/cli/scan.py` (`MAX_TREE_SECONDS`, `_collect_tree`), `heimdall/scanner/detect.py` (`Scanner.scan`), `docs/cli.md` ; `tests/test_cli_scan.py::test_scan_tree_refuses_global_deadline`, `tests/test_scanner_detect.py::test_scanner_refuses_an_expired_deadline` |
+| LOW — garde réseau de test allowlist trop lâche | `_git_argv_ok` compare désormais l'**argv complet** : `rev-parse --show-toplevel`, `DIFF_ARGUMENTS`, `STAGED_RAW_ARGUMENTS`, `check-ignore -q -- <chemin>`, `cat-file (-s|blob) -- <sha 40/64>`. Toute option supplémentaire ou sous-commande non listée est refusée | `tests/test_network_isolation.py` (`_git_argv_ok`), `tests/test_network_isolation.py::test_git_allowlist_accepts_only_exact_product_argv` |
+| LOW — README « lecture seule » sans l'exception clé HMAC | README aligné sur `docs/cli.md` : lecture seule **sur le dépôt**, seule écriture autorisée = clé locale hors dépôt (`0600`), HOME/FS en lecture seule → code 2, jamais 0 | `README.md`, `docs/cli.md` ; tests `tests/test_cli_scan.py::test_scan_ci_creates_the_local_key_outside_the_repository`, `::test_scan_ci_fails_closed_when_the_local_key_cannot_be_created` |
+
 ## Limites assumées
 
 - La validation humaine Y/N/E et le remplacement du secret ne sont pas dans ce
@@ -256,8 +266,9 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
   LOW et leurs tests ajoutés ; dixième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests ajoutés ; onzième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests ajoutés ; douzième revue APPROVE WITH COMMENTS, 3 points
+  LOW et leurs tests ajoutés ; treizième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests de non-régression ajoutés dans la passe courante (voir
-  les douze tableaux ci-dessus).
+  les treize tableaux ci-dessus).
 - La feuille SAMM externe n'est pas accessible depuis le dépôt : reporter les
   lignes ci-dessus avec le lien de la PR et le SHA final du squash/merge
   (**re-pinner les permaliens sur ce SHA final** si le squash crée un SHA

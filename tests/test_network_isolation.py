@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import socket
 import ssl
 import stat
@@ -88,22 +89,40 @@ class NetworkLedger:
         return [attempt for attempt in self.attempts if attempt.blocked]
 
 
-#: Sous-commandes git strictement locales (lecture seule, jamais de fetch).
-_GIT_LOCAL_SUBCOMMANDS: Final[tuple[str, ...]] = (
-    "rev-parse",
+#: Args **exacts** des lectures git du produit. Toute dérive (nouvelle
+#: option, sous-commande non listée) casse ce test au lieu d'être acceptée
+#: comme « locale » par simple préfixe.
+_GIT_DIFF_ARGUMENTS: Final[tuple[str, ...]] = (
     "diff",
-    "cat-file",
-    "check-ignore",
+    "--cached",
+    "--unified=0",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
 )
+_GIT_STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
+    "diff",
+    "--cached",
+    "--raw",
+    "-z",
+    "--no-abbrev",
+    "--no-renames",
+    "--no-ext-diff",
+    "--no-textconv",
+)
+_GIT_OBJECT_RE: Final[re.Pattern[str]] = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
 def _git_argv_ok(argv: Any) -> bool:
     """True pour l'argv figé des invocations git du produit, et lui seul.
 
     Binaire `git`, neutralisation `core.fsmonitor`, placement `-C <racine>`,
-    puis une sous-commande de lecture locale. Noyau partagé par les deux
-    couches d'exécution (`subprocess.Popen` et `os.posix_spawn`, par lequel
-    CPython implémente `Popen`).
+    puis **allowlist exacte** des arguments de lecture. Un `diff` avec une
+    option d'egress ajoutée, un `cat-file --follow-symlinks` ou un `git log`
+    préfixé valide sont refusés : le garde ne se contente pas du nom de la
+    sous-commande. Noyau partagé par les deux couches d'exécution
+    (`subprocess.Popen` et `os.posix_spawn`, par lequel CPython implémente
+    `Popen`).
     """
     if not isinstance(argv, (list, tuple)) or len(argv) < 6:
         return False
@@ -111,7 +130,26 @@ def _git_argv_ok(argv: Any) -> bool:
         return False
     if list(argv[1:4]) != ["-c", "core.fsmonitor=false", "-C"]:
         return False
-    return argv[5] in _GIT_LOCAL_SUBCOMMANDS
+    if not isinstance(argv[4], str):
+        return False
+    tail = tuple(argv[5:])
+    return (
+        tail == ("rev-parse", "--show-toplevel")
+        or tail in (_GIT_DIFF_ARGUMENTS, _GIT_STAGED_RAW_ARGUMENTS)
+        or (
+            len(tail) == 4
+            and tail[:3] == ("check-ignore", "-q", "--")
+            and isinstance(tail[3], str)
+        )
+        or (
+            len(tail) == 4
+            and tail[0] == "cat-file"
+            and tail[1] in ("-s", "blob")
+            and tail[2] == "--"
+            and isinstance(tail[3], str)
+            and _GIT_OBJECT_RE.fullmatch(tail[3]) is not None
+        )
+    )
 
 
 def _is_local_git_call(args: Any, kwargs: Any) -> bool:
@@ -547,6 +585,48 @@ def test_guard_still_blocks_non_local_child_processes(
             {},
         )
     assert len(loopback_only.blocked) == 5
+
+
+def test_git_allowlist_accepts_only_exact_product_argv(tmp_path: Path) -> None:
+    """Revue (LOW) : l'allowlist couvre l'argv complet, pas le préfixe."""
+    if GIT is None:  # pragma: no cover - garde-fou d'environnement de test.
+        pytest.skip("git requis")
+    root = str(tmp_path)
+    valides = (
+        ("rev-parse", "--show-toplevel"),
+        _GIT_DIFF_ARGUMENTS,
+        _GIT_STAGED_RAW_ARGUMENTS,
+        ("cat-file", "-s", "--", "a" * 40),
+        ("cat-file", "blob", "--", "a" * 64),
+        ("check-ignore", "-q", "--", "a/b"),
+    )
+    for tail in valides:
+        argv = [GIT, "-c", "core.fsmonitor=false", "-C", root, *tail]
+        assert _git_argv_ok(argv), argv
+        assert _is_local_git_call((argv,), {"stdin": subprocess.DEVNULL})
+        assert _is_local_git_spawn([GIT, argv, {}])
+
+    for tail in (
+        (
+            "diff",
+            "--cached",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--upload-pack=evil",
+        ),
+        ("cat-file", "--follow-symlinks", "--", "a" * 40),
+        ("cat-file", "blob", "--", "A" * 40),
+        ("check-ignore", "-q", "--"),
+        ("log", "--format=%H"),
+    ):
+        argv = [GIT, "-c", "core.fsmonitor=false", "-C", root, *tail]
+        assert not _git_argv_ok(argv), argv
+        assert not _is_local_git_call((argv,), {"stdin": subprocess.DEVNULL})
+        assert not _is_local_git_spawn([GIT, argv, {}])
 
 
 @pytest.mark.parametrize(

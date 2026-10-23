@@ -39,10 +39,14 @@ heimdall scan --json      # rapport JSON sur stdout (contrat heimdall.scan.v1)
 heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 ```
 
-`heimdall scan` est **en lecture seule** et **déterministe** : codes de sortie
-`0` (aucun secret), `1` (secrets détectés), `2` (erreur d'outillage — jamais
-`0` après une erreur). Aucun secret n'est jamais affiché en clair. Le
-protocole complet est dans [docs/cli.md](docs/cli.md).
+`heimdall scan` est **en lecture seule sur le dépôt** et **déterministe** :
+codes de sortie `0` (aucun secret), `1` (secrets détectés), `2` (erreur
+d'outillage — jamais `0` après une erreur). La seule écriture autorisée est la
+clé d'empreinte locale hors dépôt
+(`$XDG_DATA_HOME/heimdall/snippet-hmac.key`, `0600`) ; si elle ne peut pas
+être créée ou lue (HOME/FS en lecture seule), le scan sort en `2`, jamais en
+`0`. Aucun secret n'est jamais affiché en clair. Le protocole complet est
+dans [docs/cli.md](docs/cli.md).
 
 ### Serveur Vault
 

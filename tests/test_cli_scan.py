@@ -330,6 +330,21 @@ def test_scan_broken_stderr_still_exits_two(
     assert resultat.exit_code == EXIT_CLEAN
 
 
+def test_scan_tree_refuses_global_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : l'arbre est aussi borné en temps, pas seulement en volume.
+
+    Un dépôt adverse de petits fichiers ne doit pas faire durer la CI sans
+    verdict : deadline déjà expirée -> refus 2, comme en `--staged`.
+    """
+    monkeypatch.setattr("heimdall.cli.scan.MAX_TREE_SECONDS", -1.0)
+    racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
+    resultat = _run("scan", str(racine))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
 def test_scan_tree_refuses_too_many_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -374,7 +389,8 @@ def test_collect_tree_uses_the_pinned_root(
         def __init__(self, root: Path, *, strict: bool) -> None:
             seen.append((Path(root), strict))
 
-        def scan(self) -> list[object]:
+        def scan(self, *, deadline: float | None = None) -> list[object]:
+            assert deadline is not None
             return []
 
     monkeypatch.setattr("heimdall.cli.scan.TreeScanner", ScannerEspion)
@@ -865,8 +881,10 @@ def test_scan_tree_root_swapped_mid_scan_exits_two(
     original_scan = TreeScanner.scan
     echange = [False]
 
-    def scan_puis_echange(self: TreeScanner) -> list[object]:
-        trouvailles = original_scan(self)
+    def scan_puis_echange(
+        self: TreeScanner, **options: object
+    ) -> list[object]:
+        trouvailles = original_scan(self, **options)
         if not echange[0]:
             echange[0] = True
             cache = git_repo.root.parent / "orig-29"
@@ -894,8 +912,10 @@ def test_scan_tree_root_replaced_same_path_exits_two(
     original_scan = TreeScanner.scan
     echange = [False]
 
-    def scan_puis_remplace(self: TreeScanner) -> list[object]:
-        trouvailles = original_scan(self)
+    def scan_puis_remplace(
+        self: TreeScanner, **options: object
+    ) -> list[object]:
+        trouvailles = original_scan(self, **options)
         if not echange[0]:
             echange[0] = True
             cache = git_repo.root.parent / "orig-29"
