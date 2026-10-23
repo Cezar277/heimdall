@@ -264,8 +264,10 @@ document si `count != len(findings)` (contrainte explicitée dans la
   `heimdall scan` sur l'arbre de travail, et du job de CI de #37).
 - Un chemin de fichier doit être représentable dans le contrat
   [Finding v1](contracts/finding.md) : au-delà de **4096 caractères**, le
-  scan est refusé (code 2), jamais un chemin tronqué. Les noms contenant une
-  espace ou des caractères Unicode sont, eux, parfaitement acceptés.
+  scan est refusé (code 2), jamais un chemin tronqué. Un nom **non-UTF8**
+  (surrogates issus de `os.walk`, octets invalides en index) est également
+  refusé en code 2 dans les deux périmètres. Les noms contenant une espace ou
+  des caractères Unicode valides sont, eux, parfaitement acceptés.
 - Le scanner de signatures ne décode ni base64 ni concaténation de chaînes :
   ces obfuscations restent des `limite_connue` (#23/#24), comme documenté dans
   [scanner.md](scanner.md#limites-connues-honnêtes).

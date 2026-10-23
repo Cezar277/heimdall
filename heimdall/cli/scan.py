@@ -36,7 +36,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GIT_TIMEOUT_SECONDS, GitAccess
@@ -55,10 +55,13 @@ EXIT_CLEAN: Final[int] = 0
 EXIT_FINDINGS: Final[int] = 1
 EXIT_ERROR: Final[int] = 2
 
+#: Périmètres contractuels du scan (contrat de sortie JSON, `scope`).
+Scope = Literal["working-tree", "staged"]
+
 #: Périmètre « arbre de travail ».
-SCOPE_TREE: Final[str] = "working-tree"
+SCOPE_TREE: Final[Scope] = "working-tree"
 #: Périmètre « index git ».
-SCOPE_STAGED: Final[str] = "staged"
+SCOPE_STAGED: Final[Scope] = "staged"
 
 #: Version du contrat de sortie JSON (``--json``).
 JSON_SCHEMA: Final[str] = "heimdall.scan.v1"
@@ -95,9 +98,10 @@ _MSG_BLOB_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
+_MSG_INVALID_SCOPE: Final[str] = "scan impossible : entrée non analysable"
 
 #: Libellés du périmètre, affichés à l'humain.
-_SCOPE_LABELS: Final[dict[str, str]] = {
+_SCOPE_LABELS: Final[dict[Scope, str]] = {
     SCOPE_TREE: "arbre de travail (mode strict : exclusions techniques seules)",
     SCOPE_STAGED: "index git (blobs ajoutés ou modifiés, aucune exclusion de chemin)",
 }
@@ -119,8 +123,15 @@ class ScanReport:
     tels quels, y compris dans le JSON, ne fuit rien.
     """
 
-    scope: str
+    scope: Scope
     findings: tuple[Finding, ...]
+
+    def __post_init__(self) -> None:
+        # Garde runtime pour les appelants non typés : le `Literal` protège
+        # mypy, cette vérification protège l'exécution (jamais de `KeyError`
+        # hors contrat dans `render_text`).
+        if self.scope not in _SCOPE_LABELS:
+            raise ScanError(_MSG_INVALID_SCOPE)
 
 
 def collect(root: Path, *, staged: bool) -> ScanReport:
@@ -350,6 +361,7 @@ __all__ = [
     "SCOPE_STAGED",
     "SCOPE_TREE",
     "ScanReport",
+    "Scope",
     "ToolFailure",
     "collect",
     "render_json",

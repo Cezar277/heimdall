@@ -12,7 +12,7 @@ revue APPROVE WITH COMMENTS), ses premiers durcissements (`ae0b1c7`), les
 correctifs de la seconde revue (`593021c`, run 39838145119), ceux de la
 troisième revue (`251fd18`, run 39841323251) et la présente passe
 (run 39844814050). Les permaliens ci-dessous épinglent ce SHA : un lien vers
-la branche changerait de lignes au fil des commits. Les septième à quatorzième
+la branche changerait de lignes au fil des commits. Les septième à quinzième
 passes (courantes, voir plus bas) seront re-pinnées sur le SHA final du
 squash/merge.
 
@@ -58,16 +58,16 @@ Environnement : Linux, Python 3.14.8, venv du dépôt.
 
 ```text
 .venv/bin/python -m pytest tests/test_cli_scan.py -q
-96 passed
+98 passed
 
 .venv/bin/python -m pytest
-1544 passed, 4321 subtests passed
+1546 passed, 4321 subtests passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch \
   --cov-report=term-missing --cov-fail-under=85
-Total coverage: 95,84 % (seuil 85 % atteint)
+Total coverage: 95,89 % (seuil 85 % atteint)
 heimdall/cli/scan.py : 99 % ; heimdall/cli/main.py : 98 % ;
-heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 89 % ;
+heimdall/mcp/gitdiff.py : 96 % ; heimdall/scanner/detect.py : 89 % ;
 heimdall/scanner/exclusions.py : 95 % ;
 heimdall/scanner/signature_engine.py : 100 %
 
@@ -241,6 +241,15 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
 | LOW — relecture d'index sensible à l'ordre | la seconde énumération est comparée par **ensemble** (`set` de `StagedChange`) : une permutation à contenu identique ne provoque plus un faux 2 ; une divergence réelle reste refusée | `heimdall/cli/scan.py` (`_collect_staged`), `tests/test_cli_scan.py::test_scan_staged_accepts_a_reordered_second_enumeration` |
 | LOW — double résolution de racine persistante | documenté : `TreeScanner` rejoue la garde unique sur la forme canonique `access.root` (idempotente) ; toute substitution entre les deux est rattrapée par `_verify_root_unchanged` (`st_dev`/`st_ino`). Pas de mode « racine déjà résolue » qui contournerait la garde | `heimdall/cli/scan.py` (commentaire `_collect_tree`), `docs/cli.md` ; `tests/test_cli_scan.py::test_tree_scanner_resolves_the_same_root_from_raw_or_pinned` |
 
+## Correctifs de la quinzième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — `scope` non typé, index direct dans `_SCOPE_LABELS` | `Scope = Literal["working-tree", "staged"]`, `ScanReport.scope: Scope`, `_SCOPE_LABELS: dict[Scope, str]` ; garde runtime `__post_init__` pour les appelants non typés (jamais de `KeyError` hors contrat) | `heimdall/cli/scan.py` (`Scope`, `ScanReport`), `tests/test_cli_scan.py::test_scan_report_refuses_an_unknown_scope` |
+| LOW — chemins non-UTF8 refusés en `--staged`, acceptés en arbre | `validate_relative_path` rejette explicitement la plage des surrogates (`0xD800..0xDFFF`) : `os.walk` et le parseur d'index convergent vers le même refus 2, documenté dans `docs/cli.md` | `heimdall/scanner/finding.py` (`validate_relative_path`), `docs/cli.md` ; `tests/test_cli_scan.py::test_scan_refuses_non_utf8_paths_in_both_scopes` |
+
 ## Limites assumées
 
 - La validation humaine Y/N/E et le remplacement du secret ne sont pas dans ce
@@ -278,8 +287,9 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
   LOW et leurs tests ajoutés ; douzième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests ajoutés ; treizième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests ajoutés ; quatorzième revue APPROVE WITH COMMENTS,
-  3 points LOW et leurs tests de non-régression ajoutés dans la passe
-  courante (voir les quatorze tableaux ci-dessus).
+  3 points LOW et leurs tests ajoutés ; quinzième revue APPROVE WITH
+  COMMENTS, 2 points LOW et leurs tests de non-régression ajoutés dans la
+  passe courante (voir les quinze tableaux ci-dessus).
 - La feuille SAMM externe n'est pas accessible depuis le dépôt : reporter les
   lignes ci-dessus avec le lien de la PR et le SHA final du squash/merge
   (**re-pinner les permaliens sur ce SHA final** si le squash crée un SHA

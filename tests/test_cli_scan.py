@@ -15,6 +15,7 @@ d'exemple de la documentation AWS, jamais une clé fonctionnelle.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,6 +35,7 @@ from heimdall.cli.scan import (
     EXIT_ERROR,
     EXIT_FINDINGS,
     JSON_SCHEMA,
+    ScanReport,
     _verify_root_unchanged,
 )
 from heimdall.mcp.errors import ToolFailure
@@ -298,6 +300,16 @@ def test_scan_tool_failure_uses_the_same_static_message(
     resultat = _run("scan", str(racine))
     assert resultat.exit_code == EXIT_ERROR
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+def test_scan_report_refuses_an_unknown_scope() -> None:
+    """Revue (LOW) : le `Literal` est doublé d'une garde runtime.
+
+    Un appelant non typé ne doit pas fabriquer un rapport hors contrat qui
+    ferait un `KeyError` dans `_SCOPE_LABELS`.
+    """
+    with pytest.raises(ScanError):
+        ScanReport(scope="invalide", findings=())  # type: ignore[arg-type]
 
 
 def test_scan_broken_stderr_still_exits_two(
@@ -577,6 +589,27 @@ def test_scan_staged_accepts_a_long_path(git_repo: GitRepo) -> None:
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_FINDINGS
     assert f"{chemin}:1" in resultat.stdout
+
+
+@pytest.mark.skipif(os.name != "posix", reason="noms non-UTF8 POSIX")
+def test_scan_refuses_non_utf8_paths_in_both_scopes(git_repo: GitRepo) -> None:
+    """Revue (LOW) : un nom non-UTF8 refuse le scan, en arbre comme en index.
+
+    En arbre, `os.walk` rend des surrogates ; la garde unique
+    `validate_relative_path` les refuse désormais explicitement. En index,
+    le décodage UTF-8 strict de `git diff --raw -z` fait déjà échouer le
+    parseur. Les deux périmètres sortent en 2, jamais 0/1 partiel.
+    """
+    raw = os.fsencode(git_repo.root) + b"/bad-\xff.py"
+    descriptor = os.open(raw, os.O_CREAT | os.O_WRONLY, 0o600)
+    os.close(descriptor)
+    resultat = _run("scan", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+    git_repo.git("add", "-A")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
 def test_scan_staged_with_a_sha256_repository() -> None:
