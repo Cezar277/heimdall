@@ -27,6 +27,7 @@ from pathlib import Path
 
 import typer
 
+from heimdall.cli.vault_client import vault_pull, vault_push, vault_run
 from heimdall.vault import auth as vault_auth
 from heimdall.vault.database import init_db, resolve_db_path
 
@@ -38,10 +39,19 @@ key_app = typer.Typer(
 
 vault_app = typer.Typer(
     name="vault",
-    help="Administration du Vault Heimdall (clés API de projet).",
+    help="Administration et client du Vault Heimdall (tickets #35, #64).",
     no_args_is_help=True,
 )
 vault_app.add_typer(key_app, name="key")
+
+# Client Vault CLI (tickets #35, #99, #100, #101)
+vault_app.command("push")(vault_push)
+vault_app.command("pull")(vault_pull)
+vault_app.command(
+    "run",
+    help="Lance une commande avec les secrets injectés en mémoire (ticket #101).",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)(vault_run)
 
 _DB_PATH_OPTION = typer.Option(
     None,

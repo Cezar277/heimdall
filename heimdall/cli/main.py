@@ -30,6 +30,7 @@ from heimdall.cli.scan import (
     render_json,
     render_text,
 )
+from heimdall.cli.vault_client import vault_run
 from heimdall.cli.vault_keys import vault_app
 from heimdall.mcp.server import run_stdio
 from heimdall.scanner.errors import ScanError
@@ -45,8 +46,19 @@ app = typer.Typer(
     no_args_is_help=True,
     invoke_without_command=True,  # `--version` seul ne doit pas exiger de sous-commande.
 )
-# Administration du Vault (clés API de projet, ticket #64).
+# Administration du Vault (clés API de projet, ticket #64) et client (ticket #35).
 app.add_typer(vault_app, name="vault")
+
+# Exécution avec injection en mémoire (ticket #101)
+app.command(
+    "run",
+    help=(
+        "Lance une commande avec les secrets injectés en mémoire (ticket #101).\n\n"
+        "Limite de sécurité : sous Linux, les variables d'environnement d'un processus sont "
+        "visibles par les processus du même utilisateur via /proc/<pid>/environ."
+    ),
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)(vault_run)
 
 
 def _echo_stderr_best_effort(message: str) -> None:

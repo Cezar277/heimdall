@@ -35,6 +35,7 @@ from cryptography.x509.oid import NameOID
 from pydantic import ValidationError
 
 from heimdall.vault.app import VaultSettings, create_app, run_server
+from heimdall.vault.crypto import generate_encryption_key
 
 _LOOPBACK = "127.0.0.1"
 
@@ -187,6 +188,7 @@ class VaultTlsLauncherTests(unittest.TestCase):
                 api_key_pepper="p" * 32,
                 ssl_certfile=str(certfile),
                 ssl_keyfile=str(keyfile),
+                kek=generate_encryption_key(),
             )
             self.assertEqual(settings.ssl_certfile, str(certfile))
             self.assertEqual(settings.ssl_keyfile, str(keyfile))
@@ -242,6 +244,7 @@ class VaultTlsContractTests(unittest.TestCase):
                 api_key_pepper="p" * 32,
                 ssl_certfile=str(certfile),
                 ssl_keyfile=str(keyfile),
+                kek=generate_encryption_key(),
             )
             with (
                 patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=False),
