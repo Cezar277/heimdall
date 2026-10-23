@@ -26,9 +26,11 @@ from heimdall.vault.atomic import (
     is_git_tracked,
     parse_env_file,
     parse_example_names,
+    read_file_secure_no_follow,
     write_file_atomic,
 )
 from heimdall.vault.client import (
+    _PROJECT_ID_PATTERN,
     VaultAuthError,
     VaultClient,
     VaultClientError,
@@ -38,6 +40,7 @@ from heimdall.vault.client import (
     VaultRateLimitError,
     VaultUnavailableError,
     _read_and_check_key_file,
+    _validate_identifier,
     detect_project,
     resolve_api_key,
 )
@@ -539,6 +542,38 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         """backup_file retourne None si le fichier n'existe pas."""
         nonexistent = self.tmp_dir / "inexistant.env"
         self.assertIsNone(backup_file(nonexistent))
+
+    def test_backup_file_rejects_oversized_file(self) -> None:
+        """Un fichier > 1 Mio est refusé sans être lu intégralement."""
+        target = self.tmp_dir / ".env"
+        target.write_bytes(b"x" * (2 * 1024 * 1024))
+
+        with self.assertRaises(ValueError) as ctx:
+            backup_file(target)
+        self.assertIn("taille maximale", str(ctx.exception))
+        self.assertFalse((self.tmp_dir / ".env.bak").exists())
+
+    def test_read_file_secure_no_follow_bounds_growth_after_fstat(self) -> None:
+        """Un fichier grossi après fstat est rejeté par la lecture bornée."""
+        target = self.tmp_dir / "grow.env"
+        target.write_bytes(b"A" * (2 * 1024 * 1024))
+        # fstat menteur : annonce un petit fichier régulier alors que le
+        # fichier réel dépasse largement max_bytes.
+        fake_stat = os.stat_result((stat.S_IFREG | 0o600, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+        with patch("heimdall.vault.atomic.os.fstat", return_value=fake_stat):
+            self.assertIsNone(read_file_secure_no_follow(target, max_bytes=1024))
+
+    def test_validate_identifier_truncates_huge_value(self) -> None:
+        """Un identifiant de 1 Mio ne produit pas un message d'erreur géant."""
+        huge_value = "A" * 1_000_000
+
+        with self.assertRaises(ValueError) as ctx:
+            _validate_identifier(huge_value, "projet", _PROJECT_ID_PATTERN)
+
+        message = str(ctx.exception)
+        self.assertLess(len(message), 200)
+        self.assertNotIn("A" * 1000, message)
 
     def test_write_file_atomic_cleans_up_on_failure(self) -> None:
         """En cas d'erreur pendant l'écriture, le fichier temporaire est nettoyé."""

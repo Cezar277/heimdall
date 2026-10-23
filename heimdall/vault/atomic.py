@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Final
 
 _DEFAULT_SECURE_MODE: Final[int] = 0o600
+_MAX_BACKUP_BYTES: Final[int] = 1_048_576
 _MIN_QUOTED_LEN: Final[int] = 2
 
 
@@ -244,13 +245,20 @@ def backup_file(path: Path) -> Path | None:
     try:
         with os.fdopen(fd, "rb") as f:
             fd = -1
-            content = f.read()
+            # Lecture bornée : le fichier peut grossir entre fstat() et read().
+            content = f.read(_MAX_BACKUP_BYTES + 1)
     finally:
         if fd >= 0:
             try:
                 os.close(fd)
             except OSError:  # noqa: S110
                 pass
+
+    if len(content) > _MAX_BACKUP_BYTES:
+        raise ValueError(
+            f"Sauvegarde refusée : '{path}' dépasse la taille maximale "
+            f"({_MAX_BACKUP_BYTES} octets)."
+        )
 
     backup_path = path.with_suffix(path.suffix + ".bak")
     if os.path.islink(backup_path):
@@ -262,7 +270,10 @@ def backup_file(path: Path) -> Path | None:
     return backup_path
 
 
-def read_file_secure_no_follow(path: Path, max_bytes: int = 1_048_576) -> str | None:
+def read_file_secure_no_follow(  # noqa: PLR0911
+    path: Path,
+    max_bytes: int = 1_048_576,
+) -> str | None:
     """Lit un fichier de manière sécurisée sans suivre les liens symboliques (anti-TOCTOU).
 
     Retourne None si le fichier n'existe pas ou ne peut pas être lu
@@ -289,9 +300,8 @@ def read_file_secure_no_follow(path: Path, max_bytes: int = 1_048_576) -> str | 
             return None
         if st.st_size > max_bytes:
             return None
-        with os.fdopen(fd, "r", encoding="utf-8") as f:
-            fd = -1
-            return f.read()
+        # Lecture bornée : le fichier peut grossir entre fstat() et read().
+        raw = os.read(fd, max_bytes + 1)
     except Exception:
         return None
     finally:
@@ -300,6 +310,13 @@ def read_file_secure_no_follow(path: Path, max_bytes: int = 1_048_576) -> str | 
                 os.close(fd)
             except OSError:  # noqa: S110
                 pass
+
+    if len(raw) > max_bytes:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def parse_env_file(path: Path) -> dict[str, str] | None:

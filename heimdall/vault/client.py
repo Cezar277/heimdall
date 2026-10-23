@@ -131,9 +131,14 @@ if BaseModel is not None:
 
 
 def _validate_identifier(value: str, label: str, pattern: re.Pattern[str]) -> None:
-    """Valide la forme d'un identifiant contractuel (projet, environnement, nom)."""
+    """Valide la forme d'un identifiant contractuel (projet, environnement, nom).
+
+    Le message d'erreur est borné : une réponse Vault ou un argument CLI
+    volumineux ne doit pas être recopié en entier dans les logs (invariant 8).
+    """
     if not isinstance(value, str) or not pattern.match(value):
-        raise ValueError(f"Identifiant de {label} invalide : {value!r}")
+        preview = value[:32] if isinstance(value, str) else f"<{type(value).__name__}>"
+        raise ValueError(f"Identifiant de {label} invalide : {preview!r}")
 
 
 def _key_from_env() -> str | None:

@@ -239,7 +239,13 @@ def _validate_project_and_env(project: str | None, env: str) -> str:
 
 
 def _read_input_secrets(input_file: Path) -> dict[str, str]:
-    """Lit les secrets locaux depuis un fichier d'entrée."""
+    """Lit les secrets locaux depuis un fichier d'entrée.
+
+    Retourne un dictionnaire vide si le fichier est lisible mais ne contient
+    aucune paire ``clé=valeur``. Le code de sortie est décidé par l'appelant :
+    un fichier vide sans filtre est un succès documenté (0), un filtre
+    explicite sans correspondance est une erreur d'usage (2).
+    """
     if os.path.islink(input_file):
         typer.echo(
             f"Erreur de sécurité : le fichier source '{input_file}' est un lien symbolique.",
@@ -257,9 +263,6 @@ def _read_input_secrets(input_file: Path) -> dict[str, str]:
             err=True,
         )
         raise typer.Exit(code=2)
-    if not secrets:
-        typer.echo(f"Aucun secret trouvé dans le fichier {input_file}.", err=True)
-        raise typer.Exit(code=0)
     return secrets
 
 
@@ -350,14 +353,27 @@ def vault_push(  # noqa: PLR0913, PLR0917
     """Pousse les secrets d'un fichier local vers le Vault (ticket #99).
 
     Ne divulgue JAMAIS les valeurs secrètes dans la sortie terminal ou les erreurs.
+
+    Codes de sortie : 0 si le fichier est vide sans filtre explicite, 2 si un
+    ``--name`` fourni ne correspond à aucun secret (aucun envoi silencieux).
     """
     proj = _validate_project_and_env(project, env)
     all_secrets = _read_input_secrets(file)
-    to_push = _filter_secrets(all_secrets, names)
 
+    if not all_secrets:
+        typer.echo(f"Aucun secret trouvé dans le fichier {file}.", err=True)
+        raise typer.Exit(code=2 if names else 0)
+
+    to_push = _filter_secrets(all_secrets, names)
     if not to_push:
+        if names:
+            typer.echo(
+                "Aucun secret ne correspond aux noms demandés : rien n'a été poussé.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         typer.echo("Aucun secret valide à pousser.", err=True)
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=2)
 
     client = _init_client(vault_url, ca_cert)
     with client:

@@ -173,6 +173,61 @@ class VaultPushCliTests(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0)
                 self.assertEqual(client_instance.create_secret.call_count, 1)
 
+    def test_push_unknown_name_exits_2_instead_of_silent_success(self) -> None:
+        """Un --name sans correspondance est une erreur d'usage, pas un faux succès."""
+        env_file = self.tmp_dir / ".env"
+        env_file.write_text("FOO_A=val1\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "push",
+                        "--file",
+                        str(env_file),
+                        "--project",
+                        "demo",
+                        "--name",
+                        "INEXISTANT",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 2)
+                self.assertIn("Aucun secret ne correspond", result.output)
+                mock_init.assert_not_called()
+
+    def test_push_empty_file_exit_codes_depend_on_explicit_filter(self) -> None:
+        """Fichier vide : 0 sans filtre documenté, 2 si --name est fourni."""
+        env_file = self.tmp_dir / ".env"
+        env_file.write_text("", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                result = self.runner.invoke(
+                    app,
+                    ["vault", "push", "--file", str(env_file), "--project", "demo"],
+                )
+                self.assertEqual(result.exit_code, 0)
+                mock_init.assert_not_called()
+
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "push",
+                        "--file",
+                        str(env_file),
+                        "--project",
+                        "demo",
+                        "--name",
+                        "ANY_SECRET",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 2)
+                mock_init.assert_not_called()
+
     def test_push_handles_auth_error_401(self) -> None:
         """Erreur 401 mappe proprement avec sortie 1."""
         env_file = self.tmp_dir / ".env"
