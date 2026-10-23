@@ -17,9 +17,21 @@ ultérieur limité à cette fiche ne change pas les preuves d’implémentation.
 | Schéma fermé et refus des actions (#96) | [QualifyVerdict:112](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/heimdall/llm/qualify.py#L112), [validation JSON et appels natifs:218](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/heimdall/llm/qualify.py#L218) | champs supplémentaires, clés dupliquées et tool_calls natifs rejetés ; journal statique |
 | Moindre privilège MCP (#34/#96) | [registre:57](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/heimdall/mcp/server.py#L57), [tests stdio:267](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L267) | 7 appels d'outils/arguments/chemins hostiles refusés par le serveur réel |
 | Aucun secret écarté, aucun effet de bord (#97, REQ-SEC-01) | [modèle hostile:109](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L109) | 45 combinaisons payload/réponse ; Finding et fichier inchangés ; aucune valeur sensible dans les messages ou logs |
-| Corpus sur chaque PR et preuve locale optionnelle (#97) | [workflow:1](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/.github/workflows/prompt-injection.yml#L1), [test llm:281](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L281) | CI déterministe ; 15 tests réels uniquement sur activation manuelle |
+| Corpus sur chaque PR et preuve locale optionnelle (#97) | [workflow:1](https://github.com/Cezar277/heimdall/blob/60f9267234cda9e4cb34be2c049497ee7a1b09f2/.github/workflows/prompt-injection.yml#L1), [test llm:281](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L281) | CI déterministe ; 15 tests réels uniquement sur activation manuelle |
 | Écriture des fixtures confinée (revue LOW) | [garde:38](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L38), [noms hostiles:73](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L73), [symlink sortant:87](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L87) | aucun séparateur, chemin traversant ou lien sortant accepté avant écriture |
 | Cas limites du protocole (revue) | [balise incomplète:177](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L177), [nonce frais:185](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L185), [doublon imbriqué:214](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L214), [types tool_calls:235](https://github.com/Cezar277/heimdall/blob/b27d09a500b1f297580f1fca1955cf3ac1198cfe/tests/test_prompt_injection_corpus.py#L235) | casse mixte, balises incomplètes et doublons imbriqués testés ; seuls None et [] autorisés pour tool_calls |
+
+## Workflow sur le runner self-hosted
+
+Le workflow corrigé est épinglé sur
+`60f9267234cda9e4cb34be2c049497ee7a1b09f2`. Après récupération du passage
+à `runs-on: self-hosted`, `actions/setup-python` a été retiré : le job
+utilise le `python3` préinstallé sur le runner Linux, crée un environnement
+isolé `.venv-injection` et installe le lock avec vérification des hashes.
+Les commandes `run` du YAML ont été exécutées telles quelles sous
+Debian/WSL, Python 3.13.5 : installation réussie, **100 passed, 15 deselected**.
+Cette vérification locale ne remplace pas le résultat du job sur le runner
+GitHub self-hosted après publication.
 
 ## Validation de la garde des noms après revue
 
