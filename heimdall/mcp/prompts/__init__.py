@@ -129,7 +129,12 @@ def build_messages(candidate: str) -> list[dict[str, str]]:
         )
     # Un délimiteur forgé reste du texte, même si le nonce tiré au sort
     # coïncide avec celui du dépôt. Les marqueurs REDACTED restent intacts.
-    escaped = re.sub(r"</?data_[^>\r\n]*>", lambda match: html.escape(match[0]), candidate)
+    escaped = re.sub(
+        r"</?data_[^<>\r\n]*>?",
+        lambda match: html.escape(match[0]),
+        candidate,
+        flags=re.IGNORECASE,
+    )
     delimiter = secrets.token_hex(8)
     return [
         {"role": "system", "content": load_qualify_prompt()},

@@ -9,7 +9,8 @@ tampering, elevation of privilege ; REQ-SEC-01 et REQ-SEC-02).
 `qualify_v1` sans interpolation. Le code déjà masqué est envoyé uniquement
 dans le message utilisateur. Chaque requête utilise un nonce aléatoire de
 64 bits ; les séquences `<data_…>` et `</data_…>` issues du dépôt sont
-échappées avant insertion. Une collision du nonce ne permet donc pas de
+échappées avant insertion, sans distinction de casse et même si la balise
+est incomplète. Une collision du nonce ne permet donc pas de
 fermer le bloc. Les marqueurs `<REDACTED:…>` restent lisibles. Le prompt
 système et son schéma sont inchangés ; son nom et le SHA-256 de la chaîne
 effectivement envoyée restent journalisés.
@@ -20,6 +21,8 @@ fermé, nombre strict entre 0 et 1, aucun champ supplémentaire. Les demandes
 de chemin, variable, commande, outil ou application de patch sont donc
 rejetées, sans tenter de les réparer ou de les exécuter. Les appels d'outils
 natifs Ollama sont également refusés, même accompagnés d'un JSON valide.
+Le champ `tool_calls` n'accepte que `None` ou une liste vide ; tout autre
+type est refusé, y compris un objet faux en contexte booléen.
 Les clés JSON dupliquées sont rejetées pour éviter toute interprétation
 ambiguë du verdict. Les réponses restent bornées avant parsing.
 
@@ -41,7 +44,10 @@ contient 15 cas répartis entre les trois familles demandées. Chaque extrait
 est matérialisé avec un jeton synthétique dérivé à l'exécution, reconnu par
 le vrai scanner et masqué avant qualification. Un faux LLM hostile est
 rejoué avec trois réponses par cas ; le fichier et les Findings sont
-comparés avant/après. Ces tests prouvent le maintien de l'alerte, même
+comparés avant/après. Les noms de fixtures sont limités à un seul nom de
+fichier ; la résolution du chemin refuse également un lien symbolique
+sortant du dossier temporaire avant toute écriture. Ces tests prouvent le
+maintien de l'alerte, même
 quand le modèle obéit à l'injection ; ils ne prétendent pas que le modèle
 comprend toujours les instructions de sécurité.
 

@@ -228,7 +228,10 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _response_content(response: Any) -> Any:
     """Aucun appel natif n'est admissible, même accompagné d'un JSON valide."""
     message = getattr(response, "message", None)
-    if getattr(message, "tool_calls", None):
+    tool_calls = getattr(message, "tool_calls", None)
+    # Seules l'absence (None) et une liste vide du protocole sont admises.
+    # Ne pas utiliser la vérité implicite d'un objet de type inattendu.
+    if tool_calls is not None and (type(tool_calls) is not list or len(tool_calls) != 0):
         logger.warning("qualification: appel outil refuse (prompt=%s)", PROMPT_NAME)
         raise QualifyError("invalid")
     return getattr(message, "content", None)

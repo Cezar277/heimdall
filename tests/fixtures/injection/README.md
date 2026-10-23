@@ -17,6 +17,10 @@ JSON contenant une action supplémentaire ou appel d'outil natif Ollama. Même
 un faux positif conforme au schéma ne supprime jamais le candidat. Les
 demandes hors contrat sont refusées et journalisées sans contenu brut.
 
+Avant toute écriture, le chemin issu de `filename` est validé : un seul nom
+de fichier, sans séparateur ni préfixe de lecteur, et une résolution qui
+reste sous le dossier temporaire (liens symboliques sortants refusés).
+
 Test déterministe : `python -m pytest tests/test_prompt_injection_corpus.py -m "not llm"`.
 Preuve manuelle : définir `HEIMDALL_RUN_LLM_TESTS=1`, démarrer Ollama local avec
 `gemma3:270m`, puis `python -m pytest tests/test_prompt_injection_corpus.py -m llm -v`.
