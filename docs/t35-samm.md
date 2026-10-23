@@ -14,7 +14,7 @@ regroupement (voir §4).
 | #98 | Client HTTP boucle locale, TLS vérifié, clé jamais en argv, `0600` + `O_NOFOLLOW` | `heimdall/vault/client.py` (`VaultClient`, `resolve_api_key`, `_validate_loopback_url`, `_read_and_check_key_file`) | `tests/test_vault_client.py`, `tests/test_vault_tls.py`, `tests/security/test_vault_replay_bruteforce.py` |
 | #99 | `heimdall vault push` : `.env` → Vault, refus `\n`/`\r`/`\x00`, quoting symétrique | `heimdall/cli/vault_client.py` (`push`, `format_env_value`, `_init_client`) | `tests/test_vault_cli.py`, `tests/test_vault_integration_client_server.py::test_cli_end_to_end_push_pull_and_run` |
 | #100 | `heimdall vault pull` : Vault → `.env` atomique `0600`, anti-symlink, `fsync` | `heimdall/vault/atomic.py` (`write_file_atomic`, `_open_parent_dir_secure`, `backup_file`), `heimdall/cli/vault_client.py` (`pull`) | `tests/test_vault_client.py::VaultAtomicOperationsTests`, `tests/test_vault_integration_client_server.py` |
-| #101 | `heimdall run -- <cmd>` : injection mémoire seule, allowlist locale + denylist, sans `shell=True` | `heimdall/cli/vault_client.py` (`run`, allowlist + `shutil.which`) | `tests/test_vault_cli.py`, `tests/security/test_path_traversal.py` |
+| #101 | `heimdall run -- <cmd>` (canonique) + alias `heimdall vault run` : injection mémoire seule, allowlist locale + denylist, sans `shell=True` (voir §5) | `heimdall/cli/vault_client.py` (`vault_run`, allowlist + `shutil.which`, `RUN_CONTEXT_SETTINGS`), `heimdall/cli/main.py` (`run`), `heimdall/cli/vault_keys.py` (`vault run`) | `tests/test_vault_cli.py::test_run_and_vault_run_share_callback_and_guards`, `tests/security/test_path_traversal.py` |
 | #102 | Intégration push→pull→run bout en bout (SQLite temporaire, ASGI) | `tests/test_vault_integration_client_server.py` (`SyncASGITransport`, fixture `vault_test_server`) | `tests/test_vault_integration_client_server.py` (7 scénarios) |
 
 ## 2. Correctifs LOW de la revue « APPROVE WITH COMMENTS »
@@ -53,3 +53,22 @@ validée explicitement par les mainteneurs avant fusion ; les prochaines
 livraisons suivront une PR par sous-ticket. Le revert ciblé reste possible :
 #98 → `vault/client.py`, #99/#100/#101 → `cli/vault_client.py` par commande,
 #100 → `vault/atomic.py`, #102 → `tests/test_vault_integration_client_server.py`.
+
+## 5. Voies `run` : canonique vs alias (ticket #101)
+
+Le ticket #101 spécifie `heimdall run -- <cmd>` : c'est la voie canonique
+(`heimdall/cli/main.py:53`, `app.command("run")`). `heimdall vault run`
+(`heimdall/cli/vault_keys.py:50`, `vault_app.command("run")`) est un alias
+de découvrabilité (`vault push` / `vault pull` / `vault run` groupés),
+pas une seconde implémentation.
+
+Garanties anti-divergence :
+- même callback `vault_run` (`heimdall/cli/vault_client.py:616`), donc mêmes
+  gardes : allowlist locale (nom Vault jamais utilisé), denylist étendue,
+  `shutil.which` préalable, sans `shell=True`, `Exit(2)` sur commande vide ;
+- mêmes réglages Typer via la source unique `RUN_CONTEXT_SETTINGS`
+  (`allow_extra_args` + `ignore_unknown_options`) importée par les deux
+  enregistrements ;
+- test de non-divergence : `tests/test_vault_cli.py::test_run_and_vault_run_share_callback_and_guards`
+  (même objet callback, mêmes `context_settings`, `Exit(2)` + « Aucune commande »
+  sur les deux voies).

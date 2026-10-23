@@ -30,7 +30,7 @@ from heimdall.cli.scan import (
     render_json,
     render_text,
 )
-from heimdall.cli.vault_client import vault_run
+from heimdall.cli.vault_client import RUN_CONTEXT_SETTINGS, vault_run
 from heimdall.cli.vault_keys import vault_app
 from heimdall.mcp.server import run_stdio
 from heimdall.scanner.errors import ScanError
@@ -49,7 +49,10 @@ app = typer.Typer(
 # Administration du Vault (clés API de projet, ticket #64) et client (ticket #35).
 app.add_typer(vault_app, name="vault")
 
-# Exécution avec injection en mémoire (ticket #101)
+# Exécution avec injection en mémoire (ticket #101). Voie canonique :
+# `heimdall run`. L'alias `heimdall vault run` (vault_keys.py) partage le
+# même callback et les mêmes réglages (RUN_CONTEXT_SETTINGS) — voir
+# docs/t35-samm.md §5.
 app.command(
     "run",
     help=(
@@ -57,7 +60,7 @@ app.command(
         "Limite de sécurité : sous Linux, les variables d'environnement d'un processus sont "
         "visibles par les processus du même utilisateur via /proc/<pid>/environ."
     ),
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    context_settings=RUN_CONTEXT_SETTINGS,
 )(vault_run)
 
 

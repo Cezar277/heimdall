@@ -148,6 +148,13 @@ _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
 _MAX_ERROR_MSG_LEN: Final[int] = 150
 _TRUNCATE_MSG_LEN: Final[int] = 147
 
+#: Réglages Typer partagés par les deux voies `run` (canonique `heimdall run`
+#: + alias `heimdall vault run`) : source unique anti-divergence.
+RUN_CONTEXT_SETTINGS: Final[dict[str, bool]] = {
+    "allow_extra_args": True,
+    "ignore_unknown_options": True,
+}
+
 
 def is_dangerous_env_var(name: str) -> bool:
     """Vérifie si un nom de variable est dangereux pour l'exécution d'un processus."""
@@ -689,4 +696,10 @@ def vault_run(  # noqa: PLR0913, PLR0917
         raise typer.Exit(code=1) from None
 
 
-__all__ = ["is_dangerous_env_var", "vault_pull", "vault_push", "vault_run"]
+__all__ = [
+    "RUN_CONTEXT_SETTINGS",
+    "is_dangerous_env_var",
+    "vault_pull",
+    "vault_push",
+    "vault_run",
+]

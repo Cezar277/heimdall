@@ -15,6 +15,9 @@ from unittest.mock import MagicMock, patch
 from typer.testing import CliRunner
 
 from heimdall.cli.main import app
+from heimdall.cli.main import app as cli_app
+from heimdall.cli.vault_client import RUN_CONTEXT_SETTINGS, vault_run
+from heimdall.cli.vault_keys import vault_app
 from heimdall.vault.atomic import check_file_mode_600, parse_env_file
 from heimdall.vault.client import (
     VaultAuthError,
@@ -790,6 +793,32 @@ class VaultRunCliTests(unittest.TestCase):
         result = self.runner.invoke(app, ["run", "--project", "demo"])
         self.assertEqual(result.exit_code, 2)
         self.assertIn("Aucune commande", result.output)
+
+    def test_run_and_vault_run_share_callback_and_guards(self) -> None:
+        """`heimdall run` (canonique #101) et `heimdall vault run` (alias)
+        routent vers la même `vault_run` avec les mêmes gardes."""
+        self.assertEqual(
+            RUN_CONTEXT_SETTINGS,
+            {"allow_extra_args": True, "ignore_unknown_options": True},
+        )
+        top_run = next(
+            c for c in cli_app.registered_commands if getattr(c, "name", None) == "run"
+        )
+        vault_run_cmd = next(
+            c for c in vault_app.registered_commands if getattr(c, "name", None) == "run"
+        )
+        self.assertIs(top_run.callback, vault_run)
+        self.assertIs(vault_run_cmd.callback, vault_run)
+        self.assertIs(top_run.callback, vault_run_cmd.callback)
+        self.assertEqual(top_run.context_settings, RUN_CONTEXT_SETTINGS)
+        self.assertEqual(vault_run_cmd.context_settings, RUN_CONTEXT_SETTINGS)
+        # Mêmes gardes : commande vide → Exit(2) sur les deux voies.
+        top_res = self.runner.invoke(app, ["run", "--project", "demo"])
+        vault_res = self.runner.invoke(app, ["vault", "run", "--project", "demo"])
+        self.assertEqual(top_res.exit_code, 2)
+        self.assertEqual(vault_res.exit_code, 2)
+        self.assertIn("Aucune commande", top_res.output)
+        self.assertIn("Aucune commande", vault_res.output)
 
     def test_run_nonexistent_command(self) -> None:
         """Exit 127 si l'exécutable spécifié est introuvable."""
