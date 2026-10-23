@@ -108,12 +108,14 @@ _MOT_HORS_PERIMETRE: Final[str] = "répertoire hors périmètre (non analysé)"
 #: ni y injecter de fausses lignes.
 _TRACE_PATH_MAX: Final[int] = 256
 #: Catégories Unicode neutralisées dans le journal : ``Cc`` (contrôle, dont
-#: U+0085), ``Cf`` (format, dont l'override bidirectionnel U+202E), ``Zl``
-#: et ``Zp`` (séparateurs de ligne, dont U+2028/U+2029). Un séparateur de
-#: ligne Unicode ne se voit pas dans un terminal classique, mais il casse
-#: l'affichage ligne à ligne des journaux et des consoles d'audit : un nom
-#: adverse ne doit jamais pouvoir insérer une fausse ligne de journal.
-_UNSAFE_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
+#: U+0085), ``Cf`` (format, dont l'override bidirectionnel U+202E), ``Cs``
+#: (surrogates issus d'un nom de fichier non UTF-8), ``Zl`` et ``Zp``
+#: (séparateurs de ligne, dont U+2028/U+2029). Un séparateur de ligne Unicode
+#: ne se voit pas dans un terminal classique, mais il casse l'affichage ligne
+#: à ligne des journaux et des consoles d'audit : un nom adverse ne doit
+#: jamais pouvoir insérer une fausse ligne de journal. Un surrogate, lui,
+#: ferait échouer l'écriture d'un journal en UTF-8 strict.
+_UNSAFE_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
 __all__ = [
     "MAX_FILE_BYTES",
@@ -139,10 +141,10 @@ def _safe_path(relative: str) -> str:
     Un nom de fichier est une donnée **non fiable** : il peut contenir un
     retour à la ligne (injection de fausses lignes de journal), un
     séparateur de ligne Unicode (U+2028), un séparateur de paragraphe
-    (U+2029), un « next line » (U+0085) ou un override bidirectionnel
-    (U+202E). Les caractères de contrôle (``Cc``), de format (``Cf``) et les
-    séparateurs de ligne (``Zl``/``Zp``) sont remplacés ; la longueur est
-    bornée.
+    (U+2029), un « next line » (U+0085), un override bidirectionnel
+    (U+202E) ou un surrogate (nom non UTF-8). Les caractères de contrôle
+    (``Cc``), de format (``Cf``), les surrogates (``Cs``) et les séparateurs
+    de ligne (``Zl``/``Zp``) sont remplacés ; la longueur est bornée.
     """
     nettoye = "".join(
         "?" if unicodedata.category(character) in _UNSAFE_CATEGORIES else character
@@ -241,11 +243,19 @@ def _validate_relative_path(relative: str) -> str:
 
 
 def _open_flags() -> int:
-    """Descripteur de lecture : un lien symbolique n'est jamais suivi."""
+    """Descripteur de lecture : lien non suivi et ouverture non bloquante.
+
+    ``O_NONBLOCK`` ferme la course « fichier régulier remplacé par un FIFO
+    entre le ``stat`` et l'``open`` » : sans lui, l'ouverture d'un FIFO sans
+    écrivain bloque indéfiniment le hook/CI avant même que ``fstat`` puisse
+    refuser le descripteur. Sur un fichier régulier, le drapeau est sans
+    effet ; ``fstat`` reste l'autorité qui exige ``S_ISREG``.
+    """
     return (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_BINARY", 0)
     )
 
@@ -259,12 +269,19 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
     symboliques ne sont jamais suivis » vaut donc aussi pour la racine et
     pour le fichier unique.
 
-    Une racine invalide — chemin vide, octet NUL, racine absente — est
-    refusée par ``ScanError`` au message statique : jamais une
-    ``ValueError`` nue qui court-circuiterait le contrat d'erreur.
+    Une racine invalide — chemin vide, octet NUL, type non chemin, racine
+    absente — est refusée par ``ScanError`` au message statique : jamais une
+    ``ValueError``/``TypeError`` nue qui court-circuiterait le contrat
+    d'erreur.
     """
     try:
-        absolute = Path(os.path.abspath(Path(root).expanduser()))
+        brut = os.fspath(root)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise ScanError(_SCAN_ERROR) from None
+    if not isinstance(brut, str) or not brut:
+        raise ScanError(_SCAN_ERROR)
+    try:
+        absolute = Path(os.path.abspath(Path(brut).expanduser()))
         for candidate in (absolute, *absolute.parents):
             if candidate.is_symlink():
                 raise ScanError(_SCAN_ERROR)
@@ -316,10 +333,15 @@ class ScannerRacine:
         journal: Callable[[str], None] | None = None,
     ) -> None:
         resolved = _resolve_root(root)
-        if resolved.is_dir():
+        try:
+            est_repertoire = resolved.is_dir()
+            est_fichier = resolved.is_file()
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+        if est_repertoire:
             self._root = resolved
             self._single: Path | None = None
-        elif resolved.is_file():
+        elif est_fichier:
             self._root = resolved.parent
             self._single = resolved
         else:
@@ -469,19 +491,37 @@ class ScannerRacine:
             raise ScanError(_SCAN_ERROR) from None
 
     def _on_walk_error(self, error: OSError) -> None:
-        """Une erreur de parcours interrompt le scan, sauf en arbre de tiers."""
+        """Une erreur de parcours interrompt le scan, sauf en arbre de tiers.
+
+        Le chemin fautif désigne ici un **répertoire** : ``classer_chemin``
+        ne regarde que les parents (il classe des fichiers) et ignorerait
+        donc le nom du répertoire lui-même. Sans la classification du
+        dernier segment, un ``vendor/`` illisible à la racine serait pris
+        pour le périmètre strict et interromprait le scan au lieu d'être
+        tracé comme les autres échecs d'un arbre de tiers.
+        """
         nom = error.filename or ""
-        regime = Perimetre.STRICT
+        relatif = nom
         if nom:
             try:
                 relatif = Path(nom).relative_to(self._root).as_posix()
             except ValueError:
                 relatif = nom
-            regime = classer_chemin(relatif)
+        regime = classer_chemin(relatif) if relatif else Perimetre.STRICT
+        if relatif and regime is not Perimetre.HORS_PERIMETRE:
+            regime_repertoire = classer_repertoire(Path(relatif).name)
+            if regime_repertoire is Perimetre.HORS_PERIMETRE:
+                regime = Perimetre.HORS_PERIMETRE
+            elif regime_repertoire is Perimetre.TIERS:
+                regime = Perimetre.TIERS
         if regime is Perimetre.STRICT:
             raise ScanError(_SCAN_ERROR) from None
+        if regime is Perimetre.HORS_PERIMETRE:
+            self._hors_perimetre += 1
+            self._tracer(_MOT_HORS_PERIMETRE, relatif)
+            return
         self._non_analyses += 1
-        self._tracer(_MOT_NON_ANALYSE, nom or "")
+        self._tracer(_MOT_NON_ANALYSE, relatif)
 
     def _analyser_fichier(
         self,

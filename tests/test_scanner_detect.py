@@ -29,6 +29,8 @@ from heimdall.scanner.detect import (
     RapportScan,
     ScanError,
     ScannerRacine,
+    _open_flags,
+    _safe_path,
     find_candidates,
     scan,
     scan_rapport,
@@ -411,8 +413,8 @@ def test_the_slack_bounds_are_coupled_by_construction() -> None:
     assert ROTATING_PAYLOAD_MAX >= SLACK_TOKEN_MAX
     assert ROTATING_PAYLOAD_MAX == SLACK_TOKEN_MAX == 255
     assert SLACK_TOKEN_MAX == SLACK_PREFIX_MAX + SLACK_PAYLOAD_MAX
-    # La borne rotative n'exclut pas non plus les jetsons les plus courts
-    # que la forme rotative ne pourrait pas porter.
+    # La borne rotative n'exclut pas les jetons plus courts : son minimum
+    # ne dépasse pas celui du jeton interne.
     assert ROTATING_PAYLOAD_MIN <= SLACK_TOKEN_MIN
 
 
@@ -779,6 +781,32 @@ def test_a_walk_error_in_a_tier_tree_never_becomes_a_clean_list(tmp_path: Path) 
     assert rapport.non_analyses == 1
 
 
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="permissions POSIX")
+def test_an_unreadable_tier_directory_at_the_root_is_traced(tmp_path: Path) -> None:
+    """Le répertoire de tiers fautif est classé par son propre nom.
+
+    ``classer_chemin`` classe des **fichiers** et ignore le dernier segment.
+    Pour une erreur de parcours, le dernier segment est le répertoire fautif :
+    un ``vendor/`` illisible à la racine doit être tracé (tiers), pas pris
+    pour le périmètre strict.
+    """
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    (vendor / "secret.txt").write_text(f'AWS = "{_aws("vendor")}"', encoding="utf-8")
+    vendor.chmod(0o000)
+    try:
+        with pytest.raises(ScanError):
+            scan(tmp_path)
+        with pytest.raises(ScanError):
+            find_candidates(str(tmp_path))
+        rapport = scan_rapport(str(tmp_path))
+    finally:
+        vendor.chmod(0o700)
+    assert rapport.non_analyses == 1
+    assert rapport.complet is False
+    assert rapport.findings == ()
+
+
 def test_the_report_is_not_complete_when_a_binary_was_left_aside(tmp_path: Path) -> None:
     """Un binaire non lu rend le verdict « propre » non fondé."""
     _write(tmp_path, "image.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
@@ -899,6 +927,17 @@ def test_the_trace_neutralises_unicode_separators_in_paths(
     assert trace.count("\n") == 1
     # Une seule ligne logique : aucun séparateur Unicode ne subsiste.
     assert trace.splitlines() == [trace.rstrip("\n")]
+
+
+def test_the_trace_neutralises_surrogates_from_non_utf8_names() -> None:
+    """Un nom POSIX non UTF-8 (surrogate) ne casse pas le journal.
+
+    Python expose les octets invalides d'un nom de fichier sous forme de
+    surrogates (catégorie ``Cs``). Les laisser passer ferait échouer une
+    écriture de journal en UTF-8 strict : ils sont neutralisés comme les
+    autres caractères non sûrs.
+    """
+    assert _safe_path("vendor/binaire\udcff.png") == "vendor/binaire?.png"
 
 
 def test_the_trace_truncates_an_absurdly_long_path(
@@ -1184,6 +1223,35 @@ def test_a_root_with_a_nul_byte_is_fail_closed() -> None:
     with pytest.raises(ScanError) as context:
         ScannerRacine("a\x00b")
     assert str(context.value) == "scan impossible : entrée non analysable"
+
+
+def test_an_empty_root_is_fail_closed() -> None:
+    """Un chemin vide n'est pas « le répertoire courant » : il est refusé.
+
+    La docstring de ``_resolve_root`` promet le refus du chemin vide ; sans
+    garde explicite, ``Path("")`` vaut ``.`` et le scanner analyserait le
+    répertoire courant à l'insu de l'appelant.
+    """
+    for api in (ScannerRacine, scan, find_candidates):
+        with pytest.raises(ScanError) as context:
+            api("")
+        assert str(context.value) == "scan impossible : entrée non analysable"
+
+
+def test_a_non_path_root_is_fail_closed() -> None:
+    """Un type qui n'est pas un chemin ne fuit pas une ``TypeError`` nue."""
+    with pytest.raises(ScanError) as context:
+        ScannerRacine(42)  # type: ignore[arg-type]
+    assert str(context.value) == "scan impossible : entrée non analysable"
+
+
+def test_open_flags_are_read_only_non_blocking_and_never_follow_links() -> None:
+    """L'ouverture ne suit pas un lien et ne bloque jamais sur un FIFO."""
+    flags = _open_flags()
+    assert flags & os.O_WRONLY == 0
+    assert flags & os.O_RDWR == 0
+    assert flags & getattr(os, "O_NOFOLLOW", 0) == getattr(os, "O_NOFOLLOW", 0)
+    assert flags & getattr(os, "O_NONBLOCK", 0) == getattr(os, "O_NONBLOCK", 0)
 
 
 def test_report_is_deterministic_and_sorted(tmp_path: Path) -> None:

@@ -9,11 +9,21 @@ bibliothèque et par les tests d'acceptation T21.
 ## API
 
 ```python
-from heimdall.scanner import Finding, RapportScan, ScannerRacine, find_candidates
+from heimdall.scanner import (
+    Finding,
+    RapportScan,
+    ScannerRacine,
+    exiger_complet,
+    find_candidates,
+    scan,
+    scan_complet,
+    scan_rapport,
+)
 
 scanner = ScannerRacine(".")
 findings: list[Finding] = scanner.scan()     # fail-closed : ScanError si incomplet
 rapport: RapportScan = scanner.analyser()     # Findings + ce qui n'a pas été lu
+strict: RapportScan = scanner.analyser_complet()  # refuse un rapport incomplet
 payload: list[dict[str, object]] = find_candidates(".")  # contrat #14
 ```
 
@@ -28,17 +38,29 @@ Un Finding contient exactement : `file`, `line`, `type`, `entropy`,
 `snippet_hash`, `status` (`detecte`) et `source` (`regex`). **La valeur brute
 n'est jamais conservée** : seule une empreinte HMAC-SHA-256 est produite.
 
-### Deux API, deux contrats
+### Trois API, trois contrats
 
 | API | Contrat | Usage |
 | --- | --- | --- |
-| `scan()` / `find_candidates()` | **fail-closed** : `ScanError` dès qu'un fichier du périmètre n'a pas pu être analysé. Un scan incomplet ne devient jamais une liste vide ou partielle | appel local, corpus, tests |
-| `analyser()` / `scan_rapport()` | renvoie le bilan **et** les compteurs de ce qui n'a pas été lu | #29 (CLI) et tout affichage d'audit |
+| `scan()` / `find_candidates()` | **fail-closed** : `ScanError` dès qu'un fichier du périmètre n'a pas pu être analysé. Un scan incomplet ne devient jamais une liste vide ou partielle. Une liste vide **n'est pas** la preuve d'un dépôt propre : un `ScanIncomplet` est émis si des contenus ont été laissés de côté | appel local, corpus, tests |
+| `analyser()` / `scan_rapport()` | renvoie le bilan **et** les compteurs de ce qui n'a pas été lu | affichage d'audit, tri des compteurs |
+| `analyser_complet()` / `scan_complet()` / `exiger_complet()` | **stricte** : `ScanError` dès que le rapport n'est pas complet (binaire, lien, base VCS, fichier illisible). Un rapport complet et vide est le seul verdict « propre » fondé | **hook et CI** (#29) |
 
 `scan()` et `find_candidates()` ne peuvent pas dire ce qui n'a pas été lu : ils
 lèvent donc `ScanError` plutôt que de rendre une liste qui laisserait croire à
-un dépôt propre. Un verdict « propre » **fondé** suppose `scan_rapport()` et
-`RapportScan.complet`.
+un dépôt propre, et **avertissent** (`ScanIncomplet`) quand une exclusion de
+politique a laissé du contenu de côté. Un verdict « propre » **fondé** suppose
+`scan_complet()` (ou `scan_rapport()` + `RapportScan.complet`) : la garde est
+**programmatique**, pas une consigne de documentation.
+
+```python
+# #29 : un rapport incomplet doit produire le code 2, jamais 0.
+try:
+    rapport = scan_complet(".")          # ou exiger_complet(scan_rapport("."))
+except ScanError:
+    raise typer.Exit(code=2)             # erreur d'outillage
+```
+
 
 ### Le rapport de scan : ce qui a été lu, ce qui ne l'a pas été
 
@@ -59,12 +81,21 @@ sont nuls. Un binaire ignoré, un lien non suivi ou une base VCS non parcourue
 sont autant de contenus **non lus** — un secret peut y dormir — donc le verdict
 « propre » ne serait pas fondé. `scan()` et `find_candidates()` lèvent
 `ScanError` dès que `non_analyses` est non nul : un scan *incomplet* ne
-devient jamais une liste vide ou partielle.
+devient jamais une liste vide ou partielle. Pour les trois exclusions de
+politique (binaire, lien, base VCS), ils **avertissent** (`ScanIncomplet`) :
+une liste vide signifie « rien trouvé dans ce qui a été lu », pas « dépôt
+propre ».
+
+La garde stricte `scan_complet()` (ou `exiger_complet(scan_rapport(...))`)
+**refuse** un rapport incomplet : c'est le refus d'outillage que #29 doit
+traduire par le code 2. La règle est donc exécutable, testée, et pas seulement
+énoncée dans ce document.
 
 Chaque élément ignoré est **journalisé sur `stderr`** (une ligne par fichier :
-le chemin seul, jamais de contenu ; les caractères de contrôle et les
-séparateurs Unicode du nom sont neutralisés pour ne pas injecter de fausse
-ligne de journal). La trace est injectable (`ScannerRacine(root,
+le chemin seul, jamais de contenu ; les caractères de contrôle, les
+séparateurs Unicode et les surrogates d'un nom non UTF-8 sont neutralisés pour
+ne pas injecter de fausse ligne de journal ni faire échouer une écriture en
+UTF-8 strict). La trace est injectable (`ScannerRacine(root,
 journal=...)`) et le verdict sort sur `stdout`, jamais sur `stderr`.
 
 Règle pour #29 (à implémenter avec le branchement CLI) : **code 2** si le scan
@@ -104,13 +135,24 @@ Le point (`foo.xapp-…`, `foo.xoxe.…`) n'est **pas** un frontière de mot : u
 jeton collé à un préfixe de domaine ou à une concaténation reste détecté. En
 revanche, le préfixe rotatif `xoxe.` est traité comme un préfixe : le jeton
 qu'il contient n'est signalé qu'une fois (une seule empreinte, donc une seule
-entrée Vault à révoquer). Cette neutralisation est **conditionnelle** : elle ne
-porte que si le préfixe `xoxe.` est lui-même ancré, c'est-à-dire si la règle
-rotative le reconnaît. Un préfixe **bourré** (`xxoxe.xapp-…`) n'est pas une
-forme rotative : le jeton qu'il contient reste un vrai secret et est signalé.
-La charge de la forme rotative est bornée à 255 caractères (250 + les 5
-caractères de `xoxe.`) : un jeton detectable seul reste detectable une fois
-préfixé — le préfixe ne peut pas le faire disparaître.
+entrée Vault à révoquer). Cette neutralisation est **conditionnelle à
+l'ancrage** du préfixe : elle ne porte que si `xoxe.` est lui-même ancré
+(précédé d'un caractère qui n'est ni lettre, ni chiffre, ni tiret). Un préfixe
+**bourré** (`xxoxe.xapp-…`) n'est pas ancré : le jeton qu'il contient reste un
+vrai secret et est signalé.
+
+La neutralisation ne teste **pas** la longueur de la charge : elle neutralise
+le jeton interne dès que `xoxe.` est ancré. Dans les bornes documentées, cela
+coïncide avec la reconnaissance de la forme rotative — et cette coïncidence
+est **structurelle**, pas fortuite : la borne de la forme rotative est
+**dérivée** de celle du jeton interne (`ROTATING_PAYLOAD_MAX` =
+`SLACK_TOKEN_MAX` = 255 = préfixe interne + 250 de charge), l'invariant est
+vérifié **au chargement** du registre (fail-closed) et **figé par un test**
+(jeton interne à charge maximale : exactement un finding, la forme rotative).
+Un jeton detectable seul reste donc detectable une fois préfixé : le préfixe
+ne peut pas le faire disparaître. Un jeton à charge **hors** bornes (au-delà
+de 250 caractères) n'est detectable ni seul ni préfixé : c'est une limite
+écrite, pas un secret perdu en silence.
 
 **Fenêtre multi-ligne bornée.** Chaque ligne est analysée seule, puis
 jointure avec les lignes **suivantes et contiguës** (au plus trois lignes
@@ -156,7 +198,10 @@ Les répertoires sont classés en trois régimes :
 
 Le nom du répertoire ne sert donc qu'à qualifier la **conséquence** d'un échec
 de lecture (interrompre le scan ou le tracer) : il ne dispense jamais de lire
-le fichier.
+le fichier. Une erreur de parcours est classée avec le nom du répertoire
+fautif lui-même : un `vendor/` illisible **à la racine** est donc tracé et
+compté comme les autres échecs d'un arbre de tiers, pas traité comme du
+périmètre strict.
 
 Un répertoire nommé `env/` n'est **pas** un cas particulier : seuls les
 environnements virtuels connus sont des arbres de tiers, et ils sont lus.
@@ -192,13 +237,14 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | Situation | Résultat |
 | --- | --- |
 | racine absente, non régulière ou illisible | `ScanError` |
-| racine invalide (octet NUL, chemin non interprétable) | `ScanError` (jamais une `ValueError` nue) |
+| racine invalide (chemin vide, octet NUL, type non chemin, chemin non interprétable) | `ScanError` (jamais une `ValueError`/`TypeError` nue) |
 | racine ou fichier unique symlinké (ou ancêtre symlinké) | `ScanError` |
 | racine non canonique (ex. `/tmp` symlinké vers `/private/tmp` sur macOS) | `ScanError` — passer un chemin canonique (sans lien) |
 | fichier non régulier (FIFO, device) | `ScanError` (tracé dans un arbre de tiers) |
+| fichier régulier remplacé par un FIFO entre le `stat` et l'`open` | `ScanError` (tracé dans un arbre de tiers) — l'ouverture est `O_NONBLOCK`, donc le scan ne bloque jamais ; `fstat` refuse le descripteur non régulier |
 | fichier > 1 Mio | `ScanError` (tracé dans un arbre de tiers) |
 | fichier modifié pendant la lecture | `ScanError` (tracé dans un arbre de tiers) |
-| fichier **tronqué ou réécrit entre le `stat` et l'`open`** (même inode) | `ScanError` — la lecture ne porterait que sur un préfixe |
+| fichier **tronqué ou réécrit entre le `stat` et l'`open`** (même inode) | `ScanError` (tracé dans un arbre de tiers) — la lecture ne porterait que sur un préfixe |
 | nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` (tracé dans un arbre de tiers) |
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
 | clé HMAC demandée avec `..` dans le chemin | `ScanError` |
@@ -206,7 +252,8 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | binaire connu | ignoré par politique, **tracé** (compteur `binaires_ignores`) |
 | lien symbolique | jamais suivi, **tracé** (compteur `liens_ignores`) |
 | base VCS (`.git/`, `.hg/`, `.svn/`) | non parcourue, **tracée** (compteur `hors_perimetre`) |
-| scan réussi sans signature | liste vide (réellement propre) |
+| rapport incomplet (un compteur non nul) | `ScanError` par `scan_complet()` / `exiger_complet()` |
+| scan réussi sans signature, périmètre complet | liste vide (réellement propre) |
 
 Un scan incomplet ne devient donc jamais une liste vide ou partielle : dans un
 arbre de tiers, un fichier non analysable est tracé **et** compté, et
@@ -221,11 +268,15 @@ jamais 0 ou 1.
 > `ScanError` dès qu'un fichier n'a pas pu être analysé, mais elles ne
 > disent rien de ce qui a été **laissé de côté** : un `[]` sur dépôt complet
 > peut masquer un secret contenu dans un **binaire** (contenu non lu, tracé
-> mais pas signalé) ou coupé au-delà de la fenêtre 4 Kio. #29 doit donc
-> consommer `scan_rapport()`, **refuser** (code 2) tant que
-> `RapportScan.complet` n'est pas vrai, scanner tout blob stagé et prouver
-> 0/1/2 end-to-end ; en attendant, aucun usage CI du scan réel n'est
-> autorisé (la CLI reste en stub, sortie 2). Voir limites ci-dessous.
+> mais pas signalé) ou coupé au-delà de la fenêtre 4 Kio. Un `ScanIncomplet`
+> est émis dans ce cas : le misuse est visible, mais il reste au lecteur.
+>
+> La garde est donc **programmatique**, pas documentaire : `scan_complet()`
+> (ou `exiger_complet(scan_rapport(...))`) **refuse** un rapport incomplet par
+> `ScanError` — le refus que #29 traduit par le code 2. #29 doit donc
+> consommer `scan_complet()`, scanner tout blob stagé et prouver 0/1/2
+> end-to-end ; en attendant, aucun usage CI du scan réel n'est autorisé (la
+> CLI reste en stub, sortie 2). Voir limites ci-dessous.
 
 ## Empreinte et entropie
 
@@ -279,6 +330,10 @@ jamais 0 ou 1.
   (`xoxb-`, `xoxp-`, `xapp-`, `xwfp-`, `xoxe.` et les historiques `xoxa-`,
   `xoxr-`, `xoxs-`) : une famille ajoutée par Slack n'est pas couverte avant
   #23/#24.
+- La charge d'un jeton Slack est bornée à **250 caractères** après son
+  préfixe publié : au-delà, le jeton n'est détecté **ni seul ni préfixé** par
+  `xoxe.`. C'est une borne écrite (et figée par un test), pas un secret que la
+  neutralisation du préfixe rotatif ferait disparaître en silence.
 - La détection PEM porte sur la ligne d'en-tête ; le corps multiligne n'est
   pas hashé. Le Finding ne fuit donc aucune valeur, mais deux clés différentes
   partagent l'empreinte de leur en-tête.
@@ -287,7 +342,10 @@ jamais 0 ou 1.
   #29/#30.
 - La CLI `heimdall scan` reste en stub (sortie 2, « voir #29 ») : aucun usage
   CI du scan réel n'est autorisé avant #29, qui devra prouver propre => 0,
-  secret avéré => 1, erreur => 2, sans écriture.
+  secret avéré => 1, erreur => 2, sans écriture. Le refus par défaut (code 2)
+  est donc déjà le comportement : aucun verdict « propre » ne peut sortir du
+  CLI tant que #29 n'a pas branché `scan_complet()` (et sa traduction de
+  `ScanError` en code 2).
 
 ## Preuves locales
 

@@ -29,6 +29,14 @@ relecture (« REQUEST CHANGES » : verdict propre partiel masqué, troncature
 entre `stat` et `open`, `complet` trop optimiste, `ValueError` brute, journal
 Unicode, garde Slack inconditionnelle).
 
+Révision du code testé **actuel** : `c391cc0b15cd58743e826a2d5947e9743507b9ef`
+(commit `fix(scanner): garde executable du verdict propre, bornes Slack
+couplees (#22)`, rejoué sur
+`origin/22-t22-scanner-regex-de-signatures-et-exclusions`). Il reprend la
+livraison `b2304c6…` et y ajoute le correctif du 4ᵉ passage de la relecture
+(« APPROVE WITH COMMENTS » : garde **exécutable** du verdict propre, bornes
+Slack couplées par construction, re-pin des permaliens outillé).
+
 Les permaliens du tableau principal épinglent `b38dec1…` ; ceux de documentation
 épinglent `f4dc3c8…` (ADR-002) et `81a67df…` (ADR-001). **Ces permaliens
 décrivent la livraison précédente** : la relecture « REQUEST CHANGES » (2ᵉ
@@ -122,25 +130,78 @@ antérieures restent épinglées sur `b38dec1…` et `5de5140…`.
 
 | Remarque | Correctif | Preuve |
 |---|---|---|
-| **HIGH** — résultat partiel masqué en arbre tiers : `scan()` et `find_candidates()` jetaient les compteurs, donc un `vendor/` illisible, hors borne, non régulier ou mal nommé rendait `[]` — un **verdict propre inventé** alors que la docstring promettait déjà `ScanError` | `ScannerRacine.scan()` lève `ScanError` dès que `non_analyses > 0` ; `find_candidates()` et `scan()` en héritent. Seul `scan_rapport()` expose un bilan partiel (avec ses compteurs) ; les trois docstrings disent désormais ce qu'elles font | [heimdall/scanner/detect.py:343–359](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L343-L359), [heimdall/scanner/detect.py:558–601](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L558-L601), [tests/test_scanner_detect.py:629–716](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L629-L716), [tests/security/test_scanner_bypass.py:123–147](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/security/test_scanner_bypass.py#L123-L147) |
-| **HIGH** — troncature entre `stat` et `open` : l'identité `dev`/`ino` ne voyait pas un fichier tronqué **sur le même inode** ; la lecture ne portait que sur un préfixe, le secret placé dans la partie tronquée disparaissait et le verdict « propre » était partiel | `_lire_borne` compare désormais l'état **avant** (`stat`) à l'état **après ouverture** (`fstat`) : taille et `mtime_ns` en plus de `dev`/`ino`. Toute divergence → refus (`ScanError`) avant lecture | [heimdall/scanner/detect.py:497–542](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L497-L542), [tests/test_scanner_detect.py:1076–1112](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L1076-L1112) |
-| **HIGH** — `RapportScan.complet` ignorait `binaires_ignores`, `liens_ignores` et `hors_perimetre` : un dépôt avec un vrai binaire, un lien interne ou une base VCS rendait `complet is True` | `complet` est vrai **seulement** si les quatre compteurs sont nuls : rien n'a été laissé de côté, donc rien n'a pu cacher un secret. #29 doit refuser (code 2) tant que `complet` est faux | [heimdall/scanner/detect.py:151–190](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L151-L190), [tests/test_scanner_detect.py:719–762](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L719-L762), [tests/security/test_scanner_bypass.py:149–175](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/security/test_scanner_bypass.py#L149-L175) |
-| **MEDIUM** — une racine contenant un octet NUL levait une `ValueError` nue, qui traversait le contrat d'erreur (message statique, code 2) | `_resolve_root` capture `ValueError` au même titre que `OSError`/`RuntimeError` : `ScanError` au message statique | [heimdall/scanner/detect.py:216–242](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L216-L242), [tests/test_scanner_detect.py:1114–1124](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L1114-L1124) |
-| **MEDIUM** — le journal neutralisait seulement les contrôles ASCII : U+2028, U+2029, U+0085 et l'override U+202E subsistaient et pouvaient injecter une fausse ligne d'audit | `_safe_path` neutralise les catégories Unicode `Cc`, `Cf`, `Zl` et `Zp` : le journal reste **une ligne logique** par fichier | [heimdall/scanner/detect.py:91–134](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L91-L134), [tests/test_scanner_detect.py:789–840](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L789-L840) |
-| **LOW** — la garde `xoxe.` était **inconditionnelle** : un préfixe rotatif bourré (`xxoxe.xapp-…`) ne correspondait plus à la forme rotative, et le jeton qu'il contient disparaissait (faux négatif). La charge de la forme rotative (250) était en outre plus courte que celle du jeton qu'elle porte (250 + `xoxe.`) : un jeton detectable seul pouvait ne plus l'être une fois préfixé | la garde devient **conditionnelle** à l'ancrage du préfixe (`(?<!(?<![A-Za-z0-9-])xoxe\.)`) : elle ne neutralise le jeton interne que si la règle rotative reconnaît le préfixe. La charge rotative passe à **255** (250 + 5) : un jeton detectable seul le reste une fois préfixé. « Un secret, une empreinte, une entrée Vault » est conservé, « jamais un manqué » aussi | [heimdall/scanner/signatures/stripe_slack.py:38–101](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/signatures/stripe_slack.py#L38-L101), [tests/test_scanner_detect.py:322–389](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L322-L389) |
+| **HIGH** — résultat partiel masqué en arbre tiers : `scan()` et `find_candidates()` jetaient les compteurs, donc un `vendor/` illisible, hors borne, non régulier ou mal nommé rendait `[]` — un **verdict propre inventé** alors que la docstring promettait déjà `ScanError` | `ScannerRacine.scan()` lève `ScanError` dès que `non_analyses > 0` ; `find_candidates()` et `scan()` en héritent. Seul `scan_rapport()` expose un bilan partiel (avec ses compteurs) ; les trois docstrings disent désormais ce qu'elles font | [heimdall/scanner/detect.py:343–359](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L343-L359), [heimdall/scanner/detect.py:558–601](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L558-L601), [tests/test_scanner_detect.py:629–716](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L629-L716), [tests/security/test_scanner_bypass.py:123–147](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/security/test_scanner_bypass.py#L123-L147) |
+| **HIGH** — troncature entre `stat` et `open` : l'identité `dev`/`ino` ne voyait pas un fichier tronqué **sur le même inode** ; la lecture ne portait que sur un préfixe, le secret placé dans la partie tronquée disparaissait et le verdict « propre » était partiel | `_lire_borne` compare désormais l'état **avant** (`stat`) à l'état **après ouverture** (`fstat`) : taille et `mtime_ns` en plus de `dev`/`ino`. Toute divergence → refus (`ScanError`) avant lecture | [heimdall/scanner/detect.py:497–542](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L497-L542), [tests/test_scanner_detect.py:1076–1112](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L1076-L1112) |
+| **HIGH** — `RapportScan.complet` ignorait `binaires_ignores`, `liens_ignores` et `hors_perimetre` : un dépôt avec un vrai binaire, un lien interne ou une base VCS rendait `complet is True` | `complet` est vrai **seulement** si les quatre compteurs sont nuls : rien n'a été laissé de côté, donc rien n'a pu cacher un secret. #29 doit refuser (code 2) tant que `complet` est faux | [heimdall/scanner/detect.py:151–190](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L151-L190), [tests/test_scanner_detect.py:719–762](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L719-L762), [tests/security/test_scanner_bypass.py:149–175](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/security/test_scanner_bypass.py#L149-L175) |
+| **MEDIUM** — une racine contenant un octet NUL levait une `ValueError` nue, qui traversait le contrat d'erreur (message statique, code 2) | `_resolve_root` capture `ValueError` au même titre que `OSError`/`RuntimeError` : `ScanError` au message statique | [heimdall/scanner/detect.py:216–242](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L216-L242), [tests/test_scanner_detect.py:1114–1124](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L1114-L1124) |
+| **MEDIUM** — le journal neutralisait seulement les contrôles ASCII : U+2028, U+2029, U+0085 et l'override U+202E subsistaient et pouvaient injecter une fausse ligne d'audit | `_safe_path` neutralise les catégories Unicode `Cc`, `Cf`, `Zl` et `Zp` : le journal reste **une ligne logique** par fichier | [heimdall/scanner/detect.py:91–134](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L91-L134), [tests/test_scanner_detect.py:789–840](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L789-L840) |
+| **LOW** — la garde `xoxe.` était **inconditionnelle** : un préfixe rotatif bourré (`xxoxe.xapp-…`) ne correspondait plus à la forme rotative, et le jeton qu'il contient disparaissait (faux négatif). La charge de la forme rotative (250) était en outre plus courte que celle du jeton qu'elle porte (250 + `xoxe.`) : un jeton detectable seul pouvait ne plus l'être une fois préfixé | la garde devient **conditionnelle** à l'ancrage du préfixe (`(?<!(?<![A-Za-z0-9-])xoxe\.)`) : elle ne neutralise le jeton interne que si la règle rotative reconnaît le préfixe. La charge rotative passe à **255** (250 + 5) : un jeton detectable seul le reste une fois préfixé. « Un secret, une empreinte, une entrée Vault » est conservé, « jamais un manqué » aussi | [heimdall/scanner/signatures/stripe_slack.py:38–101](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/signatures/stripe_slack.py#L38-L101), [tests/test_scanner_detect.py:322–389](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L322-L389) |
 
 ### Ce que le correctif permet désormais de prouver
 
 | Exigence vérifiée | Implémentation | Test et preuve permanente |
 |---|---|---|
-| **Aucun verdict propre partiel** : un fichier non analysable ne rend jamais une liste vide | [heimdall/scanner/detect.py:343–359](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L343-L359) | [tests/test_scanner_detect.py:629–716](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L629-L716), [tests/security/test_scanner_bypass.py:123–147](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/security/test_scanner_bypass.py#L123-L147) |
-| **Un verdict « propre » n'est fondé que si rien n'a été laissé de côté** (binaire, lien, base VCS, fichier illisible) | [heimdall/scanner/detect.py:151–190](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L151-L190) | [tests/test_scanner_detect.py:719–762](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L719-L762), [tests/security/test_scanner_bypass.py:149–175](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/security/test_scanner_bypass.py#L149-L175) |
-| **Un fichier tronqué entre le `stat` et l'`open` n'est jamais scanné partiellement** | [heimdall/scanner/detect.py:497–542](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L497-L542) | [tests/test_scanner_detect.py:1076–1112](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L1076-L1112) |
-| **Le contrat d'erreur est unique** : une racine invalide ne produit jamais une `ValueError` nue | [heimdall/scanner/detect.py:216–242](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L216-L242) | [tests/test_scanner_detect.py:1114–1124](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L1114-L1124) |
-| **Le journal reste une ligne logique par fichier** (contrôles ASCII, U+2028/U+2029, U+0085, U+202E) | [heimdall/scanner/detect.py:91–134](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L91-L134) | [tests/test_scanner_detect.py:789–840](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L789-L840) |
-| **« Un secret, une empreinte, une entrée Vault » sans « jamais un manqué »** : l'« inner » d'un jeton rotatif reste détecté seul, et un préfixe rotatif bourré ne masque plus le secret | [heimdall/scanner/signatures/stripe_slack.py:38–101](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/signatures/stripe_slack.py#L38-L101) | [tests/test_scanner_detect.py:322–389](https://github.com/Cezarwers/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L322-L389) |
+| **Aucun verdict propre partiel** : un fichier non analysable ne rend jamais une liste vide | [heimdall/scanner/detect.py:343–359](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L343-L359) | [tests/test_scanner_detect.py:629–716](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L629-L716), [tests/security/test_scanner_bypass.py:123–147](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/security/test_scanner_bypass.py#L123-L147) |
+| **Un verdict « propre » n'est fondé que si rien n'a été laissé de côté** (binaire, lien, base VCS, fichier illisible) | [heimdall/scanner/detect.py:151–190](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L151-L190) | [tests/test_scanner_detect.py:719–762](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L719-L762), [tests/security/test_scanner_bypass.py:149–175](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/security/test_scanner_bypass.py#L149-L175) |
+| **Un fichier tronqué entre le `stat` et l'`open` n'est jamais scanné partiellement** | [heimdall/scanner/detect.py:497–542](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L497-L542) | [tests/test_scanner_detect.py:1076–1112](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L1076-L1112) |
+| **Le contrat d'erreur est unique** : une racine invalide ne produit jamais une `ValueError` nue | [heimdall/scanner/detect.py:216–242](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L216-L242) | [tests/test_scanner_detect.py:1114–1124](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L1114-L1124) |
+| **Le journal reste une ligne logique par fichier** (contrôles ASCII, U+2028/U+2029, U+0085, U+202E) | [heimdall/scanner/detect.py:91–134](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/detect.py#L91-L134) | [tests/test_scanner_detect.py:789–840](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L789-L840) |
+| **« Un secret, une empreinte, une entrée Vault » sans « jamais un manqué »** : l'« inner » d'un jeton rotatif reste détecté seul, et un préfixe rotatif bourré ne masque plus le secret | [heimdall/scanner/signatures/stripe_slack.py:38–101](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/heimdall/scanner/signatures/stripe_slack.py#L38-L101) | [tests/test_scanner_detect.py:322–389](https://github.com/Cezar277/heimdall/blob/b2304c645445b9609b5d2ee50aed7a4255a55eef/tests/test_scanner_detect.py#L322-L389) |
 
-### Durcissements de l'amont conservés au rebase
+## Corrections issues de la relecture « APPROVE WITH COMMENTS » (4ᵉ passage)
+
+Cette section décrit le correctif demandé par la relecture « APPROVE WITH
+COMMENTS » (4ᵉ passage) : *aucun verdict propre sans garde exécutable*, et
+*aucun couplage fragile entre deux bornes*. Les permaliens sont épinglés sur
+la révision du code testé
+`c391cc0b15cd58743e826a2d5947e9743507b9ef` (commit `fix(scanner): garde executable du verdict propre, bornes
+Slack couplees (#22)`) ; les sections antérieures restent épinglées sur
+`b38dec1…`, `5de5140…` et `b2304c6…`.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| **MEDIUM** — un verdict « propre » n'était fondé que par une **consigne de documentation** : `scan()`/`find_candidates()` rendent `[]` quand un binaire, un lien symbolique ou une base VCS ont été laissés de côté ; rien n'empêchait un futur appelant (#29) de confondre `[]` et « dépôt propre » | la garde est désormais **programmatique** : `exiger_complet(rapport)` refuse un rapport incomplet par `ScanError` (message statique — le refus que la CLI traduit par le **code 2**, jamais 0 ni 1) ; `ScannerRacine.analyser_complet()` et `scan_complet()` l'appliquent d'office ; `scan()`/`find_candidates()` **avertissent** (`ScanIncomplet`) quand une liste vide ne signifie que « rien trouvé dans ce qui a été lu ». La CLI reste refusée par défaut (code 2) | [heimdall/scanner/detect.py:212–236](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/detect.py#L212-L236), [heimdall/scanner/detect.py:380–388](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/detect.py#L380-L388), [heimdall/scanner/detect.py:656–673](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/detect.py#L656-L673), [heimdall/scanner/errors.py:26–36](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/errors.py#L26-L36), [tests/security/test_scanner_bypass.py:183–276](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/security/test_scanner_bypass.py#L183-L276) |
+| **LOW** — couplage fragile des bornes Slack (250 / 255) entre deux règles : la garde `xoxe.` neutralise le jeton interne sans vérifier la charge ; si une borne évoluait sans l'autre, un secret préfixé devenait invisible **des deux** règles | les bornes sont **dérivées** des mêmes constantes (`SLACK_PAYLOAD_MAX` → `SLACK_TOKEN_MAX` → `ROTATING_PAYLOAD_MAX`) : elles ne peuvent plus diverger par retouche locale. L'invariant « la forme rotative couvre tout jeton detectable seul » est **vérifié au chargement** du registre (fail-closed : un registre incohérent refuse d'être importé) et **figé par un test** aux bornes exactes (jeton interne à charge maximale : exactement un finding, la forme rotative) | [heimdall/scanner/signatures/stripe_slack.py:30–91](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/signatures/stripe_slack.py#L30-L91), [tests/test_scanner_detect.py:400–452](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/test_scanner_detect.py#L400-L452) |
+| **LOW** — le commentaire « garde conditionnelle » sur-promettait : il annonçait que le jeton interne n'est neutralisé que « si la règle `slack_rotating_token` le reconnaît », alors que la regex ne teste ni la longueur ni la frontière avale | le commentaire et la documentation disent maintenant **exactement** ce qui est garanti : la neutralisation est conditionnelle à l'**ancrage** du préfixe `xoxe.`, et elle coïncide avec la reconnaissance de la forme rotative **dans les bornes documentées** — coïncidence rendue structurelle par les bornes dérivées. La limite au-delà (charge > 250) est **écrite** et figée par un test : un jeton hors bornes n'est detectable ni seul ni préfixé | [heimdall/scanner/signatures/stripe_slack.py:56–73](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/signatures/stripe_slack.py#L56-L73), [heimdall/scanner/signatures/stripe_slack.py:108–130](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/signatures/stripe_slack.py#L108-L130), [docs/scanner.md](scanner.md#signatures-54), [docs/scanner-signatures.md](scanner-signatures.md#les-dix-règles), [tests/test_scanner_detect.py:442–452](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/test_scanner_detect.py#L442-L452) |
+| **LOW** — hygiène de PR : quatre sous-tickets dans une PR | exception **signalée à nouveau** dans cette fiche (section « Exception de regroupement ») : elle reste une exception, à faire **valider explicitement par les mainteneurs** avant fusion. Le 4ᵉ passage ne modifie ni le découpage ni le périmètre des sous-tickets | [docs/t22-samm.md](#exception-de-regroupement) |
+| **LOW** — preuves SAMM épinglées sur des SHA intermédiaires : les permaliens pointaient vers `5de5140…`, `b2304c6…` et `2ba3ebf…`, pas vers le SHA final : la preuve **pourrit** dès la fusion | le re-pin est **outillé** et **déterministe** : `scripts/repin_samm.py --sha <sha-final>` ré-écrit les permaliens des fichiers encore livrés (les preuves historiques, dont le fichier a disparu depuis, restent épinglées sur leur révision d'origine), et `scripts/repin_samm.py --check` signale tout permalien mort. Les **29 permaliens** pointant vers un dépôt mal orthographié (`Cezarwers`) sont corrigés : une preuve morte n'est plus une preuve | [scripts/repin_samm.py](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/scripts/repin_samm.py), [tests/security/test_samm_permalinks.py](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/security/test_samm_permalinks.py) |
+
+### Ce que le correctif permet désormais de prouver
+
+| Exigence vérifiée | Implémentation | Test et preuve permanente |
+|---|---|---|
+| **Aucun verdict « propre » sans garde exécutable** : un rapport incomplet est **refusé** (`ScanError`, code 2 attendu), jamais rendu comme un dépôt propre | [heimdall/scanner/detect.py:212–236](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/detect.py#L212-L236) | [tests/security/test_scanner_bypass.py:183–220](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/security/test_scanner_bypass.py#L183-L220) (binaire, lien, base VCS, fichier non analysable : refus dans les quatre cas) |
+| **La CLI ne peut pas annoncer de verdict propre tant que #29 n'est pas branché** (sortie 2, jamais 0) | [heimdall/cli/main.py:38–49](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/cli/main.py#L38-L49) | [tests/security/test_scanner_bypass.py:264–276](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/security/test_scanner_bypass.py#L264-L276), [tests/test_package.py:53–69](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/test_package.py#L53-L69) |
+| **Les bornes Slack sont couplées par construction** : la forme rotative couvre tout jeton detectable seul, invariant vérifié au chargement du registre | [heimdall/scanner/signatures/stripe_slack.py:30–91](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/signatures/stripe_slack.py#L30-L91) | [tests/test_scanner_detect.py:400–418](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/test_scanner_detect.py#L400-L418) |
+| **Aux bornes exactes, un jeton préfixé reste détecté** (un seul finding : la forme rotative) ; au-delà, la limite est écrite et figée | [heimdall/scanner/signatures/stripe_slack.py:155–176](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/signatures/stripe_slack.py#L155-L176) | [tests/test_scanner_detect.py:420–452](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/test_scanner_detect.py#L420-L452) |
+| **Les preuves SAMM ne sont pas des liens morts** : dépôt attendu, révision connue, fichier présent à la révision, re-pin outillé | [scripts/repin_samm.py](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/scripts/repin_samm.py) | [tests/security/test_samm_permalinks.py](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/security/test_samm_permalinks.py) |
+
+## Révisions à re-pinner après la fusion
+
+Les permaliens de cette fiche sont épinglés sur la révision du code testé
+`c391cc0b15cd58743e826a2d5947e9743507b9ef`. Tant que cette révision est un commit **intermédiaire** de la
+branche, la preuve est rejouable sur la branche mais **pourrit à la fusion**
+(un squash n'apporte pas les commits intermédiaires dans `main`) : les liens
+deviennent morts et la preuve n'est plus vérifiable par un auditeur.
+
+| Révision | Commit | Passe |
+|---|---|---|
+| `c391cc0b15cd58743e826a2d5947e9743507b9ef` | fix(scanner): garde executable du verdict propre, bornes Slack couplees (#22) | 4ᵉ passage |
+
+Après la fusion (SHA du squash connu), re-pince **en une commande** :
+
+```sh
+python scripts/repin_samm.py --sha <sha-du-squash>   # ré-écrit la fiche
+python scripts/repin_samm.py --check                 # contrôle : 0 permutation
+```
+
+Le re-pin ne touche qu'aux permaliens dont le fichier est **encore livré** :
+les preuves historiques (fichier déplacé ou supprimé depuis) restent épinglées
+sur leur révision d'origine, sinon elles deviendraient des liens morts. La
+table ci-dessus est alors vidée, et `tests/security/test_samm_permalinks.py`
+vérifie qu'aucun permalien mort ne subsiste.
+
+## Durcissements de l'amont conservés au rebase
 
 Le correctif ci-dessus a été rejoué sur `origin/22-t22-scanner-regex-de-signatures-et-exclusions`
 (branche distante, commits `420ec98` → `2ba3ebf` → `a03b6ab`). Les durcissements
@@ -162,6 +223,19 @@ de la **lecture** est fermée par la comparaison `before`/`after`
 (`detect.py:497–542` sur `b2304c6…`) ; la contradiction Slack est arbitrée
 dans les deux sens — « un secret, une empreinte » **et** « jamais un manqué »
 (voir la section « 3ᵉ passage »).
+
+Le durcissement de lecture est complété sans changer le contrat : une racine
+**vide** ou d'un **type non chemin** est refusée (`ScanError` statique, jamais
+`TypeError`/`ValueError` nue) ; l'ouverture est `O_NONBLOCK`, donc un fichier
+régulier remplacé par un FIFO entre le `stat` et l'`open` est refusé par
+`fstat` au lieu de bloquer le hook/CI ; le journal neutralise aussi les
+surrogates d'un nom non UTF-8 (`Cs`) ; une erreur de parcours sur un répertoire
+de tiers est classée avec **son propre nom**, donc un `vendor/` illisible à la
+racine est tracé/compté comme les autres échecs de l'arbre de tiers. Tests :
+`test_an_empty_root_is_fail_closed`, `test_a_non_path_root_is_fail_closed`,
+`test_open_flags_are_read_only_non_blocking_and_never_follow_links`,
+`test_the_trace_neutralises_surrogates_from_non_utf8_names`,
+`test_an_unreadable_tier_directory_at_the_root_is_traced`.
 
 ## Résultats locaux
 
@@ -211,6 +285,14 @@ modifie ni le découpage ni le périmètre des sous-tickets. Le correctif du 3�
 passage ne modifie pas non plus le découpage : il porte sur le comportement
 fail-closed du scanner (#59 et #60), pas sur un nouveau sous-ticket.
 
+La relecture « APPROVE WITH COMMENTS » (4ᵉ passage) **la signale encore** :
+c'est un point de vigilance d'usage, pas un blocage technique — le
+correctif de ce 4ᵉ passage ne modifie ni le découpage ni le périmètre des
+sous-tickets (il porte sur la garde du verdict propre et sur les bornes
+Slack). L'exception reste **à valider explicitement par les mainteneurs**
+avant fusion ; les PR suivantes suivront le découpage habituel (1 PR = 1
+sous-ticket).
+
 ## Relecture et PR
 
 - PR : à ouvrir sur la branche
@@ -218,9 +300,14 @@ fail-closed du scanner (#59 et #60), pas sur un nouveau sous-ticket.
 - Relecture inter-domaines et check `CI (/ci)` restent requis avant fusion.
 - La feuille SAMM externe n'est pas accessible depuis le dépôt ; reporter la
   ligne ci-dessus avec le lien de la PR et le SHA du **code testé**
-  `b2304c645445b9609b5d2ee50aed7a4255a55eef` (le tableau principal reste
+  `c391cc0b15cd58743e826a2d5947e9743507b9ef` (le tableau principal reste
   épinglé sur la révision historique `b38dec179de6baf22fefd50056014e8ea26fc185`,
-  signalée par ⚠️ ; les corrections du 2ᵉ passage sont prouvées plus haut, et
-  celles du 3ᵉ passage dans la section « 3ᵉ passage »).
-- **Permaliens du 3ᵉ passage** : épinglés sur `b2304c645445b9609b5d2ee50aed7a4255a55eef` (code testé) ; la
+  signalée par ⚠️ ; les corrections du 2ᵉ passage sont prouvées plus haut,
+  celles du 3ᵉ passage dans la section « 3ᵉ passage », et celles du 4ᵉ
+  passage dans la section « 4ᵉ passage »).
+- **Permaliens du 4ᵉ passage** : épinglés sur `c391cc0b15cd58743e826a2d5947e9743507b9ef` (code testé) ; la
   présente révision de documentation est celle qui les contient.
+- **Après la fusion** : re-pince la fiche sur le SHA du squash (une
+  commande, voir « Révisions à re-pinner après la fusion »), puis contrôle
+  `python scripts/repin_samm.py --check` : aucun permalien mort ne doit
+  subsister.
