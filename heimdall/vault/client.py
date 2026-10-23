@@ -471,7 +471,8 @@ def _validate_metadata_response(data: Any, label: str) -> dict[str, Any]:
         _validate_identifier(str(data["name"]), "nom de secret", _SECRET_NAME_PATTERN)
         status = data.get("status")
         if not isinstance(status, str) or not (1 <= len(status) <= _MAX_STATUS_LEN):
-            raise VaultClientError(f"Statut non conforme dans {label} : {status!r}")
+            status_preview = status[:32] if isinstance(status, str) else type(status).__name__
+            raise VaultClientError(f"Statut non conforme dans {label} : {status_preview!r}")
     return data
 
 
@@ -494,8 +495,9 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
         expected = {"project", "env", "name", "status", "value"}
         if set(data.keys()) != expected:
             diff = set(data.keys()) ^ expected
+            diff_preview = ", ".join(sorted(str(k)[:32] for k in diff))[:64]
             raise VaultClientError(
-                f"Schéma de réponse Vault invalide : champs inattendus/manquants {diff}"
+                f"Schéma de réponse Vault invalide : champs inattendus/manquants ({diff_preview})"
             )
         val = data.get("value")
         if not isinstance(val, str) or not (1 <= len(val) <= _MAX_SECRET_VALUE_LEN):
@@ -506,8 +508,10 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
         _validate_identifier(str(data["env"]), "environnement", _ENV_ID_PATTERN)
         _validate_identifier(str(data["name"]), "nom de secret", _SECRET_NAME_PATTERN)
 
-    if data.get("status") not in ("actif", "revoque", "vaulte"):
-        raise VaultClientError(f"Statut de secret non conforme : {data.get('status')!r}")
+    status_val = data.get("status")
+    if status_val not in ("actif", "revoque", "vaulte"):
+        status_preview = str(status_val)[:32]
+        raise VaultClientError(f"Statut de secret non conforme : {status_preview!r}")
 
     return data
 

@@ -178,6 +178,8 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
             _write_file_atomic_dir_fd(parent_fd, path.name, data, mode)
         else:  # pragma: no cover - dépend de la plateforme
             _write_file_atomic_fallback(parent, path, data, mode)
+    except OSError as exc:
+        raise ValueError(f"Impossible d'écrire le fichier : {exc}") from exc
     finally:
         try:
             os.close(parent_fd)
@@ -227,7 +229,7 @@ def _decode_env_value(raw_value: str) -> str:
     return value
 
 
-def backup_file(path: Path) -> Path | None:
+def backup_file(path: Path) -> Path | None:  # noqa: PLR0912
     """Crée une copie de sauvegarde d'un fichier existant avec droits 0600."""
     if os.path.islink(path):
         raise ValueError(f"Sauvegarde refusée : '{path}' est un lien symbolique.")
@@ -237,22 +239,33 @@ def backup_file(path: Path) -> Path | None:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         fd = os.open(path, flags)
     except OSError as exc:
         raise ValueError(f"Impossible d'ouvrir le fichier à sauvegarder : {exc}") from exc
 
     try:
-        with os.fdopen(fd, "rb") as f:
-            fd = -1
-            # Lecture bornée : le fichier peut grossir entre fstat() et read().
-            content = f.read(_MAX_BACKUP_BYTES + 1)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"Sauvegarde refusée : '{path}' n'est pas un fichier régulier.")
+        if st.st_size > _MAX_BACKUP_BYTES:
+            raise ValueError(
+                f"Sauvegarde refusée : '{path}' dépasse la taille maximale "
+                f"({_MAX_BACKUP_BYTES} octets)."
+            )
+        # Lecture bornée : le fichier peut grossir entre fstat() et read().
+        content = os.read(fd, _MAX_BACKUP_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"Impossible de lire le fichier à sauvegarder : {exc}") from exc
     finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:  # noqa: S110
-                pass
+        try:
+            os.close(fd)
+        except OSError:  # noqa: S110
+            pass
 
     if len(content) > _MAX_BACKUP_BYTES:
         raise ValueError(
@@ -343,19 +356,21 @@ def parse_env_file(path: Path) -> dict[str, str] | None:
     return secrets
 
 
-def parse_example_names(path: Path) -> list[str]:
+def parse_example_names(path: Path) -> list[str] | None:
     """Extrait les noms de variables déclarés dans un .env.example.
 
     Refuse de suivre les liens symboliques.
+    Retourne None si le fichier ne peut pas être lu (symlink, permission, non-régulier).
+    Retourne une liste (éventuellement vide) si le fichier a été lu avec succès.
     """
-    if not path.exists() and not os.path.islink(path):
-        return []
+    if os.path.islink(path):
+        return None
     try:
         content = read_file_secure_no_follow(path)
     except Exception:
-        return []
+        return None
     if content is None:
-        return []
+        return None
     names: list[str] = []
     for raw_line in content.splitlines():
         line = raw_line.strip()

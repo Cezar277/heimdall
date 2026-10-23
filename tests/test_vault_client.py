@@ -576,10 +576,10 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         self.assertNotIn("A" * 1000, message)
 
     def test_write_file_atomic_cleans_up_on_failure(self) -> None:
-        """En cas d'erreur pendant l'écriture, le fichier temporaire est nettoyé."""
+        """En cas d'erreur d'écriture, le fichier temporaire est nettoyé (ValueError)."""
         target = self.tmp_dir / "fail.env"
         with patch("os.fsync", side_effect=OSError("disk error")):
-            with self.assertRaises(OSError):
+            with self.assertRaises(ValueError):
                 write_file_atomic(target, "content")
         # Aucun fichier résiduel .tmp
         tmp_files = [f for f in self.tmp_dir.iterdir() if ".tmp." in f.name]
@@ -651,7 +651,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             os.symlink(victim, symlink_example)
         except OSError:
             self.skipTest("Symlinks non supportés")
-        self.assertEqual(parse_example_names(symlink_example), [])
+        self.assertIsNone(parse_example_names(symlink_example))
 
     def test_get_secret_schema_validation_never_leaks_value(self) -> None:
         """La validation du schéma ne divulgue jamais la valeur fautive (Invariant 8)."""
@@ -806,6 +806,49 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         """detect_project utilise le nom de dossier si rien d'autre."""
         with patch.dict(os.environ, {"HEIMDALL_PROJECT": "custom-proj"}):
             self.assertEqual(detect_project(), "custom-proj")
+
+    def test_backup_file_on_directory_or_fifo_raises_value_error(self) -> None:
+        """backup_file refuse un répertoire ou une FIFO échangée avec fstat."""
+        target_dir = self.tmp_dir / "dir_target"
+        target_dir.mkdir()
+        with patch("pathlib.Path.is_file", return_value=True):
+            with self.assertRaises(ValueError) as ctx:
+                backup_file(target_dir)
+            self.assertIn("n'est pas un fichier régulier", str(ctx.exception))
+
+        if hasattr(os, "mkfifo"):
+            fifo_path = self.tmp_dir / "test_fifo"
+            try:
+                os.mkfifo(fifo_path)
+            except OSError:
+                return
+            with patch("pathlib.Path.is_file", return_value=True):
+                with self.assertRaises(ValueError) as ctx:
+                    backup_file(fifo_path)
+                self.assertIn("n'est pas un fichier régulier", str(ctx.exception))
+
+    def test_get_secret_without_pydantic_truncates_huge_status(self) -> None:
+        """En mode dégradé sans Pydantic, un statut géant est tronqué à 32 car. (< 200 car.)."""
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        huge_status = "s" * 500_000
+        resp_bad_status = httpx.Response(
+            HTTPStatus.OK,
+            json={
+                "project": "demo",
+                "env": "dev",
+                "name": "MY_KEY",
+                "status": huge_status,
+                "value": "secret",
+            },
+            request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/MY_KEY"),
+        )
+        with patch("heimdall.vault.client.BaseModel", None):
+            with patch.object(httpx.Client, "send", return_value=resp_bad_status):
+                with self.assertRaises(VaultClientError) as ctx:
+                    client.get_secret("demo", "dev", "MY_KEY")
+                err_msg = str(ctx.exception)
+                self.assertLess(len(err_msg), 200)
+                self.assertNotIn("s" * 100, err_msg)
 
 
 if __name__ == "__main__":

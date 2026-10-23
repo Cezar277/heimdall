@@ -1065,6 +1065,121 @@ class VaultRunCliTests(unittest.TestCase):
                 )
                 self.assertEqual(result.exit_code, 0)
 
+    def test_run_with_null_byte_value_exits_1_without_traceback(self) -> None:
+        """Une valeur contenant un octet nul sort en 1 sans traceback (attaque MEDIUM 1)."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "NULL_VAL",
+                    "status": "actif",
+                    "value": "embedded\x00null",
+                }
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "run",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "NULL_VAL",
+                        "--",
+                        "python",
+                        "-c",
+                        "print('hello')",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertNotIn("Traceback", result.output)
+                self.assertIn("octet nul", result.output)
+
+    def test_run_with_symlink_or_unreadable_example_exits_2(self) -> None:
+        """run avec un .env.example illisible ou symlink sort en 2 sans exécuter l'enfant."""
+        runner_dir = Path(tempfile.mkdtemp())
+        example = runner_dir / ".env.example"
+        target = runner_dir / "target.txt"
+        target.write_text("S=1\n", encoding="utf-8")
+        try:
+            os.symlink(target, example)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+
+        result = self.runner.invoke(
+            app,
+            [
+                "run",
+                "--project",
+                "demo",
+                "--example-file",
+                str(example),
+                "--",
+                "python",
+                "-c",
+                "print('SHOULD_NOT_RUN')",
+            ],
+        )
+        self.assertEqual(result.exit_code, 2)
+        self.assertNotIn("SHOULD_NOT_RUN", result.output)
+        self.assertTrue(
+            "symlink" in result.output.lower() or "lien symbolique" in result.output.lower()
+        )
+
+    def test_pull_output_directory_exits_1_without_traceback(self) -> None:
+        """pull vers un répertoire existant sort en 1 sans traceback OSError."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "MY_SECRET",
+                    "status": "actif",
+                    "value": "clean_value",
+                }
+                mock_init.return_value = client_instance
+
+                dir_output = Path(tempfile.mkdtemp())
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "MY_SECRET",
+                        "-o",
+                        str(dir_output),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertNotIn("Traceback", result.output)
+                self.assertIn("Erreur de sécurité", result.output)
+
+    def test_validate_project_and_env_with_huge_input_truncates_error(self) -> None:
+        """Un identifiant de projet de 1 Mio est tronqué à 32 car. dans les logs (< 200 car.)."""
+        huge_proj = "a" * 1_000_000
+        result = self.runner.invoke(
+            app,
+            [
+                "vault",
+                "pull",
+                "--project",
+                huge_proj,
+                "--name",
+                "MY_VAR",
+            ],
+        )
+        self.assertEqual(result.exit_code, 2)
+        self.assertLess(len(result.output), 200)
+        self.assertNotIn("a" * 100, result.output)
+
 
 if __name__ == "__main__":
     unittest.main()

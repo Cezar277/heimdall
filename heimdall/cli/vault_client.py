@@ -230,10 +230,10 @@ def _validate_project_and_env(project: str | None, env: str) -> str:
     """Valide et résout le nom de projet et d'environnement."""
     proj = project or detect_project()
     if not _PROJECT_ID_PATTERN.match(proj):
-        typer.echo(f"Identifiant de projet invalide : '{proj}'", err=True)
+        typer.echo(f"Identifiant de projet invalide : {proj[:32]!r}", err=True)
         raise typer.Exit(code=2)
     if not _ENV_ID_PATTERN.match(env):
-        typer.echo(f"Identifiant d'environnement invalide : '{env}'", err=True)
+        typer.echo(f"Identifiant d'environnement invalide : {env[:32]!r}", err=True)
         raise typer.Exit(code=2)
     return proj
 
@@ -278,7 +278,7 @@ def _filter_secrets(
             continue
         if not _SECRET_NAME_PATTERN.match(key):
             typer.echo(
-                f"Avertissement : nom de secret ignoré (format invalide) : {key}",
+                f"Avertissement : nom de secret ignoré (format invalide) : {key[:32]!r}",
                 err=True,
             )
             continue
@@ -391,13 +391,39 @@ def _resolve_pull_names(
     """Détermine la liste des noms de secrets à récupérer."""
     if names:
         return list(names)
+    if os.path.islink(example_file):
+        typer.echo(
+            f"Erreur de sécurité : le fichier d'exemple '{example_file}' est un lien symbolique.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     if example_file.is_file():
         from_example = parse_example_names(example_file)
+        if from_example is None:
+            typer.echo(
+                f"Erreur lors de la lecture du fichier '{example_file}' : "
+                "fichier illisible ou non sécurisé.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         if from_example:
             return from_example
+    if os.path.islink(output):
+        typer.echo(
+            f"Erreur de sécurité : le fichier de sortie '{output}' est un lien symbolique.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     if output.is_file():
         parsed = parse_env_file(output)
-        from_existing = list((parsed or {}).keys())
+        if parsed is None:
+            typer.echo(
+                f"Erreur lors de la lecture du fichier '{output}' : "
+                "fichier illisible ou non sécurisé.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        from_existing = list(parsed.keys())
         if from_existing:
             return from_existing
     typer.echo(
@@ -419,7 +445,7 @@ def _pull_secrets_from_vault(
     for name in target_names:
         if not _SECRET_NAME_PATTERN.match(name):
             typer.echo(
-                f"Avertissement : nom de secret ignoré (format invalide) : {name}",
+                f"Avertissement : nom de secret ignoré (format invalide) : {name[:32]!r}",
                 err=True,
             )
             continue
@@ -438,7 +464,14 @@ def _pull_secrets_from_vault(
                     err=True,
                 )
                 raise typer.Exit(code=1)
-            retrieved[name] = str(val)
+            val_str = str(val)
+            if "\x00" in val_str:
+                typer.echo(
+                    f"Erreur de sécurité : le secret '{name}' contient un octet nul interdit.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            retrieved[name] = val_str
         except VaultNotFoundError:
             typer.echo(
                 f"Avertissement : secret '{name}' introuvable dans le Vault ({proj}/{env}).",
@@ -516,7 +549,7 @@ def vault_pull(  # noqa: PLR0913, PLR0917
     content = "\n".join(lines) + "\n"
     try:
         write_file_atomic(output, content, mode=0o600)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         typer.echo(f"Erreur de sécurité lors de l'écriture : {exc}", err=True)
         raise typer.Exit(code=1) from None
 
@@ -544,14 +577,40 @@ def _resolve_run_names(
     """Détermine la liste des noms de secrets à injecter en mémoire."""
     if names:
         return list(names)
+    if os.path.islink(example_file):
+        typer.echo(
+            f"Erreur de sécurité : le fichier d'exemple '{example_file}' est un lien symbolique.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     if example_file.is_file():
         from_example = parse_example_names(example_file)
+        if from_example is None:
+            typer.echo(
+                f"Erreur lors de la lecture du fichier '{example_file}' : "
+                "fichier illisible ou non sécurisé.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         if from_example:
             return from_example
     dot_env = Path(".env")
+    if os.path.islink(dot_env):
+        typer.echo(
+            f"Erreur de sécurité : le fichier '{dot_env}' est un lien symbolique.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     if dot_env.is_file():
         parsed = parse_env_file(dot_env)
-        from_env = list((parsed or {}).keys())
+        if parsed is None:
+            typer.echo(
+                f"Erreur lors de la lecture du fichier '{dot_env}' : "
+                "fichier illisible ou non sécurisé.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        from_env = list(parsed.keys())
         if from_env:
             return from_env
     return []
@@ -626,6 +685,9 @@ def vault_run(  # noqa: PLR0913, PLR0917
     except PermissionError:
         typer.echo(f"Erreur : permission refusée pour exécuter : {cmd[0]}", err=True)
         raise typer.Exit(code=126) from None
+    except (ValueError, OSError) as exc:
+        typer.echo(f"Erreur lors de l'exécution de la commande : {exc}", err=True)
+        raise typer.Exit(code=1) from None
 
 
 __all__ = ["is_dangerous_env_var", "vault_pull", "vault_push", "vault_run"]
