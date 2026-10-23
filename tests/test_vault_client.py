@@ -7,6 +7,7 @@ ni argon2.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import pickle
 import stat
@@ -114,6 +115,21 @@ class VaultClientUnitTests(unittest.TestCase):
         self.assertIsNotNone(c2)
         self.assertIsNotNone(c3)
 
+    def test_ca_cert_symlink_is_rejected(self) -> None:
+        """Un bundle CA pointé par un lien symbolique est refusé (invariant 3)."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-ca-") as tmp:
+            real_ca = Path(tmp) / "real-ca.pem"
+            real_ca.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+            symlink_ca = Path(tmp) / "ca.pem"
+            try:
+                os.symlink(real_ca, symlink_ca)
+            except OSError:
+                self.skipTest("Symlinks non supportés")
+
+            with self.assertRaises(ValueError) as ctx:
+                VaultClient(_VALID_URL, _VALID_KEY, ca_cert=symlink_ca)
+            self.assertIn("non sécurisé", str(ctx.exception))
+
     def test_reject_empty_or_whitespace_api_key(self) -> None:
         """Refus d'une clé API vide ou constituée d'espaces."""
         with self.assertRaises(ValueError):
@@ -129,7 +145,7 @@ class VaultClientUnitTests(unittest.TestCase):
             json={"status": "pass", "version": "0.1.0"},
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
         )
-        with patch.object(httpx.Client, "get", return_value=mock_resp):
+        with patch.object(httpx.Client, "send", return_value=mock_resp):
             data = client.health()
             self.assertEqual(data["status"], "pass")
 
@@ -141,16 +157,20 @@ class VaultClientUnitTests(unittest.TestCase):
             json={"project": "demo", "env": "dev", "name": "DB_PASS", "status": "vaulte"},
             request=httpx.Request("POST", f"{_VALID_URL}/api/v1/secrets"),
         )
-        with patch.object(httpx.Client, "post", return_value=mock_resp) as mock_post:
+        with patch.object(httpx.Client, "send", return_value=mock_resp) as mock_send:
             res = client.create_secret("demo", "dev", "DB_PASS", "secret_value")
             self.assertEqual(res["status"], "vaulte")
-            mock_post.assert_called_once()
-            _, kwargs = mock_post.call_args
+            mock_send.assert_called_once()
+            _, kwargs = mock_send.call_args
+            request = kwargs["request"]
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(str(request.url), f"{_VALID_URL}/api/v1/secrets")
             self.assertEqual(
-                kwargs["json"],
+                json.loads(request.content),
                 {"project": "demo", "env": "dev", "name": "DB_PASS", "value": "secret_value"},
             )
-            self.assertEqual(kwargs["headers"]["X-Heimdall-API-Key"], _VALID_KEY)
+            self.assertEqual(request.headers["X-Heimdall-API-Key"], _VALID_KEY)
+            self.assertTrue(kwargs["stream"])
 
     def test_get_secret_success(self) -> None:
         """get_secret() récupère et valide le secret."""
@@ -166,7 +186,7 @@ class VaultClientUnitTests(unittest.TestCase):
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS"),
         )
-        with patch.object(httpx.Client, "get", return_value=mock_resp):
+        with patch.object(httpx.Client, "send", return_value=mock_resp):
             res = client.get_secret("demo", "dev", "DB_PASS")
             self.assertEqual(res["value"], "super_secret")
 
@@ -186,7 +206,7 @@ class VaultClientUnitTests(unittest.TestCase):
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS"),
         )
-        with patch.object(httpx.Client, "get", return_value=resp_non_str):
+        with patch.object(httpx.Client, "send", return_value=resp_non_str):
             with self.assertRaises(VaultClientError):
                 client.get_secret("demo", "dev", "DB_PASS")
 
@@ -203,7 +223,7 @@ class VaultClientUnitTests(unittest.TestCase):
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS"),
         )
-        with patch.object(httpx.Client, "get", return_value=resp_extra):
+        with patch.object(httpx.Client, "send", return_value=resp_extra):
             with self.assertRaises(VaultClientError):
                 client.get_secret("demo", "dev", "DB_PASS")
 
@@ -219,7 +239,7 @@ class VaultClientUnitTests(unittest.TestCase):
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS"),
         )
-        with patch.object(httpx.Client, "get", return_value=resp_huge):
+        with patch.object(httpx.Client, "send", return_value=resp_huge):
             with self.assertRaises(VaultClientError):
                 client.get_secret("demo", "dev", "DB_PASS")
 
@@ -231,7 +251,7 @@ class VaultClientUnitTests(unittest.TestCase):
             json={"project": "demo", "env": "dev", "name": "DB_PASS", "status": "vaulte"},
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS/state"),
         )
-        with patch.object(httpx.Client, "get", return_value=mock_resp):
+        with patch.object(httpx.Client, "send", return_value=mock_resp):
             res = client.get_secret_state("demo", "dev", "DB_PASS")
             self.assertEqual(res["status"], "vaulte")
             self.assertNotIn("value", res)
@@ -255,7 +275,7 @@ class VaultClientUnitTests(unittest.TestCase):
                     status,
                     request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
                 )
-                with patch.object(httpx.Client, "get", return_value=resp):
+                with patch.object(httpx.Client, "send", return_value=resp):
                     with self.assertRaises(exc_class):
                         client.health()
 
@@ -267,7 +287,7 @@ class VaultClientUnitTests(unittest.TestCase):
             headers={"retry-after": "15"},
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
         )
-        with patch.object(httpx.Client, "get", return_value=resp):
+        with patch.object(httpx.Client, "send", return_value=resp):
             with self.assertRaises(VaultRateLimitError) as ctx:
                 client.health()
             self.assertEqual(ctx.exception.retry_after, 15)
@@ -277,7 +297,7 @@ class VaultClientUnitTests(unittest.TestCase):
         """Une panne de communication réseau lève VaultUnavailableError."""
         client = VaultClient(_VALID_URL, _VALID_KEY)
         connect_err = httpx.ConnectError("Connection refused")
-        with patch.object(httpx.Client, "get", side_effect=connect_err):
+        with patch.object(httpx.Client, "send", side_effect=connect_err):
             with self.assertRaises(VaultUnavailableError):
                 client.health()
 
@@ -327,6 +347,18 @@ class VaultConfigResolutionTests(unittest.TestCase):
             with self.assertRaises(VaultClientError) as ctx:
                 resolve_api_key(key_file)
             self.assertIn("0600 requis", str(ctx.exception))
+
+    def test_reject_oversized_key_file(self) -> None:
+        """Un fichier de clé > 4096 octets est refusé avant lecture complète."""
+        key_file = self.tmp_dir / "vault.key"
+        key_file.write_bytes(b"k" * 5000)
+        if os.name == "posix":
+            os.chmod(key_file, 0o600)
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": ""}):
+            with self.assertRaises(VaultClientError) as ctx:
+                resolve_api_key(key_file)
+            self.assertIn("trop volumineux", str(ctx.exception))
 
     def test_reject_symlink_key_file(self) -> None:
         """Refus strict si le fichier de clé est un lien symbolique (anti-TOCTOU)."""
@@ -443,6 +475,38 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             write_file_atomic(target, "DATA\n")
         self.assertIn("répertoire parent", str(ctx.exception))
+
+    def test_write_file_atomic_resists_parent_directory_swap(self) -> None:
+        """Un échange du parent après ouverture ne détourne pas l'écriture (dir_fd)."""
+        parent = self.tmp_dir / "work"
+        parent.mkdir()
+        moved_parent = self.tmp_dir / "work-moved"
+        outside = self.tmp_dir / "outside"
+        outside.mkdir()
+        target = parent / ".env"
+
+        real_open = os.open
+        swapped = False
+
+        def fake_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            fd = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+            if (
+                not swapped
+                and os.fspath(path) == os.fspath(parent)
+                and flags & getattr(os, "O_DIRECTORY", 0)
+            ):
+                swapped = True
+                parent.rename(moved_parent)
+                os.symlink(outside, parent)
+            return fd
+
+        with patch("heimdall.vault.atomic.os.open", side_effect=fake_open):
+            write_file_atomic(target, "SECRET=1\n")
+
+        self.assertTrue(swapped)
+        self.assertEqual((moved_parent / ".env").read_text(encoding="utf-8"), "SECRET=1\n")
+        self.assertFalse((outside / ".env").exists())
 
     def test_backup_file_creation_and_mode_600(self) -> None:
         """backup_file crée une copie .bak en droits 0600 avec assertion de mode."""
@@ -569,7 +633,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/SECRET_PASS"),
         )
-        with patch.object(httpx.Client, "get", return_value=resp_invalid):
+        with patch.object(httpx.Client, "send", return_value=resp_invalid):
             with self.assertRaises(VaultClientError) as ctx:
                 client.get_secret("demo", "dev", "SECRET_PASS")
             # Invariant 8 absolu : la valeur secrète ne doit JAMAIS figurer dans le message d'erreur
@@ -585,7 +649,27 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             content=giant_content,
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
         )
-        with patch.object(httpx.Client, "get", return_value=resp_giant):
+        with patch.object(httpx.Client, "send", return_value=resp_giant):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("trop volumineuse", str(ctx.exception))
+
+    def test_streaming_response_without_content_length_is_bounded(self) -> None:
+        """Le compteur d'octets rejette un corps infini même sans Content-Length."""
+
+        class _EndlessResponse:
+            status_code = HTTPStatus.OK
+            headers: dict[str, str] = {}
+
+            def iter_bytes(self) -> object:
+                while True:
+                    yield b"x" * 65_536
+
+            def close(self) -> None:
+                pass
+
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(httpx.Client, "send", return_value=_EndlessResponse()):
             with self.assertRaises(VaultClientError) as ctx:
                 client.health()
             self.assertIn("trop volumineuse", str(ctx.exception))
@@ -599,9 +683,42 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             content=b'{"status":"ok"}',
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
         )
-        with patch.object(httpx.Client, "get", return_value=resp):
+        with patch.object(httpx.Client, "send", return_value=resp):
             with self.assertRaises(VaultClientError) as ctx:
                 client.health()
+            self.assertIn("trop volumineuse", str(ctx.exception))
+
+    def test_health_and_create_reject_100mb_before_reading_body(self) -> None:
+        """Content-Length 100 Mo : rejet sans jamais lire le corps (health et create)."""
+
+        class _HeaderOnlyResponse:
+            def __init__(self, status_code: int) -> None:
+                self.status_code = status_code
+                self.headers = {"content-length": str(100 * 1024 * 1024)}
+
+            def iter_bytes(self) -> object:
+                raise AssertionError("le corps ne doit pas être lu")
+
+            def close(self) -> None:
+                pass
+
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(
+            httpx.Client,
+            "send",
+            return_value=_HeaderOnlyResponse(HTTPStatus.OK),
+        ):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("trop volumineuse", str(ctx.exception))
+
+        with patch.object(
+            httpx.Client,
+            "send",
+            return_value=_HeaderOnlyResponse(HTTPStatus.CREATED),
+        ):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.create_secret("demo", "dev", "DB_PASS", "val")
             self.assertIn("trop volumineuse", str(ctx.exception))
 
     def test_health_and_create_secret_schema_validation(self) -> None:
@@ -614,7 +731,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             json={"status": "ok", "extra_bad": "malicious"},
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
         )
-        with patch.object(httpx.Client, "get", return_value=resp_bad_health):
+        with patch.object(httpx.Client, "send", return_value=resp_bad_health):
             with self.assertRaises(VaultClientError):
                 client.health()
 
@@ -630,7 +747,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             },
             request=httpx.Request("POST", f"{_VALID_URL}/api/v1/secrets"),
         )
-        with patch.object(httpx.Client, "post", return_value=resp_bad_create):
+        with patch.object(httpx.Client, "send", return_value=resp_bad_create):
             with self.assertRaises(VaultClientError):
                 client.create_secret("demo", "dev", "DB_PASS", "val")
 
@@ -646,7 +763,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS/state"),
         )
-        with patch.object(httpx.Client, "get", return_value=resp_state_with_value):
+        with patch.object(httpx.Client, "send", return_value=resp_state_with_value):
             with self.assertRaises(VaultClientError):
                 client.get_secret_state("demo", "dev", "DB_PASS")
 

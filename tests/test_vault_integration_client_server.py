@@ -25,7 +25,7 @@ from typer.testing import CliRunner
 from heimdall.cli.main import app as cli_app
 from heimdall.vault import auth as vault_auth
 from heimdall.vault.app import VaultSettings, create_app
-from heimdall.vault.atomic import check_file_mode_600
+from heimdall.vault.atomic import check_file_mode_600, parse_env_file
 from heimdall.vault.client import (
     VaultAuthError,
     VaultClient,
@@ -207,9 +207,9 @@ class VaultClientServerIntegrationTests(unittest.TestCase):
                 self.assertEqual(pull_res.exit_code, 0)
                 self.assertTrue(dest_env.is_file())
                 self.assertTrue(check_file_mode_600(dest_env))
-                self.assertIn(
-                    "DATABASE_URL=postgres://localhost:5432/app",
-                    dest_env.read_text(encoding="utf-8"),
+                self.assertEqual(
+                    parse_env_file(dest_env),
+                    {"DATABASE_URL": "postgres://localhost:5432/app"},
                 )
 
                 # 3. Exécution de `heimdall run -- <cmd>`

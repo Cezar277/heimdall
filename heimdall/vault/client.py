@@ -22,10 +22,12 @@ ni argon2.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -63,6 +65,8 @@ _MAX_PORT: Final[int] = 65535
 _MAX_TIMEOUT_SECONDS: Final[float] = 300.0
 _MAX_SECRET_VALUE_LEN: Final[int] = 65536
 _MAX_RESPONSE_BYTES: Final[int] = 1_048_576
+_MAX_API_KEY_FILE_BYTES: Final[int] = 4096
+_MAX_CA_CERT_BYTES: Final[int] = 1_048_576
 _MAX_STATUS_LEN: Final[int] = 64
 _GROUP_OTHER_PERMS_MASK: Final[int] = 0o077
 
@@ -155,7 +159,7 @@ def _find_key_file(key_file: Path | None) -> Path | None:
     return None
 
 
-def _read_and_check_key_file(path: Path) -> str:
+def _read_and_check_key_file(path: Path) -> str:  # noqa: PLR0912
     """Valide les permissions et lit le fichier de clé de façon atomique sans TOCTOU."""
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -172,6 +176,10 @@ def _read_and_check_key_file(path: Path) -> str:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise VaultClientError("Le chemin de clé API doit être un fichier régulier.")
+        if st.st_size > _MAX_API_KEY_FILE_BYTES:
+            raise VaultClientError(
+                f"Fichier de clé API trop volumineux (max {_MAX_API_KEY_FILE_BYTES} octets)."
+            )
 
         if os.name == "posix":
             if st.st_uid != os.getuid():
@@ -185,9 +193,20 @@ def _read_and_check_key_file(path: Path) -> str:
                     "droits 0600 requis (chmod 600)."
                 )
 
-        with os.fdopen(fd, "r", encoding="utf-8") as f:
-            fd = -1  # Géré et fermé désormais par f
-            content = f.read().strip()
+        # Lecture bornée : le fichier peut grossir entre fstat() et read().
+        raw = os.read(fd, _MAX_API_KEY_FILE_BYTES + 1)
+        if len(raw) > _MAX_API_KEY_FILE_BYTES:
+            raise VaultClientError(
+                f"Fichier de clé API trop volumineux (max {_MAX_API_KEY_FILE_BYTES} octets)."
+            )
+        try:
+            content = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            raise VaultClientError(
+                "Le fichier de clé API n'est pas un texte UTF-8 valide."
+            ) from None
+    except OSError as exc:
+        raise VaultClientError(f"Impossible de lire le fichier de clé API : {exc}") from exc
     finally:
         if fd >= 0:
             try:
@@ -353,30 +372,50 @@ def _validate_loopback_url(base_url: str) -> str:
     return canonical
 
 
-def _parse_and_validate_json_dict(resp: Any, endpoint: str) -> dict[str, Any]:
-    """Parse et valide qu'une réponse est un dictionnaire JSON de taille bornée."""
+def _read_bounded_body(resp: Any, endpoint: str) -> bytes:
+    """Lit un corps HTTP en streaming avec une borne stricte de 1 Mio.
+
+    ``Content-Length`` est vérifié avant lecture ; le compteur d'octets
+    effectivement reçus protège aussi contre un en-tête absent, mensonger ou
+    une réponse compressée qui se décompresserait au-delà de la limite.
+    """
     content_length_header = resp.headers.get("content-length")
     if content_length_header:
         try:
-            cl = int(content_length_header)
-            if cl > _MAX_RESPONSE_BYTES:
-                raise VaultClientError(
-                    f"Réponse {endpoint} trop volumineuse ({cl} octets, max {_MAX_RESPONSE_BYTES})."
-                )
+            content_length = int(content_length_header)
         except ValueError:
-            pass
+            content_length = None
+        if content_length is not None and content_length > _MAX_RESPONSE_BYTES:
+            raise VaultClientError(
+                f"Réponse {endpoint} trop volumineuse "
+                f"({content_length} octets, max {_MAX_RESPONSE_BYTES})."
+            )
 
-    content = getattr(resp, "content", b"")
-    if len(content) > _MAX_RESPONSE_BYTES:
-        msg = (
-            f"Réponse {endpoint} trop volumineuse "
-            f"({len(content)} octets, max {_MAX_RESPONSE_BYTES})."
-        )
-        raise VaultClientError(msg)
+    chunks: list[bytes] = []
+    total = 0
     try:
-        data = resp.json()
-    except Exception as exc:
-        raise VaultClientError(f"Réponse JSON invalide pour {endpoint} : {exc}") from None
+        for chunk in resp.iter_bytes():
+            total += len(chunk)
+            if total > _MAX_RESPONSE_BYTES:
+                raise VaultClientError(
+                    f"Réponse {endpoint} trop volumineuse "
+                    f"(>{_MAX_RESPONSE_BYTES} octets, max {_MAX_RESPONSE_BYTES})."
+                )
+            chunks.append(chunk)
+    except VaultClientError:
+        raise
+    except Exception:
+        raise VaultClientError(f"Erreur de lecture de la réponse {endpoint}.") from None
+    return b"".join(chunks)
+
+
+def _parse_and_validate_json_dict(resp: Any, endpoint: str) -> dict[str, Any]:
+    """Parse et valide qu'une réponse est un dictionnaire JSON de taille bornée."""
+    content = _read_bounded_body(resp, endpoint)
+    try:
+        data = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise VaultClientError(f"Réponse JSON invalide pour {endpoint}.") from None
     if not isinstance(data, dict):
         raise VaultClientError(f"Format de réponse {endpoint} invalide : attendu un objet JSON.")
     return data
@@ -500,17 +539,28 @@ class VaultClient:
         if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > _MAX_TIMEOUT_SECONDS:
             raise ValueError("timeout invalide (nombre positif <= 300 secondes requis)")
 
+        ca_context: ssl.SSLContext | None = None
         if ca_cert is not None:
             if not isinstance(ca_cert, (str, Path)):
                 raise ValueError("chemin du certificat CA invalide")
             ca_path = Path(ca_cert)
-            if not ca_path.is_file():
-                raise ValueError(f"fichier de certificat CA introuvable : {ca_cert}")
+            ca_content = read_file_secure_no_follow(ca_path, max_bytes=_MAX_CA_CERT_BYTES)
+            if ca_content is None:
+                raise ValueError(
+                    f"fichier de certificat CA introuvable ou non sécurisé : {ca_cert}"
+                )
+            try:
+                ca_context = ssl.create_default_context()
+                ca_context.check_hostname = True
+                ca_context.verify_mode = ssl.CERT_REQUIRED
+                ca_context.load_verify_locations(cadata=ca_content)
+            except (ssl.SSLError, ValueError):
+                raise ValueError(f"certificat CA invalide : {ca_cert}") from None
 
         self._base_url = canonical
         self._api_key = api_key
         self._timeout = float(timeout)
-        self._ca_cert = str(ca_cert) if ca_cert is not None else None
+        self._ca_cert = ca_context
         self._transport = transport
         self._client: Any = None
 
@@ -532,7 +582,7 @@ class VaultClient:
         if self._client is not None and not self._client.is_closed:
             return self._client  # type: ignore[no-any-return]
 
-        verify: bool | str = True
+        verify: bool | ssl.SSLContext = True
         if self._ca_cert is not None:
             verify = self._ca_cert
 
@@ -582,17 +632,40 @@ class VaultClient:
             raise VaultUnavailableError(f"Serveur Vault indisponible ({status})")
         raise VaultClientError(f"Erreur HTTP du Vault ({status})")
 
-    def health(self) -> dict[str, object]:
-        """Vérifie la santé minimale du Vault (/api/v1/health)."""
+    def _request_json(  # noqa: PLR0913, PLR0917
+        self,
+        method: str,
+        url: str,
+        *,
+        endpoint: str,
+        expected_status: int,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Exécute une requête en streaming et parse une réponse JSON bornée."""
         client = self._get_client()
         try:
-            resp = client.get("/api/v1/health")
+            with client.stream(
+                method,
+                url,
+                headers=headers,
+                json=json_body,
+            ) as resp:
+                if resp.status_code == expected_status:
+                    return _parse_and_validate_json_dict(resp, endpoint)
+                self._handle_error_response(resp)
         except httpx.RequestError as exc:
             raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
-        if resp.status_code == HTTPStatus.OK:
-            data = _parse_and_validate_json_dict(resp, "health")
-            return _validate_health_response(data)
-        self._handle_error_response(resp)
+
+    def health(self) -> dict[str, object]:
+        """Vérifie la santé minimale du Vault (/api/v1/health)."""
+        data = self._request_json(
+            "GET",
+            "/api/v1/health",
+            endpoint="health",
+            expected_status=HTTPStatus.OK,
+        )
+        return _validate_health_response(data)
 
     def create_secret(
         self,
@@ -608,7 +681,6 @@ class VaultClient:
         if not isinstance(value, str) or not (1 <= len(value) <= _MAX_SECRET_VALUE_LEN):
             raise ValueError("Valeur de secret invalide (1-65536 caractères requis)")
 
-        client = self._get_client()
         payload = {
             "project": project,
             "env": env,
@@ -616,15 +688,15 @@ class VaultClient:
             "value": value,
         }
         headers = {"X-Heimdall-API-Key": self._api_key}
-        try:
-            resp = client.post("/api/v1/secrets", json=payload, headers=headers)
-        except httpx.RequestError as exc:
-            raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
-
-        if resp.status_code == HTTPStatus.CREATED:
-            data = _parse_and_validate_json_dict(resp, "secrets")
-            return _validate_metadata_response(data, "création secret")
-        self._handle_error_response(resp)
+        data = self._request_json(
+            "POST",
+            "/api/v1/secrets",
+            endpoint="secrets",
+            expected_status=HTTPStatus.CREATED,
+            headers=headers,
+            json_body=payload,
+        )
+        return _validate_metadata_response(data, "création secret")
 
     def get_secret(
         self,
@@ -637,17 +709,15 @@ class VaultClient:
         _validate_identifier(env, "environnement", _ENV_ID_PATTERN)
         _validate_identifier(name, "nom de secret", _SECRET_NAME_PATTERN)
 
-        client = self._get_client()
         headers = {"X-Heimdall-API-Key": self._api_key}
-        try:
-            resp = client.get(f"/api/v1/secrets/{project}/{env}/{name}", headers=headers)
-        except httpx.RequestError as exc:
-            raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
-
-        if resp.status_code == HTTPStatus.OK:
-            data = _parse_and_validate_json_dict(resp, "secrets")
-            return _validate_secret_read_response(data)
-        self._handle_error_response(resp)
+        data = self._request_json(
+            "GET",
+            f"/api/v1/secrets/{project}/{env}/{name}",
+            endpoint="secrets",
+            expected_status=HTTPStatus.OK,
+            headers=headers,
+        )
+        return _validate_secret_read_response(data)
 
     def get_secret_state(
         self,
@@ -660,19 +730,17 @@ class VaultClient:
         _validate_identifier(env, "environnement", _ENV_ID_PATTERN)
         _validate_identifier(name, "nom de secret", _SECRET_NAME_PATTERN)
 
-        client = self._get_client()
         headers = {"X-Heimdall-API-Key": self._api_key}
-        try:
-            resp = client.get(f"/api/v1/secrets/{project}/{env}/{name}/state", headers=headers)
-        except httpx.RequestError as exc:
-            raise VaultUnavailableError(f"Erreur de communication avec le Vault : {exc}") from exc
-
-        if resp.status_code == HTTPStatus.OK:
-            data = _parse_and_validate_json_dict(resp, "state")
-            if "value" in data:
-                raise VaultClientError("L'endpoint state ne doit jamais renvoyer de valeur.")
-            return _validate_metadata_response(data, "état secret")
-        self._handle_error_response(resp)
+        data = self._request_json(
+            "GET",
+            f"/api/v1/secrets/{project}/{env}/{name}/state",
+            endpoint="state",
+            expected_status=HTTPStatus.OK,
+            headers=headers,
+        )
+        if "value" in data:
+            raise VaultClientError("L'endpoint state ne doit jamais renvoyer de valeur.")
+        return _validate_metadata_response(data, "état secret")
 
     def close(self) -> None:
         """Ferme la session HTTP sous-jacente."""

@@ -35,6 +35,7 @@ from cryptography.x509.oid import NameOID
 from pydantic import ValidationError
 
 from heimdall.vault.app import VaultSettings, create_app, run_server
+from heimdall.vault.client import VaultClient
 from heimdall.vault.crypto import generate_encryption_key
 
 _LOOPBACK = "127.0.0.1"
@@ -129,6 +130,15 @@ class VaultTlsTransportTests(unittest.TestCase):
             response = client.get("/api/v1/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_vault_client_loads_internal_ca_without_symlink(self) -> None:
+        """Le client Heimdall charge le CA interne via un contexte SSL vérifié."""
+        with VaultClient(
+            f"https://{_LOOPBACK}:{self.port}",
+            "synthetic_tls_client_api_key",
+            ca_cert=self.certfile,
+        ) as client:
+            self.assertEqual(client.health()["status"], "ok")
 
     def test_untrusted_client_is_rejected_without_fallback(self) -> None:
         """Sans confiance explicite, la connexion est rompue : aucun repli non vérifié."""

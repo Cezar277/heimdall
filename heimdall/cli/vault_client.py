@@ -29,6 +29,7 @@ import typer
 
 from heimdall.vault.atomic import (
     backup_file,
+    format_env_value,
     is_git_ignored,
     is_git_tracked,
     parse_env_file,
@@ -57,10 +58,14 @@ _DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
     "DYLD_",
     "PYTHON",
     "NODE_",
+    "NPM_",
+    "YARN_",
+    "PNPM_",
     "RUBY",
     "PERL",
     "GIT_",
-    "BASH_FUNC",
+    "BASH_",
+    "PROMPT_",
     "SYSTEMD_",
     "JAVA_",
     "JDK_",
@@ -72,22 +77,72 @@ _DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
     "DOCKER_",
     "AWS_",
     "TF_",
+    "KUBE_",
+    "HELM_",
     "XDG_",
+    "CARGO_",
+    "RUSTUP_",
+    "RUSTC_",
+    "OPENSSL_",
+    "MALLOC_",
 )
 _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "PATH",
     "SHELL",
     "IFS",
     "BASH_ENV",
+    "BASHOPTS",
+    "SHELLOPTS",
     "ENV",
+    "PS0",
+    "PS1",
+    "PS2",
+    "PS3",
+    "PS4",
+    "PROMPT_COMMAND",
+    "ZDOTDIR",
     "GLIBC_TUNABLES",
+    "GCONV_PATH",
+    "LOCPATH",
+    "NLSPATH",
+    "HOSTALIASES",
     "CORE_PAGER",
     "PAGER",
+    "MANPAGER",
+    "LESSOPEN",
+    "LESSCLOSE",
     "EDITOR",
     "VISUAL",
+    "SUDO_ASKPASS",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "SSH_AUTH_SOCK",
+    "SSH_ORIGINAL_COMMAND",
     "KUBECONFIG",
+    "GOBIN",
+    "GOCACHE",
+    "GOFLAGS",
+    "GOMODCACHE",
+    "GOPATH",
+    "GOROOT",
+    "GOTOOLCHAIN",
+    "CC",
+    "CXX",
+    "CPP",
+    "CFLAGS",
+    "CPPFLAGS",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "MAKEFLAGS",
+    "MFLAGS",
     "HOME",
     "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
 })
 
 _MAX_ERROR_MSG_LEN: Final[int] = 150
@@ -270,6 +325,15 @@ def _push_single_secret(  # noqa: PLR0913, PLR0917
             msg += f" Veuillez attendre {exc.retry_after} secondes (Retry-After)."
         typer.echo(msg, err=True)
         raise typer.Exit(code=1) from None
+    except ValueError:
+        # Validation locale du client (valeur vide ou > 65536 caractères).
+        # Le message est statique : la valeur n'est jamais reflétée.
+        typer.echo(
+            f"Erreur : valeur invalide pour le secret '{name}' "
+            "(1-65536 caractères requis).",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
     except VaultClientError as exc:
         typer.echo(f"Erreur lors de l'envoi de '{name}' : {exc}", err=True)
         raise typer.Exit(code=1) from None
@@ -424,11 +488,15 @@ def vault_pull(  # noqa: PLR0913, PLR0917
             raise typer.Exit(code=1)
 
     if output.exists() and backup:
-        bak_file = backup_file(output)
+        try:
+            bak_file = backup_file(output)
+        except ValueError as exc:
+            typer.echo(f"Erreur de sécurité lors de la sauvegarde : {exc}", err=True)
+            raise typer.Exit(code=1) from None
         if bak_file:
             typer.echo(f"Sauvegarde du fichier existant vers {bak_file.name} (droits 0600).")
 
-    lines = [f"{key}={value}" for key, value in retrieved.items()]
+    lines = [f"{key}={format_env_value(value)}" for key, value in retrieved.items()]
     content = "\n".join(lines) + "\n"
     try:
         write_file_atomic(output, content, mode=0o600)
@@ -484,6 +552,14 @@ def vault_run(  # noqa: PLR0913, PLR0917
 ) -> None:
     """Lance une commande avec les secrets injectés en mémoire (ticket #101).
 
+    Allowlist locale : seuls les noms explicitement fournis par ``--name``, le
+    ``.env.example`` ou le ``.env`` local sont demandés au Vault. Le nom renvoyé
+    par la réponse du Vault n'est jamais utilisé comme nom de variable ; un
+    Vault compromis ne peut donc pas introduire une variable arbitraire, il ne
+    peut que fournir la valeur d'un nom déjà autorisé localement. Une denylist
+    de variables d'exécution système (PATH, LD_*, BASH_*, prompt, runtimes,
+    outils de build, etc.) reste appliquée en défense en profondeur.
+
     Limite de sécurité : les secrets sont injectés dans l'environnement du sous-processus
     sans écriture sur disque. Néanmoins, sous Linux, les variables d'un processus sont
     visibles pour le même UID via /proc/<pid>/environ.
@@ -505,7 +581,9 @@ def vault_run(  # noqa: PLR0913, PLR0917
         with client:
             injected_secrets = _pull_secrets_from_vault(client, proj, env, target_names)
 
-    # Garde anti-détournement : interdiction d'injecter des variables système sensibles
+    # Allowlist locale : `injected_secrets` est indexé par les noms demandés
+    # localement (jamais par `record["name"]` renvoyé par le Vault).
+    # Garde anti-détournement : interdiction d'injecter des variables système sensibles.
     for secret_name in injected_secrets:
         if is_dangerous_env_var(secret_name):
             typer.echo(

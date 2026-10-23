@@ -10,6 +10,7 @@ ni argon2.
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -18,6 +19,115 @@ from pathlib import Path
 from typing import Final
 
 _DEFAULT_SECURE_MODE: Final[int] = 0o600
+_MIN_QUOTED_LEN: Final[int] = 2
+
+
+def _write_file_atomic_dir_fd(
+    parent_fd: int,
+    target_name: str,
+    data: bytes,
+    mode: int,
+) -> None:
+    """Écrit et remplace un fichier exclusivement via le descripteur du parent.
+
+    Aucun chemin n'est ré-résolu après l'ouverture du répertoire : la création
+    du temporaire et le remplacement utilisent ``dir_fd`` (équivalent
+    ``openat``/``renameat``). Un échange du répertoire parent contre un lien
+    symbolique après l'ouverture ne peut donc pas détourner l'écriture.
+    """
+    temp_name = f".{target_name}.tmp.{secrets.token_hex(16)}"
+    temp_fd = -1
+    replaced = False
+    try:
+        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            create_flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            create_flags |= os.O_CLOEXEC
+
+        temp_fd = os.open(temp_name, create_flags, mode, dir_fd=parent_fd)
+        if os.name == "posix":
+            os.fchmod(temp_fd, mode)
+        with os.fdopen(temp_fd, "wb") as f:
+            temp_fd = -1  # Géré désormais par f
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Vérification de la cible sans suivre un éventuel lien symbolique,
+        # relativement au répertoire déjà ouvert.
+        try:
+            target_stat = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(target_stat.st_mode):
+                raise ValueError(
+                    f"Écriture refusée : la cible '{target_name}' est un lien symbolique."
+                )
+
+        os.replace(
+            temp_name,
+            target_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        replaced = True
+
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            pass
+    finally:
+        if temp_fd >= 0:
+            try:
+                os.close(temp_fd)
+            except OSError:  # noqa: S110
+                pass
+        if not replaced:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except OSError:  # noqa: S110
+                pass
+
+
+def _write_file_atomic_fallback(
+    parent: Path,
+    path: Path,
+    data: bytes,
+    mode: int,
+) -> None:
+    """Repli portable pour les plateformes sans ``dir_fd`` (Windows)."""
+    prefix = f".{path.name}.tmp."
+    temp_fd, temp_path_str = tempfile.mkstemp(prefix=prefix, dir=parent)
+    temp_path = Path(temp_path_str)
+    try:
+        if os.name == "posix":
+            os.fchmod(temp_fd, mode)
+        with os.fdopen(temp_fd, "wb") as f:
+            temp_fd = -1  # Géré désormais par f
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if os.path.islink(path):
+            raise ValueError(f"Écriture refusée : la cible '{path}' est un lien symbolique.")
+        os.replace(temp_path, path)
+        if os.name == "posix":
+            os.chmod(path, mode)
+    except Exception:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:  # noqa: S110
+                pass
+        raise
+    finally:
+        if temp_fd >= 0:
+            try:
+                os.close(temp_fd)
+            except OSError:  # noqa: S110
+                pass
 
 
 def write_file_atomic(  # noqa: PLR0912, PLR0915
@@ -28,7 +138,10 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
     """Écrit un fichier de manière atomique avec fsync et permissions strictes.
 
     Refuse strictement les liens symboliques (cible ou répertoire parent)
-    afin de prévenir tout écrasement ou détournement de cible.
+    afin de prévenir tout écrasement ou détournement de cible. Sur POSIX,
+    toutes les opérations après l'ouverture du parent passent par son
+    descripteur (``dir_fd``), ce qui neutralise une course sur le chemin du
+    répertoire parent.
     """
     # Vérification anti-symlink sur la cible et toute l'arborescence parente
     if os.path.islink(path):
@@ -58,49 +171,59 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
         raise ValueError(f"Impossible d'ouvrir le répertoire parent : {exc}") from exc
 
     data = content.encode("utf-8") if isinstance(content, str) else content
-    prefix = f".{path.name}.tmp."
-
-    temp_fd, temp_path_str = tempfile.mkstemp(prefix=prefix, dir=parent)
-    temp_path = Path(temp_path_str)
 
     try:
         if os.name == "posix":
-            os.fchmod(temp_fd, mode)
-        with os.fdopen(temp_fd, "wb") as f:
-            temp_fd = -1  # Géré désormais par f
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-
-        if os.path.islink(path):
-            raise ValueError(f"Écriture refusée : la cible '{path}' est un lien symbolique.")
-
-        os.replace(temp_path, path)
-
-        if os.name == "posix":
-            os.chmod(path, mode)
-
-        try:
-            os.fsync(parent_fd)
-        except OSError:
-            pass
-    except Exception:
-        if temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:  # noqa: S110
-                pass
-        raise
+            _write_file_atomic_dir_fd(parent_fd, path.name, data, mode)
+        else:  # pragma: no cover - dépend de la plateforme
+            _write_file_atomic_fallback(parent, path, data, mode)
     finally:
-        if temp_fd >= 0:
-            try:
-                os.close(temp_fd)
-            except OSError:  # noqa: S110
-                pass
         try:
             os.close(parent_fd)
         except OSError:  # noqa: S110
             pass
+
+
+def format_env_value(value: str) -> str:
+    """Encode une valeur ``.env`` entre guillemets doubles, sans expansion shell.
+
+    Les caractères significatifs pour le shell (``\\``, ``"``, ``$`` et
+    backtick) sont échappés. ``parse_env_file`` applique l'encodage inverse,
+    ce qui garantit un aller-retour fidèle sans exécution si le fichier est
+    sourcé.
+    """
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("`", "\\`")
+    )
+    return f'"{escaped}"'
+
+
+def _decode_env_value(raw_value: str) -> str:
+    """Décode une valeur ``.env`` produite par ``format_env_value``."""
+    value = raw_value.strip()
+    if len(value) >= _MIN_QUOTED_LEN and value.startswith('"') and value.endswith('"'):
+        inner = value[1:-1]
+        decoded: list[str] = []
+        index = 0
+        while index < len(inner):
+            char = inner[index]
+            if (
+                char == "\\"
+                and index + 1 < len(inner)
+                and inner[index + 1] in ('\\', '"', "$", "`")
+            ):
+                decoded.append(inner[index + 1])
+                index += 2
+                continue
+            decoded.append(char)
+            index += 1
+        return "".join(decoded)
+    if len(value) >= _MIN_QUOTED_LEN and value.startswith("'") and value.endswith("'"):
+        return value[1:-1]
+    return value
 
 
 def backup_file(path: Path) -> Path | None:
@@ -197,11 +320,7 @@ def parse_env_file(path: Path) -> dict[str, str] | None:
             continue
         key, _, val = line.partition("=")
         key = key.strip()
-        val = val.strip()
-        if (val.startswith('"') and val.endswith('"')) or (
-            val.startswith("'") and val.endswith("'")
-        ):
-            val = val[1:-1]
+        val = _decode_env_value(val)
         if key:
             secrets[key] = val
     return secrets
@@ -320,6 +439,7 @@ def check_file_mode_600(path: Path) -> bool:
 __all__ = [
     "backup_file",
     "check_file_mode_600",
+    "format_env_value",
     "is_git_ignored",
     "is_git_tracked",
     "parse_env_file",

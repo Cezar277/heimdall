@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 from typer.testing import CliRunner
 
 from heimdall.cli.main import app
-from heimdall.vault.atomic import check_file_mode_600
+from heimdall.vault.atomic import check_file_mode_600, parse_env_file
 from heimdall.vault.client import (
     VaultAuthError,
     VaultClientError,
@@ -233,6 +233,42 @@ class VaultPushCliTests(unittest.TestCase):
                 self.assertIn("429", result.output)
                 self.assertIn("30 secondes", result.output)
 
+    def test_push_empty_or_oversized_value_exits_2_without_traceback(self) -> None:
+        """Une valeur vide ou > 65536 sort proprement en 2 (invariant 11)."""
+        canary_value = "a" * 70000
+        cases = [
+            ("EMPTY_VALUE=", "EMPTY_VALUE"),
+            (f"BIG_VALUE={canary_value}", "BIG_VALUE"),
+        ]
+        for line, secret_name in cases:
+            with self.subTest(secret_name=secret_name):
+                env_file = self.tmp_dir / f"{secret_name}.env"
+                env_file.write_text(f"{line}\n", encoding="utf-8")
+
+                with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+                    with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                        client_instance = MagicMock()
+                        client_instance.__enter__.return_value = client_instance
+                        client_instance.create_secret.side_effect = ValueError(
+                            "Valeur de secret invalide (1-65536 caractères requis)"
+                        )
+                        mock_init.return_value = client_instance
+
+                        result = self.runner.invoke(
+                            app,
+                            [
+                                "vault",
+                                "push",
+                                "--file",
+                                str(env_file),
+                                "--project",
+                                "demo",
+                            ],
+                        )
+                        self.assertEqual(result.exit_code, 2)
+                        self.assertIn("valeur invalide", result.output)
+                        self.assertNotIn(canary_value, result.output)
+
 
 class VaultPullCliTests(unittest.TestCase):
     """Tests de la commande `heimdall vault pull` (ticket #100)."""
@@ -282,8 +318,10 @@ class VaultPullCliTests(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0)
                 self.assertTrue(output_file.is_file())
                 self.assertTrue(check_file_mode_600(output_file))
-                content = output_file.read_text(encoding="utf-8")
-                self.assertIn("DATABASE_PASSWORD=db_secret_pass", content)
+                self.assertEqual(
+                    parse_env_file(output_file),
+                    {"DATABASE_PASSWORD": "db_secret_pass"},
+                )
                 self.assertNotIn("db_secret_pass", result.output)
 
     def test_pull_creates_backup_when_env_already_exists(self) -> None:
@@ -431,6 +469,86 @@ class VaultPullCliTests(unittest.TestCase):
                 self.assertIn("lien symbolique", result.output)
                 self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM_DATA\n")
 
+    def test_pull_symlink_with_backup_enabled_exits_1_without_traceback(self) -> None:
+        """Une sauvegarde refusée (symlink) sort en 1 propre, sans traceback."""
+        victim = self.tmp_dir / "victim.txt"
+        victim.write_text("VICTIM_DATA\n", encoding="utf-8")
+        symlink_out = self.tmp_dir / ".env"
+        try:
+            os.symlink(victim, symlink_out)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "SAFE_VAR",
+                    "status": "actif",
+                    "value": "safe_val",
+                }
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "SAFE_VAR",
+                        "--output",
+                        str(symlink_out),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("Erreur de sécurité lors de la sauvegarde", result.output)
+                self.assertNotIn("Traceback", result.output)
+                self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM_DATA\n")
+
+    def test_pull_quotes_values_for_safe_round_trip(self) -> None:
+        """Les valeurs spéciales sont citées et relues à l'identique par parse_env_file."""
+        value = 'a"b #c $HOME `touch /tmp/pwned` \\ end='
+        output_file = self.tmp_dir / ".env"
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "SPECIAL_VALUE",
+                    "status": "actif",
+                    "value": value,
+                }
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "SPECIAL_VALUE",
+                        "--output",
+                        str(output_file),
+                        "--no-backup",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(parse_env_file(output_file), {"SPECIAL_VALUE": value})
+                content = output_file.read_text(encoding="utf-8")
+                self.assertIn('\\$HOME', content)
+                self.assertIn('\\`touch /tmp/pwned\\`', content)
+                self.assertNotIn('="$HOME"', content)
+
     def test_pull_rejects_glibc_tunables_and_git_ssh_command(self) -> None:
         """Refus strict de pull des variables système sensibles (Looney Tunables, Git hijack)."""
         dangerous = ["GLIBC_TUNABLES", "GIT_SSH_COMMAND"]
@@ -527,7 +645,10 @@ class VaultPullCliTests(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(result.exit_code, 0)
-                self.assertIn("FROM_EXISTING=pulled_val", output_file.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    parse_env_file(output_file),
+                    {"FROM_EXISTING": "pulled_val"},
+                )
 
     def test_pull_warns_when_env_tracked_by_git(self) -> None:
         """Avertissement sur stderr si le .env généré est suivi par Git."""
@@ -801,6 +922,93 @@ class VaultRunCliTests(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(result.exit_code, 42)
+
+    def test_run_rejects_prompt_shell_and_runtime_state_variables(self) -> None:
+        """Refus des familles PS4/PROMPT/BASH_*/NPM_*/CARGO_*/GO*/SSH_* (défense en profondeur)."""
+        dangerous_names = [
+            "PS4",
+            "PROMPT_COMMAND",
+            "BASHOPTS",
+            "SHELLOPTS",
+            "ZDOTDIR",
+            "LESSOPEN",
+            "NPM_CONFIG_REGISTRY",
+            "CARGO_HOME",
+            "GOPATH",
+            "SSH_AUTH_SOCK",
+        ]
+        for var_name in dangerous_names:
+            with self.subTest(var_name=var_name):
+                with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+                    with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                        client_instance = MagicMock()
+                        client_instance.__enter__.return_value = client_instance
+                        client_instance.get_secret.return_value = {
+                            "project": "demo",
+                            "env": "dev",
+                            "name": var_name,
+                            "status": "actif",
+                            "value": "/opt/evil",
+                        }
+                        mock_init.return_value = client_instance
+
+                        result = self.runner.invoke(
+                            app,
+                            [
+                                "run",
+                                "--project",
+                                "demo",
+                                "--name",
+                                var_name,
+                                "--",
+                                "echo",
+                                "test",
+                            ],
+                        )
+                        self.assertEqual(result.exit_code, 1)
+                        self.assertTrue(
+                            "variable système" in result.output
+                            or "injection refusée" in result.output
+                        )
+
+    def test_run_never_uses_vault_response_name_as_env_var(self) -> None:
+        """Allowlist locale : un nom renvoyé par le Vault ne devient jamais une variable."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                # Le Vault (compromis) prétend répondre pour PS4 alors que le
+                # nom demandé localement est SAFE_VAR.
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "PS4",
+                    "status": "actif",
+                    "value": "evil_prompt",
+                }
+                mock_init.return_value = client_instance
+
+                py_code = (
+                    "import os, sys\n"
+                    "ok = os.environ.get('SAFE_VAR') == 'evil_prompt'\n"
+                    "ok = ok and 'PS4' not in os.environ\n"
+                    "sys.exit(0 if ok else 1)\n"
+                )
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "run",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "SAFE_VAR",
+                        "--",
+                        "python",
+                        "-c",
+                        py_code,
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0)
 
 
 if __name__ == "__main__":
