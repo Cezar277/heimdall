@@ -1055,6 +1055,21 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         with self.assertRaises(VaultClientError):
             _read_and_check_key_file(inter / "vault.key")
 
+    def test_check_file_mode_600_refuses_symlink(self) -> None:
+        """`check_file_mode_600` ne suit jamais les liens (oracle fail-closed)."""
+        if os.name != "posix":
+            self.skipTest("POSIX requis")
+        victim = self.tmp_dir / "victim.env"
+        victim.write_text("X=1\n", encoding="utf-8")
+        os.chmod(victim, 0o600)
+        self.assertTrue(check_file_mode_600(victim))
+        link = self.tmp_dir / "link.env"
+        try:
+            os.symlink(victim, link)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        self.assertFalse(check_file_mode_600(link))
+
     def test_default_vault_url_avoids_dns_and_rebinding_is_documented(self) -> None:
         """Non-régression : défaut `127.0.0.1` (aucune résolution) + risque documenté."""
         with patch.dict(os.environ, {}, clear=False):

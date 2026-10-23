@@ -718,11 +718,18 @@ def is_git_ignored(path: Path) -> bool:
 
 
 def check_file_mode_600(path: Path) -> bool:
-    """Vérifie si un fichier a les permissions 0600 (POSIX)."""
+    """Vérifie si un fichier a les permissions 0600 (POSIX).
+
+    Ne suit jamais les liens symboliques : un symlink retourne ``False``
+    (oracle fail-closed, comme le reste du module qui utilise
+    ``lstat``/``O_NOFOLLOW``/``fstat``).
+    """
     if os.name != "posix":
         return True
     try:
-        st = path.stat()
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            return False
         mode = stat.S_IMODE(st.st_mode)
         return (mode & 0o077) == 0
     except OSError:

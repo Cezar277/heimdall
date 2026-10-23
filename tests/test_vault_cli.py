@@ -507,6 +507,87 @@ class VaultPullCliTests(unittest.TestCase):
                     self.assertIn("introuvable", result.output)
                     mock_run.assert_not_called()
 
+    def test_push_invalid_requested_name_exits_1_without_sending(self) -> None:
+        """`--name` invalide → Exit(1) avant tout envoi, même si un nom valide existe."""
+        src_env = self.tmp_dir / "source.env"
+        src_env.write_text("VALIDE_KEY=val\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "push",
+                        "--file",
+                        str(src_env),
+                        "--project",
+                        "demo",
+                        "--env",
+                        "dev",
+                        "--name",
+                        "VALIDE_KEY",
+                        "--name",
+                        "invalide-minuscule",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("invalide", result.output)
+                mock_init.assert_not_called()
+
+    def test_pull_invalid_requested_name_exits_1_without_file(self) -> None:
+        """`--name` invalide → Exit(1), aucun .env écrit."""
+        output_file = self.tmp_dir / ".env"
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--env",
+                        "dev",
+                        "--name",
+                        "VALIDE_KEY",
+                        "--name",
+                        "invalide-minuscule",
+                        "--output",
+                        str(output_file),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn("invalide", result.output)
+                self.assertFalse(output_file.exists())
+                mock_init.assert_not_called()
+
+    def test_run_invalid_requested_name_exits_1_without_executing_child(self) -> None:
+        """`--name` invalide → Exit(1), l'enfant n'est jamais exécuté."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                with patch("heimdall.cli.vault_client.subprocess.run") as mock_run:
+                    result = self.runner.invoke(
+                        app,
+                        [
+                            "run",
+                            "--project",
+                            "demo",
+                            "--name",
+                            "VALIDE_VAR",
+                            "--name",
+                            "invalide-minuscule",
+                            "--",
+                            "echo",
+                            "test",
+                        ],
+                    )
+                    self.assertEqual(result.exit_code, 1)
+                    self.assertIn("invalide", result.output)
+                    mock_run.assert_not_called()
+                    mock_init.assert_not_called()
+
     def test_pull_rejects_newline_in_secret_value(self) -> None:
         """Refus strict d'écrire un secret contenant un saut de ligne dans .env (§HIGH 2)."""
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):

@@ -258,6 +258,27 @@ def _validate_project_and_env(project: str | None, env: str) -> str:
     return proj
 
 
+def _validate_requested_names(names: list[str] | None) -> None:
+    """Refus franc des noms ``--name`` de format invalide (même sévérité que 404).
+
+    Un nom explicitement demandé qui ne respecte pas
+    ``^[A-Z][A-Z0-9_]{1,63}$`` sort en ``Exit(1)`` avant toute E/S : jamais
+    de succès partiel où l'utilisateur croirait l'ensemble demandé traité.
+    Les noms découverts via fichiers restent tolérés avec avertissement
+    (voir ``_filter_secrets`` et ``_pull_secrets_from_vault``).
+    """
+    if not names:
+        return
+    for name in names:
+        if not _SECRET_NAME_PATTERN.match(name):
+            typer.echo(
+                f"Erreur : nom de secret invalide demandé : {name[:32]!r} "
+                "(format requis : ^[A-Z][A-Z0-9_]{1,63}$).",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+
 def _read_input_secrets(input_file: Path) -> dict[str, str]:
     """Lit les secrets locaux depuis un fichier d'entrée.
 
@@ -290,7 +311,12 @@ def _filter_secrets(
     secrets: dict[str, str],
     names: list[str] | None,
 ) -> dict[str, str]:
-    """Filtre les secrets par nom et valide leur forme contractuelle."""
+    """Filtre les secrets par nom et valide leur forme contractuelle.
+
+    Les noms ``--name`` invalides sont déjà refusés en ``Exit(1)`` par
+    ``_validate_requested_names`` ; l'avertissement + saut ci-dessous ne
+    couvre que les clés découvertes via fichier (tolérance documentée).
+    """
     target_names = set(names) if names else set(secrets.keys())
     filtered: dict[str, str] = {}
     for key, value in secrets.items():
@@ -368,9 +394,12 @@ def vault_push(  # noqa: PLR0913, PLR0917
     Ne divulgue JAMAIS les valeurs secrètes dans la sortie terminal ou les erreurs.
 
     Codes de sortie : 0 si le fichier est vide sans filtre explicite, 2 si un
-    ``--name`` fourni ne correspond à aucun secret (aucun envoi silencieux).
+    ``--name`` fourni ne correspond à aucun secret (aucun envoi silencieux),
+    1 si un ``--name`` fourni est de format invalide (refus franc, même
+    sévérité que 404).
     """
     proj = _validate_project_and_env(project, env)
+    _validate_requested_names(names)
     all_secrets = _read_input_secrets(file)
 
     if not all_secrets:
@@ -458,7 +487,10 @@ def _pull_secrets_from_vault(
     Échec franc (``Exit(1)``) dès qu'un secret demandé est introuvable
     (404) : jamais de ``.env`` partiel ni d'injection partielle. Un nom
     manquant (faute de frappe, secret révoqué) sort en erreur au lieu de
-    laisser croire à une configuration complète (invariant 11).
+    laisser croire à une configuration complète (invariant 11). Les noms
+    ``--name`` de format invalide sont déjà refusés par
+    ``_validate_requested_names`` ; l'avertissement + saut sur format
+    invalide ci-dessous ne couvre que les noms découverts via fichiers.
     """
     retrieved: dict[str, str] = {}
     for name in target_names:
@@ -535,6 +567,7 @@ def vault_pull(  # noqa: PLR0913, PLR0917
 ) -> None:
     """Récupère les secrets du Vault et écrit le fichier .env en droits 0600 (ticket #100)."""
     proj = _validate_project_and_env(project, env)
+    _validate_requested_names(names)
     target_names = _resolve_pull_names(names, example_file, output)
 
     client = _init_client(vault_url, ca_cert)
@@ -681,6 +714,7 @@ def vault_run(  # noqa: PLR0913, PLR0917
         raise typer.Exit(code=127)
 
     proj = _validate_project_and_env(project, env)
+    _validate_requested_names(names)
     target_names = _resolve_run_names(names, example_file)
 
     client = _init_client(vault_url, ca_cert)
