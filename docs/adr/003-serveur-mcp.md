@@ -109,9 +109,10 @@ dormant. Refus fail-closed (`INTERNAL`) avant tout usage : le binaire
 n'est jamais exécuté. Preuve :
 `tests/test_mcp_units.py::GitAccessDirectTests`
 (`test_git_binary_under_the_root_is_refused_never_executed`).
-L'environnement est **reconstruit** (`PATH` vide, `HOME` =
-racine, `GIT_CONFIG_*` neutralisées) : `GIT_DIR`/`GIT_INDEX_FILE` hérités
-ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
+L'environnement est **reconstruit** (`PATH` vide, `HOME` = `os.devnull`
+— jamais la racine : git n'y lirait pas `~/.config/git/ignore`, que le dépôt
+pourrait fournir lui-même —, `GIT_CONFIG_*` neutralisées) : `GIT_DIR` et
+`GIT_INDEX_FILE` hérités ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
 --no-textconv` rendent inopérants `diff.external` et les filtres `textconv`
 (exécution de commande pilotée par le contenu scanné, interdit I5).
 Chaque appel passe aussi **`stdin=subprocess.DEVNULL`** : sans lui le

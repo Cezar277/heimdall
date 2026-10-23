@@ -1008,6 +1008,74 @@ def test_scan_tree_root_replaced_same_path_exits_two(
     assert "scan impossible" in resultat.stderr
 
 
+def test_scan_tree_recycled_inode_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un dossier neuf qui réobtient (dev, ino) -> 2.
+
+    `rm -rf` puis `mkdir` peut réattribuer le même inode (ext4) : sans ctime,
+    le re-contrôle croirait au même dossier. Simulé par `os.stat` : même
+    (dev, ino) pour la racine, ctime postérieur (celui du dossier neuf).
+    """
+    git_repo.write("app.py", "x = 1\n")
+    racine = git_repo.root.resolve()
+    stat_reel = os.stat
+    recyclage = [False]
+
+    def stat_recycle(path: object, *args: object, **options: object) -> object:
+        resultat = stat_reel(path, *args, **options)
+        if recyclage[0] and Path(str(path)) == racine:
+            return SimpleNamespace(
+                st_dev=resultat.st_dev,
+                st_ino=resultat.st_ino,
+                st_ctime_ns=resultat.st_ctime_ns + 1,
+            )
+        return resultat
+
+    original_scan = TreeScanner.scan
+
+    def scan_puis_recycle(self: TreeScanner, **options: object) -> list[object]:
+        trouvailles = original_scan(self, **options)
+        recyclage[0] = True
+        return trouvailles
+
+    monkeypatch.setattr(TreeScanner, "scan", scan_puis_recycle)
+    monkeypatch.setattr(os, "stat", stat_recycle)
+    resultat = _run("scan", str(git_repo.root))
+    assert recyclage[0]
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
+def _instantane(racine: Path) -> dict[str, bytes | None]:
+    """Chemins et contenus sous `racine` (répertoires à `None`), `.git` compris."""
+    return {
+        chemin.relative_to(racine).as_posix(): (chemin.read_bytes() if chemin.is_file() else None)
+        for chemin in sorted(racine.rglob("*"))
+    }
+
+
+@pytest.mark.parametrize("arguments", [[], ["--staged"]], ids=["arbre", "index"])
+def test_scan_never_reads_or_writes_a_hostile_repository_config(
+    git_repo: GitRepo, arguments: list[str]
+) -> None:
+    """Revue (LOW) : `.config/git/` piégé dans le dépôt n'influe pas le scan.
+
+    Le dépôt tente de se masquer (`ignore`) et de fausser le diff (`-diff`).
+    Le scan ne crée ni ne modifie rien dans la racine (instantané identique,
+    `.git` compris), et le secret reste signalé : verdict 1.
+    """
+    git_repo.write("secret.txt", f'KEY = "{FAKE_AWS_KEY}"\n')
+    git_repo.write(".config/git/ignore", "secret.txt\n")
+    git_repo.write(".config/git/attributes", "* -diff\n")
+    git_repo.stage("secret.txt")
+    avant = _instantane(git_repo.root)
+    resultat = _run("scan", *arguments, str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert "secret.txt:1" in resultat.stdout
+    assert _instantane(git_repo.root) == avant
+
+
 def test_verify_root_unchanged_refuses_divergent_resolution(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:

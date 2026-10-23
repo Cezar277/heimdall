@@ -85,11 +85,17 @@ séparateur `--` est accepté par le git de CI et figé par un test e2e
 La **racine elle-même est re-contrôlée** après l'analyse, dans les deux
 périmètres : la garde unique (refus symlink, égalité du résolu) est rejouée
 sur le chemin demandé et comparée à la forme figée à l'entrée — chemin
-résolu **et** identité (`st_dev`, `st_ino` épinglés à la construction). Un
-lien remplacé pendant le scan, comme un dossier remplacé par un autre au
-même chemin (même résolu, autre identité), refuse le verdict au lieu de
-juger le mauvais périmètre. Le scanner d'arbre rejoue sa garde sur la forme
-canonique déjà figée (opération idempotente) ; ce second passage n'ouvre pas
+résolu **et** identité (`st_dev`, `st_ino`, `st_ctime_ns` épinglés à la
+construction). Un lien remplacé pendant le scan, comme un dossier remplacé
+par un autre au même chemin (même résolu, autre identité), refuse le verdict
+au lieu de juger le mauvais périmètre. Le `ctime` est nécessaire : un
+`rm -rf` suivi d'un `mkdir` peut réattribuer le même inode, mais le dossier
+neuf a un `ctime` postérieur, qu'un `utime` ne peut pas forger. Revers
+assumé sous POSIX : ajouter ou supprimer une entrée **directe** de la racine
+pendant le scan refuse le verdict (code 2, fail-closed) ; sous Windows, le
+`ctime` est la date de création et ce revers n'existe pas. Le scanner d'arbre
+rejoue sa garde sur la forme canonique déjà figée (opération idempotente) ; ce
+second passage n'ouvre pas
 de bypass : toute substitution entre les deux est rattrapée par le
 re-contrôle d'identité final.
 
@@ -128,8 +134,8 @@ séquentiels, et 1 000 blobs représenteraient 2 000 processus. Au-delà de la
 deadline, refus (code 2), jamais un job CI qui s'éternise sans verdict. En
 `--staged`, le restant de deadline est propagé comme timeout à chaque appel
 git (borné au timeout unitaire de 30 s), y compris la seconde énumération de
-l'index ; un appel lent ne peut donc pas dépasser la deadline de plus que son
-timeout unitaire.
+l'index. La lecture de la sortie et l'attente de fin partagent ce délai : un
+appel git ne dépasse jamais le restant de deadline qui lui a été passé.
 
 Les bornes d'entrée ne suffisent pas : des blobs denses en candidats
 feraient gonfler la liste des Findings et le tri final en mémoire et en

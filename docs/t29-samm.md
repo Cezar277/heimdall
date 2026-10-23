@@ -250,8 +250,22 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
 | LOW — `scope` non typé, index direct dans `_SCOPE_LABELS` | `Scope = Literal["working-tree", "staged"]`, `ScanReport.scope: Scope`, `_SCOPE_LABELS: dict[Scope, str]` ; garde runtime `__post_init__` pour les appelants non typés (jamais de `KeyError` hors contrat) | `heimdall/cli/scan.py` (`Scope`, `ScanReport`), `tests/test_cli_scan.py::test_scan_report_refuses_an_unknown_scope` |
 | LOW — chemins non-UTF8 refusés en `--staged`, acceptés en arbre | `validate_relative_path` rejette explicitement la plage des surrogates (`0xD800..0xDFFF`) : `os.walk` et le parseur d'index convergent vers le même refus 2, documenté dans `docs/cli.md` | `heimdall/scanner/finding.py` (`validate_relative_path`), `docs/cli.md` ; `tests/test_cli_scan.py::test_scan_refuses_non_utf8_paths_in_both_scopes` |
 
+## Correctifs de la seizième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — réutilisation d'inode contourne le re-contrôle d'identité racine | `root_id` = (`st_dev`, `st_ino`, `st_ctime_ns`) : le ctime n'est pas forgeable par `utime` et distingue le dossier neuf d'un inode recyclé. Revers POSIX documenté (cf. Limites assumées) | `heimdall/mcp/gitdiff.py` (`GitAccess.__init__`, `root_id`), `heimdall/cli/scan.py` (`_verify_root_unchanged`) ; `tests/test_cli_scan.py::test_scan_tree_recycled_inode_exits_two` |
+| LOW — `_read_capped` peut dépasser la deadline (jusqu'à 2 ×) | lecture et attente partagent le même instant de référence : `wait` ne reçoit que `deadline - now`, le minuteur étant annulé avant `wait` | `heimdall/mcp/gitdiff.py` (`_read_capped`) ; `tests/test_mcp_units.py::GitAccessDirectTests::test_read_capped_never_outlives_its_deadline` (horloge simulée), `::test_execute_and_read_capped_propagate_the_remaining_timeout` |
+| LOW — `HOME` = racine : le dépôt scanné fournit son `~/.config/git/` | **vérifié par exécution** : avec `HOME` = racine, `check-ignore` ignorait `secret.txt` via `<racine>/.config/git/ignore` (rc=0) ; avec `HOME` = `os.devnull`, rc=1 et `rev-parse` fonctionne. Le dépôt ne peut plus se masquer | `heimdall/mcp/gitdiff.py` (`confined_environment`) ; `tests/test_mcp_units.py::GitAccessDirectTests::test_repository_cannot_supply_its_own_user_excludes`, `::ConfinedEnvironmentTests::test_minimal_and_redirection_free` ; `tests/test_cli_scan.py::test_scan_never_reads_or_writes_a_hostile_repository_config` |
+
 ## Limites assumées
 
+- Sous POSIX, ajouter ou supprimer une entrée **directe** de la racine pendant
+  un scan refuse le verdict (code 2) : l'identité racine épingle le `ctime`,
+  seul champ qu'un `utime` ne peut pas forger, pour détecter un dossier neuf
+  qui réobtient le même inode. Fail-closed, jamais un faux 0.
 - La validation humaine Y/N/E et le remplacement du secret ne sont pas dans ce
   ticket : `scan` signale, il ne répare pas (#32).
 - Les exclusions **techniques** restent (binaires, `node_modules/`, `.venv/`,

@@ -152,9 +152,10 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
     `access` fige la racine résolue ET son identité à l'entrée ; une
     reconstruction fraîche refait la garde unique (refus symlink compris).
     Toute différence — chemin résolu différent, identité (`st_dev`,
-    `st_ino`) différente — refuse le verdict : un dossier remplacé par un
-    autre au même chemin a le même résolu mais pas la même identité. Pur
-    `lstat`/`stat`, aucun `git`.
+    `st_ino`, `st_ctime_ns`) différente — refuse le verdict : un dossier
+    remplacé par un autre au même chemin a le même résolu mais pas la même
+    identité, même quand le système lui recycle l'inode. Pur `lstat`/`stat`,
+    aucun `git`.
     """
     try:
         current = GitAccess(root)
@@ -184,7 +185,7 @@ def _collect_tree(root: Path) -> ScanReport:
     # `access.root` est la forme **figée** (résolue, symlink refusé).
     # `TreeScanner` rejoue sa garde unique sur cette forme canonique
     # (idempotente) : une substitution entre les deux résolutions est
-    # refusée par `_verify_root_unchanged` (identité `st_dev`/`st_ino`).
+    # refusée par `_verify_root_unchanged` (identité `st_dev`/`st_ino`/`st_ctime_ns`).
     # On préfère ce second contrôle à un mode « racine déjà résolue » qui
     # contournerait la garde du scanner. La deadline est vérifiée dans la
     # boucle du scanner.

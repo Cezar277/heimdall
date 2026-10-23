@@ -8,8 +8,9 @@ verrouillé :
 - **environnement reconstruit de zéro**. ``GIT_DIR``, ``GIT_INDEX_FILE``,
   ``GIT_WORK_TREE``… hérités permettraient de rediriger le dépôt analysé
   sans toucher au code ; ils sont simplement absents de l'environnement
-  passé au sous-processus. Idem ``HOME`` et les configurations
-  système/global ;
+  passé au sous-processus. Idem les configurations système/global ;
+  ``HOME`` pointe vers ``os.devnull``, jamais vers la racine ni vers le ~
+  du développeur ;
 - **découverte plafonnée à la racine**. ``GIT_CEILING_DIRECTORIES`` vaut le
   parent de la racine : git n'y entre jamais, donc aucun dépôt au-dessus de
   la racine n'est découvert — le refus vient de git, pas seulement de
@@ -51,6 +52,7 @@ import re
 import shutil
 import subprocess  # nosec B404
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,7 +122,11 @@ STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
 def confined_environment(root: Path) -> dict[str, str]:
     return {
         "PATH": "",
-        "HOME": str(root),  # jamais le ~ du développeur (git y lit .gitconfig)
+        # Ni le ~ du développeur, ni la racine scannée : git y lit
+        # `~/.config/git/ignore` et `attributes`, donc le dépôt pouvait se
+        # masquer lui-même via son propre `.config/git/`. `os.devnull` n'est
+        # pas un répertoire : git n'y trouve rien, et n'y peut rien écrire.
+        "HOME": os.devnull,
         "LC_ALL": "C",  # messages et chemins stables, indépendants de la locale
         "LANG": "C",
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -260,18 +266,24 @@ class GitAccess:
             # pourrait refléter l'entrée, est remplacé par le statique.
             raise ToolFailure("INTERNAL") from None
         try:
-            # Identité du dossier (device + inode), suivie après refus des
-            # liens : un `lstat` aurait la même course que le `resolve`, mais
-            # `is_symlink` refuse un lien planté entre les deux, et tout
-            # remplacement (lien, autre dossier, suppression) change
-            # l'identité ou fait échouer le `stat` — le re-contrôle de fin
-            # de scan refuse alors le verdict (#29).
+            # Identité du dossier, suivie après refus des liens : un `lstat`
+            # aurait la même course que le `resolve`, mais `is_symlink` refuse
+            # un lien planté entre les deux, et tout remplacement (lien, autre
+            # dossier, suppression) change l'identité ou fait échouer le `stat`
+            # — le re-contrôle de fin de scan refuse alors le verdict (#29).
+            # Le ctime est indispensable : `rm -rf` puis `mkdir` peut
+            # réattribuer le même inode (ext4), mais le dossier neuf a un ctime
+            # postérieur, qu'`utime` ne peut pas forger (contrairement à mtime).
+            # Revers assumé (POSIX, où ctime = dernier changement de
+            # métadonnées) : ajouter ou supprimer une entrée directe de la
+            # racine pendant le scan refuse le verdict (code 2, fail-closed).
+            # Sous Windows, ctime = date de création : pas de revers.
             if self._root.is_symlink():
                 raise ToolFailure("INTERNAL")
             metadata = os.stat(self._root)
         except OSError:
             raise ToolFailure("INTERNAL") from None
-        self._root_id = (metadata.st_dev, metadata.st_ino)
+        self._root_id = (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns)
         # Jamais le PATH hérité : un PATH compromis (poste, CI, direnv)
         # détournerait le binaire exécuté à chaque outil. `os.defpath`
         # (`/bin:/usr/bin` sur POSIX) est le défaut système sûr, pas une
@@ -304,8 +316,8 @@ class GitAccess:
         return self._root
 
     @property
-    def root_id(self) -> tuple[int, int]:
-        """Identité du dossier racine (`st_dev`, `st_ino`) à la construction."""
+    def root_id(self) -> tuple[int, int, int]:
+        """Identité du dossier racine (`st_dev`, `st_ino`, `st_ctime_ns`) à la construction."""
         return self._root_id
 
     def execute(
@@ -489,7 +501,11 @@ class GitAccess:
 
         ``timeout`` est le délai **restant** d'une éventuelle deadline
         globale : par défaut le timeout unitaire de :data:`GIT_TIMEOUT_SECONDS`.
+        Lecture **et** attente se partagent ce délai : le minuteur est annulé
+        avant `wait`, qui ne reçoit donc que le restant (sinon un git qui
+        ferme stdout tard puis traîne durerait jusqu'à 2 × ``timeout``).
         """
+        deadline = time.monotonic() + timeout
         try:
             proc = subprocess.Popen(  # noqa: S603 # nosec B603
                 [self._git, *GIT_CONFIG_OVERRIDES, "-C", str(self._root), *arguments],
@@ -521,7 +537,7 @@ class GitAccess:
             raise ToolFailure("INTERNAL")
 
         try:
-            ret = proc.wait(timeout=timeout)
+            ret = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         except (subprocess.TimeoutExpired, OSError):
             _terminate_process(proc)
             raise ToolFailure("INTERNAL") from None

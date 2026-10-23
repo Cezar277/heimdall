@@ -343,7 +343,7 @@ class ConfinedEnvironmentTests(unittest.TestCase):
         for forbidden in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY"):
             self.assertNotIn(forbidden, env)
         self.assertEqual(env["PATH"], "")
-        self.assertEqual(env["HOME"], tmp)
+        self.assertEqual(env["HOME"], os.devnull)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         # Clone partiel : sans elle, `git cat-file` irait chercher l'objet
         # manquant sur le réseau — interdit (100 % local).
@@ -417,6 +417,41 @@ class RepositoryCeilingTests(unittest.TestCase):
         with self.assertRaises(ToolFailure) as ctx:
             access.is_ignored("nimporte.txt")
         self.assertEqual(ctx.exception.code, "INTERNAL")
+
+
+class _FakeClock:
+    """Horloge simulée : le temps ne passe que là où le faux git le dit."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _StuckGitProcess:
+    """Faux git : lit pendant `read_seconds`, ferme stdout, puis ne sort jamais."""
+
+    def __init__(self, clock: _FakeClock, read_seconds: float) -> None:
+        self._clock = clock
+        self._read_seconds = read_seconds
+        self.stdout = self
+
+    def read(self, _size: int) -> bytes:
+        self._clock.now += self._read_seconds
+        return b""
+
+    def close(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        if timeout is None:
+            return -9
+        self._clock.now += timeout
+        raise subprocess.TimeoutExpired(cmd="git", timeout=timeout)
 
 
 class GitAccessDirectTests(unittest.TestCase):
@@ -557,6 +592,17 @@ class GitAccessDirectTests(unittest.TestCase):
             with self.assertRaises(ToolFailure):
                 access.is_ignored("keep.txt")
 
+    def test_repository_cannot_supply_its_own_user_excludes(self) -> None:
+        """Revue (LOW) : `HOME` ne pointe plus dans le dépôt scanné.
+
+        Avec `HOME` = racine, git lisait `<racine>/.config/git/ignore` : un
+        dépôt se masquait ainsi lui-même à `check-ignore`. `HOME` pointe
+        désormais vers `os.devnull`, où rien de tel n'existe.
+        """
+        self.repo.write(".config/git/ignore", "secret.txt\n")
+        access = gitdiff.GitAccess(self.repo.root)
+        self.assertFalse(access.is_ignored("secret.txt"))
+
     def test_git_access_has_no_unbounded_run_method(self) -> None:
         """Méthode morte run() supprimée.
 
@@ -660,7 +706,30 @@ class GitAccessDirectTests(unittest.TestCase):
         timer_cls.assert_called_once_with(1.5, proc.kill)
         timer.start.assert_called_once()
         timer.cancel.assert_called_once()
-        proc.wait.assert_called_once_with(timeout=1.5)
+        # La lecture a été instantanée ici : `wait` reçoit le restant, au plus
+        # le délai. Le partage exact est prouvé par horloge simulée ci-dessous.
+        proc.wait.assert_called_once()
+        self.assertLessEqual(proc.wait.call_args.kwargs["timeout"], 1.5)
+
+    def test_read_capped_never_outlives_its_deadline(self) -> None:
+        """Revue (LOW) : lecture lente puis attente lente tiennent dans `timeout`.
+
+        Le git ferme stdout après 0,9 s puis ne sort jamais. Sans partage du
+        délai, `wait` repartait pour 1 s de plus : 1,9 s au total pour 1 s
+        annoncée (2 × en pire cas). Horloge simulée : déterministe.
+        """
+        clock = _FakeClock()
+        proc = _StuckGitProcess(clock, read_seconds=0.9)
+        access = gitdiff.GitAccess(self.repo.root)
+        with (
+            mock.patch.object(gitdiff, "time", clock),
+            mock.patch("subprocess.Popen", return_value=proc),
+            mock.patch.object(gitdiff.threading, "Timer"),
+        ):
+            with self.assertRaises(ToolFailure) as ctx:
+                access._read_capped(("rev-parse", "--show-toplevel"), 10, timeout=1.0)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+        self.assertLessEqual(clock.now, 1.0 + 1e-9)
 
     def test_staged_diff_truncation_flag(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
