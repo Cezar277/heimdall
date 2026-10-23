@@ -28,6 +28,7 @@ from typing import Final
 import typer
 
 from heimdall.vault.atomic import (
+    _get_git_toplevel,
     backup_file,
     format_env_value,
     is_git_ignored,
@@ -88,6 +89,15 @@ _DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
     # Shadowing credential/processus : un Vault compromis ne doit pas
     # écraser la credential du fils via `{**os.environ, **injected}`.
     "HEIMDALL_",
+    # Gestionnaires de runtimes/paquets (LOW) : redirection d'installations
+    # ou d'interpréteurs via l'enfant (BUN_/DENO_/UV_/PIP_/BUNDLE_/GEM_/CONDA_).
+    "BUN_",
+    "DENO_",
+    "UV_",
+    "PIP_",
+    "BUNDLE_",
+    "GEM_",
+    "CONDA_",
 )
 _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "PATH",
@@ -156,6 +166,11 @@ _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "GLOBIGNORE",
     "HISTFILE",
     "MAILCAPS",
+    # État du shell/environnement d'exécution (LOW) : chemins terminfo et
+    # cible venv — détournement des enfants via TERMINFO/TERMPATH/VIRTUAL_ENV.
+    "TERMINFO",
+    "TERMPATH",
+    "VIRTUAL_ENV",
 })
 
 _MAX_ERROR_MSG_LEN: Final[int] = 150
@@ -614,7 +629,17 @@ def vault_pull(  # noqa: PLR0913, PLR0917
             "pour éviter toute fuite.",
             err=True,
         )
-    elif not is_git_ignored(output):
+    elif is_git_ignored(output):
+        pass  # Ignoré avéré : rien à signaler.
+    elif _get_git_toplevel(output) is None:
+        typer.echo(
+            f"Avertissement : statut Git indéterminé pour '{output}' "
+            "(hors dépôt ou git indisponible) : impossible de vérifier "
+            "qu'il ne sera pas committé. Ajoutez-le à .gitignore et "
+            "vérifiez avec 'git status'.",
+            err=True,
+        )
+    else:
         typer.echo(
             f"Avertissement : Le fichier {output} n'est pas ignoré par Git. "
             f"Pensez à ajouter '{output}' dans .gitignore.",
@@ -690,7 +715,9 @@ def vault_run(  # noqa: PLR0913, PLR0917
     Vault compromis ne peut donc pas introduire une variable arbitraire, il ne
     peut que fournir la valeur d'un nom déjà autorisé localement. Une denylist
     de variables d'exécution système (PATH, LD_*, BASH_*, prompt, runtimes,
-    outils de build, HEIMDALL_*, CDPATH/GLOBIGNORE/HISTFILE/MAILCAPS, etc.)
+    outils de build, HEIMDALL_*, CDPATH/GLOBIGNORE/HISTFILE/MAILCAPS,
+    TERMINFO/TERMPATH/VIRTUAL_ENV, runtimes (BUN_/DENO_/UV_/PIP_/BUNDLE_/
+    GEM_/CONDA_), etc.)
     reste appliquée en défense en profondeur. Tout nom listé localement est
     une entrée de confiance : ne pas inscrire de variable de comportement
     shell dans ``--name``/``.env.example``/``.env``.

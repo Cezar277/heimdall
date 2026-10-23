@@ -926,21 +926,90 @@ class VaultPullCliTests(unittest.TestCase):
 
                 with patch("heimdall.cli.vault_client.is_git_tracked", return_value=False):
                     with patch("heimdall.cli.vault_client.is_git_ignored", return_value=False):
-                        result = self.runner.invoke(
-                            app,
-                            [
-                                "vault",
-                                "pull",
-                                "--project",
-                                "demo",
-                                "--name",
-                                "KEY",
-                                "--output",
-                                str(output_file),
-                            ],
-                        )
-                        self.assertEqual(result.exit_code, 0)
-                        self.assertIn("n'est pas ignoré", result.output)
+                        with patch(
+                            "heimdall.cli.vault_client._get_git_toplevel",
+                            return_value=self.tmp_dir,
+                        ):
+                            result = self.runner.invoke(
+                                app,
+                                [
+                                    "vault",
+                                    "pull",
+                                    "--project",
+                                    "demo",
+                                    "--name",
+                                    "KEY",
+                                    "--output",
+                                    str(output_file),
+                                ],
+                            )
+                            self.assertEqual(result.exit_code, 0)
+                            self.assertIn("n'est pas ignoré", result.output)
+
+    def test_pull_warns_indeterminate_git_status_outside_repo(self) -> None:
+        """Hors dépôt : statut « indéterminé » distinct, jamais de silence."""
+        output_file = self.tmp_dir / ".env"
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "KEY",
+                    "status": "vaulte",
+                    "value": "val",
+                }
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "KEY",
+                        "--output",
+                        str(output_file),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0)
+                self.assertIn("indéterminé", result.output)
+
+    def test_pull_warns_indeterminate_git_status_without_git_binary(self) -> None:
+        """Sans binaire git : statut « indéterminé », jamais de silence."""
+        output_file = self.tmp_dir / ".env"
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "KEY",
+                    "status": "vaulte",
+                    "value": "val",
+                }
+                mock_init.return_value = client_instance
+
+                with patch("heimdall.vault.atomic.shutil.which", return_value=None):
+                    result = self.runner.invoke(
+                        app,
+                        [
+                            "vault",
+                            "pull",
+                            "--project",
+                            "demo",
+                            "--name",
+                            "KEY",
+                            "--output",
+                            str(output_file),
+                        ],
+                    )
+                    self.assertEqual(result.exit_code, 0)
+                    self.assertIn("indéterminé", result.output)
 
 
 class VaultRunCliTests(unittest.TestCase):
@@ -1066,6 +1135,55 @@ class VaultRunCliTests(unittest.TestCase):
             "HEIMDALL_API_KEY_FILE",
             "HEIMDALL_PROJECT",
             "HEIMDALL_VAULT_URL",
+        ):
+            with self.subTest(var_name=var_name):
+                with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+                    with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                        client_instance = MagicMock()
+                        client_instance.__enter__.return_value = client_instance
+                        client_instance.get_secret.return_value = {
+                            "project": "demo",
+                            "env": "dev",
+                            "name": var_name,
+                            "status": "actif",
+                            "value": "attacker_controlled",
+                        }
+                        mock_init.return_value = client_instance
+
+                        result = self.runner.invoke(
+                            app,
+                            [
+                                "run",
+                                "--project",
+                                "demo",
+                                "--name",
+                                var_name,
+                                "--",
+                                "echo",
+                                "test",
+                            ],
+                        )
+                        self.assertEqual(result.exit_code, 1)
+                        self.assertTrue(
+                            "variable système" in result.output
+                            or "injection refusée" in result.output
+                        )
+
+    def test_run_rejects_runtime_manager_and_shell_state_vars(self) -> None:
+        """Runtimes/état shell refusés : BUN_/DENO_/UV_/PIP_/BUNDLE_/GEM_/CONDA_,
+        TERMINFO/TERMPATH/VIRTUAL_ENV (PYTHONHOME couvert par le préfixe PYTHON)."""
+        for var_name in (
+            "BUN_INSTALL",
+            "DENO_DIR",
+            "UV_PYTHON",
+            "PIP_INDEX_URL",
+            "BUNDLE_GEMFILE",
+            "GEM_HOME",
+            "CONDA_ENVS_PATH",
+            "TERMINFO",
+            "TERMPATH",
+            "VIRTUAL_ENV",
+            "PYTHONHOME",
         ):
             with self.subTest(var_name=var_name):
                 with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
