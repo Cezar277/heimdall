@@ -651,6 +651,61 @@ class GitAccessDirectTests(unittest.TestCase):
         with mock.patch.object(gitdiff.shutil, "which", return_value=str(sibling)):
             self.assertEqual(gitdiff.GitAccess(self.repo.root)._git, str(sibling))
 
+    def test_git_binary_resolve_failure_is_a_tool_failure(self) -> None:
+        """Revue (LOW) : `Path(binary).resolve()` qui lève -> ToolFailure("INTERNAL").
+
+        Boucle de liens ou composant illisible : `Path.resolve()` peut lever
+        (OSError, RuntimeError boucle, ValueError). GitAccess lève
+        ToolFailure("INTERNAL"), jamais une exception brute hors contrat.
+        """
+        binary = gitdiff.shutil.which("git", path=os.defpath)
+        if binary is None:
+            self.skipTest("git introuvable")
+        resolve_reel = _Path.resolve
+
+        def creer_resolve_piege(err: Exception) -> Any:
+            def resolve_piege(chemin: _Path, *args: Any, **options: Any) -> _Path:
+                if str(chemin) == binary:
+                    raise err
+                return resolve_reel(chemin, *args, **options)
+
+            return resolve_piege
+
+        for exc in (
+            OSError("composant inaccessible"),
+            RuntimeError("Symlink loop"),
+            ValueError("chemin invalide"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                with mock.patch.object(_Path, "resolve", creer_resolve_piege(exc)):
+                    with self.assertRaises(ToolFailure) as ctx:
+                        gitdiff.GitAccess(self.repo.root)
+                self.assertEqual(ctx.exception.code, "INTERNAL")
+
+    def test_cwd_resolve_failure_is_a_tool_failure(self) -> None:
+        """Revue (LOW) : `Path.cwd().resolve()` qui lève -> ToolFailure("INTERNAL").
+
+        Si le répertoire courant est inaccessible ou forme une boucle de liens,
+        GitAccess lève ToolFailure("INTERNAL"), jamais une exception brute.
+        """
+        for exc in (
+            OSError("cwd inaccessible"),
+            RuntimeError("Symlink loop"),
+            ValueError("cwd invalide"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                cwd_mock = mock.MagicMock()
+                cwd_mock.resolve.side_effect = exc
+                with mock.patch.object(gitdiff.Path, "cwd", return_value=cwd_mock):
+                    with self.assertRaises(ToolFailure) as ctx:
+                        gitdiff.GitAccess(self.repo.root)
+                self.assertEqual(ctx.exception.code, "INTERNAL")
+
+        with mock.patch.object(gitdiff.Path, "cwd", side_effect=OSError("cwd supprimé")):
+            with self.assertRaises(ToolFailure) as ctx:
+                gitdiff.GitAccess(self.repo.root)
+        self.assertEqual(ctx.exception.code, "INTERNAL")
+
     def test_ignored_detection_and_unexpected_codes(self) -> None:
         access = gitdiff.GitAccess(self.repo.root)
         self.repo.write(".gitignore", "ign.txt\n")

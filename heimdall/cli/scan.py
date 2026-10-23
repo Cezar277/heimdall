@@ -136,8 +136,8 @@ class ScanReport:
     def __post_init__(self) -> None:
         # Garde runtime pour les appelants non typés : le `Literal` protège
         # mypy, cette vérification protège l'exécution (jamais de `KeyError`
-        # hors contrat dans `render_text`).
-        if self.scope not in _SCOPE_LABELS:
+        # ni de `TypeError` hors contrat dans `render_text`).
+        if not isinstance(self.scope, str) or self.scope not in _SCOPE_LABELS:
             raise ScanError(_MSG_INVALID_SCOPE)
 
 

@@ -302,14 +302,26 @@ def test_scan_tool_failure_uses_the_same_static_message(
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
-def test_scan_report_refuses_an_unknown_scope() -> None:
+@pytest.mark.parametrize(
+    "bad_scope",
+    [
+        "invalide",
+        [],
+        {},
+        None,
+        42,
+    ],
+)
+def test_scan_report_refuses_an_unknown_scope(bad_scope: object) -> None:
     """Revue (LOW) : le `Literal` est doublé d'une garde runtime.
 
     Un appelant non typé ne doit pas fabriquer un rapport hors contrat qui
-    ferait un `KeyError` dans `_SCOPE_LABELS`.
+    ferait un `KeyError` ou un `TypeError` (si non hashable comme liste/dict)
+    dans `_SCOPE_LABELS` : `ScanReport(scope=[], ...)` et `scope=None` lèvent
+    `ScanError`, jamais `TypeError` ni `KeyError`.
     """
     with pytest.raises(ScanError):
-        ScanReport(scope="invalide", findings=())
+        ScanReport(scope=bad_scope, findings=())  # type: ignore[arg-type]
 
 
 def test_scan_broken_stderr_still_exits_two(
@@ -1104,6 +1116,28 @@ def test_scan_unresolvable_toplevel_exits_two(
 
     monkeypatch.setattr(GitAccess, "execute", execute_boucle)
     monkeypatch.setattr(Path, "resolve", resolve_boucle)
+    resultat = _run("scan", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+def test_scan_git_binary_or_cwd_resolve_error_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : resolve() du binaire git ou cwd qui échoue -> 2 garanti.
+
+    Dans `GitAccess.__init__`, l'échec de résolution de git ou de cwd est
+    mappé en ToolFailure("INTERNAL"), ce qui donne code 2 et message statique.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    resolve_reel = Path.resolve
+
+    def resolve_piege(self: Path, *args: object, **options: object) -> Path:
+        if self.name.startswith("git"):
+            raise RuntimeError("Symlink loop")
+        return resolve_reel(self, *args, **options)
+
+    monkeypatch.setattr(Path, "resolve", resolve_piege)
     resultat = _run("scan", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE

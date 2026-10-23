@@ -544,6 +544,34 @@ def test_symlinks_are_never_followed(tmp_path: Path) -> None:
     assert [finding["file"] for finding in find_candidates(str(repository))] == ["app.py"]
 
 
+def test_directory_is_symlink_oserror_raises_scan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `os.walk` avec `is_symlink` dossier qui lève OSError -> ScanError.
+
+    En cas d'erreur système lors du contrôle d'un sous-répertoire (permission,
+    course, composant illisible), le scanner bibliothèque doit lever ScanError
+    (contrat fail-closed), jamais une OSError brute.
+    """
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subdir = repository / "sub"
+    subdir.mkdir()
+    _write(subdir, "file.py", "x = 1\n")
+    scanner = Scanner(repository)
+
+    real_is_symlink = Path.is_symlink
+
+    def failing_is_symlink(self: Path) -> bool:
+        if self == subdir:
+            raise OSError("permission denied")
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", failing_is_symlink)
+    with pytest.raises(ScanError):
+        scanner.scan()
+
+
 # --- Lecture, confinement et fail-closed ------------------------------------
 
 

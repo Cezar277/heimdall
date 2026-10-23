@@ -148,6 +148,13 @@ def _raise_walk_error(_error: OSError) -> None:
     raise ScanError(_SCAN_ERROR)
 
 
+def _not_link(p: Path) -> bool:
+    try:
+        return not p.is_symlink()
+    except OSError:
+        raise ScanError(_SCAN_ERROR) from None
+
+
 def _resolve_root(root: str | os.PathLike[str]) -> Path:
     """Résout la racine sans jamais suivre un lien symbolique.
 
@@ -307,7 +314,7 @@ class Scanner:
                 name
                 for name in directories
                 if not is_excluded_directory(name, strict=self._strict)
-                and not (current_path / name).is_symlink()
+                and _not_link(current_path / name)
             )
             for name in sorted(filenames):
                 path = current_path / name
@@ -317,11 +324,8 @@ class Scanner:
                     raise ScanError(_SCAN_ERROR) from None
                 if is_excluded(relative, strict=self._strict):
                     continue
-                try:
-                    if path.is_symlink():
-                        continue
-                except OSError:
-                    raise ScanError(_SCAN_ERROR) from None
+                if not _not_link(path):
+                    continue
                 yield path, _validate_relative_path(relative)
 
     def _read_text(

@@ -299,7 +299,11 @@ class GitAccess:
             # Panne d'outillage : message statique, jamais de chemin ni de
             # contenu reflété (invariant 8).
             raise ToolFailure("INTERNAL")
-        resolved = Path(binary).resolve()
+        try:
+            resolved = Path(binary).resolve()
+            cwd = Path.cwd().resolve()
+        except (OSError, RuntimeError, ValueError):
+            raise ToolFailure("INTERNAL") from None
         # Jamais un binaire sous la racine ni sous le répertoire courant :
         # sur win32, `shutil.which` préfixe le répertoire courant d'office
         # (`path.insert(0, curdir)` dans la stdlib, même avec un `path`
@@ -311,7 +315,7 @@ class GitAccess:
         # Comparaison à la forme **figée** (`self._root`), jamais au
         # paramètre brut : une seule référence canonique, donc une seule
         # fenêtre TOCTOU et aucune divergence si la garde de racine évolue.
-        if resolved.is_relative_to(self._root) or resolved.parent == Path.cwd().resolve():
+        if resolved.is_relative_to(self._root) or resolved.parent == cwd:
             raise ToolFailure("INTERNAL")
         self._git = binary
 
