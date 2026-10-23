@@ -71,13 +71,13 @@ livraisons suivront une PR par sous-ticket. Le revert ciblé reste possible :
 ## 5. Voies `run` : canonique vs alias (ticket #101)
 
 Le ticket #101 spécifie `heimdall run -- <cmd>` : c'est la voie canonique
-(`heimdall/cli/main.py:53`, `app.command("run")`). `heimdall vault run`
-(`heimdall/cli/vault_keys.py:50`, `vault_app.command("run")`) est un alias
+(`heimdall/cli/main.py:56`, `app.command("run")`). `heimdall vault run`
+(`heimdall/cli/vault_keys.py:59`, `vault_app.command("run")`) est un alias
 de découvrabilité (`vault push` / `vault pull` / `vault run` groupés),
 pas une seconde implémentation.
 
 Garanties anti-divergence :
-- même callback `vault_run` (`heimdall/cli/vault_client.py:616`), donc mêmes
+- même callback `vault_run` (`heimdall/cli/vault_client.py:701`), donc mêmes
   gardes : allowlist locale (nom Vault jamais utilisé), denylist étendue,
   `shutil.which` préalable, sans `shell=True`, `Exit(2)` sur commande vide ;
 - mêmes réglages Typer via la source unique `RUN_CONTEXT_SETTINGS`
