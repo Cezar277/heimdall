@@ -18,7 +18,8 @@ un faux positif conforme au schéma ne supprime jamais le candidat. Les
 demandes hors contrat sont refusées et journalisées sans contenu brut.
 
 Avant toute écriture, le chemin issu de `filename` est validé : un seul nom
-de fichier, sans séparateur ni préfixe de lecteur, et une résolution qui
+de fichier ASCII de 1 à 64 caractères (`[A-Za-z0-9_.-]`, hors `.` et `..`),
+sans espace ni caractère de contrôle, et une résolution qui
 reste sous le dossier temporaire (liens symboliques sortants refusés).
 
 Test déterministe : `python -m pytest tests/test_prompt_injection_corpus.py -m "not llm"`.

@@ -44,8 +44,9 @@ contient 15 cas répartis entre les trois familles demandées. Chaque extrait
 est matérialisé avec un jeton synthétique dérivé à l'exécution, reconnu par
 le vrai scanner et masqué avant qualification. Un faux LLM hostile est
 rejoué avec trois réponses par cas ; le fichier et les Findings sont
-comparés avant/après. Les noms de fixtures sont limités à un seul nom de
-fichier ; la résolution du chemin refuse également un lien symbolique
+comparés avant/après. Les noms de fixtures suivent la liste blanche ASCII
+`[A-Za-z0-9_.-]{1,64}` (hors `.` et `..`) : aucun espace ni caractère de
+contrôle n'est admis. La résolution du chemin refuse également un lien symbolique
 sortant du dossier temporaire avant toute écriture. Ces tests prouvent le
 maintien de l'alerte, même
 quand le modèle obéit à l'injection ; ils ne prétendent pas que le modèle

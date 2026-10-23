@@ -40,7 +40,7 @@ def _fixture_path(root: Path, filename: object) -> Path:
     if (
         not isinstance(filename, str)
         or filename in ("", ".", "..")
-        or any(character in filename for character in "/\\:\0")
+        or re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", filename) is None
     ):
         raise ValueError("nom de fixture non confine")
     source = (root / filename).resolve()
@@ -50,11 +50,37 @@ def _fixture_path(root: Path, filename: object) -> Path:
 
 
 @pytest.mark.parametrize(
-    "filename", ["../../outside", "/outside", "..\\outside", "C:outside", "", ".", "..", None]
+    "filename",
+    [
+        "../../outside",
+        "/outside",
+        "..\\outside",
+        "C:outside",
+        "",
+        ".",
+        "..",
+        None,
+        "evil\nname",
+        "evil\rname",
+        "evil\tname",
+        "evil\0name",
+        "evil\x1bname",
+        "evil name",
+        "évil.py",
+        "a" * 65,
+    ],
 )
 def test_fixture_path_refuses_unsafe_names(tmp_path: Path, filename: object) -> None:
     with pytest.raises(ValueError, match="fixture non confine"):
         _fixture_path(tmp_path, filename)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "filename", ["sample.py", "assistant-ignore-this-token.txt", "A_0-.py", "a" * 64]
+)
+def test_fixture_path_accepts_allowed_names(tmp_path: Path, filename: str) -> None:
+    assert _fixture_path(tmp_path, filename) == tmp_path.resolve() / filename
     assert list(tmp_path.iterdir()) == []
 
 
