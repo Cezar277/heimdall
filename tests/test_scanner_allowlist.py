@@ -11,7 +11,9 @@ Couvre :
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -19,6 +21,7 @@ import pytest
 from support.git_repo import GIT, GitRepo
 from typer.testing import CliRunner, Result
 
+import heimdall.cli.scan as scan_module
 from heimdall.cli.main import app
 from heimdall.cli.scan import (
     EXIT_CLEAN,
@@ -64,6 +67,17 @@ def git_repo() -> Iterator[GitRepo]:
 
 def _run(*arguments: str) -> Result:
     return CliRunner().invoke(app, list(arguments))
+
+
+def _run_cli_process(*arguments: str) -> subprocess.CompletedProcess[str]:
+    """Lance la CLI dans un sous-processus borné (test anti-blocage FIFO)."""
+    return subprocess.run(  # noqa: S603 - argv figé, aucun shell
+        [sys.executable, "-c", "from heimdall.cli.main import main; main()", *arguments],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
 
 
 # --- 1. Tests unitaires des composants de base -------------------------------
@@ -717,17 +731,22 @@ def test_allowlist_is_empty() -> None:
 
 
 def test_path_pattern_validation_errors() -> None:
-    """Validation stricte des motifs de chemin."""
-    with pytest.raises(ScanError):
-        _validate_path_pattern("")
-    with pytest.raises(ScanError):
-        _validate_path_pattern("/absolute/path")
-    with pytest.raises(ScanError):
-        _validate_path_pattern("\\backslash\\root")
-    with pytest.raises(ScanError):
-        _validate_path_pattern("path/with/\x00/null")
-    with pytest.raises(ScanError):
-        _validate_path_pattern("a" * 4097)
+    """Validation stricte des motifs de chemin (même grammaire que Finding #14)."""
+    for bad_pattern in (
+        "",
+        "/absolute/path",
+        "\\backslash\\root",
+        "C:/Windows/system.ini",
+        "C:\\Windows\\system.ini",
+        "path/with/\x00/null",
+        "path/with\nnewline",
+        "path/../traversal",
+        "path//empty-segment",
+        "path/./dot-segment",
+        "a" * 4097,
+    ):
+        with pytest.raises(ScanError):
+            _validate_path_pattern(bad_pattern)
 
 
 def test_regex_compilation_errors() -> None:
@@ -1070,10 +1089,37 @@ def test_example_substring_myexample_remains_detected() -> None:
 
 def test_fuzz_patterns_and_paths() -> None:
     """Fuzzing défensif sur les motifs de chemins et regex (CWE-22, CWE-20)."""
-    # Chemins hostiles
-    for bad_path in ["../secret.txt", "/etc/passwd", "tests/../../etc", "a\x00b", "a\nb"]:
+    # Chemins hostiles, y compris formes Windows et segments ambigus
+    for bad_path in [
+        "../secret.txt",
+        "/etc/passwd",
+        "tests/../../etc",
+        "C:/Windows/system.ini",
+        "C:\\Windows\\system.ini",
+        "a\x00b",
+        "a\nb",
+        "a//b",
+        "a/./b",
+    ]:
         with pytest.raises(ScanError):
             _validate_path_pattern(bad_path)
+
+    # Glob long et répétitif : accepté comme motif relatif, mais ne matche
+    # pas un chemin ordinaire et ne provoque pas de backtracking bloquant.
+    long_glob = "*a" * 1024 + "*b"
+    assert _validate_path_pattern(long_glob) == long_glob
+    rule = AllowlistRule(
+        name="long-glob",
+        description="fuzz",
+        paths=(long_glob,),
+        keywords=("dummy",),
+    )
+    assert not rule.matches(
+        value="dummy",
+        file_path="a" * 4096,
+        line_number=1,
+        secret_type="password",
+    )
 
     # Regex hostiles
     for bad_regex in ["a" * 129, "a\x00b", ""]:
@@ -1218,6 +1264,51 @@ keywords = ["AKIA"]
     git_repo.stage("app.py")
 
     res = _run("scan", "--staged", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "auto-attestation" in res.stderr.lower() or "scan impossible" in res.stderr.lower()
+
+
+def test_staged_config_race_uses_verified_bytes_and_fails_closed(
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue (LOW) : substitution entre garde et parsing -> code 2, jamais 0.
+
+    La garde rend les octets vérifiés contre l'index ; le parseur les
+    consomme sans relire. Un second contrôle détecte la substitution
+    concurrente et refuse loud.
+    """
+    git_repo.write("heimdall.toml", _config_saine())
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: config initiale")
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("app.py")
+
+    config_path = git_repo.root / "heimdall.toml"
+    clean_bytes = config_path.read_bytes()
+    hostile_bytes = b"""
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "hostile-bypass"
+description = "bypass"
+patterns = ["^AKIA.*$"]
+"""
+    real_read = scan_module._read_worktree_file
+    calls = 0
+
+    def read_then_swap(path: Path) -> bytes | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # La garde lit le contenu propre, puis l'attaquant substitue.
+            config_path.write_bytes(hostile_bytes)
+            return clean_bytes
+        return real_read(path)
+
+    monkeypatch.setattr(scan_module, "_read_worktree_file", read_then_swap)
+    res = _run("scan", "--staged", str(git_repo.root))
+    assert calls >= 2
     assert res.exit_code == EXIT_ERROR
     assert "auto-attestation" in res.stderr.lower() or "scan impossible" in res.stderr.lower()
 
@@ -1379,6 +1470,77 @@ def test_index_entry_rejects_malformed_plumbing_output(
     else:
         with pytest.raises(ToolFailure):
             access.index_entry("heimdall.toml")
+
+
+@pytest.mark.parametrize("tracked_config", [True, False])
+def test_tree_scan_dirty_or_untracked_config_is_advisory_but_ci_and_staged_refuse(
+    git_repo: GitRepo,
+    tracked_config: bool,
+) -> None:
+    """Revue (LOW) : le mode arbre local est indicatif, --ci/--staged font foi.
+
+    Un heimdall.toml dirty ou untracked, accompagné d'un secret non stagé,
+    peut fausser le verdict local (0 toléré, comportement figé). En CI et en
+    --staged, la même configuration est refusée en code 2.
+    """
+    if tracked_config:
+        git_repo.write("heimdall.toml", _config_saine())
+        git_repo.stage("heimdall.toml")
+        git_repo.commit_all("chore: config initiale")
+
+    # Configuration hostile dirty (ou untracked) + secret non stagé.
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "hostile-bypass"
+description = "bypass"
+patterns = ["^AKIA.*$"]
+""",
+    )
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+
+    res_tree = _run("scan", str(git_repo.root))
+    assert res_tree.exit_code == EXIT_CLEAN
+    assert "Allowlist : 1 finding(s) ignoré(s)" in res_tree.stdout
+
+    # Les deux périmètres opposables refusent la config non propre.
+    res_ci = _run("scan", "--ci", str(git_repo.root))
+    assert res_ci.exit_code == EXIT_ERROR
+    assert "auto-attestation" in res_ci.stderr.lower() or "scan impossible" in res_ci.stderr.lower()
+
+    res_staged = _run("scan", "--staged", str(git_repo.root))
+    assert res_staged.exit_code == EXIT_ERROR
+    assert (
+        "auto-attestation" in res_staged.stderr.lower()
+        or "scan impossible" in res_staged.stderr.lower()
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO POSIX uniquement")
+@pytest.mark.parametrize("explicit_config", [False, True])
+def test_scan_tree_fifo_config_fails_closed_without_blocking(
+    git_repo: GitRepo,
+    explicit_config: bool,
+) -> None:
+    """Revue (LOW) : un FIFO à la place de la config -> code 2, jamais un blocage.
+
+    Le sous-processus est borné : sans O_NONBLOCK, le test échoue par timeout
+    au lieu de suspendre toute la suite.
+    """
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    if explicit_config:
+        os.mkfifo(git_repo.root / "custom.toml")
+        arguments = ("scan", "--config", "custom.toml", str(git_repo.root))
+    else:
+        os.mkfifo(git_repo.root / "heimdall.toml")
+        arguments = ("scan", str(git_repo.root))
+
+    completed = _run_cli_process(*arguments)
+    assert completed.returncode == EXIT_ERROR
+    assert "scan impossible" in completed.stderr.lower()
 
 
 def test_allowlist_exports_and_default_docstring() -> None:

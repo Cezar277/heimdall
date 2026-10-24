@@ -50,6 +50,7 @@ from heimdall.scanner.allowlist import (
     Allowlist,
     AllowlistTrace,
     load_allowlist,
+    parse_allowlist_bytes,
 )
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.detect import Scanner as TreeScanner
@@ -240,10 +241,10 @@ def _is_worktree_file_clean_and_tracked(
     rel_path: str,
     *,
     timeout: float,
-) -> bool:
+) -> bytes | None:
     """Vérifie que le fichier du worktree est suivi dans l'index et non modifié (CWE-345).
 
-    Retourne True si et seulement si :
+    Retourne le contenu vérifié (``bytes``) si et seulement si :
     1. Le fichier existe, est un fichier ordinaire et est lisible dans l'arbre
        de travail (ouverture `O_NOFOLLOW` via la garde unique) ;
     2. Le fichier est présent dans l'index Git au stage 0, en mode fichier
@@ -252,16 +253,18 @@ def _is_worktree_file_clean_and_tracked(
     3. L'empreinte de blob Git du contenu du worktree correspond exactement à
        l'index (SHA-1 ou SHA-256).
 
-    En cas de doute (erreur I/O, index symlinké, format non reconnu,
-    dirty/untracked, sous-module), retourne False : l'appelant refuse le scan.
+    Le contenu est rendu pour que l'appelant parse exactement les octets
+    vérifiés, sans relire le fichier (fenêtre TOCTOU éliminée). En cas de
+    doute (erreur I/O, index symlinké, format non reconnu, dirty/untracked,
+    sous-module), retourne ``None`` : l'appelant refuse le scan.
     """
     content = _read_worktree_file(access.root / rel_path)
     if content is None:
-        return False
+        return None
     try:
         entry = access.index_entry(rel_path, timeout=timeout)
         if entry is None:
-            return False
+            return None
         _, index_sha = entry
         blob_sha1 = hashlib.sha1(
             f"blob {len(content)}\0".encode("ascii") + content,
@@ -270,9 +273,19 @@ def _is_worktree_file_clean_and_tracked(
         blob_sha256 = hashlib.sha256(
             f"blob {len(content)}\0".encode("ascii") + content
         ).hexdigest()
-        return index_sha in (blob_sha1, blob_sha256)
+        if index_sha in (blob_sha1, blob_sha256):
+            return content
+        return None
     except Exception:
-        return False
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedConfig:
+    """Contenu de configuration vérifié contre l'index (CWE-345)."""
+
+    path: str
+    content: bytes
 
 
 def _guard_anti_self_attestation(  # noqa: PLR0913
@@ -284,7 +297,7 @@ def _guard_anti_self_attestation(  # noqa: PLR0913
     staged_changes: Sequence[object],
     timeout: float,
     is_staged_scan: bool = False,
-) -> None:
+) -> _VerifiedConfig | None:
     """Protection anti auto-attestation (CWE-345).
 
     1. En mode CI, la configuration du dépôt scanné ne peut JAMAIS s'auto-attester :
@@ -296,9 +309,13 @@ def _guard_anti_self_attestation(  # noqa: PLR0913
          dans l'index (staged_changes), refuser en code 2.
        - en mode --staged, si la configuration du worktree est modifiée (dirty) ou
          non suivie (untracked) par rapport à l'index, refuser en code 2 (fail-closed).
+         Le contenu vérifié est rendu pour être parsé sans relecture.
+       - en mode arbre local, la propreté du worktree n'est PAS vérifiée
+         (seule une configuration stagée est refusée) : ce périmètre est
+         indicatif, seuls --ci et --staged sont opposables.
     """
     if custom_allowlist is not None:
-        return
+        return None
 
     root = access.root
     rel_cfg: str | None = None
@@ -323,7 +340,7 @@ def _guard_anti_self_attestation(  # noqa: PLR0913
                 "auto-attestation refusée : en mode --ci, la configuration ne peut pas "
                 "provenir du dépôt scanné (CWE-345)"
             )
-        return
+        return None
 
     if rel_cfg is not None:
         is_cfg_staged = any(
@@ -335,15 +352,39 @@ def _guard_anti_self_attestation(  # noqa: PLR0913
             raise ScanError(
                 f"auto-attestation refusée : {rel_cfg} est staged (CWE-345)"
             )
-        if is_staged_scan and not _is_worktree_file_clean_and_tracked(
-            access,
-            rel_cfg,
-            timeout=timeout,
-        ):
-            raise ScanError(
-                f"auto-attestation refusée : en mode --staged, {rel_cfg} du worktree n'est pas "
-                "propre et suivi dans l'index (CWE-345)"
+        if is_staged_scan:
+            content = _is_worktree_file_clean_and_tracked(
+                access,
+                rel_cfg,
+                timeout=timeout,
             )
+            if content is None:
+                raise ScanError(
+                    f"auto-attestation refusée : en mode --staged, {rel_cfg} du worktree n'est pas "
+                    "propre et suivi dans l'index (CWE-345)"
+                )
+            return _VerifiedConfig(path=rel_cfg, content=content)
+    return None
+
+
+def _load_allowlist_verified(
+    access: GitAccess,
+    verified: _VerifiedConfig,
+) -> Allowlist:
+    """Parse le contenu déjà vérifié, puis re-contrôle le fichier (CWE-345).
+
+    Le parseur ne relit jamais la configuration : il consomme les octets
+    validés contre l'index par la garde. Un second contrôle détecte une
+    substitution concurrente entre la garde et le parsing et refuse en code 2.
+    """
+    allowlist = parse_allowlist_bytes(verified.content)
+    current = _read_worktree_file(access.root / verified.path)
+    if current is None or current != verified.content:
+        raise ScanError(
+            f"auto-attestation refusée : {verified.path} a changé pendant "
+            "le chargement (CWE-345)"
+        )
+    return allowlist
 
 
 def _collect_tree(
@@ -374,7 +415,7 @@ def _collect_tree(
         raise ScanError(_MSG_NOT_A_REPO)
 
     staged_changes = access.staged_changes(timeout=_call_timeout(deadline))
-    _guard_anti_self_attestation(
+    verified = _guard_anti_self_attestation(
         access,
         ci=ci,
         config=config,
@@ -387,7 +428,11 @@ def _collect_tree(
     allowlist = (
         custom_allowlist
         if custom_allowlist is not None
-        else load_allowlist(access.root, config_file=config, allow_external=ci)
+        else (
+            _load_allowlist_verified(access, verified)
+            if verified is not None
+            else load_allowlist(access.root, config_file=config, allow_external=ci)
+        )
     )
     scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
     findings = scanner.scan(deadline=deadline)
@@ -447,7 +492,7 @@ def _collect_staged(
     if len(changes) > MAX_STAGED_FILES:
         raise ScanError(_MSG_TOO_MANY_FILES)
 
-    _guard_anti_self_attestation(
+    verified = _guard_anti_self_attestation(
         access,
         ci=ci,
         config=config,
@@ -460,7 +505,11 @@ def _collect_staged(
     allowlist = (
         custom_allowlist
         if custom_allowlist is not None
-        else load_allowlist(access.root, config_file=config, allow_external=ci)
+        else (
+            _load_allowlist_verified(access, verified)
+            if verified is not None
+            else load_allowlist(access.root, config_file=config, allow_external=ci)
+        )
     )
     # Même échéance que la passe : un blob dense est interrompu à l'intérieur,
     # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).

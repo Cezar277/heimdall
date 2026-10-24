@@ -5,10 +5,10 @@ Périmètre : ticket #24 « Allowlist déterministe », sous-ticket de l'épic #
 preuves des exigences vérifiées pour le rapport d'audit SAMM.
 
 Révision du code auditée : [`834f3bfed1fe2c0a5f203b5851f4929de51f0978`](https://github.com/Cezar277/heimdall/commit/834f3bfed1fe2c0a5f203b5851f4929de51f0978).
-Les permaliens du tableau épinglent cette révision. Les correctifs issus de la
-revue (frontière `_` stricte, remplacement du parseur DIRC par la plomberie Git)
-sont décrits en fin de fiche ; leurs plages seront ré-épinglées au SHA de
-livraison.
+Les permaliens du tableau épinglent cette révision. Les correctifs issus des
+revues successives (frontière `_` stricte, plomberie Git, FIFO/TOCTOU,
+périmètre local indicatif) sont décrits en fin de fiche ; leurs plages seront
+ré-épinglées au SHA de livraison.
 
 ## En une phrase
 
@@ -81,10 +81,10 @@ Environnement : Linux, Python 3.14.8 / venv du dépôt.
 
 ```text
 .venv/bin/pytest tests/test_scanner_allowlist.py -q
-65 passed
+70 passed
 
 .venv/bin/pytest -o addopts="" -q
-1938 passed, 15 skipped
+1943 passed, 15 skipped
 
 .venv/bin/ruff check heimdall tests
 All checks passed!
@@ -109,14 +109,14 @@ désormais `\b` **dans tous les cas**, y compris pour une règle restreinte par
 chemin (`tests/**`). `_` étant un caractère de mot, `fake_slack_token` et
 `my_dummy_key` restent signalés ; `fake-token` ou la valeur exacte `dummy`
 restent reconnus. Le test de non-régression
-[`test_scanner_allowlist.py:213–231`](../tests/test_scanner_allowlist.py#L213-L231)
+[`test_scanner_allowlist.py:227–245`](../tests/test_scanner_allowlist.py#L227-L245)
 couvre `_fake_`/`_dummy_` sous `tests/`, et
-[`test_scanner_allowlist.py:1120–1136`](../tests/test_scanner_allowlist.py#L1120-L1136)
+[`test_scanner_allowlist.py:1166–1182`](../tests/test_scanner_allowlist.py#L1166-L1182)
 verrouille la frontière (sous-chaînes rejetées, séparateurs non-mot acceptés).
 
 ### Index Git lu par la plomberie, plus par un parseur DIRC maison
 
-[`gitdiff.py:436–526`](../heimdall/mcp/gitdiff.py#L436-L526) ajoute
+[`gitdiff.py:436–530`](../heimdall/mcp/gitdiff.py#L436-L530) ajoute
 `_checked_index_path` et `index_entry` :
 
 - `git rev-parse --git-path index` localise l'index réel (dépôt standard,
@@ -127,12 +127,39 @@ verrouille la frontière (sous-chaînes rejetées, séparateurs non-mot accepté
   absent, lien symbolique, gitlink ou index en conflit sont refusés
   (`None`/`ToolFailure`), toute sortie ambiguë échoue en code 2.
 
-[`scan.py:200–273`](../heimdall/cli/scan.py#L200-L273) conserve la vérification
+[`scan.py:201–282`](../heimdall/cli/scan.py#L201-L282) conserve la vérification
 anti-auto-attestation : lecture du fichier du worktree via `_resolve_root` +
 `O_NOFOLLOW`, puis comparaison de l'empreinte de blob brute (SHA-1 ou SHA-256)
 avec le SHA de l'index, sans exécuter de filtre Git `clean`.
 
-Tests de non-régression : [`test_scanner_allowlist.py:1236–1381`](../tests/test_scanner_allowlist.py#L1236-L1381)
+Tests de non-régression : [`test_scanner_allowlist.py:1327–1472`](../tests/test_scanner_allowlist.py#L1327-L1472)
 couvre index v4, worktree lié, gitlink/sous-module, index symlinké (code 2),
 chemins invalides (`..`, NUL, absolu) et sorties `ls-files` malformées
 (paramétrage fuzz).
+
+### Deuxième revue (LOW) — disponibilité et TOCTOU
+
+- **FIFO à l'ouverture de la config** : [`allowlist.py:488–525`](../heimdall/scanner/allowlist.py#L488-L525)
+  ouvre désormais avec `O_NONBLOCK` (comme le worktree et l'index) ; le
+  `fstat` + `S_ISREG` existant refuse un FIFO en code 2 sans blocage.
+  Test borné par sous-processus :
+  [`test_scanner_allowlist.py:1522–1543`](../tests/test_scanner_allowlist.py#L1522-L1543)
+  (config par défaut et `--config`).
+- **TOCTOU garde → parsing** : la garde rend les octets vérifiés
+  ([`scan.py:239–282`](../heimdall/cli/scan.py#L239-L282)), le parseur les
+  consomme sans relire ([`allowlist.py:468–485`](../heimdall/scanner/allowlist.py#L468-L485)),
+  et un second contrôle refuse toute substitution
+  ([`scan.py:291–367`](../heimdall/cli/scan.py#L291-L367),
+  [`scan.py:370–387`](../heimdall/cli/scan.py#L370-L387)). Test de course :
+  [`test_scanner_allowlist.py:1271–1313`](../tests/test_scanner_allowlist.py#L1271-L1313).
+- **Arbre local indicatif** : hors `--ci`/`--staged`, seule une configuration
+  stagée est refusée ; la propreté du fichier du worktree (dirty/untracked)
+  n'est pas vérifiée. Ce périmètre est documenté comme non opposable dans
+  [`docs/cli.md`](cli.md#limites-connues-honnêtes). Le comportement est figé
+  par [`test_scanner_allowlist.py:1475–1519`](../tests/test_scanner_allowlist.py#L1475-L1519),
+  qui vérifie aussi que `--ci` et `--staged` refusent la même configuration.
+- **Fuzz des `paths`** : [`allowlist.py:342–355`](../heimdall/scanner/allowlist.py#L342-L355)
+  réutilise la grammaire du contrat Finding #14 (refus de `..`, absolu,
+  `C:/`, antislash, NUL, segment vide) ; les motifs glob longs restent
+  non bloquants. Tests : [`test_scanner_allowlist.py:733–749`](../tests/test_scanner_allowlist.py#L733-L749)
+  et [`1090–1127`](../tests/test_scanner_allowlist.py#L1090-L1127).

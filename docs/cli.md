@@ -306,6 +306,13 @@ document si `count != len(findings)` (contrainte explicitée dans la
   adressés par SHA (`cat-file blob <sha>`), et re-vérifie l'état complet de l'index avant de
   rendre son verdict (toute modification concurrente refuse en code 2). Seul `--staged` est
   atomique et fait donc foi pour les barrières de sécurité bloquantes (hook de pré-commit et CI).
+- **Mode arbre local indicatif, pas une barrière** : hors `--ci` et hors `--staged`,
+  `heimdall scan` refuse une configuration **stagée**, mais ne vérifie pas que le
+  fichier `heimdall.toml` (ou un `--config` interne) du worktree est propre et suivi
+  dans l'index. Un fichier de configuration local dirty/untracked peut donc fausser le
+  verdict local (jusqu'à 0). Seuls `--ci` (refus de toute configuration interne) et
+  `--staged` (configuration propre et suivie, contenu vérifié lié au parseur) sont
+  opposables ; le hook de pré-commit et la CI doivent utiliser ces modes.
 - **Course résiduelle à l'initialisation de la racine (re-contrôle final garant)** :
   Dans `GitAccess.__init__`, entre `_resolve_root` et `os.stat`, un échange rapide
   `dossier` -> `symlink` -> `autre dossier` à la racine pourrait théoriquement échapper

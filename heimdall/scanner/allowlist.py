@@ -48,7 +48,7 @@ else:
     import tomli as tomllib
 
 from heimdall.scanner.errors import ScanError
-from heimdall.scanner.finding import MAX_PATH_LENGTH
+from heimdall.scanner.finding import validate_relative_path
 from heimdall.scanner.interface import _open_flags, _resolve_root
 
 logger = logging.getLogger("heimdall.scanner.allowlist")
@@ -340,18 +340,17 @@ def create_default_rules() -> tuple[AllowlistRule, ...]:
 
 
 def _validate_path_pattern(pattern: str) -> str:
-    """Valide qu'un motif de chemin est relatif et sans traversée."""
-    if not isinstance(pattern, str) or not pattern:
-        raise ScanError(_CONFIG_ERROR)
-    if len(pattern) > MAX_PATH_LENGTH:
-        raise ScanError(_CONFIG_ERROR)
-    if "\x00" in pattern or "\r" in pattern or "\n" in pattern:
-        raise ScanError(_CONFIG_ERROR)
-    if pattern.startswith("/") or pattern.startswith("\\"):
-        raise ScanError(_CONFIG_ERROR)
-    parts = pattern.replace("\\", "/").split("/")
-    if any(part == ".." for part in parts):
-        raise ScanError(_CONFIG_ERROR)
+    """Valide un motif de chemin selon la grammaire du contrat Finding #14.
+
+    Un motif est un chemin relatif POSIX : pas de traversée (`..`), pas
+    d'absolu, pas de lecteur Windows (`C:`), pas d'antislash, pas de NUL ou
+    de caractère de contrôle, pas de segment vide. Les métacaractères glob
+    (`*`, `?`, `[...]`) restent autorisés.
+    """
+    try:
+        validate_relative_path(pattern)
+    except ValueError:
+        raise ScanError(_CONFIG_ERROR) from None
     return pattern
 
 
@@ -466,14 +465,34 @@ def parse_allowlist_toml(content: str, *, sha256: str | None = None) -> Allowlis
     return Allowlist(rules, sha256=sha256)
 
 
+def parse_allowlist_bytes(raw_bytes: bytes) -> Allowlist:
+    """Parse une configuration déjà lue et bornée, sans nouvelle I/O.
+
+    Cette fonction est le point de liaison entre la garde anti
+    auto-attestation et le parseur : le contenu vérifié contre l'index est
+    analysé directement, donc un écrivain concurrent ne peut pas substituer
+    un autre fichier entre la vérification et le parsing.
+    """
+    if not isinstance(raw_bytes, bytes) or len(raw_bytes) > MAX_CONFIG_BYTES:
+        raise ScanError(_CONFIG_ERROR)
+    try:
+        content = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ScanError(_CONFIG_ERROR) from None
+    return parse_allowlist_toml(
+        content,
+        sha256=hashlib.sha256(raw_bytes).hexdigest(),
+    )
+
+
 def load_allowlist_from_file(config_path: Path, *, repo_root: Path | None = None) -> Allowlist:
     """Charge l'allowlist depuis un fichier TOML en réutilisant la garde unique (`_resolve_root`).
 
     - Vérification anti-symlink sur le fichier et tous ses parents via `_resolve_root`
     - Confinement sous repo_root si fourni
-    - Ouverture par descripteur O_NOFOLLOW / O_CLOEXEC
+    - Ouverture par descripteur O_NOFOLLOW / O_CLOEXEC / O_NONBLOCK
     - Plafond de taille borné (MAX_CONFIG_BYTES) vérifié par fstat
-    - Décodage strict UTF-8
+    - Décodage strict UTF-8 et parsing depuis les octets lus (une seule lecture)
     - Calcul déterministe de l'empreinte SHA-256
     """
     resolved = _resolve_root(config_path)
@@ -483,7 +502,9 @@ def load_allowlist_from_file(config_path: Path, *, repo_root: Path | None = None
             raise ScanError(_CONFIG_ERROR)
 
     try:
-        descriptor = os.open(resolved, _open_flags())
+        # O_NONBLOCK : un FIFO posé à la place du fichier ne bloque pas
+        # l'ouverture ; le fstat + S_ISREG ci-dessous le refuse.
+        descriptor = os.open(resolved, _open_flags() | getattr(os, "O_NONBLOCK", 0))
     except OSError:
         raise ScanError(_CONFIG_ERROR) from None
 
@@ -493,18 +514,13 @@ def load_allowlist_from_file(config_path: Path, *, repo_root: Path | None = None
             raise ScanError(_CONFIG_ERROR)
 
         raw_bytes = os.read(descriptor, MAX_CONFIG_BYTES + 1)
-        if len(raw_bytes) > MAX_CONFIG_BYTES:
+        if len(raw_bytes) > MAX_CONFIG_BYTES or len(raw_bytes) != file_stat.st_size:
+            # Trop gros, ou fichier modifié pendant la lecture : fail-closed.
             raise ScanError(_CONFIG_ERROR)
     finally:
         os.close(descriptor)
 
-    try:
-        content = raw_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        raise ScanError(_CONFIG_ERROR) from None
-
-    config_sha256 = hashlib.sha256(raw_bytes).hexdigest()
-    return parse_allowlist_toml(content, sha256=config_sha256)
+    return parse_allowlist_bytes(raw_bytes)
 
 
 def load_allowlist(
@@ -555,5 +571,6 @@ __all__ = [
     "create_default_rules",
     "load_allowlist",
     "load_allowlist_from_file",
+    "parse_allowlist_bytes",
     "parse_allowlist_toml",
 ]
