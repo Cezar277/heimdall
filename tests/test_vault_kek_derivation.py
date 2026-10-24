@@ -228,17 +228,33 @@ class VaultSettingsMasterKeyTests(unittest.TestCase):
                         api_key_pepper=_PEPPER,
                     )
 
-    def test_master_key_validation_error_does_not_echo_the_secret(self) -> None:
-        """Un ValidationError de configuration ne doit jamais refléter la clé."""
-        master_key_candidate = "t262-short"
-        with self.assertRaises(ValidationError) as ctx:
-            VaultSettings(
-                master_key=master_key_candidate,
-                kek_salt=_SALT_A,
-                api_key_pepper=_PEPPER,
-            )
-        self.assertNotIn(master_key_candidate, str(ctx.exception))
-        self.assertNotIn("input_value", str(ctx.exception))
+    def test_validation_errors_do_not_echo_secrets(self) -> None:
+        """Aucun ValidationError de configuration ne doit refléter un secret."""
+        cases = (
+            (
+                "master_key",
+                {"master_key": "t262-short", "kek_salt": _SALT_A, "api_key_pepper": _PEPPER},
+                "t262-short",
+            ),
+            (
+                "kek",
+                {"kek": "t262-invalid-kek", "api_key_pepper": _PEPPER},
+                "t262-invalid-kek",
+            ),
+            (
+                "api_key_pepper",
+                {"api_key_pepper": "t262-short-pepper"},
+                "t262-short-pepper",
+            ),
+        )
+        for field_name, kwargs, candidate in cases:
+            with self.subTest(field=field_name):
+                with self.assertRaises(ValidationError) as ctx:
+                    VaultSettings(**kwargs)
+                rendered = str(ctx.exception)
+                self.assertEqual(ctx.exception.errors()[0]["loc"], (field_name,))
+                self.assertNotIn(candidate, rendered)
+                self.assertNotIn("input_value", rendered)
 
     def test_settings_validate_salt(self) -> None:
         invalid_short_salt = base64.urlsafe_b64encode(b"S" * 15).decode("ascii")
@@ -280,14 +296,42 @@ class VaultSettingsMasterKeyTests(unittest.TestCase):
                 _resolve_vault_cipher(settings, "memory")
         self.assertIn("distincts", str(ctx.exception))
 
-    def test_master_key_equal_to_pepper_is_rejected(self) -> None:
-        """La clé maîtresse elle-même ne peut pas être le pepper (invariant 5)."""
-        shared_secret = "shared_master_key_and_pepper_" + "Q" * 8
+    def test_derived_kek_equal_to_pepper_in_base64_is_rejected(self) -> None:
+        """Le pepper ne peut pas réutiliser la KEK dérivée sous son encodage base64."""
+        derived_kek = b"K" * 32
+        pepper = base64.urlsafe_b64encode(derived_kek).decode("ascii")
         settings = VaultSettings(
-            master_key=shared_secret,
+            master_key=_MASTER_KEY,
             kek_salt=_SALT_A,
-            api_key_pepper=shared_secret,
+            api_key_pepper=pepper,
         )
+        with patch(
+            "heimdall.vault.app.derive_kek_from_master_key",
+            return_value=derived_kek,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_vault_cipher(settings, "memory")
+        self.assertIn("distincts", str(ctx.exception))
+
+    def test_settings_reject_master_key_equal_to_pepper(self) -> None:
+        """La validation refuse maître == pepper avant tout store injecté."""
+        shared_secret = "shared_master_key_and_pepper_" + "Q" * 8
+        with self.assertRaises(ValidationError) as ctx:
+            VaultSettings(
+                master_key=shared_secret,
+                kek_salt=_SALT_A,
+                api_key_pepper=shared_secret,
+            )
+        self.assertIn("distincts", str(ctx.exception))
+
+    def test_resolver_rejects_master_key_equal_to_pepper_after_validation_bypass(self) -> None:
+        """Défense en profondeur si la validation pydantic est contournée."""
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=_PEPPER,
+        )
+        settings.master_key = _PEPPER  # mutation volontaire, hors validation
         with self.assertRaises(ValueError) as ctx:
             _resolve_vault_cipher(settings, "memory")
         self.assertIn("distincts", str(ctx.exception))

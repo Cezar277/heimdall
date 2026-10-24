@@ -100,6 +100,16 @@ toujours 1. La KEK n'est jamais écrite dans SQLite (test
 `test_sqlite_secret_survives_a_restart_with_the_same_master_key_and_salt` :
 recherche des octets de la KEK et de son hexadécimal dans le fichier de base).
 
+### 5. Durée de vie de la clé maîtresse
+
+La clé maîtresse n'est **pas effacée** après la dérivation : `VaultSettings`
+et `os.environ` la conservent pendant toute la vie du processus, tandis que
+`VaultCipher` ne garde que la KEK dérivée. Aucun log, `repr` ou `model_dump`
+des settings n'est émis, et `hide_input_in_errors` empêche pydantic de la
+refléter dans un `ValidationError`. Python ne garantit pas une zeroization
+fiable des chaînes immuables (copies internes, GC) : cette limite est assumée
+et documentée, pas revendiquée comme une protection supplémentaire.
+
 ## Compatibilité et non-régression
 
 - **Mode historique conservé** : `HEIMDALL_VAULT_KEK` (32 octets base64) reste
@@ -138,6 +148,6 @@ recherche des octets de la KEK et de son hexadécimal dans le fichier de base).
   `derive_kek_from_master_key`, `VaultCipher.from_master_key`),
   `heimdall/vault/app.py` (`VaultSettings.master_key`, `VaultSettings.kek_salt`,
   `_resolve_vault_cipher`).
-- Tests : `tests/test_vault_kek_derivation.py` (25 tests), dont le critère
+- Tests : `tests/test_vault_kek_derivation.py` (27 tests), dont le critère
   « Fait quand » (`test_same_master_key_and_same_salt_derive_the_same_kek`).
 - Fiche SAMM : [`docs/t262-samm.md`](../t262-samm.md).

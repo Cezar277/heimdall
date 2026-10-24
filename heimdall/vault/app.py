@@ -67,6 +67,7 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 """
 
 import asyncio
+import base64
 import ipaddress
 import logging
 import os
@@ -280,6 +281,10 @@ def _resolve_vault_cipher(
     La KEK dérivée est comparée au pepper d'authentification (invariant 5) :
     même si les deux secrets sont fournis séparément, une collision fortuite
     ou une configuration volontairement fautive est refusée fail-closed.
+
+    La clé maîtresse reste portée par ``VaultSettings`` et l'environnement pour
+    la durée du processus ; la dérivation ne prétend pas l'effacer. Seule la KEK
+    dérivée est conservée par ``VaultCipher`` et utilisée par les routes.
     """
     if settings.kek is not None:
         return VaultCipher.from_encoded_key(settings.kek)
@@ -299,11 +304,19 @@ def _resolve_vault_cipher(
                 "La clé maîtresse et le pepper d'authentification doivent être "
                 "distincts (invariant 5)."
             )
-        if pepper is not None and constant_time_equal(derived_kek, pepper.encode("utf-8")):
-            raise ValueError(
-                "La KEK dérivée de la clé maîtresse et le pepper d'authentification "
-                "doivent être distincts (invariant 5)."
-            )
+        if pepper is not None:
+            pepper_bytes = pepper.encode("utf-8")
+            derived_b64 = base64.urlsafe_b64encode(derived_kek).decode("ascii")
+            # Même sémantique que le mode historique : refuser la KEK brute ET
+            # sa représentation base64, sinon le pepper pourrait réutiliser la
+            # même entropie sous un autre encodage (invariant 5).
+            if constant_time_equal(derived_kek, pepper_bytes) or kek_matches_pepper(
+                derived_b64, pepper
+            ):
+                raise ValueError(
+                    "La KEK dérivée de la clé maîtresse et le pepper d'authentification "
+                    "doivent être distincts (invariant 5)."
+                )
         return VaultCipher(derived_kek)
     if backend == "sqlite":
         raise ValueError(
@@ -801,13 +814,26 @@ class VaultSettings(BaseSettings):
         entropie (ex. pepper UTF-8 dont le base64 32 octets est la KEK) sont
         refusées, conformément à l'invariant 5 (jamais la même clé pour le
         chiffrement et le HMAC de vérification).
+
+        Le contrôle de la clé maîtresse est également fait ici, et pas seulement
+        dans ``_resolve_vault_cipher`` : un ``secret_store`` explicite court-
+        circuite la dérivation et ne doit pas laisser passer cette collision.
         """
-        if self.kek is not None and self.api_key_pepper is not None:
-            if kek_matches_pepper(self.kek, self.api_key_pepper):
-                raise ValueError(
-                    "La KEK de chiffrement et le pepper d'authentification doivent "
-                    "être distincts, y compris sous des encodages différents."
-                )
+        pepper = self.api_key_pepper
+        if pepper is None:
+            return self
+        if self.master_key is not None and constant_time_equal(
+            self.master_key.encode("utf-8"), pepper.encode("utf-8")
+        ):
+            raise ValueError(
+                "La clé maîtresse et le pepper d'authentification doivent être "
+                "distincts (invariant 5)."
+            )
+        if self.kek is not None and kek_matches_pepper(self.kek, pepper):
+            raise ValueError(
+                "La KEK de chiffrement et le pepper d'authentification doivent "
+                "être distincts, y compris sous des encodages différents."
+            )
         return self
 
     @field_validator("db_path")
@@ -1524,6 +1550,8 @@ def create_app(
         redoc_url=None,
         openapi_url=openapi_url,
     )
+    # Ne jamais journaliser ni sérialiser ``app.state.settings`` : il porte la
+    # clé maîtresse (durée de vie du processus) et le pepper d'authentification.
     app.state.settings = effective_settings
     resolved_db = _pin_db_path(effective_settings)
     app.state.db_path = resolved_db
