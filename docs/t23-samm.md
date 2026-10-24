@@ -99,3 +99,39 @@ python -m pytest tests/test_scanner_entropy.py tests/test_scanner_detect.py \
 ```
 
 Aucun `/ci` distant déclenché ; feuille SAMM externe toujours non modifiée.
+
+## Correctif CRITICAL — affixes de jetons hexadécimaux
+
+Révision : `7f65bbf6731f9ebb529225879930bc45a73f69b6`.
+La classification du jeton entier ne suffit pas : un préfixe non hex peut
+imposer à tort le seuil base64 à une charge hex. La recherche des suites
+hexadécimales maximales dans chaque jeton borné s'effectue désormais avant
+la classification de repli. Le traitement spécial `sha512-` est supprimé.
+
+| Exigence | Code permanent | Preuve permanente |
+| --- | --- | --- |
+| Fragments hex détectés malgré un affixe non hex | [_hex_matches:77](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/heimdall/scanner/entropy_detection.py#L77) | [affixes paramétrés, deux moteurs:150](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/tests/test_scanner_entropy.py#L150) |
+| Position réelle, HMAC et score du fragment seul | [entropy_detection.py:77](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/heimdall/scanner/entropy_detection.py#L77) | [positions/empreintes:163](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/tests/test_scanner_entropy.py#L163), [deux fragments dans un jeton:184](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/tests/test_scanner_entropy.py#L184) |
+| Deadline avant le score d'un fragment | [entropy_detection.py:77](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/heimdall/scanner/entropy_detection.py#L77) | [test:193](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/tests/test_scanner_entropy.py#L193) |
+| Une signature connue ne masque pas un autre fragment hex du même jeton | [entropy_detection.py](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/heimdall/scanner/entropy_detection.py) | [test:200](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/tests/test_scanner_entropy.py#L200) |
+| CLI locale --ci : code 1, jamais 0, sans valeur brute en sortie | [détection](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/heimdall/scanner/entropy_detection.py) | [tests arbre/index:848](https://github.com/Cezar277/heimdall/blob/7f65bbf6731f9ebb529225879930bc45a73f69b6/tests/test_cli_scan.py#L848) |
+
+Les cas incluent `sha1-`, `sha256-`, `sha384-`, `sha512-`, `md5-`,
+`prefix-`, `prefix.`, `x`, `a`, `x-`, `x_`, `x+`, `x/`, ainsi que
+les suffixes `-suffix` et `x`. Les deux alphabets sont exercés et une
+charge hex conserve le type `high_entropy_hex` malgré son affixe.
+La borne 4096 est appliquée au jeton avant la recherche de fragments :
+aucun fractionnement d'un jeton trop long ne permet de contourner le refus.
+
+Ruff, mypy strict et Bandit passent. Les 674 tests ciblés passent et le
+test supplémentaire de deadline du fragment passe. La mesure T21 a été
+réexécutée : comptes et rapport JSON inchangés (core 10/8/0, all 12/8/4),
+commande de mesure en code 1 attendu, précision toujours sous 90 %.
+Les tests locaux de `--ci` ne déclenchent aucune exécution GitHub `/ci`.
+
+Suite complète finale sur `7f65bbf` : **2013 passed, 16 skipped**,
+4480 sous-tests passés, 7 avertissements ; couverture globale branches
+incluses **92,04 %** (seuil 85 % satisfait), durée 199,25 s, code de sortie 0.
+Cette validation remplace, pour le code actuel, les résultats globaux
+historiques des sections précédentes. Le seuil de précision T21 reste
+distinct, inchangé et non atteint, comme indiqué dans le rapport archivé.
