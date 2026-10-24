@@ -460,6 +460,18 @@ def vault_push(  # noqa: PLR0913, PLR0917
         typer.echo("Aucun secret valide à pousser.", err=True)
         raise typer.Exit(code=2)
 
+    for name, value in to_push.items():
+        if not isinstance(value, str) or "\x00" in value or "\n" in value or "\r" in value:
+            # Refus franc avant tout envoi : un octet nul ou un saut de ligne
+            # rendrait le secret inexploitable (pull/run le rejettent).
+            # Message statique : la valeur n'est jamais reflétée.
+            typer.echo(
+                f"Erreur : valeur invalide pour le secret '{name}' "
+                "(octets nuls et sauts de ligne interdits).",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+
     client = _init_client(vault_url, ca_cert)
     created = 0
     skipped = 0
@@ -616,7 +628,7 @@ def _pull_secrets_from_vault(
     return retrieved
 
 
-def vault_pull(  # noqa: PLR0913, PLR0917
+def vault_pull(  # noqa: PLR0912, PLR0913, PLR0917
     project: str | None = _PROJECT_OPTION,
     env: str = _ENV_OPTION,
     names: list[str] | None = _NAMES_OPTION,
@@ -654,7 +666,10 @@ def vault_pull(  # noqa: PLR0913, PLR0917
         try:
             bak_file = backup_file(output)
         except ValueError as exc:
-            typer.echo(f"Erreur de sécurité lors de la sauvegarde : {exc}", err=True)
+            msg = str(exc)
+            if len(msg) > _MAX_ERROR_MSG_LEN:
+                msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+            typer.echo(f"Erreur de sécurité lors de la sauvegarde : {msg}", err=True)
             raise typer.Exit(code=1) from None
         if bak_file:
             typer.echo(f"Sauvegarde du fichier existant vers {bak_file.name} (droits 0600).")
@@ -664,7 +679,10 @@ def vault_pull(  # noqa: PLR0913, PLR0917
     try:
         write_file_atomic(output, content, mode=0o600)
     except (ValueError, OSError) as exc:
-        typer.echo(f"Erreur de sécurité lors de l'écriture : {exc}", err=True)
+        msg = str(exc)
+        if len(msg) > _MAX_ERROR_MSG_LEN:
+            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        typer.echo(f"Erreur de sécurité lors de l'écriture : {msg}", err=True)
         raise typer.Exit(code=1) from None
 
     typer.echo(f"Fichier {output} mis à jour avec {len(retrieved)} secret(s) (droits 0600).")

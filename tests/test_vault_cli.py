@@ -424,6 +424,104 @@ class VaultPullCliTests(unittest.TestCase):
                 self.assertEqual(bak_file.read_text(encoding="utf-8"), "OLD_KEY=old_val\n")
                 self.assertTrue(check_file_mode_600(bak_file))
 
+    def test_push_rejects_null_byte_value_without_sending(self) -> None:
+        """Valeur à octet nul → `Exit(2)` franc avant tout envoi (symétrique pull/run)."""
+        src_env = self.tmp_dir / "poisoned.env"
+        src_env.write_bytes(b"POISONED_KEY=abc\x00def\n")
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "push",
+                        "--file",
+                        str(src_env),
+                        "--project",
+                        "demo",
+                        "--env",
+                        "dev",
+                        "--name",
+                        "POISONED_KEY",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 2)
+                self.assertIn("valeur invalide", result.output)
+                mock_init.assert_not_called()
+
+    def test_pull_backup_error_message_is_bounded(self) -> None:
+        """Échec de sauvegarde : stderr < 200 car., pas de recopie intégrale."""
+        output_file = self.tmp_dir / ".env"
+        output_file.write_bytes(b"OLD=1\n")
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "NEW_KEY",
+                    "status": "vaulte",
+                    "value": "new_val",
+                }
+                mock_init.return_value = client_instance
+                with patch(
+                    "heimdall.cli.vault_client.backup_file",
+                    side_effect=ValueError("z" * 5000),
+                ):
+                    result = self.runner.invoke(
+                        app,
+                        [
+                            "vault",
+                            "pull",
+                            "--project",
+                            "demo",
+                            "--name",
+                            "NEW_KEY",
+                            "--output",
+                            str(output_file),
+                        ],
+                    )
+                    self.assertEqual(result.exit_code, 1)
+                    self.assertLess(len(result.output), 200)
+                    self.assertNotIn("z" * 5000, result.output)
+
+    def test_pull_write_error_message_is_bounded(self) -> None:
+        """Échec d'écriture : stderr < 200 car., pas de recopie intégrale."""
+        output_file = self.tmp_dir / "fresh.env"
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "NEW_KEY",
+                    "status": "vaulte",
+                    "value": "new_val",
+                }
+                mock_init.return_value = client_instance
+                with patch(
+                    "heimdall.cli.vault_client.write_file_atomic",
+                    side_effect=ValueError("w" * 5000),
+                ):
+                    result = self.runner.invoke(
+                        app,
+                        [
+                            "vault",
+                            "pull",
+                            "--project",
+                            "demo",
+                            "--name",
+                            "NEW_KEY",
+                            "--output",
+                            str(output_file),
+                        ],
+                    )
+                    self.assertEqual(result.exit_code, 1)
+                    self.assertLess(len(result.output), 200)
+                    self.assertNotIn("w" * 5000, result.output)
+
     def test_pull_missing_named_secret_exits_1_without_partial_file(self) -> None:
         """404 sur un nom explicite → Exit(1), aucun .env partiel écrit."""
         output_file = self.tmp_dir / ".env"
