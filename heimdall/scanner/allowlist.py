@@ -39,7 +39,7 @@ import stat
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Final
 
 if sys.version_info >= (3, 11):
@@ -68,21 +68,23 @@ _RULE_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0
 
 #: Détection rigoureuse de constructions regex à risque de backtracking catastrophique (CWE-1333).
 #: Interdit :
-#: 1. L'alternance sous quantificateur : `(a|b)+`, `(a|aa)+`, `(a|b){2,}`
-#: 2. Les wildcards ou classes quantifiées sous quantificateur : `(.*a)+`, `(\w+)+`
-#: 3. La double quantification imbriquée : `(a+)+`
-#: 4. Les quantificateurs consécutifs : `a++`, `a**`
-#: 5. Les quantificateurs répétés sur le même atome : `a*a*`, `.*.*`
-#: 6. Les classes de caractères quantifiées consécutives : `\d+\d+`, `\w+\w+`
-#: 7. Les classes entre crochets quantifiées consécutives : `[0-9]+[0-9]+`
+#: 1. L'alternance sous quantificateur : `(a|b)+`, `(a|aa)+`, `(a|b)?`, `(a|b){2,}`
+#: 2. Les wildcards ou classes quantifiées sous quantificateur : `(.*a)+`, `(\w+)+`, `(a?)+`
+#: 3. La double quantification imbriquée : `(a+)+`, `(a?)+`
+#: 4. Les quantificateurs consécutifs : `a++`, `a**`, `a??`
+#: 5. Les quantificateurs lazy : `*?`, `+?`, `??`
+#: 6. Les quantificateurs répétés sur le même atome : `a*a*`, `a?a?`, `.*.*`
+#: 7. Les classes de caractères quantifiées consécutives : `\d+\d+`, `\w+\w+`, `\s?\s?`
+#: 8. Les classes entre crochets quantifiées consécutives : `[0-9]+[0-9]+`
+_QUANT: Final[str] = r"(?:[*+?]|\{\d+,?\d*\})\??"
 _REDOS_DANGEROUS_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    re.compile(r"\([^)]*\|[^)]*\)\s*([*+]|\{\d+,?\d*\})"),
-    re.compile(r"\([^)]*\.[*+][^)]*\)\s*([*+]|\{\d+,?\d*\})"),
-    re.compile(r"\([^)]*([*+]|\{\d+,?\d*\})[^)]*\)\s*([*+]|\{\d+,?\d*\})"),
-    re.compile(r"([*+]|\{\d+,?\d*\})\s*([*+]|\{\d+,?\d*\})"),
-    re.compile(r"(.)[*+]\s*\1[*+]"),
-    re.compile(r"\\[dDwWsS][*+]\s*\\[dDwWsS][*+]"),
-    re.compile(r"\[[^\]]+\][*+]\s*\[[^\]]+\][*+]"),
+    re.compile(r"\([^)]*\|[^)]*\)\s*" + _QUANT),
+    re.compile(r"\([^)]*" + _QUANT + r"[^)]*\)\s*" + _QUANT),
+    re.compile(r"[*+?]\?"),
+    re.compile(r"[*+?]{2,}"),
+    re.compile(r"(.)" + _QUANT + r"\s*\1" + _QUANT),
+    re.compile(r"\\[dDwWsS]" + _QUANT + r"\s*\\[dDwWsS]" + _QUANT),
+    re.compile(r"\[[^\]]+\]" + _QUANT + r"\s*\[[^\]]+\]" + _QUANT),
 )
 
 _CONFIG_ERROR: Final[str] = "configuration allowlist invalide"
@@ -117,9 +119,8 @@ def _keyword_matches_value(kw: str, value: str, has_paths: bool = False) -> bool
 
     Pour éviter tout faux négatif sur un secret réel de production contenant
     un mot-clé comme sous-chaîne (ex: mot de passe 'dummyP@ssw0rd!' ou
-    'prod_fake_token_123'), la correspondance exige :
+    'prod_fake_token_123', ou 'myexample'), la correspondance exige :
     - Soit l'égalité exacte insensible à la casse (ex: 'changeme', 'your_key_here')
-    - Soit la sous-chaîne terminale explicite 'example' (marqueurs AWS 'AKIA...EXAMPLE')
     - Soit une frontière de mot complète '\\b' (ex: '\\bdummy\\b', '\\bfake\\b', 'admin:changeme')
     - Pour les règles délimitées à un chemin (has_paths=True, ex: tests/**), les frontières
       délimitées par les séparateurs de code classiques ([^a-zA-Z0-9]|^/$) comme 'fake_slack_token'
@@ -127,8 +128,6 @@ def _keyword_matches_value(kw: str, value: str, has_paths: bool = False) -> bool
     kw_cf = kw.casefold()
     val_cf = value.casefold()
     if val_cf == kw_cf:
-        return True
-    if kw_cf == "example" and val_cf.endswith("example"):
         return True
     if re.search(rf"\b{re.escape(kw_cf)}\b", val_cf):
         return True
@@ -144,12 +143,13 @@ class AllowlistRule:
     """Règle nommée et auditable d'allowlist (#24).
 
     Une règle est constituée d'un nom unique, d'une description et d'au moins
-    un critère de correspondance parmi :
-    - `keywords` : sous-chaînes sur la valeur du secret (ex. 'example', 'dummy')
+    un critère sur la valeur du candidat parmi :
+    - `keywords` : sous-chaînes/mots entiers sur la valeur du secret (ex. 'example', 'dummy')
     - `patterns` : expressions régulières compilées linéaires sur la valeur
-    - `paths` : motifs glob POSIX relatifs (ex. 'tests/**', '*_test.py')
+
+    Les critères de restriction facultatifs (en conjonction avec keywords/patterns) sont :
+    - `paths` : motifs glob POSIX relatifs (évalués via `fnmatch`)
     - `secret_types` : types de secrets restreints (ex. 'aws', 'stripe')
-    - `hashes` : empreintes HMAC-SHA-256 exactes autorisées
     """
 
     name: str
@@ -158,7 +158,6 @@ class AllowlistRule:
     patterns: tuple[re.Pattern[str], ...] = ()
     paths: tuple[str, ...] = ()
     secret_types: tuple[str, ...] = ()
-    hashes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _RULE_NAME_RE.fullmatch(self.name):
@@ -170,34 +169,29 @@ class AllowlistRule:
         if len(self.description) > MAX_DESCRIPTION_LENGTH:
             raise ScanError(_CONFIG_ERROR)
 
-        has_criteria = bool(
-            self.keywords or self.patterns or self.paths or self.secret_types or self.hashes
-        )
-        if not has_criteria:
+        # Invariant 1 / Sécurité : toute règle DOIT obligatoirement définir au moins
+        # un critère sur la valeur (keywords ou patterns). Les filtres paths ou
+        # secret_types ne peuvent JAMAIS constituer une règle aveugle à eux seuls.
+        if not self.keywords and not self.patterns:
             raise ScanError(_CONFIG_ERROR)
 
-    def matches(  # noqa: PLR0913
+    def matches(
         self,
         *,
         value: str,
         file_path: str,
         line_number: int,
         secret_type: str,
-        line_text: str = "",
-        snippet_hash: str = "",
     ) -> bool:
         """Détermine si un candidat satisfait tous les critères de la règle.
 
         Important (sécurité) : les mots-clés et patterns ne sont vérifiés
-        QUE sur `value` (le secret candidat), JAMAIS sur `line_text`. Cela
-        interdit tout contournement par ajout d'un commentaire en fin de ligne
-        (ex: `key = "AKIA...REEL" # dummy`).
+        QUE sur `value` (le secret candidat).
         """
-        # 1. Filtre par chemin (si spécifié)
+        # 1. Filtre par chemin (si spécifié) — moteur unique fnmatch documenté
         if self.paths:
             path_matched = any(
                 fnmatch.fnmatch(file_path, pattern)
-                or PurePosixPath(file_path).match(pattern)
                 for pattern in self.paths
             )
             if not path_matched:
@@ -207,15 +201,7 @@ class AllowlistRule:
         if self.secret_types and secret_type not in self.secret_types:
             return False
 
-        # 3. Filtre par empreinte HMAC exacte (si spécifiée)
-        if self.hashes and snippet_hash not in self.hashes:
-            return False
-
-        # 4. Si la règle n'a ni keywords ni patterns, le filtre chemin/type/hash suffit
-        if not self.keywords and not self.patterns:
-            return True
-
-        # 5. Filtre par keywords et patterns — SUR VALUE UNIQUEMENT avec frontières de mots
+        # 3. Filtre par keywords et patterns — SUR VALUE UNIQUEMENT avec frontières de mots
         has_paths = bool(self.paths)
         kw_match = bool(
             self.keywords
@@ -270,15 +256,13 @@ class Allowlist:
     def is_empty(self) -> bool:
         return len(self._rules) == 0
 
-    def evaluate(  # noqa: PLR0913
+    def evaluate(
         self,
         *,
         value: str,
         file: str,
         line: int,
         secret_type: str,
-        line_text: str = "",
-        snippet_hash: str = "",
     ) -> str | None:
         """Évalue un candidat et retourne le nom de la règle si rejeté, sinon None."""
         for rule in self._rules:
@@ -287,8 +271,6 @@ class Allowlist:
                 file_path=file,
                 line_number=line,
                 secret_type=secret_type,
-                line_text=line_text,
-                snippet_hash=snippet_hash,
             ):
                 logger.info(
                     "rejet allowlist : règle '%s' sur %s:%d (type=%s)",
@@ -338,7 +320,7 @@ def create_default_rules() -> tuple[AllowlistRule, ...]:
         AllowlistRule(
             name="test-fixtures",
             description="Valeurs factices et fixtures délimitées dans les tests",
-            paths=("tests/**", "*_test.py", "test_*.py", "**/fixtures/**", "**/support/**"),
+            paths=("tests/**", "fixtures/**", "**/fixtures/**", "support/**", "**/support/**"),
             keywords=(
                 "fake",
                 "mock",
@@ -393,7 +375,6 @@ _ALLOWED_RULE_KEYS: Final[frozenset[str]] = frozenset(
         "patterns",
         "paths",
         "secret_types",
-        "hashes",
     }
 )
 
@@ -427,7 +408,6 @@ def _parse_rule_dict(raw_rule: object) -> AllowlistRule:
 
     keywords = _parse_str_list(raw_rule, "keywords")
     secret_types = _parse_str_list(raw_rule, "secret_types")
-    hashes = _parse_str_list(raw_rule, "hashes")
 
     raw_paths = raw_rule.get("paths", [])
     if not isinstance(raw_paths, list) or len(raw_paths) > MAX_ITEMS_PER_RULE:
@@ -446,7 +426,6 @@ def _parse_rule_dict(raw_rule: object) -> AllowlistRule:
         patterns=patterns,
         paths=paths,
         secret_types=secret_types,
-        hashes=hashes,
     )
 
 
@@ -523,7 +502,12 @@ def load_allowlist_from_file(config_path: Path, *, repo_root: Path | None = None
     return parse_allowlist_toml(content, sha256=config_sha256)
 
 
-def load_allowlist(root: Path, config_file: str | Path | None = None) -> Allowlist:
+def load_allowlist(
+    root: Path,
+    config_file: str | Path | None = None,
+    *,
+    allow_external: bool = False,
+) -> Allowlist:
     """Charge la configuration d'allowlist pour la racine d'un dépôt.
 
     Si `config_file` est fourni, ce fichier spécifique est chargé (fail-closed s'il
@@ -537,7 +521,12 @@ def load_allowlist(root: Path, config_file: str | Path | None = None) -> Allowli
         target = Path(config_file)
         if not target.is_absolute():
             target = resolved_root / target
-        return load_allowlist_from_file(target, repo_root=resolved_root)
+        resolved_target = _resolve_root(target)
+        if resolved_target.is_relative_to(resolved_root):
+            return load_allowlist_from_file(resolved_target, repo_root=resolved_root)
+        if allow_external:
+            return load_allowlist_from_file(resolved_target, repo_root=None)
+        raise ScanError(_CONFIG_ERROR)
 
     default_config = resolved_root / "heimdall.toml"
     try:

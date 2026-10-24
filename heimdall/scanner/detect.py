@@ -398,7 +398,6 @@ class Scanner:
                     match,
                     line_number,
                     relative,
-                    line_text=line,
                     deadline=deadline,
                 )
             following = self._joined_window(line, lines, index)
@@ -417,7 +416,6 @@ class Scanner:
                     match,
                     line_number,
                     relative,
-                    line_text=joined,
                     deadline=deadline,
                 )
         return findings
@@ -447,7 +445,6 @@ class Scanner:
         line_number: int,
         relative: str,
         *,
-        line_text: str = "",
         deadline: float | None = None,
     ) -> None:
         # Une seule ligne peut porter des milliers de matches : le contrôle
@@ -473,8 +470,6 @@ class Scanner:
                 file=relative,
                 line=line_number,
                 secret_type=match.secret_type,
-                line_text=line_text,
-                snippet_hash=snippet_hash,
             )
             if rule_name is not None:
                 self._traces.append(

@@ -143,7 +143,6 @@ def test_rule_example_placeholders() -> None:
             file="app.py",
             line=5,
             secret_type="aws",
-            line_text="EXAMPLE_AWS_KEY = 'unrelated_string'",
         )
         is None
     )
@@ -221,7 +220,6 @@ def test_trap_real_secret_in_tests_is_never_ignored() -> None:
         file="tests/test_live.py",
         line=10,
         secret_type="aws",
-        line_text=f"AWS_KEY = '{real_looking_secret}'",
     )
     # L'allowlist REFUSE d'ignorer ce secret : verdict None
     assert result is None
@@ -440,7 +438,7 @@ version = "1"
 [[allowlist.rules]]
 name = "example-placeholders"
 description = "Exemple"
-keywords = ["example"]
+patterns = ["^AKIA.*EXAMPLE$"]
 """,
     )
     # Committer heimdall.toml pour qu'il soit une configuration de dépôt validée
@@ -478,7 +476,7 @@ version = "1"
 [[allowlist.rules]]
 name = "my-custom-rule"
 description = "desc"
-keywords = ["example"]
+patterns = ["^AKIA.*EXAMPLE$"]
 """,
     )
     git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
@@ -495,7 +493,7 @@ def test_cli_scan_with_invalid_config_fails_closed(git_repo: GitRepo) -> None:
         collect(git_repo.root, staged=False)
 
 
-def test_cli_scan_runner_shows_allowlist_output(git_repo: GitRepo) -> None:
+def test_cli_scan_runner_shows_allowlist_output(git_repo: GitRepo, tmp_path: Path) -> None:
     """Vérifie la commande heimdall scan complète avec Typer."""
     git_repo.write(
         "heimdall.toml",
@@ -506,7 +504,7 @@ version = "1"
 [[allowlist.rules]]
 name = "example-placeholders"
 description = "desc"
-keywords = ["example"]
+patterns = ["^AKIA.*EXAMPLE$"]
 """,
     )
     git_repo.stage("heimdall.toml")
@@ -521,8 +519,21 @@ keywords = ["example"]
     assert "Allowlist : 1 finding(s) ignoré(s) :" in res.stdout
     assert "app.py:1  règle=example-placeholders" in res.stdout
 
-    # 2. Mode --ci : avec --config explicite, résumé sur stderr avec nombre d'ignorés et sha256
-    res_ci = _run("scan", "--ci", "--config", "heimdall.toml", str(git_repo.root))
+    # 2. Mode --ci : avec --config externe explicite, résumé sur stderr
+    ext_ci_cfg = tmp_path / "ci_heimdall.toml"
+    ext_ci_cfg.write_text(
+        """
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "example-placeholders"
+description = "desc"
+patterns = ["^AKIA.*EXAMPLE$"]
+""",
+        encoding="utf-8",
+    )
+    res_ci = _run("scan", "--ci", "--config", str(ext_ci_cfg), str(git_repo.root))
     assert res_ci.exit_code == EXIT_CLEAN
     assert "1 ignoré(s) par l'allowlist (config sha256:" in res_ci.stderr
 
@@ -554,7 +565,7 @@ version = "1"
 [[allowlist.rules]]
 name = "custom-rule"
 description = "desc"
-keywords = ["example"]
+patterns = ["^AKIA.*EXAMPLE$"]
 """,
     )
     git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
@@ -602,7 +613,7 @@ def test_rule_description_too_long_rejected() -> None:
 
 
 def test_rule_matching_criteria_combinations() -> None:
-    """Teste les combinaisons de critères : secret_types, hashes, paths seuls."""
+    """Teste les combinaisons de critères : restrictions conjonctives de chemin et de type."""
     # Règle avec secret_types restreint
     r_type = AllowlistRule(
         name="aws-only",
@@ -623,45 +634,52 @@ def test_rule_matching_criteria_combinations() -> None:
         secret_type="aws",
     )
 
-    # Règle avec hashes restreints
-    r_hash = AllowlistRule(
-        name="hash-only",
-        description="desc",
-        hashes=("abcdef123456",),
-    )
-    assert not r_hash.matches(
-        value="any",
-        file_path="app.py",
-        line_number=1,
-        secret_type="aws",
-        snippet_hash="other_hash",
-    )
-    assert r_hash.matches(
-        value="any",
-        file_path="app.py",
-        line_number=1,
-        secret_type="aws",
-        snippet_hash="abcdef123456",
-    )
-
-    # Règle avec paths seulement (sans keywords ni patterns)
+    # Règle avec paths et keywords
     r_path = AllowlistRule(
         name="fixtures-dir",
         description="desc",
-        paths=("fixtures/**",),
+        paths=("fixtures/**", "**/fixtures/**"),
+        keywords=("sample",),
     )
     assert r_path.matches(
-        value="any_value",
+        value="sample",
         file_path="fixtures/test.json",
         line_number=1,
         secret_type="aws",
     )
     assert not r_path.matches(
-        value="any_value",
+        value="sample",
         file_path="src/app.py",
         line_number=1,
         secret_type="aws",
     )
+    assert not r_path.matches(
+        value="other_secret",
+        file_path="fixtures/test.json",
+        line_number=1,
+        secret_type="aws",
+    )
+
+
+def test_rule_must_have_value_criterion_rejects_paths_or_types_alone() -> None:
+    """Toute règle sans keywords ni patterns est refusée à la validation (fail-closed)."""
+    with pytest.raises(ScanError):
+        AllowlistRule(name="blind-paths", description="d", paths=("src/**",))
+    with pytest.raises(ScanError):
+        AllowlistRule(name="blind-types", description="d", secret_types=("aws",))
+    with pytest.raises(ScanError):
+        AllowlistRule(name="blind-both", description="d", paths=("src/**",), secret_types=("aws",))
+
+    bad_toml = """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "blind-rule"
+description = "d"
+paths = ["src/**"]
+"""
+    with pytest.raises(ScanError):
+        parse_allowlist_toml(bad_toml)
 
 
 def test_allowlist_is_empty() -> None:
@@ -858,8 +876,10 @@ keywords = ["AKIA"]
     assert "scan impossible" in res.stderr.lower() or "auto-attestation" in res.stderr.lower()
 
 
-def test_self_attestation_committed_heimdall_toml_in_ci_fails_loud(git_repo: GitRepo) -> None:
-    """En mode --ci, un heimdall.toml committé dans le dépôt exige --config explicite."""
+def test_self_attestation_committed_heimdall_toml_in_ci_fails_loud(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    """En mode --ci, un heimdall.toml committé dans le dépôt ne peut pas s'auto-attester."""
     git_repo.write(
         "heimdall.toml",
         """
@@ -885,9 +905,27 @@ patterns = ["^AKIA.*"]
     assert res_no_al.exit_code == EXIT_FINDINGS
     assert "1 secret(s) détecté(s)" in res_no_al.stderr
 
-    # 3. En --ci avec --config explicite : la configuration épinglée est acceptée
-    res_explicit = _run("scan", "--ci", "--config", "heimdall.toml", str(git_repo.root))
-    assert res_explicit.exit_code == EXIT_CLEAN
+    # 3. En --ci avec --config interne pointant dans le dépôt : refus fail-closed loud (code 2)
+    res_repo_cfg = _run("scan", "--ci", "--config", "heimdall.toml", str(git_repo.root))
+    assert res_repo_cfg.exit_code == EXIT_ERROR
+    err_lower = res_repo_cfg.stderr.lower()
+    assert "auto-attestation" in err_lower or "scan impossible" in err_lower
+
+    # 4. En --ci avec --config externe (hors dépôt attaqué) : accepté (code 0)
+    ext_config = tmp_path / "ci_approved.toml"
+    ext_config.write_text(
+        """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "ci-approved"
+description = "d"
+patterns = ["^AKIA.*"]
+""",
+        encoding="utf-8",
+    )
+    res_ext = _run("scan", "--ci", "--config", str(ext_config), str(git_repo.root))
+    assert res_ext.exit_code == EXIT_CLEAN
 
 
 def test_real_prod_password_with_dummy_or_fake_remains_detected() -> None:
@@ -957,10 +995,47 @@ def test_redos_dangerous_patterns_refused() -> None:
         r"\w+\w+",
         r"[0-9]+[0-9]+",
         "(a|b){2,5}",
+        "a*?",
+        "a+?",
+        "a?a?",
+        "(a?)+",
     ]
     for pattern in dangerous_patterns:
         with pytest.raises(ScanError):
             _compile_safe_regex(pattern)
+
+
+def test_example_substring_myexample_remains_detected() -> None:
+    """Une valeur se terminant par 'example' (ex: myexample) reste détectée (Invariant 1)."""
+    al = Allowlist.default()
+    assert (
+        al.evaluate(
+            value="myexample",
+            file="app.py",
+            line=1,
+            secret_type="password",
+        )
+        is None
+    )
+    assert (
+        al.evaluate(
+            value="not_an_example_token",
+            file="app.py",
+            line=2,
+            secret_type="password",
+        )
+        is None
+    )
+    # Le mot-clé exact ou délimité reste reconnu
+    assert (
+        al.evaluate(
+            value="example",
+            file="app.py",
+            line=3,
+            secret_type="password",
+        )
+        == "example-placeholders"
+    )
 
 
 def test_fuzz_patterns_and_paths() -> None:
@@ -1000,3 +1075,13 @@ patterns = ["^AKIA.*DUMMY.*$"]
     assert trace.file == "app.py"
     assert trace.line == 1
     assert "AKIA" not in str(trace.as_dict())
+
+    # Non-fuite absolue (CWE-200 / Invariant 8) dans toutes les sorties CLI (texte, JSON, stderr)
+    raw_secret = "AKIA0123456789DUMMY1"
+    res_text = _run("scan", str(git_repo.root))
+    assert raw_secret not in res_text.stdout
+    assert raw_secret not in res_text.stderr
+
+    res_json = _run("scan", "--json", str(git_repo.root))
+    assert raw_secret not in res_json.stdout
+    assert raw_secret not in res_json.stderr

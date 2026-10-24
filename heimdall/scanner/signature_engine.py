@@ -129,7 +129,7 @@ class SignatureEngine:
             ):
                 raise ScanError(_DEADLINE_ERROR)
             for match in find_signature_matches(line):
-                self._append(findings, seen, match, line_number, cible.path, line_text=line)
+                self._append(findings, seen, match, line_number, cible.path)
             following = self._joined_window(line, lines, index)
             if following is None:
                 continue
@@ -139,7 +139,7 @@ class SignatureEngine:
                 # à la ligne suivante : elle y sera déjà signalée.
                 if match.start >= limit:
                     continue
-                self._append(findings, seen, match, line_number, cible.path, line_text=joined)
+                self._append(findings, seen, match, line_number, cible.path)
         return findings
 
     def _joined_window(
@@ -174,15 +174,13 @@ class SignatureEngine:
             return None
         return joined, len(line)
 
-    def _append(  # noqa: PLR0913
+    def _append(
         self,
         findings: list[Finding],
         seen: set[tuple[int, str, str]],
         match: SignatureMatch,
         line_number: int,
         relative_path: str,
-        *,
-        line_text: str = "",
     ) -> None:
         # La valeur brute n'est **jamais conservée** : elle est hachée à la
         # volée, puis abandonnée. La clé de déduplication porte l'empreinte
@@ -212,8 +210,6 @@ class SignatureEngine:
                 file=relative_path,
                 line=line_number,
                 secret_type=match.secret_type,
-                line_text=line_text,
-                snippet_hash=snippet_hash,
             )
             if rule_name is not None:
                 self._traces.append(

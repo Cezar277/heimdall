@@ -47,7 +47,7 @@ from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding
-from heimdall.scanner.interface import FileTarget
+from heimdall.scanner.interface import FileTarget, _resolve_root
 from heimdall.scanner.interface import Scanner as TargetScanner
 from heimdall.scanner.signature_engine import SignatureEngine
 
@@ -198,19 +198,34 @@ def _guard_anti_self_attestation(
 ) -> None:
     """Protection anti auto-attestation (CWE-345).
 
-    1. En mode CI, la configuration du dépôt scanné ne peut pas s'auto-attester :
-       exiger --config explicite ou --no-allowlist si heimdall.toml existe dans le dépôt.
-    2. Si heimdall.toml fait partie des fichiers indexés modifiés/ajoutés et qu'aucune
-       config explicite externe n'est passée, fail-closed loud (code 2).
+    1. En mode CI, la configuration du dépôt scanné ne peut JAMAIS s'auto-attester :
+       - si --config est passé, il DOIT être situé hors du dépôt scanné.
+       - si aucun --config n'est passé et que heimdall.toml existe dans le dépôt,
+         refuser en code 2 (exiger --config externe ou --no-allowlist).
+    2. En mode hors CI, si heimdall.toml fait partie des fichiers indexés modifiés/ajoutés
+       et qu'aucune config explicite externe n'est passée, fail-closed loud (code 2).
     """
-    if custom_allowlist is not None or config is not None:
+    if custom_allowlist is not None:
         return
-    if ci and (root / "heimdall.toml").exists():
-        raise ScanError(
-            "auto-attestation refusée : en mode --ci, l'allowlist du dépôt exige "
-            "--config explicite ou --no-allowlist (CWE-345)"
-        )
-    if is_staged_modified:
+    if ci:
+        if config is None:
+            if (root / "heimdall.toml").exists():
+                raise ScanError(
+                    "auto-attestation refusée : en mode --ci, l'allowlist du dépôt exige "
+                    "--config externe ou --no-allowlist (CWE-345)"
+                )
+        else:
+            cfg_path = Path(config)
+            if not cfg_path.is_absolute():
+                cfg_path = root / cfg_path
+            resolved_cfg = _resolve_root(cfg_path)
+            if resolved_cfg.is_relative_to(root):
+                raise ScanError(
+                    "auto-attestation refusée : en mode --ci, la configuration ne peut pas "
+                    "provenir du dépôt scanné (CWE-345)"
+                )
+        return
+    if is_staged_modified and config is None:
         raise ScanError(
             "auto-attestation refusée : heimdall.toml est staged (CWE-345)"
         )
@@ -259,7 +274,7 @@ def _collect_tree(
     allowlist = (
         custom_allowlist
         if custom_allowlist is not None
-        else load_allowlist(access.root, config_file=config)
+        else load_allowlist(access.root, config_file=config, allow_external=ci)
     )
     scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
     findings = scanner.scan(deadline=deadline)
@@ -334,7 +349,7 @@ def _collect_staged(
     allowlist = (
         custom_allowlist
         if custom_allowlist is not None
-        else load_allowlist(access.root, config_file=config)
+        else load_allowlist(access.root, config_file=config, allow_external=ci)
     )
     # Même échéance que la passe : un blob dense est interrompu à l'intérieur,
     # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).

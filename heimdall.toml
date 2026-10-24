@@ -26,7 +26,7 @@ keywords = ["dummy"]
 [[allowlist.rules]]
 name = "test-fixtures"
 description = "Fixtures et valeurs factices explicites dans les répertoires et fichiers de test"
-paths = ["tests/**", "*_test.py", "test_*.py", "**/fixtures/**", "**/support/**"]
+paths = ["tests/**", "fixtures/**", "**/fixtures/**", "support/**", "**/support/**"]
 keywords = [
   "fake",
   "mock",
