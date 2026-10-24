@@ -138,6 +138,10 @@ def scan(  # noqa: PLR0913, PLR0917
     En cas de doute, **refus par défaut** : une entrée non analysable (racine
     absente, index en conflit, fichier illisible) sort en 2, jamais en 0.
     """
+    if config is not None and no_allowlist:
+        _echo_stderr_best_effort("options incompatibles : --config et --no-allowlist")
+        raise typer.Exit(code=2)
+
     try:
         custom_allowlist = Allowlist.empty() if no_allowlist else None
         report = collect(
@@ -158,9 +162,9 @@ def scan(  # noqa: PLR0913, PLR0917
             typer.echo(render_text(report))
         if ci:
             # Résumé déterministe sur stderr : le journal CI montre toujours
-            # le verdict, le nombre de findings ignorés et l'empreinte de config.
+            # le verdict, le nombre de findings ignorés et l'empreinte sha256 de config.
             hash_info = (
-                f" (config sha256:{report.config_hash[:16]})"
+                f" (config sha256:{report.config_hash})"
                 if report.config_hash
                 else ""
             )

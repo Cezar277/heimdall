@@ -60,9 +60,10 @@ from typing import Final
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.paths import is_rel_path
-from heimdall.scanner.detect import MAX_FILE_BYTES, _resolve_root
+from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import validate_relative_path
+from heimdall.scanner.interface import _resolve_root
 
 # Options NON négociables (contrat 4.1) — voir le tableau du contrat pour la
 # justification de chacune. `-C` place git dans la racine sans dépendre du

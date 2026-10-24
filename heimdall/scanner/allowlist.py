@@ -72,14 +72,17 @@ _RULE_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0
 #: 2. Les wildcards ou classes quantifiées sous quantificateur : `(.*a)+`, `(\w+)+`
 #: 3. La double quantification imbriquée : `(a+)+`
 #: 4. Les quantificateurs consécutifs : `a++`, `a**`
-#: 5. Les wildcards ou classes répétées consécutivement : `.*.*`, `\w+\w+`
+#: 5. Les quantificateurs répétés sur le même atome : `a*a*`, `.*.*`
+#: 6. Les classes de caractères quantifiées consécutives : `\d+\d+`, `\w+\w+`
+#: 7. Les classes entre crochets quantifiées consécutives : `[0-9]+[0-9]+`
 _REDOS_DANGEROUS_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\([^)]*\|[^)]*\)\s*([*+]|\{\d+,?\d*\})"),
     re.compile(r"\([^)]*\.[*+][^)]*\)\s*([*+]|\{\d+,?\d*\})"),
     re.compile(r"\([^)]*([*+]|\{\d+,?\d*\})[^)]*\)\s*([*+]|\{\d+,?\d*\})"),
     re.compile(r"([*+]|\{\d+,?\d*\})\s*([*+]|\{\d+,?\d*\})"),
-    re.compile(r"\.[*+]\s*\.[*+]"),
-    re.compile(r"\\[wdDsS][*+]\s*\\[wdDsS][*+]"),
+    re.compile(r"(.)[*+]\s*\1[*+]"),
+    re.compile(r"\\[dDwWsS][*+]\s*\\[dDwWsS][*+]"),
+    re.compile(r"\[[^\]]+\][*+]\s*\[[^\]]+\][*+]"),
 )
 
 _CONFIG_ERROR: Final[str] = "configuration allowlist invalide"
@@ -107,6 +110,33 @@ class AllowlistTrace:
 
     def as_dict(self) -> dict[str, object]:
         return {"rule": self.rule, "file": self.file, "line": self.line}
+
+
+def _keyword_matches_value(kw: str, value: str, has_paths: bool = False) -> bool:
+    """Vérifie si un mot-clé correspond à la valeur du secret (Invariant 1).
+
+    Pour éviter tout faux négatif sur un secret réel de production contenant
+    un mot-clé comme sous-chaîne (ex: mot de passe 'dummyP@ssw0rd!' ou
+    'prod_fake_token_123'), la correspondance exige :
+    - Soit l'égalité exacte insensible à la casse (ex: 'changeme', 'your_key_here')
+    - Soit la sous-chaîne terminale explicite 'example' (marqueurs AWS 'AKIA...EXAMPLE')
+    - Soit une frontière de mot complète '\\b' (ex: '\\bdummy\\b', '\\bfake\\b', 'admin:changeme')
+    - Pour les règles délimitées à un chemin (has_paths=True, ex: tests/**), les frontières
+      délimitées par les séparateurs de code classiques ([^a-zA-Z0-9]|^/$) comme 'fake_slack_token'
+    """
+    kw_cf = kw.casefold()
+    val_cf = value.casefold()
+    if val_cf == kw_cf:
+        return True
+    if kw_cf == "example" and val_cf.endswith("example"):
+        return True
+    if re.search(rf"\b{re.escape(kw_cf)}\b", val_cf):
+        return True
+    if has_paths and re.search(
+        rf"(?:[^a-zA-Z0-9]|^){re.escape(kw_cf)}(?:[^a-zA-Z0-9]|$)", val_cf
+    ):
+        return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,10 +215,14 @@ class AllowlistRule:
         if not self.keywords and not self.patterns:
             return True
 
-        # 5. Filtre par keywords et patterns — SUR VALUE UNIQUEMENT
-        val_cf = value.casefold()
+        # 5. Filtre par keywords et patterns — SUR VALUE UNIQUEMENT avec frontières de mots
+        has_paths = bool(self.paths)
         kw_match = bool(
-            self.keywords and any(kw.casefold() in val_cf for kw in self.keywords)
+            self.keywords
+            and any(
+                _keyword_matches_value(kw, value, has_paths=has_paths)
+                for kw in self.keywords
+            )
         )
         pat_match = bool(
             self.patterns and any(pattern.search(value) for pattern in self.patterns)
@@ -288,8 +322,8 @@ def create_default_rules() -> tuple[AllowlistRule, ...]:
     return (
         AllowlistRule(
             name="example-placeholders",
-            description="Mots-clés et jetons d'exemple (example, sample, your_key_here)",
-            keywords=("example", "sample", "your_key_here"),
+            description="Mots-clés et jetons d'exemple (AKIAIOSFODNN7EXAMPLE, example, sample)",
+            keywords=("AKIAIOSFODNN7EXAMPLE", "example", "sample", "your_key_here"),
         ),
         AllowlistRule(
             name="changeme-passwords",

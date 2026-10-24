@@ -160,7 +160,7 @@ def test_rule_changeme_passwords() -> None:
     ) == "changeme-passwords"
 
     assert al.evaluate(
-        value="admin:changeme123",
+        value="admin:changeme",
         file="docker-compose.yml",
         line=8,
         secret_type="password",
@@ -521,10 +521,10 @@ keywords = ["example"]
     assert "Allowlist : 1 finding(s) ignoré(s) :" in res.stdout
     assert "app.py:1  règle=example-placeholders" in res.stdout
 
-    # 2. Mode --ci : résumé sur stderr avec nombre d'ignorés
-    res_ci = _run("scan", "--ci", str(git_repo.root))
+    # 2. Mode --ci : avec --config explicite, résumé sur stderr avec nombre d'ignorés et sha256
+    res_ci = _run("scan", "--ci", "--config", "heimdall.toml", str(git_repo.root))
     assert res_ci.exit_code == EXIT_CLEAN
-    assert "1 ignoré(s) par l'allowlist" in res_ci.stderr
+    assert "1 ignoré(s) par l'allowlist (config sha256:" in res_ci.stderr
 
     # 3. Mode --json : sortie JSON valide
     res_json = _run("scan", "--json", str(git_repo.root))
@@ -858,6 +858,91 @@ keywords = ["AKIA"]
     assert "scan impossible" in res.stderr.lower() or "auto-attestation" in res.stderr.lower()
 
 
+def test_self_attestation_committed_heimdall_toml_in_ci_fails_loud(git_repo: GitRepo) -> None:
+    """En mode --ci, un heimdall.toml committé dans le dépôt exige --config explicite."""
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "hostile-bypass"
+description = "d"
+patterns = ["^AKIA.*"]
+""",
+    )
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("heimdall.toml", "app.py")
+    git_repo.commit_all("feat: hostile bypass committed")
+
+    # 1. En --ci par défaut (sans --config) : refus fail-closed loud (code 2)
+    res_ci = _run("scan", "--ci", str(git_repo.root))
+    assert res_ci.exit_code == EXIT_ERROR
+    assert "auto-attestation" in res_ci.stderr.lower() or "scan impossible" in res_ci.stderr.lower()
+
+    # 2. En --ci avec --no-allowlist : le secret est bien détecté (code 1)
+    res_no_al = _run("scan", "--ci", "--no-allowlist", str(git_repo.root))
+    assert res_no_al.exit_code == EXIT_FINDINGS
+    assert "1 secret(s) détecté(s)" in res_no_al.stderr
+
+    # 3. En --ci avec --config explicite : la configuration épinglée est acceptée
+    res_explicit = _run("scan", "--ci", "--config", "heimdall.toml", str(git_repo.root))
+    assert res_explicit.exit_code == EXIT_CLEAN
+
+
+def test_real_prod_password_with_dummy_or_fake_remains_detected() -> None:
+    """Un secret de prod contenant 'dummy' ou 'fake' comme sous-chaîne reste détecté (CWE-200)."""
+    al = Allowlist(
+        [
+            AllowlistRule(
+                name="dummy-tokens",
+                description="tokens factices",
+                keywords=("dummy", "fake"),
+            )
+        ]
+    )
+    # 1. Mot de passe de prod avec 'dummy' dans la chaîne
+    assert (
+        al.evaluate(
+            value="prod_dummy_password_12345",
+            file="prod.env",
+            line=1,
+            secret_type="password",
+        )
+        is None
+    )
+
+    # 2. Mot de passe de prod avec 'fake'
+    assert (
+        al.evaluate(
+            value="fakePassword999!",
+            file="prod.env",
+            line=2,
+            secret_type="password",
+        )
+        is None
+    )
+
+    # 3. Valeur exacte 'dummy' : reconnue
+    assert (
+        al.evaluate(
+            value="dummy",
+            file="test.py",
+            line=3,
+            secret_type="password",
+        )
+        == "dummy-tokens"
+    )
+
+
+def test_cli_scan_incompatible_config_and_no_allowlist(git_repo: GitRepo) -> None:
+    """--config et --no-allowlist combinés lèvent une erreur explicite (code 2)."""
+    git_repo.write("custom.toml", '[allowlist]\nversion = "1"\n')
+    res = _run("scan", "--config", "custom.toml", "--no-allowlist", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "options incompatibles" in res.stderr
+
+
 def test_redos_dangerous_patterns_refused() -> None:
     """Vérifie le rejet des constructions regex à risque ReDoS (CWE-1333)."""
     dangerous_patterns = [
@@ -867,7 +952,10 @@ def test_redos_dangerous_patterns_refused() -> None:
         "a++",
         "(a+)+",
         ".*.*",
+        "a*a*",
+        r"\d+\d+",
         r"\w+\w+",
+        r"[0-9]+[0-9]+",
         "(a|b){2,5}",
     ]
     for pattern in dangerous_patterns:
@@ -897,7 +985,7 @@ version = "1"
 [[allowlist.rules]]
 name = "dummy-tokens"
 description = "tokens factices"
-keywords = ["dummy"]
+patterns = ["^AKIA.*DUMMY.*$"]
 """
     git_repo.write("heimdall.toml", toml_content)
     git_repo.write("app.py", 'KEY = "AKIA0123456789DUMMY1"\n')

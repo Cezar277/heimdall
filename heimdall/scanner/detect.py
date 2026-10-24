@@ -53,7 +53,7 @@ from heimdall.scanner.finding import (
     validate_relative_path,
 )
 from heimdall.scanner.hashing import SnippetHasher
-from heimdall.scanner.interface import _open_flags as _open_flags, _resolve_root as _resolve_root
+from heimdall.scanner.interface import _open_flags, _resolve_root
 from heimdall.scanner.signature_engine import MAX_FINDINGS
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 

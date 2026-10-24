@@ -188,6 +188,34 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
         raise ScanError(_MSG_ROOT_CHANGED)
 
 
+def _guard_anti_self_attestation(
+    root: Path,
+    *,
+    ci: bool,
+    config: str | Path | None,
+    custom_allowlist: Allowlist | None,
+    is_staged_modified: bool,
+) -> None:
+    """Protection anti auto-attestation (CWE-345).
+
+    1. En mode CI, la configuration du dépôt scanné ne peut pas s'auto-attester :
+       exiger --config explicite ou --no-allowlist si heimdall.toml existe dans le dépôt.
+    2. Si heimdall.toml fait partie des fichiers indexés modifiés/ajoutés et qu'aucune
+       config explicite externe n'est passée, fail-closed loud (code 2).
+    """
+    if custom_allowlist is not None or config is not None:
+        return
+    if ci and (root / "heimdall.toml").exists():
+        raise ScanError(
+            "auto-attestation refusée : en mode --ci, l'allowlist du dépôt exige "
+            "--config explicite ou --no-allowlist (CWE-345)"
+        )
+    if is_staged_modified:
+        raise ScanError(
+            "auto-attestation refusée : heimdall.toml est staged (CWE-345)"
+        )
+
+
 def _collect_tree(
     root: Path,
     *,
@@ -215,18 +243,18 @@ def _collect_tree(
     if not access.is_repository(timeout=_call_timeout(deadline)):
         raise ScanError(_MSG_NOT_A_REPO)
 
-    # Protection anti auto-attestation (CWE-345) :
-    # Si heimdall.toml fait partie des fichiers indexés modifiés/ajoutés et qu'aucune
-    # config explicite externe n'est passée, fail-closed loud (code 2).
-    if custom_allowlist is None and config is None:
-        staged_changes = access.staged_changes(timeout=_call_timeout(deadline))
-        if any(
-            change.path == "heimdall.toml" or change.path.endswith("/heimdall.toml")
-            for change in staged_changes
-        ):
-            raise ScanError(
-                "auto-attestation refusée : heimdall.toml est staged (CWE-345)"
-            )
+    staged_changes = access.staged_changes(timeout=_call_timeout(deadline))
+    is_staged_modified = any(
+        change.path == "heimdall.toml" or change.path.endswith("/heimdall.toml")
+        for change in staged_changes
+    )
+    _guard_anti_self_attestation(
+        access.root,
+        ci=ci,
+        config=config,
+        custom_allowlist=custom_allowlist,
+        is_staged_modified=is_staged_modified,
+    )
 
     allowlist = (
         custom_allowlist
@@ -291,17 +319,17 @@ def _collect_staged(
     if len(changes) > MAX_STAGED_FILES:
         raise ScanError(_MSG_TOO_MANY_FILES)
 
-    # Protection anti auto-attestation (CWE-345) en mode staged :
-    # Si heimdall.toml fait partie des fichiers indexés modifiés/ajoutés et que
-    # la configuration n'est pas fournie explicitement hors dépôt, fail-closed immédiat (code 2).
-    if custom_allowlist is None and config is None:
-        if any(
-            change.path == "heimdall.toml" or change.path.endswith("/heimdall.toml")
-            for change in changes
-        ):
-            raise ScanError(
-                "auto-attestation refusée : heimdall.toml est staged (CWE-345)"
-            )
+    is_staged_modified = any(
+        change.path == "heimdall.toml" or change.path.endswith("/heimdall.toml")
+        for change in changes
+    )
+    _guard_anti_self_attestation(
+        access.root,
+        ci=ci,
+        config=config,
+        custom_allowlist=custom_allowlist,
+        is_staged_modified=is_staged_modified,
+    )
 
     allowlist = (
         custom_allowlist

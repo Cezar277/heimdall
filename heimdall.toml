@@ -11,7 +11,7 @@ version = "1"
 [[allowlist.rules]]
 name = "example-placeholders"
 description = "Mots-clés et jetons d'exemple évidents (ex: AKIA...EXAMPLE, your_key_here)"
-keywords = ["example", "sample", "your_key_here"]
+keywords = ["AKIAIOSFODNN7EXAMPLE", "example", "sample", "your_key_here"]
 
 [[allowlist.rules]]
 name = "changeme-passwords"
