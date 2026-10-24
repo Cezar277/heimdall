@@ -145,6 +145,7 @@ def scan(  # noqa: PLR0913, PLR0917
             staged=staged,
             config=config,
             allowlist=custom_allowlist,
+            ci=ci,
         )
         # Le **rendu** et le résumé --ci sont dans le même try que la
         # collecte : un échec de rendu (bug futur, panne mémoire, écriture
@@ -157,11 +158,16 @@ def scan(  # noqa: PLR0913, PLR0917
             typer.echo(render_text(report))
         if ci:
             # Résumé déterministe sur stderr : le journal CI montre toujours
-            # le verdict et le nombre de findings ignorés.
+            # le verdict, le nombre de findings ignorés et l'empreinte de config.
+            hash_info = (
+                f" (config sha256:{report.config_hash[:16]})"
+                if report.config_hash
+                else ""
+            )
             typer.echo(
                 f"heimdall scan : périmètre {report.scope}, "
                 f"{len(report.findings)} secret(s) détecté(s), "
-                f"{report.ignored_count} ignoré(s) par l'allowlist.",
+                f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}.",
                 err=True,
             )
     except (ScanError, ToolFailure):

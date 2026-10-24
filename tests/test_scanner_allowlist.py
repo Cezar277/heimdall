@@ -136,14 +136,17 @@ def test_rule_example_placeholders() -> None:
         secret_type="api_key",
     ) == "example-placeholders"
 
-    # Dans la ligne
-    assert al.evaluate(
-        value="unrelated_string",
-        file="app.py",
-        line=5,
-        secret_type="aws",
-        line_text="EXAMPLE_AWS_KEY = 'unrelated_string'",
-    ) == "example-placeholders"
+    # Dans la ligne uniquement (ne doit PAS matcher pour éviter tout contournement par commentaire)
+    assert (
+        al.evaluate(
+            value="unrelated_string",
+            file="app.py",
+            line=5,
+            secret_type="aws",
+            line_text="EXAMPLE_AWS_KEY = 'unrelated_string'",
+        )
+        is None
+    )
 
 
 def test_rule_changeme_passwords() -> None:
@@ -440,9 +443,12 @@ description = "Exemple"
 keywords = ["example"]
 """,
     )
+    # Committer heimdall.toml pour qu'il soit une configuration de dépôt validée
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: add allowlist")
     # Fichier avec une clé contenant 'EXAMPLE'
     git_repo.write("app.py", 'FAKE_KEY = "AKIAIOSFODNN7EXAMPLE"\n')
-    git_repo.stage("heimdall.toml", "app.py")
+    git_repo.stage("app.py")
 
     # 1. Scan working-tree avec allowlist active -> code 0 (propre), 1 ignoré
     report = collect(git_repo.root, staged=False)
@@ -503,8 +509,11 @@ description = "desc"
 keywords = ["example"]
 """,
     )
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: add allowlist")
     git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
-    git_repo.stage("heimdall.toml", "app.py")
+    git_repo.stage("app.py")
+    git_repo.commit_all("feat: app")
 
     # 1. Scan texte par défaut : code 0, affiche le nombre et la trace
     res = _run("scan", str(git_repo.root))
@@ -526,6 +535,7 @@ keywords = ["example"]
     assert doc["traces"] == [
         {"rule": "example-placeholders", "file": "app.py", "line": 1}
     ]
+    assert doc["config_hash"] is not None and len(doc["config_hash"]) == 64
 
     # 4. Mode --no-allowlist : le secret n'est pas ignoré -> sortie code 1
     res_no_al = _run("scan", "--no-allowlist", str(git_repo.root))
@@ -748,3 +758,157 @@ def test_load_allowlist_invalid_utf8(tmp_path: Path) -> None:
         load_allowlist_from_file(bad_utf8)
 
 
+def test_comment_bypass_abuse_prevented(git_repo: GitRepo) -> None:
+    """Un vrai secret avec # dummy ou # example sur la même ligne reste détecté (CWE-200)."""
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "dummy-tokens"
+description = "tokens factices"
+keywords = ["dummy"]
+
+[[allowlist.rules]]
+name = "example-placeholders"
+description = "placeholders"
+keywords = ["example"]
+""",
+    )
+    # Vrai secret AWS (synthétique sans dummy/example dans la valeur) + commentaire piège
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"  # dummy example changeme token\n')
+    git_repo.stage("app.py")
+
+    # Mode staged : doit détecter le secret (exit 1) et ne pas le bypasser
+    res_staged = _run("scan", "--staged", str(git_repo.root))
+    assert res_staged.exit_code == EXIT_FINDINGS
+    assert "1 secret(s) détecté(s) :" in res_staged.stdout
+
+    # Mode arbre : doit aussi détecter le secret (exit 1)
+    res_tree = _run("scan", str(git_repo.root))
+    assert res_tree.exit_code == EXIT_FINDINGS
+    assert "1 secret(s) détecté(s) :" in res_tree.stdout
+
+
+def test_substring_keyword_in_tests_does_not_mask_real_secret(git_repo: GitRepo) -> None:
+    """latest/contest sous tests/ ne doit pas matcher 'test' et ignorer un vrai secret."""
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "test-fixtures"
+description = "fixtures factices"
+paths = ["tests/**"]
+keywords = ["fake", "mock", "dummy", "placeholder", "synthetic", "factice", "fixture"]
+""",
+    )
+    git_repo.write("tests/test_foo.py", 'latest_token = "AKIA0123456789ABCDEF"\n')
+    git_repo.write("tests/contest.py", 'contest_key = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("tests/test_foo.py", "tests/contest.py")
+
+    res = _run("scan", str(git_repo.root))
+    assert res.exit_code == EXIT_FINDINGS
+    assert "2 secret(s) détecté(s) :" in res.stdout
+
+
+def test_self_attestation_staged_modifying_heimdall_toml_fails_loud(git_repo: GitRepo) -> None:
+    """Stager une modification de heimdall.toml lève ScanError (code 2, fail-closed)."""
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "bypass"
+description = "d"
+keywords = ["AKIA"]
+""",
+    )
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("heimdall.toml", "app.py")
+
+    res = _run("scan", "--staged", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "scan impossible" in res.stderr.lower() or "auto-attestation" in res.stderr.lower()
+
+
+def test_self_attestation_tree_modifying_heimdall_toml_fails_loud(git_repo: GitRepo) -> None:
+    """Stager heimdall.toml et scanner l'arbre lève ScanError (code 2, CWE-345)."""
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "bypass"
+description = "d"
+keywords = ["AKIA"]
+""",
+    )
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("heimdall.toml", "app.py")
+
+    res = _run("scan", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "scan impossible" in res.stderr.lower() or "auto-attestation" in res.stderr.lower()
+
+
+def test_redos_dangerous_patterns_refused() -> None:
+    """Vérifie le rejet des constructions regex à risque ReDoS (CWE-1333)."""
+    dangerous_patterns = [
+        "(a|aa)+",
+        "(.*a)+",
+        "(a|a)+",
+        "a++",
+        "(a+)+",
+        ".*.*",
+        r"\w+\w+",
+        "(a|b){2,5}",
+    ]
+    for pattern in dangerous_patterns:
+        with pytest.raises(ScanError):
+            _compile_safe_regex(pattern)
+
+
+def test_fuzz_patterns_and_paths() -> None:
+    """Fuzzing défensif sur les motifs de chemins et regex (CWE-22, CWE-20)."""
+    # Chemins hostiles
+    for bad_path in ["../secret.txt", "/etc/passwd", "tests/../../etc", "a\x00b", "a\nb"]:
+        with pytest.raises(ScanError):
+            _validate_path_pattern(bad_path)
+
+    # Regex hostiles
+    for bad_regex in ["a" * 129, "a\x00b", ""]:
+        with pytest.raises(ScanError):
+            _compile_safe_regex(bad_regex)
+
+
+def test_contract_scan_report_ignored_count_and_config_hash(git_repo: GitRepo) -> None:
+    """Invariants du rapport : ignored_count == len(traces), config_hash déterministe."""
+    toml_content = """
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "dummy-tokens"
+description = "tokens factices"
+keywords = ["dummy"]
+"""
+    git_repo.write("heimdall.toml", toml_content)
+    git_repo.write("app.py", 'KEY = "AKIA0123456789DUMMY1"\n')
+
+    report = collect(git_repo.root, staged=False)
+    assert report.ignored_count == len(report.traces) == 1
+    assert report.config_hash is not None
+    assert len(report.config_hash) == 64
+    # La trace ne contient que règle, fichier, ligne — JAMAIS la valeur candidate
+    trace = report.traces[0]
+    assert trace.rule == "dummy-tokens"
+    assert trace.file == "app.py"
+    assert trace.line == 1
+    assert "AKIA" not in str(trace.as_dict())

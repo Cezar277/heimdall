@@ -9,23 +9,29 @@ Invariants de sécurité :
   Chaque rejet émet une trace contenant exactement : règle, fichier, ligne.
 - Confidentialité (invariant 8) : aucun secret ou extrait de secret n'est
   jamais reflété dans les traces, les journaux ou les rapports.
+- Absence de contournement par commentaire (invariant 1) : les mots-clés et
+  motifs ne sont évalués que sur la valeur candidate du secret, JAMAIS sur le
+  texte complet de la ligne.
 - Confinement strict (CWE-22) : le fichier de configuration et les motifs
   de chemins ne peuvent pas traverser hors du dépôt (refus des `..`, des
-  liens symboliques et des chemins absolus).
+  liens symboliques et des chemins absolus via la garde centrale `_resolve_root`).
 - Anti-DDoS / Anti-ReDoS (CWE-400, CWE-1333) : la taille du fichier TOML
   est plafonnée (64 Kio), le nombre de règles et de motifs est borné,
-  et les regex sont vérifiées contre les quantificateurs imbriqués.
+  et les regex sont vérifiées contre toute alternance ou répétition imbriquée.
 - Fail-closed (REQ-SEC-07) : toute configuration invalide, corrompue,
   inconnue ou inaccessible lève ``ScanError`` (code 2), jamais un passage
   silencieux.
-- Piège évité : aucun allowlist aveugle de `tests/` ; un vrai secret placé
-  dans un fichier de test reste détecté s'il ne correspond pas à une règle
+- Anti auto-attestation (CWE-345) : une modification de `heimdall.toml` dans
+  les changements scannés en CI/staged est refusée loud (code 2).
+- Piège évité (CWE-1188) : aucun allowlist aveugle de `tests/` ; un vrai secret
+  placé dans un fichier de test reste détecté s'il ne correspond pas à une règle
   spécifique de valeurs factices.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import logging
 import os
 import re
@@ -43,6 +49,7 @@ else:
 
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import MAX_PATH_LENGTH
+from heimdall.scanner.interface import _open_flags, _resolve_root
 
 logger = logging.getLogger("heimdall.scanner.allowlist")
 
@@ -52,16 +59,27 @@ MAX_CONFIG_BYTES: Final[int] = 65_536
 #: Plafonds de complexité pour prévenir les abus de configuration.
 MAX_RULES: Final[int] = 100
 MAX_ITEMS_PER_RULE: Final[int] = 50
-MAX_PATTERN_LENGTH: Final[int] = 256
+MAX_PATTERN_LENGTH: Final[int] = 128
 MAX_RULE_NAME_LENGTH: Final[int] = 64
 MAX_DESCRIPTION_LENGTH: Final[int] = 512
 
 #: Validation stricte de l'identifiant de règle (nom ASCII sécurisé).
 _RULE_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
-#: Détection basique de motifs regex à risque de backtracking catastrophique.
-_REDOS_DANGEROUS_RE: Final[re.Pattern[str]] = re.compile(
-    r"(\([^)]*[+*]\)[+*]|\.[+*]\.[+*]|\\[wdDsS][+*]\\[wdDsS][+*])"
+#: Détection rigoureuse de constructions regex à risque de backtracking catastrophique (CWE-1333).
+#: Interdit :
+#: 1. L'alternance sous quantificateur : `(a|b)+`, `(a|aa)+`, `(a|b){2,}`
+#: 2. Les wildcards ou classes quantifiées sous quantificateur : `(.*a)+`, `(\w+)+`
+#: 3. La double quantification imbriquée : `(a+)+`
+#: 4. Les quantificateurs consécutifs : `a++`, `a**`
+#: 5. Les wildcards ou classes répétées consécutivement : `.*.*`, `\w+\w+`
+_REDOS_DANGEROUS_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"\([^)]*\|[^)]*\)\s*([*+]|\{\d+,?\d*\})"),
+    re.compile(r"\([^)]*\.[*+][^)]*\)\s*([*+]|\{\d+,?\d*\})"),
+    re.compile(r"\([^)]*([*+]|\{\d+,?\d*\})[^)]*\)\s*([*+]|\{\d+,?\d*\})"),
+    re.compile(r"([*+]|\{\d+,?\d*\})\s*([*+]|\{\d+,?\d*\})"),
+    re.compile(r"\.[*+]\s*\.[*+]"),
+    re.compile(r"\\[wdDsS][*+]\s*\\[wdDsS][*+]"),
 )
 
 _CONFIG_ERROR: Final[str] = "configuration allowlist invalide"
@@ -97,8 +115,8 @@ class AllowlistRule:
 
     Une règle est constituée d'un nom unique, d'une description et d'au moins
     un critère de correspondance parmi :
-    - `keywords` : sous-chaînes insensibles à la casse (ex. 'example', 'dummy')
-    - `patterns` : expressions régulières compilées linéaires
+    - `keywords` : sous-chaînes sur la valeur du secret (ex. 'example', 'dummy')
+    - `patterns` : expressions régulières compilées linéaires sur la valeur
     - `paths` : motifs glob POSIX relatifs (ex. 'tests/**', '*_test.py')
     - `secret_types` : types de secrets restreints (ex. 'aws', 'stripe')
     - `hashes` : empreintes HMAC-SHA-256 exactes autorisées
@@ -114,6 +132,8 @@ class AllowlistRule:
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _RULE_NAME_RE.fullmatch(self.name):
+            raise ScanError(_CONFIG_ERROR)
+        if len(self.name) > MAX_RULE_NAME_LENGTH:
             raise ScanError(_CONFIG_ERROR)
         if not isinstance(self.description, str) or not self.description:
             raise ScanError(_CONFIG_ERROR)
@@ -136,7 +156,13 @@ class AllowlistRule:
         line_text: str = "",
         snippet_hash: str = "",
     ) -> bool:
-        """Détermine si un candidat satisfait tous les critères de la règle."""
+        """Détermine si un candidat satisfait tous les critères de la règle.
+
+        Important (sécurité) : les mots-clés et patterns ne sont vérifiés
+        QUE sur `value` (le secret candidat), JAMAIS sur `line_text`. Cela
+        interdit tout contournement par ajout d'un commentaire en fin de ligne
+        (ex: `key = "AKIA...REEL" # dummy`).
+        """
         # 1. Filtre par chemin (si spécifié)
         if self.paths:
             path_matched = any(
@@ -159,22 +185,13 @@ class AllowlistRule:
         if not self.keywords and not self.patterns:
             return True
 
-        # 5. Filtre par keywords et patterns
+        # 5. Filtre par keywords et patterns — SUR VALUE UNIQUEMENT
         val_cf = value.casefold()
-        line_cf = line_text.casefold()
         kw_match = bool(
-            self.keywords
-            and any(
-                kw.casefold() in val_cf or (line_cf and kw.casefold() in line_cf)
-                for kw in self.keywords
-            )
+            self.keywords and any(kw.casefold() in val_cf for kw in self.keywords)
         )
         pat_match = bool(
-            self.patterns
-            and any(
-                pattern.search(value) or (line_text and pattern.search(line_text))
-                for pattern in self.patterns
-            )
+            self.patterns and any(pattern.search(value) for pattern in self.patterns)
         )
         return kw_match or pat_match
 
@@ -186,9 +203,14 @@ class Allowlist:
     structurée pour chaque candidat rejeté.
     """
 
-    __slots__ = ("_rules", "_rules_by_name")
+    __slots__ = ("_rules", "_rules_by_name", "_sha256")
 
-    def __init__(self, rules: Sequence[AllowlistRule] = ()) -> None:
+    def __init__(
+        self,
+        rules: Sequence[AllowlistRule] = (),
+        *,
+        sha256: str | None = None,
+    ) -> None:
         names: set[str] = set()
         validated: list[AllowlistRule] = []
         for rule in rules:
@@ -200,10 +222,16 @@ class Allowlist:
             validated.append(rule)
         self._rules: tuple[AllowlistRule, ...] = tuple(validated)
         self._rules_by_name: dict[str, AllowlistRule] = {r.name: r for r in self._rules}
+        self._sha256 = sha256
 
     @property
     def rules(self) -> tuple[AllowlistRule, ...]:
         return self._rules
+
+    @property
+    def sha256(self) -> str | None:
+        """Empreinte SHA-256 du fichier de configuration ayant produit cette allowlist."""
+        return self._sha256
 
     def is_empty(self) -> bool:
         return len(self._rules) == 0
@@ -241,12 +269,12 @@ class Allowlist:
     @classmethod
     def empty(cls) -> Allowlist:
         """Allowlist vide : aucun candidat n'est ignoré."""
-        return cls(())
+        return cls((), sha256=None)
 
     @classmethod
     def default(cls) -> Allowlist:
         """Allowlist par défaut contenant les 4 règles standard (#24)."""
-        return cls(create_default_rules())
+        return cls(create_default_rules(), sha256=None)
 
 
 def create_default_rules() -> tuple[AllowlistRule, ...]:
@@ -275,10 +303,9 @@ def create_default_rules() -> tuple[AllowlistRule, ...]:
         ),
         AllowlistRule(
             name="test-fixtures",
-            description="Valeurs factices et corpus délimités dans les tests",
+            description="Valeurs factices et fixtures délimitées dans les tests",
             paths=("tests/**", "*_test.py", "test_*.py", "**/fixtures/**", "**/support/**"),
             keywords=(
-                "test",
                 "fake",
                 "mock",
                 "dummy",
@@ -286,8 +313,6 @@ def create_default_rules() -> tuple[AllowlistRule, ...]:
                 "synthetic",
                 "factice",
                 "fixture",
-                "expected",
-                "invalid",
             ),
         ),
     )
@@ -310,13 +335,16 @@ def _validate_path_pattern(pattern: str) -> str:
 
 
 def _compile_safe_regex(raw: str) -> re.Pattern[str]:
-    """Compile une regex avec vérification anti-ReDoS élémentaire."""
+    """Compile une regex avec vérification anti-ReDoS élémentaire (CWE-1333)."""
     if not isinstance(raw, str) or not raw:
         raise ScanError(_CONFIG_ERROR)
     if len(raw) > MAX_PATTERN_LENGTH:
         raise ScanError(_CONFIG_ERROR)
-    if _REDOS_DANGEROUS_RE.search(raw):
+    if "\x00" in raw:
         raise ScanError(_CONFIG_ERROR)
+    for dangerous in _REDOS_DANGEROUS_PATTERNS:
+        if dangerous.search(raw):
+            raise ScanError(_CONFIG_ERROR)
     try:
         return re.compile(raw)
     except re.error:
@@ -345,6 +373,8 @@ def _parse_str_list(raw_dict: dict[str, object], field: str) -> tuple[str, ...]:
     res: list[str] = []
     for item in items:
         if not isinstance(item, str) or not item or len(item) > MAX_PATTERN_LENGTH:
+            raise ScanError(_CONFIG_ERROR)
+        if "\x00" in item:
             raise ScanError(_CONFIG_ERROR)
         res.append(item)
     return tuple(res)
@@ -386,7 +416,7 @@ def _parse_rule_dict(raw_rule: object) -> AllowlistRule:
     )
 
 
-def parse_allowlist_toml(content: str) -> Allowlist:
+def parse_allowlist_toml(content: str, *, sha256: str | None = None) -> Allowlist:
     """Parse et valide le document TOML d'allowlist."""
     try:
         data = tomllib.loads(content)
@@ -400,7 +430,6 @@ def parse_allowlist_toml(content: str) -> Allowlist:
     if not isinstance(allowlist_table, dict):
         raise ScanError(_CONFIG_ERROR)
 
-    # Vérification des clés de la table [allowlist]
     allowed_allowlist_keys = {"version", "rules"}
     if not set(allowlist_table.keys()).issubset(allowed_allowlist_keys):
         raise ScanError(_CONFIG_ERROR)
@@ -416,51 +445,48 @@ def parse_allowlist_toml(content: str) -> Allowlist:
         raise ScanError(_CONFIG_ERROR)
 
     rules = [_parse_rule_dict(raw) for raw in raw_rules]
-    return Allowlist(rules)
+    return Allowlist(rules, sha256=sha256)
 
 
 def load_allowlist_from_file(config_path: Path, *, repo_root: Path | None = None) -> Allowlist:
-    """Charge l'allowlist depuis un fichier TOML en appliquant les contrôles de sécurité.
+    """Charge l'allowlist depuis un fichier TOML en réutilisant la garde unique (`_resolve_root`).
 
-    - Vérification anti-symlink (sur le fichier ET ses répertoires ancêtres)
+    - Vérification anti-symlink sur le fichier et tous ses parents via `_resolve_root`
     - Confinement sous repo_root si fourni
-    - Plafond de taille borné (MAX_CONFIG_BYTES)
+    - Ouverture par descripteur O_NOFOLLOW / O_CLOEXEC
+    - Plafond de taille borné (MAX_CONFIG_BYTES) vérifié par fstat
     - Décodage strict UTF-8
+    - Calcul déterministe de l'empreinte SHA-256
     """
+    resolved = _resolve_root(config_path)
+    if repo_root is not None:
+        resolved_root = _resolve_root(repo_root)
+        if not resolved.is_relative_to(resolved_root):
+            raise ScanError(_CONFIG_ERROR)
+
     try:
-        if not config_path.exists():
-            raise ScanError(_CONFIG_ERROR)
-
-        # Vérification des liens symboliques
-        if config_path.is_symlink():
-            raise ScanError(_CONFIG_ERROR)
-        for parent in config_path.parents:
-            if parent.is_symlink():
-                raise ScanError(_CONFIG_ERROR)
-
-        resolved = config_path.resolve(strict=True)
-        if repo_root is not None:
-            resolved_root = repo_root.resolve(strict=True)
-            if not resolved.is_relative_to(resolved_root):
-                raise ScanError(_CONFIG_ERROR)
-
-        file_stat = os.stat(config_path, follow_symlinks=False)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ScanError(_CONFIG_ERROR)
-        if file_stat.st_size > MAX_CONFIG_BYTES:
-            raise ScanError(_CONFIG_ERROR)
-
-        raw_bytes = config_path.read_bytes()
-        try:
-            content = raw_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            raise ScanError(_CONFIG_ERROR) from None
-
-        return parse_allowlist_toml(content)
-    except (OSError, RuntimeError) as exc:
-        if isinstance(exc, ScanError):
-            raise
+        descriptor = os.open(resolved, _open_flags())
+    except OSError:
         raise ScanError(_CONFIG_ERROR) from None
+
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > MAX_CONFIG_BYTES:
+            raise ScanError(_CONFIG_ERROR)
+
+        raw_bytes = os.read(descriptor, MAX_CONFIG_BYTES + 1)
+        if len(raw_bytes) > MAX_CONFIG_BYTES:
+            raise ScanError(_CONFIG_ERROR)
+    finally:
+        os.close(descriptor)
+
+    try:
+        content = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ScanError(_CONFIG_ERROR) from None
+
+    config_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    return parse_allowlist_toml(content, sha256=config_sha256)
 
 
 def load_allowlist(root: Path, config_file: str | Path | None = None) -> Allowlist:
@@ -471,10 +497,7 @@ def load_allowlist(root: Path, config_file: str | Path | None = None) -> Allowli
     Si `config_file` n'est pas fourni, recherche `heimdall.toml` à la racine de `root`.
     Si `heimdall.toml` n'existe pas, retourne une Allowlist vide.
     """
-    try:
-        resolved_root = root.resolve(strict=True)
-    except (OSError, RuntimeError):
-        raise ScanError(_CONFIG_ERROR) from None
+    resolved_root = _resolve_root(root)
 
     if config_file is not None:
         target = Path(config_file)
@@ -484,7 +507,7 @@ def load_allowlist(root: Path, config_file: str | Path | None = None) -> Allowli
 
     default_config = resolved_root / "heimdall.toml"
     try:
-        if not default_config.is_file() or default_config.is_symlink():
+        if not default_config.exists():
             return Allowlist.empty()
     except OSError:
         return Allowlist.empty()
@@ -494,6 +517,8 @@ def load_allowlist(root: Path, config_file: str | Path | None = None) -> Allowli
 
 __all__ = [
     "MAX_CONFIG_BYTES",
+    "MAX_PATTERN_LENGTH",
+    "MAX_RULES",
     "Allowlist",
     "AllowlistRule",
     "AllowlistTrace",

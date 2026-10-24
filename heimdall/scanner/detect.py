@@ -35,7 +35,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
-from heimdall.scanner.allowlist import Allowlist, AllowlistTrace, load_allowlist
+from heimdall.scanner.allowlist import Allowlist, AllowlistTrace
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import (
@@ -53,8 +53,20 @@ from heimdall.scanner.finding import (
     validate_relative_path,
 )
 from heimdall.scanner.hashing import SnippetHasher
+from heimdall.scanner.interface import _open_flags as _open_flags, _resolve_root as _resolve_root
 from heimdall.scanner.signature_engine import MAX_FINDINGS
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
+
+
+def _raise_walk_error(_error: OSError) -> None:
+    raise ScanError(_SCAN_ERROR)
+
+
+def _not_link(p: Path) -> bool:
+    try:
+        return not p.is_symlink()
+    except OSError:
+        raise ScanError(_SCAN_ERROR) from None
 
 MAX_FILE_BYTES: Final[int] = 1_048_576
 MULTILINE_WINDOW: Final[int] = 4096
@@ -136,50 +148,6 @@ def _decode_data(data: bytes, *, allow_binary_suffix: bool) -> str | None:
         raise
 
 
-def _open_flags() -> int:
-    return (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_BINARY", 0)
-    )
-
-
-def _raise_walk_error(_error: OSError) -> None:
-    raise ScanError(_SCAN_ERROR)
-
-
-def _not_link(p: Path) -> bool:
-    try:
-        return not p.is_symlink()
-    except OSError:
-        raise ScanError(_SCAN_ERROR) from None
-
-
-def _resolve_root(root: str | os.PathLike[str]) -> Path:
-    """Résout la racine sans jamais suivre un lien symbolique.
-
-    La racine elle-même et chacun de ses ancêtres sont vérifiés par
-    ``lstat`` : un lien symbolique dans le chemin de la racine est refusé
-    (``ScanError``) au lieu d'être suivi en silence. La promesse « les liens
-    symboliques ne sont jamais suivis » vaut donc aussi pour la racine et
-    pour le fichier unique.
-    """
-    try:
-        absolute = Path(os.path.abspath(Path(root).expanduser()))
-        for candidate in (absolute, *absolute.parents):
-            if candidate.is_symlink():
-                raise ScanError(_SCAN_ERROR)
-        resolved = absolute.resolve(strict=True)
-        # Course symlink (check-then-resolve) : si un composant a été remplacé
-        # entre le `lstat` et le `resolve`, le résolu diffère du demandé et la
-        # racine serait détournée hors périmètre — refus au lieu de suivre.
-        if resolved != absolute:
-            raise ScanError(_SCAN_ERROR)
-        return resolved
-    except (OSError, RuntimeError):
-        raise ScanError(_SCAN_ERROR) from None
-
 
 class Scanner:
     """Scanner déterministe d'une racine confinée (couche système #22/#59).
@@ -239,7 +207,7 @@ class Scanner:
             raise ScanError(_SCAN_ERROR)
         self._hasher = SnippetHasher() if hasher is None else hasher
         self._strict = strict
-        self._allowlist = allowlist if allowlist is not None else load_allowlist(self._root)
+        self._allowlist = allowlist if allowlist is not None else Allowlist.empty()
         self._traces: list[AllowlistTrace] = []
 
     @property

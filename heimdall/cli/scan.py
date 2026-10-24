@@ -135,6 +135,7 @@ class ScanReport:
     scope: Scope
     findings: tuple[Finding, ...]
     traces: tuple[AllowlistTrace, ...] = ()
+    config_hash: str | None = None
 
     def __post_init__(self) -> None:
         # Garde runtime pour les appelants non typés : le `Literal` protège
@@ -155,6 +156,7 @@ def collect(
     staged: bool,
     config: str | Path | None = None,
     allowlist: Allowlist | None = None,
+    ci: bool = False,
 ) -> ScanReport:
     """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
@@ -163,8 +165,8 @@ def collect(
     code 0.
     """
     if staged:
-        return _collect_staged(root, config=config, custom_allowlist=allowlist)
-    return _collect_tree(root, config=config, custom_allowlist=allowlist)
+        return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
+    return _collect_tree(root, config=config, custom_allowlist=allowlist, ci=ci)
 
 
 def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
@@ -191,6 +193,7 @@ def _collect_tree(
     *,
     config: str | Path | None = None,
     custom_allowlist: Allowlist | None = None,
+    ci: bool = False,
 ) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
@@ -211,27 +214,36 @@ def _collect_tree(
     access = GitAccess(root)
     if not access.is_repository(timeout=_call_timeout(deadline)):
         raise ScanError(_MSG_NOT_A_REPO)
-    # `access.root` est la forme **figée** (résolue, symlink refusé).
-    # `TreeScanner` rejoue sa garde unique sur cette forme canonique
-    # (idempotente) : une substitution entre les deux résolutions est
-    # refusée par `_verify_root_unchanged` (identité `st_dev`/`st_ino`/`st_ctime_ns`).
-    # On préfère ce second contrôle à un mode « racine déjà résolue » qui
-    # contournerait la garde du scanner. La deadline est vérifiée dans la
-    # boucle du scanner.
+
+    # Protection anti auto-attestation (CWE-345) :
+    # Si heimdall.toml fait partie des fichiers indexés modifiés/ajoutés et qu'aucune
+    # config explicite externe n'est passée, fail-closed loud (code 2).
+    if custom_allowlist is None and config is None:
+        staged_changes = access.staged_changes(timeout=_call_timeout(deadline))
+        if any(
+            change.path == "heimdall.toml" or change.path.endswith("/heimdall.toml")
+            for change in staged_changes
+        ):
+            raise ScanError(
+                "auto-attestation refusée : heimdall.toml est staged (CWE-345)"
+            )
+
     allowlist = (
         custom_allowlist
         if custom_allowlist is not None
         else load_allowlist(access.root, config_file=config)
     )
-    try:
-        scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
-    except TypeError:
-        scanner = TreeScanner(access.root, strict=True)
+    scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
     findings = scanner.scan(deadline=deadline)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
-    traces = getattr(scanner, "traces", ())
-    return ScanReport(scope=SCOPE_TREE, findings=tuple(findings), traces=tuple(traces))
+    traces = scanner.traces
+    return ScanReport(
+        scope=SCOPE_TREE,
+        findings=tuple(findings),
+        traces=tuple(traces),
+        config_hash=allowlist.sha256,
+    )
 
 
 def _call_timeout(deadline: float) -> float:
@@ -253,6 +265,7 @@ def _collect_staged(
     *,
     config: str | Path | None = None,
     custom_allowlist: Allowlist | None = None,
+    ci: bool = False,
 ) -> ScanReport:
     """Scanne les blobs **ajoutés ou modifiés** de l'index git avec allowlist (#24).
 
@@ -277,6 +290,19 @@ def _collect_staged(
     changes = access.staged_changes(timeout=_call_timeout(deadline))
     if len(changes) > MAX_STAGED_FILES:
         raise ScanError(_MSG_TOO_MANY_FILES)
+
+    # Protection anti auto-attestation (CWE-345) en mode staged :
+    # Si heimdall.toml fait partie des fichiers indexés modifiés/ajoutés et que
+    # la configuration n'est pas fournie explicitement hors dépôt, fail-closed immédiat (code 2).
+    if custom_allowlist is None and config is None:
+        if any(
+            change.path == "heimdall.toml" or change.path.endswith("/heimdall.toml")
+            for change in changes
+        ):
+            raise ScanError(
+                "auto-attestation refusée : heimdall.toml est staged (CWE-345)"
+            )
+
     allowlist = (
         custom_allowlist
         if custom_allowlist is not None
@@ -284,17 +310,11 @@ def _collect_staged(
     )
     # Même échéance que la passe : un blob dense est interrompu à l'intérieur,
     # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).
-    try:
-        engine = SignatureEngine(
-            max_findings=MAX_STAGED_FINDINGS,
-            deadline=deadline,
-            allowlist=allowlist,
-        )
-    except TypeError:
-        engine = SignatureEngine(
-            max_findings=MAX_STAGED_FINDINGS,
-            deadline=deadline,
-        )
+    engine = SignatureEngine(
+        max_findings=MAX_STAGED_FINDINGS,
+        deadline=deadline,
+        allowlist=allowlist,
+    )
     moteur = TargetScanner(engine)
     findings: list[Finding] = []
     total = 0
@@ -362,8 +382,13 @@ def _collect_staged(
         raise ScanError(_MSG_INDEX_CHANGED)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
-    traces = getattr(engine, "traces", ())
-    return ScanReport(scope=SCOPE_STAGED, findings=tuple(findings), traces=tuple(traces))
+    traces = engine.traces
+    return ScanReport(
+        scope=SCOPE_STAGED,
+        findings=tuple(findings),
+        traces=tuple(traces),
+        config_hash=allowlist.sha256,
+    )
 
 
 def render_json(report: ScanReport) -> str:
@@ -381,6 +406,7 @@ def render_json(report: ScanReport) -> str:
         "findings": [finding.as_dict() for finding in report.findings],
         "ignored_count": report.ignored_count,
         "traces": [trace.as_dict() for trace in report.traces],
+        "config_hash": report.config_hash,
     }
     return json.dumps(
         payload,

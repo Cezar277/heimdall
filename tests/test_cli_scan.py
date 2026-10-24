@@ -411,8 +411,9 @@ def test_collect_tree_uses_the_pinned_root(
     seen: list[tuple[Path, bool]] = []
 
     class ScannerEspion:
-        def __init__(self, root: Path, *, strict: bool) -> None:
+        def __init__(self, root: Path, *, strict: bool, **kwargs: object) -> None:
             seen.append((Path(root), strict))
+            self.traces: tuple[object, ...] = ()
 
         def scan(self, *, deadline: float | None = None) -> list[object]:
             assert deadline is not None
@@ -1682,12 +1683,21 @@ def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
         "findings",
         "ignored_count",
         "traces",
+        "config_hash",
     }
 
 
 def test_scan_schema_refuses_invalid_documents() -> None:
     """Le schéma fige le contrat : valeur, enum, fermeture et items Finding."""
     validator = _scan_validator()
+    # Rétrocompatibilité : l'ancien document sans ignored_count/traces/config_hash reste valide
+    legacy_base = {
+        "schema": "heimdall.scan.v1",
+        "scope": "staged",
+        "count": 0,
+        "findings": [],
+    }
+    assert validator.is_valid(legacy_base)
     base = {
         "schema": "heimdall.scan.v1",
         "scope": "staged",
@@ -1695,6 +1705,7 @@ def test_scan_schema_refuses_invalid_documents() -> None:
         "findings": [],
         "ignored_count": 0,
         "traces": [],
+        "config_hash": None,
     }
     assert validator.is_valid(base)
     for invalide in (
