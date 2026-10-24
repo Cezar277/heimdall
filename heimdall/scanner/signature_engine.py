@@ -23,6 +23,12 @@ import time
 from typing import Final
 
 from heimdall.scanner.entropy import shannon_entropy
+from heimdall.scanner.entropy_detection import (
+    DEFAULT_ENTROPY_CONFIG,
+    EntropyConfig,
+    check_multiline_overflow,
+    find_line_matches,
+)
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.hashing import SnippetHasher
@@ -77,16 +83,20 @@ class SignatureEngine:
     moteur construit pour une passe ne se réutilise pas après son échéance.
     """
 
-    __slots__ = ("_deadline", "_hasher", "_max_findings")
+    __slots__ = ("_deadline", "_hasher", "_max_findings", "_entropy_config")
 
     def __init__(
         self,
         hasher: SnippetHasher | None = None,
+        entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
         *,
         max_findings: int | None = None,
         deadline: float | None = None,
     ) -> None:
         self._deadline = deadline
+        if not isinstance(entropy_config, EntropyConfig):
+            raise ValueError("configuration d'entropie invalide")
+        self._entropy_config = entropy_config
         self._hasher = hasher
         # `None` ne doit jamais désactiver la borne : on retombe sur le
         # défaut, y compris pour un appelant non typé qui passerait `None`
@@ -110,6 +120,7 @@ class SignatureEngine:
         # brute n'y entre jamais : elle est hachée à la volée puis oubliée.
         seen: set[tuple[int, str, str]] = set()
         lines = cible.lignes()
+        preceding: tuple[SignatureMatch, ...] = ()
         for index, (line_number, line) in enumerate(lines):
             # Contrôle périodique intra-cible (cf. `deadline`) : sans lui, la
             # deadline `--staged` n'est vue qu'après la fin du blob.
@@ -119,17 +130,21 @@ class SignatureEngine:
                 and time.monotonic() > self._deadline
             ):
                 raise ScanError(_DEADLINE_ERROR)
-            for match in find_signature_matches(line):
+            for match in find_line_matches(
+                line, self._entropy_config, preceding, deadline=self._deadline
+            ):
                 self._append(findings, seen, match, line_number, cible.path)
             following = self._joined_window(line, lines, index)
             if following is None:
+                preceding = ()
                 continue
             joined, limit = following
-            for match in find_signature_matches(joined):
-                # Une correspondance qui commence après la jonction appartient
-                # à la ligne suivante : elle y sera déjà signalée.
-                if match.start >= limit:
-                    continue
+            # Réutilisé pour dédupliquer l'entropie de la ligne suivante :
+            # une fenêtre contiguë n'est jamais analysée une seconde fois.
+            preceding = tuple(
+                match for match in find_signature_matches(joined) if match.start < limit
+            )
+            for match in preceding:
                 self._append(findings, seen, match, line_number, cible.path)
         return findings
 
@@ -158,10 +173,12 @@ class SignatureEngine:
             return None
         joined = line + following
         if len(joined) > MULTILINE_WINDOW:
+            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
             return None
         # Le nombre de caractères minore le nombre d'octets UTF-8 : le premier
         # contrôle évite d'encoder les lignes déjà trop longues.
         if not joined.isascii() and len(joined.encode("utf-8")) > MULTILINE_WINDOW:
+            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
             return None
         return joined, len(line)
 
@@ -199,6 +216,7 @@ class SignatureEngine:
                 type=match.secret_type,
                 entropy=round(shannon_entropy(match.value.encode("utf-8")), 4),
                 snippet_hash=snippet_hash,
+                source=match.source,
             )
         )
         if len(findings) > self._max_findings:

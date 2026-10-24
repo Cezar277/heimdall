@@ -27,8 +27,11 @@ fichier est ensuite revérifié à l'usage (identité du descripteur, chemin ré
 sous la racine, refus des liens symboliques).
 
 Un Finding contient exactement : `file`, `line`, `type`, `entropy`,
-`snippet_hash`, `status` (`detecte`) et `source` (`regex`). **La valeur brute
+`snippet_hash`, `status` (`detecte`) et `source` (`regex` ou `entropy`). **La valeur brute
 n'est jamais conservée** : seule une empreinte HMAC-SHA-256 est produite.
+
+La détection générique par entropie (#23), ses seuils et ses limites
+sont documentés dans [scanner-entropy.md](scanner-entropy.md).
 
 ## Signatures (#54)
 
@@ -61,7 +64,10 @@ jointure avec la ligne suivante (sans séparateur) si la fenêtre totale ne
 dépasse pas **4 Kio**. Un secret coupé par un retour à la ligne
 (`aws_secret_access_key =` puis la valeur à la ligne suivante) est donc
 détecté, et le Finding porte la ligne où la correspondance commence. Au-delà
-de 4 Kio, la jointure n'est pas faite : c'est une limite documentée.
+de 4 Kio, la jointure n'est pas faite. Un délimiteur d'affectation (`:`/`=`)
+ou un jeton de longueur candidate sur une des lignes lève `ScanError` (#23),
+quel que soit le fournisseur. Un jeton individuel > 4096 caractères est
+également refusé avant calcul d'entropie (y compris les longues charges JWT).
 
 Une ligne peut produire plusieurs Findings de types différents. Deux **valeurs
 distinctes** du même type sur la même ligne produisent **deux** Findings
@@ -118,7 +124,7 @@ Les fichiers texte sont décodés, pas ignorés :
 
 | Cas | Traitement |
 | --- | --- |
-| UTF-8 (avec ou sans BOM) | décodage strict avec BOM, remplacement sans BOM |
+| UTF-8 (avec ou sans BOM) | décodage strict ; octet invalide → `ScanError` (#23) |
 | UTF-16 / UTF-32 avec BOM | décodage strict, fichier scanné |
 | UTF-16 / UTF-32 sans BOM | heuristique bornée (proportion ASCII puis caractères imprimables), fichier scanné |
 | signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | ignoré par politique |
@@ -169,7 +175,7 @@ jamais 0 ni 1.
 ## Empreinte et entropie
 
 - `entropy` : Shannon sur les octets UTF-8 du candidat, 0 à 8 bits/octet.
-  Cette valeur est une métadonnée ; la détection par seuil appartient à #23.
+  La détection générique par seuil est livrée par [#23](scanner-entropy.md).
 - `snippet_hash` : HMAC-SHA-256 avec une clé locale de 32 octets hors dépôt
   (`$HEIMDALL_SNIPPET_HMAC_KEY` en hexadécimal ou fichier XDG en `0600`). Le
   fichier doit être un fichier régulier, appartenir à l'utilisateur courant et
@@ -189,9 +195,9 @@ jamais 0 ni 1.
 ## Limites connues (honnêtes)
 
 - Le scanner de signatures ne décode pas les base64 et n'analyse pas le flux
-  des variables : les six cas obfusqués de T21 restent des `limite_connue`
-  (rappel 0,625 sur `all`, 1,0 sur le périmètre `core`). Le décodage/entropie
-  relève de #23 et l'allowlist de #24.
+  des variables : les cas reconstruits de T21 restent des `limite_connue`. Depuis #23,
+  deux valeurs encodées sont détectées par entropie, sans décodage :
+  rappel 0,75 sur `all`, 1,0 sur `core`. L'allowlist relève de #24.
 - Les fichiers binaires, lockfiles et répertoires tiers sont ignorés par
   la politique #59 **de la bibliothèque** : un secret qui y serait copié n'est
   pas signalé. En mode dépôt complet, `[]` vaut donc « propre hors
@@ -199,13 +205,13 @@ jamais 0 ni 1.
   mode strict (arbre de travail) ou l'analyse **sans exclusion** des blobs
   indexés (`--staged`) : ce blocage est levé pour la CLI, il reste entier
   pour l'usage bibliothèque, et #59 garde la main sur la politique.
-- La jointure multi-ligne est bornée à 4 Kio : un secret coupé par un retour
-  à la ligne n'est recherché que si la fenêtre des deux lignes tient dans
-  cette borne. Au-delà, la coupure n'est pas détectée (`[]`). Padding
-  volontaire = évasion connue : bloquant #23 (`ScanError` statique ou Finding
-  `tronqué` sur affectation sans valeur + fenêtre dépassée).
-- La charge d'un JWT est bornée à 64 Kio et l'en-tête à 1 Kio : un jeton
-  conforme est détecté, un jeton hors de ces bornes ne l'est pas. Les autres
+- La jointure multi-ligne est bornée à 4 Kio. Une affectation ou un jeton de
+  longueur candidate sur une des lignes provoque `ScanError` lorsque cette
+  borne est dépassée, sans exception par fournisseur. Les jetons individuels
+  > 4096 caractères provoquent également `ScanError`, jamais un skip.
+- Le motif de signature JWT accepte une charge de 64 Kio et un en-tête de
+  1 Kio, mais le moteur refuse désormais tout jeton lexical > 4096 caractères
+  (`ScanError`, y compris pour un JWT). Les autres
   préfixes AWS (au-delà de `AKIA`/`ASIA`/`ABIA`/`ACCA`) ne sont pas couverts.
 - Seules les familles de jetons Slack publiées par Slack sont couvertes
   (`xoxb-`, `xoxp-`, `xapp-`, `xwfp-`, `xoxe.` et les historiques `xoxa-`,
@@ -233,8 +239,12 @@ jamais 0 ni 1.
 .venv/bin/python tests/measure_trap.py
 ```
 
-Résultats de la livraison : **122 tests passés**, couverture du paquet
+Résultats historiques de la livraison #22 : **122 tests passés**, couverture du paquet
 `heimdall/scanner` **91,31 %** (branches incluses), suite complète **936 tests
 passés**, couverture globale **96,69 %**, mesure T21 `core` précision **1,00**,
-rappel **1,00**, aucune fausse alerte sur les 18 non-leaks.
+rappel **1,00**, aucune fausse alerte sur les 18 non-leaks à cette révision.
+Depuis la correction de revue #23, les étiquettes digest/data URI et UUID
+ne taisent plus les candidats : huit faux positifs sont comptés honnêtement
+sur ce corpus. Les résultats actuels et le seuil de précision non atteint
+sont dans [scanner-entropy.md](scanner-entropy.md).
 Les liens permanents et la fiche SAMM sont dans [t22-samm.md](t22-samm.md).

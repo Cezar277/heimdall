@@ -201,8 +201,12 @@ def test_finding_matches_contract_schema(tmp_path: Path) -> None:
         'DOC = "-----BEGIN CERTIFICATE-----"',
     ],
 )
-def test_known_false_positives_are_not_reported(tmp_path: Path, line: str) -> None:
-    assert _scan_lines(tmp_path, line) == []
+def test_public_values_are_not_silently_allowlisted(tmp_path: Path, line: str) -> None:
+    findings = _scan_lines(tmp_path, line)
+    if line.startswith(("UUID =", "SHA256 =", "COMMIT =")):
+        assert findings and all(f["source"] == "entropy" for f in findings)
+    else:
+        assert findings == []
 
 
 def test_multiple_types_on_one_line_are_all_reported(tmp_path: Path) -> None:
@@ -235,8 +239,8 @@ def test_identical_value_same_type_on_one_line_is_reported_once(tmp_path: Path) 
     assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
 
 
-def test_jwt_payload_above_previous_bound_is_detected(tmp_path: Path) -> None:
-    """Une charge JWT de 9 000 caractères reste dans la borne 64 Kio."""
+def test_jwt_payload_above_token_bound_is_fail_closed(tmp_path: Path) -> None:
+    """T23 : la borne par jeton refuse aussi les longues charges JWT."""
     jwt = ".".join(
         [
             _b64(b'{"alg":"HS256","typ":"JWT"}'),
@@ -244,8 +248,8 @@ def test_jwt_payload_above_previous_bound_is_detected(tmp_path: Path) -> None:
             _b64(hashlib.sha256(b"heimdall-long-jwt").digest()),
         ]
     )
-    findings = _scan_lines(tmp_path, f'JWT = "{jwt}"')
-    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "jwt")]
+    with pytest.raises(ScanError):
+        _scan_lines(tmp_path, f'JWT = "{jwt}"')
 
 
 @pytest.mark.parametrize("prefix", ["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xapp-", "xwfp-"])
@@ -289,11 +293,12 @@ def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:
     assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
 
 
-def test_split_secret_beyond_the_window_is_a_documented_limit(tmp_path: Path) -> None:
-    """Au-delà de la fenêtre de 4 Kio, le secret coupé n'est pas recherché."""
+def test_split_secret_beyond_the_window_is_fail_closed(tmp_path: Path) -> None:
+    """Une affectation non analysable au-delà de 4 Kio est refusée."""
     secret = fake_token("", 40)
     _write(tmp_path, "wide.py", "aws_secret_access_key = " + "x" * 5_000 + f'\n"{secret}"\n')
-    assert find_candidates(str(tmp_path)) == []
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
 
 
 # --- Exclusions (#59) -------------------------------------------------------
@@ -425,7 +430,8 @@ def test_decode_text_handles_bom_and_plain_utf8() -> None:
     assert decode_text(b"abc") == "abc"
     for encoding in ("utf-8-sig", "utf-16", "utf-32"):
         assert decode_text("AZERTY".encode(encoding)) == "AZERTY"
-    assert decode_text(b"caf\xe9") == "caf\ufffd"
+    with pytest.raises(ScanError):
+        decode_text(b"caf\xe9")
     assert decode_text(b"\xef\xbb\xbf") == ""
 
 
@@ -617,9 +623,10 @@ def test_scan_text_checks_deadline_intra_file(
         )
 
 
-def test_invalid_utf8_is_scanned_with_replacement(tmp_path: Path) -> None:
+def test_invalid_utf8_is_fail_closed(tmp_path: Path) -> None:
     _write(tmp_path, "latin1.py", f'AWS = "{_aws()}"'.encode("ascii") + b" \xff\n")
-    assert [finding["file"] for finding in find_candidates(str(tmp_path))] == ["latin1.py"]
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
 
 
 def test_missing_root_is_fail_closed_without_reflection(tmp_path: Path) -> None:
@@ -894,6 +901,7 @@ def test_long_lines_are_processed_linearly(tmp_path: Path) -> None:
     for index, payload in enumerate(payloads):
         path = _write(tmp_path, f"long_{index}.txt", payload)
         started = time.perf_counter()
-        scan(path)
+        with pytest.raises(ScanError):
+            scan(path)
         elapsed = time.perf_counter() - started
         assert elapsed < 10.0, (index, elapsed)
