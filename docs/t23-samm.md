@@ -61,3 +61,41 @@ Suite complète sur la révision corrigée : **1937 passed, 16 skipped**,
 4480 sous-tests passés, 7 avertissements ; couverture globale branches
 incluses **91,98 %** (seuil 85 % satisfait), durée 204,10 s, code de sortie 0.
 Le rapport de mesure T21 reste distinct et retourne 1, comme détaillé plus haut.
+
+## Complément après APPROVE WITH COMMENTS
+
+Révision du complément : `35c6672e6d6d1caebdda6917848b357cfae43dd5`.
+Les preuves ci-dessus restent épinglées à la révision du premier correctif.
+
+- Validation commune des lignes, de la configuration et des deadlines :
+  [entropy_detection.py:52](https://github.com/Cezar277/heimdall/blob/35c6672e6d6d1caebdda6917848b357cfae43dd5/heimdall/scanner/entropy_detection.py#L52).
+  Rejet des booléens, chaînes, NaN, infinis et entiers hors conversion
+  flottante ; `ScanError` statique, même sur des lignes vides.
+- `preceding_matches` doit être un tuple de `SignatureMatch` :
+  [entrée:76](https://github.com/Cezar277/heimdall/blob/35c6672e6d6d1caebdda6917848b357cfae43dd5/heimdall/scanner/entropy_detection.py#L76),
+  [tests paramétrés:254](https://github.com/Cezar277/heimdall/blob/35c6672e6d6d1caebdda6917848b357cfae43dd5/tests/test_scanner_entropy.py#L254),
+  [deadlines des deux fonctions:272](https://github.com/Cezar277/heimdall/blob/35c6672e6d6d1caebdda6917848b357cfae43dd5/tests/test_scanner_entropy.py#L272).
+- Disponibilité : la politique conservatrice reste assumée. Deux lignes
+  JSON bénignes > 4 Kio avec `:`, sans candidat entropie, refusent le scan :
+  [test des deux moteurs:305](https://github.com/Cezar277/heimdall/blob/35c6672e6d6d1caebdda6917848b357cfae43dd5/tests/test_scanner_entropy.py#L305).
+  La CLI sort en 2, en mode arbre comme en mode indexé :
+  [tests CLI:821](https://github.com/Cezar277/heimdall/blob/35c6672e6d6d1caebdda6917848b357cfae43dd5/tests/test_cli_scan.py#L821).
+  Ce refus peut bloquer un bundle ou un fichier minifié sans secret ; il
+  n'est pas présenté comme un verdict de fuite.
+
+Validation du complément : Ruff, mypy strict et Bandit passent ;
+**623 tests ciblés passent**, couverture scanner branches incluses **96,52 %**,
+module `entropy_detection.py` **100 %**, durée 41,74 s, code de sortie 0.
+La suite globale de 1937 tests ci-dessus concerne la révision précédente ;
+elle n'a pas été relancée pour ce complément limité aux gardes et à la politique
+déjà conservatrice. Les mesures T21 et leurs limites restent inchangées.
+
+```sh
+python -m pytest tests/test_scanner_entropy.py tests/test_scanner_detect.py \
+  tests/test_scanner_signatures.py tests/test_scanner_interface.py \
+  tests/test_trap_acceptance.py tests/test_cli_scan.py \
+  tests/security/test_scanner_bypass.py --cov=heimdall.scanner --cov-branch \
+  --cov-report=term --cov-fail-under=85 --tb=short
+```
+
+Aucun `/ci` distant déclenché ; feuille SAMM externe toujours non modifiée.
