@@ -4,7 +4,7 @@ Périmètre : ticket #24 « Allowlist déterministe », sous-ticket de l'épic #
 « Scanner de secrets ». Cette fiche fournit les couples **module + ligne** et les
 preuves des exigences vérifiées pour le rapport d'audit SAMM.
 
-Révision du code auditée : [`22021fb6cc4ca95c0e7b9afa891fa6f634074d99`](https://github.com/Cezar277/heimdall/commit/22021fb6cc4ca95c0e7b9afa891fa6f634074d99).
+Révision du code auditée : [`35713ca64e1defad1c18514ef2364e48dd00d423`](https://github.com/Cezar277/heimdall/commit/35713ca64e1defad1c18514ef2364e48dd00d423).
 Les permaliens du tableau épinglent cette révision. Les correctifs issus des
 revues successives (frontière `_` stricte, plomberie Git, FIFO/TOCTOU,
 périmètre local indicatif, contrat TOML strict) sont décrits en fin de fiche ;
@@ -21,26 +21,29 @@ et affichage permanent du nombre de findings ignorés dans les rapports local et
 
 | Exigence vérifiée | Implémentation (module + ligne) | Test et preuve permanente | Résultat local |
 |---|---|---|---|
-| **Règle example** : écarte les jetons et placeholders évidents (`example`, `sample`, `your_key_here`, `AKIAIOSFODNN7EXAMPLE`) | [`allowlist.py:642–646`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L642-L646), [`heimdall.toml:23–26`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall.toml#L23-L26) | [`tests/test_scanner_allowlist.py:166–193`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L166-L193) | Clés AWS/jetons d'exemple écartés avec trace `example-placeholders` |
-| **Règle changeme** : écarte les mots de passe et configs changeme | [`allowlist.py:647–651`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L647-L651), [`heimdall.toml:28–31`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall.toml#L28-L31) | [`tests/test_scanner_allowlist.py:196–211`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L196-L211) | Mots de passe par défaut écartés avec trace `changeme-passwords` |
-| **Règle dummy** : écarte les jetons et identifiants factices dummy | [`allowlist.py:652–656`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L652-L656), [`heimdall.toml:33–36`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall.toml#L33-L36) | [`tests/test_scanner_allowlist.py:214–229`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L214-L229) | Jetons factices écartés avec trace `dummy-tokens` |
-| **Règle test-fixtures** : fixtures factices délimitées aux tests (sans mot-clé générique `test`) | [`allowlist.py:657–673`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L657-L673), [`heimdall.toml:38–53`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall.toml#L38-L53) | [`tests/test_scanner_allowlist.py:232–248`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L232-L248), [`251–269`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L251-L269) | Fixtures factices sous `tests/` écartées avec trace `test-fixtures` ; `_fake_`/`_dummy_` restent signalés |
-| **PIÈGE ÉVITÉ (CWE-1188)** : aucun secret réel dans `tests/` n'est ignoré | [`allowlist.py:410–428`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L410-L428), [`495–543`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L495-L543) | [`tests/test_scanner_allowlist.py:275–291`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L275-L291), [`1191–1233`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1191-L1233), [`1555–1571`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1555-L1571) | Une vraie clé AWS sous `tests/` ou nommée `latest_token` reste détectée et bloque |
-| **ABSENCE DE CONTOURNEMENT PAR COMMENTAIRE (Invariant 1, CRITICAL)** : évaluation sur `value` uniquement | [`allowlist.py:495–543`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L495-L543) | [`tests/test_scanner_allowlist.py:1037–1070`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1037-L1070) | `key = "AKIA..." # dummy` reste détecté à 100 % en arbre et staged |
-| **ANTI AUTO-ATTESTATION (CWE-345, HIGH)** : refus de l'allowlist du dépôt sans --config en CI, refus staged et vérification worktree propre | [`scan.py:291–372`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/cli/scan.py#L291-L372), [`422–431`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/cli/scan.py#L422-L431), [`500–512`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/cli/scan.py#L500-L512), [`592–598`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/cli/scan.py#L592-L598) | [`1097–1188`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1097-L1188), [`1574–1702`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1574-L1702), [`1865–1908`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1865-L1908), [`1913–1932`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1913-L1932) | `ScanError` (code 2) si commit/staged modifie `heimdall.toml` ou `--config` custom, si worktree dirty/untracked en `--staged`, ou en `--ci` sans `--config` externe / `--no-allowlist` |
-| **GARDE DE CHEMIN UNIQUE (Invariant 3, MEDIUM)** : réutilisation centrale de `_resolve_root` | [`allowlist.py:875–910`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L875-L910), [`interface.py:38–69`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/interface.py#L38-L69) | [`365–398`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L365-L398), [`944–960`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L944-L960) | Pas de garde divergente ; résolution stricte et ouverture par descripteur |
-| **ANTI-REDOS STRICT (CWE-1333, MEDIUM)** : analyse structurelle des groupes, alternances quantifiées, quantificateurs adjacents, max 128 chars | [`allowlist.py:141–307`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L141-L307), [`698–734`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L698-L734) | [`1244–1265`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1244-L1265), [`1268–1297`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1268-L1297), [`963–970`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L963-L970), [`1437–1516`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1437-L1516) | Rejet de `(a\|aa)+`, `((a|aa))+$`, `(a|(b|c))+$`, `(?:(a|aa))+$`, `(a+)+`, `a++`, `a*?`, `(a?)+`, backrefs et motifs > 128 chars |
-| **ANTI-ALLOWLIST AVEUGLE (CWE-1188, MEDIUM)** : refus des motifs universels et exigence de littéraux | [`allowlist.py:86–104`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L86-L104), [`332–383`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L332-L383), [`698–734`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L698-L734) | [`1300–1349`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1300-L1349), [`1352–1360`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1352-L1360), [`1363–1382`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1363-L1382), [`1385–1401`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1385-L1401) | `.`, `.*`, `^`, `^.*$`, `\w+`, `[a-z]+`, `[^x]+` refusés ; chaque branche d'alternance doit porter ≥ 3 littéraux |
-| **TYPAGE API (Invariant 11)** : `patterns` doit contenir des regex compilées, jamais des chaînes | [`allowlist.py:457–493`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L457-L493) | [`116–152`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L116-L152) | `AllowlistRule(patterns=("x",))` → `ScanError`, jamais `AttributeError` |
-| **CRITÈRE D'ACCEPTATION : traçabilité univoque** : aucun rejet sans règle nommée | [`allowlist.py:586–610`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L586-L610), [`detect.py:465–478`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/detect.py#L465-L478) | [`297–324`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L297-L324), [`327–336`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L327-L336) | Chaque finding ignoré émet `AllowlistTrace(rule, file, line)` |
-| **Transparence du rapport** : affiche TOUJOURS le nombre de findings ignorés | [`scan.py:654–682`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/cli/scan.py#L654-L682) | [`598–616`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L598-L616), [`1519–1552`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1519-L1552) | 0 ignoré affiché si vide, liste détaillée des rejets sinon |
-| **Contrat JSON machine** : rétrocompatible v1 avec `ignored_count`, `traces` et `config_hash` | [`scan.schema.json:15–81`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/schemas/scan.schema.json#L15-L81), [`scan.py:610–633`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/cli/scan.py#L610-L633) | [`619–630`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L619-L630), [`1519–1552`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1519-L1552), [`test_cli_scan.py:1690–1722`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_cli_scan.py#L1690-L1722) | Schéma draft 2020-12 validé ; champs rétrocompatibles |
-| **Mode CI headless** : résumé sur stderr avec nombre d'ignorés et hash SHA-256 complet de config | [`main.py:163–176`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/cli/main.py#L163-L176) | [`700–758`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L700-L758), [`test_cli_scan.py:1742–1748`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_cli_scan.py#L1742-L1748) | stderr : verdict déterministe + décompte des ignorés + sha256 complet de config |
-| **Confidentialité absolue (CWE-200, Invariant 8)** : aucun secret dans les traces ou les logs | [`allowlist.py:387–407`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L387-L407), [`586–610`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L586-L610) | [`327–336`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L327-L336), [`1191–1233`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1191-L1233), [`1519–1552`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1519-L1552) | La valeur brute n'apparaît ni dans la trace, ni dans les logs, ni dans le rapport |
-| **CONTRAT TOML STRICT (CWE-20)** : clés racine fermées, `version` obligatoire et typée `"1"`, mots-clés ≥ 3 caractères | [`allowlist.py:749–771`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L749-L771), [`812–852`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L812-L852), [`835–843`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L835-L843), [`785–789`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L785-L789) | [`445–564`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L445-L564), [`485–503`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L485-L503), [`973–1018`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L973-L1018) | `[tool.foo]`, `version` absente ou `version = 1` et `keywords = ["a"]` refusés en `ScanError` (code 2) |
-| **DISPONIBILITÉ CONFIG (CWE-400)** : FIFO refusé sans blocage | [`allowlist.py:875–910`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L875-L910) | [`1913–1932`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1913-L1932) | `O_NONBLOCK` + `S_ISREG` : FIFO par défaut ou `--config` → code 2 sans attente |
-| **--CONFIG EXTERNE (CWE-345, LOW)** : `--config` hors dépôt accepté comme choix opérateur, gardes inchangées | [`allowlist.py:913–949`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L913-L949), [`scan.py:439–443`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/cli/scan.py#L439-L443), [`520–524`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/cli/scan.py#L520-L524) | [`401–434`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L401-L434), [`824–856`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L824-L856) | Opt-in explicite : arbre et staged hors CI acceptés, contenu invalide toujours code 2 ; sans opt-in refus fail-closed inchangé |
-| **FILTRE CHEMIN BORNÉ (CWE-400, LOW)** : au plus 10 jokers `*` par motif, chemin soumis à `fnmatch` borné à 1024 | [`allowlist.py:677–695`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L677-L695), [`515–528`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L515-L528), [`99–104`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/heimdall/scanner/allowlist.py#L99-L104) | [`1437–1516`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L1437-L1516), [`944–960`](https://github.com/Cezar277/heimdall/blob/22021fb6cc4ca95c0e7b9afa891fa6f634074d99/tests/test_scanner_allowlist.py#L944-L960) | Au-delà de 10 `*` → code 2 ; chemin > 1024 non soumis au filtre, candidat reste signalé (fail-closed) ; fuzz adversarial borné (< 1 ms) |
+| **Règle example** : écarte les jetons et placeholders évidents (`example`, `sample`, `your_key_here`, `AKIAIOSFODNN7EXAMPLE`) | [`allowlist.py:642–646`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L642-L646), [`heimdall.toml:23–26`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall.toml#L23-L26) | [`tests/test_scanner_allowlist.py:166–193`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L166-L193) | Clés AWS/jetons d'exemple écartés avec trace `example-placeholders` |
+| **Règle changeme** : écarte les mots de passe et configs changeme | [`allowlist.py:647–651`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L647-L651), [`heimdall.toml:28–31`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall.toml#L28-L31) | [`tests/test_scanner_allowlist.py:196–211`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L196-L211) | Mots de passe par défaut écartés avec trace `changeme-passwords` |
+| **Règle dummy** : écarte les jetons et identifiants factices dummy | [`allowlist.py:652–656`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L652-L656), [`heimdall.toml:33–36`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall.toml#L33-L36) | [`tests/test_scanner_allowlist.py:214–229`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L214-L229) | Jetons factices écartés avec trace `dummy-tokens` |
+| **Règle test-fixtures** : fixtures factices délimitées aux tests (sans mot-clé générique `test`) | [`allowlist.py:657–673`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L657-L673), [`heimdall.toml:38–53`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall.toml#L38-L53) | [`tests/test_scanner_allowlist.py:232–248`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L232-L248), [`251–269`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L251-L269) | Fixtures factices sous `tests/` écartées avec trace `test-fixtures` ; `_fake_`/`_dummy_` restent signalés |
+| **PIÈGE ÉVITÉ (CWE-1188)** : aucun secret réel dans `tests/` n'est ignoré | [`allowlist.py:410–428`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L410-L428), [`495–543`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L495-L543) | [`tests/test_scanner_allowlist.py:275–291`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L275-L291), [`1335–1377`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1335-L1377), [`1699–1715`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1699-L1715) | Une vraie clé AWS sous `tests/` ou nommée `latest_token` reste détectée et bloque |
+| **ABSENCE DE CONTOURNEMENT PAR COMMENTAIRE (Invariant 1, CRITICAL)** : évaluation sur `value` uniquement | [`allowlist.py:495–543`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L495-L543) | [`tests/test_scanner_allowlist.py:1181–1214`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1181-L1214) | `key = "AKIA..." # dummy` reste détecté à 100 % en arbre et staged |
+| **ANTI AUTO-ATTESTATION (CWE-345, HIGH)** : refus de l'allowlist du dépôt sans --config en CI, refus staged et vérification worktree propre | [`scan.py:296–387`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L296-L387), [`439–448`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L439-L448), [`517–529`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L517-L529), [`609–615`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L609-L615) | [`1241–1332`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1241-L1332), [`1718–1846`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1718-L1846), [`2009–2052`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L2009-L2052), [`2057–2076`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L2057-L2076) | `ScanError` (code 2) si commit/staged modifie `heimdall.toml` ou `--config` custom, si worktree dirty/untracked en `--staged`, ou en `--ci` sans `--config` externe / `--no-allowlist` |
+| **GARDE DE CHEMIN UNIQUE (Invariant 3, MEDIUM)** : réutilisation centrale de `_resolve_root` | [`allowlist.py:875–915`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L875-L915), [`interface.py:38–71`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/interface.py#L38-L71) | [`365–398`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L365-L398), [`1088–1104`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1088-L1104) | Pas de garde divergente ; résolution stricte et ouverture par descripteur |
+| **ANTI-REDOS STRICT (CWE-1333, MEDIUM)** : analyse structurelle des groupes, alternances quantifiées, quantificateurs adjacents, max 128 chars | [`allowlist.py:141–307`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L141-L307), [`698–734`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L698-L734) | [`1388–1409`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1388-L1409), [`1412–1441`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1412-L1441), [`1107–1114`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1107-L1114), [`1581–1660`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1581-L1660) | Rejet de `(a\|aa)+`, `((a|aa))+$`, `(a|(b|c))+$`, `(?:(a|aa))+$`, `(a+)+`, `a++`, `a*?`, `(a?)+`, backrefs et motifs > 128 chars |
+| **ANTI-ALLOWLIST AVEUGLE (CWE-1188, MEDIUM)** : refus des motifs universels et exigence de littéraux | [`allowlist.py:86–104`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L86-L104), [`332–383`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L332-L383), [`698–734`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L698-L734) | [`1444–1493`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1444-L1493), [`1496–1504`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1496-L1504), [`1507–1526`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1507-L1526), [`1529–1545`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1529-L1545) | `.`, `.*`, `^`, `^.*$`, `\w+`, `[a-z]+`, `[^x]+` refusés ; chaque branche d'alternance doit porter ≥ 3 littéraux |
+| **TYPAGE API (Invariant 11)** : `patterns` doit contenir des regex compilées, jamais des chaînes | [`allowlist.py:457–493`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L457-L493) | [`116–152`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L116-L152) | `AllowlistRule(patterns=("x",))` → `ScanError`, jamais `AttributeError` |
+| **CRITÈRE D'ACCEPTATION : traçabilité univoque** : aucun rejet sans règle nommée | [`allowlist.py:586–610`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L586-L610), [`detect.py:465–478`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/detect.py#L465-L478) | [`297–324`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L297-L324), [`327–336`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L327-L336) | Chaque finding ignoré émet `AllowlistTrace(rule, file, line)` |
+| **Transparence du rapport** : affiche TOUJOURS le nombre de findings ignorés | [`scan.py:671–699`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L671-L699) | [`624–642`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L624-L642), [`1663–1696`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1663-L1696) | 0 ignoré affiché si vide, liste détaillée des rejets sinon |
+| **Contrat JSON machine** : rétrocompatible v1 avec `ignored_count`, `traces` et `config_hash` | [`scan.schema.json:15–81`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/schemas/scan.schema.json#L15-L81), [`scan.py:627–650`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L627-L650) | [`645–656`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L645-L656), [`1663–1696`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1663-L1696), [`test_cli_scan.py:1690–1722`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_cli_scan.py#L1690-L1722) | Schéma draft 2020-12 validé ; champs rétrocompatibles |
+| **Mode CI headless** : résumé sur stderr avec nombre d'ignorés et hash SHA-256 complet de config | [`main.py:163–176`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/main.py#L163-L176) | [`726–784`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L726-L784), [`test_cli_scan.py:1742–1748`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_cli_scan.py#L1742-L1748) | stderr : verdict déterministe + décompte des ignorés + sha256 complet de config |
+| **Confidentialité absolue (CWE-200, Invariant 8)** : aucun secret dans les traces ou les logs | [`allowlist.py:387–407`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L387-L407), [`586–610`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L586-L610) | [`327–336`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L327-L336), [`1335–1377`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1335-L1377), [`1663–1696`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1663-L1696) | La valeur brute n'apparaît ni dans la trace, ni dans les logs, ni dans le rapport |
+| **CONTRAT TOML STRICT (CWE-20)** : clés racine fermées, `version` obligatoire et typée `"1"`, mots-clés ≥ 3 caractères | [`allowlist.py:749–771`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L749-L771), [`812–852`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L812-L852), [`835–843`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L835-L843), [`785–789`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L785-L789) | [`471–590`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L471-L590), [`511–529`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L511-L529), [`1117–1162`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1117-L1162) | `[tool.foo]`, `version` absente ou `version = 1` et `keywords = ["a"]` refusés en `ScanError` (code 2) |
+| **DISPONIBILITÉ CONFIG (CWE-400)** : FIFO refusé sans blocage | [`allowlist.py:875–915`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L875-L915) | [`2057–2076`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L2057-L2076) | `O_NONBLOCK` + `S_ISREG` : FIFO par défaut ou `--config` → code 2 sans attente |
+| **--CONFIG EXTERNE (CWE-345, LOW)** : `--config` hors dépôt accepté comme choix opérateur, gardes inchangées | [`allowlist.py:918–965`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L918-L965), [`scan.py:456–460`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L456-L460), [`537–541`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L537-L541) | [`401–434`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L401-L434), [`850–882`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L850-L882) | Opt-in explicite : arbre et staged hors CI acceptés, contenu invalide toujours code 2 ; sans opt-in refus fail-closed inchangé |
+| **FILTRE CHEMIN BORNÉ (CWE-400, LOW)** : au plus 10 jokers `*` par motif, chemin soumis à `fnmatch` borné à 1024 | [`allowlist.py:677–695`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L677-L695), [`515–528`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L515-L528), [`99–104`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L99-L104) | [`1581–1660`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1581-L1660), [`1088–1104`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L1088-L1104) | Au-delà de 10 `*` → code 2 ; chemin > 1024 non soumis au filtre, candidat reste signalé (fail-closed) ; fuzz adversarial borné (< 1 ms) |
+| **FERMETURE DESCRIPTEUR FAIL-CLOSED (CWE-400, LOW)** : `os.close` en échec converti, jamais d'`OSError` brute | [`allowlist.py:907–913`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L907-L913), [`scan.py:219–241`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L219-L241) | [`905–927`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L905-L927) | `load_allowlist_from_file` → `ScanError` (invariant 11), `_read_worktree_file` → `None` (try imbriqué + `finally` + `except`, sans `return` en `finally`) |
+| **GARDE ANTI AUTO-ATTESTATION STATIQUE (CWE-200, LOW)** : `rel_cfg`/`verified.path` jamais reflétés | [`scan.py:368–374`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L368-L374), [`381–385`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L381-L385), [`402–408`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/cli/scan.py#L402-L408) | [`929–957`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L929-L957), [`959–977`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L959-L977) | `str(exc)` sans nom de config, préfixe `auto-attestation` conservé ; en CLI le libellé est masqué par le message générique |
+| **CONFIG ILLISIBLE = CODE 2 (REQ-SEC-07, LOW)** : `exists()` en échec → `ScanError`, pas allowlist vide | [`allowlist.py:954–963`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/heimdall/scanner/allowlist.py#L954-L963) | [`979–1000`](https://github.com/Cezar277/heimdall/blob/35713ca64e1defad1c18514ef2364e48dd00d423/tests/test_scanner_allowlist.py#L979-L1000) | Seule l'absence avérée vaut « pas de config » ; docstring `load_allowlist` mise à jour |
 
 ## Fichier versionné `heimdall.toml`
 
@@ -87,10 +90,10 @@ Environnement : Linux, Python 3.14.8 / venv du dépôt.
 
 ```text
 .venv/bin/pytest tests/test_scanner_allowlist.py -q
-83 passed
+89 passed
 
 .venv/bin/pytest -o addopts="" -q
-1956 passed, 15 skipped
+1962 passed, 15 skipped
 
 .venv/bin/ruff check heimdall tests
 All checks passed!
@@ -117,7 +120,7 @@ chemin (`tests/**`). `_` étant un caractère de mot, `fake_slack_token` et
 restent reconnus. Le test de non-régression
 [`test_scanner_allowlist.py:251–269`](../tests/test_scanner_allowlist.py#L251-L269)
 couvre `_fake_`/`_dummy_` sous `tests/`, et
-[`test_scanner_allowlist.py:1555–1571`](../tests/test_scanner_allowlist.py#L1555-L1571)
+[`test_scanner_allowlist.py:1699–1715`](../tests/test_scanner_allowlist.py#L1699-L1715)
 verrouille la frontière (sous-chaînes rejetées, séparateurs non-mot acceptés).
 
 ### Index Git lu par la plomberie, plus par un parseur DIRC maison
@@ -133,42 +136,42 @@ verrouille la frontière (sous-chaînes rejetées, séparateurs non-mot accepté
   absent, lien symbolique, gitlink ou index en conflit sont refusés
   (`None`/`ToolFailure`), toute sortie ambiguë échoue en code 2.
 
-[`scan.py:201–280`](../heimdall/cli/scan.py#L201-L280) conserve la vérification
+[`scan.py:201–285`](../heimdall/cli/scan.py#L201-L285) conserve la vérification
 anti-auto-attestation : lecture du fichier du worktree via `_resolve_root` +
 `O_NOFOLLOW`, puis comparaison de l'empreinte de blob brute (SHA-1 ou SHA-256)
 avec le SHA de l'index, sans exécuter de filtre Git `clean`.
 
-Tests de non-régression : [`test_scanner_allowlist.py:1716–1861`](../tests/test_scanner_allowlist.py#L1716-L1861)
+Tests de non-régression : [`test_scanner_allowlist.py:1860–2005`](../tests/test_scanner_allowlist.py#L1860-L2005)
 couvre index v4, worktree lié, gitlink/sous-module, index symlinké (code 2),
 chemins invalides (`..`, NUL, absolu) et sorties `ls-files` malformées
 (paramétrage fuzz).
 
 ### Deuxième revue (LOW) — disponibilité et TOCTOU
 
-- **FIFO à l'ouverture de la config** : [`allowlist.py:875–910`](../heimdall/scanner/allowlist.py#L875-L910)
+- **FIFO à l'ouverture de la config** : [`allowlist.py:875–915`](../heimdall/scanner/allowlist.py#L875-L915)
   ouvre désormais avec `O_NONBLOCK` (comme le worktree et l'index) ; le
   `fstat` + `S_ISREG` existant refuse un FIFO en code 2 sans blocage.
   Test borné par sous-processus :
-  [`test_scanner_allowlist.py:1913–1932`](../tests/test_scanner_allowlist.py#L1913-L1932)
+  [`test_scanner_allowlist.py:2057–2076`](../tests/test_scanner_allowlist.py#L2057-L2076)
   (config par défaut et `--config`).
 - **TOCTOU garde → parsing** : la garde rend les octets vérifiés
-  ([`scan.py:239–280`](../heimdall/cli/scan.py#L239-L280)), le parseur les
+  ([`scan.py:244–285`](../heimdall/cli/scan.py#L244-L285)), le parseur les
   consomme sans relire ([`allowlist.py:855–872`](../heimdall/scanner/allowlist.py#L855-L872)),
   et un second contrôle refuse toute substitution
-  ([`scan.py:291–372`](../heimdall/cli/scan.py#L291-L372),
-  [`scan.py:375–392`](../heimdall/cli/scan.py#L375-L392)). Test de course :
-  [`test_scanner_allowlist.py:1660–1702`](../tests/test_scanner_allowlist.py#L1660-L1702).
+  ([`scan.py:296–387`](../heimdall/cli/scan.py#L296-L387),
+  [`scan.py:390–409`](../heimdall/cli/scan.py#L390-L409)). Test de course :
+  [`test_scanner_allowlist.py:1804–1846`](../tests/test_scanner_allowlist.py#L1804-L1846).
 - **Arbre local indicatif** : hors `--ci`/`--staged`, seule une configuration
   stagée est refusée ; la propreté du fichier du worktree (dirty/untracked)
   n'est pas vérifiée. Ce périmètre est documenté comme non opposable dans
   [`docs/cli.md`](cli.md#limites-connues-honnêtes). Le comportement est figé
-  par [`test_scanner_allowlist.py:1865–1908`](../tests/test_scanner_allowlist.py#L1865-L1908),
+  par [`test_scanner_allowlist.py:2009–2052`](../tests/test_scanner_allowlist.py#L2009-L2052),
   qui vérifie aussi que `--ci` et `--staged` refusent la même configuration.
 - **Fuzz des `paths`** : [`allowlist.py:677–695`](../heimdall/scanner/allowlist.py#L677-L695)
   réutilise la grammaire du contrat Finding #14 (refus de `..`, absolu,
   `C:/`, antislash, NUL, segment vide) ; les motifs glob longs restent
-  non bloquants. Tests : [`test_scanner_allowlist.py:944–960`](../tests/test_scanner_allowlist.py#L944-L960)
-  et [`1437–1516`](../tests/test_scanner_allowlist.py#L1437-L1516).
+  non bloquants. Tests : [`test_scanner_allowlist.py:1088–1104`](../tests/test_scanner_allowlist.py#L1088-L1104)
+  et [`1581–1660`](../tests/test_scanner_allowlist.py#L1581-L1660).
 
 ### Troisième revue (LOW) — contrat TOML strict et permaliens
 
@@ -177,24 +180,24 @@ chemins invalides (`..`, NUL, absolu) et sorties `ls-files` malformées
 - **Clés racine fermées** : [`allowlist.py:812–852`](../heimdall/scanner/allowlist.py#L812-L852)
   refuse toute table racine hors `{"allowlist"}` (`[tool.foo]`, faute de
   frappe) en `ScanError` (code 2). Tests :
-  [`test_scanner_allowlist.py:445–473`](../tests/test_scanner_allowlist.py#L445-L473).
+  [`test_scanner_allowlist.py:471–499`](../tests/test_scanner_allowlist.py#L471-L499).
 - **Version typée** : `version = 1` (int) est refusé ; seul le littéral
   `"1"` est accepté ([`allowlist.py:835–843`](../heimdall/scanner/allowlist.py#L835-L843)).
-  Test : [`test_scanner_allowlist.py:476–482`](../tests/test_scanner_allowlist.py#L476-L482).
+  Test : [`test_scanner_allowlist.py:502–508`](../tests/test_scanner_allowlist.py#L502-L508).
 - **Mots-clés trop courts** : `keywords = ["a"]` et `["ab"]` sont refusés,
   minimum `MIN_KEYWORD_LENGTH = 3`
   ([`allowlist.py:79`](../heimdall/scanner/allowlist.py#L79),
   [`749–771`](../heimdall/scanner/allowlist.py#L749-L771),
   [`785–789`](../heimdall/scanner/allowlist.py#L785-L789)). Test :
-  [`test_scanner_allowlist.py:541–564`](../tests/test_scanner_allowlist.py#L541-L564).
+  [`test_scanner_allowlist.py:567–590`](../tests/test_scanner_allowlist.py#L567-L590).
 - **Fabriques explicites** : `Allowlist.default()` et `create_default_rules()`
   restent réservées aux tests et à l'API Python ; le chargement CLI/CI ne les
   branche pas. Sans `heimdall.toml`, `load_allowlist()` rend
   `Allowlist.empty()` ([`allowlist.py:618–627`](../heimdall/scanner/allowlist.py#L618-L627),
-  [`913–949`](../heimdall/scanner/allowlist.py#L913-L949)). Test :
-  [`test_scanner_allowlist.py:803–814`](../tests/test_scanner_allowlist.py#L803-L814).
+  [`918–965`](../heimdall/scanner/allowlist.py#L918-L965)). Test :
+  [`test_scanner_allowlist.py:829–840`](../tests/test_scanner_allowlist.py#L829-L840).
 - **FIFO** : le correctif `O_NONBLOCK` + `S_ISREG` reste couvert par
-  [`test_scanner_allowlist.py:1913–1932`](../tests/test_scanner_allowlist.py#L1913-L1932)
+  [`test_scanner_allowlist.py:2057–2076`](../tests/test_scanner_allowlist.py#L2057-L2076)
   (config par défaut et `--config`, sous-processus borné).
 
 ### Quatrième revue (MEDIUM) — ReDoS imbriqué et motifs universels
@@ -206,8 +209,8 @@ chemins invalides (`..`, NUL, absolu) et sorties `ls-files` malformées
   traversait pas `)`. Les références arrière (`\1`, `(?P=nom)`), les groupes
   conditionnels, les commentaires `(?#...)` et le mode verbose `(?x)` sont
   également refusés ; `MAX_PATTERN_LENGTH = 128` reste appliqué. Tests :
-  [`test_scanner_allowlist.py:1268–1283`](../tests/test_scanner_allowlist.py#L1268-L1283)
-  et [`1286–1297`](../tests/test_scanner_allowlist.py#L1286-L1297) (fuzz ancré
+  [`test_scanner_allowlist.py:1412–1427`](../tests/test_scanner_allowlist.py#L1412-L1427)
+  et [`1430–1441`](../tests/test_scanner_allowlist.py#L1430-L1441) (fuzz ancré
   borné en temps).
 - **Motifs universels** : [`allowlist.py:698–734`](../heimdall/scanner/allowlist.py#L698-L734)
   compile puis refuse tout motif qui matche la chaîne vide, et exige au moins
@@ -215,15 +218,15 @@ chemins invalides (`..`, NUL, absolu) et sorties `ls-files` malformées
   ([`allowlist.py:332–383`](../heimdall/scanner/allowlist.py#L332-L383)).
   `.`, `.*`, `^`, `^.*$`, `\w+`, `[a-z]+`, `[^x]+` sont refusés en
   `ScanError`/code 2. Tests TOML :
-  [`1300–1349`](../tests/test_scanner_allowlist.py#L1300-L1349),
-  [`1352–1360`](../tests/test_scanner_allowlist.py#L1352-L1360),
-  [`1363–1382`](../tests/test_scanner_allowlist.py#L1363-L1382),
-  [`1385–1401`](../tests/test_scanner_allowlist.py#L1385-L1401).
+  [`1444–1493`](../tests/test_scanner_allowlist.py#L1444-L1493),
+  [`1496–1504`](../tests/test_scanner_allowlist.py#L1496-L1504),
+  [`1507–1526`](../tests/test_scanner_allowlist.py#L1507-L1526),
+  [`1529–1545`](../tests/test_scanner_allowlist.py#L1529-L1545).
 - **Valeur candidate bornée** : [`allowlist.py:495–543`](../heimdall/scanner/allowlist.py#L495-L543)
   n'évalue les regex que si `len(value) <= MAX_REGEX_VALUE_LENGTH = 256` ;
   au-delà, l'évaluation est **omise** et le candidat reste signalé
   (fail-closed, sans troncature). Test :
-  [`test_scanner_allowlist.py:1363–1382`](../tests/test_scanner_allowlist.py#L1363-L1382).
+  [`test_scanner_allowlist.py:1507–1526`](../tests/test_scanner_allowlist.py#L1507-L1526).
 - **Typage de l'API** : [`allowlist.py:457–493`](../heimdall/scanner/allowlist.py#L457-L493)
   valide `patterns` (regex `str` compilées), `keywords`, `paths` et
   `secret_types`. `AllowlistRule(patterns=("x",))` lève `ScanError`, jamais
@@ -235,33 +238,33 @@ chemins invalides (`..`, NUL, absolu) et sorties `ls-files` malformées
   que l'analyse structurelle ne cible pas directement.
 - **Non-régression** : les motifs réalistes (`^AKIA.*EXAMPLE$`, `^ghp_...`,
   `^sk-...`) restent acceptés ; la suite complète passe à
-  **1956 passed, 15 skipped** et les 83 tests d'allowlist sont verts.
+  **1962 passed, 15 skipped** et les 89 tests d'allowlist sont verts.
 
 ### Cinquième revue (LOW) — config externe, version obligatoire, littéraux, fnmatch borné
 
-- **`--config` externe accepté hors CI** : [`scan.py:439–443`](../heimdall/cli/scan.py#L439-L443)
-  et [`520–524`](../heimdall/cli/scan.py#L520-L524) passent désormais
+- **`--config` externe accepté hors CI** : [`scan.py:456–460`](../heimdall/cli/scan.py#L456-L460)
+  et [`537–541`](../heimdall/cli/scan.py#L537-L541) passent désormais
   `allow_external=ci or config is not None` : un `--config` explicite peut
   vivre hors du dépôt scanné (choix opérateur, conformément à l'aide de la
   CLI), la garde `_resolve_root` + `O_NOFOLLOW`, le plafond de taille et le
   contrat fermé restant appliqués
-  ([`allowlist.py:913–949`](../heimdall/scanner/allowlist.py#L913-L949)).
+  ([`allowlist.py:918–965`](../heimdall/scanner/allowlist.py#L918-L965)).
   Sans opt-in, le refus fail-closed reste la norme. Tests :
   [`401–434`](../tests/test_scanner_allowlist.py#L401-L434) (API : refus sans
   opt-in, acceptation avec opt-in, contenu invalide toujours refusé) et
-  [`824–856`](../tests/test_scanner_allowlist.py#L824-L856) (CLI : arbre et
+  [`850–882`](../tests/test_scanner_allowlist.py#L850-L882) (CLI : arbre et
   staged hors CI, externe invalide → code 2).
 - **`version` obligatoire** : [`allowlist.py:812–852`](../heimdall/scanner/allowlist.py#L812-L852)
   exige une `version` explicite ([`835–843`](../heimdall/scanner/allowlist.py#L835-L843)) —
   plus de défaut implicite `"1"` : une table `[allowlist]` sans `version`, un
   entier ou toute autre chaîne sont refusés en `ScanError` (code 2). Test :
-  [`485–503`](../tests/test_scanner_allowlist.py#L485-L503).
+  [`511–529`](../tests/test_scanner_allowlist.py#L511-L529).
 - **Motifs à < 3 littéraux : refus maintenu, reformulation documentée** :
   `\d{3}-\d{4}`, `x{3}y{3}`, `[a-z]+`, `\w+` restent refusés (motifs
   aveugles, fail-closed) ; la reformulation `EXAMPLE-[0-9]{4}` est acceptée
   et n'ignore que la forme visée. Le contrat est documenté dans
   [`heimdall.toml`](../heimdall.toml) et [`docs/cli.md`](cli.md). Tests :
-  [`505–538`](../tests/test_scanner_allowlist.py#L505-L538).
+  [`531–564`](../tests/test_scanner_allowlist.py#L531-L564).
 - **`fnmatch` borné des deux côtés** : au plus
   `MAX_PATH_WILDCARDS = 10` jokers `*` par motif (au-delà : code 2)
   ([`allowlist.py:677–695`](../heimdall/scanner/allowlist.py#L677-L695),
@@ -273,9 +276,40 @@ chemins invalides (`..`, NUL, absolu) et sorties `ls-files` malformées
   (immunisé) ; sous les interpréteurs antérieurs, 20 `*` croisés à un chemin
   de 4 096 caractères coûtaient ≈ 1 s, les plafonds ramènent la passe sous
   la milliseconde. Fuzz adversarial borné en temps :
-  [`1437–1516`](../tests/test_scanner_allowlist.py#L1437-L1516).
+  [`1581–1660`](../tests/test_scanner_allowlist.py#L1581-L1660).
 - **Non-régression** : la suite complète passe à
-  **1956 passed, 15 skipped** et les 83 tests d'allowlist sont verts ; les
+  **1962 passed, 15 skipped** et les 89 tests d'allowlist sont verts ; les
   plafonds `MAX_PATH_WILDCARDS = 10` et `MAX_MATCH_PATH_LENGTH = 1024` et
   l'exigence `version` sont figés par les exports vérifiés
-  ([`1935–1956`](../tests/test_scanner_allowlist.py#L1935-L1956)).
+  ([`2079–2100`](../tests/test_scanner_allowlist.py#L2079-L2100)).
+
+### Sixième revue (LOW) — fail-closed strict et messages statiques
+
+- **`os.close` protégé** : [`allowlist.py:907–913`](../heimdall/scanner/allowlist.py#L907-L913)
+  convertit toute `OSError` en `ScanError` (contrat unique, invariant 11) ;
+  [`scan.py:219–241`](../heimdall/cli/scan.py#L219-L241) rend `None`
+  (fail-closed) via try imbriqué + `finally` + `except` externe — sans
+  `return` en `finally` (`SyntaxWarning` évité, fermeture garantie sur
+  tous les chemins). Test :
+  [`905–927`](../tests/test_scanner_allowlist.py#L905-L927) (fermeture
+  réelle puis panne simulée : `ScanError` d'un côté, `None` de l'autre,
+  jamais d'`OSError` brute).
+- **Messages de garde strictement statiques** : `rel_cfg` et `verified.path`
+  (entrées opérateur normalisées) ne sont plus reflétés —
+  [`scan.py:368–374`](../heimdall/cli/scan.py#L368-L374) (configuration
+  stagée), [`381–385`](../heimdall/cli/scan.py#L381-L385) (worktree non
+  propre en staged),
+  [`402–408`](../heimdall/cli/scan.py#L402-L408) (re-contrôle anti-TOCTOU) ;
+  le préfixe `auto-attestation` est conservé pour l'audit. Tests :
+  [`929–957`](../tests/test_scanner_allowlist.py#L929-L957) (arbre, staged,
+  `--config` interne : `str(exc)` sans nom de config) et
+  [`959–977`](../tests/test_scanner_allowlist.py#L959-L977) (substitution
+  entre garde et parsing).
+- **`exists()` en échec → code 2** :
+  [`allowlist.py:954–963`](../heimdall/scanner/allowlist.py#L954-L963)
+  lève `ScanError` sur `OSError` (répertoire illisible) au lieu de rendre
+  une allowlist vide silencieuse ; seule l'absence avérée vaut « pas de
+  config » (le vide reste fail-closed). Test :
+  [`979–1000`](../tests/test_scanner_allowlist.py#L979-L1000).
+- **Non-régression** : la suite complète passe à
+  **1962 passed, 15 skipped** et les 89 tests d'allowlist sont verts.
