@@ -24,6 +24,12 @@ Tout jeton de plus de 4096 caractères lève `ScanError` avant les regex de
 signatures et le calcul Shannon, y compris une longue charge JWT. La lecture
 reste bornée à 1 Mio et la deadline est contrôlée à l'intérieur des lignes,
 par jeton. Cette limite refuse explicitement le scan au lieu de sauter la valeur.
+La collecte lexicale n'effectue qu'un parcours et ne retient que les jetons
+assez longs pour être candidats. Dans le détecteur d'entropie, une ligne de
+micro-jetons n'appelle donc ni les signatures ni Shannon ; une échéance déjà
+expirée est refusée avant tout parcours. Les candidats retenus restent
+revérifiés contre la deadline après la phase de signatures. Cette optimisation
+n'ajoute pas d'interruption à l'intérieur des regex de signatures existantes.
 Les lignes arbitraires ne sont pas concaténées pour augmenter leur entropie.
 
 ```python
@@ -91,6 +97,16 @@ concaténations et reconstructions de variables Python/JavaScript ; aucun
 interpréteur de code ni analyse de flux n'est ajouté. Le rappel global
 précédent était de 0,625 (10/16). Ces chiffres portent sur ce corpus, pas
 sur tous les dépôts possibles.
+
+**Limite connue mono-ligne :** découper un hex de 64 caractères en blocs de
+8 caractères séparés par `-`, un espace, `.` ou `_` donne des fragments
+inférieurs à `min_length` (20 par défaut, plancher configurable 16). Si le
+jeton complet ne franchit pas non plus le seuil base64, les deux moteurs
+rendent `[]`, sans `ScanError`. Le secret reste reconstructible par suppression
+des séparateurs : le scanner ne réalise pas cette reconstruction. Ce cas est
+figé explicitement dans les tests et appartient à la même famille de limites
+que la concaténation/reconstruction de variables. Il n'est pas ajouté à l'oracle
+T21 ; ses quatre faux négatifs et les métriques ci-dessus restent distincts.
 
 ## Corrections demandées dans les commentaires de #23
 

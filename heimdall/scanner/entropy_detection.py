@@ -120,15 +120,21 @@ def find_entropy_matches(
         raise ScanError(_SCAN_ERROR)
     if deadline is not None and time.monotonic() > deadline:
         raise ScanError(_SCAN_ERROR)
-    # Préflight avant les regex de signatures : même un jeton de 1 Mio
-    # s'arrête à la première fenêtre bornée, avant hachage ou Shannon.
-    for _token in _tokens(line, deadline):
-        pass
+    # Un seul parcours lexical, avant les signatures/Shannon : refus immédiat
+    # d'un jeton trop long, et conservation des seuls candidats assez longs.
+    # Une ligne de micro-jetons n'accumule donc pas une liste de matches.
+    tokens = [
+        token
+        for token in _tokens(line, deadline)
+        if token.end() - token.start() >= config.min_length
+    ]
+    if not tokens:
+        return
     signatures = find_signature_matches(line) + preceding_matches
-    for token in _tokens(line, deadline):
+    for token in tokens:
+        if deadline is not None and time.monotonic() > deadline:
+            raise ScanError(_SCAN_ERROR)
         value = token.group()
-        if len(value) < config.min_length:
-            continue
         found_hex = False
         for match in _hex_matches(token, config, signatures, deadline):
             found_hex = True

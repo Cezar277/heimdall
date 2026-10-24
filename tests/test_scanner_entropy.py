@@ -380,3 +380,60 @@ def test_benign_minified_json_overflow_is_an_explicit_refusal(tmp_path: Path) ->
         TreeScanner(tmp_path, hasher=hasher).scan()
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
         SignatureEngine(hasher).analyser(FileTarget("data.jsonl", text))
+
+
+@pytest.mark.parametrize("separator", ["-", " ", ".", "_"])
+def test_short_inline_hex_fragments_are_a_documented_known_limit(
+    tmp_path: Path, separator: str
+) -> None:
+    value = synthetic_value("hex")
+    fragmented = separator.join(value[index : index + 8] for index in range(0, len(value), 8))
+    assert "".join(fragmented.split(separator)) == value
+    text = f'credential = "{fragmented}"'
+    assert not tuple(find_entropy_matches(text))
+    (tmp_path / "config.py").write_text(text)
+    hasher = SnippetHasher(key=b"T" * 32)
+    assert TreeScanner(tmp_path, hasher=hasher).scan() == []
+    assert SignatureEngine(hasher).analyser(FileTarget("config.py", text)) == []
+
+
+def test_half_million_micro_tokens_use_one_lexical_pass(monkeypatch) -> None:
+    original = module._tokens
+    passes = 0
+    visited = 0
+
+    def counted(line, deadline):
+        nonlocal passes, visited
+        passes += 1
+        for token in original(line, deadline):
+            visited += 1
+            yield token
+
+    def forbidden(*args):
+        pytest.fail("micro tokens must not reach signatures or Shannon in the entropy detector")
+
+    monkeypatch.setattr(module, "_tokens", counted)
+    monkeypatch.setattr(module, "find_signature_matches", forbidden)
+    monkeypatch.setattr(module, "shannon_entropy", forbidden)
+    assert not tuple(find_entropy_matches("a " * 500_000))
+    assert passes == 1
+    assert visited == 500_000
+
+
+def test_expired_deadline_rejects_dense_line_before_any_work(tmp_path: Path, monkeypatch) -> None:
+    def forbidden(*args):
+        pytest.fail("expired deadline must refuse before lexical or signature work")
+
+    text = "a " * 500_000
+    (tmp_path / "config.py").write_text(text)
+    monkeypatch.setattr(module, "_tokens", forbidden)
+    monkeypatch.setattr(module, "find_signature_matches", forbidden)
+    monkeypatch.setattr("heimdall.scanner.detect.find_signature_matches", forbidden)
+    monkeypatch.setattr("heimdall.scanner.signature_engine.find_signature_matches", forbidden)
+    hasher = SnippetHasher(key=b"T" * 32)
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        tuple(find_entropy_matches(text, deadline=0.0))
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        TreeScanner(tmp_path, hasher=hasher).scan(deadline=0.0)
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        SignatureEngine(hasher, deadline=0.0).analyser(FileTarget("config.py", text))
