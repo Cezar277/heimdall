@@ -305,7 +305,10 @@ def test_validate_rules_refuses_a_secret_type_outside_the_closed_set() -> None:
 
 def test_every_registered_secret_type_is_in_the_closed_set() -> None:
     """Le registre livré ne produit que des types documentés."""
-    assert {rule.secret_type for rule in RULES} == set(ALLOWED_SECRET_TYPES)
+    assert {rule.secret_type for rule in RULES} == set(ALLOWED_SECRET_TYPES) - {
+        "high_entropy_hex",
+        "high_entropy_base64",
+    }
 
 
 def test_matches_refuses_a_non_string_line() -> None:

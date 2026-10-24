@@ -14,6 +14,10 @@ l'entropie par caractère est identique à l'entropie par octet du contrat.
 Un seuil est inclusif. Les booléens, NaN et infinis sont refusés. Les valeurs
 hexadécimales sont classées avant les valeurs base64/base64url. Les jetons
 sont maximaux : aucune découpe d'un long jeton en fenêtres artificielles.
+Tout jeton de plus de 4096 caractères lève `ScanError` avant les regex de
+signatures et le calcul Shannon, y compris une longue charge JWT. La lecture
+reste bornée à 1 Mio et la deadline est contrôlée à l'intérieur des lignes,
+par jeton. Cette limite refuse explicitement le scan au lieu de sauter la valeur.
 Les lignes arbitraires ne sont pas concaténées pour augmenter leur entropie.
 
 ```python
@@ -34,38 +38,44 @@ ne contient jamais la valeur brute : seulement l'empreinte HMAC et le score.
 Les signatures gardent la priorité, y compris pour les valeurs multilignes,
 afin de ne pas doubler les alertes. Les plafonds Findings et deadlines
 existants restent appliqués aux nouveaux candidats.
+L'origine vient du champ typé `SignatureMatch.source`, jamais du nom de la
+règle : une signature nommée `entropy` reste `source="regex"`. Les deux types
+génériques appartiennent à `ALLOWED_SECRET_TYPES`, avec les types fournisseurs.
 
 ## Contexte local
 
-`heimdall.scanner.entropy_detection.context_lines(target, finding.line)`
-rend un `ScanContext` avec l'attribut sensible `lines` : couples
-`(numéro réel, texte)`, cinq lignes avant et après, tronqués aux bords du
-fichier. Pour un diff, seules les lignes disponibles dans la cible sont
-rendues ; les lignes absentes ne sont pas inventées. Le `repr` masque le
-contenu. Cette API interne est destinée au triage local : aucune écriture,
-aucun appel réseau, aucune transmission automatique à un LLM. Le contenu
-brut ne doit pas être journalisé ni ajouté au Finding ou à un rapport.
+`ScanContext` et `context_lines` ont été supprimés après revue : aucun
+consommateur de production ne justifiait une nouvelle surface de texte clair.
+Le contexte ±5 lignes demandé initialement reste différé jusqu'à son
+intégration avec un consommateur et une politique de masquage explicites.
+Aucun champ de contexte n'est ajouté au Finding ; sa sérialisation reste
+sans valeur brute, vérifiée par `json.dumps(asdict(finding))` dans les tests.
 
 ## Faux positifs et limites
 
-Les UUID, les digests explicitement affectés à `sha*`, `md5`, `commit`,
-`checksum`, `integrity`, les valeurs préfixées `sha512-` et les charges de
-data URI base64 ne produisent pas de signal d'entropie. Une signature connue
-reste signalée dans ces contextes. Ces filtres sont des heuristiques : un
-secret sans signature déguisé en digest ou data URI peut donc être manqué.
-À l'inverse, un hash sans indication de contexte peut produire une alerte.
-L'entropie n'est pas une preuve qu'une valeur est un secret. L'allowlist
-générale reste le périmètre de #24.
+Les étiquettes `sha256`, `commit`, `checksum`, `integrity`, les UUID et les
+data URI ne constituent jamais une autorisation de taire un candidat.
+La charge d'un préfixe `sha512-` est analysée, y compris si elle est hexadécimale.
+Les UUID utilisent le seuil hexadécimal. Seules les valeurs déjà reconnues
+par une signature évitent un second signal redondant. Les valeurs publiques
+aléatoires peuvent donc produire des faux positifs : l'allowlist explicite
+et auditée relève de #24, pas d'une heuristique sur un nom contrôlable.
 
 Mesure reproductible sur le corpus T21, oracle inchangé (34 cas, dont
 18 non-secrets), avec `PYTHONPATH=. python tests/measure_trap.py` :
 
 | Périmètre | VP | FP | FN | Précision | Rappel |
 | --- | --- | --- | --- | --- | --- |
-| `core` (sans obfuscations) | 10 | 0 | 0 | 1,00 | 1,00 |
-| `all` | 12 | 0 | 4 | 1,00 | 0,75 |
+| `core` (sans obfuscations) | 10 | 8 | 0 | 0,5556 | 1,00 |
+| `all` | 12 | 8 | 4 | 0,60 | 0,75 |
 
-Aucune fausse alerte sur les 18 non-secrets. Les deux chaînes encodées sont
+Huit fausses alertes sur les 18 non-secrets (UUID, SHA-256, commit et intégrité,
+dans chaque langage). Le seuil de précision de 90 % de `measure_trap.py`
+reste inchangé : cette commande retourne **1**, car ce critère T21 n'est
+plus satisfait sans l'allowlist. L'oracle n'est ni modifié ni filtré et le
+test de régression vérifie ces comptes exacts ; une suite pytest verte ne
+signifie donc pas que le seuil de précision T21 est atteint.
+Les deux chaînes encodées sont
 repérées par leur entropie sans décodage. Les quatre cas restants sont les
 concaténations et reconstructions de variables Python/JavaScript ; aucun
 interpréteur de code ni analyse de flux n'est ajouté. Le rappel global
@@ -74,8 +84,12 @@ sur tous les dépôts possibles.
 
 ## Corrections demandées dans les commentaires de #23
 
-- Affectation AWS sans valeur reconnue et fenêtre multiligne dépassant
-  4096 octets UTF-8 : `ScanError` statique, dans les deux moteurs.
+- Fenêtre multiligne dépassant 4096 octets UTF-8 : `ScanError` statique dans
+  les deux moteurs dès qu'une des lignes porte `:` ou `=`, ou un jeton de
+  longueur candidate. Ce choix conservateur couvre tous les fournisseurs et
+  les fragments dont l'entropie isolée est inférieure à celle du secret entier.
+  Sans parseur de langage, une affectation complète dans cette situation
+  peut aussi être refusée ; le refus est explicite, jamais une liste vide.
 - UTF-8 invalide sans BOM : décodage strict, puis `ScanError` statique ;
   un vrai binaire connu reste exclu par la politique existante. Un faux PNG
   non UTF-8 contenant du texte clair fait échouer la CLI en code 2.

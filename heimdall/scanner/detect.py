@@ -423,7 +423,11 @@ class Scanner:
             if index % 256 == 0 and deadline is not None and time.monotonic() > deadline:
                 raise ScanError(_SCAN_ERROR)
             line_number = index + 1
-            previous = self._joined_window(lines[index - 1], lines, index - 1) if index else None
+            previous = (
+                self._joined_window(lines[index - 1], lines, index - 1, deadline=deadline)
+                if index
+                else None
+            )
             preceding = (
                 ()
                 if previous is None
@@ -433,7 +437,9 @@ class Scanner:
                     if match.start < previous[1]
                 )
             )
-            for match in find_entropy_matches(line, self._entropy_config, preceding):
+            for match in find_entropy_matches(
+                line, self._entropy_config, preceding, deadline=deadline
+            ):
                 self._append(findings, seen, match, line_number, relative, deadline=deadline)
             for match in find_signature_matches(line):
                 self._append(
@@ -444,7 +450,7 @@ class Scanner:
                     relative,
                     deadline=deadline,
                 )
-            following = self._joined_window(line, lines, index)
+            following = self._joined_window(line, lines, index, deadline=deadline)
             if following is None:
                 continue
             joined, limit = following
@@ -464,11 +470,13 @@ class Scanner:
                 )
         return findings
 
-    def _joined_window(self, line: str, lines: list[str], index: int) -> tuple[str, int] | None:
+    def _joined_window(
+        self, line: str, lines: list[str], index: int, *, deadline: float | None = None
+    ) -> tuple[str, int] | None:
         """Jointure bornée de deux lignes, pour les secrets coupés par un ``\\n``.
 
-        La fenêtre est limitée à :data:`MULTILINE_WINDOW` octets : au-delà, un
-        secret coupé n'est pas recherché (limite documentée).
+        Au-delà de :data:`MULTILINE_WINDOW` octets, une affectation ou un
+        jeton de longueur candidate refuse le scan au lieu d'être ignoré.
         """
         if index + 1 >= len(lines):
             return None
@@ -476,7 +484,7 @@ class Scanner:
         # Fenêtre en octets UTF-8 (doc 4 Kio), pas en caractères : l'écart
         # doc/implantation sur UTF-8 multioctets serait une borne contournable.
         if len((line + following).encode("utf-8")) > MULTILINE_WINDOW:
-            check_multiline_overflow(line)
+            check_multiline_overflow(line, following, self._entropy_config, deadline=deadline)
             return None
         return line + following, len(line)
 
@@ -507,7 +515,7 @@ class Scanner:
                 type=match.secret_type,
                 entropy=round(shannon_entropy(match.value.encode("utf-8")), 4),
                 snippet_hash=snippet_hash,
-                source="entropy" if match.signature == "entropy" else "regex",
+                source=match.source,
             )
         )
         if len(findings) > self._max_findings:

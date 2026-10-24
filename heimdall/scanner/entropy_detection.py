@@ -1,14 +1,12 @@
-"""Détection locale des valeurs hex/base64 sans signature connue (#23).
-
-Les correspondances brutes restent internes au moteur ; aucun I/O ici.
-"""
+"""Détection locale des valeurs hex/base64 sans exclusions de contenu (#23)."""
 
 from __future__ import annotations
 
 import math
 import re
+import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.errors import ScanError
@@ -16,20 +14,12 @@ from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
 MIN_TOKEN_LENGTH = 16
 MAX_TOKEN_LENGTH = 4096
-CONTEXT_RADIUS = 5
-PREFIX_WINDOW = 256
+_SCAN_ERROR = "scan impossible : entrée non analysable"
 
-_TOKEN = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
+# Un caractère sentinelle au-delà du plafond : refus avant calcul d'entropie.
+_TOKEN = re.compile(r"[A-Za-z0-9_+/-]{1,4097}={0,2}")
 _HEX = re.compile(r"[0-9a-fA-F]+")
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
-_PUBLIC_DIGEST = re.compile(
-    r"(?i)\b(?:sha(?:1|224|256|384|512)?|md5|commit|integrity|checksum)"
-    r"[\"']?\s*[:=]\s*[\"']?$"
-)
-_DATA_URI = re.compile(r"data:[^\s\"']{0,128};base64,$")
-_AWS_ASSIGNMENT = re.compile(
-    r"(?i)(?:aws_secret_access_key|aws_secret_key|secret_access_key)[\"']?\]?\s*[:=]"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,84 +49,77 @@ class EntropyConfig:
 DEFAULT_ENTROPY_CONFIG = EntropyConfig()
 
 
+def _tokens(line: str, deadline: float | None) -> Iterator[re.Match[str]]:
+    for token in _TOKEN.finditer(line):
+        if deadline is not None and time.monotonic() > deadline:
+            raise ScanError(_SCAN_ERROR)
+        if token.end() - token.start() > MAX_TOKEN_LENGTH:
+            raise ScanError(_SCAN_ERROR)
+        yield token
+
+
 def find_entropy_matches(
     line: str,
     config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
     preceding_matches: tuple[SignatureMatch, ...] = (),
+    *,
+    deadline: float | None = None,
 ) -> Iterator[SignatureMatch]:
-    """Valeurs maximales, jamais des fragments artificiels d'un long jeton.
+    """Candidats internes, sans filtre digest/UUID/data URI contrôlable.
 
-    UUID et digests explicitement étiquetés ne sont pas des signaux d'entropie.
-    Ce filtre ne s'applique jamais aux signatures déterministes.
+    Un jeton > 4096 caractères refuse le scan ; aucun fragment n'est ignoré.
+    Une signature reconnue conserve la priorité sur son signal entropie.
     """
+    if not isinstance(line, str) or not isinstance(config, EntropyConfig):
+        raise ScanError(_SCAN_ERROR)
+    if deadline is not None and time.monotonic() > deadline:
+        raise ScanError(_SCAN_ERROR)
+    # Préflight avant les regex de signatures : même un jeton de 1 Mio
+    # s'arrête à la première fenêtre bornée, avant hachage ou Shannon.
+    for _token in _tokens(line, deadline):
+        pass
     signatures = find_signature_matches(line) + preceding_matches
-    for token in _TOKEN.finditer(line):
+    for token in _tokens(line, deadline):
         value = token.group()
-        if len(value) < config.min_length or _UUID.fullmatch(value):
+        # Le préfixe d'intégrité est un séparateur de format, jamais une
+        # raison de taire sa charge (y compris une charge hexadécimale).
+        start = token.start()
+        if value.startswith("sha512-"):
+            value = value[len("sha512-") :]
+            start += len("sha512-")
+        if len(value) < config.min_length:
             continue
-        # Pas de double signal pour une signature (JWT/PEM inclus).
         if any(value in match.value or match.value in value for match in signatures):
             continue
-        prefix = line[max(0, token.start() - PREFIX_WINDOW) : token.start()]
-        if _PUBLIC_DIGEST.search(prefix) or value.startswith("sha512-"):
-            continue
-        # Les data: URI ne sont pas des identifiants de connexion.
-        if _DATA_URI.search(prefix):
-            continue
-        hexadecimal = _HEX.fullmatch(value) is not None
-        if not hexadecimal:
-            body = value.rstrip("=")
-            if "=" in body or ("-" in body and "+" in body):
-                continue
+        hexadecimal = _HEX.fullmatch(value) is not None or _UUID.fullmatch(value) is not None
         threshold = config.hex_threshold if hexadecimal else config.base64_threshold
         if shannon_entropy(value.encode("ascii")) >= threshold:
             yield SignatureMatch(
                 "high_entropy_hex" if hexadecimal else "high_entropy_base64",
                 "entropy",
                 value,
-                token.start(),
+                start,
+                source="entropy",
             )
 
 
-def check_multiline_overflow(line: str) -> None:
-    """Refuse une affectation AWS non reconnue si la jointure est impossible."""
-    assignments = tuple(_AWS_ASSIGNMENT.finditer(line))
-    if not assignments:
-        return
-    recognized = {
-        match.start
-        for match in find_signature_matches(line)
-        if match.signature == "aws_secret_access_key"
-    }
-    if any(assignment.start() not in recognized for assignment in assignments):
-        raise ScanError("scan impossible : entrée non analysable")
+def check_multiline_overflow(
+    line: str,
+    following: str,
+    config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
+    *,
+    deadline: float | None = None,
+) -> None:
+    """Refus conservateur d'une jointure incomplète, tous fournisseurs.
 
-
-@dataclass(frozen=True, slots=True)
-class ScanContext:
-    """Contexte sensible dont le repr masque le contenu."""
-
-    lines: tuple[tuple[int, str], ...] = field(repr=False)
-
-
-def context_lines(target: object, line_number: int) -> ScanContext:
-    """Cinq lignes avant/après, numéros réels, contenu sensible non journalisable.
-
-    Surface explicite interne destinée au triage local, distincte de Finding v1.
-    Le retour ne doit jamais être sérialisé dans un rapport ni un journal.
-    Les trous d'un diff restent des trous : aucun contenu n'est inventé.
+    Un délimiteur d'affectation sur l'une des lignes suffit à refuser :
+    distinguer une affectation complète nécessiterait un parseur de langage.
+    Sans affectation, un jeton de longueur candidate refuse aussi : un secret
+    fragmenté peut avoir moins d'entropie que sa valeur reconstruite.
     """
-    # Import différé pour éviter un cycle avec l'interface du moteur.
-    from heimdall.scanner.interface import DiffTarget, FileTarget  # noqa: PLC0415
-
-    if not isinstance(target, (FileTarget, DiffTarget)):
-        raise ScanError("cible de contexte invalide")
-    if type(line_number) is not int or line_number < 1:
-        raise ScanError("ligne de contexte invalide")
-    return ScanContext(
-        tuple(
-            (number, text)
-            for number, text in target.lignes()
-            if abs(number - line_number) <= CONTEXT_RADIUS
-        )
-    )
+    if any(delimiter in text for text in (line, following) for delimiter in (":", "=")):
+        raise ScanError(_SCAN_ERROR)
+    for text in (line, following):
+        for token in _tokens(text, deadline):
+            if token.end() - token.start() >= config.min_length:
+                raise ScanError(_SCAN_ERROR)

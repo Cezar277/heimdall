@@ -139,7 +139,9 @@ class SignatureEngine:
                     if match.start < previous[1]
                 )
             )
-            for match in find_entropy_matches(line, self._entropy_config, preceding):
+            for match in find_entropy_matches(
+                line, self._entropy_config, preceding, deadline=self._deadline
+            ):
                 self._append(findings, seen, match, line_number, cible.path)
             for match in find_signature_matches(line):
                 self._append(findings, seen, match, line_number, cible.path)
@@ -180,12 +182,12 @@ class SignatureEngine:
             return None
         joined = line + following
         if len(joined) > MULTILINE_WINDOW:
-            check_multiline_overflow(line)
+            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
             return None
         # Le nombre de caractères minore le nombre d'octets UTF-8 : le premier
         # contrôle évite d'encoder les lignes déjà trop longues.
         if not joined.isascii() and len(joined.encode("utf-8")) > MULTILINE_WINDOW:
-            check_multiline_overflow(line)
+            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
             return None
         return joined, len(line)
 
@@ -223,7 +225,7 @@ class SignatureEngine:
                 type=match.secret_type,
                 entropy=round(shannon_entropy(match.value.encode("utf-8")), 4),
                 snippet_hash=snippet_hash,
-                source="entropy" if match.signature == "entropy" else "regex",
+                source=match.source,
             )
         )
         if len(findings) > self._max_findings:

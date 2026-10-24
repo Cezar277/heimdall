@@ -2,17 +2,23 @@
 
 import base64
 import hashlib
+import json
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
 
+import heimdall.scanner.entropy_detection as module
+import heimdall.scanner.signatures as registry
 from heimdall.scanner import DiffTarget, EntropyConfig, FileTarget, Finding, Scanner
 from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.entropy import shannon_entropy
-from heimdall.scanner.entropy_detection import context_lines, find_entropy_matches
+from heimdall.scanner.entropy_detection import find_entropy_matches
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.signature_engine import SignatureEngine
+from heimdall.scanner.signatures import SignatureMatch
+from heimdall.scanner.signatures.model import ALLOWED_SECRET_TYPES
 
 
 def synthetic_value(alphabet: str) -> str:
@@ -69,19 +75,8 @@ def test_invalid_configuration_is_refused(field: str, value: object) -> None:
         EntropyConfig(**{field: value})
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "a" * 100,
-        "550e8400-e29b-41d4-a716-446655440000",
-        "sha256 = '" + synthetic_value("hex") + "'",
-        "commit = '" + synthetic_value("hex")[:40] + "'",
-        "integrity = 'sha512-" + synthetic_value("base64") + "'",
-        "data:image/png;base64," + synthetic_value("base64"),
-    ],
-)
-def test_documented_non_secret_forms(text: str) -> None:
-    assert not tuple(find_entropy_matches(text))
+def test_low_entropy_is_not_a_candidate() -> None:
+    assert not tuple(find_entropy_matches("a" * 100))
 
 
 def test_distinct_values_same_line_and_limit() -> None:
@@ -106,31 +101,6 @@ def test_unquoted_env_assignment_is_detected(alphabet: str) -> None:
     assert findings[0].type == f"high_entropy_{alphabet}"
 
 
-def test_public_value_does_not_hide_a_second_value_on_same_line() -> None:
-    value = synthetic_value("base64")
-    line = f'checksum="{synthetic_value("hex")}"; credential="{value}"'
-    assert [match.value for match in find_entropy_matches(line)] == [value]
-    line = f'icon="data:image/png;base64,AAAA"; credential="{value}"'
-    assert [match.value for match in find_entropy_matches(line)] == [value]
-
-
-def test_context_has_five_lines_each_side_without_finding_extension() -> None:
-    target = FileTarget("config.py", "\n".join(f"line {number}" for number in range(1, 20)))
-    context = context_lines(target, 10)
-    assert [number for number, _ in context.lines] == list(range(5, 16))
-    assert "line 10" not in repr(context)
-    assert [number for number, _ in context_lines(target, 1).lines] == list(range(1, 7))
-    assert [number for number, _ in context_lines(target, 19).lines] == list(range(14, 20))
-    diff = DiffTarget("config.py", ((1, "first"), (10, "candidate"), (12, "last")))
-    assert context_lines(diff, 10).lines == ((10, "candidate"), (12, "last"))
-
-
-@pytest.mark.parametrize("target,line", [(object(), 1), (FileTarget("x", ""), 0)])
-def test_invalid_context_request_is_refused(target: object, line: int) -> None:
-    with pytest.raises(ScanError):
-        context_lines(target, line)
-
-
 def test_invalid_byte_inside_candidate_is_fail_closed(tmp_path: Path) -> None:
     (tmp_path / "config.py").write_bytes(b"AKIA12345678\xff12345678")
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
@@ -148,3 +118,133 @@ def test_invalid_config_object_is_refused_by_both_motors(tmp_path: Path) -> None
         SignatureEngine(entropy_config=None)
     with pytest.raises(ValueError, match="configuration d'entropie invalide"):
         TreeScanner(tmp_path, hasher=SnippetHasher(key=b"T" * 32), entropy_config=None)
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "sha256 = '{}'",
+        "commit = '{}'",
+        "checksum = '{}'",
+        "integrity = 'sha512-{}'",
+        "data:text/plain;base64,{}",
+        "'{}'",
+    ],
+)
+@pytest.mark.parametrize("alphabet", ["hex", "base64"])
+def test_labels_cannot_hide_unknown_candidates(tmp_path: Path, wrapper: str, alphabet: str) -> None:
+    text = wrapper.format(synthetic_value(alphabet))
+    (tmp_path / "config.py").write_text(text)
+    hasher = SnippetHasher(key=b"T" * 32)
+    tree = TreeScanner(tmp_path, hasher=hasher).scan()
+    engine = SignatureEngine(hasher).analyser(FileTarget("config.py", text))
+    assert tree == engine
+    assert tree and all(f.source == "entropy" for f in tree)
+    assert all(f.type in ALLOWED_SECRET_TYPES for f in tree)
+
+
+def test_uuid_shape_is_not_an_exclusion() -> None:
+    value = synthetic_value("hex")
+    uuid = "-".join((value[:8], value[8:12], value[12:16], value[16:20], value[20:32]))
+    assert tuple(find_entropy_matches(uuid))
+
+
+@pytest.mark.parametrize("label", ["stripe", "slack", "pat", "jwt", "unknown", ""])
+def test_multiline_overflow_is_not_provider_specific(tmp_path: Path, label: str) -> None:
+    value = synthetic_value("base64")
+    text = (f"{label} = " if label else "") + " " * 5000 + "\n" + value
+    (tmp_path / "config.py").write_text(text)
+    hasher = SnippetHasher(key=b"T" * 32)
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        TreeScanner(tmp_path, hasher=hasher).scan()
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        SignatureEngine(hasher).analyser(FileTarget("config.py", text))
+
+
+@pytest.mark.parametrize(
+    "line,config",
+    [(None, EntropyConfig()), (b"abc", EntropyConfig()), ("abc", None), ("abc", object())],
+)
+def test_direct_function_rejects_invalid_inputs(line: object, config: object) -> None:
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        tuple(find_entropy_matches(line, config))
+
+
+def test_oversized_token_refuses_before_shannon_or_signature_work(monkeypatch) -> None:
+    def forbidden(*args):
+        pytest.fail("unbounded token reached signature matching or Shannon")
+
+    monkeypatch.setattr("heimdall.scanner.entropy_detection.shannon_entropy", forbidden)
+    monkeypatch.setattr("heimdall.scanner.entropy_detection.find_signature_matches", forbidden)
+    with pytest.raises(ScanError):
+        tuple(find_entropy_matches("a" * 1_048_576))
+
+
+def test_deadline_is_checked_inside_a_line(monkeypatch) -> None:
+    times = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr("heimdall.scanner.entropy_detection.time.monotonic", lambda: next(times))
+    with pytest.raises(ScanError):
+        tuple(find_entropy_matches("first second third", deadline=1.0))
+
+
+def test_megabyte_token_and_expired_deadline_in_both_engines(tmp_path: Path) -> None:
+    text = "a" * 1_048_576
+    (tmp_path / "config.py").write_text(text)
+    hasher = SnippetHasher(key=b"T" * 32)
+    for deadline in (None, 0.0):
+        with pytest.raises(ScanError):
+            TreeScanner(tmp_path, hasher=hasher).scan(deadline=deadline)
+        with pytest.raises(ScanError):
+            SignatureEngine(hasher, deadline=deadline).analyser(FileTarget("config.py", text))
+
+
+@pytest.mark.parametrize("size", [4096, 4097])
+def test_token_limit_is_inclusive(size: int) -> None:
+    if size == 4096:
+        assert not tuple(find_entropy_matches("A" * size))
+    else:
+        with pytest.raises(ScanError):
+            tuple(find_entropy_matches("A" * size))
+
+
+def test_low_entropy_fragment_cannot_hide_behind_overflow() -> None:
+    text = "A" * 20 + " " * 5000 + "\n" + "B" * 20
+    with pytest.raises(ScanError):
+        SignatureEngine(SnippetHasher(key=b"T" * 32)).analyser(FileTarget("config.py", text))
+
+
+def test_overflow_without_candidate_or_assignment_remains_scannable() -> None:
+    text = "#" * 5000 + "\nshort"
+    assert (
+        SignatureEngine(SnippetHasher(key=b"T" * 32)).analyser(FileTarget("config.py", text)) == []
+    )
+
+
+def test_signature_id_entropy_does_not_control_source() -> None:
+    hasher = SnippetHasher(key=b"T" * 32)
+    match = SignatureMatch("aws", "entropy", "A" * 20)
+    findings = []
+    SignatureEngine(hasher)._append(findings, set(), match, 1, "config.py")
+    assert findings[0].source == "regex"
+
+
+def test_real_registry_rule_named_entropy_stays_regex(tmp_path: Path, monkeypatch) -> None:
+    rule = replace(registry.RULES[0], id="entropy")
+    monkeypatch.setattr(registry, "RULES", (rule,))
+    hasher = SnippetHasher(key=b"T" * 32)
+    target = FileTarget("config.py", rule.positive_example)
+    (tmp_path / target.path).write_text(target.text)
+    for findings in (
+        SignatureEngine(hasher).analyser(target),
+        TreeScanner(tmp_path, hasher=hasher).scan(),
+    ):
+        assert findings and all(f.source == "regex" for f in findings)
+
+
+def test_removed_context_surface_cannot_expose_cleartext() -> None:
+    assert not hasattr(module, "ScanContext")
+    assert not hasattr(module, "context_lines")
+    value = synthetic_value("hex")
+    finding = SignatureEngine(SnippetHasher(key=b"T" * 32)).analyser(FileTarget("x", value))[0]
+    assert value not in json.dumps(asdict(finding))
+    assert value not in str(finding)

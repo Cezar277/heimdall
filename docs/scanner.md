@@ -30,7 +30,7 @@ Un Finding contient exactement : `file`, `line`, `type`, `entropy`,
 `snippet_hash`, `status` (`detecte`) et `source` (`regex` ou `entropy`). **La valeur brute
 n'est jamais conservée** : seule une empreinte HMAC-SHA-256 est produite.
 
-La détection générique par entropie (#23), ses seuils et le contexte local
+La détection générique par entropie (#23), ses seuils et ses limites
 sont documentés dans [scanner-entropy.md](scanner-entropy.md).
 
 ## Signatures (#54)
@@ -64,8 +64,10 @@ jointure avec la ligne suivante (sans séparateur) si la fenêtre totale ne
 dépasse pas **4 Kio**. Un secret coupé par un retour à la ligne
 (`aws_secret_access_key =` puis la valeur à la ligne suivante) est donc
 détecté, et le Finding porte la ligne où la correspondance commence. Au-delà
-de 4 Kio, la jointure n'est pas faite. Une affectation AWS sans valeur
-reconnue sur la ligne courante lève alors `ScanError` (#23).
+de 4 Kio, la jointure n'est pas faite. Un délimiteur d'affectation (`:`/`=`)
+ou un jeton de longueur candidate sur une des lignes lève `ScanError` (#23),
+quel que soit le fournisseur. Un jeton individuel > 4096 caractères est
+également refusé avant calcul d'entropie (y compris les longues charges JWT).
 
 Une ligne peut produire plusieurs Findings de types différents. Deux **valeurs
 distinctes** du même type sur la même ligne produisent **deux** Findings
@@ -203,11 +205,13 @@ jamais 0 ni 1.
   mode strict (arbre de travail) ou l'analyse **sans exclusion** des blobs
   indexés (`--staged`) : ce blocage est levé pour la CLI, il reste entier
   pour l'usage bibliothèque, et #59 garde la main sur la politique.
-- La jointure multi-ligne est bornée à 4 Kio. Une affectation AWS sans
-  valeur reconnue dont la jointure dépasse cette borne lève `ScanError`
-  depuis #23 ; les autres reconstructions ne sont pas interprétées.
-- La charge d'un JWT est bornée à 64 Kio et l'en-tête à 1 Kio : un jeton
-  conforme est détecté, un jeton hors de ces bornes ne l'est pas. Les autres
+- La jointure multi-ligne est bornée à 4 Kio. Une affectation ou un jeton de
+  longueur candidate sur une des lignes provoque `ScanError` lorsque cette
+  borne est dépassée, sans exception par fournisseur. Les jetons individuels
+  > 4096 caractères provoquent également `ScanError`, jamais un skip.
+- Le motif de signature JWT accepte une charge de 64 Kio et un en-tête de
+  1 Kio, mais le moteur refuse désormais tout jeton lexical > 4096 caractères
+  (`ScanError`, y compris pour un JWT). Les autres
   préfixes AWS (au-delà de `AKIA`/`ASIA`/`ABIA`/`ACCA`) ne sont pas couverts.
 - Seules les familles de jetons Slack publiées par Slack sont couvertes
   (`xoxb-`, `xoxp-`, `xapp-`, `xwfp-`, `xoxe.` et les historiques `xoxa-`,
@@ -235,8 +239,12 @@ jamais 0 ni 1.
 .venv/bin/python tests/measure_trap.py
 ```
 
-Résultats de la livraison : **122 tests passés**, couverture du paquet
+Résultats historiques de la livraison #22 : **122 tests passés**, couverture du paquet
 `heimdall/scanner` **91,31 %** (branches incluses), suite complète **936 tests
 passés**, couverture globale **96,69 %**, mesure T21 `core` précision **1,00**,
-rappel **1,00**, aucune fausse alerte sur les 18 non-leaks.
+rappel **1,00**, aucune fausse alerte sur les 18 non-leaks à cette révision.
+Depuis la correction de revue #23, les étiquettes digest/data URI et UUID
+ne taisent plus les candidats : huit faux positifs sont comptés honnêtement
+sur ce corpus. Les résultats actuels et le seuil de précision non atteint
+sont dans [scanner-entropy.md](scanner-entropy.md).
 Les liens permanents et la fiche SAMM sont dans [t22-samm.md](t22-samm.md).
