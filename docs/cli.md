@@ -59,11 +59,13 @@ passage silencieux. Un `secret_types` doit suivre la grammaire des types
 du contrat Finding (`[a-z][a-z0-9_]*`, 64 caractères max, ex. `aws`) :
 `"AWS"` ou `"../etc"` sont refusés en code 2 au lieu de rendre la règle
 muette. Le critère `exact_keywords` (optionnel) compare à égalité
-insensible à la casse : c'est le choix auditable pour les marqueurs
-globaux sans `paths` (`example`, `changeme`, `dummy`) — `my-example-key`
-reste détecté, seul le marqueur exact est ignoré. Les `keywords`
-classiques gardent la frontière `\b` stricte et restent réservés aux
-règles restreintes par `paths` (fixtures de test).
+insensible à la casse : c'est le SEUL critère valeur autorisé sans
+restriction — le choix auditable pour les marqueurs globaux sans `paths`
+(`example`, `changeme`, `dummy`) : `my-example-key` reste détecté, seul le
+marqueur exact est ignoré. Les `keywords` classiques gardent la frontière
+`\b` stricte mais exigent une restriction conjointe (`paths` et/ou
+`secret_types`, ex. fixtures de test) : une règle `keywords`/`patterns`
+globale est refusée en code 2, jamais silencieusement ignorante.
 
 Les `patterns` ne peuvent pas rendre l'allowlist aveugle : via TOML, chaque
 chaîne est compilée puis validée ; via l'API Python, seules des expressions

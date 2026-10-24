@@ -168,6 +168,7 @@ def test_allowlist_rule_validation() -> None:
         name="test-rule",
         description="Règle de test",
         keywords=("dummy",),
+        paths=("src/**",),
     )
     assert rule.name == "test-rule"
 
@@ -202,8 +203,8 @@ def test_allowlist_rule_validation() -> None:
 
 def test_allowlist_duplicate_rule_names_rejected() -> None:
     """Deux règles ne peuvent pas porter le même nom (traçabilité univoque)."""
-    r1 = AllowlistRule(name="dup", description="first", keywords=("a",))
-    r2 = AllowlistRule(name="dup", description="second", keywords=("b",))
+    r1 = AllowlistRule(name="dup", description="first", keywords=("a",), paths=("src/**",))
+    r2 = AllowlistRule(name="dup", description="second", keywords=("b",), paths=("src/**",))
     with pytest.raises(ScanError):
         Allowlist([r1, r2])
 
@@ -299,6 +300,78 @@ def test_rule_dummy_tokens() -> None:
         )
         is None
     )
+
+
+def test_global_value_criteria_require_restriction() -> None:
+    """Revue (MEDIUM) : aucun `keywords`/`patterns` global sans `paths`/`secret_types`.
+
+    Seuls les `exact_keywords` peuvent être globaux ; un motif ou un mot-clé
+    large exige une restriction conjointe, sinon la règle est muette sur les
+    valeurs choisies (footgun `my-example-key`, invariant 1).
+    """
+    # API : refus fail-closed.
+    with pytest.raises(ScanError):
+        AllowlistRule(name="g", description="d", keywords=("example",))
+    with pytest.raises(ScanError):
+        AllowlistRule(
+            name="g", description="d", patterns=(re.compile(r"EXAMPLE.*"),)
+        )
+    # TOML : idem (le parseur construit via le même contrat).
+    with pytest.raises(ScanError):
+        parse_allowlist_toml(
+            '[allowlist]\nversion = "1"\n[[allowlist.rules]]\n'
+            'name = "g"\ndescription = "d"\nkeywords = ["example"]\n'
+        )
+    with pytest.raises(ScanError):
+        parse_allowlist_toml(
+            '[allowlist]\nversion = "1"\n[[allowlist.rules]]\n'
+            'name = "g"\ndescription = "d"\npatterns = ["EXAMPLE.*"]\n'
+        )
+    # Restreints : acceptés, et seuls les `exact_keywords` restent globaux.
+    AllowlistRule(
+        name="ok-paths", description="d", keywords=("example",), paths=("docs/**",)
+    )
+    AllowlistRule(
+        name="ok-types",
+        description="d",
+        patterns=(re.compile(r"EXAMPLE.*"),),
+        secret_types=("password",),
+    )
+    exact_only = AllowlistRule(
+        name="ok-exact", description="d", exact_keywords=("example",)
+    )
+    assert exact_only.matches(
+        value="example", file_path="app.py", line_number=1, secret_type="password"
+    )
+    assert not exact_only.matches(
+        value="my-example-key-12345",
+        file_path="app.py",
+        line_number=1,
+        secret_type="password",
+    )
+
+
+def test_cli_global_keywords_config_exits_two(git_repo: GitRepo, tmp_path: Path) -> None:
+    """Revue (MEDIUM) : `--config` avec règle globale -> code 2, jamais muette."""
+    bad_cfg = tmp_path / "global.toml"
+    bad_cfg.write_text(
+        '[allowlist]\nversion = "1"\n\n[[allowlist.rules]]\nname = "g"\n'
+        'description = "d"\nkeywords = ["example"]\nsecret_types = ["aws"]\n',
+        encoding="utf-8",
+    )
+    # Avec restriction c'est valide : le scan aboutit (secret réel détecté -> 1),
+    # ce qui fige la différence avec le refus en 2 du cas global ci-dessous.
+    git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+    res_restricted = _run("scan", "--config", str(bad_cfg), str(git_repo.root))
+    assert res_restricted.exit_code == EXIT_FINDINGS
+    bad_cfg.write_text(
+        '[allowlist]\nversion = "1"\n\n[[allowlist.rules]]\nname = "g"\n'
+        'description = "d"\nkeywords = ["example"]\n',
+        encoding="utf-8",
+    )
+    res = _run("scan", "--config", str(bad_cfg), str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "scan impossible" in res.stderr.lower()
 
 
 def test_global_keywords_do_not_swallow_chosen_values() -> None:
@@ -517,7 +590,7 @@ def test_load_allowlist_explicit_external_config_accepted(tmp_path: Path) -> Non
     outside = tmp_path / "outside.toml"
     outside.write_text(
         '[allowlist]\nversion = "1"\n\n[[allowlist.rules]]\n'
-        'name = "dummy"\ndescription = "d"\nkeywords = ["dummy"]\n',
+        'name = "dummy"\ndescription = "d"\nexact_keywords = ["dummy"]\n',
         encoding="utf-8",
     )
     repo = tmp_path / "repo"
@@ -656,6 +729,7 @@ def test_pattern_min_literals_reformulation_is_accepted() -> None:
         name="example-form",
         description="d",
         patterns=(ok,),
+        secret_types=("password",),
     )
     assert rule.matches(
         value="EXAMPLE-1234",
@@ -694,6 +768,7 @@ version = "1"
 name = "minimum-keyword"
 description = "d"
 keywords = ["abc"]
+paths = ["src/**"]
 """)
     assert parsed.rules[0].keywords == ("abc",)
 
@@ -777,6 +852,7 @@ version = "1"
 name = "example-placeholders"
 description = "Exemple"
 patterns = ["^AKIA.*EXAMPLE$"]
+paths = ["app.py"]
 """,
     )
     # Committer heimdall.toml pour qu'il soit une configuration de dépôt validée
@@ -815,6 +891,7 @@ version = "1"
 name = "my-custom-rule"
 description = "desc"
 patterns = ["^AKIA.*EXAMPLE$"]
+paths = ["app.py"]
 """,
     )
     git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
@@ -843,6 +920,7 @@ version = "1"
 name = "example-placeholders"
 description = "desc"
 patterns = ["^AKIA.*EXAMPLE$"]
+paths = ["app.py"]
 """,
     )
     git_repo.stage("heimdall.toml")
@@ -868,6 +946,7 @@ version = "1"
 name = "example-placeholders"
 description = "desc"
 patterns = ["^AKIA.*EXAMPLE$"]
+paths = ["app.py"]
 """,
         encoding="utf-8",
     )
@@ -904,6 +983,7 @@ version = "1"
 name = "custom-rule"
 description = "desc"
 patterns = ["^AKIA.*EXAMPLE$"]
+paths = ["app.py"]
 """,
     )
     git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
@@ -911,6 +991,40 @@ patterns = ["^AKIA.*EXAMPLE$"]
     res = _run("scan", "--config", "custom.toml", str(git_repo.root))
     assert res.exit_code == EXIT_CLEAN
     assert "règle=custom-rule" in res.stdout
+
+
+def test_samm_toml_block_matches_versioned_config() -> None:
+    """Revue (LOW) : le bloc TOML de `docs/t24-samm.md` == `heimdall.toml`.
+
+    Non-régression fiche : un bloc copié-collé obsolète (ex. `keywords`
+    globaux) réintroduirait le footgun corrigé ; ce test l'interdit en
+    figeant l'égalité règle par règle (nom, description, critères).
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    doc = (repo_root / "docs" / "t24-samm.md").read_text(encoding="utf-8")
+    section = doc.split("## Fichier versionné", 1)[1]
+    blocks = re.findall(r"```toml\n(.*?)```", section, re.DOTALL)
+    assert blocks, "aucun bloc TOML dans la fiche SAMM"
+
+    def signature(al: Allowlist) -> list:
+        return [
+            (
+                rule.name,
+                rule.description,
+                rule.keywords,
+                tuple(pattern.pattern for pattern in rule.patterns),
+                rule.exact_keywords,
+                rule.paths,
+                rule.secret_types,
+            )
+            for rule in al.rules
+        ]
+
+    ref_path = repo_root / "heimdall.toml"
+    expected = signature(parse_allowlist_toml(ref_path.read_text(encoding="utf-8")))
+    assert expected, "heimdall.toml versionné sans règles ?!"
+    for block in blocks:
+        assert signature(parse_allowlist_toml(block)) == expected
 
 
 def test_versioned_rules_and_load_allowlist(git_repo: GitRepo) -> None:
@@ -971,7 +1085,7 @@ def test_cli_external_config_accepted_outside_ci(
     outside.write_text(
         '[allowlist]\nversion = "1"\n\n[[allowlist.rules]]\n'
         'name = "custom-rule"\ndescription = "d"\n'
-        'patterns = ["^AKIA.*EXAMPLE$"]\n',
+        'patterns = ["^AKIA.*EXAMPLE$"]\npaths = ["app.py"]\n',
         encoding="utf-8",
     )
     git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
@@ -1318,13 +1432,14 @@ def test_control_characters_in_keywords_and_patterns_rejected(
     """Revue (LOW) : contrôles littéraux refusés (règle morte), échappements OK."""
     for bad_kw in ("abc\ndef", "abc\rdef", "abc\tdef", "fake\u202etoken", "abc\x7f"):
         with pytest.raises(ScanError):
-            AllowlistRule(name="ctrl", description="d", keywords=(bad_kw,))
+            AllowlistRule(name="ctrl", description="d", keywords=(bad_kw,), paths=("src/**",))
     with pytest.raises(ScanError):
         AllowlistRule(
             name="ctrl",
             description="d",
             keywords=("dummy",),
             patterns=(re.compile("ABC\nDEF"),),
+            paths=("src/**",),
         )
     # Via TOML : les `"""` multilignes font passer de vrais `\n`/RLO au parseur.
     bad_kw_toml = (
@@ -1352,6 +1467,7 @@ def test_control_characters_in_keywords_and_patterns_rejected(
         description="d",
         keywords=("dummy",),
         patterns=(re.compile(r"ABC\nDEF"),),
+        paths=("src/**",),
     )
     assert rule.patterns[0].pattern == r"ABC\nDEF"
     # Via CLI : config fautive -> code 2, jamais de règle morte silencieuse.
@@ -1487,12 +1603,12 @@ version = "1"
 [[allowlist.rules]]
 name = "dummy-tokens"
 description = "tokens factices"
-keywords = ["dummy"]
+exact_keywords = ["dummy"]
 
 [[allowlist.rules]]
 name = "example-placeholders"
 description = "placeholders"
-keywords = ["example"]
+exact_keywords = ["example"]
 """,
     )
     git_repo.stage("heimdall.toml")
@@ -1591,6 +1707,7 @@ version = "1"
 name = "hostile-bypass"
 description = "d"
 patterns = ["^AKIA.*"]
+paths = ["**"]
 """,
     )
     git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
@@ -1623,6 +1740,7 @@ version = "1"
 name = "ci-approved"
 description = "d"
 patterns = ["^AKIA.*"]
+paths = ["app.py"]
 """,
         encoding="utf-8",
     )
@@ -1631,13 +1749,18 @@ patterns = ["^AKIA.*"]
 
 
 def test_real_prod_password_with_dummy_or_fake_remains_detected() -> None:
-    """Un secret de prod contenant 'dummy' ou 'fake' comme sous-chaîne reste détecté (CWE-200)."""
+    """Un secret de prod contenant 'dummy' ou 'fake' comme sous-chaîne reste détecté (CWE-200).
+
+    Les mots-clés `\b` n'existent qu'avec `paths` : hors périmètre, une
+    valeur choisie contenant le marqueur reste signalée (invariant 1).
+    """
     al = Allowlist(
         [
             AllowlistRule(
                 name="dummy-tokens",
                 description="tokens factices",
                 keywords=("dummy", "fake"),
+                paths=("tests/**",),
             )
         ]
     )
@@ -1667,7 +1790,7 @@ def test_real_prod_password_with_dummy_or_fake_remains_detected() -> None:
     assert (
         al.evaluate(
             value="dummy",
-            file="test.py",
+            file="tests/test.py",
             line=3,
             secret_type="password",
         )
@@ -1778,6 +1901,7 @@ patterns = ["{pattern}"]
         name="specific-pattern",
         description="d",
         patterns=(_compile_safe_regex(r"^AKIA[A-Z0-9]{16}$"),),
+        secret_types=("aws",),
     )
     al = Allowlist([rule])
     assert (
@@ -1808,6 +1932,7 @@ def test_regex_value_length_cap_is_fail_closed() -> None:
         name="long-value",
         description="d",
         patterns=(_compile_safe_regex(r"^AKIA.*EXAMPLE$"),),
+        secret_types=("aws",),
     )
     assert rule.matches(
         value="AKIA" + "A" * 10 + "EXAMPLE",
@@ -2017,6 +2142,7 @@ version = "1"
 name = "dummy-tokens"
 description = "tokens factices"
 patterns = ["^AKIA.*DUMMY.*$"]
+paths = ["app.py"]
 """
     git_repo.write("heimdall.toml", toml_content)
     git_repo.write("app.py", 'KEY = "AKIA0123456789DUMMY1"\n')
@@ -2173,6 +2299,7 @@ version = "1"
 name = "hostile-bypass"
 description = "bypass"
 patterns = ["^AKIA.*$"]
+paths = ["**"]
 """
     real_read = scan_module._read_worktree_file
     calls = 0
@@ -2200,7 +2327,7 @@ version = "1"
 [[allowlist.rules]]
 name = "safe-rule"
 description = "safe"
-keywords = ["dummy"]
+exact_keywords = ["dummy"]
 """
 
 
@@ -2378,6 +2505,7 @@ version = "1"
 name = "hostile-bypass"
 description = "bypass"
 patterns = ["^AKIA.*$"]
+paths = ["**"]
 """,
     )
     git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')

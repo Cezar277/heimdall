@@ -544,6 +544,13 @@ class AllowlistRule:
         # aveugle à eux seuls.
         if not self.keywords and not self.patterns and not self.exact_keywords:
             raise ScanError(_CONFIG_ERROR)
+        # Seuls les marqueurs exacts peuvent être globaux : un `keywords`
+        # (`\b`) ou un `patterns` sans `paths` ni `secret_types` ignore des
+        # valeurs choisies contenant le marqueur (footgun `my-example-key`,
+        # invariant 1 : doute → signalé). Les règles globales passent par
+        # `exact_keywords` ; les motifs larges se restreignent par `paths`.
+        if (self.keywords or self.patterns) and not (self.paths or self.secret_types):
+            raise ScanError(_CONFIG_ERROR)
 
     def matches(
         self,
