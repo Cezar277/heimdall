@@ -39,7 +39,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NoReturn
 from urllib.parse import urlparse
 
-from heimdall.vault.atomic import _open_file_read_fd, read_file_secure_no_follow
+from heimdall.vault.atomic import (
+    _bounded_error_message,
+    _open_file_read_fd,
+    read_file_secure_no_follow,
+)
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -209,7 +213,8 @@ def _read_and_check_key_file(path: Path) -> str:  # noqa: PLR0912
     try:
         fd = _open_file_read_fd(path)
     except (ValueError, OSError) as exc:
-        raise VaultClientError(f"Impossible d'ouvrir le fichier de clé API : {exc}") from exc
+        msg = _bounded_error_message(str(exc))
+        raise VaultClientError(f"Impossible d'ouvrir le fichier de clé API : {msg}") from exc
 
     try:
         st = os.fstat(fd)
@@ -245,7 +250,8 @@ def _read_and_check_key_file(path: Path) -> str:  # noqa: PLR0912
                 "Le fichier de clé API n'est pas un texte UTF-8 valide."
             ) from None
     except OSError as exc:
-        raise VaultClientError(f"Impossible de lire le fichier de clé API : {exc}") from exc
+        msg = _bounded_error_message(str(exc))
+        raise VaultClientError(f"Impossible de lire le fichier de clé API : {msg}") from exc
     finally:
         if fd >= 0:
             try:

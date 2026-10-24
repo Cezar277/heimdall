@@ -21,7 +21,31 @@ from typing import Final
 
 _DEFAULT_SECURE_MODE: Final[int] = 0o600
 _MAX_BACKUP_BYTES: Final[int] = 1_048_576
+#: Extrait borné d'un chemin dans un message (invariant 8 : pas de chemin
+#: opérateur de 5000 caractères recopié dans les logs).
+_PATH_PREVIEW_LEN: Final[int] = 32
+_MAX_ERROR_MSG_LEN: Final[int] = 150
 _MIN_QUOTED_LEN: Final[int] = 2
+
+
+def _bounded_error_message(message: str, max_len: int = _MAX_ERROR_MSG_LEN) -> str:
+    """Borne et échappe un message d'erreur non fiable (invariant 8).
+
+    Les caractères non imprimables (``\\n``, ``\\r``, ESC/ANSI, NUL, tabulation,
+    C1...) sont rendus sous forme ``\\n``/``\\x1b`` : aucun saut de ligne brut
+    ni séquence de terminal ne peut être injecté dans stderr/logs. Les
+    caractères imprimables (accents compris) sont conservés. La transformation
+    est idempotente et la longueur finale est plafonnée à ``max_len``.
+    """
+    safe = "".join(
+        char if char.isprintable() else char.encode("unicode_escape").decode("ascii")
+        for char in message
+    )
+    if len(safe) > max_len:
+        safe = safe[: max_len - len("...")] + "..."
+    return safe
+
+
 #: Plafond d'attente des sondes `git` (gardes informatives) : un binaire
 #: bloqué ne doit jamais pendre la CLI. `git` vient du PATH de confiance de
 #: l'opérateur (jamais du Vault) ; tout échec/timeout vaut statut inconnu.
@@ -372,6 +396,7 @@ def _open_file_read_fd(path: Path) -> int:  # noqa: PLR0912
     Lève ``ValueError`` fail-closed en cas de symlink ou de parent non sûr.
     """
     target_name = path.name
+    path_preview = str(path)[:_PATH_PREVIEW_LEN]
     if (
         not target_name
         or target_name in (".", "..")
@@ -379,9 +404,9 @@ def _open_file_read_fd(path: Path) -> int:  # noqa: PLR0912
         or "\x00" in target_name
         or (os.sep != "/" and os.sep in target_name)
     ):
-        raise ValueError(f"Lecture refusée : nom de fichier invalide '{path}'.")
+        raise ValueError(f"Lecture refusée : nom de fichier invalide {path_preview!r}.")
     if os.path.islink(path):
-        raise ValueError(f"Lecture refusée : '{path}' est un lien symbolique.")
+        raise ValueError(f"Lecture refusée : {path_preview!r} est un lien symbolique.")
 
     if os.name == "posix" and hasattr(os, "O_NOFOLLOW"):
         parent_fd = _open_parent_dir_secure(path.parent, create_missing=False)
@@ -395,9 +420,11 @@ def _open_file_read_fd(path: Path) -> int:  # noqa: PLR0912
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise ValueError(
-                    f"Lecture refusée : '{path}' est un lien symbolique."
+                    f"Lecture refusée : {path_preview!r} est un lien symbolique."
                 ) from exc
-            raise ValueError(f"Impossible d'ouvrir le fichier : {exc}") from exc
+            raise ValueError(
+                f"Impossible d'ouvrir le fichier : {_bounded_error_message(str(exc))}"
+            ) from exc
         finally:
             try:
                 os.close(parent_fd)
@@ -414,7 +441,9 @@ def _open_file_read_fd(path: Path) -> int:  # noqa: PLR0912
     try:
         return os.open(path, flags)
     except OSError as exc:
-        raise ValueError(f"Impossible d'ouvrir le fichier : {exc}") from exc
+        raise ValueError(
+            f"Impossible d'ouvrir le fichier : {_bounded_error_message(str(exc))}"
+        ) from exc
 
 
 def write_file_atomic(  # noqa: PLR0912, PLR0915
