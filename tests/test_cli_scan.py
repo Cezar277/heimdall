@@ -806,20 +806,14 @@ def test_scan_staged_gitlink_does_not_hide_other_secrets(git_repo: GitRepo) -> N
     assert FAKE_AWS_KEY not in resultat.output
 
 
-def test_scan_staged_polyglot_binary_header_is_scanned(git_repo: GitRepo) -> None:
-    """Revue #166 : en-tête binaire + texte clair (sans NUL) -> **scanné**.
-
-    ``decode_text`` ne saute un blob que sur signature binaire **et**
-    contenu majoritairement binaire : un faux PNG qui porte un secret en
-    clair est analysé, pas ignoré en silence.
-    """
+def test_scan_staged_polyglot_binary_header_is_fail_closed(git_repo: GitRepo) -> None:
+    """T23 : faux PNG avec UTF-8 invalide -> erreur, jamais propre."""
     git_repo.write_bytes(
         "faux.png", b"\x89PNG\r\n\x1a\n" + f'AWS = "{FAKE_AWS_KEY}"\n'.encode()
     )
     git_repo.stage("faux.png")
     resultat = _run("scan", "--staged", str(git_repo.root))
-    assert resultat.exit_code == EXIT_FINDINGS
-    assert "faux.png:" in resultat.stdout
+    assert resultat.exit_code == EXIT_ERROR
     assert FAKE_AWS_KEY not in resultat.output
 
 

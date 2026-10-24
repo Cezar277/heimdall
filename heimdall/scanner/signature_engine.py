@@ -23,6 +23,12 @@ import time
 from typing import Final
 
 from heimdall.scanner.entropy import shannon_entropy
+from heimdall.scanner.entropy_detection import (
+    DEFAULT_ENTROPY_CONFIG,
+    EntropyConfig,
+    check_multiline_overflow,
+    find_entropy_matches,
+)
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.hashing import SnippetHasher
@@ -77,16 +83,20 @@ class SignatureEngine:
     moteur construit pour une passe ne se réutilise pas après son échéance.
     """
 
-    __slots__ = ("_deadline", "_hasher", "_max_findings")
+    __slots__ = ("_deadline", "_hasher", "_max_findings", "_entropy_config")
 
     def __init__(
         self,
         hasher: SnippetHasher | None = None,
+        entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
         *,
         max_findings: int | None = None,
         deadline: float | None = None,
     ) -> None:
         self._deadline = deadline
+        if not isinstance(entropy_config, EntropyConfig):
+            raise ValueError("configuration d'entropie invalide")
+        self._entropy_config = entropy_config
         self._hasher = hasher
         # `None` ne doit jamais désactiver la borne : on retombe sur le
         # défaut, y compris pour un appelant non typé qui passerait `None`
@@ -119,6 +129,18 @@ class SignatureEngine:
                 and time.monotonic() > self._deadline
             ):
                 raise ScanError(_DEADLINE_ERROR)
+            previous = self._joined_window(lines[index - 1][1], lines, index - 1) if index else None
+            preceding = (
+                ()
+                if previous is None
+                else tuple(
+                    match
+                    for match in find_signature_matches(previous[0])
+                    if match.start < previous[1]
+                )
+            )
+            for match in find_entropy_matches(line, self._entropy_config, preceding):
+                self._append(findings, seen, match, line_number, cible.path)
             for match in find_signature_matches(line):
                 self._append(findings, seen, match, line_number, cible.path)
             following = self._joined_window(line, lines, index)
@@ -158,10 +180,12 @@ class SignatureEngine:
             return None
         joined = line + following
         if len(joined) > MULTILINE_WINDOW:
+            check_multiline_overflow(line)
             return None
         # Le nombre de caractères minore le nombre d'octets UTF-8 : le premier
         # contrôle évite d'encoder les lignes déjà trop longues.
         if not joined.isascii() and len(joined.encode("utf-8")) > MULTILINE_WINDOW:
+            check_multiline_overflow(line)
             return None
         return joined, len(line)
 
@@ -199,6 +223,7 @@ class SignatureEngine:
                 type=match.secret_type,
                 entropy=round(shannon_entropy(match.value.encode("utf-8")), 4),
                 snippet_hash=snippet_hash,
+                source="entropy" if match.signature == "entropy" else "regex",
             )
         )
         if len(findings) > self._max_findings:

@@ -289,11 +289,12 @@ def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:
     assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
 
 
-def test_split_secret_beyond_the_window_is_a_documented_limit(tmp_path: Path) -> None:
-    """Au-delà de la fenêtre de 4 Kio, le secret coupé n'est pas recherché."""
+def test_split_secret_beyond_the_window_is_fail_closed(tmp_path: Path) -> None:
+    """Une affectation non analysable au-delà de 4 Kio est refusée."""
     secret = fake_token("", 40)
     _write(tmp_path, "wide.py", "aws_secret_access_key = " + "x" * 5_000 + f'\n"{secret}"\n')
-    assert find_candidates(str(tmp_path)) == []
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
 
 
 # --- Exclusions (#59) -------------------------------------------------------
@@ -425,7 +426,8 @@ def test_decode_text_handles_bom_and_plain_utf8() -> None:
     assert decode_text(b"abc") == "abc"
     for encoding in ("utf-8-sig", "utf-16", "utf-32"):
         assert decode_text("AZERTY".encode(encoding)) == "AZERTY"
-    assert decode_text(b"caf\xe9") == "caf\ufffd"
+    with pytest.raises(ScanError):
+        decode_text(b"caf\xe9")
     assert decode_text(b"\xef\xbb\xbf") == ""
 
 
@@ -617,9 +619,10 @@ def test_scan_text_checks_deadline_intra_file(
         )
 
 
-def test_invalid_utf8_is_scanned_with_replacement(tmp_path: Path) -> None:
+def test_invalid_utf8_is_fail_closed(tmp_path: Path) -> None:
     _write(tmp_path, "latin1.py", f'AWS = "{_aws()}"'.encode("ascii") + b" \xff\n")
-    assert [finding["file"] for finding in find_candidates(str(tmp_path))] == ["latin1.py"]
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
 
 
 def test_missing_root_is_fail_closed_without_reflection(tmp_path: Path) -> None:
