@@ -295,8 +295,8 @@ def _resolve_vault_cipher(
             raise ValueError(
                 "HEIMDALL_VAULT_KEK_SALT est obligatoire avec HEIMDALL_VAULT_MASTER_KEY."
             )
-        derived_kek = derive_kek_from_master_key(settings.master_key, salt)
         pepper = settings.api_key_pepper
+        # Contrôle bon marché AVANT la KDF coûteuse (défense en profondeur).
         if pepper is not None and constant_time_equal(
             settings.master_key.encode("utf-8"), pepper.encode("utf-8")
         ):
@@ -304,6 +304,7 @@ def _resolve_vault_cipher(
                 "La clé maîtresse et le pepper d'authentification doivent être "
                 "distincts (invariant 5)."
             )
+        derived_kek = derive_kek_from_master_key(settings.master_key, salt)
         if pepper is not None:
             pepper_bytes = pepper.encode("utf-8")
             derived_b64 = base64.urlsafe_b64encode(derived_kek).decode("ascii")

@@ -324,16 +324,18 @@ class VaultSettingsMasterKeyTests(unittest.TestCase):
             )
         self.assertIn("distincts", str(ctx.exception))
 
-    def test_resolver_rejects_master_key_equal_to_pepper_after_validation_bypass(self) -> None:
-        """Défense en profondeur si la validation pydantic est contournée."""
+    def test_resolver_rejects_master_key_equal_to_pepper_before_kdf(self) -> None:
+        """Défense en profondeur : collision refusée avant la KDF, même après bypass."""
         settings = VaultSettings(
             master_key=_MASTER_KEY,
             kek_salt=_SALT_A,
             api_key_pepper=_PEPPER,
         )
         settings.master_key = _PEPPER  # mutation volontaire, hors validation
-        with self.assertRaises(ValueError) as ctx:
-            _resolve_vault_cipher(settings, "memory")
+        with patch("heimdall.vault.app.derive_kek_from_master_key") as derive:
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_vault_cipher(settings, "memory")
+        derive.assert_not_called()
         self.assertIn("distincts", str(ctx.exception))
 
     def test_missing_salt_after_validation_is_rejected(self) -> None:
