@@ -41,6 +41,13 @@ heimdall scan --json [CHEMIN]       # rapport JSON sur stdout
 | `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) |
 | `--no-allowlist` | désactive l'allowlist déterministe pour le scan courant |
 
+Le fichier d'allowlist est un **contrat fermé** : seule la table racine
+`[allowlist]` est acceptée, `version` doit être le littéral `"1"` (un entier
+`1` est refusé), et chaque mot-clé doit faire au moins 3 caractères. Toute
+clé racine inconnue (`[tool.foo]`, faute de frappe), tout type incorrect ou
+tout mot-clé trop court est une erreur d'outillage (code 2), jamais un
+passage silencieux.
+
 `CHEMIN` vaut `.` par défaut. Il doit être la **racine** d'un dépôt git,
 dans les deux périmètres (sinon : erreur, code 2) : hors dépôt —
 répertoire quelconque, fichier isolé — il n'y a pas de verdict « propre »,
