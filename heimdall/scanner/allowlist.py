@@ -467,8 +467,12 @@ class AllowlistRule:
     - `keywords` : sous-chaînes/mots entiers sur la valeur du secret (ex. 'example', 'dummy')
     - `patterns` : expressions régulières compilées, non universelles et
       porteuses d'au moins :data:`MIN_PATTERN_LITERALS` caractères littéraux
+    - `exact_keywords` : marqueurs exacts comparés à égalité insensible à la
+      casse (ex. 'changeme') — le choix auditable pour les règles globales
+      sans `paths` : `my-example-key` reste détecté (invariant 1)
 
-    Les critères de restriction facultatifs (en conjonction avec keywords/patterns) sont :
+    Les critères de restriction facultatifs (en conjonction avec
+    keywords/patterns/exact_keywords) sont :
     - `paths` : motifs glob POSIX relatifs (évalués via `fnmatch`)
     - `secret_types` : types de secrets restreints (ex. 'aws', 'stripe')
 
@@ -481,10 +485,11 @@ class AllowlistRule:
     description: str
     keywords: tuple[str, ...] = ()
     patterns: tuple[re.Pattern[str], ...] = ()
+    exact_keywords: tuple[str, ...] = ()
     paths: tuple[str, ...] = ()
     secret_types: tuple[str, ...] = ()
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: PLR0912 - gauntlet de validation, un bloc par champ du contrat
         if not isinstance(self.name, str) or not _RULE_NAME_RE.fullmatch(self.name):
             raise ScanError(_CONFIG_ERROR)
         if len(self.name) > MAX_RULE_NAME_LENGTH:
@@ -507,6 +512,10 @@ class AllowlistRule:
             not isinstance(keyword, str) for keyword in self.keywords
         ):
             raise ScanError(_CONFIG_ERROR)
+        if not isinstance(self.exact_keywords, (tuple, list)) or any(
+            not isinstance(exact, str) for exact in self.exact_keywords
+        ):
+            raise ScanError(_CONFIG_ERROR)
         if not isinstance(self.paths, (tuple, list)) or any(
             not isinstance(path, str) for path in self.paths
         ):
@@ -524,13 +533,16 @@ class AllowlistRule:
         # matcherait jamais — faute de frappe, pas règle de test.
         for keyword in self.keywords:
             _reject_control_characters(keyword)
+        for exact in self.exact_keywords:
+            _reject_control_characters(exact)
         for pattern in self.patterns:
             _reject_control_characters(pattern.pattern)
 
         # Invariant 1 / Sécurité : toute règle DOIT obligatoirement définir au moins
-        # un critère sur la valeur (keywords ou patterns). Les filtres paths ou
-        # secret_types ne peuvent JAMAIS constituer une règle aveugle à eux seuls.
-        if not self.keywords and not self.patterns:
+        # un critère sur la valeur (keywords, patterns ou exact_keywords). Les
+        # filtres paths ou secret_types ne peuvent JAMAIS constituer une règle
+        # aveugle à eux seuls.
+        if not self.keywords and not self.patterns and not self.exact_keywords:
             raise ScanError(_CONFIG_ERROR)
 
     def matches(
@@ -577,11 +589,18 @@ class AllowlistRule:
             self.keywords
             and any(_keyword_matches_value(kw, value) for kw in self.keywords)
         )
+        # Marqueurs exacts : égalité insensible à la casse sur la valeur
+        # entière — aucun coût regex, aucun faux-négatif par frontière.
+        val_cf = value.casefold()
+        ex_match = bool(
+            self.exact_keywords
+            and any(exact.casefold() == val_cf for exact in self.exact_keywords)
+        )
         if self.patterns and len(value) <= MAX_REGEX_VALUE_LENGTH:
             pat_match = any(pattern.search(value) for pattern in self.patterns)
         else:
             pat_match = False
-        return kw_match or pat_match
+        return kw_match or ex_match or pat_match
 
 
 class Allowlist:
@@ -726,6 +745,7 @@ _ALLOWED_RULE_KEYS: Final[frozenset[str]] = frozenset(
         "description",
         "keywords",
         "patterns",
+        "exact_keywords",
         "paths",
         "secret_types",
     }
@@ -776,6 +796,11 @@ def _parse_rule_dict(raw_rule: object) -> AllowlistRule:
         "keywords",
         min_length=MIN_KEYWORD_LENGTH,
     )
+    exact_keywords = _parse_str_list(
+        raw_rule,
+        "exact_keywords",
+        min_length=MIN_KEYWORD_LENGTH,
+    )
     secret_types = _parse_str_list(raw_rule, "secret_types")
     # Grammaire du contrat #14 : un type hors grammaire (`"AWS"`, `"../etc"`)
     # ne matcherait jamais et rendrait la règle muette sans erreur.
@@ -797,6 +822,7 @@ def _parse_rule_dict(raw_rule: object) -> AllowlistRule:
         description=description,
         keywords=keywords,
         patterns=patterns,
+        exact_keywords=exact_keywords,
         paths=paths,
         secret_types=secret_types,
     )

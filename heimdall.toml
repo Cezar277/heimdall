@@ -23,17 +23,22 @@ version = "1"
 [[allowlist.rules]]
 name = "example-placeholders"
 description = "Mots-clés et jetons d'exemple évidents (ex: AKIA...EXAMPLE, your_key_here)"
-keywords = ["AKIAIOSFODNN7EXAMPLE", "example", "sample", "your_key_here"]
+# Marqueurs EXACTS (égalité insensible à la casse) : un secret choisi
+# contenant `-example-` délimité (ex. `my-example-key-12345`) reste détecté
+# (invariant 1 : doute → signalé). Ne jamais repasser en `keywords` \b.
+exact_keywords = ["AKIAIOSFODNN7EXAMPLE", "example", "sample", "your_key_here"]
 
 [[allowlist.rules]]
 name = "changeme-passwords"
 description = "Mots de passe ou valeurs de configuration par défaut changeme"
-keywords = ["changeme"]
+# Exact : `admin:changeme` reste détecté (credential par défaut = finding).
+exact_keywords = ["changeme"]
 
 [[allowlist.rules]]
 name = "dummy-tokens"
 description = "Valeurs, identifiants et jetons factices dummy"
-keywords = ["dummy"]
+# Exact : `prod-dummy-secret` ou `xoxb-dummy-12345` restent détectés.
+exact_keywords = ["dummy"]
 
 [[allowlist.rules]]
 name = "test-fixtures"

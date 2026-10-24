@@ -101,17 +101,22 @@ def _standard_test_allowlist() -> Allowlist:
             AllowlistRule(
                 name="example-placeholders",
                 description="Mots-clés et jetons d'exemple",
-                keywords=("AKIAIOSFODNN7EXAMPLE", "example", "sample", "your_key_here"),
+                exact_keywords=(
+                    "AKIAIOSFODNN7EXAMPLE",
+                    "example",
+                    "sample",
+                    "your_key_here",
+                ),
             ),
             AllowlistRule(
                 name="changeme-passwords",
                 description="Mots de passe par défaut changeme",
-                keywords=("changeme",),
+                exact_keywords=("changeme",),
             ),
             AllowlistRule(
                 name="dummy-tokens",
                 description="Valeurs factices dummy",
-                keywords=("dummy",),
+                exact_keywords=("dummy",),
             ),
             AllowlistRule(
                 name="test-fixtures",
@@ -237,7 +242,11 @@ def test_rule_example_placeholders() -> None:
 
 
 def test_rule_changeme_passwords() -> None:
-    """Règle 'changeme' : écarte les mots de passe et configs changeme."""
+    """Règle 'changeme' : écarte les mots de passe et configs changeme.
+
+    Marqueurs EXACTS (invariant 1) : seul `changeme` exact est ignoré ;
+    `admin:changeme` (credential par défaut) reste détecté.
+    """
     al = _standard_test_allowlist()
     assert al.evaluate(
         value="changeme",
@@ -246,30 +255,86 @@ def test_rule_changeme_passwords() -> None:
         secret_type="password",
     ) == "changeme-passwords"
 
-    assert al.evaluate(
-        value="admin:changeme",
-        file="docker-compose.yml",
-        line=8,
-        secret_type="password",
-    ) == "changeme-passwords"
+    assert (
+        al.evaluate(
+            value="admin:changeme",
+            file="docker-compose.yml",
+            line=8,
+            secret_type="password",
+        )
+        is None
+    )
 
 
 def test_rule_dummy_tokens() -> None:
-    """Règle 'dummy' : écarte les jetons et identifiants factices dummy."""
+    """Règle 'dummy' : écarte les jetons et identifiants factices dummy.
+
+    Marqueur EXACT (invariant 1) : seul `dummy` exact est ignoré ; une
+    valeur choisie contenant `-dummy-` délimité reste détectée.
+    """
     al = _standard_test_allowlist()
     assert al.evaluate(
-        value="dummy-secret-token",
+        value="dummy",
         file="client.py",
         line=20,
         secret_type="token",
     ) == "dummy-tokens"
 
-    assert al.evaluate(
-        value="xoxb-dummy-12345",
-        file="slack.py",
-        line=2,
-        secret_type="slack",
-    ) == "dummy-tokens"
+    assert (
+        al.evaluate(
+            value="dummy-secret-token",
+            file="client.py",
+            line=21,
+            secret_type="token",
+        )
+        is None
+    )
+
+    assert (
+        al.evaluate(
+            value="xoxb-dummy-12345",
+            file="slack.py",
+            line=2,
+            secret_type="slack",
+        )
+        is None
+    )
+
+
+def test_global_keywords_do_not_swallow_chosen_values() -> None:
+    """Revue (MEDIUM) : `my-example-key-12345` / `prod-dummy-…` restent détectés.
+
+    Les règles globales sans `paths` n'ignorent que leurs marqueurs exacts :
+    toute valeur choisie contenant `-example-`/`-dummy-`/`-changeme-`
+    délimité est signalée (invariant 1 : doute → signalé).
+    """
+    al = _standard_test_allowlist()
+    for value in (
+        "my-example-key-12345",
+        "prod-dummy-secret",
+        "svc-changeme-2024!",
+        "xoxb-dummy-12345",
+        "AKIAIOSFODNN7EXAMPLE-1",
+    ):
+        assert (
+            al.evaluate(
+                value=value,
+                file="app.py",
+                line=1,
+                secret_type="password",
+            )
+            is None
+        )
+    for value in ("example", "sample", "changeme", "dummy", "your_key_here"):
+        assert (
+            al.evaluate(
+                value=value,
+                file="app.py",
+                line=1,
+                secret_type="password",
+            )
+            is not None
+        )
 
 
 def test_rule_test_fixtures() -> None:
@@ -1891,6 +1956,55 @@ def test_fuzz_patterns_and_paths() -> None:
     for bad_regex in ["a" * 129, "a\x00b", ""]:
         with pytest.raises(ScanError):
             _compile_safe_regex(bad_regex)
+
+    # Juste sous les plafonds, `fnmatch` tourne vraiment : borné en temps,
+    # jamais de hang, jamais d'évasion (10 jokers, chemin de 1024 caractères).
+    heavy = "*a" * 9 + "*b"
+    assert _validate_path_pattern(heavy) == heavy
+    heavy_rule = AllowlistRule(
+        name="heavy-glob",
+        description="fuzz",
+        paths=(heavy,),
+        keywords=("dummy",),
+    )
+    start_heavy = time.monotonic()
+    assert not heavy_rule.matches(
+        value="dummy",
+        file_path="a" * MAX_MATCH_PATH_LENGTH,
+        line_number=1,
+        secret_type="password",
+    )
+    assert time.monotonic() - start_heavy < 2.0
+
+
+def test_staged_subdir_config_does_not_block_root_scan(git_repo: GitRepo) -> None:
+    """Revue (LOW) : `subdir/heimdall.toml` stagé ne bloque pas le scan racine.
+
+    La garde compare le chemin normalisé exact (`== rel_cfg`) : seul le
+    fichier chargé (`heimdall.toml` ou `--config` interne) bloque en 2.
+    """
+    git_repo.write("subdir/heimdall.toml", _config_saine())
+    git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+    git_repo.stage("subdir/heimdall.toml", "app.py")
+    res = _run("scan", str(git_repo.root))
+    assert res.exit_code == EXIT_FINDINGS
+    assert "1 secret(s) détecté(s)" in res.stdout
+
+    # Idem avec --config interne : seul le chemin exact bloque.
+    git_repo.write("custom.toml", _config_saine())
+    git_repo.stage("custom.toml")
+    git_repo.commit_all("chore: config")
+    git_repo.write("subdir/custom.toml", _config_saine())
+    git_repo.stage("subdir/custom.toml")
+    res_cfg = _run("scan", "--config", "custom.toml", str(git_repo.root))
+    assert res_cfg.exit_code == EXIT_FINDINGS
+
+
+def test_module_constants_use_uniform_uppercase() -> None:
+    """Revue (LOW) : tous les plafonds `MAX_*`/`MIN_*` sont tout en capitales."""
+    for name in dir(al_module):
+        if name.startswith(("MAX_", "MIN_")):
+            assert name == name.upper(), name
 
 
 def test_contract_scan_report_ignored_count_and_config_hash(git_repo: GitRepo) -> None:

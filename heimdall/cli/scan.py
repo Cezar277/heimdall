@@ -395,10 +395,13 @@ def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
         return None
 
     if rel_cfg is not None:
+        # Comparaison stricte sur le chemin normalisé : un `subdir/heimdall.toml`
+        # stagé n'est PAS la config chargée (`rel_cfg == "heimdall.toml"`) et ne
+        # doit pas bloquer le scan (disponibilité). Idem pour `--config`
+        # interne (`subdir/custom.toml` vs `other/subdir/custom.toml`).
+        # Les deux côtés sont déjà normalisés (relatif au dépôt, `/`).
         is_cfg_staged = any(
-            getattr(change, "path", None) == rel_cfg
-            or str(getattr(change, "path", "")).endswith("/" + rel_cfg)
-            for change in staged_changes
+            getattr(change, "path", None) == rel_cfg for change in staged_changes
         )
         if is_cfg_staged:
             # Message strictement statique : `rel_cfg` (entrée opérateur
