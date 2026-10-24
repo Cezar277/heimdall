@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 import httpx
 
 from heimdall.vault.atomic import (
+    _bounded_error_message,
     _get_git_toplevel,
     _open_file_read_fd,
     _write_file_atomic_fallback,
@@ -1461,6 +1462,31 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         self.assertLessEqual(len(message), 220)
         self.assertNotIn("K" * 200, message)
 
+    def test_open_file_read_fd_escapes_controls_in_open_error(self) -> None:
+        """Un chemin non fiable (`\\n`, ESC/ANSI) est échappé dans l'erreur `openat`."""
+        control_path = self.tmp_dir / ("A\nB\x1b[2J" + "K" * 300)
+        with self.assertRaises(ValueError) as ctx:
+            _open_file_read_fd(control_path)
+        message = str(ctx.exception)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\x1b", message)
+        self.assertIn("\\n", message)
+        self.assertIn("\\x1b", message)
+        self.assertLessEqual(len(message), 220)
+
+    def test_bounded_error_message_escapes_controls_and_truncates(self) -> None:
+        """Helper commun : contrôles échappés, longueur bornée, idempotence."""
+        message = _bounded_error_message("a\nb\rc\td\x1b[2J" + "K" * 5000)
+        self.assertLessEqual(len(message), 150)
+        self.assertTrue(message.endswith("..."))
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\r", message)
+        self.assertNotIn("\t", message)
+        self.assertNotIn("\x1b", message)
+        self.assertIn("\\n", message)
+        self.assertIn("\\x1b", message)
+        self.assertEqual(_bounded_error_message(message), message)
+
     def test_read_and_check_key_file_bounds_wrapped_error(self) -> None:
         """Toute erreur d'ouverture de clé est tronquée avant d'être relayée."""
         long_error = "Lecture refusée : '" + "P" * 5000 + "' est un lien symbolique."
@@ -1475,20 +1501,24 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         self.assertNotIn("P" * 200, message)
 
     def test_read_and_check_key_file_bounds_read_error(self) -> None:
-        """Une `OSError` géante de `os.read` est bornée à la source."""
+        """Une `OSError` géante et piégée de `os.read` est bornée et échappée."""
         key_file = self.tmp_dir / "vault.key"
         key_file.write_text("synthetic_key_value", encoding="utf-8")
         key_file.chmod(0o600)
 
         with patch(
             "heimdall.vault.client.os.read",
-            side_effect=OSError("R" * 5000),
+            side_effect=OSError("A\n\x1b[2J" + "R" * 5000),
         ):
             with self.assertRaises(VaultClientError) as ctx:
                 _read_and_check_key_file(key_file)
 
         message = str(ctx.exception)
         self.assertLessEqual(len(message), 220)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\x1b", message)
+        self.assertIn("\\n", message)
+        self.assertIn("\\x1b", message)
         self.assertNotIn("R" * 200, message)
 
     def test_write_file_atomic_rejects_symlinked_intermediate_parent(self) -> None:

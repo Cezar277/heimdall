@@ -206,13 +206,13 @@ class VaultPushCliTests(unittest.TestCase):
         mock_init.assert_not_called()
 
     def test_init_client_bounds_long_config_error(self) -> None:
-        """Une erreur de configuration de 5000 caractères est tronquée en CLI."""
+        """Une erreur de configuration géante et piégée est bornée et échappée."""
         env_file = self.tmp_dir / ".env"
         env_file.write_text("SAFE_VAR=value\n", encoding="utf-8")
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
             with patch(
                 "heimdall.cli.vault_client.resolve_api_key",
-                side_effect=VaultClientError("P" * 5000),
+                side_effect=VaultClientError("P\n\x1b[2J" + "P" * 5000),
             ):
                 result = self.runner.invoke(
                     app,
@@ -221,6 +221,9 @@ class VaultPushCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 2)
         self.assertLessEqual(len(result.output), 300)
         self.assertNotIn("P" * 1000, result.output)
+        self.assertNotIn("\x1b", result.output)
+        self.assertNotIn("P\n", result.output)
+        self.assertIn("\\x1b", result.output)
 
     def test_push_rejects_invalid_project_or_env(self) -> None:
         """Validation fail-closed des formats de projet et d'environnement."""
@@ -695,7 +698,7 @@ class VaultPullCliTests(unittest.TestCase):
                 mock_init.return_value = client_instance
                 with patch(
                     "heimdall.cli.vault_client.backup_file",
-                    side_effect=ValueError("z" * 5000),
+                    side_effect=ValueError("z\n\x1b[2J" + "z" * 5000),
                 ):
                     result = self.runner.invoke(
                         app,
@@ -713,6 +716,9 @@ class VaultPullCliTests(unittest.TestCase):
                     self.assertEqual(result.exit_code, 1)
                     self.assertLess(len(result.output), 200)
                     self.assertNotIn("z" * 5000, result.output)
+                    self.assertNotIn("\x1b", result.output)
+                    self.assertNotIn("z\n", result.output)
+                    self.assertIn("\\x1b", result.output)
 
     def test_pull_write_error_message_is_bounded(self) -> None:
         """Échec d'écriture : stderr < 200 car., pas de recopie intégrale."""
@@ -731,7 +737,7 @@ class VaultPullCliTests(unittest.TestCase):
                 mock_init.return_value = client_instance
                 with patch(
                     "heimdall.cli.vault_client.write_file_atomic",
-                    side_effect=ValueError("w" * 5000),
+                    side_effect=ValueError("w\n\x1b[2J" + "w" * 5000),
                 ):
                     result = self.runner.invoke(
                         app,
@@ -931,7 +937,7 @@ class VaultPullCliTests(unittest.TestCase):
                 mock_init.return_value = client_instance
                 with patch(
                     "heimdall.cli.vault_client.subprocess.run",
-                    side_effect=OSError("x" * 5000),
+                    side_effect=OSError("x\n\x1b[2J" + "x" * 5000),
                 ):
                     result = self.runner.invoke(
                         app,
@@ -941,6 +947,9 @@ class VaultPullCliTests(unittest.TestCase):
                     self.assertLess(len(result.output), 200)
                     self.assertNotIn("x" * 5000, result.output)
                     self.assertIn("...", result.output)
+                    self.assertNotIn("\x1b", result.output)
+                    self.assertNotIn("x\n", result.output)
+                    self.assertIn("\\x1b", result.output)
 
     def test_run_refuses_resolved_binary_divergence(self) -> None:
         """`which` A avant fetch puis B après → refus, pas d'exécution du binaire périmé."""
@@ -1085,6 +1094,24 @@ class VaultPullCliTests(unittest.TestCase):
         self.assertIn("\\n", message)
         self.assertNotIn("K" * 100, message)
         client.create_secret.assert_not_called()
+
+    def test_push_single_secret_bounds_and_escapes_send_error(self) -> None:
+        """Erreur d'envoi géante et piégée : message borné, sans contrôle brut."""
+        client = MagicMock()
+        client.create_secret.side_effect = VaultClientError("E\n\x1b[2J" + "X" * 5000)
+
+        with patch("heimdall.cli.vault_client.typer.echo") as mock_echo:
+            with self.assertRaises(Exit) as ctx:
+                _push_single_secret(client, "demo", "dev", "SAFE_VAR", "value")
+
+        self.assertEqual(ctx.exception.exit_code, 1)
+        message = mock_echo.call_args.args[0]
+        self.assertLessEqual(len(message), 200)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\x1b", message)
+        self.assertIn("\\n", message)
+        self.assertIn("\\x1b", message)
+        self.assertNotIn("X" * 200, message)
 
     def test_push_single_secret_distinguishes_identifier_from_value_errors(self) -> None:
         """`ValueError` client : message identifiant vs valeur, jamais la valeur reflétée."""

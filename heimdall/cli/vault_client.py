@@ -29,6 +29,7 @@ from typing import Final, NoReturn
 import typer
 
 from heimdall.vault.atomic import (
+    _bounded_error_message,
     _get_git_toplevel,
     backup_file,
     format_env_value,
@@ -181,8 +182,6 @@ _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "LUA_INIT",
 })
 
-_MAX_ERROR_MSG_LEN: Final[int] = 150
-_TRUNCATE_MSG_LEN: Final[int] = 147
 #: Bornes anti-OOM locales de `pull`/`run` : nombre de secrets demandés et
 #: volume cumulé des valeurs (caractères). Symétriques des plafonds de réponse
 #: du client (1 Mio) et dimensionnées pour un `.env`/environnement raisonnable.
@@ -264,9 +263,7 @@ def _init_client(vault_url: str | None, ca_cert: Path | None) -> VaultClient:
     try:
         api_key = resolve_api_key()
     except VaultClientError as exc:
-        msg = str(exc)
-        if len(msg) > _MAX_ERROR_MSG_LEN:
-            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        msg = _bounded_error_message(str(exc))
         typer.echo(f"Erreur de configuration : {msg}", err=True)
         raise typer.Exit(code=2) from None
 
@@ -449,9 +446,7 @@ def _push_single_secret(
             )
         raise typer.Exit(code=2) from None
     except VaultClientError as exc:
-        msg = str(exc)
-        if len(msg) > _MAX_ERROR_MSG_LEN:
-            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        msg = _bounded_error_message(str(exc))
         typer.echo(f"Erreur lors de l'envoi de {name_preview} : {msg}", err=True)
         raise typer.Exit(code=1) from None
 
@@ -694,9 +689,7 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             typer.echo(msg, err=True)
             raise typer.Exit(code=1) from None
         except VaultClientError as exc:
-            msg = str(exc)
-            if len(msg) > _MAX_ERROR_MSG_LEN:
-                msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+            msg = _bounded_error_message(str(exc))
             typer.echo(f"Erreur lors de la récupération de '{name}' : {msg}", err=True)
             raise typer.Exit(code=1) from None
         except ValueError:
@@ -749,9 +742,7 @@ def vault_pull(  # noqa: PLR0912, PLR0913, PLR0917
         try:
             bak_file = backup_file(output)
         except ValueError as exc:
-            msg = str(exc)
-            if len(msg) > _MAX_ERROR_MSG_LEN:
-                msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+            msg = _bounded_error_message(str(exc))
             typer.echo(f"Erreur de sécurité lors de la sauvegarde : {msg}", err=True)
             raise typer.Exit(code=1) from None
         if bak_file:
@@ -762,9 +753,7 @@ def vault_pull(  # noqa: PLR0912, PLR0913, PLR0917
     try:
         write_file_atomic(output, content, mode=0o600)
     except (ValueError, OSError) as exc:
-        msg = str(exc)
-        if len(msg) > _MAX_ERROR_MSG_LEN:
-            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        msg = _bounded_error_message(str(exc))
         typer.echo(f"Erreur de sécurité lors de l'écriture : {msg}", err=True)
         raise typer.Exit(code=1) from None
 
@@ -998,9 +987,7 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
         typer.echo(f"Erreur : permission refusée pour exécuter : {cmd[0]}", err=True)
         raise typer.Exit(code=126) from None
     except (ValueError, OSError) as exc:
-        msg = str(exc)
-        if len(msg) > _MAX_ERROR_MSG_LEN:
-            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        msg = _bounded_error_message(str(exc))
         typer.echo(f"Erreur lors de l'exécution de la commande : {msg}", err=True)
         raise typer.Exit(code=1) from None
 
