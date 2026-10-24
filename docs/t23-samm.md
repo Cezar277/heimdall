@@ -135,3 +135,35 @@ incluses **92,04 %** (seuil 85 % satisfait), durée 199,25 s, code de sortie 0.
 Cette validation remplace, pour le code actuel, les résultats globaux
 historiques des sections précédentes. Le seuil de précision T21 reste
 distinct, inchangé et non atteint, comme indiqué dans le rapport archivé.
+
+## Complément LOW — fragmentation mono-ligne et parcours lexical unique
+
+Révision : `b0877156871104b99e23778ddcf01ff28320121b`.
+
+- **Limite connue assumée :** hex de 64 caractères découpé en blocs de 8
+  par `-`, espace, `.` ou `_` ; les deux moteurs rendent `[]`, sans erreur.
+  La reconstruction par suppression des séparateurs n'est pas effectuée :
+  [test paramétré:386](https://github.com/Cezar277/heimdall/blob/b0877156871104b99e23778ddcf01ff28320121b/tests/test_scanner_entropy.py#L386),
+  [limite documentée](https://github.com/Cezar277/heimdall/blob/b0877156871104b99e23778ddcf01ff28320121b/docs/scanner-entropy.md).
+  Ces cas ne sont pas ajoutés à l'oracle T21 ni présentés comme détectés.
+- **Un seul parcours lexical** collecte les seuls candidats assez longs,
+  tout en refusant un jeton > 4096 avant signatures/Shannon :
+  [find_entropy_matches:104](https://github.com/Cezar277/heimdall/blob/b0877156871104b99e23778ddcf01ff28320121b/heimdall/scanner/entropy_detection.py#L104).
+  Le test compte exactement un parcours et 500 000 petits jetons, sans
+  signatures ni Shannon dans le détecteur d'entropie :
+  [test:400](https://github.com/Cezar277/heimdall/blob/b0877156871104b99e23778ddcf01ff28320121b/tests/test_scanner_entropy.py#L400).
+- **Deadline expirée avant parcours :** ligne dense de 500 000 petits jetons,
+  `deadline=0.0`, `ScanError` statique avant analyse lexicale ou signatures,
+  sur l'import direct et les deux moteurs :
+  [test:423](https://github.com/Cezar277/heimdall/blob/b0877156871104b99e23778ddcf01ff28320121b/tests/test_scanner_entropy.py#L423).
+  Les regex de signatures existantes ne deviennent pas interruptibles ; les
+  candidats retenus sont revérifiés contre la deadline après cette phase.
+
+Validation locale du complément : Ruff, mypy strict et Bandit passent ;
+**681 tests ciblés passent**, couverture scanner branches incluses **96,43 %**,
+durée 41,97 s, code de sortie 0. La sélection est celle du complément LOW
+précédent (scanner, interface, CLI, corpus et tests de bypass). La suite
+globale de 2013 tests reste une preuve historique de la révision précédente ;
+elle n'a pas été relancée pour ce complément. Les tests T21 conservent les
+comptes documentés (core 10/8/0, all 12/8/4), sans changer le seuil de 90 %.
+Aucun `/ci` GitHub déclenché ; feuille SAMM externe non modifiée.
