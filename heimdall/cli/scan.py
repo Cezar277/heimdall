@@ -288,7 +288,7 @@ class _VerifiedConfig:
     content: bytes
 
 
-def _guard_anti_self_attestation(  # noqa: PLR0913
+def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
     access: GitAccess,
     *,
     ci: bool,
@@ -325,7 +325,14 @@ def _guard_anti_self_attestation(  # noqa: PLR0913
     root = access.root
     rel_cfg: str | None = None
     if config is not None:
-        cfg_path = Path(config)
+        # `Path()` lève `ValueError` sur un octet NUL : fail-closed en
+        # `ScanError` statique (contrat unique, invariant 11), comme
+        # `_resolve_root` ci-dessous. Le texte est volontairement le message
+        # générique (aucune entrée reflétée, invariant 8).
+        try:
+            cfg_path = Path(config)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            raise ScanError(_MSG_NOT_A_REPO) from None
         if not cfg_path.is_absolute():
             cfg_path = root / cfg_path
         resolved_cfg = _resolve_root(cfg_path)

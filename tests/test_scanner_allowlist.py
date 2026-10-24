@@ -434,6 +434,32 @@ def test_load_allowlist_explicit_external_config_accepted(tmp_path: Path) -> Non
         load_allowlist(repo, config_file=outside, allow_external=True)
 
 
+def test_config_with_nul_stays_in_scan_error_contract(git_repo: GitRepo) -> None:
+    """Revue (LOW) : un chemin avec NUL reste dans le contrat `ScanError`.
+
+    Un NUL fait échouer les appels OS en `ValueError`
+    (« embedded null character ») : chaque frontière (`_resolve_root`,
+    `load_allowlist`, la garde anti auto-attestation via `collect`) doit
+    convertir en `ScanError` statique (invariant 11), jamais laisser fuir
+    le brut vers l'appelant.
+    """
+    with pytest.raises(ScanError):
+        load_allowlist(git_repo.root, config_file="a\x00b")
+    with pytest.raises(ScanError):
+        load_allowlist(git_repo.root, config_file=Path("a\x00b"))
+    with pytest.raises(ScanError):
+        load_allowlist(Path("a\x00b"))
+    with pytest.raises(ScanError):
+        load_allowlist_from_file(Path("a\x00b"))
+    # La garde anti auto-attestation convertit aussi (arbre comme staged).
+    with pytest.raises(ScanError):
+        collect(git_repo.root, staged=False, config="a\x00b")
+    git_repo.write("app.py", 'KEY = "x"\n')
+    git_repo.stage("app.py")
+    with pytest.raises(ScanError):
+        collect(git_repo.root, staged=True, config="a\x00b")
+
+
 def test_load_allowlist_size_limit_fail_closed(tmp_path: Path) -> None:
     """CWE-400 : un fichier dépassant MAX_CONFIG_BYTES est refusé."""
     big_config = tmp_path / "big.toml"
@@ -854,6 +880,26 @@ def test_cli_external_config_accepted_outside_ci(
     outside.write_text("[allowlist]\nversion = 1\n", encoding="utf-8")
     res_bad = _run("scan", "--config", str(outside), str(git_repo.root))
     assert res_bad.exit_code == EXIT_ERROR
+
+
+def test_cli_config_with_nul_fail_closed(git_repo: GitRepo) -> None:
+    """Revue (LOW) : `--config`/racine avec NUL → code 2, jamais 0.
+
+    Via un argv réel un NUL est impossible (terminateur C), mais l'appel
+    in-process l'accepte : le contrat CLI reste le code 2 avec le message
+    statique (invariant 8), sans `ValueError` brut ni traceback.
+    """
+    res = _run("scan", "--config", "a\x00b", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "scan impossible" in res.stderr.lower()
+    assert "\x00" not in res.stderr
+    assert not isinstance(res.exception, ValueError)
+
+    res_root = _run("scan", "a\x00b")
+    assert res_root.exit_code == EXIT_ERROR
+    assert "scan impossible" in res_root.stderr.lower()
+    assert "\x00" not in res_root.stderr
+    assert not isinstance(res_root.exception, ValueError)
 
 
 # --- 7. Tests d'exhaustivité et de robustesse supplémentaire -----------------

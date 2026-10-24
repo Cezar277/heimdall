@@ -929,7 +929,13 @@ def load_allowlist(
     resolved_root = _resolve_root(root)
 
     if config_file is not None:
-        target = Path(config_file)
+        # `Path()` lève `ValueError` sur un octet NUL (ou `TypeError` sur un
+        # type inattendu) : convertir en `ScanError` pour garder le contrat
+        # d'erreur unique (invariant 11), comme `_resolve_root` ci-dessous.
+        try:
+            target = Path(config_file)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            raise ScanError(_CONFIG_ERROR) from None
         if not target.is_absolute():
             target = resolved_root / target
         resolved_target = _resolve_root(target)

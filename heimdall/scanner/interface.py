@@ -51,7 +51,9 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
     ``lstat`` : un lien symbolique dans le chemin de la racine est refusé
     (``ScanError``) au lieu d'être suivi en silence. La promesse « les liens
     symboliques ne sont jamais suivis » vaut donc aussi pour la racine et
-    pour le fichier unique.
+    pour le fichier unique. Un chemin non analysable (octet NUL, type
+    inattendu, racine absente) est refusé en ``ScanError`` statique, jamais
+    en ``ValueError``/``TypeError`` brut (contrat d'erreur unique).
     """
     try:
         absolute = Path(os.path.abspath(Path(root).expanduser()))
@@ -65,7 +67,7 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
         if resolved != absolute:
             raise ScanError(_MSG_SCAN_IMPOSSIBLE)
         return resolved
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError, TypeError):
         raise ScanError(_MSG_SCAN_IMPOSSIBLE) from None
 
 #: Nombre de parties d'une ligne ajoutée : ``(numéro, texte)``.
