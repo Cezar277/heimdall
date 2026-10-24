@@ -70,6 +70,8 @@ _MAX_SECRET_VALUE_LEN: Final[int] = 65536
 _MAX_RESPONSE_BYTES: Final[int] = 1_048_576
 _MAX_API_KEY_FILE_BYTES: Final[int] = 4096
 _MAX_CA_CERT_BYTES: Final[int] = 1_048_576
+_MAX_ERROR_MSG_LEN: Final[int] = 150
+_TRUNCATE_MSG_LEN: Final[int] = 147
 _MAX_STATUS_LEN: Final[int] = 64
 _GROUP_OTHER_PERMS_MASK: Final[int] = 0o077
 #: Taille des morceaux de lecture HTTP : aucun chunk alloué au-delà avant le
@@ -209,7 +211,10 @@ def _read_and_check_key_file(path: Path) -> str:  # noqa: PLR0912
     try:
         fd = _open_file_read_fd(path)
     except (ValueError, OSError) as exc:
-        raise VaultClientError(f"Impossible d'ouvrir le fichier de clé API : {exc}") from exc
+        msg = str(exc)
+        if len(msg) > _MAX_ERROR_MSG_LEN:
+            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        raise VaultClientError(f"Impossible d'ouvrir le fichier de clé API : {msg}") from exc
 
     try:
         st = os.fstat(fd)

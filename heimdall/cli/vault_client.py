@@ -264,7 +264,10 @@ def _init_client(vault_url: str | None, ca_cert: Path | None) -> VaultClient:
     try:
         api_key = resolve_api_key()
     except VaultClientError as exc:
-        typer.echo(f"Erreur de configuration : {exc}", err=True)
+        msg = str(exc)
+        if len(msg) > _MAX_ERROR_MSG_LEN:
+            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        typer.echo(f"Erreur de configuration : {msg}", err=True)
         raise typer.Exit(code=2) from None
 
     try:
@@ -360,6 +363,14 @@ def _filter_secrets(
                 err=True,
             )
             continue
+        if is_dangerous_env_var(key):
+            # Symétrie pull/run : un nom interdit à l'injection ne doit jamais
+            # être stocké (secret empoisonné, rotation crue mais inexploitable).
+            typer.echo(
+                f"Erreur de sécurité : le secret '{key}' est une variable système interdite.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         filtered[key] = value
     return filtered
 
@@ -376,6 +387,12 @@ def _push_single_secret(
     Retourne ``True`` si le secret a été créé, ``False`` s'il existait déjà
     (409 : avertissement, non écrasé). Les autres erreurs sortent en `Exit`.
     """
+    if is_dangerous_env_var(name):
+        typer.echo(
+            f"Erreur de sécurité : le secret '{name}' est une variable système interdite.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     try:
         client.create_secret(proj, env, name, value)
         typer.echo(f"Secret '{name}' poussé vers le Vault ({proj}/{env}) [statut: vaulte].")

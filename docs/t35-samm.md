@@ -48,6 +48,9 @@ regroupement (voir §4).
 | `push` sans borne nombre/volume (N POST sans plafond) | Mêmes helpers `_enforce_secret_count` / `_enforce_total_secret_chars` que `pull`/`run`, appliqués à `to_push` AVANT `_init_client` : > 1024 entrées ou > 1 048 576 caractères cumulés → `Exit(1)`, aucun POST partiel | `heimdall/cli/vault_client.py` (`vault_push`, helpers de bornes) + `tests/test_vault_cli.py::test_push_rejects_too_many_secrets_before_any_post`, `::test_push_rejects_cumulative_secret_volume_before_any_post` |
 | `ValueError` identifiant non mappée dans `_pull_secrets_from_vault` | `except ValueError` dédié (défense en profondeur si les patterns CLI/client divergent) → message borné sans valeur + `Exit(1)`, jamais de traceback (invariant 11) | `heimdall/cli/vault_client.py` (`_pull_secrets_from_vault`) + `tests/test_vault_cli.py::test_pull_maps_value_error_identifier_to_exit_1` |
 | Voie `run` avec slash sans empreinte figée | Même empreinte figée avant le fetch que la voie `which` (`_regular_file_identity(cmd[0])`), revérifiée juste avant `exec` après `lstat`+`S_ISREG` ; réécriture en place détectée par taille/mtime/ctime, rename par inode. Limite résiduelle documentée : réécriture préservant toute l'empreinte (sans `fexecve` portable) | `heimdall/cli/vault_client.py` (`vault_run`, `_regular_file_identity`) + `tests/test_vault_cli.py::test_run_refuses_path_command_rewritten_in_place_before_exec` |
+| Chemin du fichier de clé reflété sans borne | Chemin tronqué à 32 car. à la source (`_open_file_read_fd`), erreurs d'ouverture bornées à 150 dans `_read_and_check_key_file`, puis message de configuration CLI borné à 150 : un `HEIMDALL_API_KEY_FILE` de 5000 car. ne bloat plus les logs | `heimdall/vault/atomic.py` (`_PATH_PREVIEW_LEN`, `_open_file_read_fd`), `heimdall/vault/client.py` (`_read_and_check_key_file`), `heimdall/cli/vault_client.py` (`_init_client`) + `tests/test_vault_client.py::test_open_file_read_fd_bounds_long_path_in_error`, `::test_read_and_check_key_file_bounds_wrapped_error`, `tests/test_vault_cli.py::test_init_client_bounds_long_config_error` |
+| `push` accepte les noms dangereux refusés par `pull`/`run` | `_filter_secrets` et `_push_single_secret` refusent `is_dangerous_env_var` en `Exit(2)` statique avant tout POST : plus de secret empoisonné (`PATH`, `LD_PRELOAD`, `HEIMDALL_API_KEY`...) inexploitable après rotation | `heimdall/cli/vault_client.py` (`_filter_secrets`, `_push_single_secret`) + `tests/test_vault_cli.py::test_push_rejects_dangerous_env_names_before_send`, `::test_push_single_secret_rejects_dangerous_name` |
+| Fiche SAMM §5 : numéros de ligne obsolètes | §5 ne cite plus de numéros de ligne pour `main.py`/`vault_keys.py`/`vault_run` (symboles seuls, comme au §1) : plus de dérive à chaque déplacement de code | `docs/t35-samm.md` §5 |
 | En-têtes HTTP non bornés avant le corps streaming (pic mémoire httpx/h11) | Double plafond avant lecture du corps : 256 en-têtes / 64 Kio (`_MAX_RESPONSE_HEADER_COUNT`/`_MAX_RESPONSE_HEADERS_BYTES`, octets exacts via `.raw`, fail-closed si illisibles) | `heimdall/vault/client.py` (`_measure_response_headers`, `_read_bounded_body`) + `tests/test_vault_client.py::test_streaming_response_with_giant_headers_rejected_without_reading_body`, `::test_streaming_response_with_too_many_headers_rejected` |
 | `Path.home()` non mappé dans la résolution de clé (traceback au lieu d'`Exit(2)`) | Corps `_find_key_file` + `exists()` appelant sous `try` (`OSError`/`RuntimeError`/`ValueError`) → `None`/« clé requise » ; version-indépendant (`exists()` face à l'octet nul varie selon Python ≥3.10) | `heimdall/vault/client.py` (`_find_key_file`, `resolve_api_key`) + `tests/test_vault_client.py::test_resolve_api_key_survives_undeterminable_home`, `::test_find_key_file_survives_null_byte_in_env_paths`, `tests/test_vault_cli.py::test_pull_without_api_key_and_broken_home_exits_2_cleanly`, `::test_pull_without_api_key_and_null_byte_key_file_exits_2_cleanly` |
 | `ValueError` identifiant confondue avec valeur invalide dans `push` (message trompeur) | Deux branches sans reflet de valeur : identifiant → message format, valeur → message 1-65536 inchangé (même `Exit(2)`) | `heimdall/cli/vault_client.py` (`_push_single_secret`) + `tests/test_vault_cli.py::test_push_single_secret_distinguishes_identifier_from_value_errors` |
@@ -96,13 +99,13 @@ livraisons suivront une PR par sous-ticket. Le revert ciblé reste possible :
 ## 5. Voies `run` : canonique vs alias (ticket #101)
 
 Le ticket #101 spécifie `heimdall run -- <cmd>` : c'est la voie canonique
-(`heimdall/cli/main.py:56`, `app.command("run")`). `heimdall vault run`
-(`heimdall/cli/vault_keys.py:59`, `vault_app.command("run")`) est un alias
+(`heimdall/cli/main.py`, `app.command("run")`). `heimdall vault run`
+(`heimdall/cli/vault_keys.py`, `vault_app.command("run")`) est un alias
 de découvrabilité (`vault push` / `vault pull` / `vault run` groupés),
 pas une seconde implémentation.
 
 Garanties anti-divergence :
-- même callback `vault_run` (`heimdall/cli/vault_client.py:701`), donc mêmes
+- même callback `vault_run` (`heimdall/cli/vault_client.py`), donc mêmes
   gardes : allowlist locale (nom Vault jamais utilisé), denylist étendue,
   `shutil.which` préalable, sans `shell=True`, `Exit(2)` sur commande vide ;
 - mêmes réglages Typer via la source unique `RUN_CONTEXT_SETTINGS`

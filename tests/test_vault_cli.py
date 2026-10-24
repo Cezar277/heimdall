@@ -155,6 +155,48 @@ class VaultPushCliTests(unittest.TestCase):
         self.assertIn("volume cumulé", result.output)
         mock_init.assert_not_called()
 
+    def test_push_rejects_dangerous_env_names_before_send(self) -> None:
+        """`push --name PATH` (ou équivalents) → Exit(2), aucun envoi."""
+        for bad_name in ("PATH", "LD_PRELOAD", "HEIMDALL_API_KEY"):
+            with self.subTest(bad_name=bad_name):
+                env_file = self.tmp_dir / f"{bad_name}.env"
+                env_file.write_text(f"{bad_name}=poison\n", encoding="utf-8")
+                with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+                    with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                        result = self.runner.invoke(
+                            app,
+                            [
+                                "vault",
+                                "push",
+                                "--file",
+                                str(env_file),
+                                "--project",
+                                "demo",
+                                "--name",
+                                bad_name,
+                            ],
+                        )
+                self.assertEqual(result.exit_code, 2)
+                self.assertIn("interdite", result.output)
+                mock_init.assert_not_called()
+
+    def test_init_client_bounds_long_config_error(self) -> None:
+        """Une erreur de configuration de 5000 caractères est tronquée en CLI."""
+        env_file = self.tmp_dir / ".env"
+        env_file.write_text("SAFE_VAR=value\n", encoding="utf-8")
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch(
+                "heimdall.cli.vault_client.resolve_api_key",
+                side_effect=VaultClientError("P" * 5000),
+            ):
+                result = self.runner.invoke(
+                    app,
+                    ["vault", "push", "--file", str(env_file), "--project", "demo"],
+                )
+        self.assertEqual(result.exit_code, 2)
+        self.assertLessEqual(len(result.output), 300)
+        self.assertNotIn("P" * 1000, result.output)
+
     def test_push_rejects_invalid_project_or_env(self) -> None:
         """Validation fail-closed des formats de projet et d'environnement."""
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
@@ -991,6 +1033,14 @@ class VaultPullCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 1)
         self.assertIn("volume cumulé", result.output)
         mock_run.assert_not_called()
+
+    def test_push_single_secret_rejects_dangerous_name(self) -> None:
+        """Défense en profondeur : `_push_single_secret` refuse aussi les noms interdits."""
+        client = MagicMock()
+        with self.assertRaises(Exit) as ctx:
+            _push_single_secret(client, "demo", "dev", "PATH", "value")
+        self.assertEqual(ctx.exception.exit_code, 2)
+        client.create_secret.assert_not_called()
 
     def test_push_single_secret_distinguishes_identifier_from_value_errors(self) -> None:
         """`ValueError` client : message identifiant vs valeur, jamais la valeur reflétée."""

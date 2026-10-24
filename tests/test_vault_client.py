@@ -26,6 +26,7 @@ import httpx
 
 from heimdall.vault.atomic import (
     _get_git_toplevel,
+    _open_file_read_fd,
     _write_file_atomic_fallback,
     backup_file,
     check_file_mode_600,
@@ -1450,6 +1451,28 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         with self.assertRaises(VaultClientError) as ctx:
             _read_and_check_key_file(fifo_path)
         self.assertIn("fichier régulier", str(ctx.exception))
+
+    def test_open_file_read_fd_bounds_long_path_in_error(self) -> None:
+        """Un nom de 4096 caractères ne produit pas un message géant."""
+        long_path = self.tmp_dir / ("K" * 4096)
+        with self.assertRaises(ValueError) as ctx:
+            _open_file_read_fd(long_path)
+        message = str(ctx.exception)
+        self.assertLessEqual(len(message), 220)
+        self.assertNotIn("K" * 200, message)
+
+    def test_read_and_check_key_file_bounds_wrapped_error(self) -> None:
+        """Toute erreur d'ouverture de clé est tronquée avant d'être relayée."""
+        long_error = "Lecture refusée : '" + "P" * 5000 + "' est un lien symbolique."
+        with patch(
+            "heimdall.vault.client._open_file_read_fd",
+            side_effect=ValueError(long_error),
+        ):
+            with self.assertRaises(VaultClientError) as ctx:
+                _read_and_check_key_file(self.tmp_dir / "vault.key")
+        message = str(ctx.exception)
+        self.assertLessEqual(len(message), 220)
+        self.assertNotIn("P" * 200, message)
 
     def test_write_file_atomic_rejects_symlinked_intermediate_parent(self) -> None:
         """write_file_atomic refuse d'écrire si un parent intermédiaire est un symlink."""
