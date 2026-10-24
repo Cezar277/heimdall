@@ -55,7 +55,10 @@ littéral `"1"` (un entier `1`, ou une `version` simplement omise, sont
 refusés), et chaque mot-clé doit faire au moins 3 caractères. Toute
 clé racine inconnue (`[tool.foo]`, faute de frappe), tout type incorrect ou
 tout mot-clé trop court est une erreur d'outillage (code 2), jamais un
-passage silencieux.
+passage silencieux. Un `secret_types` doit suivre la grammaire des types
+du contrat Finding (`[a-z][a-z0-9_]*`, 64 caractères max, ex. `aws`) :
+`"AWS"` ou `"../etc"` sont refusés en code 2 au lieu de rendre la règle
+muette.
 
 Les `patterns` ne peuvent pas rendre l'allowlist aveugle : via TOML, chaque
 chaîne est compilée puis validée ; via l'API Python, seules des expressions
@@ -64,6 +67,9 @@ déjà compilées sont acceptées. Un motif qui matche la chaîne vide (`.`, `.*
 3 caractères **littéraux** : `EXAMPLE-[0-9]{4}` est accepté, tandis que
 `[a-z]+`, `\w+`, `\d{3}-\d{4}` ou `x{3}y{3}` sont refusés (motif trop large
 pour être auditable) — reformuler en portant les marqueurs concrets visés.
+Aucun mot-clé ni motif ne peut porter de caractère de contrôle ou invisible
+(`\n` littéral, tabulation, RLO…) : faute de frappe refusée en code 2
+(les échappements regex `\n` restent deux caractères ordinaires et acceptés).
 Les constructions à backtracking non borné (alternance ou groupe imbriqué
 sous quantificateur, quantificateurs consécutifs, références arrière) sont
 refusées en `ScanError` (code 2). Une valeur candidate de plus de 256
