@@ -41,6 +41,8 @@ from heimdall.scanner import allowlist as al_module
 from heimdall.scanner.allowlist import (
     MAX_CONFIG_BYTES,
     MAX_DESCRIPTION_LENGTH,
+    MAX_MATCH_PATH_LENGTH,
+    MAX_PATH_WILDCARDS,
     MAX_REGEX_VALUE_LENGTH,
     MAX_RULE_NAME_LENGTH,
     MIN_KEYWORD_LENGTH,
@@ -396,6 +398,42 @@ def test_load_allowlist_outside_repo_root_is_refused(tmp_path: Path) -> None:
         load_allowlist_from_file(outside, repo_root=repo)
 
 
+def test_load_allowlist_explicit_external_config_accepted(tmp_path: Path) -> None:
+    """Revue (LOW) : un `--config` explicite hors dépôt est accepté hors CI.
+
+    C'est un choix opérateur explicite (disponibilité, cf. l'aide `--config`)
+    : la garde `_resolve_root` + `O_NOFOLLOW`, le plafond de taille et le
+    contrat fermé s'appliquent toujours. Sans `allow_external`, le refus
+    fail-closed reste la norme.
+    """
+    outside = tmp_path / "outside.toml"
+    outside.write_text(
+        '[allowlist]\nversion = "1"\n\n[[allowlist.rules]]\n'
+        'name = "dummy"\ndescription = "d"\nkeywords = ["dummy"]\n',
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # Sans l'opt-in explicite : refus fail-closed (comportement historique).
+    with pytest.raises(ScanError):
+        load_allowlist(repo, config_file=outside, allow_external=False)
+
+    # Avec l'opt-in explicite : accepté et fonctionnel.
+    allowlist = load_allowlist(repo, config_file=outside, allow_external=True)
+    assert allowlist.evaluate(
+        value="dummy",
+        file="app.py",
+        line=1,
+        secret_type="password",
+    ) is not None
+
+    # Un contenu invalide reste fail-closed, même explicitement opté.
+    outside.write_text("[allowlist]\nversion = 1\n", encoding="utf-8")
+    with pytest.raises(ScanError):
+        load_allowlist(repo, config_file=outside, allow_external=True)
+
+
 def test_load_allowlist_size_limit_fail_closed(tmp_path: Path) -> None:
     """CWE-400 : un fichier dépassant MAX_CONFIG_BYTES est refusé."""
     big_config = tmp_path / "big.toml"
@@ -442,6 +480,62 @@ def test_parse_allowlist_version_is_strictly_typed() -> None:
 
     parsed = parse_allowlist_toml('[allowlist]\nversion = "1"\n')
     assert parsed.is_empty()
+
+
+def test_parse_allowlist_missing_version_is_rejected() -> None:
+    """Revue (LOW) : `version` est obligatoire, jamais une valeur par défaut.
+
+    Le contrat annoncé est fermé : une table `[allowlist]` sans `version`
+    échoue en `ScanError` (code 2) au lieu d'impliquer silencieusement la
+    grammaire "1".
+    """
+    with pytest.raises(ScanError):
+        parse_allowlist_toml("[allowlist]\n")
+
+    with pytest.raises(ScanError):
+        parse_allowlist_toml(
+            '[allowlist]\n[[allowlist.rules]]\nname = "r"\ndescription = "d"\n'
+            'keywords = ["abc"]\n'
+        )
+
+    # Avec explication de la table racine, la version reste le seul littéral admis.
+    with pytest.raises(ScanError):
+        parse_allowlist_toml('[allowlist]\nversion = "2"\n')
+
+def test_pattern_min_literals_reformulation_is_accepted() -> None:
+    """Revue (LOW) : le refus des motifs à 1-2 littéraux est figé, avec
+    l'exemple de reformulation documenté (`EXAMPLE-[0-9]{4}`).
+
+    Un motif doit porter au moins MIN_PATTERN_LITERALS caractères littéraux
+    hors classes, ancres et quantificateurs pour rester auditable.
+    """
+    # Refusés : pas assez de littéraux (motif trop large).
+    for narrow in (r"\d{3}-\d{4}", "x{3}y{3}", r"\w+", "[a-z]+"):
+        with pytest.raises(ScanError):
+            _compile_safe_regex(narrow)
+
+    # La reformulation documentée porte des marqueurs concrets : acceptée,
+    # et elle ignore UNIQUEMENT la forme allowlistée visée.
+    ok = _compile_safe_regex(r"EXAMPLE-[0-9]{4}")
+    assert ok.search("AKIAIOSFODNN7EXAMPLE-1234")
+    rule = AllowlistRule(
+        name="example-form",
+        description="d",
+        patterns=(ok,),
+    )
+    assert rule.matches(
+        value="EXAMPLE-1234",
+        file_path="app.py",
+        line_number=1,
+        secret_type="password",
+    )
+    # Un secret réel ne respectant pas la forme reste signalé (invariant 1).
+    assert not rule.matches(
+        value="AKIAIOSFODNN7EXAMPLE",
+        file_path="app.py",
+        line_number=1,
+        secret_type="password",
+    )
 
 
 def test_parse_allowlist_short_keywords_rejected() -> None:
@@ -725,6 +819,41 @@ def test_cli_scan_runner_config_outside_repo_exits_two(git_repo: GitRepo) -> Non
     res = _run("scan", "--config", "../../etc/passwd", str(git_repo.root))
     assert res.exit_code == EXIT_ERROR
     assert "scan impossible" in res.stderr
+
+
+def test_cli_external_config_accepted_outside_ci(
+    git_repo: GitRepo,
+    tmp_path: Path,
+) -> None:
+    """Revue (LOW) : `--config` externe hors CI est accepté (choix opérateur).
+
+    L'aide `--config PATH` promet un fichier alternatif ; un opérateur local
+    peut donc épingler sa configuration hors dépôt. La garde `_resolve_root`
+    + `O_NOFOLLOW`, le plafond de taille et le contrat fermé s'appliquent.
+    """
+    outside = tmp_path / "outside.toml"
+    outside.write_text(
+        '[allowlist]\nversion = "1"\n\n[[allowlist.rules]]\n'
+        'name = "custom-rule"\ndescription = "d"\n'
+        'patterns = ["^AKIA.*EXAMPLE$"]\n',
+        encoding="utf-8",
+    )
+    git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+
+    # En mode arbre local (non CI) : accepté, la règle `custom-rule` s'applique.
+    res = _run("scan", "--config", str(outside), str(git_repo.root))
+    assert res.exit_code == EXIT_CLEAN
+    assert "règle=custom-rule" in res.stdout
+
+    # En staged (non CI) : même disponibilité.
+    git_repo.stage("app.py")
+    res_staged = _run("scan", "--staged", "--config", str(outside), str(git_repo.root))
+    assert res_staged.exit_code == EXIT_CLEAN
+
+    # Une externe invalide reste un code 2 (fail-closed).
+    outside.write_text("[allowlist]\nversion = 1\n", encoding="utf-8")
+    res_bad = _run("scan", "--config", str(outside), str(git_repo.root))
+    assert res_bad.exit_code == EXIT_ERROR
 
 
 # --- 7. Tests d'exhaustivité et de robustesse supplémentaire -----------------
@@ -1322,22 +1451,40 @@ def test_fuzz_patterns_and_paths() -> None:
         with pytest.raises(ScanError):
             _validate_path_pattern(bad_path)
 
-    # Glob long et répétitif : accepté comme motif relatif, mais ne matche
-    # pas un chemin ordinaire et ne provoque pas de backtracking bloquant.
+    # Glob très répétitif : refusé à la validation (CWE-400). Chaque `*`
+    # devient un quantificateur dans fnmatch ; une longue chaîne de `*`
+    # croisée à un chemin adverse pourrait ralentir la passe sous les
+    # interpréteurs sans groupes atomiques. Plafond MAX_PATH_WILDCARDS.
     long_glob = "*a" * 1024 + "*b"
-    assert _validate_path_pattern(long_glob) == long_glob
+    with pytest.raises(ScanError):
+        _validate_path_pattern(long_glob)
+    # À la limite du plafond, le motif reste accepté et jamais bloquant :
+    # fuzz adversarial borné en temps (chemin à la limite, peu de `a`).
+    edge_glob = "*a" * (MAX_PATH_WILDCARDS - 1) + "*b"
+    assert _validate_path_pattern(edge_glob) == edge_glob
     rule = AllowlistRule(
-        name="long-glob",
+        name="edge-glob",
         description="fuzz",
-        paths=(long_glob,),
+        paths=(edge_glob,),
         keywords=("dummy",),
     )
+    adversarial = "ab" * (MAX_MATCH_PATH_LENGTH // 2) + "Z"
+    start = time.monotonic()
     assert not rule.matches(
         value="dummy",
-        file_path="a" * 4096,
+        file_path=adversarial,
         line_number=1,
         secret_type="password",
     )
+    # Dépassee le plafond de longueur, fnmatch n'est même pas sollicité
+    # (fail-closed : le candidat reste signalé).
+    assert not rule.matches(
+        value="dummy",
+        file_path="a" * (MAX_MATCH_PATH_LENGTH + 1),
+        line_number=1,
+        secret_type="password",
+    )
+    assert time.monotonic() - start < 2.0
 
     # `fnmatch` ne doit jamais transformer un chemin hostile en match.
     fixtures_rule = AllowlistRule(
@@ -1792,11 +1939,15 @@ def test_allowlist_exports_and_default_docstring() -> None:
     assert "MIN_KEYWORD_LENGTH" in al_module.__all__
     assert "MIN_PATTERN_LITERALS" in al_module.__all__
     assert "MAX_REGEX_VALUE_LENGTH" in al_module.__all__
+    assert "MAX_PATH_WILDCARDS" in al_module.__all__
+    assert "MAX_MATCH_PATH_LENGTH" in al_module.__all__
     assert MAX_RULE_NAME_LENGTH == 64
     assert MAX_DESCRIPTION_LENGTH == 512
     assert MIN_KEYWORD_LENGTH == 3
     assert MIN_PATTERN_LITERALS == 3
     assert MAX_REGEX_VALUE_LENGTH == 256
+    assert MAX_PATH_WILDCARDS == 10
+    assert MAX_MATCH_PATH_LENGTH == 1024
 
     # Allowlist.default() fournit les règles standards et possède une docstring explicite
     default_al = Allowlist.default()

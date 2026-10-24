@@ -4,6 +4,18 @@
 #
 # Piège évité : aucun allowlist global de tests/ ; un secret réel dans tests/
 # reste détecté et bloque la CI s'il ne répond pas à une règle spécifique de factice.
+#
+# Contrat fermé :
+# - `version = "1"` est OBLIGATOIRE (jamais implicite) ; un entier ou toute
+#   autre chaîne est refusé en code 2.
+# - `patterns` : une regex doit porter au moins 3 caractères LITTÉRAUX
+#   (hors classes, ancres et quantificateurs) et ne jamais matcher la
+#   chaîne vide. Accepté : `EXAMPLE-[0-9]{4}`. Refusé : `[a-z]+`,
+#   `\w+`, `\d{3}-\d{4}` ou `x{3}y{3}` — motif trop large pour être
+#   auditable : reformuler en portant les marqueurs concrets visés.
+# - `paths` : au plus 10 jokers `*` par motif glob ; un chemin de plus de
+#   1024 caractères n'est pas soumis au filtre (fail-closed, il reste
+#   signalé).
 
 [allowlist]
 version = "1"

@@ -313,6 +313,11 @@ def _guard_anti_self_attestation(  # noqa: PLR0913
        - en mode arbre local, la propreté du worktree n'est PAS vérifiée
          (seule une configuration stagée est refusée) : ce périmètre est
          indicatif, seuls --ci et --staged sont opposables.
+    3. Un `--config` explicite peut vivre hors du dépôt scanné, y compris hors
+       CI : c'est un choix opérateur (disponibilité), équivalent au cas CI.
+       La garde unique `_resolve_root` + `O_NOFOLLOW`, le plafond de taille et
+       le contrat fermé s'appliquent dans les deux cas ; le contenu ne peut
+       pas rendre l'allowlist aveugle (motifs universels refusés).
     """
     if custom_allowlist is not None:
         return None
@@ -431,7 +436,11 @@ def _collect_tree(
         else (
             _load_allowlist_verified(access, verified)
             if verified is not None
-            else load_allowlist(access.root, config_file=config, allow_external=ci)
+            else load_allowlist(
+                access.root,
+                config_file=config,
+                allow_external=ci or config is not None,
+            )
         )
     )
     scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
@@ -508,7 +517,11 @@ def _collect_staged(
         else (
             _load_allowlist_verified(access, verified)
             if verified is not None
-            else load_allowlist(access.root, config_file=config, allow_external=ci)
+            else load_allowlist(
+                access.root,
+                config_file=config,
+                allow_external=ci or config is not None,
+            )
         )
     )
     # Même échéance que la passe : un blob dense est interrompu à l'intérieur,

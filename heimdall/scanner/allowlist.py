@@ -19,7 +19,10 @@ Invariants de sécurité :
   est plafonnée (64 Kio), le nombre de règles et de motifs est borné, les
   regex subissent une analyse structurelle (imbrication réelle, alternance
   sous quantificateur, quantificateurs consécutifs, références arrière) et
-  la valeur candidate soumise à une regex est bornée.
+  la valeur candidate soumise à une regex est bornée. Le filtre de chemins
+  est borné d'un côté et de l'autre : au plus
+  :data:`MAX_PATH_WILDCARDS` jokers `*` par motif via `fnmatch`, et au plus
+  :data:`MAX_MATCH_PATH_LENGTH` caractères de chemin soumis au filtre.
 - Anti-allowlist aveugle (CWE-1188) : un motif doit porter au moins
   :data:`MIN_PATTERN_LITERALS` caractères littéraux et ne jamais matcher la
   chaîne vide ; les motifs universels (`.`, `.*`, `^`, `^.*$`) sont refusés.
@@ -87,6 +90,18 @@ MIN_PATTERN_LITERALS: Final[int] = 3
 #: fail-closed, et cela borne l'exposition à un motif pathologique qui
 #: aurait échappé à l'analyse structurelle.
 MAX_REGEX_VALUE_LENGTH: Final[int] = 256
+
+#: Nombre maximal de jokers `*` par motif de chemin. Chaque `*` devient
+#: un quantificateur dans la regex de `fnmatch` ; sous Python < 3.13
+#: (translate sans groupes atomiques), une longue chaîne de `*` croisée à
+#: un chemin adverse peut explorer un nombre exponentiel de découpages.
+#: Un plafond conservateur borne ce coût à des millisecondes mesurées.
+MAX_PATH_WILDCARDS: Final[int] = 10
+
+#: Longueur maximale d'un chemin soumis à `fnmatch`. Au-delà, l'évaluation
+#: est **omise** (le candidat reste signalé, fail-closed) : même protection
+#: que :data:`MAX_REGEX_VALUE_LENGTH` pour le filtre de chemins.
+MAX_MATCH_PATH_LENGTH: Final[int] = 1024
 
 #: Validation stricte de l'identifiant de règle (nom ASCII sécurisé).
 _RULE_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
@@ -491,15 +506,23 @@ class AllowlistRule:
         QUE sur `value` (le secret candidat).
 
         Une valeur plus longue que :data:`MAX_REGEX_VALUE_LENGTH` n'est pas
-        soumise aux regex : le candidat reste signalé (fail-closed). Cela
-        borne l'exposition à un motif pathologique qui aurait échappé à
-        l'analyse structurelle.
+        soumise aux regex, et un chemin plus long que
+        :data:`MAX_MATCH_PATH_LENGTH` n'est pas soumis à `fnmatch` : dans les
+        deux cas le candidat reste signalé (fail-closed). Cela borne
+        l'exposition à un motif pathologique qui aurait échappé aux
+        validations.
         """
-        # 1. Filtre par chemin (si spécifié) — moteur unique fnmatch documenté
+        # 1. Filtre par chemin (si spécifié) — moteur unique fnmatch documenté.
+        # Un chemin plus long que MAX_MATCH_PATH_LENGTH n'est pas soumis à
+        # fnmatch : le candidat reste signalé (fail-closed), même protection
+        # anti-backtracking que pour les regex sur la valeur.
         if self.paths:
-            path_matched = any(
-                fnmatch.fnmatch(file_path, pattern)
-                for pattern in self.paths
+            path_matched = (
+                len(file_path) <= MAX_MATCH_PATH_LENGTH
+                and any(
+                    fnmatch.fnmatch(file_path, pattern)
+                    for pattern in self.paths
+                )
             )
             if not path_matched:
                 return False
@@ -657,12 +680,18 @@ def _validate_path_pattern(pattern: str) -> str:
     Un motif est un chemin relatif POSIX : pas de traversée (`..`), pas
     d'absolu, pas de lecteur Windows (`C:`), pas d'antislash, pas de NUL ou
     de caractère de contrôle, pas de segment vide. Les métacaractères glob
-    (`*`, `?`, `[...]`) restent autorisés.
+    (`*`, `?`, `[...]`) restent autorisés, dans la limite de
+    :data:`MAX_PATH_WILDCARDS` jokers `*` par motif (anti-backtracking).
     """
     try:
         validate_relative_path(pattern)
     except ValueError:
         raise ScanError(_CONFIG_ERROR) from None
+    if pattern.count("*") > MAX_PATH_WILDCARDS:
+        # Chaque `*` devient un quantificateur dans fnmatch ; une chaîne de
+        # `*` croisée à un chemin adverse peut ralentir la passe sous les
+        # interpréteurs sans groupes atomiques. Refus fail-closed (code 2).
+        raise ScanError(_CONFIG_ERROR)
     return pattern
 
 
@@ -803,8 +832,13 @@ def parse_allowlist_toml(content: str, *, sha256: str | None = None) -> Allowlis
     if not set(allowlist_table.keys()).issubset(allowed_allowlist_keys):
         raise ScanError(_CONFIG_ERROR)
 
-    version = allowlist_table.get("version", "1")
-    # Typage strict : `version = 1` (int) n'est pas `version = "1"`.
+    version = allowlist_table.get("version")
+    # Contrat fermé : `version` est EXPLICITE et vaut exactement le littéral
+    # `"1"` — une version manquante, un entier `1` ou toute autre chaîne
+    # est refusée (fail-closed), pour qu'un opérateur sache toujours quelle
+    # grammaire il lit.
+    if "version" not in allowlist_table:
+        raise ScanError(_CONFIG_ERROR)
     if not isinstance(version, str) or version != "1":
         raise ScanError(_CONFIG_ERROR)
 
@@ -885,7 +919,10 @@ def load_allowlist(
     """Charge la configuration d'allowlist pour la racine d'un dépôt.
 
     Si `config_file` est fourni, ce fichier spécifique est chargé (fail-closed s'il
-    est invalide ou manquant).
+    est invalide ou manquant). Un chemin explicite peut vivre **hors** du dépôt :
+    c'est un choix opérateur (`--config`), assumé par `allow_external=True` ; la
+    garde `_resolve_root` + `O_NOFOLLOW` et le plafond de taille s'appliquent
+    toujours, et le contenu reste soumis au contrat fermé.
     Si `config_file` n'est pas fourni, recherche `heimdall.toml` à la racine de `root`.
     Si `heimdall.toml` n'existe pas, retourne une Allowlist vide.
     """
@@ -915,7 +952,9 @@ def load_allowlist(
 __all__ = [
     "MAX_CONFIG_BYTES",
     "MAX_DESCRIPTION_LENGTH",
+    "MAX_MATCH_PATH_LENGTH",
     "MAX_PATTERN_LENGTH",
+    "MAX_PATH_WILDCARDS",
     "MAX_REGEX_VALUE_LENGTH",
     "MAX_RULES",
     "MAX_RULE_NAME_LENGTH",
