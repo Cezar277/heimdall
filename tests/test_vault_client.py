@@ -50,6 +50,7 @@ from heimdall.vault.client import (
     VaultUnavailableError,
     _check_localhost_resolution,
     _detect_from_git,
+    _find_key_file,
     _pin_loopback_ip,
     _read_and_check_key_file,
     _validate_identifier,
@@ -384,6 +385,37 @@ class VaultConfigResolutionTests(unittest.TestCase):
                 resolve_api_key()
             self.assertIn("trop volumineuse", str(ctx.exception))
             self.assertNotIn(giant_key, str(ctx.exception))
+
+    def test_find_key_file_survives_null_byte_in_env_paths(self) -> None:
+        """Octet nul / HOME indéterminé → pas de traceback, erreur « clé requise »."""
+        real_get = os.environ.get
+
+        def fake_get_factory(overrides: dict[str, str]) -> object:
+            def fake_get(key: str, default: str | None = None) -> str | None:
+                if key in overrides:
+                    return overrides[key]
+                return real_get(key, default)
+
+            return fake_get
+
+        cases = [
+            # HEIMDALL_API_KEY_FILE à octet nul : jamais de traceback, quelle
+            # que soit la version Python (Path() ou exists() peuvent lever).
+            {"HEIMDALL_API_KEY": "", "HEIMDALL_API_KEY_FILE": "a\x00b", "XDG_CONFIG_HOME": ""},
+            # XDG_CONFIG_HOME à octet nul : recherche impossible → None.
+            {"HEIMDALL_API_KEY": "", "HEIMDALL_API_KEY_FILE": "", "XDG_CONFIG_HOME": "c\x00d"},
+        ]
+        for env in cases:
+            with self.subTest(xdg=env["XDG_CONFIG_HOME"] != ""):
+                with patch("os.environ.get", side_effect=fake_get_factory(env)):
+                    try:
+                        _find_key_file(None)
+                    except Exception as exc:
+                        self.fail(f"_find_key_file a levé {type(exc).__name__}")
+                    # Contrat : jamais de traceback, toujours l'erreur « clé requise ».
+                    with self.assertRaises(VaultClientError) as ctx:
+                        resolve_api_key()
+                    self.assertIn("Clé API", str(ctx.exception))
 
     def test_resolve_api_key_from_file_0600(self) -> None:
         """Lecture de la clé depuis un fichier avec permissions strictes 0600."""
@@ -966,6 +998,42 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         )
         client = VaultClient(_VALID_URL, _VALID_KEY)
         with patch.object(httpx.Client, "send", return_value=resp_giant_headers):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("En-têtes", str(ctx.exception))
+
+    def test_streaming_items_only_headers_without_raw_rejected_early(self) -> None:
+        """En-têtes sans `.raw` (`.items()` seul) de 2 Mio → rejet borné, sans liste."""
+
+        class _NoRawHeaders:
+            """Headers-like minimal : `.items()`/`.get()`/comptage, sans `.raw`."""
+
+            def __init__(self, mapping: dict[str, str]) -> None:
+                self._mapping = dict(mapping)
+
+            def get(self, key: str, default: str | None = None) -> str | None:
+                lowered = {k.lower(): v for k, v in self._mapping.items()}
+                return lowered.get(key.lower(), default)
+
+            def items(self) -> object:
+                return self._mapping.items()
+
+            def __len__(self) -> int:
+                return len(self._mapping)
+
+        class _ItemsOnlyGiantHeaders:
+            status_code = HTTPStatus.OK
+            headers = _NoRawHeaders({"x-pad": "y" * (2 * 1024 * 1024)})
+
+            def iter_bytes(self, chunk_size: int | None = None) -> object:
+                raise AssertionError("le corps ne doit pas être lu")
+
+            def close(self) -> None:
+                pass
+
+        assert not hasattr(_ItemsOnlyGiantHeaders.headers, "raw")
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(httpx.Client, "send", return_value=_ItemsOnlyGiantHeaders()):
             with self.assertRaises(VaultClientError) as ctx:
                 client.health()
             self.assertIn("En-têtes", str(ctx.exception))

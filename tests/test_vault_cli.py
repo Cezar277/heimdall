@@ -1082,6 +1082,38 @@ class VaultPullCliTests(unittest.TestCase):
                 self.assertIn("Erreur de configuration", result.output)
                 self.assertFalse(output_file.exists())
 
+    def test_pull_without_api_key_and_null_byte_key_file_exits_2_cleanly(self) -> None:
+        """`HEIMDALL_API_KEY_FILE` à octet nul → `Exit(2)` propre, pas de traceback."""
+        output_file = self.tmp_dir / ".env"
+        real_get = os.environ.get
+
+        def fake_get(key: str, default: str | None = None) -> str | None:
+            if key == "HEIMDALL_API_KEY":
+                return ""
+            if key == "HEIMDALL_API_KEY_FILE":
+                return "kb\x00b"
+            if key == "XDG_CONFIG_HOME":
+                return ""
+            return real_get(key, default)
+
+        with patch("os.environ.get", side_effect=fake_get):
+            result = self.runner.invoke(
+                app,
+                [
+                    "vault",
+                    "pull",
+                    "--project",
+                    "demo",
+                    "--name",
+                    "KEY",
+                    "--output",
+                    str(output_file),
+                ],
+            )
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn("Erreur de configuration", result.output)
+            self.assertFalse(output_file.exists())
+
     def test_pull_warns_indeterminate_git_status_without_git_binary(self) -> None:
         """Sans binaire git : statut « indéterminé », jamais de silence."""
         output_file = self.tmp_dir / ".env"

@@ -171,23 +171,25 @@ def _key_from_env() -> str | None:
 def _find_key_file(key_file: Path | None) -> Path | None:
     """Détermine le chemin du fichier de clé API.
 
-    ``HOME`` indéterminé → ``None`` (l'appelant lève l'erreur standard
-    « clé requise », qui devient ``Exit(2)`` en CLI — jamais de traceback).
+    ``HOME`` indéterminé, chemin invalide (octet nul...), permission... :
+    tout indéterminable vaut ``None`` — l'appelant lève l'erreur standard
+    « clé requise » (``Exit(2)`` en CLI), jamais de traceback, quelle que
+    soit la version Python (``Path.exists()`` face à l'octet nul varie).
     """
-    if key_file is not None:
-        return key_file
-    env_file = os.environ.get("HEIMDALL_API_KEY_FILE")
-    if env_file is not None and env_file.strip():
-        return Path(env_file.strip())
-    xdg_config = os.environ.get("XDG_CONFIG_HOME")
     try:
+        if key_file is not None:
+            return key_file
+        env_file = os.environ.get("HEIMDALL_API_KEY_FILE")
+        if env_file is not None and env_file.strip():
+            return Path(env_file.strip())
+        xdg_config = os.environ.get("XDG_CONFIG_HOME")
         config_dir = Path(xdg_config) if xdg_config else Path.home() / ".config"
-    except (OSError, RuntimeError):
+        default_file = config_dir / "heimdall" / "vault.key"
+        if default_file.exists():
+            return default_file
         return None
-    default_file = config_dir / "heimdall" / "vault.key"
-    if default_file.exists():
-        return default_file
-    return None
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _read_and_check_key_file(path: Path) -> str:  # noqa: PLR0912
@@ -268,14 +270,23 @@ def resolve_api_key(key_file: Path | None = None) -> str:
         key = env_key
     else:
         candidate_path = _find_key_file(key_file)
-        if candidate_path is None or not candidate_path.exists():
+        usable_path: Path | None = None
+        if candidate_path is not None:
+            try:
+                if candidate_path.exists():
+                    usable_path = candidate_path
+            except (OSError, RuntimeError, ValueError):
+                # Chemin inexploitable (ex. octet nul sur certaines versions
+                # Python) : traité comme absent, jamais de traceback.
+                usable_path = None
+        if usable_path is None:
             raise VaultClientError(
                 "Clé API du Vault requise. "
                 "Définir la variable d'environnement HEIMDALL_API_KEY "
                 "ou placer la clé dans un fichier en permissions 0600 "
                 "(HEIMDALL_API_KEY_FILE ou ~/.config/heimdall/vault.key)."
             )
-        key = _read_and_check_key_file(candidate_path)
+        key = _read_and_check_key_file(usable_path)
 
     if re.search(r"[\r\n\x00]", key):
         raise VaultClientError(
@@ -474,22 +485,33 @@ def _measure_response_headers(headers: Any) -> tuple[int, int]:
     """
     raw = getattr(headers, "raw", None)
     if raw is not None:
+        count = 0
         total = 0
         for k, v in raw:
+            count += 1
             total += len(k) + len(v)
-        return len(raw), total
+            if count > _MAX_RESPONSE_HEADER_COUNT or total > _MAX_RESPONSE_HEADERS_BYTES:
+                raise ValueError("en-têtes de réponse trop volumineux")
+        return count, total
     items = getattr(headers, "items", None)
     if items is None:
         raise ValueError("en-têtes de réponse illisibles")
-    entries = list(items())
-    return len(entries), sum(len(str(k)) + len(str(v)) for k, v in entries)
+    count = 0
+    total = 0
+    for k, v in items():
+        count += 1
+        total += len(str(k)) + len(str(v))
+        if count > _MAX_RESPONSE_HEADER_COUNT or total > _MAX_RESPONSE_HEADERS_BYTES:
+            raise ValueError("en-têtes de réponse trop volumineux")
+    return count, total
 
 
 def _read_bounded_body(resp: Any, endpoint: str) -> bytes:
     """Lit un corps HTTP en streaming avec une borne stricte de 1 Mio.
 
     Les en-têtes sont bornés d'abord (nombre + octets, sans copie
-    transitoire ; borne ultime = buffering httpx/h11, voir constantes) ;
+    transitoire et avec sortie anticipée dès dépassement ; borne ultime =
+    buffering httpx/h11, voir constantes) ;
     ``Content-Length`` est vérifié avant lecture ;
     le compteur d'octets effectivement reçus protège aussi contre un en-tête
     absent, mensonger ou une réponse compressée qui se décompresserait
@@ -497,14 +519,12 @@ def _read_bounded_body(resp: Any, endpoint: str) -> bytes:
     ``_STREAM_CHUNK_SIZE`` : aucun chunk géant n'est alloué avant le contrôle
     du compteur.
     """
-    header_count, header_bytes = _measure_response_headers(resp.headers)
-    if header_count > _MAX_RESPONSE_HEADER_COUNT or header_bytes > _MAX_RESPONSE_HEADERS_BYTES:
+    try:
+        _measure_response_headers(resp.headers)
+    except ValueError as exc:
         raise VaultClientError(
-            f"En-têtes de réponse {endpoint} trop volumineux "
-            f"(bornes : {_MAX_RESPONSE_HEADER_COUNT} en-têtes / "
-            f"{_MAX_RESPONSE_HEADERS_BYTES} octets max)."
-        )
-
+            f"En-têtes de réponse {endpoint} rejetés ({exc})."
+        ) from exc
     content_length_header = resp.headers.get("content-length")
     if content_length_header:
         try:
