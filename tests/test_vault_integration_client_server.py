@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -224,7 +225,7 @@ class VaultClientServerIntegrationTests(unittest.TestCase):
                         "--name",
                         "DATABASE_URL",
                         "--",
-                        "python",
+                        sys.executable,
                         "-c",
                         (
                             "import os, sys\n"
