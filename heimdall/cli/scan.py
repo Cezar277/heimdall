@@ -32,9 +32,11 @@ résultat partiel n'est jamais présenté comme complet.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
@@ -188,13 +190,130 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
         raise ScanError(_MSG_ROOT_CHANGED)
 
 
-def _guard_anti_self_attestation(
+_INDEX_HDR_LEN: Final[int] = 12
+_INDEX_ENTRY_PREFIX_LEN: Final[int] = 22
+_INDEX_V3_MIN: Final[int] = 3
+
+
+def _read_index_entry_sha(index_bytes: bytes, rel_path: str) -> str | None:
+    """Extrait le SHA hexadécimal d'un fichier suivi dans l'index Git binaire (DIRC).
+
+    Lit directement le format d'index Git sans appel de sous-processus afin de respecter
+    strictement les invariants de confinement d'exécution et d'isolation réseau.
+    Supporte les formats d'index Git version 2 et 3 (avec SHA-1 ou SHA-256).
+    """
+    if len(index_bytes) < _INDEX_HDR_LEN or index_bytes[:4] != b"DIRC":
+        return None
+    version = int.from_bytes(index_bytes[4:8], "big")
+    count = int.from_bytes(index_bytes[8:12], "big")
+    target_bytes = rel_path.encode("utf-8")
+
+    # Parcours séquentiel des entrées (version 2 et 3, sha1=20 ou sha256=32)
+    for hash_len in (20, 32):
+        pos = _INDEX_HDR_LEN
+        parsed_entries = 0
+        try:
+            for _ in range(count):
+                if pos + 40 + hash_len + 2 > len(index_bytes):
+                    break
+                entry_start = pos
+                sha = index_bytes[pos + 40 : pos + 40 + hash_len].hex()
+                flags = int.from_bytes(
+                    index_bytes[pos + 40 + hash_len : pos + 40 + hash_len + 2], "big"
+                )
+                extended = bool(flags & 0x4000)
+                path_start = (
+                    pos + 40 + hash_len + 4
+                    if (version >= _INDEX_V3_MIN and extended)
+                    else pos + 40 + hash_len + 2
+                )
+                null_pos = index_bytes.find(b"\x00", path_start)
+                if null_pos == -1:
+                    break
+                path_bytes = index_bytes[path_start:null_pos]
+                parsed_entries += 1
+                if path_bytes == target_bytes:
+                    return sha
+                entry_len = null_pos + 1 - entry_start
+                pad = (8 - (entry_len % 8)) % 8
+                pos = null_pos + 1 + pad
+            if parsed_entries == count:
+                return None
+        except (ValueError, IndexError):
+            pass
+
+    # Recherche directe en repli
+    for term in (b"\x00" + target_bytes + b"\x00", target_bytes + b"\x00"):
+        idx = index_bytes.find(term)
+        if idx != -1:
+            name_idx = idx + (1 if term.startswith(b"\x00") else 0)
+            if name_idx >= _INDEX_ENTRY_PREFIX_LEN:
+                return index_bytes[name_idx - _INDEX_ENTRY_PREFIX_LEN : name_idx - 2].hex()
+    return None
+
+
+def _resolve_git_dir(root: Path) -> Path | None:
+    """Localise le dossier .git effectif pour un dépôt standard, submodule ou worktree."""
+    git_dir = root / ".git"
+    if git_dir.is_dir():
+        return git_dir
+    if git_dir.is_file():
+        try:
+            line = git_dir.read_text("utf-8").strip()
+            if line.startswith("gitdir:"):
+                target = line[len("gitdir:") :].strip()
+                p = Path(target)
+                return p if p.is_absolute() else (root / p).resolve()
+        except OSError:
+            return None
+    return None
+
+
+def _is_worktree_file_clean_and_tracked(root: Path, rel_path: str) -> bool:
+    """Vérifie que le fichier du worktree est suivi dans l'index et non modifié (CWE-345).
+
+    Retourne True si et seulement si :
+    1. Le fichier existe et est lisible dans l'arbre de travail.
+    2. Le fichier est présent dans l'index Git (.git/index).
+    3. L'empreinte de blob Git du contenu du worktree correspond exactement à l'index.
+    En cas de doute (erreur I/O, format non reconnu, dirty/untracked), retourne False.
+    """
+    file_path = root / rel_path
+    if not file_path.is_file():
+        return False
+    try:
+        content = file_path.read_bytes()
+    except OSError:
+        return False
+
+    git_dir = _resolve_git_dir(root)
+    if git_dir is None or not (git_dir / "index").is_file():
+        return False
+    try:
+        index_bytes = (git_dir / "index").read_bytes()
+        index_sha = _read_index_entry_sha(index_bytes, rel_path)
+        if not index_sha:
+            return False
+        blob_sha1 = hashlib.sha1(
+            f"blob {len(content)}\0".encode("ascii") + content,
+            usedforsecurity=False,
+        ).hexdigest()
+        blob_sha256 = hashlib.sha256(
+            f"blob {len(content)}\0".encode("ascii") + content
+        ).hexdigest()
+        return index_sha in (blob_sha1, blob_sha256)
+    except Exception:
+        return False
+
+
+def _guard_anti_self_attestation(  # noqa: PLR0913
     root: Path,
     *,
     ci: bool,
     config: str | Path | None,
     custom_allowlist: Allowlist | None,
-    is_staged_modified: bool,
+    staged_changes: Sequence[object],
+    is_staged_scan: bool = False,
 ) -> None:
     """Protection anti auto-attestation (CWE-345).
 
@@ -202,33 +321,54 @@ def _guard_anti_self_attestation(
        - si --config est passé, il DOIT être situé hors du dépôt scanné.
        - si aucun --config n'est passé et que heimdall.toml existe dans le dépôt,
          refuser en code 2 (exiger --config externe ou --no-allowlist).
-    2. En mode hors CI, si heimdall.toml fait partie des fichiers indexés modifiés/ajoutés
-       et qu'aucune config explicite externe n'est passée, fail-closed loud (code 2).
+    2. En mode hors CI :
+       - si la configuration (heimdall.toml ou --config interne) est modifiée/ajoutée
+         dans l'index (staged_changes), refuser en code 2.
+       - en mode --staged, si la configuration du worktree est modifiée (dirty) ou
+         non suivie (untracked) par rapport à l'index, refuser en code 2 (fail-closed).
     """
     if custom_allowlist is not None:
         return
+
+    rel_cfg: str | None = None
+    if config is not None:
+        cfg_path = Path(config)
+        if not cfg_path.is_absolute():
+            cfg_path = root / cfg_path
+        resolved_cfg = _resolve_root(cfg_path)
+        if resolved_cfg.is_relative_to(root):
+            rel_cfg = resolved_cfg.relative_to(root).as_posix()
+    elif (root / "heimdall.toml").exists():
+        rel_cfg = "heimdall.toml"
+
     if ci:
-        if config is None:
-            if (root / "heimdall.toml").exists():
+        if rel_cfg is not None:
+            if config is None:
                 raise ScanError(
                     "auto-attestation refusée : en mode --ci, l'allowlist du dépôt exige "
                     "--config externe ou --no-allowlist (CWE-345)"
                 )
-        else:
-            cfg_path = Path(config)
-            if not cfg_path.is_absolute():
-                cfg_path = root / cfg_path
-            resolved_cfg = _resolve_root(cfg_path)
-            if resolved_cfg.is_relative_to(root):
-                raise ScanError(
-                    "auto-attestation refusée : en mode --ci, la configuration ne peut pas "
-                    "provenir du dépôt scanné (CWE-345)"
-                )
+            raise ScanError(
+                "auto-attestation refusée : en mode --ci, la configuration ne peut pas "
+                "provenir du dépôt scanné (CWE-345)"
+            )
         return
-    if is_staged_modified and config is None:
-        raise ScanError(
-            "auto-attestation refusée : heimdall.toml est staged (CWE-345)"
+
+    if rel_cfg is not None:
+        is_cfg_staged = any(
+            getattr(change, "path", None) == rel_cfg
+            or str(getattr(change, "path", "")).endswith("/" + rel_cfg)
+            for change in staged_changes
         )
+        if is_cfg_staged:
+            raise ScanError(
+                f"auto-attestation refusée : {rel_cfg} est staged (CWE-345)"
+            )
+        if is_staged_scan and not _is_worktree_file_clean_and_tracked(root, rel_cfg):
+            raise ScanError(
+                f"auto-attestation refusée : en mode --staged, {rel_cfg} du worktree n'est pas "
+                "propre et suivi dans l'index (CWE-345)"
+            )
 
 
 def _collect_tree(
@@ -259,16 +399,13 @@ def _collect_tree(
         raise ScanError(_MSG_NOT_A_REPO)
 
     staged_changes = access.staged_changes(timeout=_call_timeout(deadline))
-    is_staged_modified = any(
-        change.path == "heimdall.toml" or change.path.endswith("/heimdall.toml")
-        for change in staged_changes
-    )
     _guard_anti_self_attestation(
         access.root,
         ci=ci,
         config=config,
         custom_allowlist=custom_allowlist,
-        is_staged_modified=is_staged_modified,
+        staged_changes=staged_changes,
+        is_staged_scan=False,
     )
 
     allowlist = (
@@ -334,16 +471,13 @@ def _collect_staged(
     if len(changes) > MAX_STAGED_FILES:
         raise ScanError(_MSG_TOO_MANY_FILES)
 
-    is_staged_modified = any(
-        change.path == "heimdall.toml" or change.path.endswith("/heimdall.toml")
-        for change in changes
-    )
     _guard_anti_self_attestation(
         access.root,
         ci=ci,
         config=config,
         custom_allowlist=custom_allowlist,
-        is_staged_modified=is_staged_modified,
+        staged_changes=changes,
+        is_staged_scan=True,
     )
 
     allowlist = (

@@ -29,12 +29,16 @@ from heimdall.cli.scan import (
     render_json,
     render_text,
 )
+from heimdall.scanner import allowlist as al_module
 from heimdall.scanner.allowlist import (
     MAX_CONFIG_BYTES,
+    MAX_DESCRIPTION_LENGTH,
+    MAX_RULE_NAME_LENGTH,
     Allowlist,
     AllowlistRule,
     AllowlistTrace,
     _compile_safe_regex,
+    _keyword_matches_value,
     _validate_path_pattern,
     create_default_rules,
     load_allowlist,
@@ -795,6 +799,8 @@ description = "placeholders"
 keywords = ["example"]
 """,
     )
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: add allowlist")
     # Vrai secret AWS (synthétique sans dummy/example dans la valeur) + commentaire piège
     git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"  # dummy example changeme token\n')
     git_repo.stage("app.py")
@@ -1085,3 +1091,130 @@ patterns = ["^AKIA.*DUMMY.*$"]
     res_json = _run("scan", "--json", str(git_repo.root))
     assert raw_secret not in res_json.stdout
     assert raw_secret not in res_json.stderr
+
+
+def test_keyword_boundary_matches_isolated_and_paths() -> None:
+    """Vérifie que les sous-chaînes sans frontières sont strictement rejetées."""
+    # Faux-positifs en sous-chaîne sans séparateur : JAMAIS ignorés (Invariant 1)
+    for kw in ("fake", "test", "example", "dummy"):
+        assert not _keyword_matches_value(kw, f"pro{kw}", has_paths=False)
+        assert not _keyword_matches_value(kw, f"pro{kw}", has_paths=True)
+        assert not _keyword_matches_value(kw, f"{kw}abc", has_paths=False)
+        assert not _keyword_matches_value(kw, f"{kw}abc", has_paths=True)
+
+    assert not _keyword_matches_value("test", "latest", has_paths=False)
+    assert not _keyword_matches_value("test", "latest", has_paths=True)
+    assert not _keyword_matches_value("example", "myexample", has_paths=False)
+    assert not _keyword_matches_value("example", "myexample", has_paths=True)
+
+    # Séparateurs de code '_' acceptés uniquement avec has_paths=True (fixtures)
+    assert _keyword_matches_value("fake", "fake_slack_token", has_paths=True)
+    assert not _keyword_matches_value("fake", "fake_slack_token", has_paths=False)
+    assert _keyword_matches_value("dummy", "my_dummy_key", has_paths=True)
+    assert not _keyword_matches_value("dummy", "my_dummy_key", has_paths=False)
+
+    # Frontières de mot standards '\b' acceptées dans les deux modes
+    assert _keyword_matches_value("fake", "fake-token", has_paths=False)
+    assert _keyword_matches_value("fake", "fake-token", has_paths=True)
+    assert _keyword_matches_value("dummy", "dummy", has_paths=False)
+    assert _keyword_matches_value("dummy", "dummy", has_paths=True)
+
+
+def test_self_attestation_staged_custom_config_fails_loud(git_repo: GitRepo) -> None:
+    """Stager un fichier de config alternatif lève ScanError (code 2, fail-closed)."""
+    git_repo.write(
+        "custom_al.toml",
+        """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "bypass"
+description = "d"
+keywords = ["AKIA"]
+""",
+    )
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("custom_al.toml", "app.py")
+
+    res = _run("scan", "--config", "custom_al.toml", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "auto-attestation" in res.stderr.lower() or "scan impossible" in res.stderr.lower()
+
+
+def test_self_attestation_staged_scan_worktree_config_dirty_fails_loud(git_repo: GitRepo) -> None:
+    """En --staged, un heimdall.toml dirty dans le worktree lève ScanError (code 2)."""
+    # 1. Config légitime committée initialement
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "safe-rule"
+description = "safe"
+keywords = ["dummy"]
+""",
+    )
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: initial commit with allowlist")
+
+    # 2. L'attaquant altère heimdall.toml dans le worktree SANS le stager
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "malicious-bypass"
+description = "bypass"
+keywords = ["AKIA"]
+""",
+    )
+
+    # 3. L'attaquant stage un vrai secret
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("app.py")
+
+    # 4. Le hook (scan --staged) refuse immédiatement en code 2 (fail-closed)
+    res = _run("scan", "--staged", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "auto-attestation" in res.stderr.lower() or "scan impossible" in res.stderr.lower()
+
+
+def test_self_attestation_staged_scan_worktree_config_untracked_fails_loud(
+    git_repo: GitRepo,
+) -> None:
+    """En --staged, un heimdall.toml non suivi (untracked) dans le worktree lève ScanError."""
+    # heimdall.toml créé mais jamais committé ni stagé
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "untracked-bypass"
+description = "bypass"
+keywords = ["AKIA"]
+""",
+    )
+    # Stage d'un vrai secret
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("app.py")
+
+    res = _run("scan", "--staged", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "auto-attestation" in res.stderr.lower() or "scan impossible" in res.stderr.lower()
+
+
+def test_allowlist_exports_and_default_docstring() -> None:
+    """Vérifie l'export des constantes de taille et la documentation de Allowlist.default."""
+    assert "MAX_RULE_NAME_LENGTH" in al_module.__all__
+    assert "MAX_DESCRIPTION_LENGTH" in al_module.__all__
+    assert MAX_RULE_NAME_LENGTH == 64
+    assert MAX_DESCRIPTION_LENGTH == 512
+
+    # Allowlist.default() fournit les règles standards et possède une docstring explicite
+    default_al = Allowlist.default()
+    assert not default_al.is_empty()
+    assert len(default_al.rules) == 4
+    assert "Allowlist par défaut" in (Allowlist.default.__doc__ or "")

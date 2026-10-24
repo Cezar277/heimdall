@@ -124,6 +124,8 @@ def _keyword_matches_value(kw: str, value: str, has_paths: bool = False) -> bool
     - Soit une frontière de mot complète '\\b' (ex: '\\bdummy\\b', '\\bfake\\b', 'admin:changeme')
     - Pour les règles délimitées à un chemin (has_paths=True, ex: tests/**), les frontières
       délimitées par les séparateurs de code classiques ([^a-zA-Z0-9]|^/$) comme 'fake_slack_token'
+      ou 'my_dummy_key' sont acceptées, tout en rejetant strictement les inclusions partielles
+      sans séparateur (ex: 'profake', 'latest', 'myexample' restent signalés).
     """
     kw_cf = kw.casefold()
     val_cf = value.casefold()
@@ -289,7 +291,12 @@ class Allowlist:
 
     @classmethod
     def default(cls) -> Allowlist:
-        """Allowlist par défaut contenant les 4 règles standard (#24)."""
+        """Allowlist par défaut contenant les 4 règles standard (#24).
+
+        Cette méthode de fabrique est réservée aux tests et à l'API Python
+        programmatique ; en usage CLI / CI, l'allowlist est chargée depuis la
+        configuration TOML auditée (`load_allowlist`).
+        """
         return cls(create_default_rules(), sha256=None)
 
 
@@ -540,8 +547,10 @@ def load_allowlist(
 
 __all__ = [
     "MAX_CONFIG_BYTES",
+    "MAX_DESCRIPTION_LENGTH",
     "MAX_PATTERN_LENGTH",
     "MAX_RULES",
+    "MAX_RULE_NAME_LENGTH",
     "Allowlist",
     "AllowlistRule",
     "AllowlistTrace",
