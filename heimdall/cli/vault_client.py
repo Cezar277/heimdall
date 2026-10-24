@@ -171,6 +171,13 @@ _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
     "TERMINFO",
     "TERMPATH",
     "VIRTUAL_ENV",
+    "INPUTRC",
+    "TERM",
+    "TZ",
+    "TERMCAP",
+    "LUA_PATH",
+    "LUA_CPATH",
+    "LUA_INIT",
 })
 
 _MAX_ERROR_MSG_LEN: Final[int] = 150
@@ -263,7 +270,11 @@ def _init_client(vault_url: str | None, ca_cert: Path | None) -> VaultClient:
 
 def _validate_project_and_env(project: str | None, env: str) -> str:
     """Valide et résout le nom de projet et d'environnement."""
-    proj = project or detect_project()
+    try:
+        proj = project or detect_project()
+    except VaultClientError as exc:
+        typer.echo(f"Erreur de configuration : {exc}", err=True)
+        raise typer.Exit(code=2) from None
     if not _PROJECT_ID_PATTERN.match(proj):
         typer.echo(f"Identifiant de projet invalide : {proj[:32]!r}", err=True)
         raise typer.Exit(code=2)
@@ -754,11 +765,12 @@ def vault_run(  # noqa: PLR0913, PLR0917
     peut que fournir la valeur d'un nom déjà autorisé localement. Une denylist
     de variables d'exécution système (PATH, LD_*, BASH_*, prompt, runtimes,
     outils de build, HEIMDALL_*, CDPATH/GLOBIGNORE/HISTFILE/MAILCAPS,
-    TERMINFO/TERMPATH/VIRTUAL_ENV, runtimes (BUN_/DENO_/UV_/PIP_/BUNDLE_/
-    GEM_/CONDA_), etc.)
+    TERMINFO/TERMPATH/VIRTUAL_ENV, INPUTRC/TERM/TZ/TERMCAP/LUA_*,
+    runtimes (BUN_/DENO_/UV_/PIP_/BUNDLE_/GEM_/CONDA_), etc.)
     reste appliquée en défense en profondeur. Tout nom listé localement est
-    une entrée de confiance : ne pas inscrire de variable de comportement
-    shell dans ``--name``/``.env.example``/``.env``.
+    une entrée de confiance : ne jamais y inscrire de variable de comportement
+    shell (dont INPUTRC/TERM/TZ — readline, terminal, fuseau — ni LUA_*
+    — chargement de modules) dans ``--name``/``.env.example``/``.env``.
 
     Limite de sécurité : les secrets sont injectés dans l'environnement du sous-processus
     sans écriture sur disque. Néanmoins, sous Linux, les variables d'un processus sont

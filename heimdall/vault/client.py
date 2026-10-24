@@ -369,7 +369,13 @@ def detect_project(start_dir: Path | None = None) -> str:
         if _PROJECT_ID_PATTERN.match(candidate):
             return candidate
 
-    dir_to_check = (start_dir or Path.cwd()).resolve()
+    try:
+        dir_to_check = (start_dir or Path.cwd()).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise VaultClientError(
+            "Impossible de déterminer le répertoire de travail "
+            "(supprimé ou inaccessible)."
+        ) from exc
     from_git = _detect_from_git(dir_to_check)
     if from_git is not None:
         return from_git

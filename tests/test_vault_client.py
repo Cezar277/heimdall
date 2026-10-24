@@ -534,6 +534,20 @@ class VaultConfigResolutionTests(unittest.TestCase):
             detected = detect_project(self.tmp_dir)
             self.assertNotEqual(detected, "my-special-project")
 
+    def test_detect_project_survives_deleted_cwd(self) -> None:
+        """cwd supprimé → VaultClientError mappée (jamais de traceback FileNotFoundError)."""
+        doomed = self.tmp_dir / "doomed"
+        doomed.mkdir()
+        previous = os.getcwd()
+        os.chdir(doomed)
+        try:
+            os.rmdir(doomed)
+            with patch.dict(os.environ, {"HEIMDALL_PROJECT": ""}):
+                with self.assertRaises(VaultClientError):
+                    detect_project()
+        finally:
+            os.chdir(previous)
+
 
 class VaultAtomicOperationsTests(unittest.TestCase):
     """Tests des fonctions atomiques et sécurisées de manipulation de fichiers."""
