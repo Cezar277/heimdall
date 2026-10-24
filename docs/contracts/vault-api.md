@@ -168,7 +168,7 @@ AES-GCM de 96 bits est tiré de l'aléatoire du système (`os.urandom`) **à cha
 chiffrement** (ticket #67) : il n'est ni un compteur ni dérivé de l'heure, donc
 jamais réutilisé avec la même clé, et le blob stocké contient
 `nonce + ciphertext + tag` (l'étiquette GCM de 16 octets est déjà en fin de
-ciphertext). Deux chiffremens de la même valeur donnent donc deux blobs
+ciphertext). Deux chiffrements de la même valeur donnent donc deux blobs
 différents, et un blob copié sur un autre secret échoue à l'authentification
 (AAD différent). Le backend
 mémoire, réservé aux tests/développement, chiffre aussi son dictionnaire avec une
