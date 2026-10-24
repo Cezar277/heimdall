@@ -908,6 +908,57 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         self.assertEqual(seen.get("chunk_size"), _STREAM_CHUNK_SIZE)
         self.assertEqual(_STREAM_CHUNK_SIZE, 64 * 1024)
 
+    def test_streaming_response_with_giant_headers_rejected_without_reading_body(self) -> None:
+        """En-têtes de 2 Mo sans corps → rejet borné, corps jamais lu."""
+
+        class _GiantHeadersResponse:
+            status_code = HTTPStatus.OK
+            headers = {"x-pad": "y" * (2 * 1024 * 1024)}
+
+            def iter_bytes(self, chunk_size: int | None = None) -> object:
+                raise AssertionError("le corps ne doit pas être lu")
+
+            def close(self) -> None:
+                pass
+
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(httpx.Client, "send", return_value=_GiantHeadersResponse()):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("En-têtes", str(ctx.exception))
+
+    def test_streaming_response_with_too_many_headers_rejected(self) -> None:
+        """300 mini en-têtes → rejet par le plafond de nombre, sans lecture du corps."""
+
+        class _ManyHeadersResponse:
+            status_code = HTTPStatus.OK
+            headers = {f"x-h{i:04d}": "v" for i in range(300)}
+
+            def iter_bytes(self, chunk_size: int | None = None) -> object:
+                raise AssertionError("le corps ne doit pas être lu")
+
+            def close(self) -> None:
+                pass
+
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(httpx.Client, "send", return_value=_ManyHeadersResponse()):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("En-têtes", str(ctx.exception))
+
+    def test_resolve_api_key_survives_undeterminable_home(self) -> None:
+        """`HOME` indéterminé → `VaultClientError` (clé requise), jamais de traceback."""
+        with patch.dict(
+            os.environ,
+            {"HEIMDALL_API_KEY": "", "HEIMDALL_API_KEY_FILE": "", "XDG_CONFIG_HOME": ""},
+        ):
+            with patch.object(
+                Path, "home", side_effect=RuntimeError("Could not determine home")
+            ):
+                with self.assertRaises(VaultClientError) as ctx:
+                    resolve_api_key()
+                self.assertIn("Clé API", str(ctx.exception))
+
     def test_ca_cert_path_is_truncated_in_errors(self) -> None:
         """Le chemin --ca-cert n'est jamais recopié en entier (messages bornés)."""
         long_path = "A" * 200

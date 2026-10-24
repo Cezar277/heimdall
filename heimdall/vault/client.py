@@ -74,6 +74,11 @@ _GROUP_OTHER_PERMS_MASK: Final[int] = 0o077
 #: Taille des morceaux de lecture HTTP : aucun chunk alloué au-delà avant le
 #: contrôle du compteur (miroir de ``os.read(fd, MAX + 1)`` côté fichiers).
 _STREAM_CHUNK_SIZE: Final[int] = 64 * 1024
+#: Plafonds des en-têtes HTTP avant lecture du corps : httpx/h11 les
+#: bufferise intégralement avant ``iter_bytes`` — un Vault compromis ne doit
+#: pas faire piquer la mémoire via des en-têtes géants.
+_MAX_RESPONSE_HEADERS_BYTES: Final[int] = 64 * 1024
+_MAX_RESPONSE_HEADER_COUNT: Final[int] = 256
 #: Longueur maximale d'un extrait d'entrée recopié dans un message d'erreur
 #: (invariant 8 : messages bornés, jamais de valeur recopiée en entier).
 _PREVIEW_LEN: Final[int] = 32
@@ -162,14 +167,21 @@ def _key_from_env() -> str | None:
 
 
 def _find_key_file(key_file: Path | None) -> Path | None:
-    """Détermine le chemin du fichier de clé API."""
+    """Détermine le chemin du fichier de clé API.
+
+    ``HOME`` indéterminé → ``None`` (l'appelant lève l'erreur standard
+    « clé requise », qui devient ``Exit(2)`` en CLI — jamais de traceback).
+    """
     if key_file is not None:
         return key_file
     env_file = os.environ.get("HEIMDALL_API_KEY_FILE")
     if env_file is not None and env_file.strip():
         return Path(env_file.strip())
     xdg_config = os.environ.get("XDG_CONFIG_HOME")
-    config_dir = Path(xdg_config) if xdg_config else Path.home() / ".config"
+    try:
+        config_dir = Path(xdg_config) if xdg_config else Path.home() / ".config"
+    except (OSError, RuntimeError):
+        return None
     default_file = config_dir / "heimdall" / "vault.key"
     if default_file.exists():
         return default_file
@@ -441,15 +453,43 @@ def _validate_loopback_url(base_url: str) -> str:  # noqa: PLR0912
     return f"{parsed.scheme}://{pinned_authority}"
 
 
+def _measure_response_headers(headers: Any) -> tuple[int, int]:
+    """Compte les en-têtes et leurs octets (``httpx.Headers`` comme ``dict``).
+
+    Préfère ``.raw`` (octets exacts sur le fil, doublons comptés) quand
+    disponible, sinon ``.items()``. En-têtes illisibles → ``ValueError``
+    (l'appelant convertit en ``VaultClientError`` bornée, fail-closed).
+    """
+    raw = getattr(headers, "raw", None)
+    if raw is not None:
+        pairs = [(bytes(k), bytes(v)) for k, v in raw]
+        return len(pairs), sum(len(k) + len(v) for k, v in pairs)
+    items = getattr(headers, "items", None)
+    if items is None:
+        raise ValueError("en-têtes de réponse illisibles")
+    entries = list(items())
+    return len(entries), sum(len(str(k)) + len(str(v)) for k, v in entries)
+
+
 def _read_bounded_body(resp: Any, endpoint: str) -> bytes:
     """Lit un corps HTTP en streaming avec une borne stricte de 1 Mio.
 
-    ``Content-Length`` est vérifié avant lecture ; le compteur d'octets
-    effectivement reçus protège aussi contre un en-tête absent, mensonger ou
-    une réponse compressée qui se décompresserait au-delà de la limite. La
-    lecture se fait par morceaux de ``_STREAM_CHUNK_SIZE`` : aucun chunk
-    géant n'est alloué avant le contrôle du compteur.
+    Les en-têtes sont bornés d'abord (nombre + octets, httpx les bufferise
+    avant ``iter_bytes``) ; ``Content-Length`` est vérifié avant lecture ;
+    le compteur d'octets effectivement reçus protège aussi contre un en-tête
+    absent, mensonger ou une réponse compressée qui se décompresserait
+    au-delà de la limite. La lecture se fait par morceaux de
+    ``_STREAM_CHUNK_SIZE`` : aucun chunk géant n'est alloué avant le contrôle
+    du compteur.
     """
+    header_count, header_bytes = _measure_response_headers(resp.headers)
+    if header_count > _MAX_RESPONSE_HEADER_COUNT or header_bytes > _MAX_RESPONSE_HEADERS_BYTES:
+        raise VaultClientError(
+            f"En-têtes de réponse {endpoint} trop volumineux "
+            f"(bornes : {_MAX_RESPONSE_HEADER_COUNT} en-têtes / "
+            f"{_MAX_RESPONSE_HEADERS_BYTES} octets max)."
+        )
+
     content_length_header = resp.headers.get("content-length")
     if content_length_header:
         try:

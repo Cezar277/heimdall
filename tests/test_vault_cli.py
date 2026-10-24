@@ -12,11 +12,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from typer import Exit
 from typer.testing import CliRunner
 
 from heimdall.cli.main import app
 from heimdall.cli.main import app as cli_app
-from heimdall.cli.vault_client import RUN_CONTEXT_SETTINGS, vault_run
+from heimdall.cli.vault_client import RUN_CONTEXT_SETTINGS, _push_single_secret, vault_run
 from heimdall.cli.vault_keys import vault_app
 from heimdall.vault.atomic import check_file_mode_600, parse_env_file
 from heimdall.vault.client import (
@@ -651,6 +652,19 @@ class VaultPullCliTests(unittest.TestCase):
                         self.assertIn("modifiée", result.output)
                         mock_run.assert_not_called()
 
+    def test_push_single_secret_distinguishes_identifier_from_value_errors(self) -> None:
+        """`ValueError` client : message identifiant vs valeur, jamais la valeur reflétée."""
+        client = MagicMock()
+        client.create_secret.side_effect = ValueError("Identifiant de nom invalide")
+        with self.assertRaises(Exit) as ctx:
+            _push_single_secret(client, "demo", "dev", "bad-name", "val")
+        self.assertEqual(ctx.exception.exit_code, 2)
+
+        client.create_secret.side_effect = ValueError("Valeur de secret invalide")
+        with self.assertRaises(Exit) as ctx:
+            _push_single_secret(client, "demo", "dev", "GOOD_NAME", "x" * 70000)
+        self.assertEqual(ctx.exception.exit_code, 2)
+
     def test_pull_rejects_newline_in_secret_value(self) -> None:
         """Refus strict d'écrire un secret contenant un saut de ligne dans .env (§HIGH 2)."""
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
@@ -1040,6 +1054,33 @@ class VaultPullCliTests(unittest.TestCase):
                 )
                 self.assertEqual(result.exit_code, 0)
                 self.assertIn("indéterminé", result.output)
+
+    def test_pull_without_api_key_and_broken_home_exits_2_cleanly(self) -> None:
+        """`HOME` indéterminé + pas de clé → `Exit(2)` propre, pas de traceback."""
+        output_file = self.tmp_dir / ".env"
+        with patch.dict(
+            os.environ,
+            {"HEIMDALL_API_KEY": "", "HEIMDALL_API_KEY_FILE": "", "XDG_CONFIG_HOME": ""},
+        ):
+            with patch.object(
+                Path, "home", side_effect=RuntimeError("Could not determine home")
+            ):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "KEY",
+                        "--output",
+                        str(output_file),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 2)
+                self.assertIn("Erreur de configuration", result.output)
+                self.assertFalse(output_file.exists())
 
     def test_pull_warns_indeterminate_git_status_without_git_binary(self) -> None:
         """Sans binaire git : statut « indéterminé », jamais de silence."""

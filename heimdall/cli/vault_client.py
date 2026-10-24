@@ -383,13 +383,22 @@ def _push_single_secret(
         typer.echo(msg, err=True)
         raise typer.Exit(code=1) from None
     except ValueError:
-        # Validation locale du client (valeur vide ou > 65536 caractères).
-        # Le message est statique : la valeur n'est jamais reflétée.
-        typer.echo(
-            f"Erreur : valeur invalide pour le secret '{name}' "
-            "(1-65536 caractères requis).",
-            err=True,
-        )
+        # Validation locale du client : distinguer identifiant et valeur.
+        # L'identifiant a déjà été validé en amont (patterns CLI) : cette
+        # branche est de la défense en profondeur. La valeur n'est jamais
+        # reflétée (message statique, invariant 8).
+        if not _SECRET_NAME_PATTERN.match(name):
+            typer.echo(
+                f"Erreur : nom de secret invalide : {name[:32]!r} "
+                "(format requis : ^[A-Z][A-Z0-9_]{1,63}$).",
+                err=True,
+            )
+        else:
+            typer.echo(
+                f"Erreur : valeur invalide pour le secret '{name}' "
+                "(1-65536 caractères requis).",
+                err=True,
+            )
         raise typer.Exit(code=2) from None
     except VaultClientError as exc:
         typer.echo(f"Erreur lors de l'envoi de '{name}' : {exc}", err=True)
