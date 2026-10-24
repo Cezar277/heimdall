@@ -16,8 +16,13 @@ Invariants de sécurité :
   de chemins ne peuvent pas traverser hors du dépôt (refus des `..`, des
   liens symboliques et des chemins absolus via la garde centrale `_resolve_root`).
 - Anti-DDoS / Anti-ReDoS (CWE-400, CWE-1333) : la taille du fichier TOML
-  est plafonnée (64 Kio), le nombre de règles et de motifs est borné,
-  et les regex sont vérifiées contre toute alternance ou répétition imbriquée.
+  est plafonnée (64 Kio), le nombre de règles et de motifs est borné, les
+  regex subissent une analyse structurelle (imbrication réelle, alternance
+  sous quantificateur, quantificateurs consécutifs, références arrière) et
+  la valeur candidate soumise à une regex est bornée.
+- Anti-allowlist aveugle (CWE-1188) : un motif doit porter au moins
+  :data:`MIN_PATTERN_LITERALS` caractères littéraux et ne jamais matcher la
+  chaîne vide ; les motifs universels (`.`, `.*`, `^`, `^.*$`) sont refusés.
 - Fail-closed (REQ-SEC-07) : toute configuration invalide, corrompue,
   inconnue ou inaccessible lève ``ScanError`` (code 2), jamais un passage
   silencieux.
@@ -70,19 +75,36 @@ MAX_DESCRIPTION_LENGTH: Final[int] = 512
 #: Python reste libre de construire des règles de test explicites.
 MIN_KEYWORD_LENGTH: Final[int] = 3
 
+#: Nombre minimal de caractères littéraux dans un motif regex. En dessous,
+#: le motif est trop large pour être auditable : `.`, `.*`, `^`, `$`,
+#: `\w+`, `[a-z]+` ou `[^x]+` ne portent aucun marqueur concret et peuvent
+#: ignorer n'importe quel secret. Un motif doit contenir au moins trois
+#: caractères littéraux (hors classes, ancres et quantificateurs).
+MIN_PATTERN_LITERALS: Final[int] = 3
+
+#: Longueur maximale de la valeur candidate soumise à une regex. Au-delà,
+#: l'évaluation regex est **omise** (le candidat reste signalé) : c'est
+#: fail-closed, et cela borne l'exposition à un motif pathologique qui
+#: aurait échappé à l'analyse structurelle.
+MAX_REGEX_VALUE_LENGTH: Final[int] = 256
+
 #: Validation stricte de l'identifiant de règle (nom ASCII sécurisé).
 _RULE_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
 #: Détection rigoureuse de constructions regex à risque de backtracking catastrophique (CWE-1333).
-#: Interdit :
-#: 1. L'alternance sous quantificateur : `(a|b)+`, `(a|aa)+`, `(a|b)?`, `(a|b){2,}`
-#: 2. Les wildcards ou classes quantifiées sous quantificateur : `(.*a)+`, `(\w+)+`, `(a?)+`
-#: 3. La double quantification imbriquée : `(a+)+`, `(a?)+`
-#: 4. Les quantificateurs consécutifs : `a++`, `a**`, `a??`
-#: 5. Les quantificateurs lazy : `*?`, `+?`, `??`
-#: 6. Les quantificateurs répétés sur le même atome : `a*a*`, `a?a?`, `.*.*`
-#: 7. Les classes de caractères quantifiées consécutives : `\d+\d+`, `\w+\w+`, `\s?\s?`
-#: 8. Les classes entre crochets quantifiées consécutives : `[0-9]+[0-9]+`
+#: La fonction :func:`_reject_dangerous_regex` effectue une analyse structurelle
+#: (groupes, classes, échappements) qui couvre l'imbrication réelle, puis les
+#: motifs ci-dessous servent de seconde barrière pour les répétitions d'atomes.
+#: Sont interdits :
+#: 1. L'alternance sous quantificateur : `(a|b)+`, `((a|aa))+`, `(a|b)?`
+#: 2. Les wildcards ou classes quantifiées sous quantificateur : `(.*a)+`, `(\w+)+`
+#: 3. La double quantification imbriquée : `(a+)+`, `(a?)+`, `(?:(a|aa))+`
+#: 4. Les quantificateurs consécutifs : `a++`, `a**`, `a??`, `a*?`
+#: 5. Les quantificateurs répétés sur le même atome : `a*a*`, `a?a?`, `.*.*`
+#: 6. Les classes de caractères quantifiées consécutives : `\d+\d+`, `\w+\w+`
+#: 7. Les classes entre crochets quantifiées consécutives : `[0-9]+[0-9]+`
+#: 8. Les références arrière (`\1`, `(?P=nom)`) et les groupes conditionnels,
+#:    dont le coût de backtracking n'est pas borné linéairement.
 _QUANT: Final[str] = r"(?:[*+?]|\{\d+,?\d*\})\??"
 _REDOS_DANGEROUS_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\([^)]*\|[^)]*\)\s*" + _QUANT),
@@ -95,6 +117,255 @@ _REDOS_DANGEROUS_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
 )
 
 _CONFIG_ERROR: Final[str] = "configuration allowlist invalide"
+
+#: Drapeaux inline reconnus par `re` (hors `x`, refusé car il rend l'analyse
+#: statique des littéraux non fiable).
+_FLAG_CHARS: Final[frozenset[str]] = frozenset("aiLmsux-")
+
+
+def _skip_char_class(raw: str, start: int) -> int:
+    """Retourne l'index juste après une classe ``[...]`` fermée.
+
+    Gère l'échappement, le ``^`` de négation et le ``]`` littéral en première
+    position. Une classe non fermée est une configuration invalide.
+    """
+    i = start + 1
+    n = len(raw)
+    if i < n and raw[i] == "^":
+        i += 1
+    if i < n and raw[i] == "]":
+        i += 1
+    while i < n:
+        if raw[i] == "\\":
+            i += 2
+            continue
+        if raw[i] == "]":
+            return i + 1
+        i += 1
+    raise ScanError(_CONFIG_ERROR)
+
+
+def _group_content_start(  # noqa: PLR0911, PLR0912 - préfixes (?...) exhaustifs
+    raw: str,
+    open_index: int,
+) -> tuple[int, int | None]:
+    """Localise le contenu d'un groupe et refuse les constructions non analysables.
+
+    Retourne ``(content_start, skip_to)``. Un ``skip_to`` non nul signifie que
+    le groupe entier doit être ignoré (groupe de drapeaux sans contenu) : il ne
+    porte aucun motif à analyser.
+    """
+    if open_index + 1 >= len(raw) or raw[open_index + 1] != "?":
+        return open_index + 1, None
+
+    i = open_index + 2
+    if i >= len(raw):
+        return i, None
+    marker = raw[i]
+
+    if marker == "P":
+        if i + 1 < len(raw) and raw[i + 1] == "<":
+            end = raw.find(">", i + 2)
+            if end < 0:
+                raise ScanError(_CONFIG_ERROR)
+            return end + 1, None
+        if i + 1 < len(raw) and raw[i + 1] == "=":
+            # Référence arrière nommée : coût de backtracking non borné.
+            raise ScanError(_CONFIG_ERROR)
+        return i + 1, None
+
+    if marker == "#":
+        # Commentaire de motif : refusé, car il complique l'analyse statique.
+        raise ScanError(_CONFIG_ERROR)
+
+    if marker == "(":
+        # Groupe conditionnel (?(id)oui|non) : non supporté.
+        raise ScanError(_CONFIG_ERROR)
+
+    if marker in "=!":
+        return i + 1, None
+
+    if marker == "<" and i + 1 < len(raw) and raw[i + 1] in "=!":
+        return i + 2, None
+
+    if marker == ">":
+        # Groupe atomique : son contenu reste analysable normalement.
+        return i + 1, None
+
+    # (?drapeaux) ou (?drapeaux:...)
+    j = i
+    while j < len(raw) and raw[j] in _FLAG_CHARS:
+        if raw[j] in "xX":
+            # Mode verbose : espaces et `#` deviennent significatifs, l'analyse
+            # statique des littéraux ne serait plus fiable.
+            raise ScanError(_CONFIG_ERROR)
+        j += 1
+    if j < len(raw) and raw[j] == ":":
+        return j + 1, None
+    if j < len(raw) and raw[j] == ")":
+        return j + 1, j + 1
+    return i, None
+
+
+def _skip_quantifier(raw: str, start: int) -> int:
+    """Retourne l'index juste après un quantificateur ``*``, ``+``, ``?`` ou ``{m,n}``."""
+    if raw[start] in "*+?":
+        return start + 1
+    end = raw.find("}", start + 1)
+    if end < 0:
+        return start + 1
+    return end + 1
+
+
+def _body_is_unsafe(body: str) -> bool:
+    """Vrai si un corps de groupe contient une imbrication dangereuse.
+
+    Détecte une alternance, un quantificateur ou un groupe imbriqué hors
+    échappement et hors classe de caractères. Une imbrication sous
+    quantificateur est refusée par prudence : c'est le vecteur ReDoS
+    ``((a|aa))+$`` que les regex ``[^)]*`` ne voyaient pas.
+    """
+    i = 0
+    n = len(body)
+    while i < n:
+        char = body[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char == "[":
+            i = _skip_char_class(body, i)
+            continue
+        if char in "(|*+?{":
+            return True
+        i += 1
+    return False
+
+
+def _reject_dangerous_regex(raw: str) -> None:  # noqa: PLR0912 - automate explicite
+    """Analyse structurelle anti-ReDoS (CWE-1333).
+
+    Suit la pile des groupes, ignore échappements et classes, et refuse :
+    - un groupe quantifié dont le corps contient ``(``, ``|`` ou un
+      quantificateur (imbrication réelle, y compris ``((a|aa))+``) ;
+    - les quantificateurs consécutifs ou lazy (``a++``, ``a*?``) ;
+    - les références arrière (``\\1``) et constructions non supportées.
+    """
+    stack: list[int] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        char = raw[i]
+        if char == "\\":
+            if i + 1 < n and raw[i + 1] in "123456789":
+                raise ScanError(_CONFIG_ERROR)
+            i += 2
+            continue
+        if char == "[":
+            i = _skip_char_class(raw, i)
+            continue
+        if char == "(":
+            content_start, skip_to = _group_content_start(raw, i)
+            if skip_to is not None:
+                i = skip_to
+                continue
+            stack.append(content_start)
+            i = content_start
+            continue
+        if char == ")":
+            if not stack:
+                raise ScanError(_CONFIG_ERROR)
+            content_start = stack.pop()
+            next_index = i + 1
+            if next_index < n and raw[next_index] in "*+?{":
+                if _body_is_unsafe(raw[content_start:i]):
+                    raise ScanError(_CONFIG_ERROR)
+            i += 1
+            continue
+        if char in "*+?{":
+            next_index = _skip_quantifier(raw, i)
+            if next_index < n and raw[next_index] in "*+?{":
+                raise ScanError(_CONFIG_ERROR)
+            i = next_index
+            continue
+        i += 1
+    if stack:
+        raise ScanError(_CONFIG_ERROR)
+
+
+def _split_alternatives(raw: str) -> tuple[str, ...]:
+    """Découpe sur les ``|`` hors classes et échappements."""
+    parts: list[str] = []
+    start = 0
+    i = 0
+    n = len(raw)
+    while i < n:
+        char = raw[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char == "[":
+            i = _skip_char_class(raw, i)
+            continue
+        if char == "|":
+            parts.append(raw[start:i])
+            start = i + 1
+        i += 1
+    parts.append(raw[start:])
+    return tuple(parts)
+
+
+def _count_literal_chars(segment: str) -> int:
+    """Compte les caractères littéraux hors classes, ancres et quantificateurs.
+
+    Les classes (``[a-z]``), les ancres (``^``, ``$``, ``\\b``), les classes
+    abrégées (``\\w``, ``\\d``), les jokers (``.``) et les quantificateurs ne
+    comptent pas : ils ne constituent pas un marqueur auditable.
+    """
+    count = 0
+    i = 0
+    n = len(segment)
+    while i < n:
+        char = segment[i]
+        if char == "\\":
+            if i + 1 >= n:
+                break
+            escaped = segment[i + 1]
+            if escaped in "123456789":
+                raise ScanError(_CONFIG_ERROR)
+            if escaped in "dDwWsSbBAZz":
+                i += 2
+                continue
+            if escaped in "xXuU":
+                count += 1
+                i += 2
+                while i < n and segment[i] in "0123456789abcdefABCDEF":
+                    i += 1
+                continue
+            if escaped == "N" and i + 2 < n and segment[i + 2] == "{":
+                count += 1
+                end = segment.find("}", i + 3)
+                i = n if end < 0 else end + 1
+                continue
+            count += 1
+            i += 2
+            continue
+        if char == "[":
+            i = _skip_char_class(segment, i)
+            continue
+        if char == "(":
+            content_start, skip_to = _group_content_start(segment, i)
+            i = skip_to if skip_to is not None else content_start
+            continue
+        if char == "{":
+            end = segment.find("}", i + 1)
+            i = end + 1 if end >= 0 else i + 1
+            continue
+        if char in ")|^$.*+?":
+            i += 1
+            continue
+        count += 1
+        i += 1
+    return count
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +420,8 @@ class AllowlistRule:
     Une règle est constituée d'un nom unique, d'une description et d'au moins
     un critère sur la valeur du candidat parmi :
     - `keywords` : sous-chaînes/mots entiers sur la valeur du secret (ex. 'example', 'dummy')
-    - `patterns` : expressions régulières compilées linéaires sur la valeur
+    - `patterns` : expressions régulières compilées, non universelles et
+      porteuses d'au moins :data:`MIN_PATTERN_LITERALS` caractères littéraux
 
     Les critères de restriction facultatifs (en conjonction avec keywords/patterns) sont :
     - `paths` : motifs glob POSIX relatifs (évalués via `fnmatch`)
@@ -177,6 +449,28 @@ class AllowlistRule:
         if len(self.description) > MAX_DESCRIPTION_LENGTH:
             raise ScanError(_CONFIG_ERROR)
 
+        # Validation de type des critères. En particulier, une chaîne passée
+        # à `patterns` provoquerait un AttributeError dans `matches()` :
+        # l'API doit rester dans le contrat ScanError (invariant 11).
+        if not isinstance(self.patterns, (tuple, list)) or any(
+            not isinstance(pattern, re.Pattern)
+            or not isinstance(pattern.pattern, str)
+            for pattern in self.patterns
+        ):
+            raise ScanError(_CONFIG_ERROR)
+        if not isinstance(self.keywords, (tuple, list)) or any(
+            not isinstance(keyword, str) for keyword in self.keywords
+        ):
+            raise ScanError(_CONFIG_ERROR)
+        if not isinstance(self.paths, (tuple, list)) or any(
+            not isinstance(path, str) for path in self.paths
+        ):
+            raise ScanError(_CONFIG_ERROR)
+        if not isinstance(self.secret_types, (tuple, list)) or any(
+            not isinstance(secret_type, str) for secret_type in self.secret_types
+        ):
+            raise ScanError(_CONFIG_ERROR)
+
         # Invariant 1 / Sécurité : toute règle DOIT obligatoirement définir au moins
         # un critère sur la valeur (keywords ou patterns). Les filtres paths ou
         # secret_types ne peuvent JAMAIS constituer une règle aveugle à eux seuls.
@@ -195,6 +489,11 @@ class AllowlistRule:
 
         Important (sécurité) : les mots-clés et patterns ne sont vérifiés
         QUE sur `value` (le secret candidat).
+
+        Une valeur plus longue que :data:`MAX_REGEX_VALUE_LENGTH` n'est pas
+        soumise aux regex : le candidat reste signalé (fail-closed). Cela
+        borne l'exposition à un motif pathologique qui aurait échappé à
+        l'analyse structurelle.
         """
         # 1. Filtre par chemin (si spécifié) — moteur unique fnmatch documenté
         if self.paths:
@@ -214,9 +513,10 @@ class AllowlistRule:
             self.keywords
             and any(_keyword_matches_value(kw, value) for kw in self.keywords)
         )
-        pat_match = bool(
-            self.patterns and any(pattern.search(value) for pattern in self.patterns)
-        )
+        if self.patterns and len(value) <= MAX_REGEX_VALUE_LENGTH:
+            pat_match = any(pattern.search(value) for pattern in self.patterns)
+        else:
+            pat_match = False
         return kw_match or pat_match
 
 
@@ -367,20 +667,42 @@ def _validate_path_pattern(pattern: str) -> str:
 
 
 def _compile_safe_regex(raw: str) -> re.Pattern[str]:
-    """Compile une regex avec vérification anti-ReDoS élémentaire (CWE-1333)."""
+    """Compile une regex après analyse structurelle anti-ReDoS (CWE-1333).
+
+    Refuse aussi les motifs universels : une regex qui matche la chaîne vide
+    (donc toute valeur par un match de longueur nulle) ou dont une branche
+    d'alternance ne porte pas au moins :data:`MIN_PATTERN_LITERALS` caractères
+    littéraux est une allowlist aveugle.
+    """
     if not isinstance(raw, str) or not raw:
         raise ScanError(_CONFIG_ERROR)
     if len(raw) > MAX_PATTERN_LENGTH:
         raise ScanError(_CONFIG_ERROR)
     if "\x00" in raw:
         raise ScanError(_CONFIG_ERROR)
+
+    # 1. Analyse structurelle : imbrication réelle, quantificateurs, backrefs.
+    _reject_dangerous_regex(raw)
+    # 2. Seconde barrière pour les répétitions d'atomes connues.
     for dangerous in _REDOS_DANGEROUS_PATTERNS:
         if dangerous.search(raw):
             raise ScanError(_CONFIG_ERROR)
+
     try:
-        return re.compile(raw)
+        compiled = re.compile(raw)
     except re.error:
         raise ScanError(_CONFIG_ERROR) from None
+
+    # 3. Un match de longueur nulle sur "" vaut pour toute valeur en position 0.
+    if compiled.search(""):
+        raise ScanError(_CONFIG_ERROR)
+
+    # 4. Chaque branche d'alternance doit porter un marqueur littéral suffisant.
+    for branch in _split_alternatives(raw):
+        if _count_literal_chars(branch) < MIN_PATTERN_LITERALS:
+            raise ScanError(_CONFIG_ERROR)
+
+    return compiled
 
 
 _ALLOWED_RULE_KEYS: Final[frozenset[str]] = frozenset(
@@ -594,9 +916,11 @@ __all__ = [
     "MAX_CONFIG_BYTES",
     "MAX_DESCRIPTION_LENGTH",
     "MAX_PATTERN_LENGTH",
+    "MAX_REGEX_VALUE_LENGTH",
     "MAX_RULES",
     "MAX_RULE_NAME_LENGTH",
     "MIN_KEYWORD_LENGTH",
+    "MIN_PATTERN_LITERALS",
     "Allowlist",
     "AllowlistRule",
     "AllowlistTrace",

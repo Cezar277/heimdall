@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -39,8 +41,10 @@ from heimdall.scanner import allowlist as al_module
 from heimdall.scanner.allowlist import (
     MAX_CONFIG_BYTES,
     MAX_DESCRIPTION_LENGTH,
+    MAX_REGEX_VALUE_LENGTH,
     MAX_RULE_NAME_LENGTH,
     MIN_KEYWORD_LENGTH,
+    MIN_PATTERN_LITERALS,
     Allowlist,
     AllowlistRule,
     AllowlistTrace,
@@ -128,6 +132,22 @@ def test_allowlist_rule_validation() -> None:
     # Description vide
     with pytest.raises(ScanError):
         AllowlistRule(name="valid-name", description="", keywords=("k",))
+
+    # Patterns non compilés : ScanError, jamais AttributeError (invariant 11).
+    with pytest.raises(ScanError):
+        AllowlistRule(name="bad-pattern", description="desc", patterns=("x",))
+    with pytest.raises(ScanError):
+        AllowlistRule(
+            name="bytes-pattern",
+            description="desc",
+            patterns=(re.compile(b"x"),),
+        )
+
+    # Les autres critères sont également typés.
+    with pytest.raises(ScanError):
+        AllowlistRule(name="bad-keyword", description="desc", keywords=(1,))
+    with pytest.raises(ScanError):
+        AllowlistRule(name="bad-path", description="desc", keywords=("x",), paths=(1,))
 
 
 def test_allowlist_duplicate_rule_names_rejected() -> None:
@@ -1116,6 +1136,142 @@ def test_redos_dangerous_patterns_refused() -> None:
             _compile_safe_regex(pattern)
 
 
+def test_redos_nested_alternation_refused() -> None:
+    """Revue (MEDIUM) : l'imbrication réelle est refusée, pas seulement (a|aa)+.
+
+    Les regex `[^)]*` du premier filtre ne traversaient pas `)` : des motifs
+    comme `((a|aa))+$` passaient. L'analyse structurelle les refuse.
+    """
+    for pattern in (
+        r"((a|aa))+$",
+        r"(a|(b|c))+$",
+        r"(?:(a|aa))+$",
+        r"((a+))+$",
+        r"(?:(?:a|aa))+",
+        r"((ab|cd))+",
+    ):
+        with pytest.raises(ScanError):
+            _compile_safe_regex(pattern)
+
+
+def test_redos_nested_fuzz_is_bounded_in_time() -> None:
+    """Fuzz des imbrications ancrées : refus immédiat, jamais de `search` explosif."""
+    start = time.monotonic()
+    for prefix in ("", "^"):
+        for suffix in ("", "$"):
+            for body in (r"((a|aa))+", r"(a|(b|c))+", r"(?:(a|aa))+"):
+                with pytest.raises(ScanError):
+                    _compile_safe_regex(f"{prefix}{body}{suffix}")
+    # Un motif sûr reste linéaire sur la valeur piège utilisée par la revue.
+    safe = _compile_safe_regex(r"^AKIA[A-Z0-9]{16}$")
+    assert safe.search("a" * 30 + "!") is None
+    assert time.monotonic() - start < 2.0
+
+
+def test_universal_patterns_are_refused() -> None:
+    """Revue (MEDIUM) : `.`, `.*`, `^`, `^.*$` ne peuvent pas être une allowlist aveugle."""
+    # Les quatre motifs universels de la revue sont refusés via le TOML.
+    for pattern in (".", ".*", "^", "^.*$"):
+        with pytest.raises(ScanError):
+            parse_allowlist_toml(f"""
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "blind"
+description = "d"
+patterns = ["{pattern}"]
+""")
+
+    for pattern in (
+        ".",
+        ".*",
+        ".+",
+        "^",
+        "$",
+        "^.*$",
+        "^.+$",
+        r"\w+",
+        r"\d{16}",
+        "[a-z]+",
+        "[A-Z]{20}",
+        "[^x]+",
+        ".|AKIA",
+        "(?:.|AKIA)",
+    ):
+        with pytest.raises(ScanError):
+            _compile_safe_regex(pattern)
+
+    # Un motif spécifique ne doit jamais ignorer un secret réel qui ne le respecte pas.
+    rule = AllowlistRule(
+        name="specific-pattern",
+        description="d",
+        patterns=(_compile_safe_regex(r"^AKIA[A-Z0-9]{16}$"),),
+    )
+    al = Allowlist([rule])
+    assert (
+        al.evaluate(
+            value="AKIA" + "A" * 15 + "!",
+            file="app.py",
+            line=1,
+            secret_type="aws",
+        )
+        is None
+    )
+
+
+def test_specific_patterns_still_accepted() -> None:
+    """Les motifs porteurs de marqueurs littéraux restent acceptés."""
+    for pattern in (
+        r"^AKIA.*EXAMPLE$",
+        r"^ghp_[A-Za-z0-9]{36}$",
+        r"^sk-[A-Za-z0-9]{20}$",
+        r"\bAKIA[A-Z0-9]{16}\b",
+    ):
+        assert _compile_safe_regex(pattern) is not None
+
+
+def test_regex_value_length_cap_is_fail_closed() -> None:
+    """Une valeur trop longue n'est jamais ignorée par une regex (fail-closed)."""
+    rule = AllowlistRule(
+        name="long-value",
+        description="d",
+        patterns=(_compile_safe_regex(r"^AKIA.*EXAMPLE$"),),
+    )
+    assert rule.matches(
+        value="AKIA" + "A" * 10 + "EXAMPLE",
+        file_path="app.py",
+        line_number=1,
+        secret_type="aws",
+    )
+    long_value = "AKIA" + "A" * (MAX_REGEX_VALUE_LENGTH + 1) + "EXAMPLE"
+    assert not rule.matches(
+        value=long_value,
+        file_path="app.py",
+        line_number=1,
+        secret_type="aws",
+    )
+
+
+def test_cli_universal_pattern_config_exits_two(git_repo: GitRepo) -> None:
+    """Une config avec un motif universel échoue loud (code 2), jamais exit 0."""
+    git_repo.write(
+        "heimdall.toml",
+        """
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "blind"
+description = "d"
+patterns = ["."]
+""",
+    )
+    git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+    res = _run("scan", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+
+
 def test_example_substring_myexample_remains_detected() -> None:
     """Une valeur se terminant par 'example' (ex: myexample) reste détectée (Invariant 1)."""
     al = Allowlist.default()
@@ -1634,9 +1790,13 @@ def test_allowlist_exports_and_default_docstring() -> None:
     assert "MAX_RULE_NAME_LENGTH" in al_module.__all__
     assert "MAX_DESCRIPTION_LENGTH" in al_module.__all__
     assert "MIN_KEYWORD_LENGTH" in al_module.__all__
+    assert "MIN_PATTERN_LITERALS" in al_module.__all__
+    assert "MAX_REGEX_VALUE_LENGTH" in al_module.__all__
     assert MAX_RULE_NAME_LENGTH == 64
     assert MAX_DESCRIPTION_LENGTH == 512
     assert MIN_KEYWORD_LENGTH == 3
+    assert MIN_PATTERN_LITERALS == 3
+    assert MAX_REGEX_VALUE_LENGTH == 256
 
     # Allowlist.default() fournit les règles standards et possède une docstring explicite
     default_al = Allowlist.default()
