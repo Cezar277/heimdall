@@ -353,17 +353,23 @@ def _push_single_secret(
     env: str,
     name: str,
     value: str,
-) -> None:
-    """Envoie un secret unique au Vault et gère les erreurs contractuelles."""
+) -> bool:
+    """Envoie un secret unique au Vault et gère les erreurs contractuelles.
+
+    Retourne ``True`` si le secret a été créé, ``False`` s'il existait déjà
+    (409 : avertissement, non écrasé). Les autres erreurs sortent en `Exit`.
+    """
     try:
         client.create_secret(proj, env, name, value)
         typer.echo(f"Secret '{name}' poussé vers le Vault ({proj}/{env}) [statut: vaulte].")
+        return True
     except VaultConflictError:
         typer.echo(
             f"Avertissement : le secret '{name}' existe déjà dans le Vault ({proj}/{env}) "
             "(409 Conflict).",
             err=True,
         )
+        return False
     except VaultAuthError:
         typer.echo(
             "Erreur 401 : Authentification requise ou clé API invalide.",
@@ -420,7 +426,8 @@ def vault_push(  # noqa: PLR0913, PLR0917
     Codes de sortie : 0 si le fichier est vide sans filtre explicite, 2 si un
     ``--name`` fourni ne correspond à aucun secret (aucun envoi silencieux),
     1 si un ``--name`` fourni est de format invalide (refus franc, même
-    sévérité que 404).
+    sévérité que 404), 1 si aucun secret créé (tous déjà existants, 409 —
+    jamais de succès affiché sans création).
     """
     proj = _validate_project_and_env(project, env)
     _validate_requested_names(names)
@@ -442,11 +449,29 @@ def vault_push(  # noqa: PLR0913, PLR0917
         raise typer.Exit(code=2)
 
     client = _init_client(vault_url, ca_cert)
+    created = 0
+    skipped = 0
     with client:
         for name, value in to_push.items():
-            _push_single_secret(client, proj, env, name, value)
+            if _push_single_secret(client, proj, env, name, value):
+                created += 1
+            else:
+                skipped += 1
 
-    typer.echo(f"{len(to_push)} secret(s) traités pour le projet '{proj}' ({env}).")
+    if created == 0:
+        typer.echo(
+            f"Aucun secret créé : {skipped} déjà existant(s) dans le Vault "
+            f"({proj}/{env}), non écrasé(s) (409 Conflict).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if skipped:
+        typer.echo(
+            f"{created} secret(s) créé(s), {skipped} déjà existant(s) "
+            f"(409, non écrasé(s)) pour le projet '{proj}' ({env})."
+        )
+    else:
+        typer.echo(f"{len(to_push)} secret(s) traités pour le projet '{proj}' ({env}).")
 
 
 def _resolve_pull_names(

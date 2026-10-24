@@ -346,6 +346,23 @@ class VaultClientUnitTests(unittest.TestCase):
             self.assertEqual(ctx.exception.retry_after, 15)
             self.assertIn("15 secondes", str(ctx.exception))
 
+    def test_rate_limit_with_aberrant_retry_after_ignores_value(self) -> None:
+        """Retry-After négatif ou géant → ignoré, message sans valeur aberrante."""
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        for header_value in ("-5", "-1", "999999999"):
+            with self.subTest(header_value=header_value):
+                resp = httpx.Response(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    headers={"retry-after": header_value},
+                    request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
+                )
+                with patch.object(httpx.Client, "send", return_value=resp):
+                    with self.assertRaises(VaultRateLimitError) as ctx:
+                        client.health()
+                    self.assertIsNone(ctx.exception.retry_after)
+                    self.assertIn("Trop de requêtes", str(ctx.exception))
+                    self.assertNotIn(header_value, str(ctx.exception))
+
     def test_network_unavailable_error(self) -> None:
         """Une panne de communication réseau lève VaultUnavailableError."""
         client = VaultClient(_VALID_URL, _VALID_KEY)

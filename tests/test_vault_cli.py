@@ -1819,9 +1819,62 @@ class VaultRunCliTests(unittest.TestCase):
                         app,
                         ["vault", "push", "--project", "demo", "--file", str(dummy_env)],
                     )
-                    self.assertEqual(result.exit_code, 0)
+                    self.assertEqual(result.exit_code, 1)
                     self.assertIn("409 Conflict", result.output)
+                    self.assertIn("non écrasé", result.output)
                     self.assertNotIn("--force", result.output)
+                finally:
+                    if dummy_env.exists():
+                        dummy_env.unlink()
+
+    def test_push_all_conflict_exits_1_without_claiming_success(self) -> None:
+        """Tout-conflit → Exit(1), aucun message de succès affiché."""
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.create_secret.side_effect = VaultConflictError("Conflict")
+                mock_init.return_value = client_instance
+
+                dummy_env = Path(tempfile.mkdtemp()) / "allconflict.env"
+                dummy_env.write_text("AAA=1\nBBB=2\n", encoding="utf-8")
+                try:
+                    result = self.runner.invoke(
+                        app,
+                        ["vault", "push", "--project", "demo", "--file", str(dummy_env)],
+                    )
+                    self.assertEqual(result.exit_code, 1)
+                    self.assertIn("Aucun secret créé", result.output)
+                    self.assertNotIn("traité", result.output)
+                finally:
+                    if dummy_env.exists():
+                        dummy_env.unlink()
+
+    def test_push_mixed_created_and_conflict_reports_honest_counts(self) -> None:
+        """Partiel réel (1 créé + 1 conflit) → Exit(0) avec compteurs honnêtes."""
+
+        def fake_create(project: str, env: str, name: str, value: str) -> dict[str, str]:
+            if name == "TAKEN_VAR":
+                raise VaultConflictError("Conflict")
+            return {"project": project, "env": env, "name": name, "status": "vaulte"}
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.create_secret.side_effect = fake_create
+                mock_init.return_value = client_instance
+
+                dummy_env = Path(tempfile.mkdtemp()) / "mixed.env"
+                dummy_env.write_text("NEW_VAR=v\nTAKEN_VAR=w\n", encoding="utf-8")
+                try:
+                    result = self.runner.invoke(
+                        app,
+                        ["vault", "push", "--project", "demo", "--file", str(dummy_env)],
+                    )
+                    self.assertEqual(result.exit_code, 0)
+                    self.assertIn("1 secret(s) créé(s)", result.output)
+                    self.assertIn("1 déjà existant(s)", result.output)
                 finally:
                     if dummy_env.exists():
                         dummy_env.unlink()

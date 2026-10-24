@@ -74,6 +74,9 @@ _GROUP_OTHER_PERMS_MASK: Final[int] = 0o077
 #: Taille des morceaux de lecture HTTP : aucun chunk alloué au-delà avant le
 #: contrôle du compteur (miroir de ``os.read(fd, MAX + 1)`` côté fichiers).
 _STREAM_CHUNK_SIZE: Final[int] = 64 * 1024
+#: Plafond d'un `Retry-After` accepté pour l'affichage (pas de sleep côté
+#: client) : au-delà d'une heure ou négatif, la valeur réseau est ignorée.
+_MAX_RETRY_AFTER_SECONDS: Final[int] = 3600
 #: Plafonds des en-têtes HTTP avant lecture du corps. httpx 0.28.1 /
 #: httpcore / h11 n'exposent aucun plafond configurable sur les en-têtes
 #: (vérifié dans le venv : h11 bufferise jusqu'à fin des en-têtes sans
@@ -823,7 +826,11 @@ class VaultClient:
             try:
                 retry_after = int(resp.headers["retry-after"])
             except ValueError:
-                pass
+                retry_after = None
+            # Valeur réseau non fiable : hors borne 0..3600 → ignorée (pas de
+            # sleep côté client, message seul ; jamais de valeur aberrante).
+            if retry_after is None or not 0 <= retry_after <= _MAX_RETRY_AFTER_SECONDS:
+                retry_after = None
 
         if status == HTTPStatus.BAD_REQUEST:
             raise VaultClientError("Requête invalide auprès du Vault (400)")
