@@ -343,6 +343,13 @@ document si `count != len(findings)` (contrainte explicitée dans la
   signale, comme il le doit. Un job de CI sur ce dépôt devra donc traiter ces
   fixtures (allowlist, #24) — sinon il échouerait à chaque exécution. C'est un
   choix assumé : mieux vaut un faux positif visible qu'un secret caché.
+- **Zone de clémence `tests/` (allowlist, #24)** : avec un `heimdall.toml`
+  contenant la règle `test-fixtures`, toute valeur sous `tests/`,
+  `fixtures/` ou `support/` qui contient un marqueur délimité (`dummy`,
+  `fake`, `mock`…) est ignorée — y compris un mot de passe choisi comme
+  `my-dummy-key-12345`. C'est volontaire et documenté dans le fichier lui-même :
+  les répertoires de test ne doivent jamais contenir de vrais secrets. En CI
+  stricte (sans `heimdall.toml`, allowlist vide), tout y est signalé.
 - **Non-atomicité assumée du mode arbre (`working-tree`) vs atomicité stricte de `--staged`** :
   L'arbre de travail est un parcours direct du système de fichiers (`os.walk`), par nature
   **non atomique** (best-effort). Le re-contrôle final d'identité racine (`st_dev`, `st_ino`,

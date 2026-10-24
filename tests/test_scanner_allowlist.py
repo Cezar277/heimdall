@@ -450,6 +450,51 @@ def test_rule_test_fixtures_does_not_treat_underscore_as_separator() -> None:
         )
 
 
+def test_test_fixtures_leniency_zone_is_documented_and_pinned() -> None:
+    """Revue (MEDIUM) : zone de clémence `tests/` documentée et figée.
+
+    Sous `tests/` (et `fixtures/`, `support/`), TOUTE valeur contenant un
+    marqueur délimité est ignorée — y compris un mot de passe choisi comme
+    `my-dummy-key-12345` ou `prod-fake-token`. C'est volontaire et documenté
+    dans `heimdall.toml` : les répertoires de test ne doivent jamais contenir
+    de vrais secrets. Hors de ce périmètre, la même valeur reste détectée
+    (invariant 1 : doute → signalé).
+    """
+    al = _standard_test_allowlist()
+    for value in ("my-dummy-key-12345", "prod-fake-token"):
+        # Sous tests/ : ignoré (clémence documentée).
+        assert (
+            al.evaluate(
+                value=value,
+                file="tests/test_feature.py",
+                line=1,
+                secret_type="password",
+            )
+            == "test-fixtures"
+        )
+        # Hors tests/ : détecté (aucune règle globale ne le couvre).
+        assert (
+            al.evaluate(
+                value=value,
+                file="src/app.py",
+                line=1,
+                secret_type="password",
+            )
+            is None
+        )
+    # Marqueurs exacts globaux : ignorés partout, sans exception.
+    for value in ("changeme", "sample", "example", "dummy", "your_key_here"):
+        assert (
+            al.evaluate(
+                value=value,
+                file="src/app.py",
+                line=1,
+                secret_type="password",
+            )
+            is not None
+        )
+
+
 # --- 3. Piège à éviter (CWE-1188) : Pas d'allowlist aveugle de tests/ --------
 
 

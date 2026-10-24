@@ -46,6 +46,14 @@ description = "Fixtures et valeurs factices explicites dans les répertoires et 
 # Frontière \b stricte, y compris avec `paths` : `_` est un caractère de mot.
 # `fake_slack_token` ou `my_dummy_key` NE sont PAS ignorés (invariant 1) ;
 # utiliser une valeur exacte (`dummy`) ou un séparateur non-mot (`fake-token`).
+# ZONE DE CLÉMENCE DOCUMENTÉE : sous `tests/` (et `fixtures/`, `support/`),
+# TOUTE valeur contenant un marqueur délimité (`my-dummy-key-12345`,
+# `prod-fake-token`) est ignorée, y compris un mot de passe choisi qui
+# ressemblerait à une fixture. C'est volontaire : les répertoires de test
+# ne doivent jamais contenir de vrais secrets (aucun allowlist aveugle
+# hors de ce périmètre) ; en CI stricte (sans `heimdall.toml`, allowlist
+# vide) tout y est signalé. Ne pas élargir : ni `secret_types` global ni
+# `\b` hors `paths`.
 paths = ["tests/**", "fixtures/**", "**/fixtures/**", "support/**", "**/support/**"]
 keywords = [
   "fake",
