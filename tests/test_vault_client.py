@@ -37,6 +37,7 @@ from heimdall.vault.atomic import (
     write_file_atomic,
 )
 from heimdall.vault.client import (
+    _MAX_API_KEY_FILE_BYTES,
     _PROJECT_ID_PATTERN,
     _STREAM_CHUNK_SIZE,
     VaultAuthError,
@@ -374,6 +375,15 @@ class VaultConfigResolutionTests(unittest.TestCase):
         """Priorité à HEIMDALL_API_KEY si définie."""
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": "env_secret_key"}):
             self.assertEqual(resolve_api_key(), "env_secret_key")
+
+    def test_resolve_api_key_rejects_oversized_env_key(self) -> None:
+        """Clé env > 4096 o. refusée comme le fichier, jamais reflétée."""
+        giant_key = "K" * (_MAX_API_KEY_FILE_BYTES + 1)
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": giant_key}):
+            with self.assertRaises(VaultClientError) as ctx:
+                resolve_api_key()
+            self.assertIn("trop volumineuse", str(ctx.exception))
+            self.assertNotIn(giant_key, str(ctx.exception))
 
     def test_resolve_api_key_from_file_0600(self) -> None:
         """Lecture de la clé depuis un fichier avec permissions strictes 0600."""
@@ -942,6 +952,20 @@ class VaultAtomicOperationsTests(unittest.TestCase):
 
         client = VaultClient(_VALID_URL, _VALID_KEY)
         with patch.object(httpx.Client, "send", return_value=_ManyHeadersResponse()):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+            self.assertIn("En-têtes", str(ctx.exception))
+
+    def test_streaming_real_httpx_response_with_giant_headers_rejected(self) -> None:
+        """Vrai `httpx.Response` 2 Mo d'en-têtes → rejet via `.raw`, corps jamais lu."""
+        resp_giant_headers = httpx.Response(
+            HTTPStatus.OK,
+            headers={"x-pad": "y" * (2 * 1024 * 1024)},
+            content=b'{"status": "ok"}',
+            request=httpx.Request("GET", f"{_VALID_URL}/api/v1/health"),
+        )
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(httpx.Client, "send", return_value=resp_giant_headers):
             with self.assertRaises(VaultClientError) as ctx:
                 client.health()
             self.assertIn("En-têtes", str(ctx.exception))

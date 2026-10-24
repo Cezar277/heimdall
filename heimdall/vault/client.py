@@ -74,9 +74,11 @@ _GROUP_OTHER_PERMS_MASK: Final[int] = 0o077
 #: Taille des morceaux de lecture HTTP : aucun chunk alloué au-delà avant le
 #: contrôle du compteur (miroir de ``os.read(fd, MAX + 1)`` côté fichiers).
 _STREAM_CHUNK_SIZE: Final[int] = 64 * 1024
-#: Plafonds des en-têtes HTTP avant lecture du corps : httpx/h11 les
-#: bufferise intégralement avant ``iter_bytes`` — un Vault compromis ne doit
-#: pas faire piquer la mémoire via des en-têtes géants.
+#: Plafonds des en-têtes HTTP avant lecture du corps. httpx 0.28.1 /
+#: httpcore / h11 n'exposent aucun plafond configurable sur les en-têtes
+#: (vérifié dans le venv : h11 bufferise jusqu'à fin des en-têtes sans
+#: limite) : ce contrôle pré-corps est le point d'application, le buffering
+#: pair restant la borne ultime (best-effort, boucle locale uniquement).
 _MAX_RESPONSE_HEADERS_BYTES: Final[int] = 64 * 1024
 _MAX_RESPONSE_HEADER_COUNT: Final[int] = 256
 #: Longueur maximale d'un extrait d'entrée recopié dans un message d'erreur
@@ -255,6 +257,14 @@ def resolve_api_key(key_file: Path | None = None) -> str:
     """
     env_key = _key_from_env()
     if env_key is not None:
+        # Symétrique au fichier (4096 o.) : une variable d'opérateur n'a
+        # aucune raison de dépasser le plafond, et la clé part en en-tête
+        # vers le Vault. Message statique : la clé n'est jamais reflétée.
+        if len(env_key) > _MAX_API_KEY_FILE_BYTES:
+            raise VaultClientError(
+                "Clé API du Vault trop volumineuse "
+                f"(max {_MAX_API_KEY_FILE_BYTES} octets)."
+            )
         key = env_key
     else:
         candidate_path = _find_key_file(key_file)
@@ -457,13 +467,17 @@ def _measure_response_headers(headers: Any) -> tuple[int, int]:
     """Compte les en-têtes et leurs octets (``httpx.Headers`` comme ``dict``).
 
     Préfère ``.raw`` (octets exacts sur le fil, doublons comptés) quand
-    disponible, sinon ``.items()``. En-têtes illisibles → ``ValueError``
-    (l'appelant convertit en ``VaultClientError`` bornée, fail-closed).
+    disponible, sinon ``.items()``. Aucune copie transitoire : comptage en
+    générateur, jamais de liste dupliquée. En-têtes illisibles →
+    ``ValueError`` (l'appelant convertit en ``VaultClientError`` bornée,
+    fail-closed).
     """
     raw = getattr(headers, "raw", None)
     if raw is not None:
-        pairs = [(bytes(k), bytes(v)) for k, v in raw]
-        return len(pairs), sum(len(k) + len(v) for k, v in pairs)
+        total = 0
+        for k, v in raw:
+            total += len(k) + len(v)
+        return len(raw), total
     items = getattr(headers, "items", None)
     if items is None:
         raise ValueError("en-têtes de réponse illisibles")
@@ -474,8 +488,9 @@ def _measure_response_headers(headers: Any) -> tuple[int, int]:
 def _read_bounded_body(resp: Any, endpoint: str) -> bytes:
     """Lit un corps HTTP en streaming avec une borne stricte de 1 Mio.
 
-    Les en-têtes sont bornés d'abord (nombre + octets, httpx les bufferise
-    avant ``iter_bytes``) ; ``Content-Length`` est vérifié avant lecture ;
+    Les en-têtes sont bornés d'abord (nombre + octets, sans copie
+    transitoire ; borne ultime = buffering httpx/h11, voir constantes) ;
+    ``Content-Length`` est vérifié avant lecture ;
     le compteur d'octets effectivement reçus protège aussi contre un en-tête
     absent, mensonger ou une réponse compressée qui se décompresserait
     au-delà de la limite. La lecture se fait par morceaux de
