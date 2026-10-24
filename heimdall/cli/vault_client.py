@@ -183,6 +183,11 @@ _DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
 
 _MAX_ERROR_MSG_LEN: Final[int] = 150
 _TRUNCATE_MSG_LEN: Final[int] = 147
+#: Bornes anti-OOM locales de `pull`/`run` : nombre de secrets demandés et
+#: volume cumulé des valeurs (caractères). Symétriques des plafonds de réponse
+#: du client (1 Mio) et dimensionnées pour un `.env`/environnement raisonnable.
+_MAX_SECRETS_PER_PULL: Final[int] = 1024
+_MAX_TOTAL_SECRET_CHARS: Final[int] = 1_048_576
 
 #: Réglages Typer partagés par les deux voies `run` (canonique `heimdall run`
 #: + alias `heimdall vault run`) : source unique anti-divergence.
@@ -549,7 +554,7 @@ def _resolve_pull_names(
     raise typer.Exit(code=2)
 
 
-def _pull_secrets_from_vault(
+def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
     client: VaultClient,
     proj: str,
     env: str,
@@ -564,8 +569,23 @@ def _pull_secrets_from_vault(
     ``--name`` de format invalide sont déjà refusés par
     ``_validate_requested_names`` ; l'avertissement + saut sur format
     invalide ci-dessous ne couvre que les noms découverts via fichiers.
+
+    Deux bornes anti-OOM s'appliquent AVANT toute écriture/injection (et avant
+    même la première requête pour le nombre) : au plus
+    ``_MAX_SECRETS_PER_PULL`` noms, et au plus ``_MAX_TOTAL_SECRET_CHARS``
+    caractères cumulés. Un Vault compromis ne peut donc pas faire croître le
+    dict/``.env``/environnement enfant à plusieurs Go.
     """
+    if len(target_names) > _MAX_SECRETS_PER_PULL:
+        typer.echo(
+            "Erreur de sécurité : trop de secrets demandés "
+            f"({len(target_names)}, max {_MAX_SECRETS_PER_PULL}).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     retrieved: dict[str, str] = {}
+    total_chars = 0
     for name in target_names:
         if not _SECRET_NAME_PATTERN.match(name):
             typer.echo(
@@ -591,6 +611,14 @@ def _pull_secrets_from_vault(
             if "\x00" in val:
                 typer.echo(
                     f"Erreur de sécurité : le secret '{name}' contient un octet nul interdit.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            total_chars += len(val)
+            if total_chars > _MAX_TOTAL_SECRET_CHARS:
+                typer.echo(
+                    "Erreur de sécurité : volume cumulé des secrets trop important "
+                    f"(max {_MAX_TOTAL_SECRET_CHARS} caractères).",
                     err=True,
                 )
                 raise typer.Exit(code=1)
@@ -766,7 +794,24 @@ def _resolve_run_names(
     raise typer.Exit(code=2)
 
 
-def vault_run(  # noqa: PLR0912, PLR0913, PLR0917
+def _regular_file_identity(path: str) -> tuple[int, int] | None:
+    """Retourne ``(st_dev, st_ino)`` d'un fichier régulier, sinon ``None``.
+
+    Les liens symboliques du PATH (``/usr/bin/python3``...) sont suivis
+    volontairement : l'identité comparée est celle de la cible réellement
+    exécutée. Un remplacement à même chemin (rename/nouvel inode) ou un type
+    non régulier (FIFO, répertoire...) est ainsi détecté fail-closed.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return st.st_dev, st.st_ino
+
+
+def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
     ctx: typer.Context,
     project: str | None = _PROJECT_OPTION,
     env: str = _ENV_OPTION,
@@ -803,11 +848,17 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0917
         )
         raise typer.Exit(code=2)
 
-    # Résolution préalable de l'exécutable dans le PATH actuel sans influence de variables injectées
+    # Résolution préalable de l'exécutable dans le PATH actuel sans influence
+    # de variables injectées. L'identité (dev, ino) est figée avant le
+    # round-trip Vault : le chemin seul ne suffit pas, un remplacement à même
+    # chemin (rename) exécuterait sinon le binaire substitué avec les secrets.
     executable = shutil.which(cmd[0])
     if executable is None and not Path(cmd[0]).is_file():
         typer.echo(f"Erreur : commande introuvable : '{cmd[0]}'", err=True)
         raise typer.Exit(code=127)
+    executable_identity = (
+        _regular_file_identity(executable) if executable is not None else None
+    )
 
     proj = _validate_project_and_env(project, env)
     _validate_requested_names(names)
@@ -846,12 +897,29 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0917
         if not path_still_ok:
             typer.echo(f"Erreur : commande introuvable : '{cmd[0]}'", err=True)
             raise typer.Exit(code=127)
-    elif shutil.which(cmd[0]) != executable:
-        typer.echo(
-            "Erreur de sécurité : commande modifiée entre résolution et exécution.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+    else:
+        # `which` peut renvoyer la même chaîne alors que le fichier a été
+        # remplacé à même chemin : comparer l'identité (st_dev, st_ino) figée
+        # avant le fetch, et exiger un fichier régulier juste avant `exec`.
+        current_identity = _regular_file_identity(executable)
+        if (
+            executable_identity is None
+            or current_identity is None
+            or current_identity != executable_identity
+        ):
+            typer.echo(
+                "Erreur de sécurité : commande modifiée ou remplacée "
+                "entre résolution et exécution.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if shutil.which(cmd[0]) != executable:
+            typer.echo(
+                "Erreur de sécurité : commande modifiée ou remplacée "
+                "entre résolution et exécution.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
 
     try:
         proc = subprocess.run(target_cmd, env=child_env, check=False)  # noqa: S603  # nosec B603

@@ -7,6 +7,7 @@ ni argon2.
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -385,6 +386,89 @@ class VaultPullCliTests(unittest.TestCase):
                 )
                 self.assertNotIn("db_secret_pass", result.output)
 
+    def test_pull_rejects_too_many_names_before_fetch_or_write(self) -> None:
+        """Plus de 1024 noms → Exit(1) avant toute requête et sans .env partiel."""
+        output_file = self.tmp_dir / ".env"
+        names = [f"SECRET_{index:04d}" for index in range(1025)]
+        args = ["vault", "pull", "--project", "demo", "--output", str(output_file)]
+        for name in names:
+            args.extend(["--name", name])
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(app, args)
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("trop de secrets", result.output)
+        client_instance.get_secret.assert_not_called()
+        self.assertFalse(output_file.exists())
+
+    def test_pull_rejects_too_many_names_from_example_file_before_fetch(self) -> None:
+        """Gros `.env.example` (> 1024 noms) → Exit(1) avant fetch et sans .env."""
+        example_file = self.tmp_dir / ".env.example"
+        example_file.write_text(
+            "\n".join(f"S{index:05d}=" for index in range(65_536)) + "\n",
+            encoding="utf-8",
+        )
+        output_file = self.tmp_dir / ".env"
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--output",
+                        str(output_file),
+                        "--example-file",
+                        str(example_file),
+                    ],
+                )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("trop de secrets", result.output)
+        client_instance.get_secret.assert_not_called()
+        self.assertFalse(output_file.exists())
+
+    def test_pull_rejects_cumulative_secret_volume_before_write(self) -> None:
+        """17 valeurs de 64 Kio (> 1 Mio cumulé) → Exit(1), aucun .env partiel."""
+        output_file = self.tmp_dir / ".env"
+        names = [f"BIG_{index:02d}" for index in range(17)]
+        args = ["vault", "pull", "--project", "demo", "--output", str(output_file)]
+        for name in names:
+            args.extend(["--name", name])
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "BIG_00",
+                    "status": "actif",
+                    "value": "x" * 65_536,
+                }
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(app, args)
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("volume cumulé", result.output)
+        self.assertEqual(client_instance.get_secret.call_count, 17)
+        self.assertFalse(output_file.exists())
+
     def test_pull_creates_backup_when_env_already_exists(self) -> None:
         """Si un fichier .env existe déjà, un .bak est créé avec droits 0600."""
         output_file = self.tmp_dir / ".env"
@@ -749,6 +833,87 @@ class VaultPullCliTests(unittest.TestCase):
                         self.assertEqual(result.exit_code, 1)
                         self.assertIn("modifiée", result.output)
                         mock_run.assert_not_called()
+
+    def test_run_rejects_which_same_path_with_changed_inode(self) -> None:
+        """`which` renvoie la même chaîne mais l'inode change → refus, pas d'exec."""
+        real_stat = os.stat
+        calls = 0
+        first = os.stat_result((stat.S_IFREG | 0o755, 111, 222, 1, 0, 0, 0, 0, 0, 0))
+        second = os.stat_result((stat.S_IFREG | 0o755, 333, 444, 1, 0, 0, 0, 0, 0, 0))
+
+        def fake_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+            nonlocal calls
+            if str(path) == "/usr/bin/tool":
+                calls += 1
+                return first if calls == 1 else second
+            return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "SAFE_VAR",
+                    "status": "actif",
+                    "value": "secret_val",
+                }
+                mock_init.return_value = client_instance
+                with patch(
+                    "heimdall.cli.vault_client.shutil.which",
+                    return_value="/usr/bin/tool",
+                ):
+                    with patch(
+                        "heimdall.cli.vault_client.os.stat", side_effect=fake_stat
+                    ):
+                        with patch(
+                            "heimdall.cli.vault_client.subprocess.run"
+                        ) as mock_run:
+                            result = self.runner.invoke(
+                                app,
+                                [
+                                    "run",
+                                    "--project",
+                                    "demo",
+                                    "--name",
+                                    "SAFE_VAR",
+                                    "--",
+                                    "tool",
+                                    "--do",
+                                ],
+                            )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("modifiée", result.output)
+        self.assertEqual(calls, 2)
+        mock_run.assert_not_called()
+
+    def test_run_rejects_cumulative_secret_volume_before_exec(self) -> None:
+        """17 valeurs de 64 Kio en `run` → Exit(1), aucune exécution enfant."""
+        names = [f"BIG_{index:02d}" for index in range(17)]
+        args = ["run", "--project", "demo"]
+        for name in names:
+            args.extend(["--name", name])
+        args.extend(["--", "true"])
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "BIG_00",
+                    "status": "actif",
+                    "value": "x" * 65_536,
+                }
+                mock_init.return_value = client_instance
+                with patch("heimdall.cli.vault_client.subprocess.run") as mock_run:
+                    result = self.runner.invoke(app, args)
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("volume cumulé", result.output)
+        mock_run.assert_not_called()
 
     def test_push_single_secret_distinguishes_identifier_from_value_errors(self) -> None:
         """`ValueError` client : message identifiant vs valeur, jamais la valeur reflétée."""

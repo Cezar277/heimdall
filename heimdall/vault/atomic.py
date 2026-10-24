@@ -661,12 +661,16 @@ def parse_example_names(path: Path) -> list[str] | None:
     if content is None:
         return None
     names: list[str] = []
+    seen: set[str] = set()
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         key = line.partition("=")[0].strip()
-        if key and key not in names:
+        # Dédoublonnage O(1) : un .env.example d'1 Mio peut contenir ~200k
+        # noms ; `key not in names` (liste) était O(n²), DoS CPU local.
+        if key and key not in seen:
+            seen.add(key)
             names.append(key)
     return names
 

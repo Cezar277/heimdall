@@ -1039,6 +1039,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         DATABASE_URL=
         API_TOKEN=placeholder
         EMPTY_VAR=
+        API_TOKEN=duplicate
         """
         example_file = self.tmp_dir / ".env.example"
         example_file.write_text(content, encoding="utf-8")
