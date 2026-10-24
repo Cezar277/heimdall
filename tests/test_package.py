@@ -124,10 +124,15 @@ class PackageSmokeTests(unittest.TestCase):
 
     def test_vault_client_allows_loopback_https_only(self) -> None:
         """HIGH : tout hôte non local est rejeté (exfiltration impossible)."""
-        for base_url in ("https://127.0.0.1:8443", "https://[::1]:8443", "https://localhost:8443"):
+        for base_url in ("https://127.0.0.1:8443", "https://[::1]:8443"):
             with self.subTest(base_url=base_url):
                 client = heimdall.vault.client.VaultClient(base_url, "PLACEHOLDER")
                 self.assertEqual(client._base_url, base_url)
+        # localhost accepté mais épinglé vers l'IP à la construction
+        # (anti-rebinding) : jamais de nom d'hôte stocké dans _base_url.
+        pinned = heimdall.vault.client.VaultClient("https://localhost:8443", "PLACEHOLDER")
+        self.assertIn(pinned._base_url, ("https://127.0.0.1:8443", "https://[::1]:8443"))
+        self.assertNotIn("localhost", pinned._base_url)
         for base_url in (
             "https://evil.example",
             "https://127.0.0.1.evil.example",
