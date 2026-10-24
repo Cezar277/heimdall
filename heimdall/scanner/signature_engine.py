@@ -27,7 +27,7 @@ from heimdall.scanner.entropy_detection import (
     DEFAULT_ENTROPY_CONFIG,
     EntropyConfig,
     check_multiline_overflow,
-    find_entropy_matches,
+    find_line_matches,
 )
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
@@ -120,6 +120,7 @@ class SignatureEngine:
         # brute n'y entre jamais : elle est hachée à la volée puis oubliée.
         seen: set[tuple[int, str, str]] = set()
         lines = cible.lignes()
+        preceding: tuple[SignatureMatch, ...] = ()
         for index, (line_number, line) in enumerate(lines):
             # Contrôle périodique intra-cible (cf. `deadline`) : sans lui, la
             # deadline `--staged` n'est vue qu'après la fin du blob.
@@ -129,31 +130,21 @@ class SignatureEngine:
                 and time.monotonic() > self._deadline
             ):
                 raise ScanError(_DEADLINE_ERROR)
-            previous = self._joined_window(lines[index - 1][1], lines, index - 1) if index else None
-            preceding = (
-                ()
-                if previous is None
-                else tuple(
-                    match
-                    for match in find_signature_matches(previous[0])
-                    if match.start < previous[1]
-                )
-            )
-            for match in find_entropy_matches(
+            for match in find_line_matches(
                 line, self._entropy_config, preceding, deadline=self._deadline
             ):
                 self._append(findings, seen, match, line_number, cible.path)
-            for match in find_signature_matches(line):
-                self._append(findings, seen, match, line_number, cible.path)
             following = self._joined_window(line, lines, index)
             if following is None:
+                preceding = ()
                 continue
             joined, limit = following
-            for match in find_signature_matches(joined):
-                # Une correspondance qui commence après la jonction appartient
-                # à la ligne suivante : elle y sera déjà signalée.
-                if match.start >= limit:
-                    continue
+            # Réutilisé pour dédupliquer l'entropie de la ligne suivante :
+            # une fenêtre contiguë n'est jamais analysée une seconde fois.
+            preceding = tuple(
+                match for match in find_signature_matches(joined) if match.start < limit
+            )
+            for match in preceding:
                 self._append(findings, seen, match, line_number, cible.path)
         return findings
 

@@ -101,18 +101,13 @@ def _hex_matches(
             )
 
 
-def find_entropy_matches(
+def _prepare_line(
     line: str,
-    config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
-    preceding_matches: tuple[SignatureMatch, ...] = (),
-    *,
-    deadline: float | None = None,
-) -> Iterator[SignatureMatch]:
-    """Candidats internes, sans filtre digest/UUID/data URI contrôlable.
-
-    Un jeton > 4096 caractères refuse le scan ; aucun fragment n'est ignoré.
-    Une signature reconnue conserve la priorité sur son signal entropie.
-    """
+    config: EntropyConfig,
+    preceding_matches: tuple[SignatureMatch, ...],
+    deadline: float | None,
+) -> tuple[list[re.Match[str]], tuple[SignatureMatch, ...]]:
+    """Valide et borne les jetons avant un unique appel aux signatures."""
     _validate_input(line, config, deadline)
     if not isinstance(preceding_matches, tuple) or any(
         not isinstance(match, SignatureMatch) for match in preceding_matches
@@ -129,8 +124,16 @@ def find_entropy_matches(
         if token.end() - token.start() >= config.min_length
     ]
     if not tokens:
-        return
-    signatures = find_signature_matches(line) + preceding_matches
+        return tokens, ()
+    return tokens, find_signature_matches(line)
+
+
+def _entropy_matches(
+    tokens: list[re.Match[str]],
+    config: EntropyConfig,
+    signatures: tuple[SignatureMatch, ...],
+    deadline: float | None,
+) -> Iterator[SignatureMatch]:
     for token in tokens:
         if deadline is not None and time.monotonic() > deadline:
             raise ScanError(_SCAN_ERROR)
@@ -153,6 +156,40 @@ def find_entropy_matches(
                 token.start(),
                 source="entropy",
             )
+
+
+def find_entropy_matches(
+    line: str,
+    config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
+    preceding_matches: tuple[SignatureMatch, ...] = (),
+    *,
+    deadline: float | None = None,
+) -> Iterator[SignatureMatch]:
+    """Candidats entropie internes ; valeurs brutes à ne pas journaliser."""
+    tokens, signatures = _prepare_line(line, config, preceding_matches, deadline)
+    yield from _entropy_matches(tokens, config, signatures + preceding_matches, deadline)
+
+
+def find_line_matches(
+    line: str,
+    config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
+    preceding_matches: tuple[SignatureMatch, ...] = (),
+    *,
+    deadline: float | None = None,
+) -> Iterator[SignatureMatch]:
+    """Entropie puis signatures, calculées une seule fois pour cette ligne.
+
+    Surface interne sensible : les moteurs hachent les valeurs immédiatement.
+    Le préflight borné précède toujours les signatures, même sans candidat
+    entropie ; la deadline est revérifiée après les signatures.
+    """
+    tokens, signatures = _prepare_line(line, config, preceding_matches, deadline)
+    if not tokens:
+        signatures = find_signature_matches(line)
+        if deadline is not None and time.monotonic() > deadline:
+            raise ScanError(_SCAN_ERROR)
+    yield from _entropy_matches(tokens, config, signatures + preceding_matches, deadline)
+    yield from signatures
 
 
 def check_multiline_overflow(

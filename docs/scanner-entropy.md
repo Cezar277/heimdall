@@ -25,11 +25,19 @@ signatures et le calcul Shannon, y compris une longue charge JWT. La lecture
 reste bornée à 1 Mio et la deadline est contrôlée à l'intérieur des lignes,
 par jeton. Cette limite refuse explicitement le scan au lieu de sauter la valeur.
 La collecte lexicale n'effectue qu'un parcours et ne retient que les jetons
-assez longs pour être candidats. Dans le détecteur d'entropie, une ligne de
-micro-jetons n'appelle donc ni les signatures ni Shannon ; une échéance déjà
-expirée est refusée avant tout parcours. Les candidats retenus restent
-revérifiés contre la deadline après la phase de signatures. Cette optimisation
-n'ajoute pas d'interruption à l'intérieur des regex de signatures existantes.
+assez longs pour être candidats. L'API interne `find_entropy_matches` seule
+n'appelle ni les signatures ni Shannon pour une ligne de micro-jetons.
+Les deux moteurs utilisent `find_line_matches` : un même résultat de signatures
+est partagé entre la déduplication de l'entropie et les Findings regex.
+Chaque ligne courante n'est donc analysée qu'une fois par les signatures,
+même sans candidat entropie. Chaque fenêtre de deux lignes contiguës est
+également analysée une fois, puis son résultat est réutilisé pour dédupliquer
+l'entropie de la ligne suivante. Les valeurs brutes de ce cache temporaire
+restent internes au scan de la cible et ne sont ni rendues ni journalisées.
+Une échéance déjà expirée est refusée avant tout parcours ; elle est
+revérifiée après les signatures, y compris sans candidat entropie. Ces
+contrôles n'ajoutent pas d'interruption à l'intérieur des regex de signatures
+existantes ; les bornes de lecture et de fenêtre restent appliquées.
 Les lignes arbitraires ne sont pas concaténées pour augmenter leur entropie.
 
 ```python

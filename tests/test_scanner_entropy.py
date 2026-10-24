@@ -13,7 +13,11 @@ import heimdall.scanner.signatures as registry
 from heimdall.scanner import DiffTarget, EntropyConfig, FileTarget, Finding, Scanner
 from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.entropy import shannon_entropy
-from heimdall.scanner.entropy_detection import check_multiline_overflow, find_entropy_matches
+from heimdall.scanner.entropy_detection import (
+    check_multiline_overflow,
+    find_entropy_matches,
+    find_line_matches,
+)
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.signature_engine import SignatureEngine
@@ -229,19 +233,21 @@ def test_multiline_overflow_is_not_provider_specific(tmp_path: Path, label: str)
     "line,config",
     [(None, EntropyConfig()), (b"abc", EntropyConfig()), ("abc", None), ("abc", object())],
 )
-def test_direct_function_rejects_invalid_inputs(line: object, config: object) -> None:
+@pytest.mark.parametrize("detector", [find_entropy_matches, find_line_matches])
+def test_direct_function_rejects_invalid_inputs(line: object, config: object, detector) -> None:
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
-        tuple(find_entropy_matches(line, config))
+        tuple(detector(line, config))
 
 
-def test_oversized_token_refuses_before_shannon_or_signature_work(monkeypatch) -> None:
+@pytest.mark.parametrize("detector", [find_entropy_matches, find_line_matches])
+def test_oversized_token_refuses_before_shannon_or_signature_work(monkeypatch, detector) -> None:
     def forbidden(*args):
         pytest.fail("unbounded token reached signature matching or Shannon")
 
     monkeypatch.setattr("heimdall.scanner.entropy_detection.shannon_entropy", forbidden)
     monkeypatch.setattr("heimdall.scanner.entropy_detection.find_signature_matches", forbidden)
     with pytest.raises(ScanError):
-        tuple(find_entropy_matches("a" * 1_048_576))
+        tuple(detector("a" * 1_048_576))
 
 
 def test_deadline_is_checked_inside_a_line(monkeypatch) -> None:
@@ -315,9 +321,10 @@ def test_removed_context_surface_cannot_expose_cleartext() -> None:
 
 
 @pytest.mark.parametrize("preceding", ["evil", ["x"], ("x",), (object(),), None])
-def test_direct_function_rejects_invalid_preceding_matches(preceding: object) -> None:
+@pytest.mark.parametrize("detector", [find_entropy_matches, find_line_matches])
+def test_direct_function_rejects_invalid_preceding_matches(preceding: object, detector) -> None:
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
-        tuple(find_entropy_matches("abc", preceding_matches=preceding))
+        tuple(detector("abc", preceding_matches=preceding))
 
 
 @pytest.mark.parametrize(
@@ -333,9 +340,10 @@ def test_direct_function_rejects_invalid_preceding_matches(preceding: object) ->
         pytest.param(10**400, id="oversized-integer"),
     ],
 )
-def test_direct_functions_reject_invalid_deadlines(deadline: object) -> None:
+@pytest.mark.parametrize("detector", [find_entropy_matches, find_line_matches])
+def test_direct_functions_reject_invalid_deadlines(deadline: object, detector) -> None:
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
-        tuple(find_entropy_matches("abc", deadline=deadline))
+        tuple(detector("abc", deadline=deadline))
     # No token or delimiter: validation must precede every early return.
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
         check_multiline_overflow("", "", deadline=deadline)
@@ -434,6 +442,55 @@ def test_expired_deadline_rejects_dense_line_before_any_work(tmp_path: Path, mon
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
         tuple(find_entropy_matches(text, deadline=0.0))
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        tuple(find_line_matches(text, deadline=0.0))
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
         TreeScanner(tmp_path, hasher=hasher).scan(deadline=0.0)
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
         SignatureEngine(hasher, deadline=0.0).analyser(FileTarget("config.py", text))
+
+
+@pytest.mark.parametrize("engine", ["tree", "target"])
+def test_signature_results_are_reused_for_lines_and_adjacent_windows(
+    tmp_path: Path, monkeypatch, engine
+):
+    calls = []
+    original = registry.find_signature_matches
+
+    def counted(line):
+        calls.append(line)
+        return original(line)
+
+    for path in (
+        "heimdall.scanner.entropy_detection.find_signature_matches",
+        "heimdall.scanner.detect.find_signature_matches",
+        "heimdall.scanner.signature_engine.find_signature_matches",
+    ):
+        monkeypatch.setattr(path, counted)
+    lines = ["aws_secret_access_key =", '"' + synthetic_value("hex")[:40] + '"', "benign"]
+    text = "\n".join(lines)
+    hasher = SnippetHasher(key=b"T" * 32)
+    (tmp_path / "config.py").write_text(text)
+    findings = (
+        TreeScanner(tmp_path, hasher=hasher).scan()
+        if engine == "tree"
+        else SignatureEngine(hasher).analyser(FileTarget("config.py", text))
+    )
+    assert [(f.line, f.type, f.source) for f in findings] == [(1, "aws", "regex")]
+    assert calls == [lines[0], lines[0] + lines[1], lines[1], lines[1] + lines[2], lines[2]]
+
+
+def test_dense_line_checks_deadline_after_its_single_signature_scan(monkeypatch) -> None:
+    now = 0.0
+    signature_calls = 0
+
+    def signatures(line):
+        nonlocal now, signature_calls
+        signature_calls += 1
+        now = 2.0
+        return ()
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(module, "find_signature_matches", signatures)
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        tuple(find_line_matches("a " * 500_000, deadline=1.0))
+    assert signature_calls == 1

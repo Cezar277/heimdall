@@ -40,7 +40,7 @@ from heimdall.scanner.entropy_detection import (
     DEFAULT_ENTROPY_CONFIG,
     EntropyConfig,
     check_multiline_overflow,
-    find_entropy_matches,
+    find_line_matches,
 )
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import (
@@ -416,6 +416,7 @@ class Scanner:
         # identique, déjà émise sur la même ligne, est dédupliquée.
         seen: set[tuple[int, str, str]] = set()
         lines = text.splitlines()
+        preceding: tuple[SignatureMatch, ...] = ()
         for index, line in enumerate(lines):
             # Contrôle périodique **intra-fichier** : un seul fichier de
             # 1 Mio dense (beaucoup de lignes ou de matches) ne doit pas
@@ -423,43 +424,20 @@ class Scanner:
             if index % 256 == 0 and deadline is not None and time.monotonic() > deadline:
                 raise ScanError(_SCAN_ERROR)
             line_number = index + 1
-            previous = (
-                self._joined_window(lines[index - 1], lines, index - 1, deadline=deadline)
-                if index
-                else None
-            )
-            preceding = (
-                ()
-                if previous is None
-                else tuple(
-                    match
-                    for match in find_signature_matches(previous[0])
-                    if match.start < previous[1]
-                )
-            )
-            for match in find_entropy_matches(
+            for match in find_line_matches(
                 line, self._entropy_config, preceding, deadline=deadline
             ):
                 self._append(findings, seen, match, line_number, relative, deadline=deadline)
-            for match in find_signature_matches(line):
-                self._append(
-                    findings,
-                    seen,
-                    match,
-                    line_number,
-                    relative,
-                    deadline=deadline,
-                )
             following = self._joined_window(line, lines, index, deadline=deadline)
             if following is None:
+                preceding = ()
                 continue
             joined, limit = following
-            for match in find_signature_matches(joined):
-                # Seule une correspondance qui commence dans la ligne courante
-                # est retenue : une valeur située après la jonction appartient
-                # à la ligne suivante et y est déjà signalée.
-                if match.start >= limit:
-                    continue
+            # La fenêtre sert aussi à la déduplication de la ligne suivante.
+            preceding = tuple(
+                match for match in find_signature_matches(joined) if match.start < limit
+            )
+            for match in preceding:
                 self._append(
                     findings,
                     seen,
