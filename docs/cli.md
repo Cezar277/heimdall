@@ -48,6 +48,16 @@ clé racine inconnue (`[tool.foo]`, faute de frappe), tout type incorrect ou
 tout mot-clé trop court est une erreur d'outillage (code 2), jamais un
 passage silencieux.
 
+Les `patterns` ne peuvent pas rendre l'allowlist aveugle : via TOML, chaque
+chaîne est compilée puis validée ; via l'API Python, seules des expressions
+déjà compilées sont acceptées. Un motif qui matche la chaîne vide (`.`, `.*`,
+`^`, `^.*$`…) est refusé, et chaque branche d'alternance doit porter au moins
+3 caractères littéraux. Les constructions à backtracking non borné
+(alternance ou groupe imbriqué sous quantificateur, quantificateurs
+consécutifs, références arrière) sont refusées en `ScanError` (code 2). Une
+valeur candidate de plus de 256 caractères n'est pas soumise aux regex :
+elle reste signalée (fail-closed), ce qui borne l'exposition résiduelle.
+
 `CHEMIN` vaut `.` par défaut. Il doit être la **racine** d'un dépôt git,
 dans les deux périmètres (sinon : erreur, code 2) : hors dépôt —
 répertoire quelconque, fichier isolé — il n'y a pas de verdict « propre »,
