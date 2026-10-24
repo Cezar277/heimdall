@@ -114,7 +114,7 @@ class AllowlistTrace:
         return {"rule": self.rule, "file": self.file, "line": self.line}
 
 
-def _keyword_matches_value(kw: str, value: str, has_paths: bool = False) -> bool:
+def _keyword_matches_value(kw: str, value: str) -> bool:
     """Vérifie si un mot-clé correspond à la valeur du secret (Invariant 1).
 
     Pour éviter tout faux négatif sur un secret réel de production contenant
@@ -122,22 +122,17 @@ def _keyword_matches_value(kw: str, value: str, has_paths: bool = False) -> bool
     'prod_fake_token_123', ou 'myexample'), la correspondance exige :
     - Soit l'égalité exacte insensible à la casse (ex: 'changeme', 'your_key_here')
     - Soit une frontière de mot complète '\\b' (ex: '\\bdummy\\b', '\\bfake\\b', 'admin:changeme')
-    - Pour les règles délimitées à un chemin (has_paths=True, ex: tests/**), les frontières
-      délimitées par les séparateurs de code classiques ([^a-zA-Z0-9]|^/$) comme 'fake_slack_token'
-      ou 'my_dummy_key' sont acceptées, tout en rejetant strictement les inclusions partielles
-      sans séparateur (ex: 'profake', 'latest', 'myexample' restent signalés).
+
+    La frontière est **stricte dans tous les cas**, y compris pour une règle
+    restreinte par chemin (`tests/**`). `_` est un caractère de mot pour
+    `\\b` : 'fake_slack_token' ou 'my_dummy_key' ne sont donc PAS des fixtures
+    et restent signalés. Un séparateur non-mot ('fake-token') ou une valeur
+    exacte ('dummy') reste reconnu. Ce choix privilégie l'invariant 1
+    (doute → signalé) sur la disponibilité d'une allowlist de tests.
     """
     kw_cf = kw.casefold()
     val_cf = value.casefold()
-    if val_cf == kw_cf:
-        return True
-    if re.search(rf"\b{re.escape(kw_cf)}\b", val_cf):
-        return True
-    if has_paths and re.search(
-        rf"(?:[^a-zA-Z0-9]|^){re.escape(kw_cf)}(?:[^a-zA-Z0-9]|$)", val_cf
-    ):
-        return True
-    return False
+    return val_cf == kw_cf or re.search(rf"\b{re.escape(kw_cf)}\b", val_cf) is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +147,10 @@ class AllowlistRule:
     Les critères de restriction facultatifs (en conjonction avec keywords/patterns) sont :
     - `paths` : motifs glob POSIX relatifs (évalués via `fnmatch`)
     - `secret_types` : types de secrets restreints (ex. 'aws', 'stripe')
+
+    Les mots-clés sont toujours comparés avec une frontière `\\b` stricte :
+    `paths` ne transforme jamais `_` en séparateur (voir
+    :func:`_keyword_matches_value`).
     """
 
     name: str
@@ -204,13 +203,9 @@ class AllowlistRule:
             return False
 
         # 3. Filtre par keywords et patterns — SUR VALUE UNIQUEMENT avec frontières de mots
-        has_paths = bool(self.paths)
         kw_match = bool(
             self.keywords
-            and any(
-                _keyword_matches_value(kw, value, has_paths=has_paths)
-                for kw in self.keywords
-            )
+            and any(_keyword_matches_value(kw, value) for kw in self.keywords)
         )
         pat_match = bool(
             self.patterns and any(pattern.search(value) for pattern in self.patterns)
@@ -326,7 +321,10 @@ def create_default_rules() -> tuple[AllowlistRule, ...]:
         ),
         AllowlistRule(
             name="test-fixtures",
-            description="Valeurs factices et fixtures délimitées dans les tests",
+            description=(
+                "Valeurs factices et fixtures délimitées dans les tests "
+                "(frontière \\b stricte : 'fake_slack_token' reste signalé)"
+            ),
             paths=("tests/**", "fixtures/**", "**/fixtures/**", "support/**", "**/support/**"),
             keywords=(
                 "fake",

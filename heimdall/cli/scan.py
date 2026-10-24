@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import time
 import unicodedata
 from collections.abc import Sequence
@@ -43,13 +45,18 @@ from typing import Final, Literal
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GIT_TIMEOUT_SECONDS, GitAccess
-from heimdall.scanner.allowlist import Allowlist, AllowlistTrace, load_allowlist
+from heimdall.scanner.allowlist import (
+    MAX_CONFIG_BYTES,
+    Allowlist,
+    AllowlistTrace,
+    load_allowlist,
+)
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding
-from heimdall.scanner.interface import FileTarget, _resolve_root
+from heimdall.scanner.interface import FileTarget, _open_flags, _resolve_root
 from heimdall.scanner.interface import Scanner as TargetScanner
 from heimdall.scanner.signature_engine import SignatureEngine
 
@@ -190,110 +197,72 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
         raise ScanError(_MSG_ROOT_CHANGED)
 
 
-_INDEX_HDR_LEN: Final[int] = 12
-_INDEX_ENTRY_PREFIX_LEN: Final[int] = 22
-_INDEX_V3_MIN: Final[int] = 3
+def _read_worktree_file(path: Path) -> bytes | None:
+    """Lit un fichier du worktree via la garde unique, sans suivre de lien.
 
-
-def _read_index_entry_sha(index_bytes: bytes, rel_path: str) -> str | None:
-    """Extrait le SHA hexadécimal d'un fichier suivi dans l'index Git binaire (DIRC).
-
-    Lit directement le format d'index Git sans appel de sous-processus afin de respecter
-    strictement les invariants de confinement d'exécution et d'isolation réseau.
-    Supporte les formats d'index Git version 2 et 3 (avec SHA-1 ou SHA-256).
+    Retourne ``None`` au moindre doute : chemin non résoluble, lien
+    symbolique, non-régulier, trop gros ou lecture incomplète. La taille est
+    bornée par :data:`MAX_CONFIG_BYTES` (ce helper ne sert qu'à la config).
     """
-    if len(index_bytes) < _INDEX_HDR_LEN or index_bytes[:4] != b"DIRC":
+    try:
+        resolved = _resolve_root(path)
+        # O_NONBLOCK évite qu'un FIFO placé à la place du fichier ne bloque
+        # l'ouverture ; le fstat ci-dessous refuse ensuite tout non-régulier.
+        descriptor = os.open(resolved, _open_flags() | getattr(os, "O_NONBLOCK", 0))
+    except (ScanError, OSError):
         return None
-    version = int.from_bytes(index_bytes[4:8], "big")
-    count = int.from_bytes(index_bytes[8:12], "big")
-    target_bytes = rel_path.encode("utf-8")
-
-    # Parcours séquentiel des entrées (version 2 et 3, sha1=20 ou sha256=32)
-    for hash_len in (20, 32):
-        pos = _INDEX_HDR_LEN
-        parsed_entries = 0
-        try:
-            for _ in range(count):
-                if pos + 40 + hash_len + 2 > len(index_bytes):
-                    break
-                entry_start = pos
-                sha = index_bytes[pos + 40 : pos + 40 + hash_len].hex()
-                flags = int.from_bytes(
-                    index_bytes[pos + 40 + hash_len : pos + 40 + hash_len + 2], "big"
-                )
-                extended = bool(flags & 0x4000)
-                path_start = (
-                    pos + 40 + hash_len + 4
-                    if (version >= _INDEX_V3_MIN and extended)
-                    else pos + 40 + hash_len + 2
-                )
-                null_pos = index_bytes.find(b"\x00", path_start)
-                if null_pos == -1:
-                    break
-                path_bytes = index_bytes[path_start:null_pos]
-                parsed_entries += 1
-                if path_bytes == target_bytes:
-                    return sha
-                entry_len = null_pos + 1 - entry_start
-                pad = (8 - (entry_len % 8)) % 8
-                pos = null_pos + 1 + pad
-            if parsed_entries == count:
-                return None
-        except (ValueError, IndexError):
-            pass
-
-    # Recherche directe en repli
-    for term in (b"\x00" + target_bytes + b"\x00", target_bytes + b"\x00"):
-        idx = index_bytes.find(term)
-        if idx != -1:
-            name_idx = idx + (1 if term.startswith(b"\x00") else 0)
-            if name_idx >= _INDEX_ENTRY_PREFIX_LEN:
-                return index_bytes[name_idx - _INDEX_ENTRY_PREFIX_LEN : name_idx - 2].hex()
-    return None
-
-
-def _resolve_git_dir(root: Path) -> Path | None:
-    """Localise le dossier .git effectif pour un dépôt standard, submodule ou worktree."""
-    git_dir = root / ".git"
-    if git_dir.is_dir():
-        return git_dir
-    if git_dir.is_file():
-        try:
-            line = git_dir.read_text("utf-8").strip()
-            if line.startswith("gitdir:"):
-                target = line[len("gitdir:") :].strip()
-                p = Path(target)
-                return p if p.is_absolute() else (root / p).resolve()
-        except OSError:
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_CONFIG_BYTES:
             return None
-    return None
+        expected = metadata.st_size
+        chunks: list[bytes] = []
+        remaining = expected + 1  # un octet de plus détecte une croissance
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        # Un fichier qui a rétréci ou grossi pendant la lecture est refusé.
+        if len(content) != expected:
+            return None
+        return content
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
 
 
-def _is_worktree_file_clean_and_tracked(root: Path, rel_path: str) -> bool:
+def _is_worktree_file_clean_and_tracked(
+    access: GitAccess,
+    rel_path: str,
+    *,
+    timeout: float,
+) -> bool:
     """Vérifie que le fichier du worktree est suivi dans l'index et non modifié (CWE-345).
 
     Retourne True si et seulement si :
-    1. Le fichier existe et est lisible dans l'arbre de travail.
-    2. Le fichier est présent dans l'index Git (.git/index).
-    3. L'empreinte de blob Git du contenu du worktree correspond exactement à l'index.
-    En cas de doute (erreur I/O, format non reconnu, dirty/untracked), retourne False.
-    """
-    file_path = root / rel_path
-    if not file_path.is_file():
-        return False
-    try:
-        content = file_path.read_bytes()
-    except OSError:
-        return False
+    1. Le fichier existe, est un fichier ordinaire et est lisible dans l'arbre
+       de travail (ouverture `O_NOFOLLOW` via la garde unique) ;
+    2. Le fichier est présent dans l'index Git au stage 0, en mode fichier
+       ordinaire (git plumbing `ls-files -s`, donc index v2/v3/v4, worktrees
+       et sous-modules couverts sans parseur DIRC maison) ;
+    3. L'empreinte de blob Git du contenu du worktree correspond exactement à
+       l'index (SHA-1 ou SHA-256).
 
-    git_dir = _resolve_git_dir(root)
-    if git_dir is None or not (git_dir / "index").is_file():
+    En cas de doute (erreur I/O, index symlinké, format non reconnu,
+    dirty/untracked, sous-module), retourne False : l'appelant refuse le scan.
+    """
+    content = _read_worktree_file(access.root / rel_path)
+    if content is None:
         return False
     try:
-        index_bytes = (git_dir / "index").read_bytes()
-        index_sha = _read_index_entry_sha(index_bytes, rel_path)
-        if not index_sha:
+        entry = access.index_entry(rel_path, timeout=timeout)
+        if entry is None:
             return False
+        _, index_sha = entry
         blob_sha1 = hashlib.sha1(
             f"blob {len(content)}\0".encode("ascii") + content,
             usedforsecurity=False,
@@ -307,12 +276,13 @@ def _is_worktree_file_clean_and_tracked(root: Path, rel_path: str) -> bool:
 
 
 def _guard_anti_self_attestation(  # noqa: PLR0913
-    root: Path,
+    access: GitAccess,
     *,
     ci: bool,
     config: str | Path | None,
     custom_allowlist: Allowlist | None,
     staged_changes: Sequence[object],
+    timeout: float,
     is_staged_scan: bool = False,
 ) -> None:
     """Protection anti auto-attestation (CWE-345).
@@ -330,6 +300,7 @@ def _guard_anti_self_attestation(  # noqa: PLR0913
     if custom_allowlist is not None:
         return
 
+    root = access.root
     rel_cfg: str | None = None
     if config is not None:
         cfg_path = Path(config)
@@ -364,7 +335,11 @@ def _guard_anti_self_attestation(  # noqa: PLR0913
             raise ScanError(
                 f"auto-attestation refusée : {rel_cfg} est staged (CWE-345)"
             )
-        if is_staged_scan and not _is_worktree_file_clean_and_tracked(root, rel_cfg):
+        if is_staged_scan and not _is_worktree_file_clean_and_tracked(
+            access,
+            rel_cfg,
+            timeout=timeout,
+        ):
             raise ScanError(
                 f"auto-attestation refusée : en mode --staged, {rel_cfg} du worktree n'est pas "
                 "propre et suivi dans l'index (CWE-345)"
@@ -400,11 +375,12 @@ def _collect_tree(
 
     staged_changes = access.staged_changes(timeout=_call_timeout(deadline))
     _guard_anti_self_attestation(
-        access.root,
+        access,
         ci=ci,
         config=config,
         custom_allowlist=custom_allowlist,
         staged_changes=staged_changes,
+        timeout=_call_timeout(deadline),
         is_staged_scan=False,
     )
 
@@ -472,11 +448,12 @@ def _collect_staged(
         raise ScanError(_MSG_TOO_MANY_FILES)
 
     _guard_anti_self_attestation(
-        access.root,
+        access,
         ci=ci,
         config=config,
         custom_allowlist=custom_allowlist,
         staged_changes=changes,
+        timeout=_call_timeout(deadline),
         is_staged_scan=True,
     )
 

@@ -26,6 +26,9 @@ keywords = ["dummy"]
 [[allowlist.rules]]
 name = "test-fixtures"
 description = "Fixtures et valeurs factices explicites dans les répertoires et fichiers de test"
+# Frontière \b stricte, y compris avec `paths` : `_` est un caractère de mot.
+# `fake_slack_token` ou `my_dummy_key` NE sont PAS ignorés (invariant 1) ;
+# utiliser une valeur exacte (`dummy`) ou un séparateur non-mot (`fake-token`).
 paths = ["tests/**", "fixtures/**", "**/fixtures/**", "support/**", "**/support/**"]
 keywords = [
   "fake",

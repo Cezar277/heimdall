@@ -11,11 +11,12 @@ Couvre :
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from support.git_repo import GitRepo
+from support.git_repo import GIT, GitRepo
 from typer.testing import CliRunner, Result
 
 from heimdall.cli.main import app
@@ -29,6 +30,8 @@ from heimdall.cli.scan import (
     render_json,
     render_text,
 )
+from heimdall.mcp.errors import ToolFailure
+from heimdall.mcp.gitdiff import GitAccess
 from heimdall.scanner import allowlist as al_module
 from heimdall.scanner.allowlist import (
     MAX_CONFIG_BYTES,
@@ -191,20 +194,41 @@ def test_rule_dummy_tokens() -> None:
 def test_rule_test_fixtures() -> None:
     """Règle 'test-fixtures' : écarte les fixtures factices délimitées aux tests."""
     al = Allowlist.default()
-    # Factice dans tests/ -> écarté
+    # Factice dans tests/ -> écarté (séparateur non-mot, frontière \b stricte)
     assert al.evaluate(
-        value="fake_slack_token_12345",
+        value="fake-token-12345",
         file="tests/test_slack.py",
         line=15,
         secret_type="slack",
     ) == "test-fixtures"
 
     assert al.evaluate(
-        value="mock_jwt_token_payload",
+        value="mock-jwt-token-payload",
         file="tests/fixtures/payload.json",
         line=4,
         secret_type="jwt",
     ) == "test-fixtures"
+
+
+def test_rule_test_fixtures_does_not_treat_underscore_as_separator() -> None:
+    """Une valeur `_fake_`/`_dummy_` sous tests/ reste signalée (Invariant 1).
+
+    `_` est un caractère de mot pour `\\b` : élargir la frontière aux
+    séparateurs de code élargirait l'allowlist et pourrait masquer un vrai
+    secret délimité par des underscores. Le comportement est volontairement
+    strict : `fake_slack_token` et `my_dummy_key` ne sont PAS des fixtures.
+    """
+    al = Allowlist.default()
+    for value in ("fake_slack_token_12345", "my_dummy_key"):
+        assert (
+            al.evaluate(
+                value=value,
+                file="tests/test_fixture.py",
+                line=1,
+                secret_type="password",
+            )
+            is None
+        )
 
 
 # --- 3. Piège à éviter (CWE-1188) : Pas d'allowlist aveugle de tests/ --------
@@ -1093,31 +1117,23 @@ patterns = ["^AKIA.*DUMMY.*$"]
     assert raw_secret not in res_json.stderr
 
 
-def test_keyword_boundary_matches_isolated_and_paths() -> None:
+def test_keyword_boundary_matches_isolated_and_strict() -> None:
     """Vérifie que les sous-chaînes sans frontières sont strictement rejetées."""
     # Faux-positifs en sous-chaîne sans séparateur : JAMAIS ignorés (Invariant 1)
     for kw in ("fake", "test", "example", "dummy"):
-        assert not _keyword_matches_value(kw, f"pro{kw}", has_paths=False)
-        assert not _keyword_matches_value(kw, f"pro{kw}", has_paths=True)
-        assert not _keyword_matches_value(kw, f"{kw}abc", has_paths=False)
-        assert not _keyword_matches_value(kw, f"{kw}abc", has_paths=True)
+        assert not _keyword_matches_value(kw, f"pro{kw}")
+        assert not _keyword_matches_value(kw, f"{kw}abc")
 
-    assert not _keyword_matches_value("test", "latest", has_paths=False)
-    assert not _keyword_matches_value("test", "latest", has_paths=True)
-    assert not _keyword_matches_value("example", "myexample", has_paths=False)
-    assert not _keyword_matches_value("example", "myexample", has_paths=True)
+    assert not _keyword_matches_value("test", "latest")
+    assert not _keyword_matches_value("example", "myexample")
 
-    # Séparateurs de code '_' acceptés uniquement avec has_paths=True (fixtures)
-    assert _keyword_matches_value("fake", "fake_slack_token", has_paths=True)
-    assert not _keyword_matches_value("fake", "fake_slack_token", has_paths=False)
-    assert _keyword_matches_value("dummy", "my_dummy_key", has_paths=True)
-    assert not _keyword_matches_value("dummy", "my_dummy_key", has_paths=False)
+    # '_' est un caractère de mot : jamais un séparateur, même avec paths
+    assert not _keyword_matches_value("fake", "fake_slack_token")
+    assert not _keyword_matches_value("dummy", "my_dummy_key")
 
-    # Frontières de mot standards '\b' acceptées dans les deux modes
-    assert _keyword_matches_value("fake", "fake-token", has_paths=False)
-    assert _keyword_matches_value("fake", "fake-token", has_paths=True)
-    assert _keyword_matches_value("dummy", "dummy", has_paths=False)
-    assert _keyword_matches_value("dummy", "dummy", has_paths=True)
+    # Frontières de mot standards '\b' acceptées
+    assert _keyword_matches_value("fake", "fake-token")
+    assert _keyword_matches_value("dummy", "dummy")
 
 
 def test_self_attestation_staged_custom_config_fails_loud(git_repo: GitRepo) -> None:
@@ -1204,6 +1220,165 @@ keywords = ["AKIA"]
     res = _run("scan", "--staged", str(git_repo.root))
     assert res.exit_code == EXIT_ERROR
     assert "auto-attestation" in res.stderr.lower() or "scan impossible" in res.stderr.lower()
+
+
+def _config_saine() -> str:
+    return """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "safe-rule"
+description = "safe"
+keywords = ["dummy"]
+"""
+
+
+def test_staged_index_v4_with_clean_config_is_not_a_spurious_error(
+    git_repo: GitRepo,
+) -> None:
+    """Revue (LOW) : index v4 + heimdall.toml propre -> verdict normal, jamais 2.
+
+    L'ancien parseur DIRC maison ne comprenait pas la compression de chemins
+    de l'index v4 et pouvait refuser un dépôt sain. Le passage par
+    `git ls-files -s` couvre v2/v3/v4 sans dette de format.
+    """
+    git_repo.write("heimdall.toml", _config_saine())
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: config initiale")
+    git_repo.git("update-index", "--index-version", "4")
+    index = (git_repo.root / ".git" / "index").read_bytes()
+    assert index[4:8] == (4).to_bytes(4, "big")
+
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("app.py")
+    res = _run("scan", "--staged", str(git_repo.root))
+    assert res.exit_code == EXIT_FINDINGS
+    assert "1 secret(s) détecté(s)" in res.stdout
+
+
+def test_staged_linked_worktree_with_clean_config_is_not_a_spurious_error(
+    git_repo: GitRepo,
+    tmp_path: Path,
+) -> None:
+    """Revue (LOW) : worktree lié (`.git` fichier) + config propre -> 1, pas 2.
+
+    `git rev-parse --git-path index` localise l'index réel du worktree ; la
+    garde unique vérifie ensuite ce chemin sans suivre de lien.
+    """
+    assert GIT is not None
+    git_repo.write("heimdall.toml", _config_saine())
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: config initiale")
+    worktree = tmp_path / "worktree"
+    git_repo.git("worktree", "add", "-q", "--detach", str(worktree))
+    (worktree / "app.py").write_text('KEY = "AKIA0123456789ABCDEF"\n', encoding="utf-8")
+    subprocess.run(  # noqa: S603 - argv figé, aucun shell
+        [GIT, "-C", str(worktree), "add", "--", "app.py"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+
+    res = _run("scan", "--staged", str(worktree))
+    assert res.exit_code == EXIT_FINDINGS
+    assert "1 secret(s) détecté(s)" in res.stdout
+
+
+def test_staged_gitlink_in_index_with_clean_config_is_not_a_spurious_error(
+    git_repo: GitRepo,
+) -> None:
+    """Revue (LOW) : un gitlink (sous-module) dans l'index ne fait pas échouer le scan.
+
+    Le SHA d'un gitlink désigne un commit, pas un blob ; il est ignoré comme
+    une suppression. La config propre reste vérifiée par `ls-files -s`.
+    """
+    git_repo.write("heimdall.toml", _config_saine())
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: config initiale")
+    head = git_repo.git_output("rev-parse", "HEAD").strip()
+    git_repo.git("update-index", "--add", "--cacheinfo", f"160000,{head},vendor/sub")
+
+    git_repo.write("app.py", 'KEY = "AKIA0123456789ABCDEF"\n')
+    git_repo.stage("app.py")
+    res = _run("scan", "--staged", str(git_repo.root))
+    assert res.exit_code == EXIT_FINDINGS
+    assert "1 secret(s) détecté(s)" in res.stdout
+
+
+def test_staged_symlinked_index_fails_closed(git_repo: GitRepo) -> None:
+    """Revue (LOW) : `.git/index` symlinké -> code 2, jamais un verdict propre.
+
+    `git ls-files` suivrait le lien sans le dire ; `_checked_index_path`
+    passe par `_resolve_root` + `O_NOFOLLOW` et refuse avant lecture.
+    """
+    git_repo.write("heimdall.toml", _config_saine())
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: config initiale")
+    index = git_repo.root / ".git" / "index"
+    cible = git_repo.root / "index-copie"
+    cible.write_bytes(index.read_bytes())
+    index.unlink()
+    index.symlink_to(cible)
+
+    res = _run("scan", "--staged", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "scan impossible" in res.stderr.lower() or "auto-attestation" in res.stderr.lower()
+
+
+def test_index_entry_rejects_invalid_paths(git_repo: GitRepo) -> None:
+    """Fuzz : `..`, NUL, absolu et traversée sont refusés avant tout appel git."""
+    git_repo.write("heimdall.toml", _config_saine())
+    git_repo.stage("heimdall.toml")
+    access = GitAccess(git_repo.root)
+    for chemin in ("../heimdall.toml", "a\x00b", "/etc/passwd", "a/../b"):
+        with pytest.raises(ToolFailure):
+            access.index_entry(chemin)
+
+
+@pytest.mark.parametrize(
+    ("raw", "attendu"),
+    [
+        (b"", "none"),
+        (b"100644\n", "erreur"),
+        (b"100644 " + b"a" * 40 + b" 1\theimdall.toml\x00", "erreur"),
+        (b"100644 " + b"g" * 40 + b" 0\theimdall.toml\x00", "erreur"),
+        (b"100644 " + b"a" * 40 + b" 0\tautre.toml\x00", "erreur"),
+        (b"100644 " + b"a" * 40 + b" 0\theimdall.toml\x00extra\x00", "erreur"),
+        (b"160000 " + b"a" * 40 + b" 0\theimdall.toml\x00", "none"),
+    ],
+)
+def test_index_entry_rejects_malformed_plumbing_output(
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    raw: bytes,
+    attendu: str,
+) -> None:
+    """Fuzz : toute sortie `ls-files` ambiguë est fail-closed, jamais True.
+
+    `none` = non suivi / mode non ordinaire (l'appelant refuse le scan) ;
+    `erreur` = ``ToolFailure``. Aucun cas ne rend une entrée exploitable.
+    """
+    git_repo.write("heimdall.toml", _config_saine())
+    git_repo.stage("heimdall.toml")
+    access = GitAccess(git_repo.root)
+    original = GitAccess.execute
+
+    def execute_faux(
+        self: GitAccess,
+        arguments: object,
+        **options: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if tuple(arguments)[:1] == ("ls-files",):
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout=raw, stderr=b"")
+        return original(self, arguments, **options)
+
+    monkeypatch.setattr(GitAccess, "execute", execute_faux)
+    if attendu == "none":
+        assert access.index_entry("heimdall.toml") is None
+    else:
+        with pytest.raises(ToolFailure):
+            access.index_entry("heimdall.toml")
 
 
 def test_allowlist_exports_and_default_docstring() -> None:
