@@ -1,5 +1,9 @@
 # T23 — preuves après revue REQUEST CHANGES
 
+Révision courante du code : `00e3ab90dd13ac87c28cd61ea46c3f9437d3f7aa`.
+Les compléments en fin de fiche portent les preuves les plus récentes ; les
+sections antérieures restent épinglées aux révisions qu'elles ont vérifiées.
+
 Ticket : [#23](https://github.com/Cezar277/heimdall/issues/23).
 Révision corrigée : `da8c4b618ee150d39be17a318d8f204161d5bbb4`.
 Cette fiche remplace les preuves de la première livraison `0ebc661` : ses
@@ -167,3 +171,42 @@ globale de 2013 tests reste une preuve historique de la révision précédente ;
 elle n'a pas été relancée pour ce complément. Les tests T21 conservent les
 comptes documentés (core 10/8/0, all 12/8/4), sans changer le seuil de 90 %.
 Aucun `/ci` GitHub déclenché ; feuille SAMM externe non modifiée.
+
+## Complément LOW — signatures calculées une fois par ligne et fenêtre
+
+Révision : `00e3ab90dd13ac87c28cd61ea46c3f9437d3f7aa`.
+Les deux limites admises restent inchangées : fragmentation mono-ligne sous
+`min_length` donnant `[]`, et garde multiligne conservatrice pouvant refuser
+un JSON bénin. Leurs tests et leur documentation sont conservés.
+
+- Préparation bornée partagée, avant les signatures :
+  [_prepare_line:104](https://github.com/Cezar277/heimdall/blob/00e3ab90dd13ac87c28cd61ea46c3f9437d3f7aa/heimdall/scanner/entropy_detection.py#L104).
+  `find_entropy_matches` garde son API et ses validations ; la nouvelle
+  fonction interne [find_line_matches:173](https://github.com/Cezar277/heimdall/blob/00e3ab90dd13ac87c28cd61ea46c3f9437d3f7aa/heimdall/scanner/entropy_detection.py#L173)
+  partage le résultat des signatures entre l'entropie et les Findings regex.
+- Les deux moteurs consomment cette passe commune et réutilisent la fenêtre
+  contiguë pour la déduplication de la ligne suivante, sans la recalculer :
+  [detect.py](https://github.com/Cezar277/heimdall/blob/00e3ab90dd13ac87c28cd61ea46c3f9437d3f7aa/heimdall/scanner/detect.py),
+  [signature_engine.py](https://github.com/Cezar277/heimdall/blob/00e3ab90dd13ac87c28cd61ea46c3f9437d3f7aa/heimdall/scanner/signature_engine.py).
+  Le [test compteur des deux moteurs:453](https://github.com/Cezar277/heimdall/blob/00e3ab90dd13ac87c28cd61ea46c3f9437d3f7aa/tests/test_scanner_entropy.py#L453)
+  vérifie exactement un appel par ligne et par fenêtre, avec un secret AWS
+  coupé sur deux lignes et aucun Finding entropie redondant.
+- Sur une ligne de 500 000 micro-jetons, une deadline déjà expirée reste
+  refusée avant le parcours. Si elle expire pendant les signatures, la passe
+  commune lève aussi `ScanError` au retour, même sans candidat entropie :
+  [test de deadline après signatures:482](https://github.com/Cezar277/heimdall/blob/00e3ab90dd13ac87c28cd61ea46c3f9437d3f7aa/tests/test_scanner_entropy.py#L482).
+  Les regex individuelles restent non interruptibles ; cette modification
+  supprime les appels redondants et contrôle l'échéance entre les phases.
+
+Ruff, mypy strict et Bandit passent. Les **702 tests ciblés passent**,
+couverture scanner branches incluses **96,44 %**, durée 42,64 s, code 0.
+La sélection comprend les tests CLI rejoués avec Typer dans l'environnement
+local, ainsi que le corpus T21 aux comptes inchangés. Aucun déclenchement
+de CI GitHub ni modification de la feuille SAMM externe.
+
+Suite complète finale sur `00e3ab9` : **2040 passed, 16 skipped**,
+4480 sous-tests passés, 7 avertissements ; couverture globale branches
+incluses **92,01 %** (seuil 85 % satisfait), durée 198,99 s, code de sortie 0.
+Les tests CLI sont inclus dans cette exécution locale. Ces résultats
+remplacent les chiffres globaux historiques pour le code courant ; le seuil
+de précision T21 reste distinct, inchangé et non atteint.
