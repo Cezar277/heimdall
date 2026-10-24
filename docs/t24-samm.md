@@ -488,7 +488,9 @@ chemins invalides (`..`, NUL, absolu) et sorties `ls-files` malformées
   (faux-positifs sur chaque fixture variée) ne conviennent : la restriction
   par `paths` reste le bon instrument, explicite et auditable. Test :
   [`453–495`](../tests/test_scanner_allowlist.py#L453-L495) (ignoré sous
-  `tests/`, détecté hors périmètre, exacts toujours ignorés).
+  `tests/`, détecté hors périmètre, exacts toujours ignorés). Ce
+  comportement est **volontaire et documenté** ; il est borné à
+  `tests/`/`fixtures/`/`support/`, traçable et testé.
 - **Casse des plafonds (LOW)** : `MAX_RULE_NAME_length` est byte-pour-byte
   tout en capitales (`od`/comparaisons exactes à chaque revue, y compris
   dans l'historique : `UUU_UUUU_UUUU_UUUUUU`, aucun identifiant mixte dans
