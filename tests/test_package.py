@@ -37,18 +37,17 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(heimdall.__version__, "0.1.0")
 
     def test_tomli_declared_as_runtime_dependency_for_python_310(self) -> None:
-        """`client.py` importe tomli au runtime sur 3.10 : pas seulement en [dev]."""
+        """`client.py` importe tomli au runtime sur 3.10 : pas seulement en [dev].
+
+        Le pin est volontairement inconditionnel : un marqueur ``< 3.11`` rend
+        ``tomli`` invisible à ``pip --require-hashes`` sur les Python récents,
+        qui refuse alors la contrainte transitive non épinglée.
+        """
         root = Path(__file__).resolve().parents[1]
         document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
         runtime = document["project"]["dependencies"]
         normalized = [requirement.replace(" ", "") for requirement in runtime]
-        self.assertTrue(
-            any(
-                requirement.startswith("tomli==") and "python_version<'3.11'" in requirement
-                for requirement in normalized
-            ),
-            runtime,
-        )
+        self.assertIn("tomli==2.5.0", normalized)
         dev = document["project"]["optional-dependencies"]["dev"]
         self.assertFalse(any(requirement.startswith("tomli==") for requirement in dev))
 

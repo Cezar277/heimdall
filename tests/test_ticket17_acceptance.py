@@ -59,8 +59,8 @@ def _lock_names() -> set:
             names = set()
             for line in path.read_text(encoding="utf-8").splitlines():
                 # Le lock peut porter un marqueur d'environnement après la version
-                # (ex. ``tomli==2.5.0 ; python_version < "3.11"``) : le nom reste
-                # l'identifiant avant ``==``.
+                # (dépendance conditionnelle) : le nom reste l'identifiant avant
+                # ``==``.
                 match = re.match(r"^([A-Za-z0-9_.-]+)==[^;\s]+", line.strip())
                 if match:
                     names.add(match.group(1).lower().replace("_", "-"))
