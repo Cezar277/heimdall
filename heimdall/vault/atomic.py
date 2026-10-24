@@ -670,11 +670,21 @@ def parse_example_names(path: Path) -> list[str] | None:
 
 
 def _get_git_toplevel(path: Path) -> Path | None:
-    """Trouve la racine du dépôt Git contenant le chemin."""
+    """Trouve la racine du dépôt Git contenant le chemin.
+
+    Sans jamais suivre les liens symboliques (``lstat``) : un répertoire
+    ou un parent échangé contre un symlink ne doit pas fausser le cwd
+    de ``git rev-parse`` (oracle Git trompeur, invariant 10).
+    """
     git_bin = shutil.which("git")
     if not git_bin:
         return None
-    parent_dir = path if path.is_dir() else path.parent
+    try:
+        path_stat = os.lstat(path)
+        is_plain_dir = stat.S_ISDIR(path_stat.st_mode) and not stat.S_ISLNK(path_stat.st_mode)
+    except OSError:
+        is_plain_dir = False
+    parent_dir = path if is_plain_dir else path.parent
     try:
         res = subprocess.run(  # noqa: S603
             [git_bin, "rev-parse", "--show-toplevel"],

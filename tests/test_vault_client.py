@@ -38,6 +38,7 @@ from heimdall.vault.atomic import (
 )
 from heimdall.vault.client import (
     _MAX_API_KEY_FILE_BYTES,
+    _MAX_RESPONSE_HEADER_COUNT,
     _PROJECT_ID_PATTERN,
     _STREAM_CHUNK_SIZE,
     VaultAuthError,
@@ -51,6 +52,7 @@ from heimdall.vault.client import (
     _check_localhost_resolution,
     _detect_from_git,
     _find_key_file,
+    _measure_response_headers,
     _pin_loopback_ip,
     _read_and_check_key_file,
     _validate_identifier,
@@ -805,6 +807,22 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 self.assertFalse(is_git_tracked(target))
                 self.assertFalse(is_git_ignored(target))
 
+    def test_git_toplevel_does_not_follow_symlinked_dir(self) -> None:
+        """Répertoire symlinké → cwd = parent réel (lstat), jamais la cible suivie."""
+        real_dir = self.tmp_dir / "real_repo"
+        real_dir.mkdir()
+        link_dir = self.tmp_dir / "link_repo"
+        try:
+            os.symlink(real_dir, link_dir)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        with patch("heimdall.vault.atomic.shutil.which", return_value="/usr/bin/git"):
+            with patch("heimdall.vault.atomic.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=1, stdout="")
+                self.assertIsNone(_get_git_toplevel(link_dir))
+                self.assertEqual(mock_run.call_args.kwargs["cwd"], link_dir.parent)
+                self.assertNotEqual(mock_run.call_args.kwargs["cwd"], link_dir)
+
     def test_git_helpers_survive_hanging_git_binary(self) -> None:
         """Binaire `git` bloqué : `TimeoutExpired` → statut inconnu, jamais de pendaison."""
         target = self.tmp_dir / ".env"
@@ -1085,6 +1103,34 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             with self.assertRaises(VaultClientError) as ctx:
                 client.health()
             self.assertIn("En-têtes", str(ctx.exception))
+
+    def test_measure_headers_stops_early_without_materializing(self) -> None:
+        """Comptage paresseux : rejet après ~256 tirages, jamais de liste géante."""
+
+        class _CountingHeaders:
+            """Headers-like infini dont chaque tirage est compté."""
+
+            def __init__(self) -> None:
+                self.pulls = 0
+
+            def get(self, key: str, default: object = None) -> object:
+                return default
+
+            def items(self) -> object:
+                return self._stream()
+
+            def _stream(self) -> object:
+                index = 0
+                while True:
+                    self.pulls += 1
+                    index += 1
+                    yield (f"x-{index}", "v")
+
+        headers = _CountingHeaders()
+        with self.assertRaises(ValueError):
+            _measure_response_headers(headers)
+        # Sortie anticipée : une fraction du flux suffit, pas de matérialisation.
+        self.assertLessEqual(headers.pulls, _MAX_RESPONSE_HEADER_COUNT + 2)
 
     def test_resolve_api_key_survives_undeterminable_home(self) -> None:
         """`HOME` indéterminé → `VaultClientError` (clé requise), jamais de traceback."""
