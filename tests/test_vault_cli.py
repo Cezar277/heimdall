@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -2079,13 +2080,13 @@ class VaultRunCliTests(unittest.TestCase):
                 }
                 mock_init.return_value = client_instance
 
-                # On écrit un .env local
-                dot_env = Path(".env")
-                created_here = False
-                if not dot_env.exists():
-                    dot_env.write_text("RESOLVED_FROM_ENV=val\n", encoding="utf-8")
-                    created_here = True
+                # On écrit un .env dans un répertoire isolé : le test ne doit
+                # dépendre ni du .env de la racine du dépôt ni du cwd du runner.
+                dot_env = self.tmp_dir / ".env"
+                dot_env.write_text("RESOLVED_FROM_ENV=val\n", encoding="utf-8")
+                previous = Path.cwd()
                 try:
+                    os.chdir(self.tmp_dir)
                     result = self.runner.invoke(
                         app,
                         [
@@ -2101,8 +2102,8 @@ class VaultRunCliTests(unittest.TestCase):
                     )
                     self.assertEqual(result.exit_code, 0)
                 finally:
-                    if created_here and dot_env.exists():
-                        dot_env.unlink()
+                    os.chdir(previous)
+                    dot_env.unlink(missing_ok=True)
 
     def test_run_injects_secrets_in_memory_without_writing_to_disk(self) -> None:
         """Les secrets sont injectés dans l'environnement du sous-processus sans trace disque."""
@@ -2136,7 +2137,7 @@ class VaultRunCliTests(unittest.TestCase):
                         "--name",
                         "INJECTED_SECRET_VAR",
                         "--",
-                        "python",
+                        sys.executable,
                         "-c",
                         py_code,
                     ],
@@ -2170,7 +2171,7 @@ class VaultRunCliTests(unittest.TestCase):
                         "--name",
                         "SAFE_VAR",
                         "--",
-                        "python",
+                        sys.executable,
                         "-c",
                         "import sys; sys.exit(42)",
                     ],
@@ -2257,7 +2258,7 @@ class VaultRunCliTests(unittest.TestCase):
                         "--name",
                         "SAFE_VAR",
                         "--",
-                        "python",
+                        sys.executable,
                         "-c",
                         py_code,
                     ],
@@ -2288,7 +2289,7 @@ class VaultRunCliTests(unittest.TestCase):
                         "--name",
                         "NULL_VAL",
                         "--",
-                        "python",
+                        sys.executable,
                         "-c",
                         "print('hello')",
                     ],
@@ -2317,7 +2318,7 @@ class VaultRunCliTests(unittest.TestCase):
                 "--example-file",
                 str(example),
                 "--",
-                "python",
+                sys.executable,
                 "-c",
                 "print('SHOULD_NOT_RUN')",
             ],
@@ -2416,7 +2417,7 @@ class VaultRunCliTests(unittest.TestCase):
                 "--example-file",
                 str(empty_dir / ".env.example"),
                 "--",
-                "python",
+                sys.executable,
                 "-c",
                 "print('SHOULD_NOT_RUN')",
             ],
