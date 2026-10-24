@@ -65,10 +65,17 @@ Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) vi
 python -m heimdall.vault.init_db
 
 # Variables minimales d'un déploiement réel (aucune valeur publique par défaut) :
-# KEK : python -c "from heimdall.vault.crypto import generate_encryption_key; print(generate_encryption_key())"
+# KEK (recommandé, ticket #262) : dérivée au démarrage par Argon2id depuis cette
+# clé maîtresse (phrase de passe >= 16 octets) et ce sel public de 16 octets.
+# Générer le sel UNE fois puis le conserver avec la clé maîtresse :
+#   python -c "from heimdall.vault.crypto import generate_kek_salt; print(generate_kek_salt())"
 export HEIMDALL_ENV=production
 export HEIMDALL_VAULT_API_KEY_PEPPER='<pepper aléatoire persistant, distinct de la KEK>'
-export HEIMDALL_VAULT_KEK='<KEK AES-256 base64, 32 octets, distincte du pepper>'
+export HEIMDALL_VAULT_MASTER_KEY='<phrase de passe longue et unique>'
+export HEIMDALL_VAULT_KEK_SALT='<sel base64 URL-safe de 16 octets, persisté>'
+# Mode historique (compatibilité uniquement) : KEK 32 octets utilisée SANS
+# dérivation. Mutuellement exclusif avec HEIMDALL_VAULT_MASTER_KEY.
+# export HEIMDALL_VAULT_KEK='<KEK AES-256 base64, 32 octets, distincte du pepper>'
 # TLS obligatoire en production : certificat avec SAN IP 127.0.0.1 + clé privée.
 export HEIMDALL_VAULT_SSL_CERTFILE='/chemin/absolu/server.crt'
 export HEIMDALL_VAULT_SSL_KEYFILE='/chemin/absolu/server.key'
@@ -81,8 +88,15 @@ python -m heimdall.vault.app
 ```
 
 Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une KEK qui ne
-réside jamais dans la base ; `UNIQUE(project_id, env, name)` garantit le 409
-inter-workers et `PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
+réside jamais dans la base. La KEK est **dérivée une seule fois au démarrage**
+avec Argon2id (64 Mio, 3 itérations, 4 lanes, sel public de 16 octets) depuis
+`HEIMDALL_VAULT_MASTER_KEY` + `HEIMDALL_VAULT_KEK_SALT`, puis conservée en
+mémoire ; les requêtes ne recalculent jamais la KDF. Le mode historique
+`HEIMDALL_VAULT_KEK` (KEK 32 octets directe) reste accepté pour les données
+existantes, mais les deux modes sont exclusifs. Détails et justification du
+choix Argon2id vs HKDF : [ADR-005](docs/adr/005-derivation-kek-argon2id.md).
+`UNIQUE(project_id, env, name)` garantit le 409 inter-workers et
+`PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
 Le backend mémoire, réservé aux tests/développement, chiffre également les
 valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
 Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets

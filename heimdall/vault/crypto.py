@@ -29,6 +29,17 @@ parties ensemble (``nonce || ciphertext || tag``) et l'AAD est l'identifiant du
 secret : un blob copié sur un autre secret échoue à l'authentification. Deux
 chiffrements du même texte donnent donc deux blobs différents — c'est la preuve
 archivée dans ``tests/test_vault_crypto.py``.
+
+DÉRIVATION DE LA KEK (ticket #262, sous-ticket de #26 « Clé maîtresse et
+chiffrement par enveloppe ») : la KEK qui chiffre les secrets est dérivée de la
+clé maîtresse du serveur avec **Argon2id** (``argon2.low_level.hash_secret_raw``,
+``Type.ID``), sel public de 16 octets persisté à côté de la clé maîtresse.
+Paramètres OWASP (64 Mio, 3 itérations, 4 lanes) : voir
+``docs/adr/005-derivation-kek-argon2id.md``. La dérivation est volontairement
+lente et n'a lieu **qu'une fois au démarrage** ; la KEK dérivée reste en mémoire
+dans ``VaultCipher`` et n'est jamais écrite en base. Le mode historique
+``HEIMDALL_VAULT_KEK`` (KEK 32 octets fournie directement) reste accepté pour ne
+pas rendre illisibles les blobs existants ; les deux modes sont exclusifs.
 """
 
 import base64
@@ -37,6 +48,7 @@ import hmac
 import os
 import secrets
 
+import argon2.low_level
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -48,6 +60,20 @@ _TAG_SIZE_BYTES: int = 16  # étiquette d'authentification GCM, en fin de cipher
 # Défense en profondeur : un pepper plus court que 256 bits réduit la
 # résistance hors ligne si les empreintes stockées et le pepper fuient.
 _MIN_PEPPER_BYTES: int = 32
+
+# Paramètres Argon2id de dérivation de la KEK (ticket #262, ADR-005) :
+# 64 Mio de mémoire, 3 itérations, 4 lanes. Ils dépassent les minimums OWASP
+# (19 Mio / 2 / 1) tout en restant supportables au démarrage. Changer ces
+# valeurs change la KEK produite pour un même couple (clé maîtresse, sel) :
+# les traiter comme un format de stockage, jamais comme un réglage jetable.
+ARGON2ID_TIME_COST: int = 3
+ARGON2ID_MEMORY_COST_KIB: int = 64 * 1024  # 64 Mio
+ARGON2ID_PARALLELISM: int = 4
+ARGON2ID_HASH_LEN: int = _KEY_SIZE_BYTES  # 32 octets, clé AES-256
+ARGON2ID_SALT_BYTES: int = 16  # 128 bits, sel public stocké à côté de la clé maîtresse
+# Une clé maîtresse plus courte que 128 bits n'apporte pas la marge nécessaire
+# face à une attaque hors ligne : refus fail-closed en amont d'Argon2id.
+MIN_MASTER_KEY_BYTES: int = 16
 
 # Label de domaine stable de la sous-clé d'empreinte (invariant 5 : la KEK de
 # chiffrement n'est jamais réutilisée directement comme clé HMAC). Changer ce
@@ -153,6 +179,105 @@ def generate_encryption_key() -> str:
     return base64.urlsafe_b64encode(secrets.token_bytes(_KEY_SIZE_BYTES)).decode("ascii")
 
 
+def generate_kek_salt() -> str:
+    """Génère un sel public Argon2id de 16 octets encodé base64 URL-safe (ticket #262).
+
+    Le sel n'est **pas** un secret : il doit être persisté à côté de la clé
+    maîtresse et rester stable entre les démarrages. Seul, il ne permet pas de
+    retrouver la KEK ; perdu ou modifié, il rend en revanche les secrets
+    existants illisibles (la KEK dérivée change).
+    """
+    return base64.urlsafe_b64encode(secrets.token_bytes(ARGON2ID_SALT_BYTES)).decode("ascii")
+
+
+def decode_kek_salt(salt: str | bytes) -> bytes:
+    """Décode et valide un sel Argon2id de 16 octets exactement (ticket #262).
+
+    Une chaîne est interprétée comme du base64 URL-safe ou standard (avec ou
+    sans padding, validation stricte). Des octets sont pris tels quels : les
+    tests et les appels internes peuvent fournir le sel brut. Toute autre
+    longueur est refusée : le sel est public, mais une erreur de configuration
+    doit échouer franchement plutôt que dériver silencieusement une autre KEK.
+    """
+    if isinstance(salt, str):
+        if not salt or salt != salt.strip():
+            raise ValueError("Sel KEK invalide : valeur vide ou entourée d'espaces.")
+        try:
+            raw = salt.encode("ascii")
+        except UnicodeEncodeError:
+            raise ValueError("Sel KEK invalide : encodage non ASCII.") from None
+        try:
+            padding = b"=" * (-len(raw) % 4)
+            decoded = base64.b64decode(raw + padding, altchars=b"-_", validate=True)
+        except Exception:
+            raise ValueError("Sel KEK invalide : encodage base64 incorrect.") from None
+    elif isinstance(salt, (bytes, bytearray)):
+        decoded = bytes(salt)
+    else:
+        raise ValueError("Sel KEK invalide : chaîne base64 ou octets attendus.")
+    if len(decoded) != ARGON2ID_SALT_BYTES:
+        raise ValueError(f"Sel KEK invalide : {ARGON2ID_SALT_BYTES} octets décodés requis.")
+    return decoded
+
+
+def _normalize_master_key(master_key: str | bytes) -> bytes:
+    """Normalise la clé maîtresse en octets sans jamais l'écho dans une erreur.
+
+    Une chaîne est une phrase de passe encodée en UTF-8 ; des octets sont
+    utilisés bruts (utile aux tests et aux appelants qui détiennent déjà une clé
+    aléatoire). La longueur minimale de 128 bits est une défense en profondeur
+    contre une phrase de passe triviale : Argon2id ralentit l'attaque hors ligne
+    mais ne compense pas une clé maîtresse sans entropie.
+    """
+    if isinstance(master_key, str):
+        if not master_key or not master_key.strip():
+            raise ValueError("Clé maîtresse invalide : valeur vide ou blanche.")
+        if master_key != master_key.strip():
+            raise ValueError("Clé maîtresse invalide : espaces de début ou de fin interdits.")
+        try:
+            raw = master_key.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("Clé maîtresse invalide : encodage UTF-8 impossible.") from None
+    elif isinstance(master_key, (bytes, bytearray)):
+        raw = bytes(master_key)
+        if not raw.strip():
+            raise ValueError("Clé maîtresse invalide : valeur vide ou blanche.")
+    else:
+        raise ValueError("Clé maîtresse invalide : chaîne ou octets attendus.")
+    if len(raw) < MIN_MASTER_KEY_BYTES:
+        raise ValueError(
+            f"Clé maîtresse invalide : au moins {MIN_MASTER_KEY_BYTES} octets "
+            "(128 bits) sont requis."
+        )
+    return raw
+
+
+def derive_kek_from_master_key(master_key: str | bytes, salt: str | bytes) -> bytes:
+    """Dérive la KEK 256 bits avec Argon2id (ticket #262, ADR-005).
+
+    ``argon2.low_level.hash_secret_raw`` est utilisée en ``Type.ID`` (Argon2id),
+    avec 64 Mio de mémoire, 3 itérations et 4 lanes. Ces paramètres sont figés
+    dans le module (voir ``ARGON2ID_*``) et documentés dans l'ADR : ils font
+    partie du format de la KEK, pas d'un réglage d'exécution.
+
+    La fonction est déterministe pour un même couple (clé maîtresse, sel) —
+    c'est le critère « Fait quand » du ticket — et volontairement lente. Elle
+    DOIT être appelée une seule fois au démarrage, puis la KEK retournée est
+    conservée en mémoire (``VaultCipher``), jamais recalculée par requête.
+    """
+    secret = _normalize_master_key(master_key)
+    salt_bytes = decode_kek_salt(salt)
+    return argon2.low_level.hash_secret_raw(
+        secret=secret,
+        salt=salt_bytes,
+        time_cost=ARGON2ID_TIME_COST,
+        memory_cost=ARGON2ID_MEMORY_COST_KIB,
+        parallelism=ARGON2ID_PARALLELISM,
+        hash_len=ARGON2ID_HASH_LEN,
+        type=argon2.low_level.Type.ID,
+    )
+
+
 def decode_encoded_key(encoded: str | bytes) -> bytes:
     """Décode une KEK base64 URL-safe (ou standard) de 32 octets en octets bruts.
 
@@ -204,10 +329,13 @@ def _new_nonce() -> bytes:
 
 
 class VaultCipher:
-    """Chiffrement authentifié AES-256-GCM des valeurs au repos (ticket #25/#26/#67).
+    """Chiffrement authentifié AES-256-GCM des valeurs au repos (ticket #25/#26/#67/#262).
 
-    - La KEK est fournie par l'exploitant (``HEIMDALL_VAULT_KEK``), jamais stockée
-      dans la base SQLite : la compromission de la base seule ne révèle rien.
+    - La KEK est fournie par l'exploitant soit directement
+      (``HEIMDALL_VAULT_KEK``, mode historique), soit dérivée au démarrage de la
+      clé maîtresse avec Argon2id (``HEIMDALL_VAULT_MASTER_KEY`` +
+      ``HEIMDALL_VAULT_KEK_SALT``, ticket #262). Elle n'est jamais stockée dans
+      la base SQLite : la compromission de la base seule ne révèle rien.
     - Chaque chiffrement tire un **nonce neuf de 96 bits** depuis l'aléatoire du
       système (``os.urandom``, ticket #67) : deux chiffremens du même texte
       donnent deux blobs différents, et un nonce n'est jamais réutilisé avec la
@@ -251,6 +379,16 @@ class VaultCipher:
     def from_encoded_key(cls, encoded: str | bytes) -> "VaultCipher":
         """Décode une KEK base64 URL-safe (ou standard) de 32 octets."""
         return cls(decode_encoded_key(encoded))
+
+    @classmethod
+    def from_master_key(cls, master_key: str | bytes, salt: str | bytes) -> "VaultCipher":
+        """Dérive la KEK avec Argon2id puis construit le chiffreur (ticket #262).
+
+        À appeler **une seule fois au démarrage** : la dérivation est coûteuse
+        (64 Mio, 3 itérations) et la KEK obtenue reste en mémoire pour la durée
+        de vie du processus.
+        """
+        return cls(derive_kek_from_master_key(master_key, salt))
 
     @staticmethod
     def aad(project: str, env: str, name: str) -> bytes:
