@@ -14,7 +14,7 @@ import os
 import secrets
 import shutil
 import stat
-import subprocess
+import subprocess  # nosec B404
 import tempfile
 from pathlib import Path
 from typing import Final
@@ -688,7 +688,7 @@ def _get_git_toplevel(path: Path) -> Path | None:
         is_plain_dir = False
     parent_dir = path if is_plain_dir else path.parent
     try:
-        res = subprocess.run(  # noqa: S603
+        res = subprocess.run(  # noqa: S603  # nosec B603
             [git_bin, "rev-parse", "--show-toplevel"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -701,7 +701,7 @@ def _get_git_toplevel(path: Path) -> Path | None:
             top = res.stdout.strip()
             if top:
                 return Path(top)
-    except Exception:  # noqa: S110
+    except Exception:  # noqa: S110  # nosec B110
         pass
     return None
 
@@ -741,7 +741,7 @@ def is_git_tracked(path: Path) -> bool:
     if rel is None:
         return False
     try:
-        res = subprocess.run(  # noqa: S603
+        res = subprocess.run(  # noqa: S603  # nosec B603
             [git_bin, "ls-files", "--error-unmatch", str(rel)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -766,7 +766,7 @@ def is_git_ignored(path: Path) -> bool:
     if rel is None:
         return False
     try:
-        res = subprocess.run(  # noqa: S603
+        res = subprocess.run(  # noqa: S603  # nosec B603
             [git_bin, "check-ignore", "-q", str(rel)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

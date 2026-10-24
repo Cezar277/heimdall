@@ -31,7 +31,7 @@ import shutil
 import socket
 import ssl
 import stat
-import subprocess
+import subprocess  # nosec B404
 import sys
 import threading
 from http import HTTPStatus
@@ -328,7 +328,7 @@ def _detect_from_git(start_dir: Path) -> str | None:
     if not git_bin:
         return None
     try:
-        git_root = subprocess.check_output(  # noqa: S603
+        git_root = subprocess.check_output(  # noqa: S603  # nosec
             [git_bin, "rev-parse", "--show-toplevel"],
             cwd=start_dir,
             stderr=subprocess.DEVNULL,
@@ -340,7 +340,7 @@ def _detect_from_git(start_dir: Path) -> str | None:
             sanitized = re.sub(r"[^a-z0-9_-]", "-", name)
             if sanitized and sanitized[0].isalpha() and _PROJECT_ID_PATTERN.match(sanitized):
                 return sanitized
-    except Exception:  # noqa: S110
+    except Exception:  # noqa: S110  # nosec B110
         pass
     return None
 
@@ -360,7 +360,7 @@ def _detect_from_pyproject(start_dir: Path) -> str | None:
             candidate = name.lower()
             if candidate and candidate[0].isalpha() and _PROJECT_ID_PATTERN.match(candidate):
                 return candidate
-    except Exception:  # noqa: S110
+    except Exception:  # noqa: S110  # nosec B110
         pass
     return None
 
@@ -1047,7 +1047,7 @@ class VaultClient:
             try:
                 if not getattr(self._client, "is_closed", False):
                     self._client.close()
-            except Exception:  # noqa: S110
+            except Exception:  # noqa: S110  # nosec B110
                 pass
             self._client = None
 

@@ -22,7 +22,7 @@ import os
 import re
 import shutil
 import stat
-import subprocess
+import subprocess  # nosec B404
 from pathlib import Path
 from typing import Final
 
@@ -854,7 +854,7 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0917
         raise typer.Exit(code=1)
 
     try:
-        proc = subprocess.run(target_cmd, env=child_env, check=False)  # noqa: S603
+        proc = subprocess.run(target_cmd, env=child_env, check=False)  # noqa: S603  # nosec B603
         raise typer.Exit(code=proc.returncode)
     except FileNotFoundError:
         typer.echo(f"Erreur : commande introuvable : {cmd[0]}", err=True)
