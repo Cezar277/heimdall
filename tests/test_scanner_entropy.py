@@ -129,6 +129,21 @@ def test_invalid_config_object_is_refused_by_both_motors(tmp_path: Path) -> None
         "integrity = 'sha512-{}'",
         "data:text/plain;base64,{}",
         "'{}'",
+        "sha1-{}",
+        "sha256-{}",
+        "sha384-{}",
+        "sha512-{}",
+        "md5-{}",
+        "prefix-{}",
+        "prefix.{}",
+        "x{}",
+        "a{}",
+        "x-{}",
+        "x_{}",
+        "x+{}",
+        "x/{}",
+        "{}-suffix",
+        "{}x",
     ],
 )
 @pytest.mark.parametrize("alphabet", ["hex", "base64"])
@@ -141,6 +156,55 @@ def test_labels_cannot_hide_unknown_candidates(tmp_path: Path, wrapper: str, alp
     assert tree == engine
     assert tree and all(f.source == "entropy" for f in tree)
     assert all(f.type in ALLOWED_SECRET_TYPES for f in tree)
+    if alphabet == "hex":
+        assert all(f.type == "high_entropy_hex" for f in tree)
+
+
+def test_hex_fragment_offsets_and_hashes_do_not_include_non_hex_affixes(tmp_path: Path) -> None:
+    value = synthetic_value("hex")
+    text = f'credential = "prefix-{value}-suffix"'
+    matches = tuple(find_entropy_matches(text))
+    assert len(matches) == 1
+    match = matches[0]
+    assert match.value == value
+    assert match.start == text.index(value)
+    assert text[match.start : match.start + len(match.value)] == value
+    hasher = SnippetHasher(key=b"T" * 32)
+    (tmp_path / "config.py").write_text(text)
+    for findings in (
+        TreeScanner(tmp_path, hasher=hasher).scan(),
+        SignatureEngine(hasher).analyser(FileTarget("config.py", text)),
+    ):
+        assert len(findings) == 1
+        assert findings[0].snippet_hash == hasher.hash(value)
+        assert findings[0].entropy == round(shannon_entropy(value.encode()), 4)
+        assert value not in json.dumps(asdict(findings[0]))
+
+
+def test_two_hex_fragments_in_one_token_are_both_detected() -> None:
+    first = synthetic_value("hex")
+    second = hashlib.sha256(b"heimdall-t23-second-synthetic-only").hexdigest()
+    text = f"x{first}x{second}x"
+    matches = tuple(find_entropy_matches(text))
+    assert [match.value for match in matches] == [first, second]
+    assert [match.start for match in matches] == [1, len(first) + 2]
+
+
+def test_deadline_is_checked_before_scoring_a_hex_fragment(monkeypatch) -> None:
+    times = iter([0.0, 0.0, 0.0, 2.0])
+    monkeypatch.setattr("heimdall.scanner.entropy_detection.time.monotonic", lambda: next(times))
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        tuple(find_entropy_matches("prefix-" + synthetic_value("hex"), deadline=1.0))
+
+
+def test_known_signature_does_not_hide_a_separate_hex_fragment() -> None:
+    value = synthetic_value("hex")
+    text = "ghp_" + "A" * 36 + "-" + value
+    findings = SignatureEngine(SnippetHasher(key=b"T" * 32)).analyser(FileTarget("config.py", text))
+    assert {(finding.source, finding.type) for finding in findings} == {
+        ("regex", "pat"),
+        ("entropy", "high_entropy_hex"),
+    }
 
 
 def test_uuid_shape_is_not_an_exclusion() -> None:

@@ -12,8 +12,14 @@ l'entropie par caractère est identique à l'entropie par octet du contrat.
 | `min_length` | 20 caractères | entier dans [16 ; 4096] |
 
 Un seuil est inclusif. Les booléens, NaN et infinis sont refusés. Les valeurs
-hexadécimales sont classées avant les valeurs base64/base64url. Les jetons
-sont maximaux : aucune découpe d'un long jeton en fenêtres artificielles.
+hexadécimales sont classées avant les valeurs base64/base64url. Dans chaque
+jeton lexical borné, les suites hexadécimales maximales sont analysées au
+seuil hex, même si un affixe non hexadécimal est collé : `sha256-<hex>`,
+`prefix-<hex>`, `x<hex>`, `x_<hex>`, `x+<hex>`, `x/<hex>` et `<hex>-suffix`.
+Chaque fragment admissible porte son propre score, son empreinte et sa
+position réelle (`token.start + fragment.start`). Plusieurs fragments d'un
+même jeton peuvent être signalés ; un signal hex évite un second signal
+base64 du même jeton. Il n'y a pas de découpe en fenêtres glissantes.
 Tout jeton de plus de 4096 caractères lève `ScanError` avant les regex de
 signatures et le calcul Shannon, y compris une longue charge JWT. La lecture
 reste bornée à 1 Mio et la deadline est contrôlée à l'intérieur des lignes,
@@ -55,7 +61,11 @@ sans valeur brute, vérifiée par `json.dumps(asdict(finding))` dans les tests.
 
 Les étiquettes `sha256`, `commit`, `checksum`, `integrity`, les UUID et les
 data URI ne constituent jamais une autorisation de taire un candidat.
-La charge d'un préfixe `sha512-` est analysée, y compris si elle est hexadécimale.
+La recherche de fragments hex est générique : aucun traitement spécial de
+`sha512-` n'est requis, et le charset de l'affixe ne force pas le seuil base64
+sur un fragment hexadécimal. Les essais locaux de `heimdall scan --ci`
+vérifient le code 1 en mode arbre et indexé pour ces affixes, sans valeur
+brute dans la sortie. Ces essais n'activent pas la CI GitHub.
 Les UUID utilisent le seuil hexadécimal. Seules les valeurs déjà reconnues
 par une signature évitent un second signal redondant. Les valeurs publiques
 aléatoires peuvent donc produire des faux positifs : l'allowlist explicite

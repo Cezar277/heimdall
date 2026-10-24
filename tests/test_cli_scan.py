@@ -14,6 +14,7 @@ d'exemple de la documentation AWS, jamais une clé fonctionnelle.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -827,6 +828,35 @@ def test_benign_minified_json_multiline_overflow_exits_two(git_repo: GitRepo, st
     resultat = _run("scan", *options, str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert line not in resultat.output
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "sha256-{}",
+        "sha384-{}",
+        "prefix-{}",
+        "prefix.{}",
+        "x{}",
+        "x_{}",
+        "x+{}",
+        "x/{}",
+        "{}-suffix",
+    ],
+)
+def test_ci_scan_rejects_hex_secret_with_affixes(
+    git_repo: GitRepo, staged: bool, wrapper: str
+) -> None:
+    """Le mode CI local ne doit jamais rendre propre un secret hex affixé."""
+    value = hashlib.sha256(b"heimdall-t23-synthetic-only").hexdigest()
+    git_repo.write("config.py", 'credential = "' + wrapper.format(value) + '"\n')
+    git_repo.stage("config.py")
+    options = ("--staged",) if staged else ()
+    resultat = _run("scan", "--ci", *options, str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert "high_entropy_hex" in resultat.output
+    assert value not in resultat.output
 
 
 def test_scan_staged_concurrent_index_change_exits_two(

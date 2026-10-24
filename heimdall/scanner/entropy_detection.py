@@ -19,6 +19,7 @@ _SCAN_ERROR = "scan impossible : entrée non analysable"
 # Un caractère sentinelle au-delà du plafond : refus avant calcul d'entropie.
 _TOKEN = re.compile(r"[A-Za-z0-9_+/-]{1,4097}={0,2}")
 _HEX = re.compile(r"[0-9a-fA-F]+")
+_HEX_FRAGMENT = re.compile(r"[0-9a-fA-F]{16,4096}")
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 
@@ -73,6 +74,33 @@ def _tokens(line: str, deadline: float | None) -> Iterator[re.Match[str]]:
         yield token
 
 
+def _hex_matches(
+    token: re.Match[str],
+    config: EntropyConfig,
+    signatures: tuple[SignatureMatch, ...],
+    deadline: float | None,
+) -> Iterator[SignatureMatch]:
+    """Cherche les suites hex maximales même dans un jeton d'alphabet mixte.
+
+    Le jeton a déjà passé la borne 4096 ; les affixes non hexadécimaux ne
+    doivent pas imposer le seuil base64 à une charge hexadécimale.
+    """
+    for fragment in _HEX_FRAGMENT.finditer(token.group()):
+        if deadline is not None and time.monotonic() > deadline:
+            raise ScanError(_SCAN_ERROR)
+        value = fragment.group()
+        if len(value) < config.min_length or any(value in match.value for match in signatures):
+            continue
+        if shannon_entropy(value.encode("ascii")) >= config.hex_threshold:
+            yield SignatureMatch(
+                "high_entropy_hex",
+                "entropy",
+                value,
+                token.start() + fragment.start(),
+                source="entropy",
+            )
+
+
 def find_entropy_matches(
     line: str,
     config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
@@ -99,13 +127,13 @@ def find_entropy_matches(
     signatures = find_signature_matches(line) + preceding_matches
     for token in _tokens(line, deadline):
         value = token.group()
-        # Le préfixe d'intégrité est un séparateur de format, jamais une
-        # raison de taire sa charge (y compris une charge hexadécimale).
-        start = token.start()
-        if value.startswith("sha512-"):
-            value = value[len("sha512-") :]
-            start += len("sha512-")
         if len(value) < config.min_length:
+            continue
+        found_hex = False
+        for match in _hex_matches(token, config, signatures, deadline):
+            found_hex = True
+            yield match
+        if found_hex:
             continue
         if any(value in match.value or match.value in value for match in signatures):
             continue
@@ -116,7 +144,7 @@ def find_entropy_matches(
                 "high_entropy_hex" if hexadecimal else "high_entropy_base64",
                 "entropy",
                 value,
-                start,
+                token.start(),
                 source="entropy",
             )
 
