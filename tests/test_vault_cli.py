@@ -180,6 +180,31 @@ class VaultPushCliTests(unittest.TestCase):
                 self.assertIn("interdite", result.output)
                 mock_init.assert_not_called()
 
+    def test_push_missing_requested_dangerous_name_exits_2_without_send(self) -> None:
+        """`push --name PATH` absent du fichier → Exit(2), jamais un succès silencieux."""
+        env_file = self.tmp_dir / ".env"
+        env_file.write_text("SAFE_VAR=value\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "push",
+                        "--file",
+                        str(env_file),
+                        "--project",
+                        "demo",
+                        "--name",
+                        "PATH",
+                    ],
+                )
+
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("Aucun secret ne correspond", result.output)
+        mock_init.assert_not_called()
+
     def test_init_client_bounds_long_config_error(self) -> None:
         """Une erreur de configuration de 5000 caractères est tronquée en CLI."""
         env_file = self.tmp_dir / ".env"
@@ -1040,6 +1065,25 @@ class VaultPullCliTests(unittest.TestCase):
         with self.assertRaises(Exit) as ctx:
             _push_single_secret(client, "demo", "dev", "PATH", "value")
         self.assertEqual(ctx.exception.exit_code, 2)
+        client.create_secret.assert_not_called()
+
+    def test_push_single_secret_bounds_and_escapes_dangerous_name(self) -> None:
+        """Nom dangereux de 5000 car. : reflet borné à 32 car. et échappé."""
+        client = MagicMock()
+        # Préfixe dangereux + saut de ligne dans les 32 premiers caractères :
+        # le message doit être court et ne jamais contenir de saut brut.
+        long_name = "HEIMDALL_\n" + "K" * 5000
+
+        with patch("heimdall.cli.vault_client.typer.echo") as mock_echo:
+            with self.assertRaises(Exit) as ctx:
+                _push_single_secret(client, "demo", "dev", long_name, "value")
+
+        self.assertEqual(ctx.exception.exit_code, 2)
+        message = mock_echo.call_args.args[0]
+        self.assertLessEqual(len(message), 150)
+        self.assertNotIn("\n", message)
+        self.assertIn("\\n", message)
+        self.assertNotIn("K" * 100, message)
         client.create_secret.assert_not_called()
 
     def test_push_single_secret_distinguishes_identifier_from_value_errors(self) -> None:

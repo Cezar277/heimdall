@@ -1474,6 +1474,23 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         self.assertLessEqual(len(message), 220)
         self.assertNotIn("P" * 200, message)
 
+    def test_read_and_check_key_file_bounds_read_error(self) -> None:
+        """Une `OSError` géante de `os.read` est bornée à la source."""
+        key_file = self.tmp_dir / "vault.key"
+        key_file.write_text("synthetic_key_value", encoding="utf-8")
+        key_file.chmod(0o600)
+
+        with patch(
+            "heimdall.vault.client.os.read",
+            side_effect=OSError("R" * 5000),
+        ):
+            with self.assertRaises(VaultClientError) as ctx:
+                _read_and_check_key_file(key_file)
+
+        message = str(ctx.exception)
+        self.assertLessEqual(len(message), 220)
+        self.assertNotIn("R" * 200, message)
+
     def test_write_file_atomic_rejects_symlinked_intermediate_parent(self) -> None:
         """write_file_atomic refuse d'écrire si un parent intermédiaire est un symlink."""
         sub_dir = self.tmp_dir / "real_dir" / "nested"

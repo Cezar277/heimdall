@@ -250,7 +250,10 @@ def _read_and_check_key_file(path: Path) -> str:  # noqa: PLR0912
                 "Le fichier de clé API n'est pas un texte UTF-8 valide."
             ) from None
     except OSError as exc:
-        raise VaultClientError(f"Impossible de lire le fichier de clé API : {exc}") from exc
+        msg = str(exc)
+        if len(msg) > _MAX_ERROR_MSG_LEN:
+            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        raise VaultClientError(f"Impossible de lire le fichier de clé API : {msg}") from exc
     finally:
         if fd >= 0:
             try:

@@ -49,7 +49,9 @@ regroupement (voir §4).
 | `ValueError` identifiant non mappée dans `_pull_secrets_from_vault` | `except ValueError` dédié (défense en profondeur si les patterns CLI/client divergent) → message borné sans valeur + `Exit(1)`, jamais de traceback (invariant 11) | `heimdall/cli/vault_client.py` (`_pull_secrets_from_vault`) + `tests/test_vault_cli.py::test_pull_maps_value_error_identifier_to_exit_1` |
 | Voie `run` avec slash sans empreinte figée | Même empreinte figée avant le fetch que la voie `which` (`_regular_file_identity(cmd[0])`), revérifiée juste avant `exec` après `lstat`+`S_ISREG` ; réécriture en place détectée par taille/mtime/ctime, rename par inode. Limite résiduelle documentée : réécriture préservant toute l'empreinte (sans `fexecve` portable) | `heimdall/cli/vault_client.py` (`vault_run`, `_regular_file_identity`) + `tests/test_vault_cli.py::test_run_refuses_path_command_rewritten_in_place_before_exec` |
 | Chemin du fichier de clé reflété sans borne | Chemin tronqué à 32 car. à la source (`_open_file_read_fd`), erreurs d'ouverture bornées à 150 dans `_read_and_check_key_file`, puis message de configuration CLI borné à 150 : un `HEIMDALL_API_KEY_FILE` de 5000 car. ne bloat plus les logs | `heimdall/vault/atomic.py` (`_PATH_PREVIEW_LEN`, `_open_file_read_fd`), `heimdall/vault/client.py` (`_read_and_check_key_file`), `heimdall/cli/vault_client.py` (`_init_client`) + `tests/test_vault_client.py::test_open_file_read_fd_bounds_long_path_in_error`, `::test_read_and_check_key_file_bounds_wrapped_error`, `tests/test_vault_cli.py::test_init_client_bounds_long_config_error` |
-| `push` accepte les noms dangereux refusés par `pull`/`run` | `_filter_secrets` et `_push_single_secret` refusent `is_dangerous_env_var` en `Exit(2)` statique avant tout POST : plus de secret empoisonné (`PATH`, `LD_PRELOAD`, `HEIMDALL_API_KEY`...) inexploitable après rotation | `heimdall/cli/vault_client.py` (`_filter_secrets`, `_push_single_secret`) + `tests/test_vault_cli.py::test_push_rejects_dangerous_env_names_before_send`, `::test_push_single_secret_rejects_dangerous_name` |
+| `push` accepte les noms dangereux refusés par `pull`/`run` | `_filter_secrets` et `_push_single_secret` refusent `is_dangerous_env_var` en `Exit(2)` statique avant tout POST : plus de secret empoisonné (`PATH`, `LD_PRELOAD`, `HEIMDALL_API_KEY`...) inexploitable après rotation. Reflet borné à 32 car. via `[:32]!r` (pas de nom géant ni de séquence de contrôle dans stderr) | `heimdall/cli/vault_client.py` (`_filter_secrets`, `_push_single_secret`) + `tests/test_vault_cli.py::test_push_rejects_dangerous_env_names_before_send`, `::test_push_single_secret_rejects_dangerous_name`, `::test_push_single_secret_bounds_and_escapes_dangerous_name` |
+| Branche `OSError` de lecture de clé non bornée | `except OSError` de `_read_and_check_key_file` applique le même plafond 150 car. que la branche `open` : un chemin opérateur géant dans le message de `fstat`/`read` ne fuit plus vers les consommateurs bibliothèque | `heimdall/vault/client.py` (`_read_and_check_key_file`) + `tests/test_vault_client.py::test_read_and_check_key_file_bounds_read_error` |
+| Asymétrie de codes `Exit(2)` (push) vs `Exit(1)` (pull/run) pour un nom dangereux | Codes conservés et justifiés par phase : `push` = validation locale avant tout réseau (2) ; `pull`/`run` = garde du pipeline de récupération/injection (1). Convention 0/1/2/126/127 documentée au §6 ; commentaire « symétrie » corrigé | `heimdall/cli/vault_client.py` (`_filter_secrets`, `_push_single_secret`, `_pull_secrets_from_vault`, `vault_run`), `docs/t35-samm.md` §6 + `tests/test_vault_cli.py::test_push_missing_requested_dangerous_name_exits_2_without_send` |
 | Fiche SAMM §5 : numéros de ligne obsolètes | §5 ne cite plus de numéros de ligne pour `main.py`/`vault_keys.py`/`vault_run` (symboles seuls, comme au §1) : plus de dérive à chaque déplacement de code | `docs/t35-samm.md` §5 |
 | En-têtes HTTP non bornés avant le corps streaming (pic mémoire httpx/h11) | Double plafond avant lecture du corps : 256 en-têtes / 64 Kio (`_MAX_RESPONSE_HEADER_COUNT`/`_MAX_RESPONSE_HEADERS_BYTES`, octets exacts via `.raw`, fail-closed si illisibles) | `heimdall/vault/client.py` (`_measure_response_headers`, `_read_bounded_body`) + `tests/test_vault_client.py::test_streaming_response_with_giant_headers_rejected_without_reading_body`, `::test_streaming_response_with_too_many_headers_rejected` |
 | `Path.home()` non mappé dans la résolution de clé (traceback au lieu d'`Exit(2)`) | Corps `_find_key_file` + `exists()` appelant sous `try` (`OSError`/`RuntimeError`/`ValueError`) → `None`/« clé requise » ; version-indépendant (`exists()` face à l'octet nul varie selon Python ≥3.10) | `heimdall/vault/client.py` (`_find_key_file`, `resolve_api_key`) + `tests/test_vault_client.py::test_resolve_api_key_survives_undeterminable_home`, `::test_find_key_file_survives_null_byte_in_env_paths`, `tests/test_vault_cli.py::test_pull_without_api_key_and_broken_home_exits_2_cleanly`, `::test_pull_without_api_key_and_null_byte_key_file_exits_2_cleanly` |
@@ -114,3 +116,24 @@ Garanties anti-divergence :
 - test de non-divergence : `tests/test_vault_cli.py::test_run_and_vault_run_share_callback_and_guards`
   (même objet callback, mêmes `context_settings`, `Exit(2)` + « Aucune commande »
   sur les deux voies).
+
+## 6. Codes de sortie du client Vault
+
+Convention stable pour les orchestrateurs (détaillée par commande dans les
+docstrings de `vault_push` / `vault_pull` / `vault_run`) :
+
+| Code | Sens | Exemples |
+|---|---|---|
+| `0` | Succès | push partiel ou complet, pull écrit, enfant terminé avec 0 |
+| `1` | Échec Vault ou état de sécurité découvert pendant le pipeline | 401/403/404/429, réponse non conforme, tout-conflit 409, secret interdit pendant pull/run, dépassement des bornes anti-DoS, binaire remplacé avant `exec` |
+| `2` | Erreur locale d'usage, de configuration ou de validation, avant tout accès réseau | option ou fichier illisible, `--name` sans correspondance, valeur `\x00`/`\n`/`\r`, nom `is_dangerous_env_var` au push, clé API absente ou invalide, racine de projet indéterminable |
+| `126`/`127` | Échec d'exécution de l'enfant | non exécutable / commande introuvable (`run`) |
+| autre | Code de retour de l'enfant propagé tel quel (`run`) | commande enfant sortant en 3 → `Exit(3)` |
+
+Le refus d'un nom `is_dangerous_env_var` intervient **avant tout effet de
+bord** dans les trois commandes. Le code diffère volontairement par phase :
+`vault push` valide une entrée locale avant `_init_client` (`Exit(2)`) ;
+`pull`/`run` appliquent la même denylist dans le pipeline de récupération et
+d'injection (`Exit(1)`, cohérent avec les autres refus de ce pipeline). Un
+orchestrateur doit donc traiter `1` et `2` comme deux classes d'échec
+distinctes, jamais comme « succès partiel ».

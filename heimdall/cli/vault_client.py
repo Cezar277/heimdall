@@ -364,10 +364,14 @@ def _filter_secrets(
             )
             continue
         if is_dangerous_env_var(key):
-            # Symétrie pull/run : un nom interdit à l'injection ne doit jamais
-            # être stocké (secret empoisonné, rotation crue mais inexploitable).
+            # Même refus que pull/run : un nom interdit à l'injection ne doit
+            # jamais être stocké (secret empoisonné, rotation crue mais
+            # inexploitable). Code 2 = validation locale avant tout réseau ;
+            # pull/run sortent en 1 car le refus y intervient dans le pipeline
+            # de récupération (voir docs/t35-samm.md §6).
             typer.echo(
-                f"Erreur de sécurité : le secret '{key}' est une variable système interdite.",
+                f"Erreur de sécurité : le secret {key[:32]!r} est une variable "
+                "système interdite.",
                 err=True,
             )
             raise typer.Exit(code=2)
@@ -388,18 +392,22 @@ def _push_single_secret(
     (409 : avertissement, non écrasé). Les autres erreurs sortent en `Exit`.
     """
     if is_dangerous_env_var(name):
+        # Reflet borné et échappé : `_push_single_secret` peut être appelée
+        # directement (défense en profondeur) avant tout contrôle de format.
         typer.echo(
-            f"Erreur de sécurité : le secret '{name}' est une variable système interdite.",
+            f"Erreur de sécurité : le secret {name[:32]!r} est une variable "
+            "système interdite.",
             err=True,
         )
         raise typer.Exit(code=2)
+    name_preview = f"{name[:32]!r}"
     try:
         client.create_secret(proj, env, name, value)
-        typer.echo(f"Secret '{name}' poussé vers le Vault ({proj}/{env}) [statut: vaulte].")
+        typer.echo(f"Secret {name_preview} poussé vers le Vault ({proj}/{env}) [statut: vaulte].")
         return True
     except VaultConflictError:
         typer.echo(
-            f"Avertissement : le secret '{name}' existe déjà dans le Vault ({proj}/{env}) "
+            f"Avertissement : le secret {name_preview} existe déjà dans le Vault ({proj}/{env}) "
             "(409 Conflict).",
             err=True,
         )
@@ -435,13 +443,16 @@ def _push_single_secret(
             )
         else:
             typer.echo(
-                f"Erreur : valeur invalide pour le secret '{name}' "
+                f"Erreur : valeur invalide pour le secret {name_preview} "
                 "(1-65536 caractères requis).",
                 err=True,
             )
         raise typer.Exit(code=2) from None
     except VaultClientError as exc:
-        typer.echo(f"Erreur lors de l'envoi de '{name}' : {exc}", err=True)
+        msg = str(exc)
+        if len(msg) > _MAX_ERROR_MSG_LEN:
+            msg = msg[:_TRUNCATE_MSG_LEN] + "..."
+        typer.echo(f"Erreur lors de l'envoi de {name_preview} : {msg}", err=True)
         raise typer.Exit(code=1) from None
 
 
@@ -489,7 +500,7 @@ def vault_push(  # noqa: PLR0913, PLR0917
             # rendrait le secret inexploitable (pull/run le rejettent).
             # Message statique : la valeur n'est jamais reflétée.
             typer.echo(
-                f"Erreur : valeur invalide pour le secret '{name}' "
+                f"Erreur : valeur invalide pour le secret {name[:32]!r} "
                 "(octets nuls et sauts de ligne interdits).",
                 err=True,
             )
@@ -635,7 +646,8 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             continue
         if is_dangerous_env_var(name):
             typer.echo(
-                f"Erreur de sécurité : le secret '{name}' est une variable système interdite.",
+                f"Erreur de sécurité : le secret {name[:32]!r} est une variable "
+                "système interdite.",
                 err=True,
             )
             raise typer.Exit(code=1)
@@ -939,7 +951,8 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
     for secret_name in injected_secrets:
         if is_dangerous_env_var(secret_name):
             typer.echo(
-                f"Erreur de sécurité : injection refusée pour la variable système '{secret_name}'.",
+                "Erreur de sécurité : injection refusée pour la variable système "
+                f"{secret_name[:32]!r}.",
                 err=True,
             )
             raise typer.Exit(code=1)
