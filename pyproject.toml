@@ -47,7 +47,7 @@ dev = [
   # TestClient de Starlette (T255) : starlette 1.7 exige httpx2 pour son
   # `starlette.testclient` (le repli sur httpx est déprécié). Dépendance directe
   # explicite : elle ne doit pas dépendre d'un autre paquet (mcp).
-  "httpx2==2.13.1",
+  "httpx2==2.14.0",
   # Dépendances des tests de contrats (#14/#15/#16), alignées sur tests/contracts/requirements.txt
   "jsonschema==4.26.0",
   "PyYAML==6.0.3",
