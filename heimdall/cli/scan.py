@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import stat
 import time
@@ -111,6 +112,11 @@ _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INVALID_SCOPE: Final[str] = "scan impossible : entrée non analysable"
+
+#: Journal de diagnostic (niveau debug uniquement) : les causes de refus de
+#: la garde anti auto-attestation y sont distinguées par des libellés
+#: statiques (aucune entrée ni secret reflété, invariant 8).
+logger = logging.getLogger("heimdall.cli.scan")
 
 #: Libellés du périmètre, affichés à l'humain.
 _SCOPE_LABELS: Final[dict[Scope, str]] = {
@@ -261,15 +267,29 @@ def _is_worktree_file_clean_and_tracked(
     Le contenu est rendu pour que l'appelant parse exactement les octets
     vérifiés, sans relire le fichier (fenêtre TOCTOU éliminée). En cas de
     doute (erreur I/O, index symlinké, format non reconnu, dirty/untracked,
-    sous-module), retourne ``None`` : l'appelant refuse le scan.
+    sous-module), retourne ``None`` : l'appelant refuse le scan. Chaque
+    cause de refus est journalisée en debug avec un libellé statique
+    (distinguer un `None` légitime d'une panne, sans rien refléter).
     """
     content = _read_worktree_file(access.root / rel_path)
     if content is None:
+        logger.debug("refus anti auto-attestation : lecture worktree impossible (CWE-345)")
         return None
     try:
         entry = access.index_entry(rel_path, timeout=timeout)
-        if entry is None:
-            return None
+    except ToolFailure:
+        # Index illisible (symlinké, git en échec) : panne d'outillage,
+        # fail-closed comme un untracked, mais journalisée distinctement.
+        logger.debug("refus anti auto-attestation : lecture index impossible (CWE-345)")
+        return None
+    except Exception:
+        logger.debug("refus anti auto-attestation : entrée index inattendue (CWE-345)")
+        return None
+    if entry is None:
+        logger.debug("refus anti auto-attestation : configuration non suivie (CWE-345)")
+        return None
+    verified: bytes | None
+    try:
         _, index_sha = entry
         blob_sha1 = hashlib.sha1(
             f"blob {len(content)}\0".encode("ascii") + content,
@@ -278,11 +298,13 @@ def _is_worktree_file_clean_and_tracked(
         blob_sha256 = hashlib.sha256(
             f"blob {len(content)}\0".encode("ascii") + content
         ).hexdigest()
-        if index_sha in (blob_sha1, blob_sha256):
-            return content
-        return None
+        verified = content if index_sha in (blob_sha1, blob_sha256) else None
+        if verified is None:
+            logger.debug("refus anti auto-attestation : configuration divergente (CWE-345)")
     except Exception:
-        return None
+        logger.debug("refus anti auto-attestation : empreinte incalculable (CWE-345)")
+        verified = None
+    return verified
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +313,19 @@ class _VerifiedConfig:
 
     path: str
     content: bytes
+
+
+def _default_config_present(root: Path) -> bool:
+    """Vrai si `heimdall.toml` existe à la racine du dépôt.
+
+    `exists()` lève `OSError` sur un répertoire illisible (panne
+    d'outillage) : c'est un `ScanError` statique (code 2, invariant 11),
+    pas une absence silencieuse — comme `load_allowlist` le fait déjà.
+    """
+    try:
+        return (root / "heimdall.toml").exists()
+    except OSError:
+        raise ScanError(_MSG_NOT_A_REPO) from None
 
 
 def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
@@ -343,7 +378,7 @@ def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
         resolved_cfg = _resolve_root(cfg_path)
         if resolved_cfg.is_relative_to(root):
             rel_cfg = resolved_cfg.relative_to(root).as_posix()
-    elif (root / "heimdall.toml").exists():
+    elif _default_config_present(root):
         rel_cfg = "heimdall.toml"
 
     if ci:

@@ -468,7 +468,13 @@ class GitAccess:
         except OSError:
             raise ToolFailure("INTERNAL") from None
         finally:
-            os.close(descriptor)
+            # `os.close` peut lever `OSError` (EBADF/EINTR sur FS adverse) :
+            # convertir pour garder le contrat `ToolFailure("INTERNAL")`
+            # (invariant 11), comme `allowlist.py` et `scan.py` le font déjà.
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise ToolFailure("INTERNAL") from None
         return resolved
 
     def index_entry(

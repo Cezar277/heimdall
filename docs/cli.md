@@ -41,6 +41,14 @@ heimdall scan --json [CHEMIN]       # rapport JSON sur stdout
 | `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) ; un chemin **hors du dépôt** est accepté : choix opérateur explicite, soumis aux mêmes gardes (`_resolve_root` + `O_NOFOLLOW`, plafond de taille, contrat fermé) |
 | `--no-allowlist` | désactive l'allowlist déterministe pour le scan courant |
 
+En `--ci`, l'allowlist du dépôt ne peut jamais s'auto-attester : si un
+`heimdall.toml` est présent dans le dépôt scanné (versionné à la racine,
+comme ici), `scan --ci` sans option sort en code 2. L'opérateur a deux
+choix explicites : `--config` vers un fichier **hors du dépôt** épinglé
+par l'équipe (mêmes gardes et contrat fermé, recommandé), ou
+`--no-allowlist` (aucune ignorance, verdict maximal). Exemple :
+`heimdall scan --ci --config /opt/ci/allowlist.toml .`
+
 Le fichier d'allowlist est un **contrat fermé** : seule la table racine
 `[allowlist]` est acceptée, `version` est **obligatoire** et doit être le
 littéral `"1"` (un entier `1`, ou une `version` simplement omise, sont

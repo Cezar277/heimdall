@@ -11,6 +11,7 @@ Couvre :
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -998,6 +999,98 @@ def test_default_config_unreadable_is_scan_error(
     # Sans panne : l'absence avérée reste une allowlist vide (fail-closed).
     monkeypatch.undo()
     assert load_allowlist(repo).is_empty()
+
+
+def test_guard_default_config_unreadable_is_scan_error(
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue (LOW) : `exists()` en échec dans la garde → `ScanError`/code 2.
+
+    Même contrat que `load_allowlist` : un répertoire illisible est une
+    panne d'outillage (invariant 11), pas une absence silencieuse qui
+    contournerait la garde anti auto-attestation.
+    """
+    real_exists = Path.exists
+
+    def boom(self: Path) -> bool:
+        if self.name == "heimdall.toml":
+            raise OSError("EIO simulé")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", boom)
+    with pytest.raises(ScanError):
+        collect(git_repo.root, staged=False)
+    with pytest.raises(ScanError):
+        collect(git_repo.root, staged=True)
+    res = _run("scan", str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "scan impossible" in res.stderr.lower()
+    assert not isinstance(res.exception, OSError)
+
+
+def test_worktree_check_logs_distinct_refusal_causes(
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Revue (LOW) : les causes de refus de la garde se distinguent en logs.
+
+    `None` légitime (untracked) vs panne (index illisible) vs dirty : même
+    verdict fail-closed (`None`), mais libellés debug distincts et
+    statiques (aucune entrée ni secret reflété, invariant 8).
+    """
+    access = GitAccess(git_repo.root)
+    with caplog.at_level(logging.DEBUG, logger="heimdall.cli.scan"):
+        assert (
+            scan_module._is_worktree_file_clean_and_tracked(
+                access, "ghost.toml", timeout=30
+            )
+            is None
+        )
+    assert "lecture worktree impossible" in caplog.text
+    caplog.clear()
+
+    # Index lisible mais fichier non suivi : `None` légitime.
+    git_repo.write("app.py", 'KEY = "x"\n')
+    git_repo.commit_all("chore: init")
+    git_repo.write("heimdall.toml", _config_saine())
+    with caplog.at_level(logging.DEBUG, logger="heimdall.cli.scan"):
+        assert (
+            scan_module._is_worktree_file_clean_and_tracked(
+                access, "heimdall.toml", timeout=30
+            )
+            is None
+        )
+    assert "non suivie" in caplog.text
+    caplog.clear()
+
+    def boom_index(self: GitAccess, *args: object, **kwargs: object) -> None:
+        raise ToolFailure("INTERNAL")
+
+    monkeypatch.setattr(GitAccess, "index_entry", boom_index)
+    with caplog.at_level(logging.DEBUG, logger="heimdall.cli.scan"):
+        assert (
+            scan_module._is_worktree_file_clean_and_tracked(
+                access, "heimdall.toml", timeout=30
+            )
+            is None
+        )
+    assert "lecture index impossible" in caplog.text
+    caplog.clear()
+    monkeypatch.undo()
+
+    git_repo.stage("heimdall.toml")
+    git_repo.commit_all("chore: config initiale")
+    git_repo.write("heimdall.toml", _config_saine() + "# retouche locale\n")
+    with caplog.at_level(logging.DEBUG, logger="heimdall.cli.scan"):
+        assert (
+            scan_module._is_worktree_file_clean_and_tracked(
+                access, "heimdall.toml", timeout=30
+            )
+            is None
+        )
+    assert "divergente" in caplog.text
 
 
 # --- 7. Tests d'exhaustivité et de robustesse supplémentaire -----------------

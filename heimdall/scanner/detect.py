@@ -363,7 +363,12 @@ class Scanner:
         except OSError:
             raise ScanError(_SCAN_ERROR) from None
         finally:
-            os.close(descriptor)
+            # `os.close` peut lever `OSError` (EBADF/EINTR sur FS adverse) :
+            # convertir pour garder le contrat unique `ScanError` (invariant 11).
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise ScanError(_SCAN_ERROR) from None
         return (
             _decode_data(data, allow_binary_suffix=allow_binary_suffix),
             len(data),
