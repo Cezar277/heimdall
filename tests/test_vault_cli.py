@@ -109,6 +109,52 @@ class VaultPushCliTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 2)
             self.assertIn("lien symbolique", result.output)
 
+    def test_push_rejects_too_many_secrets_before_any_post(self) -> None:
+        """> 1024 entrées → Exit(1) avant `_init_client`, donc aucun POST partiel."""
+        env_file = self.tmp_dir / ".env"
+        env_file.write_text(
+            "\n".join(f"SECRET_{index:04d}=value" for index in range(2000)) + "\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "push",
+                        "--file",
+                        str(env_file),
+                        "--project",
+                        "demo",
+                    ],
+                )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("trop de secrets", result.output)
+        mock_init.assert_not_called()
+
+    def test_push_rejects_cumulative_secret_volume_before_any_post(self) -> None:
+        """Volume cumulé > 1 Mio → Exit(1) avant `_init_client`, aucun POST."""
+        secrets = {f"BIG_{index:02d}": "x" * 65_536 for index in range(17)}
+        self.assertGreater(sum(len(value) for value in secrets.values()), 1_048_576)
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch(
+                "heimdall.cli.vault_client._read_input_secrets",
+                return_value=secrets,
+            ):
+                with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                    result = self.runner.invoke(
+                        app,
+                        ["vault", "push", "--project", "demo"],
+                    )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("volume cumulé", result.output)
+        mock_init.assert_not_called()
+
     def test_push_rejects_invalid_project_or_env(self) -> None:
         """Validation fail-closed des formats de projet et d'environnement."""
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
@@ -467,6 +513,37 @@ class VaultPullCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 1)
         self.assertIn("volume cumulé", result.output)
         self.assertEqual(client_instance.get_secret.call_count, 17)
+        self.assertFalse(output_file.exists())
+
+    def test_pull_maps_value_error_identifier_to_exit_1(self) -> None:
+        """`ValueError` d'identifiant du client → Exit(1) propre, sans traceback."""
+        output_file = self.tmp_dir / ".env"
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.side_effect = ValueError(
+                    "Identifiant de secret invalide"
+                )
+                mock_init.return_value = client_instance
+
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "SAFE_VAR",
+                        "--output",
+                        str(output_file),
+                    ],
+                )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("identifiant invalide", result.output.lower())
+        self.assertNotIn("Traceback", result.output)
         self.assertFalse(output_file.exists())
 
     def test_pull_creates_backup_when_env_already_exists(self) -> None:
@@ -1768,6 +1845,51 @@ class VaultRunCliTests(unittest.TestCase):
                         self.assertEqual(result.exit_code, 127)
                         self.assertIn("introuvable", result.output)
                         mock_run.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX requis")
+    def test_run_refuses_path_command_rewritten_in_place_before_exec(self) -> None:
+        """Voie slash : même inode, contenu/taille changés pendant le fetch → refus."""
+        tool = self.tmp_dir / "tool.sh"
+        tool.write_text("#!/bin/sh\necho safe\n", encoding="utf-8")
+        os.chmod(tool, 0o600)  # Non exécutable : `which` renvoie None (voie slash).
+        inode_before = tool.stat().st_ino
+
+        def rewrite_in_place(*args: object, **kwargs: object) -> dict[str, str]:
+            # Réécriture O_TRUNC : même inode, contenu/taille/mtime/ctime changés.
+            tool.write_text("#!/bin/sh\necho pwned-with-more-bytes\n", encoding="utf-8")
+            return {
+                "project": "demo",
+                "env": "dev",
+                "name": "SAFE_VAR",
+                "status": "actif",
+                "value": "secret_val",
+            }
+
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.side_effect = rewrite_in_place
+                mock_init.return_value = client_instance
+                with patch("heimdall.cli.vault_client.subprocess.run") as mock_run:
+                    result = self.runner.invoke(
+                        app,
+                        [
+                            "run",
+                            "--project",
+                            "demo",
+                            "--name",
+                            "SAFE_VAR",
+                            "--",
+                            str(tool),
+                            "--do",
+                        ],
+                    )
+
+        self.assertEqual(tool.stat().st_ino, inode_before)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("modifiée", result.output)
+        mock_run.assert_not_called()
 
     def test_run_resolves_binary_before_injection(self) -> None:
         """La commande cible est résolue avant injection des variables (§HIGH 3)."""

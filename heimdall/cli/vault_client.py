@@ -24,7 +24,7 @@ import shutil
 import stat
 import subprocess  # nosec B404
 from pathlib import Path
-from typing import Final
+from typing import Final, NoReturn
 
 import typer
 
@@ -465,6 +465,7 @@ def vault_push(  # noqa: PLR0913, PLR0917
         typer.echo("Aucun secret valide à pousser.", err=True)
         raise typer.Exit(code=2)
 
+    total_chars = 0
     for name, value in to_push.items():
         if not isinstance(value, str) or "\x00" in value or "\n" in value or "\r" in value:
             # Refus franc avant tout envoi : un octet nul ou un saut de ligne
@@ -476,6 +477,12 @@ def vault_push(  # noqa: PLR0913, PLR0917
                 err=True,
             )
             raise typer.Exit(code=2)
+        total_chars += len(value)
+
+    # Mêmes bornes anti-DoS que pull/run, AVANT toute initialisation client
+    # et donc avant le premier POST : jamais d'envoi partiel.
+    _enforce_secret_count(len(to_push))
+    _enforce_total_secret_chars(total_chars)
 
     client = _init_client(vault_url, ca_cert)
     created = 0
@@ -554,6 +561,28 @@ def _resolve_pull_names(
     raise typer.Exit(code=2)
 
 
+def _enforce_secret_count(count: int) -> None:
+    """Refuse un nombre de secrets au-delà du plafond anti-DoS local."""
+    if count > _MAX_SECRETS_PER_PULL:
+        typer.echo(
+            f"Erreur de sécurité : trop de secrets ({count}, "
+            f"max {_MAX_SECRETS_PER_PULL}).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _enforce_total_secret_chars(total_chars: int) -> None:
+    """Refuse un volume cumulé de valeurs au-delà du plafond anti-OOM local."""
+    if total_chars > _MAX_TOTAL_SECRET_CHARS:
+        typer.echo(
+            "Erreur de sécurité : volume cumulé des secrets trop important "
+            f"(max {_MAX_TOTAL_SECRET_CHARS} caractères).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
 def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
     client: VaultClient,
     proj: str,
@@ -576,13 +605,7 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
     caractères cumulés. Un Vault compromis ne peut donc pas faire croître le
     dict/``.env``/environnement enfant à plusieurs Go.
     """
-    if len(target_names) > _MAX_SECRETS_PER_PULL:
-        typer.echo(
-            "Erreur de sécurité : trop de secrets demandés "
-            f"({len(target_names)}, max {_MAX_SECRETS_PER_PULL}).",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+    _enforce_secret_count(len(target_names))
 
     retrieved: dict[str, str] = {}
     total_chars = 0
@@ -615,13 +638,7 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
                 )
                 raise typer.Exit(code=1)
             total_chars += len(val)
-            if total_chars > _MAX_TOTAL_SECRET_CHARS:
-                typer.echo(
-                    "Erreur de sécurité : volume cumulé des secrets trop important "
-                    f"(max {_MAX_TOTAL_SECRET_CHARS} caractères).",
-                    err=True,
-                )
-                raise typer.Exit(code=1)
+            _enforce_total_secret_chars(total_chars)
             retrieved[name] = val
         except VaultNotFoundError:
             typer.echo(
@@ -652,6 +669,15 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             if len(msg) > _MAX_ERROR_MSG_LEN:
                 msg = msg[:_TRUNCATE_MSG_LEN] + "..."
             typer.echo(f"Erreur lors de la récupération de '{name}' : {msg}", err=True)
+            raise typer.Exit(code=1) from None
+        except ValueError:
+            # Défense en profondeur : les patterns CLI et client sont
+            # dupliqués aujourd'hui. Une divergence future ne doit jamais
+            # produire un traceback (invariant 11) ni refléter la valeur.
+            typer.echo(
+                f"Erreur : identifiant invalide pour le secret '{name[:32]!r}'.",
+                err=True,
+            )
             raise typer.Exit(code=1) from None
     return retrieved
 
@@ -794,13 +820,17 @@ def _resolve_run_names(
     raise typer.Exit(code=2)
 
 
-def _regular_file_identity(path: str) -> tuple[int, int] | None:
-    """Retourne ``(st_dev, st_ino)`` d'un fichier régulier, sinon ``None``.
+def _regular_file_identity(path: str) -> tuple[int, int, int, int, int] | None:
+    """Empreinte d'un fichier régulier, sinon ``None``.
 
-    Les liens symboliques du PATH (``/usr/bin/python3``...) sont suivis
-    volontairement : l'identité comparée est celle de la cible réellement
-    exécutée. Un remplacement à même chemin (rename/nouvel inode) ou un type
-    non régulier (FIFO, répertoire...) est ainsi détecté fail-closed.
+    Retourne ``(st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns)`` : au-delà
+    du simple chemin, un rename (nouvel inode), une réécriture en place
+    (taille/mtime/ctime changés) ou un type non régulier (FIFO, répertoire...)
+    est détecté fail-closed. Les liens symboliques du PATH
+    (``/usr/bin/python3``...) sont suivis volontairement : l'empreinte est
+    celle de la cible réellement exécutée. Limite documentée : une réécriture
+    préservant inode ET taille/mtime/ctime (horloge ou FS à granularité
+    grossière) n'est pas détectable sans ``fexecve``.
     """
     try:
         st = os.stat(path)
@@ -808,7 +838,17 @@ def _regular_file_identity(path: str) -> tuple[int, int] | None:
         return None
     if not stat.S_ISREG(st.st_mode):
         return None
-    return st.st_dev, st.st_ino
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def _refuse_modified_command() -> NoReturn:
+    """Refuse une commande dont l'empreinte a changé pendant le fetch Vault."""
+    typer.echo(
+        "Erreur de sécurité : commande modifiée ou remplacée "
+        "entre résolution et exécution.",
+        err=True,
+    )
+    raise typer.Exit(code=1)
 
 
 def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
@@ -849,16 +889,20 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
         raise typer.Exit(code=2)
 
     # Résolution préalable de l'exécutable dans le PATH actuel sans influence
-    # de variables injectées. L'identité (dev, ino) est figée avant le
+    # de variables injectées. L'empreinte du fichier est figée avant le
     # round-trip Vault : le chemin seul ne suffit pas, un remplacement à même
-    # chemin (rename) exécuterait sinon le binaire substitué avec les secrets.
+    # chemin exécuterait sinon le binaire substitué avec les secrets.
     executable = shutil.which(cmd[0])
-    if executable is None and not Path(cmd[0]).is_file():
+    # Voie `which` comme voie slash : figer l'empreinte du fichier réellement
+    # visé AVANT le round-trip Vault (les deux voies sont soumises au même
+    # remplacement à même chemin pendant le fetch). Pour la voie slash,
+    # l'empreinte sert aussi de contrôle d'existence/type (fichier régulier).
+    executable_identity = _regular_file_identity(
+        executable if executable is not None else cmd[0]
+    )
+    if executable is None and executable_identity is None:
         typer.echo(f"Erreur : commande introuvable : '{cmd[0]}'", err=True)
         raise typer.Exit(code=127)
-    executable_identity = (
-        _regular_file_identity(executable) if executable is not None else None
-    )
 
     proj = _validate_project_and_env(project, env)
     _validate_requested_names(names)
@@ -897,29 +941,22 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
         if not path_still_ok:
             typer.echo(f"Erreur : commande introuvable : '{cmd[0]}'", err=True)
             raise typer.Exit(code=127)
-    else:
-        # `which` peut renvoyer la même chaîne alors que le fichier a été
-        # remplacé à même chemin : comparer l'identité (st_dev, st_ino) figée
-        # avant le fetch, et exiger un fichier régulier juste avant `exec`.
-        current_identity = _regular_file_identity(executable)
-        if (
-            executable_identity is None
-            or current_identity is None
-            or current_identity != executable_identity
-        ):
-            typer.echo(
-                "Erreur de sécurité : commande modifiée ou remplacée "
-                "entre résolution et exécution.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        if shutil.which(cmd[0]) != executable:
-            typer.echo(
-                "Erreur de sécurité : commande modifiée ou remplacée "
-                "entre résolution et exécution.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
+    elif shutil.which(cmd[0]) != executable:
+        _refuse_modified_command()
+
+    # Voie `which` ET voie slash : l'empreinte figée avant le fetch doit être
+    # identique juste avant `exec` (même chemin mais inode/taille/mtime/ctime
+    # différents → refus). Une réécriture préservant toute l'empreinte reste
+    # une limite documentée (pas de `fexecve` portable).
+    current_identity = _regular_file_identity(
+        executable if executable is not None else cmd[0]
+    )
+    if (
+        executable_identity is None
+        or current_identity is None
+        or current_identity != executable_identity
+    ):
+        _refuse_modified_command()
 
     try:
         proc = subprocess.run(target_cmd, env=child_env, check=False)  # noqa: S603  # nosec B603
