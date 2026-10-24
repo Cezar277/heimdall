@@ -905,7 +905,12 @@ def load_allowlist_from_file(config_path: Path, *, repo_root: Path | None = None
             # Trop gros, ou fichier modifié pendant la lecture : fail-closed.
             raise ScanError(_CONFIG_ERROR)
     finally:
-        os.close(descriptor)
+        # `os.close` peut lever `OSError` (EBADF/EINTR sur FS adverse) :
+        # convertir pour garder le contrat unique `ScanError` (invariant 11).
+        try:
+            os.close(descriptor)
+        except OSError:
+            raise ScanError(_CONFIG_ERROR) from None
 
     return parse_allowlist_bytes(raw_bytes)
 
@@ -924,7 +929,8 @@ def load_allowlist(
     garde `_resolve_root` + `O_NOFOLLOW` et le plafond de taille s'appliquent
     toujours, et le contenu reste soumis au contrat fermé.
     Si `config_file` n'est pas fourni, recherche `heimdall.toml` à la racine de `root`.
-    Si `heimdall.toml` n'existe pas, retourne une Allowlist vide.
+    Si `heimdall.toml` est absent, retourne une Allowlist vide ; si son accès
+    échoue (`OSError` sur `exists()`), lève `ScanError` (code 2, invariant 11).
     """
     resolved_root = _resolve_root(root)
 
@@ -946,11 +952,15 @@ def load_allowlist(
         raise ScanError(_CONFIG_ERROR)
 
     default_config = resolved_root / "heimdall.toml"
+    # `exists()` lève `OSError` sur un répertoire illisible (panne
+    # d'outillage) : c'est un code 2, pas une allowlist vide silencieuse.
+    # Seule l'absence avérée du fichier vaut « pas de config » (le vide
+    # reste fail-closed : plus strict, aucun faux-négatif).
     try:
         if not default_config.exists():
             return Allowlist.empty()
     except OSError:
-        return Allowlist.empty()
+        raise ScanError(_CONFIG_ERROR) from None
 
     return load_allowlist_from_file(default_config, repo_root=resolved_root)
 

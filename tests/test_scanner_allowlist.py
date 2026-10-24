@@ -902,6 +902,104 @@ def test_cli_config_with_nul_fail_closed(git_repo: GitRepo) -> None:
     assert not isinstance(res_root.exception, ValueError)
 
 
+def test_close_failure_never_leaks_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue (LOW) : `os.close` en échec ne sort jamais en `OSError` brute.
+
+    `load_allowlist_from_file` convertit en `ScanError` (contrat unique,
+    invariant 11) ; `_read_worktree_file` rend `None` (fail-closed).
+    La fermeture réelle a lieu avant la panne simulée (pas de fuite de fd).
+    """
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(_config_saine(), encoding="utf-8")
+    real_close = os.close
+
+    def boom(fd: int) -> None:
+        real_close(fd)
+        raise OSError("EBADF simulé")
+
+    monkeypatch.setattr(os, "close", boom)
+    with pytest.raises(ScanError):
+        load_allowlist_from_file(cfg)
+    assert scan_module._read_worktree_file(cfg) is None
+
+
+def test_guard_messages_never_reflect_config_path(git_repo: GitRepo) -> None:
+    """Revue (LOW) : la garde anti auto-attestation parle sans nommer.
+
+    `rel_cfg` est une entrée opérateur normalisée : les messages sont
+    strictement statiques (invariant 8), en arbre comme en staged, via
+    `--config` interne comme via `heimdall.toml`.
+    """
+    git_repo.write("heimdall.toml", _config_saine())
+    git_repo.stage("heimdall.toml")
+    with pytest.raises(ScanError) as excinfo:
+        collect(git_repo.root, staged=False)
+    assert "auto-attestation" in str(excinfo.value)
+    assert "heimdall.toml" not in str(excinfo.value)
+
+    git_repo.write("custom-xyz.toml", _config_saine())
+    git_repo.stage("custom-xyz.toml")
+    with pytest.raises(ScanError) as excinfo_custom:
+        collect(git_repo.root, staged=False, config="custom-xyz.toml")
+    assert "auto-attestation" in str(excinfo_custom.value)
+    assert "custom-xyz" not in str(excinfo_custom.value)
+
+    # Worktree sale en mode staged : même statut, aucun chemin reflété.
+    git_repo.commit_all("chore: config initiale")
+    git_repo.write("heimdall.toml", _config_saine() + "# retouche locale\n")
+    with pytest.raises(ScanError) as excinfo_dirty:
+        collect(git_repo.root, staged=True)
+    assert "auto-attestation" in str(excinfo_dirty.value)
+    assert "heimdall.toml" not in str(excinfo_dirty.value)
+
+
+def test_verified_reload_message_is_static(
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue (LOW) : le re-contrôle anti-TOCTOU parle sans nommer.
+
+    Substitution entre garde et parsing → `ScanError` statique, sans le
+    chemin vérifié dans le message (même oracle que la garde ci-dessus).
+    """
+    content = _config_saine().encode("utf-8")
+    monkeypatch.setattr(
+        scan_module, "_read_worktree_file", lambda path: b"contenu-substitue"
+    )
+    verified = scan_module._VerifiedConfig(path="heimdall.toml", content=content)
+    with pytest.raises(ScanError) as excinfo:
+        scan_module._load_allowlist_verified(GitAccess(git_repo.root), verified)
+    assert "auto-attestation" in str(excinfo.value)
+    assert "heimdall.toml" not in str(excinfo.value)
+
+
+def test_default_config_unreadable_is_scan_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue (LOW) : `exists()` en échec → code 2, pas allowlist vide.
+
+    Un répertoire illisible est une panne d'outillage (invariant 11), pas
+    une absence de config. Seule l'absence avérée vaut « pas de config ».
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def boom(self: Path) -> bool:
+        raise OSError("EIO simulé")
+
+    monkeypatch.setattr(Path, "exists", boom)
+    with pytest.raises(ScanError):
+        load_allowlist(repo)
+
+    # Sans panne : l'absence avérée reste une allowlist vide (fail-closed).
+    monkeypatch.undo()
+    assert load_allowlist(repo).is_empty()
+
+
 # --- 7. Tests d'exhaustivité et de robustesse supplémentaire -----------------
 
 

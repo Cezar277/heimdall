@@ -212,28 +212,33 @@ def _read_worktree_file(path: Path) -> bytes | None:
         descriptor = os.open(resolved, _open_flags() | getattr(os, "O_NONBLOCK", 0))
     except (ScanError, OSError):
         return None
+    # Le `try` interne calcule le résultat, le `finally` ferme toujours le
+    # descripteur, et le `except` externe convertit toute `OSError` (lecture
+    # comme `os.close` en échec — EBADF/EINTR sur FS adverse) en `None`
+    # fail-closed : jamais d'`OSError` brute vers l'appelant.
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_CONFIG_BYTES:
-            return None
-        expected = metadata.st_size
-        chunks: list[bytes] = []
-        remaining = expected + 1  # un octet de plus détecte une croissance
-        while remaining > 0:
-            chunk = os.read(descriptor, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        content = b"".join(chunks)
-        # Un fichier qui a rétréci ou grossi pendant la lecture est refusé.
-        if len(content) != expected:
-            return None
-        return content
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_CONFIG_BYTES:
+                return None
+            expected = metadata.st_size
+            chunks: list[bytes] = []
+            remaining = expected + 1  # un octet de plus détecte une croissance
+            while remaining > 0:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            content = b"".join(chunks)
+            # Un fichier qui a rétréci ou grossi pendant la lecture est refusé.
+            if len(content) != expected:
+                return None
+            return content
+        finally:
+            os.close(descriptor)
     except OSError:
         return None
-    finally:
-        os.close(descriptor)
 
 
 def _is_worktree_file_clean_and_tracked(
@@ -361,8 +366,11 @@ def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
             for change in staged_changes
         )
         if is_cfg_staged:
+            # Message strictement statique : `rel_cfg` (entrée opérateur
+            # normalisée) n'est jamais reflété (invariant 8). En CLI le
+            # libellé est de toute façon masqué par le message générique.
             raise ScanError(
-                f"auto-attestation refusée : {rel_cfg} est staged (CWE-345)"
+                "auto-attestation refusée : configuration stagée (CWE-345)"
             )
         if is_staged_scan:
             content = _is_worktree_file_clean_and_tracked(
@@ -372,8 +380,8 @@ def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
             )
             if content is None:
                 raise ScanError(
-                    f"auto-attestation refusée : en mode --staged, {rel_cfg} du worktree n'est pas "
-                    "propre et suivi dans l'index (CWE-345)"
+                    "auto-attestation refusée : configuration du worktree non propre "
+                    "ou non suivie en mode --staged (CWE-345)"
                 )
             return _VerifiedConfig(path=rel_cfg, content=content)
     return None
@@ -392,8 +400,10 @@ def _load_allowlist_verified(
     allowlist = parse_allowlist_bytes(verified.content)
     current = _read_worktree_file(access.root / verified.path)
     if current is None or current != verified.content:
+        # Message strictement statique : `verified.path` (entrée opérateur)
+        # n'est jamais reflété (invariant 8), comme pour la garde ci-dessus.
         raise ScanError(
-            f"auto-attestation refusée : {verified.path} a changé pendant "
+            "auto-attestation refusée : configuration modifiée pendant "
             "le chargement (CWE-345)"
         )
     return allowlist
