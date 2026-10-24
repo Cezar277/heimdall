@@ -40,6 +40,7 @@ from heimdall.scanner.allowlist import (
     MAX_CONFIG_BYTES,
     MAX_DESCRIPTION_LENGTH,
     MAX_RULE_NAME_LENGTH,
+    MIN_KEYWORD_LENGTH,
     Allowlist,
     AllowlistRule,
     AllowlistTrace,
@@ -53,6 +54,7 @@ from heimdall.scanner.allowlist import (
 )
 from heimdall.scanner.detect import Scanner
 from heimdall.scanner.errors import ScanError
+from heimdall.scanner.finding import validate_relative_path
 
 
 @pytest.fixture
@@ -384,6 +386,17 @@ def test_load_allowlist_size_limit_fail_closed(tmp_path: Path) -> None:
 
 def test_parse_allowlist_unknown_keys_rejected() -> None:
     """CWE-20 : contrat fermé - les clés inattendues sont rejetées fail-closed."""
+    # Clé inconnue au premier niveau : une faute de frappe ne doit pas
+    # être ignorée silencieusement.
+    with pytest.raises(ScanError):
+        parse_allowlist_toml("""
+[tool.foo]
+bar = 1
+
+[allowlist]
+version = "1"
+""")
+
     # Clé inconnue dans [allowlist]
     with pytest.raises(ScanError):
         parse_allowlist_toml('[allowlist]\nversion = "1"\nextra_key = true\n')
@@ -397,9 +410,44 @@ version = "1"
 [[allowlist.rules]]
 name = "rule1"
 description = "desc"
-keywords = ["a"]
+keywords = ["abc"]
 unsupported_key = "value"
 """)
+
+
+def test_parse_allowlist_version_is_strictly_typed() -> None:
+    """`version = 1` (int) est refusé ; seul le littéral `"1"` est accepté."""
+    with pytest.raises(ScanError):
+        parse_allowlist_toml("[allowlist]\nversion = 1\n")
+
+    parsed = parse_allowlist_toml('[allowlist]\nversion = "1"\n')
+    assert parsed.is_empty()
+
+
+def test_parse_allowlist_short_keywords_rejected() -> None:
+    """Un mot-clé de moins de 3 caractères est refusé (règle trop large)."""
+    for short_keyword in ("a", "ab"):
+        with pytest.raises(ScanError):
+            parse_allowlist_toml(f"""
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "short-keyword"
+description = "d"
+keywords = ["{short_keyword}"]
+""")
+
+    parsed = parse_allowlist_toml("""
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "minimum-keyword"
+description = "d"
+keywords = ["abc"]
+""")
+    assert parsed.rules[0].keywords == ("abc",)
 
 
 def test_parse_allowlist_path_traversal_in_paths_rejected() -> None:
@@ -638,6 +686,20 @@ def test_create_default_rules_and_load_allowlist(git_repo: GitRepo) -> None:
     assert al_loaded.is_empty()
 
 
+def test_cli_without_config_does_not_apply_default_factories(git_repo: GitRepo) -> None:
+    """Sans heimdall.toml, aucune règle implicite ne s'applique au verdict.
+
+    `Allowlist.default()` et `create_default_rules()` sont des fabriques
+    d'API/test ; le chargement CLI utilise `Allowlist.empty()` en l'absence
+    de configuration auditée. Ce test fige cette frontière.
+    """
+    git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+
+    res = _run("scan", str(git_repo.root))
+    assert res.exit_code == EXIT_FINDINGS
+    assert "Allowlist : 0 finding(s) ignoré(s)" in res.stdout
+
+
 def test_cli_scan_runner_config_outside_repo_exits_two(git_repo: GitRepo) -> None:
     """Tentative de path traversal avec --config -> code 2 (erreur d'outillage)."""
     res = _run("scan", "--config", "../../etc/passwd", str(git_repo.root))
@@ -775,7 +837,7 @@ def test_parse_toml_edge_case_errors() -> None:
 
     # Trop de règles (>100)
     many_rules = '[allowlist]\nversion = "1"\n' + "\n".join(
-        f'[[allowlist.rules]]\nname = "r{i}"\ndescription = "d"\nkeywords = ["k"]\n'
+        f'[[allowlist.rules]]\nname = "r{i}"\ndescription = "d"\nkeywords = ["key"]\n'
         for i in range(101)
     )
     with pytest.raises(ScanError):
@@ -802,7 +864,7 @@ keywords = "not_a_list"
         '[allowlist]\nversion = "1"\n[[allowlist.rules]]\n'
         'name = "r"\ndescription = "d"\nkeywords = ['
     )
-    too_many_kw += ", ".join(f'"k{i}"' for i in range(51)) + "]\n"
+    too_many_kw += ", ".join(f'"kw{i}"' for i in range(51)) + "]\n"
     with pytest.raises(ScanError):
         parse_allowlist_toml(too_many_kw)
 
@@ -1120,6 +1182,30 @@ def test_fuzz_patterns_and_paths() -> None:
         line_number=1,
         secret_type="password",
     )
+
+    # `fnmatch` ne doit jamais transformer un chemin hostile en match.
+    fixtures_rule = AllowlistRule(
+        name="fixtures-only",
+        description="fuzz",
+        paths=("tests/**",),
+        keywords=("dummy",),
+    )
+    for hostile_path in (
+        "../tests/secret.py",
+        "/tests/secret.py",
+        "tests\\secret.py",
+    ):
+        assert not fixtures_rule.matches(
+            value="dummy",
+            file_path=hostile_path,
+            line_number=1,
+            secret_type="password",
+        )
+    # `fnmatch` n'est pas une garde de confinement : un chemin `..` peut
+    # correspondre au glob, mais il est refusé en amont par le contrat
+    # Finding #14 avant d'atteindre l'allowlist.
+    with pytest.raises(ValueError):
+        validate_relative_path("tests/../../etc/passwd")
 
     # Regex hostiles
     for bad_regex in ["a" * 129, "a\x00b", ""]:
@@ -1547,8 +1633,10 @@ def test_allowlist_exports_and_default_docstring() -> None:
     """Vérifie l'export des constantes de taille et la documentation de Allowlist.default."""
     assert "MAX_RULE_NAME_LENGTH" in al_module.__all__
     assert "MAX_DESCRIPTION_LENGTH" in al_module.__all__
+    assert "MIN_KEYWORD_LENGTH" in al_module.__all__
     assert MAX_RULE_NAME_LENGTH == 64
     assert MAX_DESCRIPTION_LENGTH == 512
+    assert MIN_KEYWORD_LENGTH == 3
 
     # Allowlist.default() fournit les règles standards et possède une docstring explicite
     default_al = Allowlist.default()

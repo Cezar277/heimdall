@@ -63,6 +63,13 @@ MAX_PATTERN_LENGTH: Final[int] = 128
 MAX_RULE_NAME_LENGTH: Final[int] = 64
 MAX_DESCRIPTION_LENGTH: Final[int] = 512
 
+#: Longueur minimale d'un mot-clé d'allowlist. Un mot-clé d'une ou deux
+#: lettres est trop large pour être auditable : avec la frontière `\b`
+#: stricte, `keywords = ["a"]` ignorerait toute valeur contenant le mot
+#: `a` seul. La validation s'applique aux configurations TOML ; l'API
+#: Python reste libre de construire des règles de test explicites.
+MIN_KEYWORD_LENGTH: Final[int] = 3
+
 #: Validation stricte de l'identifiant de règle (nom ASCII sécurisé).
 _RULE_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
@@ -290,11 +297,16 @@ class Allowlist:
 
         Cette méthode de fabrique est réservée aux tests et à l'API Python
         programmatique ; en usage CLI / CI, l'allowlist est chargée depuis la
-        configuration TOML auditée (`load_allowlist`).
+        configuration TOML auditée (`load_allowlist`). Sans `heimdall.toml`,
+        `load_allowlist` retourne volontairement `Allowlist.empty()` : aucune
+        règle implicite ne s'applique au verdict.
         """
         return cls(create_default_rules(), sha256=None)
 
 
+#: Fabrique de commodité (tests/API). Elle n'est pas branchée sur le
+#: chargement CLI/CI : la configuration versionnée `heimdall.toml` reste la
+#: seule source d'allowlist opposable, et l'absence de fichier vaut vide.
 def create_default_rules() -> tuple[AllowlistRule, ...]:
     """Crée les règles déterministes par défaut demandées par le ticket #24 :
 
@@ -383,7 +395,12 @@ _ALLOWED_RULE_KEYS: Final[frozenset[str]] = frozenset(
 )
 
 
-def _parse_str_list(raw_dict: dict[str, object], field: str) -> tuple[str, ...]:
+def _parse_str_list(
+    raw_dict: dict[str, object],
+    field: str,
+    *,
+    min_length: int = 1,
+) -> tuple[str, ...]:
     items = raw_dict.get(field, [])
     if not isinstance(items, list):
         raise ScanError(_CONFIG_ERROR)
@@ -391,7 +408,11 @@ def _parse_str_list(raw_dict: dict[str, object], field: str) -> tuple[str, ...]:
         raise ScanError(_CONFIG_ERROR)
     res: list[str] = []
     for item in items:
-        if not isinstance(item, str) or not item or len(item) > MAX_PATTERN_LENGTH:
+        if (
+            not isinstance(item, str)
+            or len(item) < min_length
+            or len(item) > MAX_PATTERN_LENGTH
+        ):
             raise ScanError(_CONFIG_ERROR)
         if "\x00" in item:
             raise ScanError(_CONFIG_ERROR)
@@ -410,7 +431,11 @@ def _parse_rule_dict(raw_rule: object) -> AllowlistRule:
     if not isinstance(name, str) or not isinstance(description, str):
         raise ScanError(_CONFIG_ERROR)
 
-    keywords = _parse_str_list(raw_rule, "keywords")
+    keywords = _parse_str_list(
+        raw_rule,
+        "keywords",
+        min_length=MIN_KEYWORD_LENGTH,
+    )
     secret_types = _parse_str_list(raw_rule, "secret_types")
 
     raw_paths = raw_rule.get("paths", [])
@@ -443,7 +468,12 @@ def parse_allowlist_toml(content: str, *, sha256: str | None = None) -> Allowlis
     if not isinstance(data, dict):
         raise ScanError(_CONFIG_ERROR)
 
-    allowlist_table = data.get("allowlist")
+    # Contrat fermé au premier niveau : une faute de frappe (`[tool.foo]`,
+    # `[allowlistt]`) doit échouer loud, pas être ignorée silencieusement.
+    if set(data.keys()) != {"allowlist"}:
+        raise ScanError(_CONFIG_ERROR)
+
+    allowlist_table = data["allowlist"]
     if not isinstance(allowlist_table, dict):
         raise ScanError(_CONFIG_ERROR)
 
@@ -452,7 +482,8 @@ def parse_allowlist_toml(content: str, *, sha256: str | None = None) -> Allowlis
         raise ScanError(_CONFIG_ERROR)
 
     version = allowlist_table.get("version", "1")
-    if str(version) != "1":
+    # Typage strict : `version = 1` (int) n'est pas `version = "1"`.
+    if not isinstance(version, str) or version != "1":
         raise ScanError(_CONFIG_ERROR)
 
     raw_rules = allowlist_table.get("rules", [])
@@ -565,6 +596,7 @@ __all__ = [
     "MAX_PATTERN_LENGTH",
     "MAX_RULES",
     "MAX_RULE_NAME_LENGTH",
+    "MIN_KEYWORD_LENGTH",
     "Allowlist",
     "AllowlistRule",
     "AllowlistTrace",
