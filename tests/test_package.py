@@ -5,10 +5,16 @@ import os
 import pickle
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 from typer.testing import CliRunner
 
@@ -29,6 +35,22 @@ import heimdall.vault.crypto
 class PackageSmokeTests(unittest.TestCase):
     def test_version_exposed(self) -> None:
         self.assertEqual(heimdall.__version__, "0.1.0")
+
+    def test_tomli_declared_as_runtime_dependency_for_python_310(self) -> None:
+        """`client.py` importe tomli au runtime sur 3.10 : pas seulement en [dev]."""
+        root = Path(__file__).resolve().parents[1]
+        document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        runtime = document["project"]["dependencies"]
+        normalized = [requirement.replace(" ", "") for requirement in runtime]
+        self.assertTrue(
+            any(
+                requirement.startswith("tomli==") and "python_version<'3.11'" in requirement
+                for requirement in normalized
+            ),
+            runtime,
+        )
+        dev = document["project"]["optional-dependencies"]["dev"]
+        self.assertFalse(any(requirement.startswith("tomli==") for requirement in dev))
 
     def test_subpackages_importable(self) -> None:
         for module in (
