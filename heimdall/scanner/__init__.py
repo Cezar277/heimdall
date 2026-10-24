@@ -17,6 +17,7 @@ from heimdall.scanner.allowlist import (
     load_allowlist,
 )
 from heimdall.scanner.detect import find_candidates
+from heimdall.scanner.entropy_detection import EntropyConfig
 from heimdall.scanner.errors import InvalidFinding, InvalidTarget, ScanError
 from heimdall.scanner.finding import (
     FINDING_FIELDS,
@@ -51,6 +52,7 @@ __all__ = [
     "FINDING_FIELDS",
     "SIGNATURES",
     "DiffTarget",
+    "EntropyConfig",
     "FileTarget",
     "Finding",
     "FindingSource",
