@@ -32,6 +32,7 @@ dependencies = [
   "argon2-cffi==25.1.0",    # Dérivation/hachage côté Vault — import confiné à heimdall/vault/crypto.py
   "httpx==0.28.1",          # Client HTTP (tests ASGI + futur client Vault avec verify obligatoire)
   "typer==0.27.3",          # CLI `heimdall` (Typer au-dessus de Click)
+  "tomli==2.5.0",            # lecture TOML (détection projet) sur Python 3.10 ; pin inconditionnel pour --require-hashes
 ]
 
 [project.optional-dependencies]
@@ -43,7 +44,6 @@ dev = [
   "setuptools==84.2.1",     # backend de build, installé depuis le lock en CI
   "pytest-cov==7.1.0",      # couverture + seuil CI (#20), aligné sur tests/security
   "pip-audit==2.10.1",      # audit CVE des dépendances en CI (#20), réseau documenté README
-  "tomli==2.5.0; python_version < '3.11'",  # lecture TOML des tests d'acceptation sur 3.10
   # TestClient de Starlette (T255) : starlette 1.7 exige httpx2 pour son
   # `starlette.testclient` (le repli sur httpx est déprécié). Dépendance directe
   # explicite : elle ne doit pas dépendre d'un autre paquet (mcp).
