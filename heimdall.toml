@@ -1,0 +1,41 @@
+# Heimdall Configuration - Allowlist déterministe (#24)
+# Écarte les cas évidents sans passer par le LLM (local et CI).
+# Chaque rejet produit une trace auditable : (règle, fichier, ligne).
+#
+# Piège évité : aucun allowlist global de tests/ ; un secret réel dans tests/
+# reste détecté et bloque la CI s'il ne répond pas à une règle spécifique de factice.
+
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "example-placeholders"
+description = "Mots-clés et jetons d'exemple évidents (ex: AKIA...EXAMPLE, your_key_here)"
+keywords = ["example", "sample", "your_key_here"]
+
+[[allowlist.rules]]
+name = "changeme-passwords"
+description = "Mots de passe ou valeurs de configuration par défaut changeme"
+keywords = ["changeme"]
+
+[[allowlist.rules]]
+name = "dummy-tokens"
+description = "Valeurs, identifiants et jetons factices dummy"
+keywords = ["dummy"]
+
+[[allowlist.rules]]
+name = "test-fixtures"
+description = "Fixtures et valeurs factices explicites dans les répertoires et fichiers de test"
+paths = ["tests/**", "*_test.py", "test_*.py", "**/fixtures/**", "**/support/**"]
+keywords = [
+  "test",
+  "fake",
+  "mock",
+  "dummy",
+  "placeholder",
+  "synthetic",
+  "factice",
+  "fixture",
+  "expected",
+  "invalid",
+]

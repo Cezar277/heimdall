@@ -1675,13 +1675,27 @@ def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
         "https://github.com/Cezar277/heimdall/schemas/finding.schema.json"
     )
     assert document["count"] == len(document["findings"]) == 1
-    assert set(document) == {"schema", "scope", "count", "findings"}
+    assert set(document) == {
+        "schema",
+        "scope",
+        "count",
+        "findings",
+        "ignored_count",
+        "traces",
+    }
 
 
 def test_scan_schema_refuses_invalid_documents() -> None:
     """Le schéma fige le contrat : valeur, enum, fermeture et items Finding."""
     validator = _scan_validator()
-    base = {"schema": "heimdall.scan.v1", "scope": "staged", "count": 0, "findings": []}
+    base = {
+        "schema": "heimdall.scan.v1",
+        "scope": "staged",
+        "count": 0,
+        "findings": [],
+        "ignored_count": 0,
+        "traces": [],
+    }
     assert validator.is_valid(base)
     for invalide in (
         dict(base, schema="heimdall.scan.v2"),

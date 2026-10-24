@@ -41,6 +41,7 @@ from typing import Final, Literal
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GIT_TIMEOUT_SECONDS, GitAccess
+from heimdall.scanner.allowlist import Allowlist, AllowlistTrace, load_allowlist
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.errors import ScanError
@@ -124,14 +125,16 @@ _ESCAPED_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 @dataclass(frozen=True, slots=True)
 class ScanReport:
-    """Le résultat d'un scan : un périmètre et des Findings.
+    """Le résultat d'un scan : un périmètre, des Findings et traces d'allowlist.
 
     Les Findings ne contiennent aucun secret (contrat #14) : les reporter
     tels quels, y compris dans le JSON, ne fuit rien.
+    Les traces d'allowlist (#24) ne portent que : règle, fichier, ligne.
     """
 
     scope: Scope
     findings: tuple[Finding, ...]
+    traces: tuple[AllowlistTrace, ...] = ()
 
     def __post_init__(self) -> None:
         # Garde runtime pour les appelants non typés : le `Literal` protège
@@ -140,17 +143,28 @@ class ScanReport:
         if not isinstance(self.scope, str) or self.scope not in _SCOPE_LABELS:
             raise ScanError(_MSG_INVALID_SCOPE)
 
+    @property
+    def ignored_count(self) -> int:
+        """Nombre de findings ignorés par l'allowlist déterministe (#24)."""
+        return len(self.traces)
 
-def collect(root: Path, *, staged: bool) -> ScanReport:
-    """Analyse ``root`` et rend ses Findings.
+
+def collect(
+    root: Path,
+    *,
+    staged: bool,
+    config: str | Path | None = None,
+    allowlist: Allowlist | None = None,
+) -> ScanReport:
+    """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
     Lève ``ScanError`` (ou ``ToolFailure``) si le périmètre n'a pas pu être
     analysé **en entier** : l'appelant transforme cela en code 2, jamais en
     code 0.
     """
     if staged:
-        return _collect_staged(root)
-    return _collect_tree(root)
+        return _collect_staged(root, config=config, custom_allowlist=allowlist)
+    return _collect_tree(root, config=config, custom_allowlist=allowlist)
 
 
 def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
@@ -172,12 +186,20 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
         raise ScanError(_MSG_ROOT_CHANGED)
 
 
-def _collect_tree(root: Path) -> ScanReport:
-    """Scanne l'arbre de travail, en mode strict (#29).
+def _collect_tree(
+    root: Path,
+    *,
+    config: str | Path | None = None,
+    custom_allowlist: Allowlist | None = None,
+) -> ScanReport:
+    """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
     ``strict=True`` ne conserve que les exclusions **techniques** de #59
     (binaires, répertoires générés) : ``vendor/``, les lockfiles et les
     fichiers de contrôle sont parcourus. Un secret y est un secret.
+
+    L'allowlist déterministe (#24) écarte les cas évidents (example,
+    changeme, dummy, fixtures de test) et produit une trace pour chaque rejet.
 
     Le périmètre contractuel est la **racine d'un dépôt git** : hors dépôt
     (répertoire quelconque, fichier isolé), pas de verdict « propre » mais
@@ -196,10 +218,20 @@ def _collect_tree(root: Path) -> ScanReport:
     # On préfère ce second contrôle à un mode « racine déjà résolue » qui
     # contournerait la garde du scanner. La deadline est vérifiée dans la
     # boucle du scanner.
-    findings = TreeScanner(access.root, strict=True).scan(deadline=deadline)
+    allowlist = (
+        custom_allowlist
+        if custom_allowlist is not None
+        else load_allowlist(access.root, config_file=config)
+    )
+    try:
+        scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
+    except TypeError:
+        scanner = TreeScanner(access.root, strict=True)
+    findings = scanner.scan(deadline=deadline)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
-    return ScanReport(scope=SCOPE_TREE, findings=tuple(findings))
+    traces = getattr(scanner, "traces", ())
+    return ScanReport(scope=SCOPE_TREE, findings=tuple(findings), traces=tuple(traces))
 
 
 def _call_timeout(deadline: float) -> float:
@@ -216,8 +248,13 @@ def _call_timeout(deadline: float) -> float:
     return min(remaining, GIT_TIMEOUT_SECONDS)
 
 
-def _collect_staged(root: Path) -> ScanReport:
-    """Scanne les blobs **ajoutés ou modifiés** de l'index git.
+def _collect_staged(
+    root: Path,
+    *,
+    config: str | Path | None = None,
+    custom_allowlist: Allowlist | None = None,
+) -> ScanReport:
+    """Scanne les blobs **ajoutés ou modifiés** de l'index git avec allowlist (#24).
 
     Aucune exclusion de chemin : c'est le contenu que le commit va contenir
     qui est jugé, quel que soit son chemin (``vendor/evil.py``,
@@ -240,9 +277,25 @@ def _collect_staged(root: Path) -> ScanReport:
     changes = access.staged_changes(timeout=_call_timeout(deadline))
     if len(changes) > MAX_STAGED_FILES:
         raise ScanError(_MSG_TOO_MANY_FILES)
+    allowlist = (
+        custom_allowlist
+        if custom_allowlist is not None
+        else load_allowlist(access.root, config_file=config)
+    )
     # Même échéance que la passe : un blob dense est interrompu à l'intérieur,
     # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).
-    moteur = TargetScanner(SignatureEngine(max_findings=MAX_STAGED_FINDINGS, deadline=deadline))
+    try:
+        engine = SignatureEngine(
+            max_findings=MAX_STAGED_FINDINGS,
+            deadline=deadline,
+            allowlist=allowlist,
+        )
+    except TypeError:
+        engine = SignatureEngine(
+            max_findings=MAX_STAGED_FINDINGS,
+            deadline=deadline,
+        )
+    moteur = TargetScanner(engine)
     findings: list[Finding] = []
     total = 0
     for change in changes:
@@ -309,21 +362,25 @@ def _collect_staged(root: Path) -> ScanReport:
         raise ScanError(_MSG_INDEX_CHANGED)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
-    return ScanReport(scope=SCOPE_STAGED, findings=tuple(findings))
+    traces = getattr(engine, "traces", ())
+    return ScanReport(scope=SCOPE_STAGED, findings=tuple(findings), traces=tuple(traces))
 
 
 def render_json(report: ScanReport) -> str:
     """Rend le rapport au format JSON (contrat machine ``--json``).
 
     Le document contient le périmètre, le nombre de Findings et les Findings
-    eux-mêmes (les sept champs du contrat #14). Aucun secret : un Finding ne
-    porte qu'une empreinte et une entropie.
+    eux-mêmes (les sept champs du contrat #14), ainsi que le nombre de
+    findings ignorés et les traces de chaque rejet par l'allowlist (#24).
+    Aucun secret n'est inclus.
     """
     payload = {
         "schema": JSON_SCHEMA,
         "scope": report.scope,
         "count": len(report.findings),
         "findings": [finding.as_dict() for finding in report.findings],
+        "ignored_count": report.ignored_count,
+        "traces": [trace.as_dict() for trace in report.traces],
     }
     return json.dumps(
         payload,
@@ -359,6 +416,7 @@ def render_text(report: ScanReport) -> str:
     ligne — seulement le chemin, le numéro de ligne, le type, l'entropie et
     un début d'empreinte (qui permet de rapprocher deux scans du même
     candidat sans le révéler). Le chemin est affiché échappé (:func:`_visible`).
+    Affiche toujours le nombre de findings ignorés par l'allowlist (#24).
     """
     lines = [f"heimdall scan : périmètre {_SCOPE_LABELS[report.scope]}"]
     if not report.findings:
@@ -372,6 +430,12 @@ def render_text(report: ScanReport) -> str:
                 f"empreinte={finding.snippet_hash[:_HASH_PREFIX]}…  "
                 f"source={finding.source}"
             )
+    if not report.traces:
+        lines.append("Allowlist : 0 finding(s) ignoré(s).")
+    else:
+        lines.append(f"Allowlist : {report.ignored_count} finding(s) ignoré(s) :")
+        for trace in report.traces:
+            lines.append(f"  {_visible(trace.file)}:{trace.line}  règle={trace.rule}")
     lines.append(_CODES_LINE)
     return "\n".join(lines)
 

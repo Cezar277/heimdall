@@ -35,6 +35,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
+from heimdall.scanner.allowlist import Allowlist, AllowlistTrace, load_allowlist
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import (
@@ -200,6 +201,7 @@ class Scanner:
     """
 
     __slots__ = (
+        "_allowlist",
         "_hasher",
         "_max_bytes",
         "_max_files",
@@ -207,6 +209,7 @@ class Scanner:
         "_root",
         "_single",
         "_strict",
+        "_traces",
     )
 
     def __init__(  # noqa: PLR0913 - bornes nommées explicites, cf. MAX_*.
@@ -218,6 +221,7 @@ class Scanner:
         max_files: int | None = None,
         max_bytes: int | None = None,
         max_findings: int | None = None,
+        allowlist: Allowlist | None = None,
     ) -> None:
         # Les bornes sont validées avant tout accès disque : une surcharge
         # explicite ne peut ni annuler ni relever les plafonds par défaut.
@@ -235,6 +239,13 @@ class Scanner:
             raise ScanError(_SCAN_ERROR)
         self._hasher = SnippetHasher() if hasher is None else hasher
         self._strict = strict
+        self._allowlist = allowlist if allowlist is not None else load_allowlist(self._root)
+        self._traces: list[AllowlistTrace] = []
+
+    @property
+    def traces(self) -> tuple[AllowlistTrace, ...]:
+        """Traces déterministes des rejets par l'allowlist (#24)."""
+        return tuple(self._traces)
 
     def scan(self, *, deadline: float | None = None) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.
@@ -419,6 +430,7 @@ class Scanner:
                     match,
                     line_number,
                     relative,
+                    line_text=line,
                     deadline=deadline,
                 )
             following = self._joined_window(line, lines, index)
@@ -437,6 +449,7 @@ class Scanner:
                     match,
                     line_number,
                     relative,
+                    line_text=joined,
                     deadline=deadline,
                 )
         return findings
@@ -466,6 +479,7 @@ class Scanner:
         line_number: int,
         relative: str,
         *,
+        line_text: str = "",
         deadline: float | None = None,
     ) -> None:
         # Une seule ligne peut porter des milliers de matches : le contrôle
@@ -482,6 +496,24 @@ class Scanner:
         if key in seen:
             return
         seen.add(key)
+
+        # Allowlist déterministe (#24) : écarte les cas évidents sans passer
+        # par le LLM. Chaque rejet émet une trace traçable (règle, fichier, ligne).
+        if not self._allowlist.is_empty():
+            rule_name = self._allowlist.evaluate(
+                value=match.value,
+                file=relative,
+                line=line_number,
+                secret_type=match.secret_type,
+                line_text=line_text,
+                snippet_hash=snippet_hash,
+            )
+            if rule_name is not None:
+                self._traces.append(
+                    AllowlistTrace(rule=rule_name, file=relative, line=line_number)
+                )
+                return
+
         findings.append(
             Finding(
                 file=relative,
@@ -504,6 +536,7 @@ def scan(
     *,
     hasher: SnippetHasher | None = None,
     strict: bool = False,
+    allowlist: Allowlist | None = None,
 ) -> list[Finding]:
     """Analyse ``root`` et retourne des objets :class:`Finding`.
 
@@ -511,14 +544,18 @@ def scan(
     techniques de #59 : ``vendor/``, lockfiles et fichiers de contrôle sont
     alors parcourus.
     """
-    return Scanner(root, hasher=hasher, strict=strict).scan()
+    return Scanner(root, hasher=hasher, strict=strict, allowlist=allowlist).scan()
 
 
-def find_candidates(path: str) -> list[dict[str, object]]:
+def find_candidates(
+    path: str,
+    *,
+    allowlist: Allowlist | None = None,
+) -> list[dict[str, object]]:
     """Repère les candidats secrets sous ``path`` (dépôt ou fichier).
 
     Retourne des dictionnaires conformes au contrat Finding v1 (#14). Lève
     ``ScanError`` dès qu'une partie du périmètre ne peut pas être analysée :
     un scan incomplet ne devient jamais une liste vide ou partielle.
     """
-    return [finding.as_dict() for finding in scan(path)]
+    return [finding.as_dict() for finding in scan(path, allowlist=allowlist)]

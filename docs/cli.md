@@ -36,8 +36,10 @@ heimdall scan --json [CHEMIN]       # rapport JSON sur stdout
 | Option | Effet |
 | --- | --- |
 | `--staged` | change le **périmètre** : les blobs **ajoutés ou modifiés** de l'index git, lus blob par blob, **sans aucune exclusion de chemin** |
-| `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr |
-| `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; les erreurs restent sur stderr |
+| `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr (avec décompte des secrets ignorés par l'allowlist) |
+| `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; inclut les traces et décomptes d'allowlist (#24) ; les erreurs restent sur stderr |
+| `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) |
+| `--no-allowlist` | désactive l'allowlist déterministe pour le scan courant |
 
 `CHEMIN` vaut `.` par défaut. Il doit être la **racine** d'un dépôt git,
 dans les deux périmètres (sinon : erreur, code 2) : hors dépôt —

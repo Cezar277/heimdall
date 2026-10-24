@@ -2,14 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Cezar277/heimdall/schemas/scan.schema.json",
   "title": "Heimdall scan report v1",
-  "description": "Rapport rendu par `heimdall scan --json` (ticket #29). Le document ne porte aucun secret : chaque Finding ne contient qu'une empreinte HMAC-SHA-256 et une entropie (contrat Finding v1, #14).",
+  "description": "Rapport rendu par `heimdall scan --json` (tickets #29 et #24). Le document ne porte aucun secret : chaque Finding ne contient qu'une empreinte HMAC-SHA-256 et une entropie (contrat Finding v1, #14). L'allowlist déterministe (#24) fournit le nombre de rejets et leur trace.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "schema",
     "scope",
     "count",
-    "findings"
+    "findings",
+    "ignored_count",
+    "traces"
   ],
   "properties": {
     "schema": {
@@ -34,6 +36,40 @@
         "$ref": "finding.schema.json"
       },
       "description": "Un Finding v1 par candidat, triés (fichier, ligne, type, empreinte)."
+    },
+    "ignored_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Nombre de findings ignorés par l'allowlist déterministe (#24)."
+    },
+    "traces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "rule",
+          "file",
+          "line"
+        ],
+        "properties": {
+          "rule": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "description": "Traces déterministes de chaque rejet (règle, fichier, ligne) (#24)."
     }
   }
 }

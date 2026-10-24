@@ -22,6 +22,7 @@ from __future__ import annotations
 import time
 from typing import Final
 
+from heimdall.scanner.allowlist import Allowlist, AllowlistTrace
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
@@ -77,7 +78,7 @@ class SignatureEngine:
     moteur construit pour une passe ne se réutilise pas après son échéance.
     """
 
-    __slots__ = ("_deadline", "_hasher", "_max_findings")
+    __slots__ = ("_allowlist", "_deadline", "_hasher", "_max_findings", "_traces")
 
     def __init__(
         self,
@@ -85,9 +86,12 @@ class SignatureEngine:
         *,
         max_findings: int | None = None,
         deadline: float | None = None,
+        allowlist: Allowlist | None = None,
     ) -> None:
         self._deadline = deadline
         self._hasher = hasher
+        self._allowlist = allowlist
+        self._traces: list[AllowlistTrace] = []
         # `None` ne doit jamais désactiver la borne : on retombe sur le
         # défaut, y compris pour un appelant non typé qui passerait `None`
         # en croyant conserver l'ancien mode non borné. Un entier explicite
@@ -102,6 +106,11 @@ class SignatureEngine:
         ):
             raise ValueError(_MAX_FINDINGS_INVALID)
         self._max_findings = max_findings
+
+    @property
+    def traces(self) -> tuple[AllowlistTrace, ...]:
+        """Traces déterministes des rejets par l'allowlist (#24)."""
+        return tuple(self._traces)
 
     def analyser(self, cible: ScanTarget) -> list[Finding]:
         """Analyse la cible et rend un Finding par candidat distinct."""
@@ -120,7 +129,7 @@ class SignatureEngine:
             ):
                 raise ScanError(_DEADLINE_ERROR)
             for match in find_signature_matches(line):
-                self._append(findings, seen, match, line_number, cible.path)
+                self._append(findings, seen, match, line_number, cible.path, line_text=line)
             following = self._joined_window(line, lines, index)
             if following is None:
                 continue
@@ -130,7 +139,7 @@ class SignatureEngine:
                 # à la ligne suivante : elle y sera déjà signalée.
                 if match.start >= limit:
                     continue
-                self._append(findings, seen, match, line_number, cible.path)
+                self._append(findings, seen, match, line_number, cible.path, line_text=joined)
         return findings
 
     def _joined_window(
@@ -165,13 +174,15 @@ class SignatureEngine:
             return None
         return joined, len(line)
 
-    def _append(
+    def _append(  # noqa: PLR0913
         self,
         findings: list[Finding],
         seen: set[tuple[int, str, str]],
         match: SignatureMatch,
         line_number: int,
         relative_path: str,
+        *,
+        line_text: str = "",
     ) -> None:
         # La valeur brute n'est **jamais conservée** : elle est hachée à la
         # volée, puis abandonnée. La clé de déduplication porte l'empreinte
@@ -192,6 +203,24 @@ class SignatureEngine:
         if key in seen:
             return
         seen.add(key)
+
+        # Allowlist déterministe (#24) : écarte les cas évidents sans passer
+        # par le LLM. Chaque rejet émet une trace traçable (règle, fichier, ligne).
+        if self._allowlist is not None and not self._allowlist.is_empty():
+            rule_name = self._allowlist.evaluate(
+                value=match.value,
+                file=relative_path,
+                line=line_number,
+                secret_type=match.secret_type,
+                line_text=line_text,
+                snippet_hash=snippet_hash,
+            )
+            if rule_name is not None:
+                self._traces.append(
+                    AllowlistTrace(rule=rule_name, file=relative_path, line=line_number)
+                )
+                return
+
         findings.append(
             Finding(
                 file=relative_path,
