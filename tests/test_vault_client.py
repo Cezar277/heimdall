@@ -168,6 +168,23 @@ class VaultClientUnitTests(unittest.TestCase):
         self.assertEqual(_pin_loopback_ip("127.0.0.1"), "127.0.0.1")
         self.assertEqual(_pin_loopback_ip("::1"), "::1")
 
+    def test_localhost_resolution_hang_fails_closed_within_timeout(self) -> None:
+        """Résolveur bloqué → `ValueError` en ~2 s, jamais de pendaison."""
+
+        def hanging_resolve(*args: object, **kwargs: object) -> object:
+            time.sleep(30)
+            return []
+
+        with patch("socket.getaddrinfo", side_effect=hanging_resolve):
+            start = time.monotonic()
+            try:
+                with self.assertRaises(ValueError) as ctx:
+                    VaultClient("https://localhost:8443", _VALID_KEY)
+            finally:
+                elapsed = time.monotonic() - start
+            self.assertLess(elapsed, 10)
+            self.assertIn("localhost", str(ctx.exception))
+
     def test_ca_cert_symlink_is_rejected(self) -> None:
         """Un bundle CA pointé par un lien symbolique est refusé (invariant 3)."""
         with tempfile.TemporaryDirectory(prefix="heimdall-ca-") as tmp:
@@ -1281,6 +1298,34 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             write_file_atomic(target, "SECRET=1\n")
         self.assertIn("pas un répertoire", str(ctx.exception))
         self.assertFalse((base / "sub").is_dir())
+
+    def test_write_file_atomic_refuses_world_writable_parent(self) -> None:
+        """Parent 0777 sans sticky bit → refus fail-closed (rename par un autre UID)."""
+        if os.name != "posix":
+            self.skipTest("Contrôle de permissions POSIX requis")
+        base = self.tmp_dir / "ww_base"
+        base.mkdir()
+        lax_dir = base / "lax"
+        lax_dir.mkdir()
+        os.chmod(lax_dir, 0o777)  # noqa: S103 - permissions volontairement laxistes pour le test
+        target = lax_dir / ".env"
+        with self.assertRaises(ValueError) as ctx:
+            write_file_atomic(target, "SECRET=1\n")
+        self.assertIn("trop permissives", str(ctx.exception))
+        self.assertFalse(target.exists())
+
+    def test_write_file_atomic_accepts_sticky_world_writable_parent(self) -> None:
+        """Parent 1777 (sticky, ex. /tmp) → autorisé, rename réservé au propriétaire."""
+        if os.name != "posix":
+            self.skipTest("Contrôle de permissions POSIX requis")
+        base = self.tmp_dir / "sticky_base"
+        base.mkdir()
+        sticky_dir = base / "shared"
+        sticky_dir.mkdir()
+        os.chmod(sticky_dir, 0o1777)  # noqa: S103 - sticky bit volontaire pour le test
+        target = sticky_dir / ".env"
+        write_file_atomic(target, "SECRET=1\n", mode=0o600)
+        self.assertEqual(target.read_text(encoding="utf-8"), "SECRET=1\n")
 
     def test_read_file_secure_no_follow_refuses_symlinked_intermediate(self) -> None:
         """Lecture insensible aux symlinks intermédiaires : `out/sub` → lien → None."""

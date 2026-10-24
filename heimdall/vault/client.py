@@ -33,6 +33,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import threading
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NoReturn
@@ -77,6 +78,9 @@ _STREAM_CHUNK_SIZE: Final[int] = 64 * 1024
 #: Plafond d'un `Retry-After` accepté pour l'affichage (pas de sleep côté
 #: client) : au-delà d'une heure ou négatif, la valeur réseau est ignorée.
 _MAX_RETRY_AFTER_SECONDS: Final[int] = 3600
+#: Délai maximal de résolution de ``localhost`` à la construction du client ;
+#: au-delà, échec franc au lieu de pendre la CLI (invariant 11).
+_LOCALHOST_RESOLVE_TIMEOUT_SECONDS: Final[float] = 2.0
 #: Plafonds des en-têtes HTTP avant lecture du corps. httpx 0.28.1 /
 #: httpcore / h11 n'exposent aucun plafond configurable sur les en-têtes
 #: (vérifié dans le venv : h11 bufferise jusqu'à fin des en-têtes sans
@@ -399,19 +403,16 @@ def _pin_loopback_ip(host: str) -> str:
     Résolution unique à la validation : le client stocke un littéral IP et
     ``httpx`` ne résout plus aucun nom à la connexion, ce qui ferme la
     fenêtre d'empoisonnement du résolveur local entre construction et
-    requêtes. Choix déterministe : ``127.0.0.1`` si présent, sinon ``::1``.
-    Toute adresse hors boucle, toute absence de résolution ou tout échec
-    (``gaierror``) lève ``ValueError`` fail-closed. Les littéraux
-    ``127.0.0.1``/``::1`` sont retournés inchangés.
+    requêtes. La résolution est bornée (thread daemon + ``join``) : un
+    résolveur bloqué lève au lieu de pendre la CLI. Choix déterministe :
+    ``127.0.0.1`` si présent, sinon ``::1``. Toute adresse hors boucle,
+    toute absence de résolution ou tout échec lève ``ValueError`` fail-closed.
+    Les littéraux ``127.0.0.1``/``::1`` sont retournés inchangés (aucune
+    résolution, aucun thread).
     """
     if host in ("127.0.0.1", "::1"):
         return host
-    try:
-        addr_info = socket.getaddrinfo("localhost", None)
-    except socket.gaierror as exc:
-        raise ValueError(
-            "Sécurité : localhost ne résout vers aucune adresse de boucle locale"
-        ) from exc
+    addr_info = _resolve_localhost_bounded()
     ips = {str(entry[4][0]) for entry in addr_info}
     outsiders = sorted(ips - {"127.0.0.1", "::1"})
     if outsiders:
@@ -423,6 +424,38 @@ def _pin_loopback_ip(host: str) -> str:
     if "::1" in ips:
         return "::1"
     raise ValueError("Sécurité : localhost ne résout vers aucune adresse de boucle locale")
+
+
+def _resolve_localhost_bounded() -> list[Any]:
+    """Résout ``localhost`` avec un délai borné (thread daemon + ``join``).
+
+    ``socket.getaddrinfo`` n'expose aucun timeout : sans borne, un résolveur
+    local bloqué pendrait la construction du client (donc ``pull``/``push``/
+    ``run``) sans code de sortie. Le thread daemon ne bloque jamais la sortie
+    de l'interpréteur ; tout dépassement ou échec lève ``ValueError``.
+    """
+    resolved: list[Any] = []
+    failures: list[BaseException] = []
+
+    def _lookup() -> None:
+        try:
+            resolved.extend(socket.getaddrinfo("localhost", None))
+        except Exception as exc:  # noqa: BLE001 - tout échec vaut refus, jamais de fuite
+            failures.append(exc)
+
+    worker = threading.Thread(target=_lookup, daemon=True)
+    worker.start()
+    worker.join(timeout=_LOCALHOST_RESOLVE_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise ValueError(
+            "Sécurité : résolution de localhost expirée "
+            f"({_LOCALHOST_RESOLVE_TIMEOUT_SECONDS} s) — utilisez 127.0.0.1."
+        )
+    if failures:
+        raise ValueError(
+            "Sécurité : localhost ne résout vers aucune adresse de boucle locale"
+        ) from None
+    return resolved
 
 
 def _check_localhost_resolution(host: str) -> None:

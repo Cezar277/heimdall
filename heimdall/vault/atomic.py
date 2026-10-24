@@ -177,7 +177,9 @@ def _open_parent_dir_secure(parent: Path, *, create_missing: bool = True) -> int
 
     Retourne un descripteur ouvert sur le répertoire parent (à fermer par
     l'appelant). Lève ``ValueError`` fail-closed en cas de symlink, de
-    composant non-répertoire ou de divergence ``fstat`` vs ``stat``.
+    composant non-répertoire, de répertoire accessible en écriture à
+    d'autres utilisateurs sans sticky bit (``0o022``), ou de divergence
+    ``fstat`` vs ``stat``.
     """
     abs_str = os.path.abspath(str(parent))
     if "\x00" in abs_str:
@@ -201,6 +203,15 @@ def _open_parent_dir_secure(parent: Path, *, create_missing: bool = True) -> int
         cur_fd = os.open("/", open_flags)
     except OSError as exc:
         raise ValueError(f"Impossible d'ouvrir le répertoire parent : {exc}") from exc
+    try:
+        root_st = os.fstat(cur_fd)
+    except OSError as exc:
+        raise ValueError(f"Impossible de vérifier le répertoire parent : {exc}") from exc
+    if (root_st.st_mode & 0o022) and not (root_st.st_mode & stat.S_ISVTX):
+        raise ValueError(
+            "Écriture refusée : permissions trop permissives sur le "
+            "répertoire parent '/' (accessible en écriture à d'autres utilisateurs)."
+        )
 
     try:
         for comp in parts[1:]:
@@ -303,6 +314,16 @@ def _open_parent_dir_secure(parent: Path, *, create_missing: bool = True) -> int
                     f"Écriture refusée : le composant parent '{comp}' "
                     "n'est pas un répertoire."
                 )
+            if (st.st_mode & 0o022) and not (st.st_mode & stat.S_ISVTX):
+                try:
+                    os.close(child_fd)
+                except OSError:  # noqa: S110
+                    pass
+                raise ValueError(
+                    "Écriture refusée : permissions trop permissives sur le "
+                    f"répertoire parent '{comp}' (accessible en écriture à "
+                    "d'autres utilisateurs)."
+                )
             try:
                 os.close(cur_fd)
             except OSError:  # noqa: S110
@@ -402,7 +423,8 @@ def write_file_atomic(  # noqa: PLR0912, PLR0915
     """Écrit un fichier de manière atomique avec fsync et permissions strictes.
 
     Refuse strictement les liens symboliques (cible ou répertoire parent)
-    afin de prévenir tout écrasement ou détournement de cible. Sur POSIX,
+    et les parents accessibles en écriture à d'autres utilisateurs (sans
+    sticky bit) afin de prévenir tout écrasement ou détournement de cible. Sur POSIX,
     les répertoires parents sont créés et ouverts composant par composant
     avec ``openat`` + ``O_NOFOLLOW`` (voir ``_open_parent_dir_secure``) puis
     toutes les opérations passent par le descripteur du parent (``dir_fd``),

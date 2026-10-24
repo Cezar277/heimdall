@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Final
@@ -747,7 +748,7 @@ def _resolve_run_names(
     raise typer.Exit(code=2)
 
 
-def vault_run(  # noqa: PLR0913, PLR0917
+def vault_run(  # noqa: PLR0912, PLR0913, PLR0917
     ctx: typer.Context,
     project: str | None = _PROJECT_OPTION,
     env: str = _ENV_OPTION,
@@ -816,11 +817,15 @@ def vault_run(  # noqa: PLR0913, PLR0917
     target_cmd = [executable if executable is not None else cmd[0], *cmd[1:]]
     child_env = {**os.environ, **injected_secrets}
 
-    # Anti-TOCTOU which → exec : le PATH a pu changer pendant le round-trip
-    # réseau ; re-résoudre juste avant d'exécuter et refuser toute divergence
-    # (fail-closed : jamais d'exécution d'un binaire périmé).
+    # Anti-TOCTOU juste avant l'exécution : si la commande était un chemin,
+    # le fichier a pu être substitué pendant le round-trip réseau — refuser
+    # s'il a disparu ou n'est plus un fichier régulier (lien, FIFO...).
     if executable is None:
-        if not Path(cmd[0]).is_file():
+        try:
+            path_still_ok = stat.S_ISREG(os.lstat(cmd[0]).st_mode)
+        except OSError:
+            path_still_ok = False
+        if not path_still_ok:
             typer.echo(f"Erreur : commande introuvable : '{cmd[0]}'", err=True)
             raise typer.Exit(code=127)
     elif shutil.which(cmd[0]) != executable:

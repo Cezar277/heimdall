@@ -1468,6 +1468,44 @@ class VaultRunCliTests(unittest.TestCase):
                             or "injection refusée" in result.output
                         )
 
+    def test_run_refuses_path_command_substituted_before_exec(self) -> None:
+        """Chemin avec slash substitué après résolution → Exit(127), pas d'exécution."""
+        tool = self.tmp_dir / "tool.sh"
+        tool.write_text("#!/bin/sh\necho pwned\n", encoding="utf-8")
+        with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+            with patch("heimdall.cli.vault_client._init_client") as mock_init:
+                client_instance = MagicMock()
+                client_instance.__enter__.return_value = client_instance
+                client_instance.get_secret.return_value = {
+                    "project": "demo",
+                    "env": "dev",
+                    "name": "SAFE_VAR",
+                    "status": "actif",
+                    "value": "secret_val",
+                }
+                mock_init.return_value = client_instance
+                with patch(
+                    "heimdall.cli.vault_client.os.lstat",
+                    side_effect=FileNotFoundError(2, "No such file or directory"),
+                ):
+                    with patch("heimdall.cli.vault_client.subprocess.run") as mock_run:
+                        result = self.runner.invoke(
+                            app,
+                            [
+                                "run",
+                                "--project",
+                                "demo",
+                                "--name",
+                                "SAFE_VAR",
+                                "--",
+                                str(tool),
+                                "--do",
+                            ],
+                        )
+                        self.assertEqual(result.exit_code, 127)
+                        self.assertIn("introuvable", result.output)
+                        mock_run.assert_not_called()
+
     def test_run_resolves_binary_before_injection(self) -> None:
         """La commande cible est résolue avant injection des variables (§HIGH 3)."""
         with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
