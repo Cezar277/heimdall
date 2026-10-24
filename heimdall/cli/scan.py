@@ -179,6 +179,14 @@ def collect(
     Lève ``ScanError`` (ou ``ToolFailure``) si le périmètre n'a pas pu être
     analysé **en entier** : l'appelant transforme cela en code 2, jamais en
     code 0.
+
+    **Auto-attestation (CWE-345)** : si ``allowlist`` est fourni (API), la
+    garde anti auto-attestation est contournée. Le seul usage légitime dans
+    les chemins CLI/hook est ``Allowlist.empty()`` via ``--no-allowlist``.
+    Pour tout autre ``Allowlist`` injecté, **l'appelant assume** que celui-ci
+    ne provient pas du dépôt scanné et ne doit pas permettre l'auto-attestation
+    de ``heimdall.toml`` interne. En cas de doute, ne pas injecter
+    d'allowlist non-vide ou utiliser ``config`` externe / ``--no-allowlist``.
     """
     if staged:
         return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
@@ -358,6 +366,11 @@ def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
        La garde unique `_resolve_root` + `O_NOFOLLOW`, le plafond de taille et
        le contrat fermé s'appliquent dans les deux cas ; le contenu ne peut
        pas rendre l'allowlist aveugle (motifs universels refusés).
+
+    Remarque (CWE-345) : si `custom_allowlist` est injecté (API), cette garde
+    est **contournée par conception**. Le chemin CLI ne l'utilise qu'avec
+    `Allowlist.empty()` via `--no-allowlist`. Tout autre injecteur assume la
+    provenance hors dépôt et la responsabilité de l'absence d'auto-attestation.
     """
     if custom_allowlist is not None:
         return None
