@@ -38,12 +38,13 @@ heimdall scan --json [CHEMIN]       # rapport JSON sur stdout
 | `--staged` | change le **périmètre** : les blobs **ajoutés ou modifiés** de l'index git, lus blob par blob, **sans aucune exclusion de chemin** |
 | `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr (avec décompte des secrets ignorés par l'allowlist) |
 | `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; inclut les traces et décomptes d'allowlist (#24) ; les erreurs restent sur stderr |
-| `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) |
+| `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) ; un chemin **hors du dépôt** est accepté : choix opérateur explicite, soumis aux mêmes gardes (`_resolve_root` + `O_NOFOLLOW`, plafond de taille, contrat fermé) |
 | `--no-allowlist` | désactive l'allowlist déterministe pour le scan courant |
 
 Le fichier d'allowlist est un **contrat fermé** : seule la table racine
-`[allowlist]` est acceptée, `version` doit être le littéral `"1"` (un entier
-`1` est refusé), et chaque mot-clé doit faire au moins 3 caractères. Toute
+`[allowlist]` est acceptée, `version` est **obligatoire** et doit être le
+littéral `"1"` (un entier `1`, ou une `version` simplement omise, sont
+refusés), et chaque mot-clé doit faire au moins 3 caractères. Toute
 clé racine inconnue (`[tool.foo]`, faute de frappe), tout type incorrect ou
 tout mot-clé trop court est une erreur d'outillage (code 2), jamais un
 passage silencieux.
@@ -52,11 +53,20 @@ Les `patterns` ne peuvent pas rendre l'allowlist aveugle : via TOML, chaque
 chaîne est compilée puis validée ; via l'API Python, seules des expressions
 déjà compilées sont acceptées. Un motif qui matche la chaîne vide (`.`, `.*`,
 `^`, `^.*$`…) est refusé, et chaque branche d'alternance doit porter au moins
-3 caractères littéraux. Les constructions à backtracking non borné
-(alternance ou groupe imbriqué sous quantificateur, quantificateurs
-consécutifs, références arrière) sont refusées en `ScanError` (code 2). Une
-valeur candidate de plus de 256 caractères n'est pas soumise aux regex :
-elle reste signalée (fail-closed), ce qui borne l'exposition résiduelle.
+3 caractères **littéraux** : `EXAMPLE-[0-9]{4}` est accepté, tandis que
+`[a-z]+`, `\w+`, `\d{3}-\d{4}` ou `x{3}y{3}` sont refusés (motif trop large
+pour être auditable) — reformuler en portant les marqueurs concrets visés.
+Les constructions à backtracking non borné (alternance ou groupe imbriqué
+sous quantificateur, quantificateurs consécutifs, références arrière) sont
+refusées en `ScanError` (code 2). Une valeur candidate de plus de 256
+caractères n'est pas soumise aux regex : elle reste signalée (fail-closed),
+ce qui borne l'exposition résiduelle.
+
+Le filtre de chemins est borné des deux côtés : un motif `paths` porte au
+plus 10 jokers `*` (au-delà : code 2), et un chemin de plus de 1024
+caractères n'est pas soumis à `fnmatch` (fail-closed : il reste signalé).
+Sous Python ≥ 3.13, `fnmatch` complète cette borne avec des groupes
+atomiques natifs.
 
 `CHEMIN` vaut `.` par défaut. Il doit être la **racine** d'un dépôt git,
 dans les deux périmètres (sinon : erreur, code 2) : hors dépôt —
