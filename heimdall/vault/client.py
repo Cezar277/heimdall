@@ -548,6 +548,28 @@ def _measure_response_headers(headers: Any) -> tuple[int, int]:
     return count, total
 
 
+def _validate_error_response_headers(status: int, headers: Any) -> None:
+    """Borne les en-têtes d'une réponse d'erreur avant toute lecture de valeur.
+
+    Même double plafond que le chemin succès. Un dépassement lève une erreur
+    typée bornée, sans jamais refléter une valeur d'en-tête : ``429`` reste
+    un ``VaultRateLimitError`` (``retry_after=None``, sous-classe de
+    ``VaultClientError``), tout autre statut un ``VaultClientError``.
+    """
+    try:
+        _measure_response_headers(headers)
+    except ValueError as exc:
+        if status == HTTPStatus.TOO_MANY_REQUESTS:
+            raise VaultRateLimitError(
+                "Trop de requêtes au Vault (429) : en-têtes de réponse "
+                "non conformes (rejetés).",
+                retry_after=None,
+            ) from exc
+        raise VaultClientError(
+            "En-têtes de réponse d'erreur non conformes (rejetés)."
+        ) from exc
+
+
 def _read_bounded_body(resp: Any, endpoint: str) -> bytes:
     """Lit un corps HTTP en streaming avec une borne stricte de 1 Mio.
 
@@ -858,8 +880,17 @@ class VaultClient:
         return self._client  # type: ignore[no-any-return]
 
     def _handle_error_response(self, resp: Any) -> NoReturn:
-        """Convertit une réponse HTTP d'erreur en exception typée."""
+        """Convertit une réponse HTTP d'erreur en exception typée.
+
+        Les en-têtes sont bornés AVANT toute lecture de valeur (``Retry-After``
+        inclus), avec le même double plafond que le chemin succès : un Vault
+        compromis ne doit pas faire lire une valeur d'en-tête non bornée sur
+        le chemin erreur. Un dépassement lève une erreur typée bornée (jamais
+        de valeur d'en-tête reflétée, jamais de lecture du corps).
+        """
         status = resp.status_code
+        _validate_error_response_headers(status, resp.headers)
+
         retry_after: int | None = None
         if "retry-after" in resp.headers:
             try:

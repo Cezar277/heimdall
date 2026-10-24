@@ -382,6 +382,53 @@ class VaultClientUnitTests(unittest.TestCase):
                     self.assertIn("Trop de requêtes", str(ctx.exception))
                     self.assertNotIn(header_value, str(ctx.exception))
 
+    def test_error_path_giant_headers_is_bounded_before_retry_after(self) -> None:
+        """429 + 2 Mio d'en-têtes : erreur bornée, Retry-After et corps jamais lus."""
+
+        class _GiantErrorHeadersResponse:
+            status_code = HTTPStatus.TOO_MANY_REQUESTS
+            headers = {"retry-after": "30", "x-pad": "y" * (2 * 1024 * 1024)}
+
+            def iter_bytes(self, chunk_size: int | None = None) -> object:
+                raise AssertionError("le corps ne doit pas être lu")
+
+            def close(self) -> None:
+                pass
+
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(
+            httpx.Client, "send", return_value=_GiantErrorHeadersResponse()
+        ):
+            with self.assertRaises(VaultRateLimitError) as ctx:
+                client.health()
+        # VaultRateLimitError est un VaultClientError : les deux contrats
+        # d'erreur restent satisfaits, sans valeur d'en-tête non bornée.
+        self.assertIsNone(ctx.exception.retry_after)
+        self.assertIn("en-têtes", str(ctx.exception))
+        self.assertNotIn("y" * 1024, str(ctx.exception))
+
+    def test_error_path_giant_headers_on_non_429_is_generic_bounded_error(self) -> None:
+        """401 + 2 Mio d'en-têtes : VaultClientError bornée, statut seul conservé."""
+
+        class _GiantErrorHeadersResponse:
+            status_code = HTTPStatus.UNAUTHORIZED
+            headers = {"x-pad": "y" * (2 * 1024 * 1024)}
+
+            def iter_bytes(self, chunk_size: int | None = None) -> object:
+                raise AssertionError("le corps ne doit pas être lu")
+
+            def close(self) -> None:
+                pass
+
+        client = VaultClient(_VALID_URL, _VALID_KEY)
+        with patch.object(
+            httpx.Client, "send", return_value=_GiantErrorHeadersResponse()
+        ):
+            with self.assertRaises(VaultClientError) as ctx:
+                client.health()
+        self.assertIn("en-têtes", str(ctx.exception).lower())
+        self.assertNotIn("y" * 1024, str(ctx.exception))
+
     def test_network_unavailable_error(self) -> None:
         """Une panne de communication réseau lève VaultUnavailableError."""
         client = VaultClient(_VALID_URL, _VALID_KEY)
@@ -823,6 +870,56 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 self.assertEqual(mock_run.call_args.kwargs["cwd"], link_dir.parent)
                 self.assertNotEqual(mock_run.call_args.kwargs["cwd"], link_dir)
 
+    def test_git_helpers_refuse_symlink_output_without_following(self) -> None:
+        """Output symlink (fichier ou répertoire) → False fail-closed, git jamais consulté.
+
+        Non-régression : ``path.resolve()`` suivait le lien final et pouvait
+        attribuer à l'output le statut Git de sa cible (avertissement tu).
+        """
+        victim_file = self.tmp_dir / "git_victim.env"
+        victim_file.write_text("X=1\n", encoding="utf-8")
+        victim_dir = self.tmp_dir / "git_victim_dir"
+        victim_dir.mkdir()
+        for victim in (victim_file, victim_dir):
+            with self.subTest(victim=victim.name):
+                link = self.tmp_dir / f"output_{victim.name}"
+                try:
+                    os.symlink(victim, link)
+                except OSError:
+                    self.skipTest("Symlinks non supportés")
+                with patch(
+                    "heimdall.vault.atomic._get_git_toplevel", return_value=self.tmp_dir
+                ):
+                    with patch("heimdall.vault.atomic.subprocess.run") as mock_run:
+                        self.assertFalse(is_git_tracked(link))
+                        self.assertFalse(is_git_ignored(link))
+                        mock_run.assert_not_called()
+
+    def test_git_helpers_resolve_parent_but_never_final_symlink(self) -> None:
+        """Un parent réel est résolu, mais un lien final reste refusé sans suivre."""
+        repo = self.tmp_dir / "repo"
+        repo.mkdir()
+        target = repo / "tracked.env"
+        target.write_text("X=1\n", encoding="utf-8")
+        link = repo / "tracked_link.env"
+        try:
+            os.symlink(target, link)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        with patch("heimdall.vault.atomic._get_git_toplevel", return_value=repo):
+            with patch(
+                "heimdall.vault.atomic.subprocess.run",
+                return_value=MagicMock(returncode=0),
+            ) as mock_run:
+                # Le chemin régulier continue d'interroger Git (comportement conservé).
+                self.assertTrue(is_git_tracked(target))
+                self.assertEqual(mock_run.call_args.args[0][-1], "tracked.env")
+                mock_run.reset_mock()
+                # Le lien final, lui, est refusé avant toute invocation de Git.
+                self.assertFalse(is_git_tracked(link))
+                self.assertFalse(is_git_ignored(link))
+                mock_run.assert_not_called()
+
     def test_git_helpers_survive_hanging_git_binary(self) -> None:
         """Binaire `git` bloqué : `TimeoutExpired` → statut inconnu, jamais de pendaison."""
         target = self.tmp_dir / ".env"
@@ -882,6 +979,40 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         plain_target = parent / "plain.env"
         _write_file_atomic_fallback(parent, plain_target, b"OK=1\n", 0o600)
         self.assertEqual(plain_target.read_bytes(), b"OK=1\n")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX requis")
+    def test_write_file_atomic_never_uses_windows_fallback_on_posix(self) -> None:
+        """POSIX : la voie forte dir_fd reste la seule utilisée, repli jamais appelé."""
+        target = self.tmp_dir / ".env"
+        with patch(
+            "heimdall.vault.atomic._write_file_atomic_fallback",
+            side_effect=AssertionError("repli Windows interdit sur POSIX"),
+        ):
+            write_file_atomic(target, "A=1\n")
+        self.assertEqual(target.read_text(encoding="utf-8"), "A=1\n")
+
+    def test_fallback_refuses_symlink_replanted_after_replace(self) -> None:
+        """Repli Windows : un symlink replanté juste après `replace` est détecté (lstat)."""
+        parent = self.tmp_dir / "fallback_race_parent"
+        parent.mkdir()
+        victim = self.tmp_dir / "fallback_race_victim.txt"
+        victim.write_text("VICTIM\n", encoding="utf-8")
+        target = parent / ".env"
+        real_replace = os.replace
+
+        def replace_then_swap(src: Path, dst: Path) -> None:
+            real_replace(src, dst)
+            # Simule la course : la cible redevient un symlink après replace.
+            os.unlink(dst)
+            os.symlink(victim, dst)
+
+        with patch(
+            "heimdall.vault.atomic.os.replace", side_effect=replace_then_swap
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _write_file_atomic_fallback(parent, target, b"EVIL\n", 0o600)
+        self.assertIn("lien symbolique", str(ctx.exception))
+        self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM\n")
 
     def test_parse_env_file(self) -> None:
         """Parsing correct des paires clé=valeur en ignorant commentaires et vides."""

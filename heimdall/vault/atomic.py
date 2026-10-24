@@ -110,8 +110,10 @@ def _write_file_atomic_fallback(
     check-then-use par construction (pas de ``dir_fd``) : il refuse tout
     symlink avant ``replace`` et revérifie par ``lstat`` après ``replace``
     (fail-closed), sans prétendre à la même résistance aux courses que la
-    voie POSIX. Cible de confinement : Linux/POSIX uniquement (CI
-    self-hosted Linux) ; Windows n'est couvert qu'en best-effort.
+    voie POSIX. Il n'est JAMAIS appelé sur POSIX : ``write_file_atomic``
+    emprunte toujours la voie forte ``dir_fd`` (verrouillé par test). Cible
+    de confinement : Linux/POSIX uniquement (CI self-hosted Linux) ; Windows
+    n'est couvert qu'en best-effort, sans garantie anti-TOCTOU native.
     """
     prefix = f".{path.name}.tmp."
     temp_fd, temp_path_str = tempfile.mkstemp(prefix=prefix, dir=parent)
@@ -704,6 +706,29 @@ def _get_git_toplevel(path: Path) -> Path | None:
     return None
 
 
+def _git_relative_path(path: Path, top: Path) -> Path | None:
+    """Calcule le chemin relatif au dépôt sans suivre la cible finale.
+
+    ``os.lstat`` refuse tout lien symbolique final (fail-closed, cohérent
+    avec ``check_file_mode_600``) : un output échangé contre un symlink ne
+    doit pas être résolu vers sa cible, ce qui fausserait le verdict
+    « suivi / ignoré » et pourrait taire l'avertissement CLI. Seuls les
+    composants parents sont résolus, jamais ``path`` lui-même. Toute erreur
+    ou sortie du dépôt vaut ``None`` (statut Git indéterminé).
+    """
+    try:
+        if not path.name or stat.S_ISLNK(os.lstat(path).st_mode):
+            return None
+    except OSError:
+        return None
+    try:
+        resolved_parent = path.parent.resolve()
+        resolved_top = top.resolve()
+        return (resolved_parent / path.name).relative_to(resolved_top)
+    except (ValueError, RuntimeError, OSError):
+        return None
+
+
 def is_git_tracked(path: Path) -> bool:
     """Vérifie si un fichier est actuellement suivi dans Git."""
     git_bin = shutil.which("git")
@@ -712,9 +737,8 @@ def is_git_tracked(path: Path) -> bool:
     top = _get_git_toplevel(path)
     if top is None:
         return False
-    try:
-        rel = path.resolve().relative_to(top.resolve())
-    except (ValueError, RuntimeError, OSError):
+    rel = _git_relative_path(path, top)
+    if rel is None:
         return False
     try:
         res = subprocess.run(  # noqa: S603
@@ -738,9 +762,8 @@ def is_git_ignored(path: Path) -> bool:
     top = _get_git_toplevel(path)
     if top is None:
         return False
-    try:
-        rel = path.resolve().relative_to(top.resolve())
-    except (ValueError, RuntimeError, OSError):
+    rel = _git_relative_path(path, top)
+    if rel is None:
         return False
     try:
         res = subprocess.run(  # noqa: S603
