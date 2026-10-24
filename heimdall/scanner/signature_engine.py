@@ -84,7 +84,14 @@ class SignatureEngine:
     moteur construit pour une passe ne se réutilise pas après son échéance.
     """
 
-    __slots__ = ("_allowlist", "_deadline", "_entropy_config", "_hasher", "_max_findings", "_traces")
+    __slots__ = (
+        "_allowlist",
+        "_deadline",
+        "_entropy_config",
+        "_hasher",
+        "_max_findings",
+        "_traces",
+    )
 
     def __init__(
         self,
