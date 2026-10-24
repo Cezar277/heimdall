@@ -58,7 +58,12 @@ tout mot-clé trop court est une erreur d'outillage (code 2), jamais un
 passage silencieux. Un `secret_types` doit suivre la grammaire des types
 du contrat Finding (`[a-z][a-z0-9_]*`, 64 caractères max, ex. `aws`) :
 `"AWS"` ou `"../etc"` sont refusés en code 2 au lieu de rendre la règle
-muette.
+muette. Le critère `exact_keywords` (optionnel) compare à égalité
+insensible à la casse : c'est le choix auditable pour les marqueurs
+globaux sans `paths` (`example`, `changeme`, `dummy`) — `my-example-key`
+reste détecté, seul le marqueur exact est ignoré. Les `keywords`
+classiques gardent la frontière `\b` stricte et restent réservés aux
+règles restreintes par `paths` (fixtures de test).
 
 Les `patterns` ne peuvent pas rendre l'allowlist aveugle : via TOML, chaque
 chaîne est compilée puis validée ; via l'API Python, seules des expressions
