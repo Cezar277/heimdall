@@ -45,6 +45,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,7 +57,7 @@ else:
     import tomli as tomllib
 
 from heimdall.scanner.errors import ScanError
-from heimdall.scanner.finding import validate_relative_path
+from heimdall.scanner.finding import MAX_TYPE_LENGTH, validate_relative_path
 from heimdall.scanner.interface import _open_flags, _resolve_root
 
 logger = logging.getLogger("heimdall.scanner.allowlist")
@@ -102,6 +103,35 @@ MAX_PATH_WILDCARDS: Final[int] = 10
 #: est **omise** (le candidat reste signalé, fail-closed) : même protection
 #: que :data:`MAX_REGEX_VALUE_LENGTH` pour le filtre de chemins.
 MAX_MATCH_PATH_LENGTH: Final[int] = 1024
+
+#: Catégories Unicode jamais acceptées dans un mot-clé ou un motif
+#: (contrôles, formats invisibles, séparateurs de ligne/paragraphe) : les
+#: mêmes que `_visible` échappe à l'affichage (`scan.py`). Un `\n` littéral
+#: ou un RLO ne matcherait jamais une valeur monoligne (règle morte
+#: silencieuse) : refusé en `ScanError`, jamais ignoré. Les échappements
+#: regex (`\\n`, `\\t`) restent deux caractères ordinaires et acceptés.
+_FORBIDDEN_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _reject_control_characters(value: str) -> None:
+    """Refuse tout caractère de contrôle/invisible (fail-closed, invariant 8)."""
+    if any(unicodedata.category(char) in _FORBIDDEN_CATEGORIES for char in value):
+        raise ScanError(_CONFIG_ERROR)
+
+
+#: Grammaire des types de secrets acceptés en allowlist : miroir exact de
+#: `finding._TYPE_PATTERN` (contrat #14) — `[a-z][a-z0-9_]*`, 64 caractères
+#: max (`finding.MAX_TYPE_LENGTH`). Un `secret_types` hors grammaire
+#: (`"AWS"`, `"../etc"`, `"foo bar"`) ne matcherait jamais le type réel et
+#: rendrait la règle muette : refusé en `ScanError`. Toute divergence entre
+#: les deux définitions est une anomalie d'audit (voir fiche SAMM T24).
+_SECRET_TYPE_RE: Final[re.Pattern[str]] = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def _validate_secret_type(value: str) -> None:
+    """Refuse un `secret_types` hors grammaire du contrat #14 (typo = règle morte)."""
+    if len(value) > MAX_TYPE_LENGTH or _SECRET_TYPE_RE.fullmatch(value) is None:
+        raise ScanError(_CONFIG_ERROR)
 
 #: Validation stricte de l'identifiant de règle (nom ASCII sécurisé).
 _RULE_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
@@ -485,6 +515,17 @@ class AllowlistRule:
             not isinstance(secret_type, str) for secret_type in self.secret_types
         ):
             raise ScanError(_CONFIG_ERROR)
+        # Grammaire du contrat #14, comme au parsing TOML : un type hors
+        # grammaire rendrait la règle muette sans erreur (typo silencieuse).
+        for secret_type in self.secret_types:
+            _validate_secret_type(secret_type)
+        # Contrôles/invisibles refusés aussi via l'API (même contrat que le
+        # parsing TOML) : un mot-clé ou un motif à `\n` littéral ou RLO ne
+        # matcherait jamais — faute de frappe, pas règle de test.
+        for keyword in self.keywords:
+            _reject_control_characters(keyword)
+        for pattern in self.patterns:
+            _reject_control_characters(pattern.pattern)
 
         # Invariant 1 / Sécurité : toute règle DOIT obligatoirement définir au moins
         # un critère sur la valeur (keywords ou patterns). Les filtres paths ou
@@ -614,65 +655,6 @@ class Allowlist:
         """Allowlist vide : aucun candidat n'est ignoré."""
         return cls((), sha256=None)
 
-    @classmethod
-    def default(cls) -> Allowlist:
-        """Allowlist par défaut contenant les 4 règles standard (#24).
-
-        Cette méthode de fabrique est réservée aux tests et à l'API Python
-        programmatique ; en usage CLI / CI, l'allowlist est chargée depuis la
-        configuration TOML auditée (`load_allowlist`). Sans `heimdall.toml`,
-        `load_allowlist` retourne volontairement `Allowlist.empty()` : aucune
-        règle implicite ne s'applique au verdict.
-        """
-        return cls(create_default_rules(), sha256=None)
-
-
-#: Fabrique de commodité (tests/API). Elle n'est pas branchée sur le
-#: chargement CLI/CI : la configuration versionnée `heimdall.toml` reste la
-#: seule source d'allowlist opposable, et l'absence de fichier vaut vide.
-def create_default_rules() -> tuple[AllowlistRule, ...]:
-    """Crée les règles déterministes par défaut demandées par le ticket #24 :
-
-    - example : mots-clés et jetons d'exemple (example, sample, your_key_here)
-    - changeme : mots de passe ou secrets par défaut changeme
-    - dummy : valeurs et jetons factices dummy
-    - test-fixtures : fixtures et valeurs factices explicites dans tests/
-    """
-    return (
-        AllowlistRule(
-            name="example-placeholders",
-            description="Mots-clés et jetons d'exemple (AKIAIOSFODNN7EXAMPLE, example, sample)",
-            keywords=("AKIAIOSFODNN7EXAMPLE", "example", "sample", "your_key_here"),
-        ),
-        AllowlistRule(
-            name="changeme-passwords",
-            description="Mots de passe ou secrets par défaut changeme",
-            keywords=("changeme",),
-        ),
-        AllowlistRule(
-            name="dummy-tokens",
-            description="Valeurs et jetons factices dummy",
-            keywords=("dummy",),
-        ),
-        AllowlistRule(
-            name="test-fixtures",
-            description=(
-                "Valeurs factices et fixtures délimitées dans les tests "
-                "(frontière \\b stricte : 'fake_slack_token' reste signalé)"
-            ),
-            paths=("tests/**", "fixtures/**", "**/fixtures/**", "support/**", "**/support/**"),
-            keywords=(
-                "fake",
-                "mock",
-                "dummy",
-                "placeholder",
-                "synthetic",
-                "factice",
-                "fixture",
-            ),
-        ),
-    )
-
 
 def _validate_path_pattern(pattern: str) -> str:
     """Valide un motif de chemin selon la grammaire du contrat Finding #14.
@@ -709,6 +691,10 @@ def _compile_safe_regex(raw: str) -> re.Pattern[str]:
         raise ScanError(_CONFIG_ERROR)
     if "\x00" in raw:
         raise ScanError(_CONFIG_ERROR)
+    # Un contrôle littéral (`\n`, RLO…) ne matcherait jamais une valeur
+    # monoligne : faute de frappe refusée (les échappements `\\n` restent
+    # deux caractères ordinaires et acceptés).
+    _reject_control_characters(raw)
 
     # 1. Analyse structurelle : imbrication réelle, quantificateurs, backrefs.
     _reject_dangerous_regex(raw)
@@ -767,6 +753,9 @@ def _parse_str_list(
             raise ScanError(_CONFIG_ERROR)
         if "\x00" in item:
             raise ScanError(_CONFIG_ERROR)
+        # Contrôles/invisibles (`\n` littéral, RLO…) : faute de frappe
+        # refusée — un tel mot-clé ne matcherait jamais (règle morte).
+        _reject_control_characters(item)
         res.append(item)
     return tuple(res)
 
@@ -788,6 +777,10 @@ def _parse_rule_dict(raw_rule: object) -> AllowlistRule:
         min_length=MIN_KEYWORD_LENGTH,
     )
     secret_types = _parse_str_list(raw_rule, "secret_types")
+    # Grammaire du contrat #14 : un type hors grammaire (`"AWS"`, `"../etc"`)
+    # ne matcherait jamais et rendrait la règle muette sans erreur.
+    for secret_type in secret_types:
+        _validate_secret_type(secret_type)
 
     raw_paths = raw_rule.get("paths", [])
     if not isinstance(raw_paths, list) or len(raw_paths) > MAX_ITEMS_PER_RULE:
@@ -979,7 +972,6 @@ __all__ = [
     "Allowlist",
     "AllowlistRule",
     "AllowlistTrace",
-    "create_default_rules",
     "load_allowlist",
     "load_allowlist_from_file",
     "parse_allowlist_bytes",

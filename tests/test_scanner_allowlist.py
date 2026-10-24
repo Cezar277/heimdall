@@ -54,7 +54,6 @@ from heimdall.scanner.allowlist import (
     _compile_safe_regex,
     _keyword_matches_value,
     _validate_path_pattern,
-    create_default_rules,
     load_allowlist,
     load_allowlist_from_file,
     parse_allowlist_toml,
@@ -86,6 +85,49 @@ def _run_cli_process(*arguments: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=20,
         check=False,
+    )
+
+
+def _standard_test_allowlist() -> Allowlist:
+    """Les 4 règles standard, fabrique locale aux tests (miroir de `heimdall.toml`).
+
+    Remplace l'ancienne fabrique prod `Allowlist.default()` (supprimée :
+    aucune règle implicite ne doit exister côté production, voir
+    `test_cli_without_config_does_not_apply_default_factories`). La source
+    opposable en CLI/CI reste le `heimdall.toml` versionné.
+    """
+    return Allowlist(
+        (
+            AllowlistRule(
+                name="example-placeholders",
+                description="Mots-clés et jetons d'exemple",
+                keywords=("AKIAIOSFODNN7EXAMPLE", "example", "sample", "your_key_here"),
+            ),
+            AllowlistRule(
+                name="changeme-passwords",
+                description="Mots de passe par défaut changeme",
+                keywords=("changeme",),
+            ),
+            AllowlistRule(
+                name="dummy-tokens",
+                description="Valeurs factices dummy",
+                keywords=("dummy",),
+            ),
+            AllowlistRule(
+                name="test-fixtures",
+                description="Fixtures explicites dans les tests",
+                paths=("tests/**", "fixtures/**", "**/fixtures/**", "support/**", "**/support/**"),
+                keywords=(
+                    "fake",
+                    "mock",
+                    "dummy",
+                    "placeholder",
+                    "synthetic",
+                    "factice",
+                    "fixture",
+                ),
+            ),
+        )
     )
 
 
@@ -166,7 +208,7 @@ def test_allowlist_duplicate_rule_names_rejected() -> None:
 
 def test_rule_example_placeholders() -> None:
     """Règle 'example' : écarte les jetons et placeholders évidents."""
-    al = Allowlist.default()
+    al = _standard_test_allowlist()
     # Dans la valeur
     assert al.evaluate(
         value="AKIAIOSFODNN7EXAMPLE",
@@ -196,7 +238,7 @@ def test_rule_example_placeholders() -> None:
 
 def test_rule_changeme_passwords() -> None:
     """Règle 'changeme' : écarte les mots de passe et configs changeme."""
-    al = Allowlist.default()
+    al = _standard_test_allowlist()
     assert al.evaluate(
         value="changeme",
         file="env.json",
@@ -214,7 +256,7 @@ def test_rule_changeme_passwords() -> None:
 
 def test_rule_dummy_tokens() -> None:
     """Règle 'dummy' : écarte les jetons et identifiants factices dummy."""
-    al = Allowlist.default()
+    al = _standard_test_allowlist()
     assert al.evaluate(
         value="dummy-secret-token",
         file="client.py",
@@ -232,7 +274,7 @@ def test_rule_dummy_tokens() -> None:
 
 def test_rule_test_fixtures() -> None:
     """Règle 'test-fixtures' : écarte les fixtures factices délimitées aux tests."""
-    al = Allowlist.default()
+    al = _standard_test_allowlist()
     # Factice dans tests/ -> écarté (séparateur non-mot, frontière \b stricte)
     assert al.evaluate(
         value="fake-token-12345",
@@ -257,7 +299,7 @@ def test_rule_test_fixtures_does_not_treat_underscore_as_separator() -> None:
     secret délimité par des underscores. Le comportement est volontairement
     strict : `fake_slack_token` et `my_dummy_key` ne sont PAS des fixtures.
     """
-    al = Allowlist.default()
+    al = _standard_test_allowlist()
     for value in ("fake_slack_token_12345", "my_dummy_key"):
         assert (
             al.evaluate(
@@ -279,7 +321,7 @@ def test_trap_real_secret_in_tests_is_never_ignored() -> None:
     Un attaquant qui placerait un vrai token AWS dans un fichier de tests/
     sans mot-clé factice reste détecté.
     """
-    al = Allowlist.default()
+    al = _standard_test_allowlist()
     # Clé AWS sans marqueur 'example', 'changeme', 'dummy' ou 'fake'
     real_looking_secret = "AKIA1234567890ABCDEF"
     result = al.evaluate(
@@ -308,7 +350,7 @@ def test_scanner_with_allowlist_produces_traces(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    al = Allowlist.default()
+    al = _standard_test_allowlist()
     scanner = Scanner(tmp_path, allowlist=al)
     findings = scanner.scan()
 
@@ -329,7 +371,7 @@ def test_scanner_traces_contain_no_secret(tmp_path: Path) -> None:
     """Invariant 8 : aucune trace d'allowlist ne contient de secret."""
     secret = "AKIAIOSFODNN7EXAMPLE"
     (tmp_path / "app.py").write_text(f'AWS = "{secret}"\n', encoding="utf-8")
-    scanner = Scanner(tmp_path, allowlist=Allowlist.default())
+    scanner = Scanner(tmp_path, allowlist=_standard_test_allowlist())
     scanner.scan()
     assert len(scanner.traces) == 1
     trace_dict = scanner.traces[0].as_dict()
@@ -806,9 +848,9 @@ patterns = ["^AKIA.*EXAMPLE$"]
     assert "règle=custom-rule" in res.stdout
 
 
-def test_create_default_rules_and_load_allowlist(git_repo: GitRepo) -> None:
-    """Vérifie create_default_rules et load_allowlist sur un dépôt."""
-    rules = create_default_rules()
+def test_versioned_rules_and_load_allowlist(git_repo: GitRepo) -> None:
+    """Vérifie les 4 règles du `heimdall.toml` versionné et `load_allowlist`."""
+    rules = _standard_test_allowlist().rules
     assert len(rules) == 4
     names = {r.name for r in rules}
     assert names == {
@@ -830,9 +872,11 @@ def test_create_default_rules_and_load_allowlist(git_repo: GitRepo) -> None:
 def test_cli_without_config_does_not_apply_default_factories(git_repo: GitRepo) -> None:
     """Sans heimdall.toml, aucune règle implicite ne s'applique au verdict.
 
-    `Allowlist.default()` et `create_default_rules()` sont des fabriques
-    d'API/test ; le chargement CLI utilise `Allowlist.empty()` en l'absence
-    de configuration auditée. Ce test fige cette frontière.
+    Il n'existe plus aucune fabrique prod de règles implicites
+    (`Allowlist.default()` / `create_default_rules()` supprimées) : le
+    chargement CLI utilise `Allowlist.empty()` en l'absence de configuration
+    auditée, et les tests utilisent l'helper local `_standard_test_allowlist()`.
+    Ce test fige cette frontière (`ignored_count == 0` sans config).
     """
     git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
 
@@ -1172,10 +1216,106 @@ paths = ["src/**"]
         parse_allowlist_toml(bad_toml)
 
 
+def test_secret_types_outside_grammar_rejected() -> None:
+    """Revue (LOW) : un `secret_types` hors grammaire (#14) est refusé, pas muet."""
+    for bad in ("AWS", "Aws", "foo bar", "../etc", "", "a" * 65, "aws\n"):
+        with pytest.raises(ScanError):
+            AllowlistRule(
+                name="typo-type",
+                description="d",
+                keywords=("dummy",),
+                secret_types=(bad,),
+            )
+    bad_toml = """
+[allowlist]
+version = "1"
+[[allowlist.rules]]
+name = "typo-type"
+description = "d"
+keywords = ["dummy"]
+secret_types = ["AWS"]
+"""
+    with pytest.raises(ScanError):
+        parse_allowlist_toml(bad_toml)
+    # Valides : grammaire exacte `[a-z][a-z0-9_]*`, 64 caractères max.
+    rule = AllowlistRule(
+        name="ok",
+        description="d",
+        keywords=("dummy",),
+        secret_types=("aws", "generic_password"),
+    )
+    assert rule.secret_types == ("aws", "generic_password")
+
+
+def test_control_characters_in_keywords_and_patterns_rejected(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    """Revue (LOW) : contrôles littéraux refusés (règle morte), échappements OK."""
+    for bad_kw in ("abc\ndef", "abc\rdef", "abc\tdef", "fake\u202etoken", "abc\x7f"):
+        with pytest.raises(ScanError):
+            AllowlistRule(name="ctrl", description="d", keywords=(bad_kw,))
+    with pytest.raises(ScanError):
+        AllowlistRule(
+            name="ctrl",
+            description="d",
+            keywords=("dummy",),
+            patterns=(re.compile("ABC\nDEF"),),
+        )
+    # Via TOML : les `"""` multilignes font passer de vrais `\n`/RLO au parseur.
+    bad_kw_toml = (
+        '[allowlist]\nversion = "1"\n[[allowlist.rules]]\nname = "ctrl"\n'
+        'description = "d"\nkeywords = ["ok", """a\nb"""]\n'
+    )
+    with pytest.raises(ScanError):
+        parse_allowlist_toml(bad_kw_toml)
+    bad_pat_toml = (
+        '[allowlist]\nversion = "1"\n[[allowlist.rules]]\nname = "ctrl"\n'
+        'description = "d"\nkeywords = ["dummy"]\n'
+        'patterns = ["^(?:EXAMPLE-[0-9]{4})$", """ABC\nDEF"""]\n'
+    )
+    with pytest.raises(ScanError):
+        parse_allowlist_toml(bad_pat_toml)
+    rlo_toml = (
+        '[allowlist]\nversion = "1"\n[[allowlist.rules]]\nname = "ctrl"\n'
+        'description = "d"\nkeywords = ["fake\\u202etoken"]\n'
+    )
+    with pytest.raises(ScanError):
+        parse_allowlist_toml(rlo_toml)
+    # Les échappements regex (`\\n`) restent deux caractères ordinaires.
+    rule = AllowlistRule(
+        name="ok",
+        description="d",
+        keywords=("dummy",),
+        patterns=(re.compile(r"ABC\nDEF"),),
+    )
+    assert rule.patterns[0].pattern == r"ABC\nDEF"
+    # Via CLI : config fautive -> code 2, jamais de règle morte silencieuse.
+    bad_cfg = tmp_path / "ctrl.toml"
+    bad_cfg.write_text(bad_pat_toml, encoding="utf-8")
+    git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+    res = _run("scan", "--config", str(bad_cfg), str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "scan impossible" in res.stderr.lower()
+
+
+def test_cli_bad_secret_types_config_exits_two(git_repo: GitRepo, tmp_path: Path) -> None:
+    """Revue (LOW) : `secret_types` typo via `--config` -> code 2, pas règle morte."""
+    bad_cfg = tmp_path / "typo.toml"
+    bad_cfg.write_text(
+        '[allowlist]\nversion = "1"\n\n[[allowlist.rules]]\nname = "t"\n'
+        'description = "d"\nkeywords = ["dummy"]\nsecret_types = ["AWS"]\n',
+        encoding="utf-8",
+    )
+    git_repo.write("app.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+    res = _run("scan", "--config", str(bad_cfg), str(git_repo.root))
+    assert res.exit_code == EXIT_ERROR
+    assert "scan impossible" in res.stderr.lower()
+
+
 def test_allowlist_is_empty() -> None:
     """Vérifie is_empty sur Allowlist."""
     assert Allowlist.empty().is_empty()
-    assert not Allowlist.default().is_empty()
+    assert not _standard_test_allowlist().is_empty()
 
 
 def test_path_pattern_validation_errors() -> None:
@@ -1640,7 +1780,7 @@ patterns = ["."]
 
 def test_example_substring_myexample_remains_detected() -> None:
     """Une valeur se terminant par 'example' (ex: myexample) reste détectée (Invariant 1)."""
-    al = Allowlist.default()
+    al = _standard_test_allowlist()
     assert (
         al.evaluate(
             value="myexample",
@@ -2169,8 +2309,8 @@ def test_scan_tree_fifo_config_fails_closed_without_blocking(
     assert "scan impossible" in completed.stderr.lower()
 
 
-def test_allowlist_exports_and_default_docstring() -> None:
-    """Vérifie l'export des constantes de taille et la documentation de Allowlist.default."""
+def test_allowlist_exports_and_no_implicit_factories() -> None:
+    """Vérifie l'export des constantes et l'absence de fabrique implicite."""
     assert "MAX_RULE_NAME_LENGTH" in al_module.__all__
     assert "MAX_DESCRIPTION_LENGTH" in al_module.__all__
     assert "MIN_KEYWORD_LENGTH" in al_module.__all__
@@ -2186,8 +2326,7 @@ def test_allowlist_exports_and_default_docstring() -> None:
     assert MAX_PATH_WILDCARDS == 10
     assert MAX_MATCH_PATH_LENGTH == 1024
 
-    # Allowlist.default() fournit les règles standards et possède une docstring explicite
-    default_al = Allowlist.default()
-    assert not default_al.is_empty()
-    assert len(default_al.rules) == 4
-    assert "Allowlist par défaut" in (Allowlist.default.__doc__ or "")
+    # Aucune fabrique prod de règles implicites : `Allowlist.default()` et
+    # `create_default_rules()` n'existent plus (ni méthode, ni export).
+    assert not hasattr(Allowlist, "default")
+    assert "create_default_rules" not in al_module.__all__
