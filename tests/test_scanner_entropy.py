@@ -13,7 +13,7 @@ import heimdall.scanner.signatures as registry
 from heimdall.scanner import DiffTarget, EntropyConfig, FileTarget, Finding, Scanner
 from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.entropy import shannon_entropy
-from heimdall.scanner.entropy_detection import find_entropy_matches
+from heimdall.scanner.entropy_detection import check_multiline_overflow, find_entropy_matches
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.signature_engine import SignatureEngine
@@ -248,3 +248,71 @@ def test_removed_context_surface_cannot_expose_cleartext() -> None:
     finding = SignatureEngine(SnippetHasher(key=b"T" * 32)).analyser(FileTarget("x", value))[0]
     assert value not in json.dumps(asdict(finding))
     assert value not in str(finding)
+
+
+@pytest.mark.parametrize("preceding", ["evil", ["x"], ("x",), (object(),), None])
+def test_direct_function_rejects_invalid_preceding_matches(preceding: object) -> None:
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        tuple(find_entropy_matches("abc", preceding_matches=preceding))
+
+
+@pytest.mark.parametrize(
+    "deadline",
+    [
+        "demain",
+        True,
+        False,
+        float("nan"),
+        float("inf"),
+        -float("inf"),
+        object(),
+        pytest.param(10**400, id="oversized-integer"),
+    ],
+)
+def test_direct_functions_reject_invalid_deadlines(deadline: object) -> None:
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        tuple(find_entropy_matches("abc", deadline=deadline))
+    # No token or delimiter: validation must precede every early return.
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        check_multiline_overflow("", "", deadline=deadline)
+
+
+@pytest.mark.parametrize(
+    "line,following,config",
+    [
+        (None, "abc", EntropyConfig()),
+        ("abc", None, EntropyConfig()),
+        ("abc", "def", None),
+        ("abc", "def", object()),
+    ],
+)
+def test_direct_overflow_guard_rejects_invalid_inputs(line, following, config) -> None:
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        check_multiline_overflow(line, following, config)
+
+
+@pytest.mark.parametrize("deadline", [None, 10**15, 1e300])
+def test_direct_functions_accept_valid_deadlines(deadline: float | None) -> None:
+    assert not tuple(find_entropy_matches("abc", deadline=deadline))
+    assert check_multiline_overflow("abc", "def", deadline=deadline) is None
+
+
+def test_empty_overflow_guard_still_checks_expired_deadline() -> None:
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        check_multiline_overflow("", "", deadline=0.0)
+
+
+def test_benign_minified_json_overflow_is_an_explicit_refusal(tmp_path: Path) -> None:
+    line = json.dumps({"a": [0] * 2500}, separators=(",", ":"))
+    assert len(line) > 4096
+    assert json.loads(line) == {"a": [0] * 2500}
+    assert not tuple(find_entropy_matches(line))
+    text = line + "\n{}"
+    (tmp_path / "data.jsonl").write_text(text)
+    hasher = SnippetHasher(key=b"T" * 32)
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        check_multiline_overflow(line, "{}")
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        TreeScanner(tmp_path, hasher=hasher).scan()
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        SignatureEngine(hasher).analyser(FileTarget("data.jsonl", text))

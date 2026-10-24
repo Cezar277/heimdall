@@ -49,6 +49,21 @@ class EntropyConfig:
 DEFAULT_ENTROPY_CONFIG = EntropyConfig()
 
 
+def _validate_input(line: str, config: EntropyConfig, deadline: float | None) -> None:
+    if not isinstance(line, str) or not isinstance(config, EntropyConfig):
+        raise ScanError(_SCAN_ERROR)
+    if deadline is None:
+        return
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        raise ScanError(_SCAN_ERROR)
+    try:
+        finite = math.isfinite(deadline)
+    except OverflowError:
+        raise ScanError(_SCAN_ERROR) from None
+    if not finite:
+        raise ScanError(_SCAN_ERROR)
+
+
 def _tokens(line: str, deadline: float | None) -> Iterator[re.Match[str]]:
     for token in _TOKEN.finditer(line):
         if deadline is not None and time.monotonic() > deadline:
@@ -70,7 +85,10 @@ def find_entropy_matches(
     Un jeton > 4096 caractères refuse le scan ; aucun fragment n'est ignoré.
     Une signature reconnue conserve la priorité sur son signal entropie.
     """
-    if not isinstance(line, str) or not isinstance(config, EntropyConfig):
+    _validate_input(line, config, deadline)
+    if not isinstance(preceding_matches, tuple) or any(
+        not isinstance(match, SignatureMatch) for match in preceding_matches
+    ):
         raise ScanError(_SCAN_ERROR)
     if deadline is not None and time.monotonic() > deadline:
         raise ScanError(_SCAN_ERROR)
@@ -117,6 +135,10 @@ def check_multiline_overflow(
     Sans affectation, un jeton de longueur candidate refuse aussi : un secret
     fragmenté peut avoir moins d'entropie que sa valeur reconstruite.
     """
+    _validate_input(line, config, deadline)
+    _validate_input(following, config, deadline)
+    if deadline is not None and time.monotonic() > deadline:
+        raise ScanError(_SCAN_ERROR)
     if any(delimiter in text for text in (line, following) for delimiter in (":", "=")):
         raise ScanError(_SCAN_ERROR)
     for text in (line, following):

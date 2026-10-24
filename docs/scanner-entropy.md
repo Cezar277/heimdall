@@ -90,6 +90,10 @@ sur tous les dépôts possibles.
   les fragments dont l'entropie isolée est inférieure à celle du secret entier.
   Sans parseur de langage, une affectation complète dans cette situation
   peut aussi être refusée ; le refus est explicite, jamais une liste vide.
+  Arbitrage confidentialité/disponibilité assumé : deux lignes de JSON
+  bénin dépassant ensemble 4 Kio, avec `:` mais sans candidat, provoquent
+  aussi `ScanError` et le code CLI 2 (arbre et index Git). Les tests figent
+  ce cas : un bundle ou un fichier minifié peut bloquer la CI sans secret.
 - UTF-8 invalide sans BOM : décodage strict, puis `ScanError` statique ;
   un vrai binaire connu reste exclu par la politique existante. Un faux PNG
   non UTF-8 contenant du texte clair fait échouer la CLI en code 2.
@@ -98,3 +102,9 @@ Les tests sont dans `tests/test_scanner_entropy.py`,
 `tests/test_scanner_detect.py`, `tests/test_scanner_signatures.py` et
 `tests/test_cli_scan.py`. Les preuves module + ligne sont archivées dans
 `t23-samm.md`.
+
+Les imports directs valident également `preceding_matches` (tuple de
+`SignatureMatch`) et `deadline` (nombre fini, hors booléens). Les deux
+fonctions de détection/garde refusent une deadline invalide en `ScanError`
+statique, même si les lignes sont vides ; la garde valide aussi ses deux
+lignes et sa configuration avant toute recherche.

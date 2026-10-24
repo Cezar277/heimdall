@@ -817,6 +817,18 @@ def test_scan_staged_polyglot_binary_header_is_fail_closed(git_repo: GitRepo) ->
     assert FAKE_AWS_KEY not in resultat.output
 
 
+@pytest.mark.parametrize("staged", [False, True])
+def test_benign_minified_json_multiline_overflow_exits_two(git_repo: GitRepo, staged: bool) -> None:
+    """T23 : le refus conservateur peut aussi bloquer un JSON bénin, sans secret."""
+    line = json.dumps({"a": [0] * 2500}, separators=(",", ":"))
+    git_repo.write("data.jsonl", line + "\n{}\n")
+    git_repo.stage("data.jsonl")
+    options = ("--staged",) if staged else ()
+    resultat = _run("scan", *options, str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert line not in resultat.output
+
+
 def test_scan_staged_concurrent_index_change_exits_two(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
