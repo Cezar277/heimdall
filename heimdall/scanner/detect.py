@@ -35,6 +35,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
+from heimdall.scanner.allowlist import Allowlist, AllowlistTrace
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.entropy_detection import (
     DEFAULT_ENTROPY_CONFIG,
@@ -58,8 +59,20 @@ from heimdall.scanner.finding import (
     validate_relative_path,
 )
 from heimdall.scanner.hashing import SnippetHasher
+from heimdall.scanner.interface import _open_flags, _resolve_root
 from heimdall.scanner.signature_engine import MAX_FINDINGS
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
+
+
+def _raise_walk_error(_error: OSError) -> None:
+    raise ScanError(_SCAN_ERROR)
+
+
+def _not_link(p: Path) -> bool:
+    try:
+        return not p.is_symlink()
+    except OSError:
+        raise ScanError(_SCAN_ERROR) from None
 
 MAX_FILE_BYTES: Final[int] = 1_048_576
 MULTILINE_WINDOW: Final[int] = 4096
@@ -141,50 +154,6 @@ def _decode_data(data: bytes, *, allow_binary_suffix: bool) -> str | None:
         raise
 
 
-def _open_flags() -> int:
-    return (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_BINARY", 0)
-    )
-
-
-def _raise_walk_error(_error: OSError) -> None:
-    raise ScanError(_SCAN_ERROR)
-
-
-def _not_link(p: Path) -> bool:
-    try:
-        return not p.is_symlink()
-    except OSError:
-        raise ScanError(_SCAN_ERROR) from None
-
-
-def _resolve_root(root: str | os.PathLike[str]) -> Path:
-    """Résout la racine sans jamais suivre un lien symbolique.
-
-    La racine elle-même et chacun de ses ancêtres sont vérifiés par
-    ``lstat`` : un lien symbolique dans le chemin de la racine est refusé
-    (``ScanError``) au lieu d'être suivi en silence. La promesse « les liens
-    symboliques ne sont jamais suivis » vaut donc aussi pour la racine et
-    pour le fichier unique.
-    """
-    try:
-        absolute = Path(os.path.abspath(Path(root).expanduser()))
-        for candidate in (absolute, *absolute.parents):
-            if candidate.is_symlink():
-                raise ScanError(_SCAN_ERROR)
-        resolved = absolute.resolve(strict=True)
-        # Course symlink (check-then-resolve) : si un composant a été remplacé
-        # entre le `lstat` et le `resolve`, le résolu diffère du demandé et la
-        # racine serait détournée hors périmètre — refus au lieu de suivre.
-        if resolved != absolute:
-            raise ScanError(_SCAN_ERROR)
-        return resolved
-    except (OSError, RuntimeError):
-        raise ScanError(_SCAN_ERROR) from None
-
 
 class Scanner:
     """Scanner déterministe d'une racine confinée (couche système #22/#59).
@@ -206,6 +175,7 @@ class Scanner:
     """
 
     __slots__ = (
+        "_allowlist",
         "_hasher",
         "_entropy_config",
         "_max_bytes",
@@ -214,6 +184,7 @@ class Scanner:
         "_root",
         "_single",
         "_strict",
+        "_traces",
     )
 
     def __init__(  # noqa: PLR0913 - bornes nommées explicites, cf. MAX_*.
@@ -226,6 +197,7 @@ class Scanner:
         max_files: int | None = None,
         max_bytes: int | None = None,
         max_findings: int | None = None,
+        allowlist: Allowlist | None = None,
     ) -> None:
         # Les bornes sont validées avant tout accès disque : une surcharge
         # explicite ne peut ni annuler ni relever les plafonds par défaut.
@@ -246,6 +218,13 @@ class Scanner:
             raise ValueError("configuration d'entropie invalide")
         self._entropy_config = entropy_config
         self._strict = strict
+        self._allowlist = allowlist if allowlist is not None else Allowlist.empty()
+        self._traces: list[AllowlistTrace] = []
+
+    @property
+    def traces(self) -> tuple[AllowlistTrace, ...]:
+        """Traces déterministes des rejets par l'allowlist (#24)."""
+        return tuple(self._traces)
 
     def scan(self, *, deadline: float | None = None) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.
@@ -395,7 +374,12 @@ class Scanner:
         except OSError:
             raise ScanError(_SCAN_ERROR) from None
         finally:
-            os.close(descriptor)
+            # `os.close` peut lever `OSError` (EBADF/EINTR sur FS adverse) :
+            # convertir pour garder le contrat unique `ScanError` (invariant 11).
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise ScanError(_SCAN_ERROR) from None
         return (
             _decode_data(data, allow_binary_suffix=allow_binary_suffix),
             len(data),
@@ -486,6 +470,22 @@ class Scanner:
         if key in seen:
             return
         seen.add(key)
+
+        # Allowlist déterministe (#24) : écarte les cas évidents sans passer
+        # par le LLM. Chaque rejet émet une trace traçable (règle, fichier, ligne).
+        if not self._allowlist.is_empty():
+            rule_name = self._allowlist.evaluate(
+                value=match.value,
+                file=relative,
+                line=line_number,
+                secret_type=match.secret_type,
+            )
+            if rule_name is not None:
+                self._traces.append(
+                    AllowlistTrace(rule=rule_name, file=relative, line=line_number)
+                )
+                return
+
         findings.append(
             Finding(
                 file=relative,
@@ -510,6 +510,7 @@ def scan(
     hasher: SnippetHasher | None = None,
     strict: bool = False,
     entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
+    allowlist: Allowlist | None = None,
 ) -> list[Finding]:
     """Analyse ``root`` et retourne des objets :class:`Finding`.
 
@@ -517,11 +518,16 @@ def scan(
     techniques de #59 : ``vendor/``, lockfiles et fichiers de contrôle sont
     alors parcourus.
     """
-    return Scanner(root, hasher=hasher, strict=strict, entropy_config=entropy_config).scan()
+    return Scanner(
+        root, hasher=hasher, strict=strict, entropy_config=entropy_config, allowlist=allowlist
+    ).scan()
 
 
 def find_candidates(
-    path: str, *, entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG
+    path: str,
+    *,
+    entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
+    allowlist: Allowlist | None = None,
 ) -> list[dict[str, object]]:
     """Repère les candidats secrets sous ``path`` (dépôt ou fichier).
 
@@ -529,4 +535,7 @@ def find_candidates(
     ``ScanError`` dès qu'une partie du périmètre ne peut pas être analysée :
     un scan incomplet ne devient jamais une liste vide ou partielle.
     """
-    return [finding.as_dict() for finding in scan(path, entropy_config=entropy_config)]
+    return [
+        finding.as_dict()
+        for finding in scan(path, entropy_config=entropy_config, allowlist=allowlist)
+    ]

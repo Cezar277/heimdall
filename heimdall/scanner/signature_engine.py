@@ -22,6 +22,7 @@ from __future__ import annotations
 import time
 from typing import Final
 
+from heimdall.scanner.allowlist import Allowlist, AllowlistTrace
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.entropy_detection import (
     DEFAULT_ENTROPY_CONFIG,
@@ -83,7 +84,7 @@ class SignatureEngine:
     moteur construit pour une passe ne se réutilise pas après son échéance.
     """
 
-    __slots__ = ("_deadline", "_hasher", "_max_findings", "_entropy_config")
+    __slots__ = ("_allowlist", "_deadline", "_entropy_config", "_hasher", "_max_findings", "_traces")
 
     def __init__(
         self,
@@ -92,12 +93,15 @@ class SignatureEngine:
         *,
         max_findings: int | None = None,
         deadline: float | None = None,
+        allowlist: Allowlist | None = None,
     ) -> None:
         self._deadline = deadline
         if not isinstance(entropy_config, EntropyConfig):
             raise ValueError("configuration d'entropie invalide")
         self._entropy_config = entropy_config
         self._hasher = hasher
+        self._allowlist = allowlist
+        self._traces: list[AllowlistTrace] = []
         # `None` ne doit jamais désactiver la borne : on retombe sur le
         # défaut, y compris pour un appelant non typé qui passerait `None`
         # en croyant conserver l'ancien mode non borné. Un entier explicite
@@ -112,6 +116,11 @@ class SignatureEngine:
         ):
             raise ValueError(_MAX_FINDINGS_INVALID)
         self._max_findings = max_findings
+
+    @property
+    def traces(self) -> tuple[AllowlistTrace, ...]:
+        """Traces déterministes des rejets par l'allowlist (#24)."""
+        return tuple(self._traces)
 
     def analyser(self, cible: ScanTarget) -> list[Finding]:
         """Analyse la cible et rend un Finding par candidat distinct."""
@@ -209,6 +218,22 @@ class SignatureEngine:
         if key in seen:
             return
         seen.add(key)
+
+        # Allowlist déterministe (#24) : écarte les cas évidents sans passer
+        # par le LLM. Chaque rejet émet une trace traçable (règle, fichier, ligne).
+        if self._allowlist is not None and not self._allowlist.is_empty():
+            rule_name = self._allowlist.evaluate(
+                value=match.value,
+                file=relative_path,
+                line=line_number,
+                secret_type=match.secret_type,
+            )
+            if rule_name is not None:
+                self._traces.append(
+                    AllowlistTrace(rule=rule_name, file=relative_path, line=line_number)
+                )
+                return
+
         findings.append(
             Finding(
                 file=relative_path,

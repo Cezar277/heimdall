@@ -229,6 +229,16 @@ jamais 0 ni 1.
   validation humaine Y/N/E et le remplacement du secret restent à faire
   (#32).
 
+## Allowlist déterministe (#24)
+
+L'allowlist déterministe écarte les cas évidents (`example`, `changeme`, `dummy`, fixtures de test) sans passer par le LLM, utilisable en local comme en mode CI headless.
+
+- **Fichier de configuration versionné** : [`heimdall.toml`](../heimdall.toml) à la racine du dépôt.
+- **Traçabilité stricte** : aucun rejet sans règle nommée. Chaque rejet émet une trace contenant exactement : règle, fichier, ligne.
+- **Transparence** : le rapport affiche toujours le nombre de findings ignorés par l'allowlist.
+- **Sécurité et anti-piège** : pas d'allowlist aveugle de `tests/` — un secret réel placé dans un fichier de test reste détecté s'il ne correspond pas à une règle spécifique de factice.
+- Voir [t24-samm.md](t24-samm.md) pour les preuves SAMM détaillées.
+
 ## Preuves locales
 
 ```sh

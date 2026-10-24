@@ -704,6 +704,44 @@ def test_crlf_line_numbers_are_preserved(tmp_path: Path) -> None:
 # --- Entropie et empreinte --------------------------------------------------
 
 
+def test_read_text_close_failure_is_scan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `os.close` en échec pendant la lecture → `ScanError`."""
+    target = tmp_path / "code.py"
+    target.write_text("password = 'x'\n", encoding="utf-8")
+    scanner = Scanner(tmp_path)
+    real_close = os.close
+
+    def boom(fd: int) -> None:
+        real_close(fd)
+        raise OSError("EBADF simulé")
+
+    monkeypatch.setattr(os, "close", boom)
+    with pytest.raises(ScanError):
+        scanner._read_text(target)
+
+
+def test_key_close_failures_are_scan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `os.close` en échec sur le fichier de clé → `ScanError`."""
+    key_path = tmp_path / "snippet.key"
+    created = hashing._create_key(key_path)
+    assert created is not None and len(created) == hashing.KEY_BYTES
+    real_close = os.close
+
+    def boom(fd: int) -> None:
+        real_close(fd)
+        raise OSError("EBADF simulé")
+
+    monkeypatch.setattr(os, "close", boom)
+    with pytest.raises(ScanError):
+        hashing._read_key(key_path)
+    with pytest.raises(ScanError):
+        hashing._create_key(tmp_path / "other.key")
+
+
 def test_shannon_entropy_bounds_and_values() -> None:
     assert shannon_entropy(b"") == 0.0
     assert shannon_entropy(b"aaaa") == 0.0

@@ -146,7 +146,12 @@ def _read_key(path: Path) -> bytes:
     except OSError:
         raise ScanError(_KEY_ERROR) from None
     finally:
-        os.close(descriptor)
+        # `os.close` peut lever `OSError` (EBADF/EINTR sur FS adverse) :
+        # convertir pour garder le contrat unique `ScanError` (invariant 11).
+        try:
+            os.close(descriptor)
+        except OSError:
+            raise ScanError(_KEY_ERROR) from None
     if len(key) != KEY_BYTES:
         raise ScanError(_KEY_ERROR)
     return key
@@ -184,7 +189,12 @@ def _create_key(path: Path) -> bytes | None:
             pass
         raise ScanError(_KEY_ERROR) from None
     finally:
-        os.close(descriptor)
+        # `os.close` peut lever `OSError` (EBADF/EINTR sur FS adverse) :
+        # convertir pour garder le contrat unique `ScanError` (invariant 11).
+        try:
+            os.close(descriptor)
+        except OSError:
+            raise ScanError(_KEY_ERROR) from None
     return key
 
 
