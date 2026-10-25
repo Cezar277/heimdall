@@ -373,6 +373,9 @@ def test_diff_target_refuses_unordered_or_invalid_lines():
         DiffTarget(path="src/app.py", lines=((1, "a"), (1, "b")))
     with pytest.raises(InvalidTarget):
         DiffTarget(path="src/app.py", lines=((1, 42),))  # type: ignore[arg-type]
+    # ``True`` vaut 1 en Python : le schéma distingue le booléen de l'entier.
+    with pytest.raises(InvalidTarget):
+        DiffTarget(path="src/app.py", lines=((True, "a"),))  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -408,6 +411,61 @@ def test_malformed_lines_are_normalised():
 def test_file_target_numbers_lines_from_one():
     target = FileTarget(path="src/app.py", text="a\nb\nc")
     assert target.lignes() == ((1, "a"), (2, "b"), (3, "c"))
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", ()),
+        ("\n", ((1, ""),)),
+        ("a\nb\n", ((1, "a"), (2, "b"))),
+        ("a\r\nb\r\n", ((1, "a"), (2, "b"))),
+        ("a\rb", ((1, "a\rb"),)),
+        ("a\r", ((1, "a\r"),)),
+        ("\r", ((1, "\r"),)),
+        ("a\rb\r", ((1, "a\rb\r"),)),
+        ("a\r\nb\r", ((1, "a"), (2, "b\r"))),
+        ("a\x0bb", ((1, "a\x0bb"),)),
+        ("a\fb", ((1, "a\fb"),)),
+        ("a\x1cb", ((1, "a\x1cb"),)),
+        ("a\x1db", ((1, "a\x1db"),)),
+        ("a\x1eb", ((1, "a\x1eb"),)),
+        ("a\x85b", ((1, "a\x85b"),)),
+        ("a\u200eb", ((1, "a\u200eb"),)),
+        ("a\u200fb", ((1, "a\u200fb"),)),
+        ("a\u2028b", ((1, "a\u2028b"),)),
+        ("a\u2029b", ((1, "a\u2029b"),)),
+    ],
+    ids=[
+        "vide",
+        "une_ligne_vide",
+        "fin_nouvelle_ligne",
+        "crlf",
+        "cr_isole",
+        "cr_final_sans_lf",
+        "cr_seul",
+        "cr_isoles_finaux",
+        "crlf_puis_cr_final",
+        "vertical_tab",
+        "form_feed",
+        "file_separator_fs",
+        "file_separator_gs",
+        "file_separator_rs",
+        "nel",
+        "lrm",
+        "rlm",
+        "u2028",
+        "u2029",
+    ],
+)
+def test_file_target_splits_only_on_lf_and_normalises_crlf(text, expected):
+    """La numérotation suit Git : ``\\n`` seul, ``\\r\\n`` normalisé.
+
+    ``str.splitlines()`` couperait aussi sur ``\\v``, ``\\f``, ``\\u2028`` et
+    ``\\u2029`` : un ``Finding.line`` décalé ferait remédier au mauvais
+    endroit. Ces séparateurs restent donc dans le contenu de la ligne.
+    """
+    assert FileTarget(path="src/app.py", text=text).lignes() == expected
 
 
 @pytest.mark.parametrize("path", ["../escape.py", "/etc/passwd", "src/../x.py", "C:/x.py"])
@@ -459,6 +517,30 @@ def test_scanner_delegates_and_sorts():
     assert moteur.cibles == [cible]
 
 
+def test_scanner_freezes_the_engine_method_at_construction():
+    """La méthode liée est figée : une mutation après coup est sans effet.
+
+    ``Scanner`` vérifie ``moteur.analyser`` à la construction ; relire
+    ``moteur.analyser`` à chaque scan laisserait une fenêtre TOCTOU. La façade
+    appelle donc la méthode liée capturée, même si l'attribut est remplacé.
+    """
+
+    class _MoteurMutable:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def analyser(self, cible):
+            self.calls += 1
+            return []
+
+    moteur = _MoteurMutable()
+    scanner = Scanner(moteur)
+    moteur.analyser = lambda cible: (_ for _ in ()).throw(RuntimeError("muté"))
+
+    assert scanner.scan(DiffTarget(path="src/app.py", lines=((1, "x"),))) == []
+    assert moteur.calls == 1
+
+
 def test_scanner_scan_all_sorts_by_file_then_line():
     moteur = _MoteurParFichier(
         [
@@ -502,6 +584,17 @@ def test_scanner_refuses_a_non_conforming_engine_output(finding):
     moteur = _MoteurFactice([finding])
     with pytest.raises(ScanError):
         Scanner(moteur).scan(DiffTarget(path="src/app.py", lines=((1, "x"),)))
+
+
+def test_scanner_does_not_swallow_a_keyboard_interrupt():
+    """Les ``BaseException`` restent des interruptions, pas des ``ScanError``."""
+
+    class _MoteurInterrompu:
+        def analyser(self, cible):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        Scanner(_MoteurInterrompu()).scan(DiffTarget(path="src/app.py", lines=((1, "x"),)))
 
 
 def test_scanner_converts_an_engine_failure_into_a_contract_error():
@@ -646,6 +739,17 @@ def test_scanner_refuses_an_engine_that_renders_nothing_usable(rendu):
 def test_scan_all_refuses_a_non_iterable_list_of_targets():
     with pytest.raises(ScanError):
         Scanner(_MoteurFactice([])).scan_all(None)  # type: ignore[arg-type]
+
+
+def test_scan_all_is_fail_closed_on_a_mixed_target_list():
+    """Une seule cible invalide suffit : aucun résultat partiel n'est rendu."""
+    with pytest.raises(InvalidTarget):
+        Scanner(_MoteurFactice([])).scan_all(
+            [
+                DiffTarget(path="src/app.py", lines=((1, "x"),)),
+                "pas une cible",  # type: ignore[list-item]
+            ]
+        )
 
 
 def test_scanner_output_validates_against_the_contract():
