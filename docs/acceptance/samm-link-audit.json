@@ -1,0 +1,154 @@
+{
+  "date": "2026-10-25",
+  "tested_revision": "ad54f025e224c5d3cdfa824a1117b5c616cc6e13",
+  "scope": "Permaliens GitHub blob des 14 fiches SAMM historiques ; verification locale des objets git et bornes de ligne, sans assertion de disponibilite HTTP.",
+  "summary": {
+    "valid": 744
+  },
+  "sheets": [
+    {
+      "sheet": "docs/t21-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "b1e401927d1c2ebb18a24b5c19167486ec9f488a24e1585a36d84ec9711b3bdb",
+      "occurrences": 12,
+      "statuses": {
+        "valid": 12
+      },
+      "historical_file_differs_occurrences": 7
+    },
+    {
+      "sheet": "docs/t22-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "c9a83016c6085694047fb1fa0f32bd35ff78ac798306bafb0c158ff2fbb04d68",
+      "occurrences": 64,
+      "statuses": {
+        "valid": 64
+      },
+      "historical_file_differs_occurrences": 58
+    },
+    {
+      "sheet": "docs/t23-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "3b14cc58715f42cc930b8d2c846ea25555fae6b1c61d33ac92fdc4a8462b9fdc",
+      "occurrences": 46,
+      "statuses": {
+        "valid": 46
+      },
+      "historical_file_differs_occurrences": 39
+    },
+    {
+      "sheet": "docs/t24-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "773a95aa63fbc136a2177b22094e79c46bcfe4d636de0f4ecc0fac03d8335f10",
+      "occurrences": 131,
+      "statuses": {
+        "valid": 131
+      },
+      "historical_file_differs_occurrences": 25
+    },
+    {
+      "sheet": "docs/t255-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "1e6981f5bd25468fe1411ba4b29831ef8505b68ddbd465791c67c19bc878cc61",
+      "occurrences": 47,
+      "statuses": {
+        "valid": 47
+      },
+      "historical_file_differs_occurrences": 1
+    },
+    {
+      "sheet": "docs/t29-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "0d5885a59e7598585432253496e69f785bce5161a6f4a047d5d172bf832af619",
+      "occurrences": 170,
+      "statuses": {
+        "valid": 170
+      },
+      "historical_file_differs_occurrences": 168
+    },
+    {
+      "sheet": "docs/t33-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "9acba408d660baf01d5b8acfd26ecc1b93c3109b48a1b1943ded3a0157171de4",
+      "occurrences": 9,
+      "statuses": {
+        "valid": 9
+      },
+      "historical_file_differs_occurrences": 0
+    },
+    {
+      "sheet": "docs/t34-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "3af3bba543b87a74b16ebd7b9b73667fedae6dcec10538efbb70fa93424bbcc5",
+      "occurrences": 18,
+      "statuses": {
+        "valid": 18
+      },
+      "historical_file_differs_occurrences": 1
+    },
+    {
+      "sheet": "docs/t35-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "fa99c296abfd87b32e407d977c848989a25263c440bd81ed57574630d1667484",
+      "occurrences": 0,
+      "statuses": {},
+      "historical_file_differs_occurrences": 0
+    },
+    {
+      "sheet": "docs/t53-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "d44a843ec73ce1e6101f3dd7861450cd391f9c5aa265ab5e00b467d4ccf2e932",
+      "occurrences": 64,
+      "statuses": {
+        "valid": 64
+      },
+      "historical_file_differs_occurrences": 54
+    },
+    {
+      "sheet": "docs/t54-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "5f4fe3d79483acf4ef9758f687fd951f141a6cf05a36072b9fe715827368e73f",
+      "occurrences": 98,
+      "statuses": {
+        "valid": 98
+      },
+      "historical_file_differs_occurrences": 84
+    },
+    {
+      "sheet": "docs/t64-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "4fa3ed4678acc1f8bfc073fbb1158bb8a5baa5ba4e778fddddcd931fa49fd1c2",
+      "occurrences": 48,
+      "statuses": {
+        "valid": 48
+      },
+      "historical_file_differs_occurrences": 29
+    },
+    {
+      "sheet": "docs/t67-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "7827027297f10e5b674acbe4119fc4e2414d45f685a4e28746c37e542550da8c",
+      "occurrences": 24,
+      "statuses": {
+        "valid": 24
+      },
+      "historical_file_differs_occurrences": 0
+    },
+    {
+      "sheet": "docs/t68-samm.md",
+      "date_checked": "2026-10-25",
+      "source_sha256": "5ad69bed1040a62a39cf6500b39739a31dc8b18dbdaee1ffec23ad30bab8120d",
+      "occurrences": 13,
+      "statuses": {
+        "valid": 13
+      },
+      "historical_file_differs_occurrences": 0
+    }
+  ],
+  "corrected_reference": {
+    "sheet": "docs/t22-samm.md",
+    "old": "entropy.py#L16-L33",
+    "new": "entropy.py#L15-L32"
+  },
+  "source_hash_normalization": "SHA-256 du texte UTF-8 avec fins de ligne LF, comme les blobs Git du depot."
+}
