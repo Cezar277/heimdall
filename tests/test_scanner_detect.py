@@ -480,8 +480,8 @@ def test_secret_split_by_a_blank_line_is_a_documented_limit(tmp_path: Path) -> N
     assert find_candidates(str(tmp_path)) == []
 
 
-def test_secret_split_over_three_lines_is_detected(tmp_path: Path) -> None:
-    """La fenêtre de trois lignes couvre un secret réparti sur trois lignes."""
+def test_secret_split_across_two_contiguous_lines_is_detected(tmp_path: Path) -> None:
+    """La fenêtre de deux lignes contiguës couvre le secret réparti sur celles-ci."""
     secret = fake_token("", 40)
     _write(tmp_path, "three.py", f'aws_secret_access_key = "{secret[:20]}\n{secret[20:]}"\n')
     findings = find_candidates(str(tmp_path))
@@ -489,7 +489,7 @@ def test_secret_split_over_three_lines_is_detected(tmp_path: Path) -> None:
 
 
 def test_secret_split_by_more_than_two_newlines_is_a_documented_limit(tmp_path: Path) -> None:
-    """Limite figée : au-delà de trois lignes jointes, la coupure n'est pas vue."""
+    """Limite figée : au-delà de deux lignes contiguës, la coupure n'est pas vue."""
     secret = fake_token("", 40)
     _write(tmp_path, "gap.py", f'aws_secret_access_key =\n\n\n"{secret}"\n')
     assert find_candidates(str(tmp_path)) == []
@@ -883,6 +883,39 @@ def test_root_under_a_symlinked_directory_is_refused(tmp_path: Path) -> None:
         scan(link / "secret.txt")
 
 
+def test_a_root_replaced_by_a_symlink_before_the_walk_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """La racine est re-vérifiée par ``lstat`` juste avant ``os.walk`` (TOCTOU).
+
+    Un remplacement furtif de la racine par un lien symbolique entre
+    ``Scanner.__init__`` et le parcours ne doit jamais être suivi. Le test
+    interdit aussi l'appel à ``os.walk`` : la garde ``lstat`` doit refuser
+    avant même le parcours.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write(outside, "leak.py", f'AWS = "{_aws("outside")}"')
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _write(repository, "app.py", "x = 1\n")
+    scanner = Scanner(repository)
+    repository.rename(tmp_path / "repo.original")
+    try:
+        repository.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Création de liens symboliques non autorisée sous Windows")
+        raise
+
+    def forbidden_walk(*args: object, **kwargs: object) -> object:
+        raise AssertionError("os.walk ne doit pas suivre une racine remplacée")
+
+    monkeypatch.setattr("heimdall.scanner.detect.os.walk", forbidden_walk)
+    with pytest.raises(ScanError):
+        scanner.scan()
+
+
 def test_symlinks_are_fail_closed(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -1069,6 +1102,30 @@ def test_a_file_truncated_between_the_stat_and_the_open_is_fail_closed(
         return metadata
 
     monkeypatch.setattr("heimdall.scanner.detect.os.fstat", truncated_fstat)
+    with pytest.raises(ScanError) as context:
+        scan(path)
+    assert str(context.value) == "scan impossible : entrée non analysable"
+
+
+def test_a_file_truncated_between_the_stat_and_the_fstat_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Une troncature entre le ``stat`` et le ``fstat`` est refusée avant lecture.
+
+    Le fichier conserve son inode : seule la comparaison de taille et de
+    ``st_mtime_ns`` entre ``before`` et ``after`` voit la course. Sans elle,
+    la lecture du contenu restant serait un scan partiel, donc un verdict
+    propre inventé.
+    """
+    path = _write(tmp_path, "truncated.txt", f'AWS = "{_aws("truncated")}"\n')
+    real_open = os.open
+
+    def truncating_open(file: object, *args: object, **kwargs: object) -> int:
+        if str(file).endswith("truncated.txt"):
+            os.truncate(file, path.stat().st_size // 2)
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("heimdall.scanner.detect.os.open", truncating_open)
     with pytest.raises(ScanError) as context:
         scan(path)
     assert str(context.value) == "scan impossible : entrée non analysable"

@@ -117,6 +117,7 @@ la politique #59 excluait `vendor/`, `node_modules/` et les lockfiles, donc un
 secret posé dans `vendor/evil.py` n'était **jamais** signalé. Un secret y est
 un secret : aucun nom de fichier ou de répertoire de contenu n'exclut plus rien,
 et le contenu décide. Seule la base VCS est hors du périmètre audité.
+L'historique VCS (.git/) n'est jamais parcouru par le mode arbre ; l'analyse de l'historique est couverte exclusivement par l'option --staged.
 
 En mode `--staged`, c'est le **blob indexé** qui est lu, pas la copie de
 travail : c'est ce que le commit va contenir qui est jugé. Le blob entier est

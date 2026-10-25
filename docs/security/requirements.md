@@ -287,8 +287,9 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   symlinké est refusé au lieu d'être suivi ; une signature binaire ne suffit
   pas à faire ignorer un fichier dont le contenu est majoritairement textuel
   (le refus est alors explicite) ; un secret coupé par un retour à la ligne
-  est recherché dans une fenêtre multi-ligne bornée à 4 Kio et à trois lignes
-  jointes (une ligne vide intercalée est couverte) ; la clé HMAC
+  est recherché dans une fenêtre multi-ligne bornée à 4 Kio, sur deux lignes
+  contiguës uniquement, les lignes vides intercalées (`\n\n`) sont hors
+  périmètre (limite documentée tickets #23/#24) ; la clé HMAC
   locale est durcie (fichier `0600`, propriétaire vérifié, parent `0700`,
   parent symlink refusé, `..` refusé) et son indisponibilité lève `ScanError`
   au lieu d'une clé éphémère.

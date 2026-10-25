@@ -269,6 +269,16 @@ class Scanner:
         return findings
 
     def _iter_files(self) -> Iterator[tuple[Path, str]]:
+        # Re-contrôle de la racine au moment du parcours : entre la résolution
+        # de ``__init__`` et l'ouverture par ``os.walk``, la racine pourrait
+        # être remplacée par un lien symbolique. ``os.walk`` suivrait alors la
+        # cible ; ``lstat`` refuse le lien (fail-closed).
+        try:
+            root_stat = os.lstat(self._root)
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise ScanError(_SCAN_ERROR)
         for current, directories, filenames in os.walk(
             self._root,
             topdown=True,
@@ -306,7 +316,7 @@ class Scanner:
                     raise ScanError(_SCAN_ERROR)
                 yield path, _validate_relative_path(relative)
 
-    def _read_text(self, path: Path) -> tuple[str, int]:
+    def _read_text(self, path: Path) -> tuple[str, int]:  # noqa: PLR0912
         """Lit un fichier borné et rend ``(texte, taille)``.
 
         La taille lue est rendue pour que ``scan()`` borne le **volume total**
@@ -332,6 +342,11 @@ class Scanner:
             if not stat.S_ISREG(after.st_mode) or after.st_size > MAX_FILE_BYTES:
                 raise ScanError(_SCAN_ERROR)
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise ScanError(_SCAN_ERROR)
+            # Même inode ne suffit pas : une troncature (ou modification)
+            # entre le ``stat`` et le ``fstat`` changerait le contenu lu sans
+            # changer l'identité. Refus avant toute lecture partielle.
+            if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
                 raise ScanError(_SCAN_ERROR)
             remaining = MAX_FILE_BYTES + 1
             while remaining > 0:
