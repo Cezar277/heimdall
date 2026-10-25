@@ -31,6 +31,7 @@ Les modèles sont simulés : aucun test ciblé ne contacte Ollama.
 | `ruff format --check heimdall/cli/cold_start.py tests/test_cold_start.py` | 2 fichiers conformes |
 | `mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts/regen_lock.py` | **47 fichiers**, aucune erreur |
 | `bandit -r heimdall -q` | Succès |
+| `python -m pytest --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85` | **2230 passed**, **16 skipped**, **4480 subtests passed**, 7 avertissements ; couverture globale **91,22 %**, durée **244,33 s** |
 
 La CI distante reste non déclenchée, conformément à la consigne utilisateur.
 Cette preuve ne déclare pas un check CI vert.
