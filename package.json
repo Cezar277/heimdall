@@ -7,7 +7,7 @@
     "lint": "spectral lint openapi.yaml --fail-severity warn"
   },
   "devDependencies": {
-    "@stoplight/spectral-cli": "6.17.0"
+    "@stoplight/spectral-cli": "6.15.0"
   },
   "engines": {
     "node": ">=18"

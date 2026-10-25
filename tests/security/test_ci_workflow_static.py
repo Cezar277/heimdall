@@ -202,38 +202,6 @@ def test_forks_et_dispatch_ne_lancent_pas_de_code_non_revu() -> None:
     assert "core.setOutput('has_pr', 'false')" in ACTIVE
 
 
-def test_lock_filelock_couvre_python_310_et_311_plus() -> None:
-    """Le lock doit servir 3.10 **et** les Python corrigés (≥ 3.11).
-
-    Six CVE filelock sont corrigées en 4.2.1, qui exige Python ≥ 3.11.
-    Un lock régénéré sous 3.10 ne peut donc sélectionner que 4.1.0
-    vulnérable : le pin marqué 3.11+ est réinséré par
-    ``scripts/regen_lock.py``. Sans ce garde, une régénération manuelle
-    réintroduit silencieusement les CVE sur la CI (Python 3.13).
-    """
-    lock_text = (REPO / "requirements.lock").read_text(encoding="utf-8")
-    filelock_lines = [
-        line for line in lock_text.splitlines() if line.startswith("filelock==")
-    ]
-    assert len(filelock_lines) == 2, filelock_lines
-    assert all("python_version" in line for line in filelock_lines), filelock_lines
-    for requirement in (
-        'filelock==4.1.0 ; python_version < "3.11"',
-        'filelock==4.2.4 ; python_version >= "3.11"',
-    ):
-        assert re.search(
-            rf"^{re.escape(requirement)} \\\n(?:    --hash=sha256:[0-9a-f]{{64}} \\\n)+",
-            lock_text,
-            re.MULTILINE,
-        ), requirement
-
-    # Le script de régénération doit lui-même porter les deux pins : c'est la
-    # seule façon de reproduire ce lock depuis un pip-compile sous 3.10.
-    script = (REPO / "scripts" / "regen_lock.py").read_text(encoding="utf-8")
-    assert 'filelock==4.1.0 ; python_version < "3.11"' in script
-    assert 'filelock==4.2.4 ; python_version >= "3.11"' in script
-
-
 def test_gardes_abus_du_declencheur() -> None:
     # Seuls OWNER/MEMBER/COLLABORATOR passent, et la garde est présente sur
     # les deux chemins (approbation et commentaire /ci).

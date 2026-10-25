@@ -62,22 +62,6 @@ Alternative écartée : `src/`-layout — inutile à cette taille, il complique
   `pip install -e . --no-deps --no-build-isolation`. `pip` et `setuptools`
   sont inclus avec hashes (génération `--allow-unsafe`) ; l'en-tête du lock
   donne les commandes exactes.
-- **Régénération : `python scripts/regen_lock.py`** (avec l'interpréteur 3.10
-  qui porte pip-tools). Le script compile le lock, restaure l'en-tête
-  français et réinsère le pin `filelock` double décrit ci-dessous ; il est
-  idempotent et échoue si la forme du bloc change (nouvelle version 3.10,
-  nouvelle CVE). Ne pas éditer `requirements.lock` à la main.
-- **Pin `filelock` double (3.10 vs 3.11+)** : `filelock 4.2.1` corrige six
-  CVE mais exige Python ≥ 3.11, alors que 4.1.0 est la dernière version
-  compatible 3.10. Compilé sous 3.10, le lock ne peut donc sélectionner que
-  la version vulnérable. Il porte explicitement
-  `filelock==4.1.0 ; python_version < "3.11"` **et**
-  `filelock==4.2.4 ; python_version >= "3.11"` ; le garde statique
-  `tests/security/test_ci_workflow_static.py` vérifie les deux lignes et le
-  script. **Python 3.10 est en fin de vie depuis le 2026-10-01** : le support
-  reste assuré pour l'instant, mais la cible recommandée (et celle de la CI
-  self-hosted) est Python ≥ 3.11 ; la branche 3.10 pourra être retirée lors
-  d'un ticket dédié.
 - `tests/contracts/requirements.txt` garde ses `==` + **hashes SHA-256**
   (`--require-hashes` en CI) ; Spectral est figé via `package.json` +
   `package-lock.json` + `npm ci` (voir correctif LOW-4 dans la PR).

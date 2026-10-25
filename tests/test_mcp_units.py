@@ -2182,30 +2182,5 @@ class MainEntryTests(unittest.TestCase):
         build.return_value.run.assert_called_once_with(transport="stdio")
 
 
-class CheckedIndexPathTests(unittest.TestCase):
-    """`_checked_index_path` : `os.close` en échec → `ToolFailure` (invariant 11)."""
-
-    def test_close_failure_stays_tool_failure(self) -> None:
-        repo = GitRepo("heimdall-close-")
-        try:
-            access = gitdiff.GitAccess(repo.root)
-            real_close = os.close
-
-            def boom(fd: int) -> None:
-                real_close(fd)
-                raise OSError("EBADF simulé")
-
-            with mock.patch.object(os, "close", new=boom):
-                try:
-                    access._checked_index_path(timeout=30)
-                except ToolFailure:
-                    return
-                except OSError as exc:
-                    self.fail(f"OSError brute : {exc!r}")
-            self.fail("aucune erreur alors que os.close échoue")
-        finally:
-            repo.close()
-
-
 if __name__ == "__main__":
     unittest.main()

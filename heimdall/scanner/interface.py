@@ -18,10 +18,8 @@ Findings, pas des verdicts sur un secret.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Final, Protocol, TypeVar, cast
 
 from heimdall.scanner.errors import InvalidTarget, ScanError
@@ -30,45 +28,6 @@ from heimdall.scanner.finding import (
     Finding,
     validate_relative_path,
 )
-
-#: Message statique : le scan est impossible (invariant 8).
-_MSG_SCAN_IMPOSSIBLE: Final[str] = "scan impossible : entrée non analysable"
-
-
-def _open_flags() -> int:
-    return (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_BINARY", 0)
-    )
-
-
-def _resolve_root(root: str | os.PathLike[str]) -> Path:
-    """Résout la racine sans jamais suivre un lien symbolique.
-
-    La racine elle-même et chacun de ses ancêtres sont vérifiés par
-    ``lstat`` : un lien symbolique dans le chemin de la racine est refusé
-    (``ScanError``) au lieu d'être suivi en silence. La promesse « les liens
-    symboliques ne sont jamais suivis » vaut donc aussi pour la racine et
-    pour le fichier unique. Un chemin non analysable (octet NUL, type
-    inattendu, racine absente) est refusé en ``ScanError`` statique, jamais
-    en ``ValueError``/``TypeError`` brut (contrat d'erreur unique).
-    """
-    try:
-        absolute = Path(os.path.abspath(Path(root).expanduser()))
-        for candidate in (absolute, *absolute.parents):
-            if candidate.is_symlink():
-                raise ScanError(_MSG_SCAN_IMPOSSIBLE)
-        resolved = absolute.resolve(strict=True)
-        # Course symlink (check-then-resolve) : si un composant a été remplacé
-        # entre le `lstat` et le `resolve`, le résolu diffère du demandé et la
-        # racine serait détournée hors périmètre — refus au lieu de suivre.
-        if resolved != absolute:
-            raise ScanError(_MSG_SCAN_IMPOSSIBLE)
-        return resolved
-    except (OSError, RuntimeError, ValueError, TypeError):
-        raise ScanError(_MSG_SCAN_IMPOSSIBLE) from None
 
 #: Nombre de parties d'une ligne ajoutée : ``(numéro, texte)``.
 _LINE_PARTS: Final[int] = 2

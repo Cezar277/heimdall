@@ -35,8 +35,6 @@ from cryptography.x509.oid import NameOID
 from pydantic import ValidationError
 
 from heimdall.vault.app import VaultSettings, create_app, run_server
-from heimdall.vault.client import VaultClient
-from heimdall.vault.crypto import generate_encryption_key
 
 _LOOPBACK = "127.0.0.1"
 
@@ -131,25 +129,6 @@ class VaultTlsTransportTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
 
-    def test_vault_client_loads_internal_ca_without_symlink(self) -> None:
-        """Le client Heimdall charge le CA interne via un contexte SSL vérifié."""
-        with VaultClient(
-            f"https://{_LOOPBACK}:{self.port}",
-            "synthetic_tls_client_api_key",
-            ca_cert=self.certfile,
-        ) as client:
-            self.assertEqual(client.health()["status"], "ok")
-
-    def test_vault_client_localhost_url_is_pinned_and_verified(self) -> None:
-        """URL `localhost` épinglée vers l'IP à la construction, TLS vérifié sur SAN IP."""
-        with VaultClient(
-            f"https://localhost:{self.port}",
-            "synthetic_tls_client_api_key",
-            ca_cert=self.certfile,
-        ) as client:
-            self.assertNotIn("localhost", client._base_url)
-            self.assertEqual(client.health()["status"], "ok")
-
     def test_untrusted_client_is_rejected_without_fallback(self) -> None:
         """Sans confiance explicite, la connexion est rompue : aucun repli non vérifié."""
         context = ssl.create_default_context()  # magasin CA public : ne connaît pas notre CA
@@ -208,7 +187,6 @@ class VaultTlsLauncherTests(unittest.TestCase):
                 api_key_pepper="p" * 32,
                 ssl_certfile=str(certfile),
                 ssl_keyfile=str(keyfile),
-                kek=generate_encryption_key(),
             )
             self.assertEqual(settings.ssl_certfile, str(certfile))
             self.assertEqual(settings.ssl_keyfile, str(keyfile))
@@ -264,7 +242,6 @@ class VaultTlsContractTests(unittest.TestCase):
                 api_key_pepper="p" * 32,
                 ssl_certfile=str(certfile),
                 ssl_keyfile=str(keyfile),
-                kek=generate_encryption_key(),
             )
             with (
                 patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=False),

@@ -14,7 +14,6 @@ d'exemple de la documentation AWS, jamais une clé fonctionnelle.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -412,9 +411,8 @@ def test_collect_tree_uses_the_pinned_root(
     seen: list[tuple[Path, bool]] = []
 
     class ScannerEspion:
-        def __init__(self, root: Path, *, strict: bool, **kwargs: object) -> None:
+        def __init__(self, root: Path, *, strict: bool) -> None:
             seen.append((Path(root), strict))
-            self.traces: tuple[object, ...] = ()
 
         def scan(self, *, deadline: float | None = None) -> list[object]:
             assert deadline is not None
@@ -808,56 +806,21 @@ def test_scan_staged_gitlink_does_not_hide_other_secrets(git_repo: GitRepo) -> N
     assert FAKE_AWS_KEY not in resultat.output
 
 
-def test_scan_staged_polyglot_binary_header_is_fail_closed(git_repo: GitRepo) -> None:
-    """T23 : faux PNG avec UTF-8 invalide -> erreur, jamais propre."""
+def test_scan_staged_polyglot_binary_header_is_scanned(git_repo: GitRepo) -> None:
+    """Revue #166 : en-tête binaire + texte clair (sans NUL) -> **scanné**.
+
+    ``decode_text`` ne saute un blob que sur signature binaire **et**
+    contenu majoritairement binaire : un faux PNG qui porte un secret en
+    clair est analysé, pas ignoré en silence.
+    """
     git_repo.write_bytes(
         "faux.png", b"\x89PNG\r\n\x1a\n" + f'AWS = "{FAKE_AWS_KEY}"\n'.encode()
     )
     git_repo.stage("faux.png")
     resultat = _run("scan", "--staged", str(git_repo.root))
-    assert resultat.exit_code == EXIT_ERROR
-    assert FAKE_AWS_KEY not in resultat.output
-
-
-@pytest.mark.parametrize("staged", [False, True])
-def test_benign_minified_json_multiline_overflow_exits_two(git_repo: GitRepo, staged: bool) -> None:
-    """T23 : le refus conservateur peut aussi bloquer un JSON bénin, sans secret."""
-    line = json.dumps({"a": [0] * 2500}, separators=(",", ":"))
-    git_repo.write("data.jsonl", line + "\n{}\n")
-    git_repo.stage("data.jsonl")
-    options = ("--staged",) if staged else ()
-    resultat = _run("scan", *options, str(git_repo.root))
-    assert resultat.exit_code == EXIT_ERROR
-    assert line not in resultat.output
-
-
-@pytest.mark.parametrize("staged", [False, True])
-@pytest.mark.parametrize(
-    "wrapper",
-    [
-        "sha256-{}",
-        "sha384-{}",
-        "prefix-{}",
-        "prefix.{}",
-        "x{}",
-        "x_{}",
-        "x+{}",
-        "x/{}",
-        "{}-suffix",
-    ],
-)
-def test_ci_scan_rejects_hex_secret_with_affixes(
-    git_repo: GitRepo, staged: bool, wrapper: str
-) -> None:
-    """Le mode CI local ne doit jamais rendre propre un secret hex affixé."""
-    value = hashlib.sha256(b"heimdall-t23-synthetic-only").hexdigest()
-    git_repo.write("config.py", 'credential = "' + wrapper.format(value) + '"\n')
-    git_repo.stage("config.py")
-    options = ("--staged",) if staged else ()
-    resultat = _run("scan", "--ci", *options, str(git_repo.root))
     assert resultat.exit_code == EXIT_FINDINGS
-    assert "high_entropy_hex" in resultat.output
-    assert value not in resultat.output
+    assert "faux.png:" in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.output
 
 
 def test_scan_staged_concurrent_index_change_exits_two(
@@ -1712,37 +1675,13 @@ def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
         "https://github.com/Cezar277/heimdall/schemas/finding.schema.json"
     )
     assert document["count"] == len(document["findings"]) == 1
-    assert set(document) == {
-        "schema",
-        "scope",
-        "count",
-        "findings",
-        "ignored_count",
-        "traces",
-        "config_hash",
-    }
+    assert set(document) == {"schema", "scope", "count", "findings"}
 
 
 def test_scan_schema_refuses_invalid_documents() -> None:
     """Le schéma fige le contrat : valeur, enum, fermeture et items Finding."""
     validator = _scan_validator()
-    # Rétrocompatibilité : l'ancien document sans ignored_count/traces/config_hash reste valide
-    legacy_base = {
-        "schema": "heimdall.scan.v1",
-        "scope": "staged",
-        "count": 0,
-        "findings": [],
-    }
-    assert validator.is_valid(legacy_base)
-    base = {
-        "schema": "heimdall.scan.v1",
-        "scope": "staged",
-        "count": 0,
-        "findings": [],
-        "ignored_count": 0,
-        "traces": [],
-        "config_hash": None,
-    }
+    base = {"schema": "heimdall.scan.v1", "scope": "staged", "count": 0, "findings": []}
     assert validator.is_valid(base)
     for invalide in (
         dict(base, schema="heimdall.scan.v2"),

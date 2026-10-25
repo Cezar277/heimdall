@@ -17,7 +17,7 @@ from pathlib import Path
 
 try:
     import tomllib
-except ModuleNotFoundError:  # Python 3.10 : backport explicite (dépendance runtime).
+except ModuleNotFoundError:  # Python 3.10 : backport explicite (extra [dev]).
     import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,10 +58,7 @@ def _lock_names() -> set:
         if path.is_file():
             names = set()
             for line in path.read_text(encoding="utf-8").splitlines():
-                # Le lock peut porter un marqueur d'environnement après la version
-                # (dépendance conditionnelle) : le nom reste l'identifiant avant
-                # ``==``.
-                match = re.match(r"^([A-Za-z0-9_.-]+)==[^;\s]+", line.strip())
+                match = re.match(r"^([A-Za-z0-9_.-]+)==[^;]+$", line.strip())
                 if match:
                     names.add(match.group(1).lower().replace("_", "-"))
             return names

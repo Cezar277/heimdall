@@ -26,7 +26,7 @@ from heimdall.scanner.errors import ScanError
 _ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z][a-z0-9_]*")
 _MAX_IDENTIFIER_LENGTH: Final[int] = 64
 _VALUE_GROUP: Final[str] = "value"
-#: Types de Finding déterministes documentés : signatures et entropie (#23).
+#: Types de Finding produits par le registre : **ensemble fermé**.
 #:
 #: Le champ ``type`` du contrat Finding v1 (#14) accepte toute chaîne
 #: ``snake_case`` ; c'est le **registre** qui borne les types qu'il sait
@@ -34,7 +34,7 @@ _VALUE_GROUP: Final[str] = "value"
 #: ``docs/scanner-signatures.md``). Un type hors de cet ensemble serait un
 #: Finding que rien ne documente : il est refusé au chargement.
 ALLOWED_SECRET_TYPES: Final[frozenset[str]] = frozenset(
-    {"aws", "stripe", "slack", "pat", "jwt", "pem", "high_entropy_hex", "high_entropy_base64"}
+    {"aws", "stripe", "slack", "pat", "jwt", "pem"}
 )
 #: Message statique : une ligne non textuelle est une violation de contrat
 #: (invariant 8 : ni l'entrée ni sa valeur ne sont jamais reflétées).

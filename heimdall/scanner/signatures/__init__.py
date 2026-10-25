@@ -14,7 +14,7 @@ des ``Finding`` avec une empreinte HMAC (voir ``signature_engine``).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Final, Literal
+from typing import Final
 
 from heimdall.scanner.signatures.aws_cloud import RULES as AWS_CLOUD_RULES
 from heimdall.scanner.signatures.github_jwt import RULES as GITHUB_JWT_RULES
@@ -61,7 +61,6 @@ class SignatureMatch:
     signature: str
     value: str = field(repr=False)
     start: int = 0
-    source: Literal["regex", "entropy"] = "regex"
 
     def __repr__(self) -> str:
         """Résumé sans la valeur candidate (jamais de secret dans un ``repr``)."""
