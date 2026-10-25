@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from heimdall.cli.scan import ScanReport, _read_worktree_file, collect, render_json, render_text
+from heimdall.cli.scan import (
+    ScanReport,
+    _read_worktree_file,
+    _verify_root_unchanged,
+    collect,
+    render_json,
+    render_text,
+)
 from heimdall.llm.qualify import ChatFn, Qualification
 from heimdall.llm.rejections import RejectionJournal, qualify_finding
 from heimdall.mcp.gitdiff import GitAccess
 from heimdall.mcp.masking import mask_text
-from heimdall.mcp.paths import confine
+from heimdall.mcp.paths import PathEscape, confine
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
@@ -22,6 +30,12 @@ from heimdall.scanner.signature_engine import SignatureEngine
 CONTEXT_LINES = 5
 MAX_CONTEXT_LINE = 128
 MAX_QUALIFICATIONS = 256
+MAX_QUALIFICATION_SECONDS = 300.0
+
+
+def _check_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise ScanError("limite de temps de qualification dépassée")
 
 
 @dataclass(frozen=True)
@@ -68,19 +82,24 @@ def qualify_target(
     *,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
+    deadline: float | None = None,
 ) -> list[CandidateOpinion]:
     """L'avis ne supprime jamais un finding, même en cas de faux positif."""
     if len(findings) > MAX_QUALIFICATIONS:
         raise ScanError("trop de candidats pour la qualification locale")
-    return [
-        CandidateOpinion(
-            finding,
-            qualify_finding(
-                finding, candidate_context(target, finding, findings), chat=chat, journal=journal
-            ),
+    if deadline is None:
+        deadline = time.monotonic() + MAX_QUALIFICATION_SECONDS
+    opinions = []
+    for finding in findings:
+        _check_deadline(deadline)
+        opinion = qualify_finding(
+            finding, candidate_context(target, finding, findings), chat=chat, journal=journal
         )
-        for finding in findings
-    ]
+        # Un appel en cours conserve le timeout réseau de T28 (60 s).
+        # Aucun appel suivant n'est lancé après la deadline globale.
+        _check_deadline(deadline)
+        opinions.append(CandidateOpinion(finding, opinion))
+    return opinions
 
 
 def collect_cold_start(
@@ -91,28 +110,45 @@ def collect_cold_start(
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:
+    # Capturer l'identité AVANT collect ferme aussi l'intervalle entre les
+    # deux passes, et pas seulement les substitutions pendant la relecture.
+    access = GitAccess(root) if llm and not ci else None
     scan = collect(root, staged=False, ci=ci)
-    if ci or not llm or not scan.findings:
+    if access is not None:
+        _verify_root_unchanged(access, root)
+    if access is None or not scan.findings:
         return ColdStartReport(scan, ())
     if len(scan.findings) > MAX_QUALIFICATIONS:
         raise ScanError("trop de candidats pour la qualification locale")
-    access = GitAccess(root)
+    deadline = time.monotonic() + MAX_QUALIFICATION_SECONDS
     by_file: dict[str, list[Finding]] = {}
     for finding in scan.findings:
         by_file.setdefault(finding.file, []).append(finding)
     opinions = []
     for file, findings in by_file.items():
-        path = confine(access.root, file).absolute
+        _check_deadline(deadline)
+        _verify_root_unchanged(access, root)
+        try:
+            path = confine(access.root, file).absolute
+        except PathEscape:
+            raise ScanError("chemin de qualification hors périmètre") from None
         raw = _read_worktree_file(path, max_bytes=MAX_FILE_BYTES)
         text = decode_text(raw) if raw is not None else None
         if text is None:
             raise ScanError("contenu modifié depuis le scan déterministe")
         target = FileTarget(file, text)
-        # Ne pas présenter au modèle le contexte d'un snapshot devenu périmé.
-        current = Scanner(SignatureEngine()).scan(target)
+        # Sur-ensemble volontaire sans allowlist : on vérifie l'appartenance
+        # des findings retenus, pas l'égalité de deux rapports. TreeScanner et
+        # SignatureEngine partagent DEFAULT_ENTROPY_CONFIG et la même clé HMAC
+        # locale persistante via SnippetHasher() ; le test de parité le prouve.
+        current = Scanner(SignatureEngine(deadline=deadline)).scan(target)
         if any(finding not in current for finding in findings):
             raise ScanError("contenu modifié depuis le scan déterministe")
-        opinions.extend(qualify_target(target, findings, chat=chat, journal=journal))
+        opinions.extend(
+            qualify_target(target, findings, chat=chat, journal=journal, deadline=deadline)
+        )
+    _verify_root_unchanged(access, root)
+    _check_deadline(deadline)
     return ColdStartReport(scan, tuple(opinions))
 
 
