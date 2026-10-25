@@ -64,18 +64,20 @@ consommation. Le canari est vérifié absent du **type**, du **message**, de
 
 ## Suivi de la revue #155
 
-Révision des correctifs : `f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f`
-(`fix(scanner): corriger la revue #155 sans changer le contrat`). Les
-remarques MEDIUM/LOW encore applicables après la fusion de `main` et les
-tests manquants sont traités sans changer le contrat de sortie ni le
-fail-closed. La remarque sur `find_candidates`/`NotImplementedError` est
-devenue sans objet : `find_candidates` est désormais implémenté (#22).
+Révision des correctifs après fusion de `main` :
+`2329958b5f4f4eebfae0e59db7932ddc6b2f061f`
+(`merge(main): intègre main dans le suivi de revue #155 (#155)`). Les
+remarques MEDIUM/LOW encore applicables et les tests manquants sont traités
+sans changer le contrat de sortie ni le fail-closed. Les remarques sur
+`find_candidates`/`NotImplementedError` et sur les contrôles `Cf` sont
+devenues sans objet après la fusion : `find_candidates` est implémenté (#22)
+et les chemins bidi sont acceptés puis échappés par la CLI (#22/#24).
 
 | Remarque | Correctif | Preuve |
 |---|---|---|
-| MEDIUM — `FileTarget.lignes()` utilisait `splitlines()` (coupait aussi sur `\v`, `\f`, `\u2028/29`) | découpage sur `\n` seul, `\r\n` normalisé, autres séparateurs conservés dans le contenu | [interface.py:174–190](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/interface.py#L174-L190) + [tests:424–451](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L424-L451) |
-| LOW — `Scanner` relisait `moteur.analyser` à chaque scan (TOCTOU) | méthode liée figée à la construction et appelée ensuite | [interface.py:261–273](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/interface.py#L261-L273), [interface.py:288](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/interface.py#L288) + [tests:534–555](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L534-L555) |
-| Tests manquants | `bool` refusé comme numéro de ligne, `KeyboardInterrupt` non converti, `scan_all` fail-closed sur liste mixte | [tests:375–387](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L375-L387), [tests:603–611](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L603-L611), [tests:758–768](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L758-L768) |
+| MEDIUM — `FileTarget.lignes()` utilisait `splitlines()` (coupait aussi sur `\v`, `\f`, `\u2028/29`) | découpage sur `\n` seul, `\r\n` normalisé, autres séparateurs conservés dans le contenu | [interface.py:215–229](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/heimdall/scanner/interface.py#L215-L229) + [tests:416–448](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L416-L448) |
+| LOW — `Scanner` relisait `moteur.analyser` à chaque scan (TOCTOU) | méthode liée figée à la construction et appelée ensuite | [interface.py:300–314](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/heimdall/scanner/interface.py#L300-L314), [interface.py:329](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/heimdall/scanner/interface.py#L329) + [tests:500–521](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L500-L521) |
+| Tests manquants | `bool` refusé comme numéro de ligne, `KeyboardInterrupt` non converti, `scan_all` fail-closed sur liste mixte | [tests:376–378](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L376-L378), [tests:569–577](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L569-L577), [tests:724–732](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L724-L732) |
 
 ## Résultats locaux
 
