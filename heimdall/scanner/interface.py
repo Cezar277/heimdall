@@ -215,18 +215,29 @@ class FileTarget:
     def lignes(self) -> tuple[tuple[int, str], ...]:
         """Les lignes à analyser, numérotées à partir de 1.
 
-        Le découpage suit les lignes Git : seul ``\\n`` sépare deux lignes, et
-        un ``\\r`` final (CRLF) est retiré. Les autres séparateurs Unicode
-        (``\\v``, ``\\f``, ``\\u2028``, ``\\u2029``...) restent dans le texte
-        de la ligne : un ``Finding.line`` doit désigner la ligne réelle du
-        fichier, pas une ligne artificielle créée par ``str.splitlines()``.
+        Le découpage suit les lignes Git : seul ``\\n`` sépare deux lignes. Un
+        ``\\r`` n'est retiré que s'il termine une ligne réellement suivie d'un
+        ``\\n`` (CRLF) ; un ``\\r`` final sans ``\\n`` appartient au contenu.
+        Les autres séparateurs Unicode (``\\v``, ``\\f``, ``\\u2028``,
+        ``\\u2029``...) restent aussi dans le texte de la ligne : un
+        ``Finding.line`` doit désigner la ligne réelle du fichier, pas une
+        ligne artificielle créée par ``str.splitlines()``.
         """
         if not self.text:
             return ()
-        text = self.text[:-1] if self.text.endswith("\n") else self.text
+        ends_with_lf = self.text.endswith("\n")
+        lines = self.text.split("\n")
+        if ends_with_lf:
+            # Un \n final ne crée pas de ligne vide supplémentaire.
+            lines.pop()
         return tuple(
-            (number, line[:-1] if line.endswith("\r") else line)
-            for number, line in enumerate(text.split("\n"), start=1)
+            (
+                number,
+                line[:-1]
+                if line.endswith("\r") and (number < len(lines) or ends_with_lf)
+                else line,
+            )
+            for number, line in enumerate(lines, start=1)
         )
 
 
