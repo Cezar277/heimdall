@@ -2,8 +2,9 @@
 
 Statut : livré par le ticket #53 (sous-ticket de l'épic #22). Ce document fixe
 la **surface** du scanner et la **forme** de sa sortie. Il ne décrit aucune
-détection : les signatures (#54) et les exclusions (#59) restent des tickets
-séparés, tout comme la mesure sur le jeu piège (#60).
+détection : les signatures sont livrées par #54 et décrites dans
+[scanner-signatures.md](scanner-signatures.md) ; les exclusions (#59) et la
+mesure sur le jeu piège (#60) restent des tickets séparés.
 
 Références :
 
@@ -13,7 +14,10 @@ Références :
 - implémentation : [`heimdall/scanner/finding.py`](../heimdall/scanner/finding.py)
   (sortie) et [`heimdall/scanner/interface.py`](../heimdall/scanner/interface.py)
   (cible + façade) ;
-- tests : [`tests/test_scanner_interface.py`](../tests/test_scanner_interface.py).
+- moteur de signatures : [`heimdall/scanner/signature_engine.py`](../heimdall/scanner/signature_engine.py)
+  et son registre dans [`heimdall/scanner/signatures/`](../heimdall/scanner/signatures/) ;
+- tests : [`tests/test_scanner_interface.py`](../tests/test_scanner_interface.py)
+  et [`tests/test_scanner_signatures.py`](../tests/test_scanner_signatures.py).
 
 ## En une phrase
 
@@ -43,10 +47,8 @@ findings: list[Finding] = scanner.scan(diff)
 Les deux cibles sont figées (immuables) et validées à la construction :
 
 - le chemin est **relatif au dépôt**, avec `/` comme séparateur, sans segment
-  vide, sans segment `.` ou `..`, sans caractère Unicode de catégorie `C`
-  (contrôle, format/bidi, surrogate, usage privé, non assigné) ni fin de
-  ligne Unicode : c'est la grammaire lexicale du contrat #14, appliquée
-  avant toute lecture ;
+  vide, sans segment `.` ou `..`, sans caractère de contrôle : c'est la
+  grammaire lexicale du contrat #14, appliquée avant toute lecture ;
 - les numéros de ligne d'un `DiffTarget` sont des entiers ≥ 1 **strictement
   croissants** (le parseur de diff du MCP produit déjà cette forme :
   `DiffEntry.lines`) ;
@@ -139,11 +141,6 @@ Les trois dérivent de `ScanError`, lui-même de `Exception` ; `InvalidFinding`
 et `InvalidTarget` dérivent aussi de `ValueError`, pour les appelants qui
 traitent les erreurs de contrat comme des valeurs invalides.
 
-Le point d'entrée historique `find_candidates` (hors façade `Scanner`) lève
-`ScannerNotImplemented`, qui hérite à la fois de `ScanError` et de
-`NotImplementedError` : le contrat unique est respecté sans casser les
-appelants qui catchent l'erreur historique.
-
 Aucune `TypeError` ni `AttributeError` brute ne doit sortir de l'interface :
 un `status` non hashable, un conteneur de lignes malformé, une cible qui
 n'est pas une cible ou un moteur sans méthode `analyser` sont refusés par
@@ -153,10 +150,10 @@ sur une liste partielle.
 
 ### Le moteur ne peut rien laisser passer non plus
 
-Le moteur est injecté : c'est du code d'un autre ticket (#54/#59), et son
-message d'exception n'est pas sous le contrôle de cette façade. Une panne du
-moteur, un rendu non conforme ou une itération qui échoue sont donc
-**enveloppés** :
+Le moteur est injecté : c'est du code d'un autre ticket (#54 pour les
+signatures, #59 pour les exclusions), et son message d'exception n'est pas
+sous le contrôle de cette façade. Une panne du moteur, un rendu non conforme
+ou une itération qui échoue sont donc **enveloppés** :
 
 | Situation | Avant | Après |
 | --- | --- | --- |
@@ -180,8 +177,9 @@ appelé (défense en profondeur contre un TOCTOU).
 
 - **Aucune I/O.** L'interface ne lit aucun fichier et n'ouvre aucun
   descripteur : elle ne fait que valider et transporter. La lecture du
-  fichier appartient au moteur (#54/#59), qui doit appliquer le confinement
-  complet.
+  fichier appartient au moteur (#59), qui doit appliquer le confinement
+  complet. Le moteur de signatures #54 ne lit rien non plus : il reçoit une
+  cible déjà validée.
 - **La garde de chemin est lexicale, et ce n'est pas assez.** `..`, un chemin
   absolu, `C:/` ou un caractère de contrôle sont refusés *avant* toute
   lecture, mais cette garde **ne protège pas contre les liens symboliques ni
@@ -189,14 +187,14 @@ appelé (défense en profondeur contre un TOCTOU).
   une racine fixée au démarrage, résoudre le chemin
   (`resolve` + `is_relative_to(racine)`), refuser les liens sortants et
   revérifier l'identité du descripteur à l'usage. C'est le cas de
-  `heimdall/mcp/gitdiff.py` et de la lecture de fichier par #54/#59 ; la garde
+  `heimdall/mcp/gitdiff.py` et de la lecture de fichier par #59 ; la garde
   lexicale de ce ticket ne doit pas être considérée comme suffisante.
 
 ## Le code est au moins aussi strict que le schéma
 
 La validation locale reproduit la grammaire du schéma #14, et le test
 `tests/test_scanner_interface.py` compare les deux sur un corpus de cas
-valides et invalides : **accord sur tous les cas**, sauf trois écarts
+valides et invalides : **accord sur tous les cas**, sauf deux écarts
 assumés, où le code est plus strict que le schéma (il refuse, il ne répare
 pas) :
 
@@ -204,7 +202,6 @@ pas) :
 | --- | --- | --- |
 | `line: 1.0` | accepté (le draft 6 considère un flottant entier comme un entier) | refusé : une ligne de fichier est un entier |
 | `entropy: NaN` | accepté (les comparaisons de `jsonschema` sont fausses pour NaN) | refusé : NaN n'est pas du JSON |
-| chemin avec un caractère `Cf` (bidi, marque invisible) | accepté (le motif ne couvre pas les catégories Unicode) | refusé : spoofing de terminal et confusion de revue |
 
 ## Branches avec le reste du projet
 
@@ -230,7 +227,7 @@ réconciliation proposée au relecteur est :
 Ce ticket ne modifie pas l'épic : il fournit l'interface et le contrat, sans
 toucher aux signatures ni aux exclusions.
 
-## Contraintes pour le moteur (#54 / #59)
+## Contraintes pour les moteurs (#54 / #59)
 
 Le moteur injecté doit :
 

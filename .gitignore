@@ -1,6 +1,7 @@
 # --- Python ---
 .venv/
 .venv-security/
+.venv-injection/
 venv/
 __pycache__/
 *.py[cod]

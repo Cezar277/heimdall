@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==84.0.0"]
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -22,7 +22,7 @@ classifiers = [
 ]
 dependencies = [
   # --- Runtime (versions verrouillées, voir docs/adr/002-stack-python.md) ---
-  "fastapi==0.143.1",       # API du Vault (#25). Épinglé à l'identique de tests/contracts/requirements.txt
+  "fastapi==0.156.4",       # API du Vault (#25). Épinglé à l'identique de tests/contracts/requirements.txt
   "pydantic==2.14.1",       # Modèles + génération OpenAPI comparée au contrat (#15)
   "pydantic-settings==2.15.0", # Settings via variables d'environnement (#25)
   "uvicorn==0.54.0",        # Serveur ASGI du Vault (#25), réseau privé + TLS uniquement
@@ -32,18 +32,22 @@ dependencies = [
   "argon2-cffi==25.1.0",    # Dérivation/hachage côté Vault — import confiné à heimdall/vault/crypto.py
   "httpx==0.28.1",          # Client HTTP (tests ASGI + futur client Vault avec verify obligatoire)
   "typer==0.27.3",          # CLI `heimdall` (Typer au-dessus de Click)
+  "tomli==2.5.0",            # lecture TOML (détection projet) sur Python 3.10 ; pin inconditionnel pour --require-hashes
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest==9.1.1",
-  "ruff==0.17.0",
+  "ruff==0.17.1",
   "mypy==2.4.0",
   "bandit==1.9.4",
-  "setuptools==84.0.0",     # backend de build, installé depuis le lock en CI
+  "setuptools==84.2.1",     # backend de build, installé depuis le lock en CI
   "pytest-cov==7.1.0",      # couverture + seuil CI (#20), aligné sur tests/security
   "pip-audit==2.10.1",      # audit CVE des dépendances en CI (#20), réseau documenté README
-  "tomli==2.5.0; python_version < '3.11'",  # lecture TOML des tests d'acceptation sur 3.10
+  # TestClient de Starlette (T255) : starlette 1.7 exige httpx2 pour son
+  # `starlette.testclient` (le repli sur httpx est déprécié). Dépendance directe
+  # explicite : elle ne doit pas dépendre d'un autre paquet (mcp).
+  "httpx2==2.14.0",
   # Dépendances des tests de contrats (#14/#15/#16), alignées sur tests/contracts/requirements.txt
   "jsonschema==4.26.0",
   "PyYAML==6.0.3",
@@ -68,6 +72,7 @@ include = ["heimdall*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["llm: preuve manuelle avec Ollama local (HEIMDALL_RUN_LLM_TESTS=1)"]
 
 # --- ruff: lint + format ---
 [tool.ruff]
@@ -83,6 +88,11 @@ ignore = ["S101"]  # assert autorisé dans les tests
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["S101", "PLR2004"]
+# Règles de signatures (#54) : les chaînes sont des exemples **synthétiques**
+# vérifiés à l'import, jamais des secrets ; `secret_type` est un type Finding.
+"heimdall/scanner/signatures/*.py" = ["S105", "S106"]
+"tests/test_scanner_signatures.py" = ["S105", "S106"]
+"tests/test_scanner_allowlist.py" = ["S105", "S106"]
 # Acceptation #17 : argv figés (sys.executable, venv éphémère), jamais de shell=True.
 "tests/test_ticket17_acceptance.py" = ["S101", "PLR2004", "S603"]
 

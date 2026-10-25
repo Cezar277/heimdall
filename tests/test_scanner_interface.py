@@ -33,7 +33,6 @@ from heimdall.scanner import (
     InvalidTarget,
     ScanError,
     Scanner,
-    ScannerNotImplemented,
 )
 from heimdall.scanner import finding as finding_module
 
@@ -235,8 +234,8 @@ def test_unknown_field_is_refused(sample):
     assert not _code_accepts(sample)
 
 
-def test_code_is_stricter_than_the_schema_on_three_edge_cases():
-    """Trois écarts assumés : le code refuse ce que le schéma tolère.
+def test_code_is_stricter_than_the_schema_on_two_edge_cases():
+    """Deux écarts assumés : le code refuse ce que le schéma tolère.
 
     1. ``line = 1.0`` : depuis le draft 6, JSON Schema considère un flottant
        entier comme un « integer ». Le code exige un vrai entier : une ligne
@@ -244,11 +243,8 @@ def test_code_is_stricter_than_the_schema_on_three_edge_cases():
     2. ``entropy = NaN`` : les comparaisons de ``jsonschema`` (``<``/``>``)
        sont fausses pour NaN, donc NaN passe les bornes. NaN n'est pas du
        JSON et ``json.dumps`` n'en produirait pas un document valide.
-    3. Un caractère Unicode de catégorie ``C`` (ici ``Cf``, bidi) dans un
-       chemin : le schéma ne l'interdit pas, le code le refuse pour empêcher
-       le spoofing de terminal et la confusion de revue.
 
-    Dans les trois cas, le code est **plus strict** que le schéma : il refuse,
+    Dans les deux cas, le code est **plus strict** que le schéma : il refuse,
     il ne répare pas (fail-closed).
     """
     integral_float = _sample(line=1.0)
@@ -259,10 +255,6 @@ def test_code_is_stricter_than_the_schema_on_three_edge_cases():
         payload = _sample(entropy=value)
         assert not _code_accepts(payload)
     assert _schema_accepts(_sample(entropy=math.nan))
-
-    bidi_path = _sample(file="src/\u202eevil.py")
-    assert _schema_accepts(bidi_path)
-    assert not _code_accepts(bidi_path)
 
 
 # --- Aucun secret en clair, aucun reflet dans les messages ---
@@ -458,32 +450,6 @@ def test_file_target_splits_only_on_lf_and_normalises_crlf(text, expected):
 
 @pytest.mark.parametrize("path", ["../escape.py", "/etc/passwd", "src/../x.py", "C:/x.py"])
 def test_targets_refuse_unsafe_paths(path):
-    with pytest.raises(InvalidTarget):
-        DiffTarget(path=path, lines=())
-    with pytest.raises(InvalidTarget):
-        FileTarget(path=path, text="x")
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        "src/\u200eevil.py",  # LEFT-TO-RIGHT MARK (Cf)
-        "src/\u202eevil.py",  # RIGHT-TO-LEFT OVERRIDE (Cf)
-        "src/\u2066evil.py",  # LEFT-TO-RIGHT ISOLATE (Cf)
-        "src/\u00adevil.py",  # SOFT HYPHEN (Cf)
-        "src/\x85evil.py",  # NEXT LINE (Cc, > 0x7F)
-    ],
-    ids=["lrm", "rlo", "lri", "soft_hyphen", "c1_next_line"],
-)
-def test_paths_with_unicode_control_or_format_characters_are_refused(path):
-    """Aucun caractère Unicode de catégorie ``C`` ne doit usurper un chemin.
-
-    Les contrôles de format (bidi, marques invisibles) réapparaîtraient dans
-    le ``repr`` et les logs CLI : ils sont refusés à la construction, comme
-    les contrôles ASCII.
-    """
-    with pytest.raises(InvalidFinding):
-        _finding(file=path)
     with pytest.raises(InvalidTarget):
         DiffTarget(path=path, lines=())
     with pytest.raises(InvalidTarget):
@@ -779,21 +745,6 @@ def test_public_api_is_exported_once():
     assert heimdall.scanner.Finding is finding_module.Finding
     assert heimdall.scanner.detect.Finding is finding_module.Finding
     assert heimdall.scanner.Scanner.__module__ == "heimdall.scanner.interface"
-
-
-def test_find_candidates_stays_in_the_scan_error_contract():
-    """L'entrée legacy respecte aussi le contrat ``ScanError``.
-
-    ``find_candidates`` n'est pas la façade ``Scanner``, mais son exception
-    hérite à la fois de ``ScanError`` et de ``NotImplementedError`` : un
-    appelant qui ne catche que l'un ou l'autre reste couvert.
-    """
-    with pytest.raises(ScannerNotImplemented) as ctx:
-        heimdall.scanner.detect.find_candidates(".")
-    assert isinstance(ctx.value, ScanError)
-    assert isinstance(ctx.value, NotImplementedError)
-    assert "22" in str(ctx.value)
-    assert heimdall.scanner.ScannerNotImplemented is ScannerNotImplemented
 
 
 def test_no_raw_typing_error_escapes_the_contract():

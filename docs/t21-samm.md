@@ -6,6 +6,12 @@ elle ne prétend pas modifier une feuille externe.
 
 Révision du code testé : `0b14b3826e60e5afed3ffc4577a2bf1c9d095c90`.
 
+> Mise à jour #22 : le marqueur `xfail(strict)` de
+> `test_scanner_precision_and_recall` a été retiré lorsque le scanner a été
+> livré. Le résultat T21 ci-dessous reste l'instantané historique de la
+> validation qui a précédé #22 ; la mesure courante est consignée dans
+> [t22-samm.md](t22-samm.md).
+
 Les permaliens épinglent la révision du code, pas le commit de documentation
 qui archive cette fiche. Le code des trois modules référencés est inchangé
 entre cette révision et le HEAD de livraison : contrôle effectué avec

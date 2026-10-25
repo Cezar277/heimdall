@@ -28,6 +28,7 @@ FINDING_DOC = REPO / "docs" / "contracts" / "finding.md"
 MCP_SERVER = REPO / "heimdall" / "mcp" / "server.py"
 MCP_GITDIFF = REPO / "heimdall" / "mcp" / "gitdiff.py"
 CLI_MAIN = REPO / "heimdall" / "cli" / "main.py"
+CLI_SCAN = REPO / "heimdall" / "cli" / "scan.py"
 REQUIREMENTS = REPO / "docs" / "security" / "requirements.md"
 
 # Contrat T28.2 (#80) : partie pure (prompt, schéma, isolation du candidat)
@@ -486,9 +487,11 @@ def test_no_llm_in_ci() -> None:
     # check_model.py) : leurs usages sont controles par _os_usage_violations.
     # Commande git confinee (#27) : argv fige en liste, jamais de shell
     # (mandat #74, contrat 4.1) — controle par _fixed_argv_violations.
-    for path in (CLI_MAIN, MCP_SERVER):
+    # Le module de scan de la CLI (#29) n'a aucun acces direct au systeme :
+    # il passe par la couche git confinee et par la bibliotheque scanner.
+    for path in (CLI_MAIN, CLI_SCAN, MCP_SERVER):
         assert _network_or_exec_violations(path) == [], path.name
-    for path in (CLI_MAIN, MCP_SERVER, MCP_GITDIFF):
+    for path in (CLI_MAIN, CLI_SCAN, MCP_SERVER, MCP_GITDIFF):
         assert _os_usage_violations(path) == [], path.name
     assert _fixed_argv_violations(MCP_GITDIFF) == []
     req = REQUIREMENTS.read_text(encoding="utf-8")

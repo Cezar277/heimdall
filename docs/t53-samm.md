@@ -65,15 +65,15 @@ consommation. Le canari est vérifié absent du **type**, du **message**, de
 ## Suivi de la revue #155
 
 Révision des correctifs : `f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f`
-(`fix(scanner): corriger la revue #155 sans changer le contrat`). Les quatre
-remarques MEDIUM/LOW de la revue et les tests manquants sont traités sans
-changer le contrat de sortie ni le fail-closed.
+(`fix(scanner): corriger la revue #155 sans changer le contrat`). Les
+remarques MEDIUM/LOW encore applicables après la fusion de `main` et les
+tests manquants sont traités sans changer le contrat de sortie ni le
+fail-closed. La remarque sur `find_candidates`/`NotImplementedError` est
+devenue sans objet : `find_candidates` est désormais implémenté (#22).
 
 | Remarque | Correctif | Preuve |
 |---|---|---|
 | MEDIUM — `FileTarget.lignes()` utilisait `splitlines()` (coupait aussi sur `\v`, `\f`, `\u2028/29`) | découpage sur `\n` seul, `\r\n` normalisé, autres séparateurs conservés dans le contenu | [interface.py:174–190](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/interface.py#L174-L190) + [tests:424–451](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L424-L451) |
-| LOW — les contrôles `Cf` (bidi, marques invisibles) passaient la garde de chemin | refus de toute catégorie Unicode `C` (contrôle, format, surrogate, privé, non assigné) | [finding.py:66–100](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/finding.py#L66-L100) + [tests:468–491](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L468-L491) |
-| LOW — `find_candidates` levait `NotImplementedError`, hors contrat `ScanError` | `ScannerNotImplemented` hérite des deux : contrat unique et compatibilité historique | [errors.py:26–32](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/errors.py#L26-L32), [detect.py:26–40](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/detect.py#L26-L40) + [tests:784–796](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L784-L796) |
 | LOW — `Scanner` relisait `moteur.analyser` à chaque scan (TOCTOU) | méthode liée figée à la construction et appelée ensuite | [interface.py:261–273](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/interface.py#L261-L273), [interface.py:288](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/heimdall/scanner/interface.py#L288) + [tests:534–555](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L534-L555) |
 | Tests manquants | `bool` refusé comme numéro de ligne, `KeyboardInterrupt` non converti, `scan_all` fail-closed sur liste mixte | [tests:375–387](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L375-L387), [tests:603–611](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L603-L611), [tests:758–768](https://github.com/Cezar277/heimdall/blob/f75c1f9cbdbb4f649fcdd0668ac51f389ffa970f/tests/test_scanner_interface.py#L758-L768) |
 
@@ -106,7 +106,7 @@ moteur réel (#54/#59) est branché sur cette interface.
 ## Limite assumée : la garde de chemin reste lexicale
 
 La garde de chemin de cette interface est **lexicale** (`..`, absolu, `C:/`,
-contrôles et formats Unicode refusés avant toute lecture) et cette PR ne fait
+caractères de contrôle refusés avant toute lecture) et cette PR ne fait
 **aucune I/O**. Conformément à l'invariant 3, le confinement complet
 (`resolve` + `is_relative_to` sur une racine fixée au démarrage, refus des
 liens sortants, identité de descripteur revérifiée à l'usage) reste à faire

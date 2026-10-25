@@ -21,18 +21,36 @@ GIT = shutil.which("git", path=os.defpath)
 
 
 class GitRepo:
-    """Dépôt git jetable, prêt à recevoir des modifications indexées."""
+    """Dépôt git jetable, prêt à recevoir des modifications indexées.
 
-    def __init__(self, prefix: str, test: unittest.TestCase) -> None:
+    ``object_format`` permet de créer un dépôt SHA-256
+    (``--object-format=sha256``) : les noms d'objets y font 64 caractères.
+    """
+
+    def __init__(
+        self,
+        prefix: str,
+        test: unittest.TestCase | None = None,
+        *,
+        object_format: str = "sha1",
+    ) -> None:
         if GIT is None:  # pragma: no cover - garde-fou d'environnement de test.
             raise unittest.SkipTest("git requis")
         self._tmp = tempfile.TemporaryDirectory(prefix=prefix)
-        test.addCleanup(self._tmp.cleanup)
+        if test is not None:
+            test.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name) / "repo"
         self.root.mkdir()
-        self.git("init", "-q")
+        init = ["init", "-q"]
+        if object_format != "sha1":
+            init.append(f"--object-format={object_format}")
+        self.git(*init)
         self.git("config", "user.email", "test@example.invalid")
         self.git("config", "user.name", "Heimdall Test")
+
+    def close(self) -> None:
+        """Supprime le dépôt jetable (usage pytest, sans ``TestCase``)."""
+        self._tmp.cleanup()
 
     def git(self, *arguments: str) -> None:
         """Commande git d'aide au test (argv figé, sans shell)."""
@@ -46,6 +64,32 @@ class GitRepo:
         )
         if completed.returncode != 0:
             raise AssertionError(f"git {arguments} a échoué : {completed.stderr}")
+
+    def git_output(self, *arguments: str) -> str:
+        """Sortie standard d'une commande git (échec = exception)."""
+        assert GIT is not None
+        completed = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+            [GIT, "-C", str(self.root), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(f"git {arguments} a échoué : {completed.stderr}")
+        return completed.stdout
+
+    def git_allow_failure(self, *arguments: str) -> int:
+        """Code de retour d'une commande git, sans lever (conflit de fusion)."""
+        assert GIT is not None
+        completed = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+            [GIT, "-C", str(self.root), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        return completed.returncode
 
     def write(self, relative: str, content: str) -> Path:
         """Écrit un fichier texte (crée les dossiers manquants)."""

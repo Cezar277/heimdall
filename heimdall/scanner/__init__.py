@@ -10,13 +10,15 @@ AUCUNE dépendance LLM ou crypto. Le LLM (via MCP) ne fait que trier les
 candidats ; en CI il n'a aucun pouvoir et un secret en clair bloque.
 """
 
-from heimdall.scanner.detect import find_candidates
-from heimdall.scanner.errors import (
-    InvalidFinding,
-    InvalidTarget,
-    ScanError,
-    ScannerNotImplemented,
+from heimdall.scanner.allowlist import (
+    Allowlist,
+    AllowlistRule,
+    AllowlistTrace,
+    load_allowlist,
 )
+from heimdall.scanner.detect import find_candidates
+from heimdall.scanner.entropy_detection import EntropyConfig
+from heimdall.scanner.errors import InvalidFinding, InvalidTarget, ScanError
 from heimdall.scanner.finding import (
     FINDING_FIELDS,
     Finding,
@@ -30,10 +32,27 @@ from heimdall.scanner.interface import (
     Scanner,
     ScanTarget,
 )
+from heimdall.scanner.signature_engine import MoteurSignatures, SignatureEngine
+from heimdall.scanner.signatures import (
+    SIGNATURES,
+    Rule,
+    Signature,
+    SignatureMatch,
+)
+
+# ``find_signature_matches`` n'est **pas** réexportée ici : son retour porte
+# la **valeur brute** des candidats (surface sensible). Elle reste importable
+# explicitement depuis ``heimdall.scanner.signatures``, et la seule surface
+# publique du paquet est celle de ``__all__`` ci-dessous.
 
 __all__ = [
+    "Allowlist",
+    "AllowlistRule",
+    "AllowlistTrace",
     "FINDING_FIELDS",
+    "SIGNATURES",
     "DiffTarget",
+    "EntropyConfig",
     "FileTarget",
     "Finding",
     "FindingSource",
@@ -41,9 +60,14 @@ __all__ = [
     "InvalidFinding",
     "InvalidTarget",
     "Moteur",
+    "MoteurSignatures",
+    "Rule",
     "ScanError",
     "ScanTarget",
     "Scanner",
-    "ScannerNotImplemented",
+    "Signature",
+    "SignatureEngine",
+    "SignatureMatch",
     "find_candidates",
+    "load_allowlist",
 ]

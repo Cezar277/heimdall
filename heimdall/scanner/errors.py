@@ -21,12 +21,3 @@ class InvalidFinding(ScanError, ValueError):
 
 class InvalidTarget(ScanError, ValueError):
     """Une cible d'analyse ne respecte pas le contrat (chemin, lignes)."""
-
-
-class ScannerNotImplemented(ScanError, NotImplementedError):
-    """Le scanner réel n'est pas encore livré (#22).
-
-    Hérite aussi de ``NotImplementedError`` pour les appelants historiques de
-    ``find_candidates`` : le contrat unique ``ScanError`` est respecté sans
-    casser ceux qui catchent l'erreur historique.
-    """

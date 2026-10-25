@@ -109,9 +109,10 @@ dormant. Refus fail-closed (`INTERNAL`) avant tout usage : le binaire
 n'est jamais exécuté. Preuve :
 `tests/test_mcp_units.py::GitAccessDirectTests`
 (`test_git_binary_under_the_root_is_refused_never_executed`).
-L'environnement est **reconstruit** (`PATH` vide, `HOME` =
-racine, `GIT_CONFIG_*` neutralisées) : `GIT_DIR`/`GIT_INDEX_FILE` hérités
-ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
+L'environnement est **reconstruit** (`PATH` vide, `HOME` = `os.devnull`
+— jamais la racine : git n'y lirait pas `~/.config/git/ignore`, que le dépôt
+pourrait fournir lui-même —, `GIT_CONFIG_*` neutralisées) : `GIT_DIR` et
+`GIT_INDEX_FILE` hérités ne peuvent pas rediriger le dépôt analysé, et `--no-ext-diff
 --no-textconv` rendent inopérants `diff.external` et les filtres `textconv`
 (exécution de commande pilotée par le contenu scanné, interdit I5).
 Chaque appel passe aussi **`stdin=subprocess.DEVNULL`** : sans lui le
@@ -137,6 +138,12 @@ plus **faible** (rc=0, `toplevel` = dépôt parent), pas plus fort — la
 découverte retomberait sur chaque appelant. Preuve de non-régression :
 `tests/test_mcp_units.py::RepositoryCeilingTests` échoue si le plafond
 redevenait la racine.
+Le plafond est **calculé une fois**, à la construction de `GitAccess`, puis
+figé avec la racine : un `resolve()` à chaque appel suivrait un lien posé
+entre-temps à la place de la racine et élargirait le plafond vers la cible
+adverse (`tests/test_mcp_units.py::ConfinedEnvironmentTests`). Limite
+assumée : `git -C <racine>` résout encore le chemin à chaque appel ; c'est le
+re-contrôle d'identité final qui refuse le verdict dans ce cas (code 2).
 Prouvé par des tests hostiles (`GIT_DIR` piégé, `diff.external` piégé,
 hook `core.fsmonitor` piégé, pager piégé, binaire `git` piégé en tête de
 PATH).
@@ -175,8 +182,10 @@ recopiée à la main avait laissé `pk_test_` masqué mais typé
 `prefix_vocabulary_is_fully_mapped` ne le voyait pas puisqu'il ne parcourait
 que la liste de typage. `rk_test_` (clé restreinte Stripe en mode test)
 ajouté au même moment. Les motifs sont linéaires (aucun quantificateur
-imbriqué) : garde-fou temporel anti-ReDoS en test. Le jour où #22 arrive,
-ses règles remplacent `_looks_like_secret` sans changer `mask_text`.
+imbriqué) : garde-fou temporel anti-ReDoS en test. Le scanner #22 est livré
+avec ses propres signatures et exclusions ; `_looks_like_secret` reste un filet
+conservateur indépendant, car `mask_text` couvre aussi des champs que le
+scanner ne produit pas.
 Limites honnêtes : un jeton **sans préfixe connu, noyé dans 100 Ko de
 remplissage**, reste indétectable par fenêtre ; un SHA de commit copié en
 clair est masqué (faux positif bénin assumé) ; une valeur courte (< 16

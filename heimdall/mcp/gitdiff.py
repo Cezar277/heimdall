@@ -8,12 +8,17 @@ verrouillé :
 - **environnement reconstruit de zéro**. ``GIT_DIR``, ``GIT_INDEX_FILE``,
   ``GIT_WORK_TREE``… hérités permettraient de rediriger le dépôt analysé
   sans toucher au code ; ils sont simplement absents de l'environnement
-  passé au sous-processus. Idem ``HOME`` et les configurations
-  système/global ;
+  passé au sous-processus. Idem les configurations système/global ;
+  ``HOME`` pointe vers ``os.devnull``, jamais vers la racine ni vers le ~
+  du développeur ;
 - **découverte plafonnée à la racine**. ``GIT_CEILING_DIRECTORIES`` vaut le
   parent de la racine : git n'y entre jamais, donc aucun dépôt au-dessus de
   la racine n'est découvert — le refus vient de git, pas seulement de
   ``is_repository()`` (invariant 3) ;
+- **aucun fetch différé**. ``GIT_NO_LAZY_FETCH`` vaut ``1`` : dans un clone
+  partiel, ``git cat-file`` irait chercher l'objet manquant **sur le
+  réseau** — interdit ici (invariant « 100 % local »). L'objet manquant est
+  alors une erreur, jamais un download ;
 - **stdin fermé**. ``stdin=subprocess.DEVNULL`` sur chaque appel : le fils
   n'hérite pas du pipe JSON-RPC du serveur, donc aucune sous-commande
   future ne peut en consommer les octets ni s'y bloquer ;
@@ -34,13 +39,21 @@ verrouillé :
   caractères par ligne) : au-delà, la sortie est tronquée et le drapeau
   ``truncated`` est posé, jamais un résultat partiel présenté comme
   complet.
+
+Depuis #29, ce module expose aussi la lecture **des blobs de l'index**
+(``staged_changes``/``blob_size``/``blob_bytes``) : c'est ce que la CLI
+``heimdall scan --staged`` analyse, sans aucune exclusion de chemin. Les
+mêmes garanties s'appliquent : argv figé (seul le SHA, validé hexadécimal,
+varie), environnement confiné, stdin fermé, aucun fetch.
 """
 
 import os
 import re
 import shutil
+import stat
 import subprocess  # nosec B404
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +61,10 @@ from typing import Final
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.paths import is_rel_path
+from heimdall.scanner.detect import MAX_FILE_BYTES
+from heimdall.scanner.errors import ScanError
+from heimdall.scanner.finding import validate_relative_path
+from heimdall.scanner.interface import _open_flags, _resolve_root
 
 # Options NON négociables (contrat 4.1) — voir le tableau du contrat pour la
 # justification de chacune. `-C` place git dans la racine sans dépendre du
@@ -71,16 +88,56 @@ DIFF_ARGUMENTS: Final[tuple[str, ...]] = (
 # aucun override pager — pas de surface ajoutée.
 GIT_CONFIG_OVERRIDES: Final[tuple[str, ...]] = ("-c", "core.fsmonitor=false")
 
+#: Options de l'énumération de l'index (#29) : la liste des fichiers **ajoutés
+#: ou modifiés** dans l'index, avec le SHA du blob indexé. `--raw -z` : un
+#: en-tête et un chemin, tous deux NUL-terminés. `--no-abbrev` impose le SHA
+#: **complet** (40 caractères en SHA-1, 64 en SHA-256) : un SHA abrégé ne
+#: désigne pas un objet de façon univoque et ne peut donc pas être relu.
+#: `--no-renames` rend la sortie déterministe (un renommage devient une
+#: suppression + un ajout : pas de score de similarité, donc pas de cas
+#: ambigu à parser).
+#: Plafond de la sortie brute de l'énumération de l'index (#29). Le pire cas
+#: légitime tient large : ``MAX_STAGED_FILES`` entrées de ~128 octets
+#: d'en-tête + chemin (4096 au plus, contrat Finding v1), soit de l'ordre de
+#: 4 Mio. Au-delà, le flux est coupé et l'index est refusé — un index adverse
+#: de 100 000 entrées ne fait jamais bufferiser des dizaines de Mo avant le
+#: contrôle du nombre de fichiers.
+MAX_STAGED_RAW_BYTES: Final[int] = 8 * 1024 * 1024
+
+STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
+    "diff",
+    "--cached",
+    "--raw",
+    "-z",
+    "--no-abbrev",
+    "--no-renames",
+    "--no-ext-diff",
+    "--no-textconv",
+)
+
+#: Modes d'index d'un fichier **ordinaire** suivi : les seuls pour lesquels une
+#: comparaison blob worktree/index a un sens pour la garde CWE-345. Un lien
+#: symbolique (120000) ou un gitlink (160000) n'est pas un fichier de config
+#: lisible : refus fail-closed côté appelant.
+_REGULAR_FILE_MODES: Final[frozenset[str]] = frozenset({"100644", "100755"})
+
+#: Champs de l'en-tête ``git ls-files -s`` : ``mode sha stage``.
+_LS_FILES_HEADER_FIELDS: Final[int] = 3
+
 
 # Environnement minimal du sous-processus git. Aucune variable de
 # redirection de dépôt (GIT_DIR, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY…),
 # aucune variable de configuration (GIT_CONFIG_*), aucun PATH : git est
 # appelé par chemin absolu, donc rien ne peut être trouvé par recherche de
 # binaire, et GIT_TERMINAL_PROMPT coupe toute invite interactive.
-def confined_environment(root: Path) -> dict[str, str]:
+def confined_environment(ceiling: str) -> dict[str, str]:
     return {
         "PATH": "",
-        "HOME": str(root),  # jamais le ~ du développeur (git y lit .gitconfig)
+        # Ni le ~ du développeur, ni la racine scannée : git y lit
+        # `~/.config/git/ignore` et `attributes`, donc le dépôt pouvait se
+        # masquer lui-même via son propre `.config/git/`. `os.devnull` n'est
+        # pas un répertoire : git n'y trouve rien, et n'y peut rien écrire.
+        "HOME": os.devnull,
         "LC_ALL": "C",  # messages et chemins stables, indépendants de la locale
         "LANG": "C",
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -88,9 +145,16 @@ def confined_environment(root: Path) -> dict[str, str]:
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",  # aucun verrou optionnel pris dans .git/
+        # Clone partiel : sans cette variable, `git cat-file` irait chercher
+        # l'objet manquant SUR LE RÉSEAU. Heimdall est 100 % local : l'objet
+        # manquant doit être une erreur, jamais un download.
+        "GIT_NO_LAZY_FETCH": "1",
         # Plafond de découverte = le PREMIER dossier que git ascendererait,
         # c'est-à-dire le PARENT de la racine : git refuse d'y entrer, donc
         # aucun dépôt au-dessus de la racine n'est découvert (invariant 3).
+        # Il est calculé UNE fois, à la construction de `GitAccess` : un
+        # `resolve()` à chaque appel suivrait un lien posé entre-temps à la
+        # place de la racine et élargirait le plafond vers la cible adverse.
         #
         # Ne pas « corriger » en mettant la racine elle-même : git n'exclut
         # que l'entrée dans un dossier plafond, et il est DÉJÀ dans la
@@ -108,13 +172,18 @@ def confined_environment(root: Path) -> dict[str, str]:
         #
         # Prouvé aussi qu'un worktree lié répond sa propre racine (le `.git`
         # y est un fichier), donc un dépôt à la racine reste découvert.
-        "GIT_CEILING_DIRECTORIES": str(root.resolve().parent),
+        "GIT_CEILING_DIRECTORIES": ceiling,
     }
 
 
 # Délai maximal d'une commande git : un diff qui ne répond pas est une panne
 # d'outillage (INTERNAL), pas une attente sans fin.
 GIT_TIMEOUT_SECONDS: Final[float] = 30.0
+
+#: Sortie maximale attendue de ``cat-file -s`` : un entier décimal. 64 octets
+#: laissent une marge très large, tout en refusant une sortie git anormale
+#: avant bufferisation (même motif que ``blob_bytes``).
+MAX_BLOB_SIZE_OUTPUT_BYTES: Final[int] = 64
 
 # Plafonds d'affichage du contrat 4.1.
 MAX_FILES: Final[int] = 200
@@ -161,25 +230,87 @@ _UNMERGED_PATH: Final[str] = "* Unmerged path "
 _BINARY_UNAMBIGUOUS_PARTS: Final[int] = 2
 
 
-def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
-    """Interrompt un sous-processus et attend sa fin sans bloquer ni lever."""
+def _terminate_process(
+    proc: subprocess.Popen[bytes],
+    *,
+    timeout: float = 0.5,
+) -> None:
+    """Interrompt un sous-processus et attend sa fin sans bloquer au-delà d'un délai."""
     try:
         proc.kill()
     except OSError:
         pass
     try:
-        proc.wait()
+        proc.wait(timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
-        pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=0.1)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
+@dataclass(frozen=True)
+class StagedChange:
+    """Un fichier ajouté ou modifié dans l'index, et le blob qui le porte.
+
+    ``blob`` est le SHA de l'objet **indexé** (40 caractères en SHA-1, 64 en
+    SHA-256) : c'est lui que la CLI scanne (#29). Le contenu n'est jamais
+    rangé ici : il vit dans le dépôt d'objets, et l'appelant n'en tire
+    qu'une empreinte.
+    """
+
+    path: str
+    blob: str
 
 
 class GitAccess:
-    """Accès git en lecture seule, confiné à une racine de dépôt."""
+    """Accès git en lecture seule, confiné à une racine de dépôt.
 
-    __slots__ = ("_git", "_root")
+    La racine est validée par la garde unique de l'invariant 3
+    (`Scanner._resolve_root`, #22) : `lstat` des ancêtres, refus des liens,
+    égalité du résolu. Le mode arbre et le mode `--staged` partagent donc
+    exactement la même définition d'une racine acceptable — pas de seconde
+    garde divergente. La racine est figée sous forme résolue et tous les
+    usages (`-C`, plafond, comparaisons) partent de cette forme.
+    """
+
+    __slots__ = ("_ceiling", "_git", "_root", "_root_id")
 
     def __init__(self, root: Path) -> None:
-        self._root = root
+        try:
+            self._root = _resolve_root(root)
+        except ScanError:
+            # Racine symlinkée, absente ou non canonique : panne
+            # d'outillage ici (`INTERNAL`), diagnostic affiné par l'appelant
+            # (`is_repository` → `NOT_A_GIT_REPO` côté MCP, code 2 côté CLI).
+            # `ScanError` ne traverse jamais la frontière : le message, qui
+            # pourrait refléter l'entrée, est remplacé par le statique.
+            raise ToolFailure("INTERNAL") from None
+        try:
+            # Identité du dossier, suivie après refus des liens : un `lstat`
+            # aurait la même course que le `resolve`, mais `is_symlink` refuse
+            # un lien planté entre les deux, et tout remplacement (lien, autre
+            # dossier, suppression) change l'identité ou fait échouer le `stat`
+            # — le re-contrôle de fin de scan refuse alors le verdict (#29).
+            # Le ctime est indispensable : `rm -rf` puis `mkdir` peut
+            # réattribuer le même inode (ext4), mais le dossier neuf a un ctime
+            # postérieur, qu'`utime` ne peut pas forger (contrairement à mtime).
+            # Revers assumé (POSIX, où ctime = dernier changement de
+            # métadonnées) : ajouter ou supprimer une entrée directe de la
+            # racine pendant le scan refuse le verdict (code 2, fail-closed).
+            # Sous Windows, ctime = date de création : pas de revers.
+            if self._root.is_symlink():
+                raise ToolFailure("INTERNAL")
+            metadata = os.stat(self._root)
+        except OSError:
+            raise ToolFailure("INTERNAL") from None
+        self._root_id = (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns)
+        # Plafond figé avec la racine (lexical, sans I/O) : voir `confined_environment`.
+        self._ceiling = str(self._root.parent)
         # Jamais le PATH hérité : un PATH compromis (poste, CI, direnv)
         # détournerait le binaire exécuté à chaque outil. `os.defpath`
         # (`/bin:/usr/bin` sur POSIX) est le défaut système sûr, pas une
@@ -190,7 +321,11 @@ class GitAccess:
             # Panne d'outillage : message statique, jamais de chemin ni de
             # contenu reflété (invariant 8).
             raise ToolFailure("INTERNAL")
-        resolved = Path(binary).resolve()
+        try:
+            resolved = Path(binary).resolve()
+            cwd = Path.cwd().resolve()
+        except (OSError, RuntimeError, ValueError):
+            raise ToolFailure("INTERNAL") from None
         # Jamais un binaire sous la racine ni sous le répertoire courant :
         # sur win32, `shutil.which` préfixe le répertoire courant d'office
         # (`path.insert(0, curdir)` dans la stdlib, même avec un `path`
@@ -199,11 +334,29 @@ class GitAccess:
         # `os.defpath` est absolu donc ce refus est un filet dormant, mais il
         # couvre aussi un `defpath` vide ou relatif. Refus fail-closed,
         # avant tout usage du binaire : il n'est jamais exécuté.
-        if resolved.is_relative_to(root.resolve()) or resolved.parent == Path.cwd().resolve():
+        # Comparaison à la forme **figée** (`self._root`), jamais au
+        # paramètre brut : une seule référence canonique, donc une seule
+        # fenêtre TOCTOU et aucune divergence si la garde de racine évolue.
+        if resolved.is_relative_to(self._root) or resolved.parent == cwd:
             raise ToolFailure("INTERNAL")
         self._git = binary
 
-    def execute(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+    @property
+    def root(self) -> Path:
+        """Racine figée sous forme résolue (refusée symlink à la construction)."""
+        return self._root
+
+    @property
+    def root_id(self) -> tuple[int, int, int]:
+        """Identité du dossier racine (`st_dev`, `st_ino`, `st_ctime_ns`) à la construction."""
+        return self._root_id
+
+    def execute(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> subprocess.CompletedProcess[bytes]:
         """Exécute une commande git figée (argv, jamais de shell).
 
         Les deux suppressions (`noqa`/`nosec`) sont justifiées : la liste
@@ -222,6 +375,9 @@ class GitAccess:
         on ne laisse pas l'héritage en place. Le garde-fou est statique
         (`tests/security/test_prompt_injection.py` refuse tout appel git
         sans `stdin=subprocess.DEVNULL`), pas seulement la ligne ci-dessous.
+
+        ``timeout`` est le délai **restant** d'une éventuelle deadline
+        globale : par défaut le timeout unitaire de :data:`GIT_TIMEOUT_SECONDS`.
         """
         try:
             return subprocess.run(  # noqa: S603 # nosec B603
@@ -229,26 +385,37 @@ class GitAccess:
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 check=False,
-                timeout=GIT_TIMEOUT_SECONDS,
-                env=confined_environment(self._root),
+                timeout=timeout,
+                env=confined_environment(self._ceiling),
             )
         except (OSError, subprocess.TimeoutExpired):
             # Panne d'outillage (binaire absent, délai dépassé) : message
             # statique, jamais de chemin ni de sortie git reflétés.
             raise ToolFailure("INTERNAL") from None
 
-    def is_repository(self) -> bool:
+    def is_repository(self, *, timeout: float = GIT_TIMEOUT_SECONDS) -> bool:
         """True si la racine est un dépôt Git avec arbre de travail à cette racine exacte.
 
         Un code de retour non nul (« not a git repository ») ou une racine
         qui pointe vers un dépôt parent n'est PAS une panne : c'est le diagnostic
-        attendu, traduit en ``NOT_A_GIT_REPO`` par l'appelant.
+        attendu, traduit en ``NOT_A_GIT_REPO`` par l'appelant. Un chemin
+        ``top`` que ``resolve()`` ne sait pas résoudre (boucle de liens,
+        composant illisible) EST une panne : ``ToolFailure``, jamais une
+        exception brute hors contrat. ``timeout`` est le délai restant transmis
+        par une deadline globale.
         """
-        completed = self.execute(("rev-parse", "--show-toplevel"))
+        completed = self.execute(("rev-parse", "--show-toplevel"), timeout=timeout)
         if completed.returncode != 0:
             return False
         top = completed.stdout.strip().decode("utf-8", errors="replace")
-        return Path(top).resolve() == self._root.resolve()
+        try:
+            # Comparé à la racine **figée** : une racine échangée depuis la
+            # construction ne peut pas redevenir « un dépôt » par resolve().
+            return Path(top).resolve() == self._root
+        except (OSError, RuntimeError, ValueError):
+            # Selon la version de Python, `resolve()` lève sur une boucle de
+            # liens (RuntimeError en 3.10) : ni « pas un dépôt », ni « dépôt ».
+            raise ToolFailure("INTERNAL") from None
 
     def is_ignored(self, relative_path: str) -> bool:
         """True si le chemin est ignoré par les .gitignore du dépôt.
@@ -265,6 +432,106 @@ class GitAccess:
         if completed.returncode == 1:
             return False
         raise ToolFailure("INTERNAL")
+
+    def _checked_index_path(self, *, timeout: float) -> Path:
+        """Chemin réel de l'index git, refusé s'il n'est pas un fichier ordinaire.
+
+        `git rev-parse --git-path index` couvre les dépôts standards, les
+        worktrees liés (`.git` est alors un fichier) et les sous-modules. Le
+        chemin est ensuite passé par la garde unique `_resolve_root` (refus de
+        tout lien symbolique sur le chemin) puis ouvert avec `O_NOFOLLOW` :
+        un index remplacé par un lien n'est jamais suivi en silence.
+        """
+        completed = self.execute(("rev-parse", "--git-path", "index"), timeout=timeout)
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        raw = completed.stdout[:-1] if completed.stdout.endswith(b"\n") else completed.stdout
+        if not raw or b"\x00" in raw or b"\n" in raw:
+            raise ToolFailure("INTERNAL")
+        try:
+            path = Path(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            raise ToolFailure("INTERNAL") from None
+        if not path.is_absolute():
+            path = self._root / path
+        try:
+            resolved = _resolve_root(path)
+            # O_NONBLOCK évite qu'un FIFO placé à la place de l'index ne
+            # bloque l'ouverture ; le fstat ci-dessous refuse tout non-régulier.
+            descriptor = os.open(resolved, _open_flags() | getattr(os, "O_NONBLOCK", 0))
+        except (ScanError, OSError):
+            raise ToolFailure("INTERNAL") from None
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ToolFailure("INTERNAL")
+        except OSError:
+            raise ToolFailure("INTERNAL") from None
+        finally:
+            # `os.close` peut lever `OSError` (EBADF/EINTR sur FS adverse) :
+            # convertir pour garder le contrat `ToolFailure("INTERNAL")`
+            # (invariant 11), comme `allowlist.py` et `scan.py` le font déjà.
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise ToolFailure("INTERNAL") from None
+        return resolved
+
+    def index_entry(
+        self,
+        relative_path: str,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> tuple[str, str] | None:
+        """Entrée d'index d'un fichier suivi, ou ``None`` s'il n'est pas suivi.
+
+        Rend ``(mode, sha)`` pour une entrée de stage 0 dont le mode est un
+        fichier ordinaire (``100644``/``100755``). Un chemin absent, un lien
+        symbolique, un gitlink (sous-module), un index en conflit ou une
+        sortie illisible sont refusés : ``None`` pour l'absence, sinon
+        ``ToolFailure``. Le format binaire DIRC n'est **jamais** reparsé ici :
+        c'est git qui répond, donc les index v2/v3/v4 et leurs extensions sont
+        couverts sans dette de maintenance.
+        """
+        try:
+            validate_relative_path(relative_path)
+        except ValueError:
+            raise ToolFailure("INTERNAL") from None
+        # Refus d'un index symlinké avant de laisser git le lire : `git
+        # ls-files` suivrait le lien sans le dire.
+        self._checked_index_path(timeout=timeout)
+        completed = self.execute(
+            ("ls-files", "-s", "-z", "--", relative_path),
+            timeout=timeout,
+        )
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        entries = [entry for entry in completed.stdout.split(b"\x00") if entry]
+        if not entries:
+            return None
+        if len(entries) != 1:
+            # Index non résolu (plusieurs stages) ou chemin ambigu.
+            raise ToolFailure("INTERNAL")
+        header, separator, path_bytes = entries[0].partition(b"\t")
+        if not separator:
+            raise ToolFailure("INTERNAL")
+        fields = header.split(b" ")
+        if len(fields) != _LS_FILES_HEADER_FIELDS:
+            raise ToolFailure("INTERNAL")
+        mode, sha, stage = fields
+        if stage != b"0":
+            raise ToolFailure("INTERNAL")
+        try:
+            mode_str = mode.decode("ascii")
+            sha_str = sha.decode("ascii")
+            path_str = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ToolFailure("INTERNAL") from None
+        if path_str != relative_path or _OBJECT_PATTERN.fullmatch(sha_str) is None:
+            raise ToolFailure("INTERNAL")
+        if mode_str not in _REGULAR_FILE_MODES:
+            return None
+        return mode_str, sha_str
 
     def staged_diff(self, max_bytes: int) -> tuple[bytes, bool]:
         """Sortie brute de ``git diff --cached``, lue en flux borné à ``max_bytes``.
@@ -293,7 +560,7 @@ class GitAccess:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env=confined_environment(self._root),
+                env=confined_environment(self._ceiling),
             )
         except OSError:
             raise ToolFailure("INTERNAL") from None
@@ -328,6 +595,156 @@ class GitAccess:
 
         return raw, False
 
+    def staged_changes(
+        self,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> list[StagedChange]:
+        """Fichiers **ajoutés ou modifiés** dans l'index, et leur blob.
+
+        Utilisé par la CLI ``heimdall scan --staged`` (#29) : l'index est la
+        source de vérité de « ce que le commit va contenir », et le contenu
+        indexé est lu **blob par blob**, sans aucune exclusion de chemin.
+        Les suppressions et les gitlinks (sous-modules : leur SHA désigne
+        un commit, pas un blob) sont ignorés — aucun texte à scanner.
+
+        La sortie est lue en **flux borné** (:data:`MAX_STAGED_RAW_BYTES`),
+        comme ``staged_diff`` : un index adverse de 100 000 entrées est
+        coupé avant d'être bufferisé, puis refusé. Pas de coupe « propre »
+        ici (contrairement au diff paginé du MCP) : une énumération
+        incomplète ne vaut pas verdict, donc c'est ``ToolFailure``.
+
+        L'index est non résolu (conflit de fusion) ou la sortie est illisible
+        → ``ToolFailure`` : le scan ne peut alors pas prétendre avoir tout vu.
+        ``timeout`` est le délai restant transmis par une deadline globale.
+        """
+        raw = self._read_capped(
+            STAGED_RAW_ARGUMENTS,
+            MAX_STAGED_RAW_BYTES,
+            timeout=timeout,
+        )
+        return parse_staged_raw(raw)
+
+    def _read_capped(
+        self,
+        arguments: Sequence[str],
+        max_bytes: int,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> bytes:
+        """Sortie d'une commande git figée, lue en flux borné à ``max_bytes``.
+
+        Même motif que ``staged_diff`` (argv figé, ``stdin=DEVNULL``,
+        environnement confiné, délai) : le flux stdout est lu jusqu'à au
+        plus ``max_bytes + 1`` octets. Au-delà, le sous-processus est tué et
+        c'est ``ToolFailure`` — ici aucune coupe partielle n'est rendue :
+        l'appelant ne sait exploiter qu'une énumération **complète**.
+
+        ``timeout`` est le délai **restant** d'une éventuelle deadline
+        globale : par défaut le timeout unitaire de :data:`GIT_TIMEOUT_SECONDS`.
+        Lecture **et** attente se partagent ce délai : le minuteur est annulé
+        avant `wait`, qui ne reçoit donc que le restant (sinon un git qui
+        ferme stdout tard puis traîne durerait jusqu'à 2 × ``timeout``).
+        """
+        deadline = time.monotonic() + timeout
+        try:
+            proc = subprocess.Popen(  # noqa: S603 # nosec B603
+                [self._git, *GIT_CONFIG_OVERRIDES, "-C", str(self._root), *arguments],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=confined_environment(self._ceiling),
+            )
+        except OSError:
+            raise ToolFailure("INTERNAL") from None
+
+        timer = threading.Timer(timeout, proc.kill)
+        timer.daemon = True
+        timer.start()
+        try:
+            raw = b""
+            if proc.stdout is not None:
+                raw = proc.stdout.read(max_bytes + 1)
+        except OSError:
+            _terminate_process(proc, timeout=max(0.1, deadline - time.monotonic()))
+            raise ToolFailure("INTERNAL") from None
+        finally:
+            timer.cancel()
+            if proc.stdout is not None:
+                proc.stdout.close()
+
+        if len(raw) > max_bytes:
+            _terminate_process(proc, timeout=max(0.1, deadline - time.monotonic()))
+            raise ToolFailure("INTERNAL")
+
+        try:
+            ret = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except (subprocess.TimeoutExpired, OSError):
+            _terminate_process(proc, timeout=max(0.1, deadline - time.monotonic()))
+            raise ToolFailure("INTERNAL") from None
+
+        if ret != 0:
+            raise ToolFailure("INTERNAL")
+
+        return raw
+
+    def blob_size(
+        self,
+        blob: str,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> int:
+        """Taille en octets d'un objet git, **sans** le lire.
+
+        L'appelant borne ainsi la lecture : un blob géant ne doit jamais
+        être chargé en mémoire (déni de service). Une taille négative est
+        refusée (panne d'outillage) : la comptabilité de volume de
+        l'appelant ne doit jamais pouvoir reculer. Zéro reste valide — un
+        blob vide ne porte aucun candidat.
+
+        La sortie est lue en flux borné à :data:`MAX_BLOB_SIZE_OUTPUT_BYTES`
+        (un entier décimal) : une sortie git anormale est refusée avant
+        bufferisation, comme pour ``blob_bytes``. ``timeout`` est le délai
+        restant d'une éventuelle deadline globale.
+        """
+        raw = self._read_capped(
+            _cat_file_arguments("-s", blob),
+            MAX_BLOB_SIZE_OUTPUT_BYTES,
+            timeout=timeout,
+        )
+        try:
+            size = int(raw.strip())
+        except ValueError:
+            raise ToolFailure("INTERNAL") from None
+        if size < 0:
+            raise ToolFailure("INTERNAL")
+        return size
+
+    def blob_bytes(
+        self,
+        blob: str,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> bytes:
+        """Contenu **brut** d'un blob (celui de l'index, pas de la copie de
+        travail).
+
+        Aucun filtre ``textconv``, aucune conversion ``CRLF`` : c'est le
+        contenu que git a indexé, octet pour octet. Le secret y figure —
+        l'appelant ne le **montre** jamais (il n'en garde qu'une empreinte).
+
+        La lecture est **streamée et bornée** à :data:`MAX_FILE_BYTES` via
+        ``_read_capped`` : si l'oracle ``cat-file -s`` mentait (store
+        incohérent, objet remplacé), le surplus n'est jamais bufferisé. Le
+        sous-processus est tué au-delà de la borne et c'est ``ToolFailure``.
+        ``timeout`` est le délai restant d'une éventuelle deadline globale.
+        """
+        return self._read_capped(
+            _cat_file_arguments("blob", blob),
+            MAX_FILE_BYTES,
+            timeout=timeout,
+        )
+
 
 @dataclass(frozen=True)
 class DiffEntry:
@@ -342,6 +759,125 @@ class DiffEntry:
     binary: bool
     lines: tuple[tuple[int, str], ...]
     line_overflow: bool = False
+
+
+#: En-tête du format « raw » de git : ``:mode mode sha sha statut``.
+_RAW_HEADER_FIELDS: Final[int] = 5
+#: Un nom d'objet git : 40 caractères (dépôt SHA-1) ou 64 (dépôt SHA-256).
+#: Les deux formats sont acceptés : un dépôt `--object-format=sha256` est
+#: parfaitement valide, et le refuser rendrait `--staged` inutilisable (#29).
+_OBJECT_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+#: Statuts de `--raw` dont le blob indexé doit être scanné : ajout,
+#: modification, changement de type (le nouveau contenu est scanné).
+_SCAN_STATUSES: Final[frozenset[str]] = frozenset({"A", "M", "T"})
+
+
+def _is_null_object(blob: str) -> bool:
+    """True pour le SHA « nul » de git (40 ou 64 zéros) : l'objet n'existe pas."""
+    return bool(blob) and set(blob) == {"0"}
+
+
+def _checked_object(blob: str) -> str:
+    """Valide un nom d'objet git avant de le mettre dans l'argv.
+
+    Un SHA est hexadécimal : cette garde interdit qu'une chaîne venue d'une
+    sortie git (ou d'un appelant) soit interprétée comme une option par git
+    (``--upload-pack=…``), et qu'une valeur inattendue parte en argument.
+    """
+    if _OBJECT_PATTERN.fullmatch(blob) is None:
+        raise ToolFailure("INTERNAL")
+    return blob
+
+
+def _cat_file_arguments(mode: str, blob: str) -> tuple[str, ...]:
+    """Argv ``cat-file`` figé : mode, **fin d'options**, SHA validé.
+
+    Le ``--`` est une défense en profondeur : même si la validation du SHA
+    évoluait (nouveau format, SHA abrégé), aucune valeur ne pourrait être
+    interprétée comme une option de git. La construction est centralisée
+    pour que ``blob_size`` et ``blob_bytes`` ne puissent pas diverger.
+    """
+    return ("cat-file", mode, "--", _checked_object(blob))
+
+
+def parse_staged_raw(raw: bytes) -> list[StagedChange]:
+    """Analyse la sortie de ``git diff --cached --raw -z``.
+
+    Rend la liste des fichiers **ajoutés ou modifiés** dans l'index (les
+    suppressions sont ignorées : il n'y a plus de blob à scanner), avec le
+    SHA du blob indexé. Les entrées gitlink (sous-modules, mode ``160000``)
+    sont ignorées de la même façon : leur SHA désigne un commit, pas un
+    blob, donc aucun texte à scanner.
+
+    Sortie illisible, statut inconnu ou index non résolu (conflit de fusion,
+    statut ``U``) → ``ToolFailure`` : mieux vaut une panne qu'un verdict
+    « propre » sur un index qu'on n'a pas su lire (invariant 1).
+    """
+    text = raw[:-1] if raw.endswith(b"\0") else raw
+    if not text:
+        return []
+    parts = text.split(b"\0")
+    if len(parts) % 2 != 0:
+        # En-tête et chemin doivent s'alterner : une sortie tronquée est
+        # illisible, et une liste partielle ne vaut pas verdict propre.
+        raise ToolFailure("INTERNAL")
+    changes: list[StagedChange] = []
+    for position in range(0, len(parts), 2):
+        change = _staged_change(parts[position], parts[position + 1])
+        if change is not None:
+            changes.append(change)
+    return changes
+
+
+def _staged_change(header: bytes, path_bytes: bytes) -> StagedChange | None:
+    """Un changement de l'index, ou ``None`` pour un fichier supprimé."""
+    fields = header.split(b" ")
+    if len(fields) != _RAW_HEADER_FIELDS or not fields[0].startswith(b":"):
+        raise ToolFailure("INTERNAL")
+    try:
+        status = fields[4].decode("ascii")
+    except UnicodeDecodeError:
+        raise ToolFailure("INTERNAL") from None
+    if not status:
+        raise ToolFailure("INTERNAL")
+    code = status[0]
+    if code == "U":
+        # Index non résolu (conflit de fusion) : git n'en montre aucun
+        # contenu, et l'index ne correspond à aucun commit. Refus.
+        raise ToolFailure("INTERNAL")
+    if code == "D":
+        return None
+    if code not in _SCAN_STATUSES:
+        raise ToolFailure("INTERNAL")
+    if fields[1] == b"160000":
+        # Entrée gitlink (sous-module) : le SHA indexé désigne un **commit**,
+        # pas un blob — il n'y a aucun texte à scanner (`cat-file blob`
+        # échouerait avec `bad file`). Ignoré comme les suppressions, pas une
+        # erreur : un sous-module stagé ne doit pas faire échouer tout le
+        # scan (#29). Seul le mode **indexé** compte : un passage gitlink →
+        # fichier (`T` vers 100644) porte un vrai blob et reste scanné.
+        return None
+    try:
+        blob = fields[3].decode("ascii")
+    except UnicodeDecodeError:
+        raise ToolFailure("INTERNAL") from None
+    if _is_null_object(blob) or _OBJECT_PATTERN.fullmatch(blob) is None:
+        raise ToolFailure("INTERNAL")
+    try:
+        path = path_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ToolFailure("INTERNAL") from None
+    try:
+        # Contrat Finding v1 (#14) : 4096 caractères, segments non vides,
+        # sans `.`/`..`, sans `\`, `:` ni caractère de contrôle. C'est la
+        # **seule** limite de chemin de la CLI : `FileTarget` revalide avec
+        # exactement la même fonction, donc aucune divergence 1024/4096.
+        validate_relative_path(path)
+    except ValueError:
+        # Un nom de fichier que le contrat ne sait pas représenter ne peut
+        # pas être montré ni rejoué : la sortie est refusée, pas tronquée.
+        raise ToolFailure("INTERNAL") from None
+    return StagedChange(path=path, blob=blob)
 
 
 @dataclass

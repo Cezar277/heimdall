@@ -1,4 +1,4 @@
-"""Rate-limiting débit du Vault (ticket #65).
+"""Rate-limiting débit du Vault (livré dans le lot d'intégration #63).
 
 Fenêtres fixes par clé API validée, par pair réseau et globale. Les 400 et 401
 consomment le budget puisqu'ils traversent ce middleware avant le routage. Une

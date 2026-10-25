@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS secrets (
 
 CREATE INDEX IF NOT EXISTS idx_secrets_project_env_name ON secrets(project_id, env, name);
 
--- Buckets de rate-limiting partagés entre workers (ticket #65). Les noms de
+-- Buckets de rate-limiting partagés entre workers (lot #63). Les noms de
 -- buckets par clé sont des empreintes HMAC, jamais les clés brutes.
 CREATE TABLE IF NOT EXISTS rate_limit_buckets (
     name TEXT PRIMARY KEY,
@@ -970,7 +970,7 @@ def get_api_key_by_hash(conn: sqlite3.Connection, key_hash: str) -> dict[str, An
     DÉPRÉCIÉ POUR L'AUTHENTIFICATION : l'égalité est évaluée par SQLite, donc
     PAS en temps constant (oracle temporel sur l'existence d'une empreinte).
     Le chemin d'authentification du serveur DOIT utiliser le full-scan à coût
-    comparable (`app._find_api_key_project` + `constant_time_equal`, sans
+    comparable (`auth.find_api_key_project` + `constant_time_equal`, sans
     `break`) ; cette fonction reste réservée aux accès admin/outils hors
     requête (tests unitaires de la couche DB). Ne jamais l'appeler depuis
     `heimdall/vault/app.py` (garde : test grep dédié).

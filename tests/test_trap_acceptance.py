@@ -201,16 +201,14 @@ def test_generation_refuses_target_symlink_escape(tmp_path, monkeypatch):
     assert not list(outside.iterdir())
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError,
-    reason="Scanner T22 non livré; aucune métrique inventée",
-    strict=True,
-)
-def test_scanner_precision_and_recall(tmp_path):
+def test_scanner_precision_and_recall_without_implicit_allowlist(tmp_path):
     report = scan_corpus(tmp_path)
     print(json.dumps(report, indent=2))
-    assert report["core"]["precision"] >= 0.9
-    assert report["core"]["recall"] >= 0.9
+    # T23 review: public UUID/hash/integrity shapes cannot authorize a skip.
+    # Keep the independent oracle and count all eight false positives honestly.
+    # measure_trap.py retains its 0.9 threshold and must return 1 on this report.
+    assert report["core"] == {"tp": 10, "fp": 8, "fn": 0, "precision": 10 / 18, "recall": 1.0}
+    assert report["all"] == {"tp": 12, "fp": 8, "fn": 4, "precision": 0.6, "recall": 0.75}
 
 
 def test_generated_python_is_valid_source(tmp_path):

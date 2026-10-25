@@ -215,6 +215,28 @@ def _reject_non_json_constant(value: str) -> Any:
     raise ValueError(f"constante non-JSON refusee : {value}")
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Refuse les clés dupliquées plutôt qu'un verdict dépendant du parseur."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("cle JSON dupliquee")
+        result[key] = value
+    return result
+
+
+def _response_content(response: Any) -> Any:
+    """Aucun appel natif n'est admissible, même accompagné d'un JSON valide."""
+    message = getattr(response, "message", None)
+    tool_calls = getattr(message, "tool_calls", None)
+    # Seules l'absence (None) et une liste vide du protocole sont admises.
+    # Ne pas utiliser la vérité implicite d'un objet de type inattendu.
+    if tool_calls is not None and (type(tool_calls) is not list or len(tool_calls) != 0):
+        logger.warning("qualification: appel outil refuse (prompt=%s)", PROMPT_NAME)
+        raise QualifyError("invalid")
+    return getattr(message, "content", None)
+
+
 def qualify(
     candidate: str,
     *,
@@ -296,7 +318,7 @@ def qualify(
         # `from None` coupe la chaîne de contexte).
         logger.warning("qualification: LLM local indisponible (prompt=%s)", PROMPT_NAME)
         raise QualifyError("unavailable") from None
-    content = getattr(getattr(response, "message", None), "content", None)
+    content = _response_content(response)
     if not isinstance(content, str):
         logger.warning("qualification: reponse sans contenu (prompt=%s)", PROMPT_NAME)
         raise QualifyError("invalid")
@@ -307,7 +329,11 @@ def qualify(
         logger.warning("qualification: reponse surdimensionnee (prompt=%s)", PROMPT_NAME)
         raise QualifyError("invalid")
     try:
-        result = json.loads(content, parse_constant=_reject_non_json_constant)
+        result = json.loads(
+            content,
+            parse_constant=_reject_non_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
     except (ValueError, RecursionError):
         # Imbrication profonde (borne de récursion : le scanneur C ne
         # récursionne plus par niveau, mais le repli pur-Python si) : même

@@ -161,6 +161,13 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   squelette, Finding : en CI une valeur en clair bloque quel que soit l'état ;
   preuve runtime due en #28).
 - Statut : exigence acceptée par #19 ; implémentation #22/#28 à prouver.
+  Depuis #29, le chemin `--ci` est **branché et opérationnel** : la commande
+  `heimdall scan --ci` ne fait aucun appel LLM (le module de scan
+  `heimdall/cli/scan.py` n'importe aucun module réseau — garde AST étendue à
+  ce module dans `tests/security/test_prompt_injection.py`), et son verdict
+  est le code de sortie (0 / 1 / 2). La preuve d'exécution est dans
+  `tests/test_cli_scan.py` ; le garde réseau (`tests/test_network_isolation.py`)
+  exerce un scan réel sous interdiction de connexion.
 
 ### REQ-SEC-03 — Écriture confinée, snapshot revérifié
 
@@ -270,7 +277,33 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
 - Preuve attendue : `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean`
   et `test_obfuscation_corpus_is_mandatory` (squelette fail-closed actuel,
   codes CLI 0/1/2, bornes et `truncated` des contrats MCP/Finding).
-- Statut : exigence acceptée par #19 ; implémentation #22 à prouver.
+- Statut : exigence acceptée par #19. Le scanner #22 livre les signatures
+  déterministes, les exclusions et le fail-closed (`ScanError` sur entrée
+  illisible, trop grosse, non régulière ou modifiée pendant la lecture).
+  Durcissement post-relecture : deux valeurs distinctes du même type sur une
+  même ligne produisent deux Findings (aucun candidat perdu) ; les fichiers
+  UTF-16/UTF-32 sont décodés et scannés, un contenu NUL non décodable lève
+  `ScanError` au lieu d'être ignoré ; une racine ou un fichier unique
+  symlinké est refusé au lieu d'être suivi ; une signature binaire ne suffit
+  pas à faire ignorer un fichier dont le contenu est majoritairement textuel
+  (le refus est alors explicite) ; un secret coupé par un retour à la ligne
+  est recherché dans une fenêtre multi-ligne bornée à 4 Kio ; la clé HMAC
+  locale est durcie (fichier `0600`, propriétaire vérifié, parent `0700`,
+  parent symlink refusé, `..` refusé) et son indisponibilité lève `ScanError`
+  au lieu d'une clé éphémère.
+  Preuves : `tests/test_scanner_detect.py`,
+  `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean` et
+  la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
+  Depuis #29, le contrat 0/1/2 est **exécuté** : `tests/test_cli_scan.py`
+  prouve dépôt propre => 0, secret avéré => 1, racine absente => 2, index en
+  conflit => 2, blob trop gros => 2, et **aucune écriture** pendant un scan.
+  Le mode `--staged` analyse les blobs ajoutés ou modifiés de l'index **sans
+  aucune exclusion de chemin** (`vendor/`, lockfiles compris) : c'est la
+  correction du point HIGH relevé à la revue de #165, où la politique #59
+  laissait passer un secret posé dans `vendor/evil.py`.
+  Limites connues documentées par T21 : base64, concaténation et flux de
+  variables ne sont pas décodés ; leur traitement relève de #23/#24 et ne
+  produit jamais un verdict propre sans les contrôles CI de #29/#19.
 
 ### REQ-SEC-08 — Hook contournable, CI de confiance
 

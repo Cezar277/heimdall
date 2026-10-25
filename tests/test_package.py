@@ -3,9 +3,18 @@
 import copy
 import os
 import pickle
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 from typer.testing import CliRunner
 
@@ -26,6 +35,21 @@ import heimdall.vault.crypto
 class PackageSmokeTests(unittest.TestCase):
     def test_version_exposed(self) -> None:
         self.assertEqual(heimdall.__version__, "0.1.0")
+
+    def test_tomli_declared_as_runtime_dependency_for_python_310(self) -> None:
+        """`client.py` importe tomli au runtime sur 3.10 : pas seulement en [dev].
+
+        Le pin est volontairement inconditionnel : un marqueur ``< 3.11`` rend
+        ``tomli`` invisible à ``pip --require-hashes`` sur les Python récents,
+        qui refuse alors la contrainte transitive non épinglée.
+        """
+        root = Path(__file__).resolve().parents[1]
+        document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        runtime = document["project"]["dependencies"]
+        normalized = [requirement.replace(" ", "") for requirement in runtime]
+        self.assertIn("tomli==2.5.0", normalized)
+        dev = document["project"]["optional-dependencies"]["dev"]
+        self.assertFalse(any(requirement.startswith("tomli==") for requirement in dev))
 
     def test_subpackages_importable(self) -> None:
         for module in (
@@ -50,8 +74,12 @@ class PackageSmokeTests(unittest.TestCase):
         self.assertEqual(version.exit_code, 0)
         self.assertIn(heimdall.__version__, version.output)
 
-    def test_scan_is_fail_closed_until_22(self) -> None:
-        """Sans scanner (#22), `scan` bloque en erreur d'outillage (exit 2)."""
+    def test_scan_is_wired_and_writes_nothing(self) -> None:
+        """#29 livré : la commande scan est branchée et reste en lecture seule."""
+        git = shutil.which("git", path=os.defpath)
+        if git is None:  # pragma: no cover - garde-fou d'environnement de test.
+            raise unittest.SkipTest("git requis")
+        assert git is not None
         runner = CliRunner()
         previous = os.getcwd()
         for argv in (["scan"], ["scan", "--ci"]):
@@ -59,19 +87,38 @@ class PackageSmokeTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory(prefix="heimdall-scan-") as tmp:
                     os.chdir(tmp)
                     try:
+                        # Le mode arbre exige une racine de dépôt (#29) : le
+                        # dossier est initialisé avant le scan.
+                        for args in (
+                            ["init", "-q"],
+                            ["config", "user.email", "test@example.invalid"],
+                            ["config", "user.name", "Heimdall Test"],
+                        ):
+                            completed = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+                                [git, *args],
+                                capture_output=True,
+                                text=True,
+                                timeout=60,
+                                check=False,
+                            )
+                            self.assertEqual(completed.returncode, 0, completed.stderr)
                         result = runner.invoke(heimdall.cli.main.app, argv)
                     finally:
                         os.chdir(previous)
-                    self.assertEqual(result.exit_code, 2)
-                    self.assertIn("#22", result.output)
-                    # Invariant 11 : 2 = panne d'outillage, jamais 1 (secrets).
-                    # Le stub n'écrit aucun fichier.
-                    self.assertEqual(os.listdir(tmp), [])
+                    # Un dépôt vide est réellement propre : 0, pas 2.
+                    self.assertEqual(result.exit_code, 0)
+                    # Le scan est une lecture : seul `.git` (créé par le test)
+                    # est présent, rien d'autre n'a été écrit.
+                    self.assertEqual(sorted(os.listdir(tmp)), [".git"])
 
     def test_scan_reports_on_stderr(self) -> None:
-        result = CliRunner().invoke(heimdall.cli.main.app, ["scan"])
+        """Erreur d'outillage : message sur stderr, code 2 (jamais 0, jamais 1)."""
+        result = CliRunner().invoke(
+            heimdall.cli.main.app,
+            ["scan", str(Path(tempfile.gettempdir()) / "heimdall-absent-29")],
+        )
         self.assertEqual(result.exit_code, 2)
-        self.assertIn("#22", result.stderr)
+        self.assertIn("scan impossible", result.stderr)
 
     def test_cli_mcp_handles_broken_pipe_and_exception(self) -> None:
         """CLI `heimdall mcp` : BrokenPipeError -> 0, exception inattendue -> 2 sans fuite."""
@@ -92,18 +139,21 @@ class PackageSmokeTests(unittest.TestCase):
 
     def test_stubs_raise_not_implemented(self) -> None:
         with self.assertRaises(NotImplementedError):
-            heimdall.scanner.detect.find_candidates(".")
-        with self.assertRaises(NotImplementedError):
             heimdall.vault.crypto.encrypt_at_rest(b"x", "k")
         with self.assertRaises(ValueError):
             heimdall.vault.client.VaultClient("http://127.0.0.1:8443", "PLACEHOLDER")
 
     def test_vault_client_allows_loopback_https_only(self) -> None:
         """HIGH : tout hôte non local est rejeté (exfiltration impossible)."""
-        for base_url in ("https://127.0.0.1:8443", "https://[::1]:8443", "https://localhost:8443"):
+        for base_url in ("https://127.0.0.1:8443", "https://[::1]:8443"):
             with self.subTest(base_url=base_url):
                 client = heimdall.vault.client.VaultClient(base_url, "PLACEHOLDER")
                 self.assertEqual(client._base_url, base_url)
+        # localhost accepté mais épinglé vers l'IP à la construction
+        # (anti-rebinding) : jamais de nom d'hôte stocké dans _base_url.
+        pinned = heimdall.vault.client.VaultClient("https://localhost:8443", "PLACEHOLDER")
+        self.assertIn(pinned._base_url, ("https://127.0.0.1:8443", "https://[::1]:8443"))
+        self.assertNotIn("localhost", pinned._base_url)
         for base_url in (
             "https://evil.example",
             "https://127.0.0.1.evil.example",
@@ -190,7 +240,7 @@ class PackageSmokeTests(unittest.TestCase):
     def test_stubs_never_reflect_input(self) -> None:
         """Invariant 8 : aucune entrée reflétée en exception (pattern #22/#27)."""
         marker = "SENTINELLE_ENTREE_NON_FIABLE"
-        with self.assertRaises(NotImplementedError) as ctx:
+        with self.assertRaises(heimdall.scanner.detect.ScanError) as ctx:
             heimdall.scanner.detect.find_candidates(marker)
         self.assertNotIn(marker, str(ctx.exception))
         # #27 : run_stdio valide sa racine en ValueError, message statique.

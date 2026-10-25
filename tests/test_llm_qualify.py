@@ -117,7 +117,8 @@ class TestPromptContract:
         assert prompts_module.PROMPT_NAME == "qualify_v1"
         assert PROMPT_PATH.is_file()
         assert prompts_module.load_qualify_prompt() == PROMPT_PATH.read_text(encoding="utf-8")
-        expected = hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest()
+        # L'empreinte porte sur le texte envoyé, y compris avec un checkout CRLF.
+        expected = hashlib.sha256(PROMPT_PATH.read_text(encoding="utf-8").encode()).hexdigest()
         assert prompts_module.prompt_digest() == expected
 
     def test_digest_is_the_exact_sent_system_content_single_read(self) -> None:
@@ -155,8 +156,9 @@ class TestPromptContract:
         assert match is not None
         real = match.group(1)
         assert real != forged  # délimiteur réel imprévisible (secrets.token_hex)
-        # Le candidat entier (faux délimiteur compris) reste inerte dans le bloc réel.
-        assert f"<data_{real}>\n{candidate}\n</data_{real}>" in content
+        # Les balises forgées sont échappées, même à l'intérieur du bloc réel.
+        escaped = candidate.replace("<", "&lt;").replace(">", "&gt;")
+        assert f"<data_{real}>\n{escaped}\n</data_{real}>" in content
 
     def test_empty_candidate_is_refused_before_any_request(self) -> None:
         for empty in ("", "   \n\t "):

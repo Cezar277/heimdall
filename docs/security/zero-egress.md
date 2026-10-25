@@ -112,22 +112,27 @@ n'est **pas signée** : elle ne doit pas être comptabilisée comme preuve runti
 avant un artefact CI signé (trace et stdout/stderr attachés au job, piste de
 durcissement hors périmètre #82).
 
-La sortie d'erreur du scan (fd 2) est `heimdall scan: scanner non implémenté
-(voir #22) — refus par défaut.` Le code 2 est le refus fail-closed attendu, pas
-un scan réussi. `unshare --net` a aussi été essayé pour couper le réseau au niveau
-du namespace, mais l'environnement refuse cette opération (`Operation not
-permitted`).
+La sortie d'erreur observée alors était `heimdall scan: scanner non implémenté
+(voir #22) — refus par défaut.` (message depuis remplacé par `commande non
+branchée (voir #29)`, lui-même remplacé par `scan impossible (erreur
+d'outillage)` depuis #29, sans changer le code de sortie). Le code 2 est le
+refus fail-closed attendu, pas un scan réussi. `unshare --net` a aussi été
+essayé pour couper le réseau au niveau du namespace, mais l'environnement
+refuse cette opération (`Operation not permitted`).
 
 ## Limite de la preuve et suite requise
 
-Le scanner #22 n'est pas encore implémenté et la commande CLI s'arrête avant
-tout scan réel. Cette preuve établit donc que le chemin CLI actuel (bloqué) ne
-crée pas de connexion, et que le garde CI bloque les destinations externes ;
-elle **ne prouve pas** qu'un scan opérationnel complet fonctionne hors ligne.
-Après livraison du scanner et de son orchestration, rejouer le test sur un dépôt
-de test, puis capturer la sortie complète de
-`strace -f -e trace=execve,%network,write,writev,sendfile` sous réseau
-effectivement coupé. Le client Ollama est déjà épinglé à
+La commande CLI est désormais branchée (#29) : `heimdall scan` exécute un scan
+réel. La trace archivée ici date du moment où la commande était encore
+bloquée (code 2 avant tout scan) : elle établit que le chemin CLI de l'époque
+ne créait pas de connexion et que le garde CI bloque les destinations
+externes, mais elle **ne prouve pas** qu'un scan opérationnel complet
+fonctionne hors ligne. Depuis #29, le test
+`tests/test_network_isolation.py::test_scan_ci_never_attempts_external_traffic`
+exerce un scan réel sous garde réseau (connexion hors boucle locale
+interceptée et Signalée) : il couvre le chemin opérationnel au niveau
+Python. La trace `strace` attachée à un scan réel reste à rejouer sur le
+runner CI et à archiver. Le client Ollama est déjà épinglé à
 `127.0.0.1:11434`, sans proxy d'environnement ni redirections
 (`heimdall/llm/qualify.py::_loopback_client`).
 

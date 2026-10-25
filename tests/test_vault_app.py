@@ -32,7 +32,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ValidationError
 
-import heimdall.vault.app as vault_app_module
+import heimdall.vault.auth as vault_auth_module
 from heimdall.vault.app import (
     BadRequestError,
     ConflictError,
@@ -583,12 +583,22 @@ class VaultSettingsTests(unittest.TestCase):
             HealthResponse(status="ok", extra="unauthorized")  # type: ignore[call-arg]
 
     def test_forbidden_error_model(self) -> None:
-        """Le modèle ForbiddenError est conforme au contrat d'erreur."""
-        err = ForbiddenError()
+        """Le modèle ForbiddenError est conforme au contrat d'erreur.
+
+        `code` et `message` sont OBLIGATOIRES (aucune valeur par défaut) : le
+        schéma OpenAPI publié doit donc exposer `required: [code, message]`,
+        comme l'exige `openapi.yaml`.
+        """
+        err = ForbiddenError(code="forbidden", message="Accès interdit")
         self.assertEqual(err.code, "forbidden")
         self.assertEqual(err.message, "Accès interdit")
         with self.assertRaises(ValidationError):
             ForbiddenError(extra="unauthorized")  # type: ignore[call-arg]
+        # Sans `code` ni `message` : le modèle refuse (champs obligatoires).
+        with self.assertRaises(ValidationError):
+            ForbiddenError()  # type: ignore[call-arg]
+        with self.assertRaises(ValidationError):
+            ForbiddenError(code="forbidden")  # type: ignore[call-arg]
 
     def test_run_server_is_callable(self) -> None:
         """run_server est défini et appelable comme point d'entrée."""
@@ -614,7 +624,7 @@ class VaultSettingsTests(unittest.TestCase):
             {
                 "host": "127.0.0.1",
                 "port": 8443,
-                # Un seul worker : le backend mémoire est mono-processus (#65).
+                # Un seul worker : le backend mémoire est mono-processus (lot #63).
                 "workers": 1,
                 "ssl_certfile": None,
                 "ssl_keyfile": None,
@@ -873,13 +883,13 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(read_m.value, "secret_val")
 
-        err400 = BadRequestError()
+        err400 = BadRequestError(code="bad_request", message="Requête invalide")
         self.assertEqual(err400.code, "bad_request")
 
-        err404 = NotFoundError()
+        err404 = NotFoundError(code="not_found", message="Ressource introuvable")
         self.assertEqual(err404.code, "not_found")
 
-        err409 = ConflictError()
+        err409 = ConflictError(code="conflict", message="Secret déjà existant")
         self.assertEqual(err409.code, "conflict")
 
     async def test_post_secret_success_201(self) -> None:
@@ -2137,8 +2147,8 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         canary = "CANARY_UNENCODABLE_API_KEY"
         test_app = create_app()
         with patch.object(
-            vault_app_module,
-            "hash_api_key",
+            vault_auth_module,
+            "hash_project_api_key",
             side_effect=ValueError(f"clé invalide : {canary}"),
         ):
             transport = ASGITransport(app=test_app, client=("127.0.0.1", 54321))
@@ -2170,8 +2180,8 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
         lookup_calls: list[str] = []
         db_calls: list[str] = []
-        real_lookup = vault_app_module._find_api_key_project
-        real_db_lookup = vault_app_module._lookup_db_api_key
+        real_lookup = vault_auth_module.find_api_key_project
+        real_db_lookup = vault_auth_module.lookup_db_api_key
 
         def counting_lookup(target_app, provided_hash):
             lookup_calls.append(provided_hash)
@@ -2182,8 +2192,8 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
             return real_db_lookup(db_path, provided_hash)
 
         with patch.object(
-            vault_app_module, "_find_api_key_project", counting_lookup
-        ), patch.object(vault_app_module, "_lookup_db_api_key", counting_db_lookup):
+            vault_auth_module, "find_api_key_project", counting_lookup
+        ), patch.object(vault_auth_module, "lookup_db_api_key", counting_db_lookup):
             transport = ASGITransport(app=scan_app, client=("127.0.0.1", 54321))
             async with AsyncClient(
                 transport=transport,
@@ -2561,7 +2571,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         Aujourd'hui le garde `strip()` refuse déjà ces clés en amont ; `fullmatch`
         lève l'ambiguïté au niveau du motif (défense en profondeur).
         """
-        pattern = vault_app_module._API_KEY_ALPHABET_PATTERN
+        pattern = vault_auth_module.API_KEY_ALPHABET_PATTERN
         # L'ambiguïté documentée : `match` + `$` laisse passer le `\n` final.
         self.assertIsNotNone(pattern.match("abc\n"))
         # Le contrôle effectif ne le laisse plus passer, sans casser le valide.
