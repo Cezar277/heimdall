@@ -302,9 +302,12 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   partielle. Seule la base VCS (`.git/`, `.hg/`, `.svn/`) est élaguée par
   politique ; elle n'est jamais parcourue et le compteur
   `heimdall.scanner.detect.Scanner.vcs_ignored` expose le nombre de bases
-  écartées lors du dernier scan. Le mode arbre ne prétend donc jamais couvrir
-  l'historique : `--staged` couvre le contenu indexé (ce que le commit va
-  contenir), pas les commits déjà écrits.
+  écartées lors du dernier scan. Ce compteur est propagé par la CLI dans
+  `ScanReport.vcs_ignored`, le JSON (`vcs_ignored`) et le résumé `--ci`. Le
+  mode arbre ne prétend donc jamais couvrir l'historique : `--staged` couvre
+  le contenu indexé (ce que le commit va contenir), pas les commits déjà
+  écrits. Un binaire connu est refusé (code 2) dans les deux périmètres : il
+  n'est jamais sauté silencieusement.
   Durcissement post-3ᵉ relecture : **aucun verdict propre partiel**. Les
   compteurs ne sont plus jetés par `scan()`/`find_candidates()` : un fichier
   du périmètre qui n'a pas pu être analysé lève `ScanError` au lieu de rendre
@@ -312,6 +315,10 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   inode) est refusé ; une racine contenant un octet NUL est refusée par
   `ScanError` et non par une `ValueError` nue ; en mode fichier unique, la
   racine parente est re-vérifiée par `lstat` avant lecture (aucun lien suivi).
+  Avant le walk, la racine **et tous ses ancêtres** sont re-`lstat`és, et
+  l'identité `(st_dev, st_ino)` de la racine parcourue doit être celle figée à
+  la construction : un ancêtre symlinké ou un répertoire substitué au même
+  chemin est refusé, jamais lu à la place du périmètre.
   Durcissement post-5ᵉ relecture : un fichier régulier nommé `.git` (gitlink
   de worktree ou de sous-module, `gitdir: …`) n'est **pas** confondu avec le
   répertoire `.git/` : seul un segment **parent** classe un chemin hors
@@ -325,12 +332,18 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   `test_symlinks_are_fail_closed`,
   `test_a_broken_file_in_the_strict_perimeter_is_fail_closed`,
   `test_a_single_file_parent_replaced_by_a_symlink_before_reading_is_fail_closed`,
+  `test_an_ancestor_of_the_root_replaced_by_a_symlink_is_fail_closed`,
+  `test_the_root_replaced_by_another_directory_is_fail_closed`,
+  `test_gitlink_file_is_scanned_vs_vcs_directory_matrix`,
   `test_scanner_does_not_consult_the_deprecated_binary_helper`),
   `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean`
   et la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
   Depuis #29, le contrat 0/1/2 est **exécuté** : `tests/test_cli_scan.py`
   prouve dépôt propre => 0, secret avéré => 1, racine absente => 2, index en
-  conflit => 2, blob trop gros => 2, et **aucune écriture** pendant un scan.
+  conflit => 2, blob trop gros => 2, blob binaire connu => 2, et **aucune
+  écriture** pendant un scan ; `test_scan_tree_reports_the_vcs_skip_in_json_and_ci`
+  prouve que `vcs_ignored` reste observable en bibliothèque, en JSON et en
+  `--ci`.
   Le mode `--staged` analyse les blobs ajoutés ou modifiés de l'index **sans
   aucune exclusion de chemin** (`vendor/`, lockfiles compris) ; le mode arbre
   de travail écarte seulement la base VCS et refuse (2) tout fichier du

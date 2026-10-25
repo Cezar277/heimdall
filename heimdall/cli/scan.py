@@ -108,6 +108,7 @@ _MSG_TOO_MANY_FILES: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_LARGE: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_MANY_FINDINGS: Final[str] = "scan impossible : entrée non analysable"
 _MSG_BLOB_CHANGED: Final[str] = "scan impossible : entrée non analysable"
+_MSG_BINARY: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
@@ -152,12 +153,15 @@ class ScanReport:
     findings: tuple[Finding, ...]
     traces: tuple[AllowlistTrace, ...] = ()
     config_hash: str | None = None
+    vcs_ignored: int = 0
 
     def __post_init__(self) -> None:
         # Garde runtime pour les appelants non typés : le `Literal` protège
         # mypy, cette vérification protège l'exécution (jamais de `KeyError`
         # ni de `TypeError` hors contrat dans `render_text`).
         if not isinstance(self.scope, str) or self.scope not in _SCOPE_LABELS:
+            raise ScanError(_MSG_INVALID_SCOPE)
+        if type(self.vcs_ignored) is not int or self.vcs_ignored < 0:
             raise ScanError(_MSG_INVALID_SCOPE)
 
     @property
@@ -469,9 +473,11 @@ def _collect_tree(
 ) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
-    ``strict=True`` ne conserve que les exclusions **techniques** de #59
-    (binaires, répertoires générés) : ``vendor/``, les lockfiles et les
-    fichiers de contrôle sont parcourus. Un secret y est un secret.
+    ``strict=True`` ne change plus le périmètre : seule la base VCS est
+    écartée (comptée dans :attr:`ScanReport.vcs_ignored`) ; ``vendor/``, les
+    lockfiles et les fichiers de contrôle sont parcourus. Un secret y est un
+    secret. Un fichier binaire connu est refusé (``ScanError``, code 2),
+    comme en ``--staged`` : aucun contenu n'est sauté en silence.
 
     L'allowlist déterministe (#24) écarte les cas évidents (example,
     changeme, dummy, fixtures de test) et produit une trace pour chaque rejet.
@@ -521,6 +527,7 @@ def _collect_tree(
         findings=tuple(findings),
         traces=tuple(traces),
         config_hash=allowlist.sha256,
+        vcs_ignored=scanner.vcs_ignored,
     )
 
 
@@ -549,8 +556,10 @@ def _collect_staged(
 
     Aucune exclusion de chemin : c'est le contenu que le commit va contenir
     qui est jugé, quel que soit son chemin (``vendor/evil.py``,
-    ``package-lock.json``…). Un blob binaire connu est ignoré (rien à
-    analyser) ; un blob illisible ou trop gros est une **erreur** (code 2).
+    ``package-lock.json``…). Un blob binaire connu est **refusé** (code 2),
+    exactement comme un fichier binaire connu en mode arbre : il n'y a pas de
+    texte à analyser, donc aucun verdict propre ne peut être rendu. Un blob
+    illisible ou trop gros est également une **erreur** (code 2).
 
     Les lectures sont adressées par SHA : un ``git add`` concurrent ne peut
     pas corrompre un blob déjà lu, mais la **liste** figée au départ peut
@@ -634,9 +643,11 @@ def _collect_staged(
         # mémoire, pas les 32 Mio du périmètre. `text`, `data` et `target`
         # sont réassignés à chaque tour ; rien ne les accumule.
         if text is None:
-            # Binaire reconnu : aucun texte à analyser. Ce n'est pas une
-            # exclusion de chemin, c'est une impossibilité technique.
-            continue
+            # Binaire reconnu : aucun texte à analyser. Contrairement à une
+            # exclusion de chemin, ce n'est pas une raison de rendre un
+            # verdict propre : un secret peut vivre dans le binaire (même
+            # limite qu'en mode arbre). Refus fail-closed, code 2.
+            raise ScanError(_MSG_BINARY)
         # `FileTarget` valide le chemin (contrat #14) : un chemin que le
         # contrat ne sait pas représenter est une erreur, pas un fichier
         # ignoré en silence.
@@ -680,8 +691,9 @@ def render_json(report: ScanReport) -> str:
 
     Le document contient le périmètre, le nombre de Findings et les Findings
     eux-mêmes (les sept champs du contrat #14), ainsi que le nombre de
-    findings ignorés et les traces de chaque rejet par l'allowlist (#24).
-    Aucun secret n'est inclus.
+    findings ignorés et les traces de chaque rejet par l'allowlist (#24), et
+    le nombre de bases VCS élaguées (``vcs_ignored``, toujours 0 en
+    ``--staged``). Aucun secret n'est inclus.
     """
     payload = {
         "schema": JSON_SCHEMA,
@@ -691,6 +703,7 @@ def render_json(report: ScanReport) -> str:
         "ignored_count": report.ignored_count,
         "traces": [trace.as_dict() for trace in report.traces],
         "config_hash": report.config_hash,
+        "vcs_ignored": report.vcs_ignored,
     }
     return json.dumps(
         payload,
@@ -746,6 +759,12 @@ def render_text(report: ScanReport) -> str:
         lines.append(f"Allowlist : {report.ignored_count} finding(s) ignoré(s) :")
         for trace in report.traces:
             lines.append(f"  {_visible(trace.file)}:{trace.line}  règle={trace.rule}")
+    # L'élagage VCS est une politique, pas un résultat : l'afficher évite de
+    # lire un « aucun secret » comme une couverture de l'historique.
+    lines.append(
+        f"Base VCS : {report.vcs_ignored} base(s) élaguée(s) "
+        "(historique non parcouru)."
+    )
     lines.append(_CODES_LINE)
     return "\n".join(lines)
 

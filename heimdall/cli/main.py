@@ -163,7 +163,8 @@ def scan(  # noqa: PLR0913, PLR0917
             typer.echo(render_text(report))
         if ci:
             # Résumé déterministe sur stderr : le journal CI montre toujours
-            # le verdict, le nombre de findings ignorés et l'empreinte sha256 de config.
+            # le verdict, les findings ignorés, l'empreinte sha256 de config
+            # et les bases VCS élaguées (jamais présentées comme analysées).
             hash_info = (
                 f" (config sha256:{report.config_hash})"
                 if report.config_hash
@@ -172,7 +173,8 @@ def scan(  # noqa: PLR0913, PLR0917
             typer.echo(
                 f"heimdall scan : périmètre {report.scope}, "
                 f"{len(report.findings)} secret(s) détecté(s), "
-                f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}.",
+                f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}, "
+                f"{report.vcs_ignored} base(s) VCS élaguée(s).",
                 err=True,
             )
     except (ScanError, ToolFailure):

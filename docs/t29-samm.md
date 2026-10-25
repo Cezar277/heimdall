@@ -310,9 +310,9 @@ par candidat désactivé) : chacun est attrapé par au moins un test.
 - Aucun répertoire de **contenu** n'est exclu : `node_modules/`, `vendor/`,
   `.venv/`, les caches et les sorties de build textuelles (`build/`, `dist/`,
   `target/`) sont scannés en strict comme en `--staged`. Seule la base VCS est
-  hors du périmètre de l'arbre. Un **binaire** reste non analysable : en
-  arbre, il est tracé et le verdict propre est refusé (code 2) ; en
-  `--staged`, un blob binaire connu est sauté (limite documentée).
+  hors du périmètre de l'arbre. Un **binaire** reste non analysable : dans
+  **les deux périmètres**, il est refusé et le verdict propre est impossible
+  (code 2).
 - `--staged` analyse l'index, pas l'historique : un secret déjà commité n'est
   pas re-détecté par ce mode.
 - La trace `strace` d'un scan opérationnel reste à archiver côté CI
@@ -348,3 +348,18 @@ par candidat désactivé) : chacun est attrapé par au moins un test.
   lignes ci-dessus avec le lien de la PR et le SHA final du squash/merge
   (**re-pinner les permaliens sur ce SHA final** si le squash crée un SHA
   neuf).
+
+## Correctifs de la dix-septième revue (run 40220479006, APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge
+avec `python scripts/repin_samm.py --sha <sha-squash> --fiche docs/t29-samm.md`,
+puis contrôlés par `--check` (script confiné et atomique, cf.
+`tests/security/test_samm_permalinks.py`).
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| MEDIUM — un blob binaire connu était sauté en `--staged` (un `0` pouvait masquer un secret dans un PNG/ZIP), alors que l'arbre refuse en 2 | `_collect_staged` lève `ScanError` dès que `decode_text` rend `None` : binaire connu = verdict propre impossible, code 2, comme en arbre. Docs `cli.md`/`scanner.md`/`requirements.md` alignées ; plus aucune limite « binaire sauté » | `heimdall/cli/scan.py` (`_collect_staged`, `_MSG_BINARY`), `tests/test_cli_scan.py::test_scan_staged_refuses_a_binary_blob` |
+| MEDIUM — `vcs_ignored` visible en bibliothèque mais pas dans la CLI | `ScanReport.vcs_ignored` (défaut 0, validé au runtime), propagé par `_collect_tree`, rendu dans le JSON (`schemas/scan.schema.json`) et rappelé sur stderr en `--ci` ; affiché aussi dans le rapport humain | `heimdall/cli/scan.py` (`ScanReport`, `render_json`, `render_text`), `heimdall/cli/main.py`, `tests/test_cli_scan.py::test_scan_tree_reports_the_vcs_skip_in_json_and_ci` |
+| LOW — `_recheck_root` ne contrôlait que le dernier segment | chaque composant (`root` + `parents`) est re-`lstat` ; un ancêtre symlinké est refusé avant `os.walk`. L'identité `(st_dev, st_ino)` de la racine parcourue est figée puis comparée, ce qui refuse aussi un répertoire substitué sans lien | `heimdall/scanner/detect.py` (`__init__`, `_recheck_root`), `tests/test_scanner_detect.py::test_an_ancestor_of_the_root_replaced_by_a_symlink_is_fail_closed`, `::test_the_root_replaced_by_another_directory_is_fail_closed` |
+| LOW — branche `est_chemin_hors_perimetre` inatteignable via `walk` | commentaire de défense en profondeur ajouté ; la matrice est figée par test (fichier `.git` lu, `a/.git/b.txt` hors périmètre) | `heimdall/scanner/detect.py` (`_iter_files`), `tests/test_scanner_detect.py::test_gitlink_file_is_scanned_vs_vcs_directory_matrix` |
+| LOW — `Perimetre.STRICT` sans second comportement | enum supprimé : `est_base_vcs(name) -> bool` est la seule décision de périmètre par nom, `est_chemin_hors_perimetre` n'examine que les parents. Aucun régime ambigu ne subsiste | `heimdall/scanner/exclusions.py`, `tests/test_scanner_detect.py::test_gitlink_file_is_scanned_vs_vcs_directory_matrix` |

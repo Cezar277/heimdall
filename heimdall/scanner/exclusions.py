@@ -6,14 +6,16 @@ nominale est un contournement trivial : il suffit de renommer le fichier
 secret ne soit ni signalé ni refusé. Le **contenu** décide :
 
 - un fichier **textuel** est décodé puis scanné ;
-- un contenu non décodable lève ``ScanError`` : il n'est jamais ignoré
-  silencieusement.
+- un contenu non décodable lève ``ScanError`` ; un binaire **connu** est
+  reconnu comme non textuel (``None``) et le scanner le refuse en
+  ``ScanError`` : il n'est jamais ignoré silencieusement.
 
 Dans le scanner, seule la base VCS (``.git/``, ``.hg/``, ``.svn/``) est
 écartée : ce n'est pas le contenu du dépôt. Aucune exclusion nominale n'est
 appliquée : le nom d'un fichier ne décide jamais du périmètre, c'est le
-**contenu** qui décide (voir ``classer_repertoire`` / ``classer_chemin`` et
-``decode_text``). Une exclusion nominale serait un contournement trivial.
+**contenu** qui décide (voir ``est_base_vcs`` /
+``est_chemin_hors_perimetre`` et ``decode_text``). Une exclusion nominale
+serait un contournement trivial.
 
 Les fichiers texte UTF-8, UTF-16 et UTF-32 (avec ou sans BOM) sont décodés et
 scannés. Le contenu n'est jamais exécuté.
@@ -22,55 +24,38 @@ scannés. Le contenu n'est jamais exécuté.
 from __future__ import annotations
 
 import codecs
-import enum
 from pathlib import PurePosixPath
 from typing import Final
 
 from heimdall.scanner.errors import ScanError
 
-
-class Perimetre(enum.Enum):
-    """Régime de périmètre d'un chemin (#59).
-
-    Seule la base VCS est écartée ; tout le reste est scanné.
-    """
-
-    STRICT = "strict"
-    HORS_PERIMETRE = "hors_perimetre"
-
-
 #: Base VCS : ce n'est pas le contenu du dépôt, elle n'est pas parcourue.
 ARBRES_HORS_PERIMETRE: Final[frozenset[str]] = frozenset({".git", ".hg", ".svn"})
 
 
-def classer_repertoire(name: str) -> Perimetre:
-    """Régime de périmètre d'un répertoire, d'après son nom (casse ignorée).
+def est_base_vcs(name: str) -> bool:
+    """Vrai si ``name`` désigne une base VCS (casse ignorée).
 
-    Seule la base VCS est écartée ; le nom ne dispense jamais de lire un
-    fichier.
+    Seule la base VCS est écartée ; ce prédicat est la **seule** décision de
+    périmètre par nom du scanner. Tous les autres noms sont parcourus, quel
+    que soit leur contenu.
     """
-    folded = name.casefold()
-    if folded in ARBRES_HORS_PERIMETRE:
-        return Perimetre.HORS_PERIMETRE
-    return Perimetre.STRICT
+    return name.casefold() in ARBRES_HORS_PERIMETRE
 
 
-def classer_chemin(relative_path: str | PurePosixPath) -> Perimetre:
-    """Régime de périmètre d'un chemin relatif (segments **parents**).
+def est_chemin_hors_perimetre(relative_path: str | PurePosixPath) -> bool:
+    """Vrai si un **parent** du chemin relatif est une base VCS.
 
     Seuls les répertoires parents décident : le dernier segment est un
     **fichier**, pas une base VCS. Un fichier régulier nommé ``.git`` est un
     gitlink légitime (worktree, sous-module : ``gitdir: …``) : il est lu
     comme n'importe quel contenu, jamais confondu avec le répertoire
-    ``.git/`` qui, lui, est élagué par :func:`classer_repertoire`.
+    ``.git/`` qui, lui, est élagué par :func:`est_base_vcs`.
     """
     path = (
         relative_path if isinstance(relative_path, PurePosixPath) else PurePosixPath(relative_path)
     )
-    for part in path.parts[:-1]:
-        if classer_repertoire(part) is Perimetre.HORS_PERIMETRE:
-            return Perimetre.HORS_PERIMETRE
-    return Perimetre.STRICT
+    return any(est_base_vcs(part) for part in path.parts[:-1])
 
 
 _TEXT_RATIO_MIN: Final[float] = 0.95
@@ -82,9 +67,10 @@ _HIGH_BIT: Final[int] = 0x80
 _TEXT_BYTES: Final[frozenset[int]] = frozenset({0x09, 0x0A, 0x0D})
 _DECODE_ERROR: Final[str] = "scan impossible : entrée non analysable"
 
-# Signatures fortes de formats binaires connus. Un fichier sans extension qui
-# porte l'une d'elles est ignoré par politique ; les autres contenus NUL non
-# décodables lèvent ``ScanError`` (fail-closed).
+# Signatures fortes de formats binaires connus. Un contenu qui porte l'une
+# d'elles ET reste majoritairement binaire est reconnu comme non textuel par
+# ``decode_text`` (retour ``None``) : le scanner d'arbre et la CLI ``--staged``
+# le refusent alors en ``ScanError`` (fail-closed), jamais un skip silencieux.
 _BINARY_MAGIC: Final[tuple[bytes, ...]] = (
     b"\x7fELF",
     b"\x89PNG\r\n\x1a\n",
@@ -226,9 +212,9 @@ def decode_text(data: bytes) -> str | None:
     - BOM UTF-8/UTF-16/UTF-32 : décodage strict ;
     - UTF-16/UTF-32 sans BOM : heuristique bornée, jamais de remplacement ;
     - UTF-8 invalide sans NUL : ScanError statique (#23) ;
-    - signature binaire **et** contenu majoritairement binaire : ignoré par
-      politique (une simple signature suivie de texte clair ne suffit pas :
-      ce serait un contournement) ;
+    - signature binaire **et** contenu majoritairement binaire : reconnu
+      comme non textuel (``None``), l'appelant le refuse (une simple signature
+      suivie de texte clair ne suffit pas : ce serait un contournement) ;
     - NUL sans décodage possible : ``ScanError``.
 
     Le nom du fichier n'intervient jamais : un ``evil.png`` dont le contenu

@@ -44,10 +44,9 @@ from heimdall.scanner.entropy_detection import (
 )
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import (
-    Perimetre,
-    classer_chemin,
-    classer_repertoire,
     decode_text,
+    est_base_vcs,
+    est_chemin_hors_perimetre,
 )
 from heimdall.scanner.finding import (
     MAX_PATH_LENGTH,
@@ -173,6 +172,7 @@ class Scanner:
         "_max_files",
         "_max_findings",
         "_root",
+        "_root_id",
         "_single",
         "_strict",
         "_traces",
@@ -197,14 +197,28 @@ class Scanner:
         self._max_bytes = _checked_bound(max_bytes, MAX_TOTAL_BYTES)
         self._max_findings = _checked_bound(max_findings, MAX_FINDINGS)
         resolved = _resolve_root(root)
-        if resolved.is_dir():
+        try:
+            resolved_stat = os.lstat(resolved)
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+        if stat.S_ISDIR(resolved_stat.st_mode):
             self._root = resolved
             self._single: Path | None = None
-        elif resolved.is_file():
+        elif stat.S_ISREG(resolved_stat.st_mode):
             self._root = resolved.parent
             self._single = resolved
         else:
             raise ScanError(_SCAN_ERROR)
+        # Identité de la racine **effectivement parcourue** (le parent en mode
+        # fichier unique), figée à la construction : `_recheck_root` refuse
+        # qu'elle soit remplacée par un autre répertoire au même chemin.
+        try:
+            root_stat = os.lstat(self._root)
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise ScanError(_SCAN_ERROR)
+        self._root_id = (root_stat.st_dev, root_stat.st_ino)
         self._hasher = SnippetHasher() if hasher is None else hasher
         if not isinstance(entropy_config, EntropyConfig):
             raise ValueError("configuration d'entropie invalide")
@@ -234,17 +248,26 @@ class Scanner:
         return self._vcs_ignored
 
     def _recheck_root(self) -> None:
-        """Re-vérifie la racine par ``lstat`` avant toute lecture.
+        """Re-vérifie la racine **et ses ancêtres** par ``lstat`` avant lecture.
 
         Entre ``__init__`` et le scan, la racine (ou son parent en mode
-        fichier unique) peut avoir été remplacée par un lien symbolique. Le
-        re-contrôle refuse ce remplacement au lieu de suivre la cible.
+        fichier unique) peut avoir été remplacée par un lien symbolique. Un
+        ancêtre remplacé par un lien détournerait aussi le chemin : chaque
+        composant est donc contrôlé, pas seulement le dernier. L'identité
+        ``(st_dev, st_ino)`` de la racine parcourue est en plus comparée à
+        celle figée à la construction, pour refuser un répertoire substitué
+        au même chemin même sans lien symbolique.
         """
         try:
+            for candidate in (self._root, *self._root.parents):
+                if stat.S_ISLNK(os.lstat(candidate).st_mode):
+                    raise ScanError(_SCAN_ERROR)
             root_stat = os.lstat(self._root)
         except OSError:
             raise ScanError(_SCAN_ERROR) from None
         if not stat.S_ISDIR(root_stat.st_mode):
+            raise ScanError(_SCAN_ERROR)
+        if (root_stat.st_dev, root_stat.st_ino) != self._root_id:
             raise ScanError(_SCAN_ERROR)
 
     def scan(self, *, deadline: float | None = None) -> list[Finding]:
@@ -338,7 +361,7 @@ class Scanner:
                 # n'est pas le contenu du dépôt et son historique n'est jamais
                 # scanné par l'arbre, par design (ce n'est pas un échec de
                 # lecture : elle est élaguée sans ScanError).
-                if classer_repertoire(name) is Perimetre.HORS_PERIMETRE:
+                if est_base_vcs(name):
                     # L'élagage est une politique, pas un échec de lecture :
                     # il est compté pour que l'appelant distingue « aucune
                     # base VCS » de « base VCS non parcourue ». Aucun chemin
@@ -360,8 +383,11 @@ class Scanner:
                 # un fichier régulier nommé `.git` (gitlink) n'est donc pas
                 # classé hors périmètre et sera lu comme tout autre fichier.
                 # Un chemin qui mènerait encore dans une base VCS est refusé,
-                # jamais sauté silencieusement.
-                if classer_chemin(relative) is Perimetre.HORS_PERIMETRE:
+                # jamais sauté silencieusement. Défense en profondeur : ce
+                # chemin est inatteignable via `os.walk` (le répertoire VCS
+                # n'est jamais émis) ; la branche protège tout futur appelant
+                # qui fournirait directement un chemin.
+                if est_chemin_hors_perimetre(relative):
                     raise ScanError(_SCAN_ERROR)
                 if not _not_link(path):
                     raise ScanError(_SCAN_ERROR)

@@ -26,6 +26,10 @@ findings = scanner.scan()
 bases_vcs_ignorees: int = scanner.vcs_ignored
 ```
 
+La CLI propage ce compteur dans `ScanReport.vcs_ignored`, le champ
+`vcs_ignored` du JSON `--json` et le résumé `--ci` sur stderr (voir
+[cli.md](cli.md)).
+
 Le scanner d'arbre est `heimdall.scanner.detect.Scanner` (alias
 `TreeScanner` ci-dessus) : c'est lui qui porte `vcs_ignored` et les bornes de
 parcours. `heimdall.scanner.Scanner` est une autre surface, la **façade de
@@ -38,7 +42,11 @@ résolu une fois, **sans suivre de lien symbolique** : la racine elle-même et
 chacun de ses ancêtres sont vérifiés par `lstat`, et un lien dans ce chemin
 lève `ScanError` (la cible n'est pas lue à la place de la racine). Chaque
 fichier est ensuite revérifié à l'usage (identité du descripteur, chemin résolu
-sous la racine, refus des liens symboliques).
+sous la racine, refus des liens symboliques). La racine parcourue est
+re-contrôlée avant le walk, **ancêtres compris**, et son identité
+(`st_dev`, `st_ino`) doit être celle figée à la construction : un ancêtre
+remplacé par un lien ou un répertoire substitué au même chemin est refusé
+avant toute lecture.
 
 Un Finding contient exactement : `file`, `line`, `type`, `entropy`,
 `snippet_hash`, `status` (`detecte`) et `source` (`regex` ou `entropy`). **La valeur brute
@@ -129,7 +137,7 @@ Les fichiers texte sont décodés, pas ignorés :
 | UTF-8 (avec ou sans BOM) | décodage strict ; octet invalide → `ScanError` (#23) |
 | UTF-16 / UTF-32 avec BOM | décodage strict, fichier scanné |
 | UTF-16 / UTF-32 sans BOM | heuristique bornée (proportion ASCII puis caractères imprimables), fichier scanné |
-| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | `ScanError` en mode arbre (binaire connu, jamais un skip silencieux) ; blob sauté en `--staged` |
+| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | `ScanError` (binaire connu, jamais un skip silencieux) en arbre **comme** en `--staged` |
 | signature binaire suivie de texte clair | `ScanError` (fail-closed) |
 | contenu NUL non décodable | `ScanError` (fail-closed) |
 
@@ -203,10 +211,9 @@ jamais 0 ni 1.
   deux valeurs encodées sont détectées par entropie, sans décodage :
   rappel 0,75 sur `all`, 1,0 sur `core`. L'allowlist relève de #24.
 - Les fichiers binaires connus ne sont pas analysés : un secret placé dans un
-  binaire reste un faux négatif. En mode arbre, le scanner **refuse** le
-  fichier (`ScanError`, code 2 pour la CLI) au lieu de l'ignorer
-  silencieusement ; en `--staged`, le blob binaire connu est sauté (limite
-  documentée dans [cli.md](cli.md)). Les répertoires et fichiers textuels de
+  binaire reste un faux négatif. Dans **les deux périmètres**, le scanner
+  **refuse** le fichier ou le blob (`ScanError`, code 2 pour la CLI) au lieu
+  de l'ignorer silencieusement. Les répertoires et fichiers textuels de
   `node_modules/`, `vendor/`, `.venv/`, `build/`, `dist/`, `target/` ou
   `htmlcov/` sont, eux, scannés dans les deux périmètres : aucun nom de
   fichier ou de répertoire de contenu n'exclut plus rien. Seule la base VCS

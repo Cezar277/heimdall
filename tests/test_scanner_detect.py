@@ -35,7 +35,11 @@ from heimdall.scanner.detect import (
     scan,
 )
 from heimdall.scanner.entropy import shannon_entropy
-from heimdall.scanner.exclusions import decode_text
+from heimdall.scanner.exclusions import (
+    decode_text,
+    est_base_vcs,
+    est_chemin_hors_perimetre,
+)
 from heimdall.scanner.finding import validate_relative_path
 from heimdall.scanner.hashing import KEY_ENV, KEY_FILE_ENV, SnippetHasher, load_local_key
 from heimdall.scanner.signatures import SIGNATURES, find_signature_matches
@@ -616,6 +620,31 @@ def test_scanner_does_not_consult_the_deprecated_binary_helper(
         scan(tmp_path)
 
 
+def test_gitlink_file_is_scanned_vs_vcs_directory_matrix(tmp_path: Path) -> None:
+    """Revue (LOW) : la décision de périmètre est un prédicat booléen figé.
+
+    ``est_base_vcs`` ne classe que les **répertoires** VCS. Un fichier
+    régulier ``.git`` (gitlink) n'est jamais hors périmètre, seul un segment
+    **parent** ``.git/`` l'est. La matrice est explicite pour qu'aucun futur
+    appelant ne réintroduise un régime ambigu.
+    """
+    assert est_base_vcs(".git") is True
+    assert est_base_vcs(".GIT") is True
+    assert est_base_vcs(".hg") is True
+    assert est_base_vcs(".svn") is True
+    assert est_base_vcs("vendor") is False
+    assert est_base_vcs(".gitignore") is False
+
+    assert est_chemin_hors_perimetre(".git") is False
+    assert est_chemin_hors_perimetre("a/.git") is False
+    assert est_chemin_hors_perimetre("a/.git/b.txt") is True
+    assert est_chemin_hors_perimetre("vendor/secret.txt") is False
+
+    _write(tmp_path, ".git", "gitdir: ../.git/worktrees/example\n")
+    _write(tmp_path, "clean.txt", "x = 1\n")
+    assert scan(tmp_path) == []
+
+
 def test_the_vcs_database_is_not_walked(tmp_path: Path) -> None:
     """``.git/`` n'est pas le contenu du dépôt : il n'est pas parcouru."""
     _write(tmp_path, ".git/config", f'AWS = "{_aws("git")}"')
@@ -912,6 +941,61 @@ def test_symlinked_root_is_refused(tmp_path: Path) -> None:
         raise
     with pytest.raises(ScanError):
         scan(link)
+
+
+def test_an_ancestor_of_the_root_replaced_by_a_symlink_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un ancêtre remplacé par un lien est refusé avant le walk.
+
+    Le re-``lstat`` du seul dernier segment suivrait un ancêtre symlinké et
+    verrait le répertoire cible. Chaque composant du chemin est donc
+    re-contrôlé ; le test interdit ``os.walk`` pour prouver que le refus
+    intervient avant tout parcours hors racine.
+    """
+    outside = tmp_path / "outside"
+    (outside / "repo").mkdir(parents=True)
+    _write(outside / "repo", "leak.py", f'AWS = "{_aws("outside")}"')
+    parent = tmp_path / "parent"
+    repository = parent / "repo"
+    repository.mkdir(parents=True)
+    _write(repository, "app.py", "x = 1\n")
+    scanner = Scanner(repository)
+    parent.rename(tmp_path / "parent.original")
+    try:
+        parent.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Création de liens symboliques non autorisée sous Windows")
+        raise
+
+    def forbidden_walk(*args: object, **kwargs: object) -> object:
+        raise AssertionError("os.walk ne doit pas suivre un ancêtre remplacé")
+
+    monkeypatch.setattr("heimdall.scanner.detect.os.walk", forbidden_walk)
+    with pytest.raises(ScanError):
+        scanner.scan()
+
+
+def test_the_root_replaced_by_another_directory_is_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """Revue (LOW) : l'identité de la racine figée détecte un sosie.
+
+    Remplacer la racine par un autre répertoire au même chemin (sans lien)
+    change ``st_dev``/``st_ino`` : le scan refuse au lieu de lire un
+    périmètre substitué.
+    """
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _write(repository, "app.py", "x = 1\n")
+    scanner = Scanner(repository)
+    repository.rename(tmp_path / "repo.original")
+    repository.mkdir()
+    _write(repository, "other.py", f'AWS = "{_aws("substitute")}"')
+
+    with pytest.raises(ScanError):
+        scanner.scan()
 
 
 def test_symlinked_single_file_root_is_refused(tmp_path: Path) -> None:

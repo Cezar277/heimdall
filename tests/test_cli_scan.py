@@ -39,9 +39,11 @@ from heimdall.cli.scan import (
     JSON_SCHEMA,
     ScanReport,
     _verify_root_unchanged,
+    collect,
 )
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess, StagedChange, parse_staged_raw
+from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.errors import ScanError
@@ -326,6 +328,13 @@ def test_scan_report_refuses_an_unknown_scope(bad_scope: object) -> None:
         ScanReport(scope=bad_scope, findings=())  # type: ignore[arg-type]
 
 
+def test_scan_report_refuses_an_invalid_vcs_ignored_count() -> None:
+    """Le champ ``vcs_ignored`` reste un entier positif ou nul au runtime."""
+    for invalid in (-1, True, 1.0, "1"):
+        with pytest.raises(ScanError):
+            ScanReport(scope="working-tree", findings=(), vcs_ignored=invalid)  # type: ignore[arg-type]
+
+
 def test_scan_broken_stderr_still_exits_two(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -415,6 +424,7 @@ def test_collect_tree_uses_the_pinned_root(
         def __init__(self, root: Path, *, strict: bool, **kwargs: object) -> None:
             seen.append((Path(root), strict))
             self.traces: tuple[object, ...] = ()
+            self.vcs_ignored = 0
 
         def scan(self, *, deadline: float | None = None) -> list[object]:
             assert deadline is not None
@@ -511,6 +521,40 @@ def test_scan_tree_strict_scans_build_outputs(tmp_path: Path) -> None:
     for chemin in contenu:
         assert f"{chemin}:1" in resultat.stdout
     assert FAKE_AWS_KEY not in resultat.output
+
+
+def test_scan_tree_reports_the_vcs_skip_in_json_and_ci(tmp_path: Path) -> None:
+    """Revue (MEDIUM) : ``vcs_ignored`` est observable jusqu'à la CLI.
+
+    Un dépôt dont le seul contenu caché est sa base VCS rend ``[]`` : le
+    rapport doit dire combien de bases ont été élaguées, en bibliothèque, en
+    JSON et dans le résumé ``--ci``. Un ``[]`` ne doit jamais être lu comme
+    « historique propre ».
+    """
+    racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
+    (racine / ".git" / "config-secret").write_text(
+        f'AWS = "{FAKE_AWS_KEY}"\n', encoding="utf-8"
+    )
+
+    report = collect(racine, staged=False, allowlist=Allowlist.empty())
+    assert report.findings == ()
+    assert report.vcs_ignored == 1
+
+    resultat_json = _run("scan", "--json", "--no-allowlist", str(racine))
+    assert resultat_json.exit_code == EXIT_CLEAN
+    document = json.loads(resultat_json.stdout)
+    assert document["vcs_ignored"] == 1
+    _validate_scan_document(document)
+
+    resultat_ci = _run("scan", "--ci", "--no-allowlist", str(racine))
+    assert resultat_ci.exit_code == EXIT_CLEAN
+    assert "1 base(s) VCS élaguée(s)" in resultat_ci.stderr
+    assert FAKE_AWS_KEY not in resultat_ci.output
+
+    resultat_texte = _run("scan", "--no-allowlist", str(racine))
+    assert resultat_texte.exit_code == EXIT_CLEAN
+    assert "Base VCS : 1 base(s) élaguée(s)" in resultat_texte.stdout
+    assert FAKE_AWS_KEY not in resultat_texte.output
 
 
 def test_scan_tree_strict_scans_text_with_binary_suffix(git_repo: GitRepo) -> None:
@@ -752,13 +796,19 @@ def test_scan_staged_caps_blob_bytes_before_buffering(
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
-def test_scan_staged_skips_a_binary_blob(git_repo: GitRepo) -> None:
-    """Un blob binaire n'a rien à analyser : il est ignoré, pas une erreur."""
+def test_scan_staged_refuses_a_binary_blob(git_repo: GitRepo) -> None:
+    """Un blob binaire est refusé (code 2), comme un fichier binaire en arbre.
+
+    Un secret placé dans un commentaire PNG/ZIP ne doit jamais produire un
+    verdict propre : sans texte analysable, le blob est une erreur
+    d'outillage, pas un skip silencieux.
+    """
     git_repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 512)
     git_repo.write("app.py", "x = 1\n")
     git_repo.stage("image.png", "app.py")
     resultat = _run("scan", "--staged", str(git_repo.root))
-    assert resultat.exit_code == EXIT_CLEAN
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
 def test_scan_staged_skips_a_staged_gitlink(git_repo: GitRepo) -> None:
@@ -1717,6 +1767,7 @@ def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
         "ignored_count",
         "traces",
         "config_hash",
+        "vcs_ignored",
     }
 
 
@@ -1739,6 +1790,7 @@ def test_scan_schema_refuses_invalid_documents() -> None:
         "ignored_count": 0,
         "traces": [],
         "config_hash": None,
+        "vcs_ignored": 0,
     }
     assert validator.is_valid(base)
     for invalide in (
@@ -1748,6 +1800,8 @@ def test_scan_schema_refuses_invalid_documents() -> None:
         dict(base, count=-1),
         dict(base, findings=[{"file": "x.py"}]),  # Finding incomplet
         dict(base, extra=True),  # contrat fermé
+        dict(base, vcs_ignored=-1),
+        dict(base, vcs_ignored="1"),
     ):
         assert not validator.is_valid(invalide), invalide
     # `count` cohérent avec `findings` : inexprimable en JSON Schema pur,
