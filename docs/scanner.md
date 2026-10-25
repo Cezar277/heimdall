@@ -3,8 +3,8 @@
 Statut : livré par le ticket #22 (sous-tickets #53 interface/Finding, #54
 signatures, #59 exclusions, #60 tests). Contrat de sortie : [Finding v1](contracts/finding.md)
 et [`schemas/finding.schema.json`](../schemas/finding.schema.json). La commande
-CLI `heimdall scan` sera branchée par #29 ; le scanner est déjà utilisable comme
-bibliothèque et par les tests d'acceptation T21.
+CLI `heimdall scan` est branchée par #29 (voir [cli.md](cli.md)) ; le scanner
+est aussi utilisable comme bibliothèque et par les tests d'acceptation T21.
 
 ## API
 
@@ -25,6 +25,10 @@ findings: list[Finding] = scanner.scan()     # fail-closed : ScanError si incomp
 rapport: RapportScan = scanner.analyser()     # Findings + ce qui n'a pas été lu
 strict: RapportScan = scanner.analyser_complet()  # refuse un rapport incomplet
 payload: list[dict[str, object]] = find_candidates(".")  # contrat #14
+
+# Mode CLI (#29) : base VCS hors périmètre, mais tout le contenu décide.
+# scan_complet() refuse un rapport incomplet (binaire, lien, illisible).
+findings_ci: list[Finding] = Scanner(".", strict=True).scan_complet()
 ```
 
 `ScannerRacine` accepte un répertoire ou un fichier régulier explicite. `root` est
@@ -210,6 +214,28 @@ environnements virtuels connus sont des arbres de tiers, et ils sont lus.
 `.pem`/`.key` sont scannés. Les mocks de `tests/` ne sont **pas** exclus
 globalement : ils font partie du corpus de non-régression T21.
 
+### Mode strict de la CLI (#29)
+
+Le mode `strict=True` est le mode **arbre de travail** de `heimdall scan`. Il
+n'ajoute ni ne retire aucune exclusion de **contenu** : `vendor/`,
+`node_modules/`, `third_party/`, les sorties de build, les lockfiles et les
+fichiers de contrôle sont parcourus, et le contenu décide. La seule différence
+avec le mode bibliothèque est la **base VCS** (`.git/`, `.hg/`, `.svn/`) :
+métadonnées et objets compressés, hors du contenu audité, elle est écartée
+sans être comptée comme une lacune. Sans cela, aucun dépôt Git ne pourrait
+rendre un verdict propre.
+
+La CLI consomme `scan_complet()` : un rapport incomplet (binaire, lien
+symbolique, fichier illisible) devient une erreur d'outillage (code 2), jamais
+un « 0 secret » trompeur. Le mode `--staged` analyse les blobs de l'index sans
+aucune exclusion de chemin.
+
+L'extension binaire ne prime jamais sur le contenu : un fichier texte nommé
+`evil.png` est lu et scanné. Un vrai binaire reste ignoré par sa signature
+**connue** (magie + majorité binaire) et rend le rapport incomplet. Un binaire
+inconnu (NUL + texte) reste fail-closed : le suffixe ne convertit jamais un
+doute en skip silencieux.
+
 ### Encodage des fichiers lus
 
 Les fichiers texte sont décodés, pas ignorés :
@@ -246,6 +272,9 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | fichier modifié pendant la lecture | `ScanError` (tracé dans un arbre de tiers) |
 | fichier **tronqué ou réécrit entre le `stat` et l'`open`** (même inode) | `ScanError` (tracé dans un arbre de tiers) — la lecture ne porterait que sur un préfixe |
 | nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` (tracé dans un arbre de tiers) |
+| plus de 50 000 fichiers, ou plus de 256 Mio lus au total | `ScanError` (bornes #29) |
+| borne explicite `max_files`/`max_bytes`/`max_findings` hors de `1..plafond` | `ValueError` à la construction (surcharge jamais silencieuse) |
+| deadline globale dépassée (option `deadline`, CLI) | `ScanError` (le scan ne rend pas de verdict partiel) |
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
 | clé HMAC demandée avec `..` dans le chemin | `ScanError` |
 | contenu NUL non décodable (hors binaire réellement binaire) | `ScanError` (tracé dans un arbre de tiers) |
@@ -257,26 +286,30 @@ Toute situation non analysable lève `ScanError` avec un message statique
 
 Un scan incomplet ne devient donc jamais une liste vide ou partielle : dans un
 arbre de tiers, un fichier non analysable est tracé **et** compté, et
-`scan()`/`find_candidates()` lèvent `ScanError` au lieu de rendre une liste
-qui laisserait croire à un dépôt propre. Seul `scan_rapport()` rend un bilan
-partiel, avec ses compteurs. Quand
-#29 branchera la CLI, `ScanError` devra produire le code 2 (erreur d'outillage),
-jamais 0 ou 1.
+`scan()`/`find_candidates()` lèvent `ScanError` si un fichier du périmètre
+strict n'a pas pu être analysé. Seul `scan_rapport()` rend un bilan avec ses
+compteurs ; il ne doit pas être confondu avec un verdict propre.
+
+Depuis #29, la CLI est branchée : `ScanError` produit le code 2 (erreur
+d'outillage), jamais 0 ni 1. Le mode arbre de la CLI utilise
+`ScannerRacine(..., strict=True).scan_complet()` : la base VCS est hors du
+périmètre audité (métadonnées), tout le reste est lu par contenu, et un
+rapport incomplet (binaire, lien, fichier illisible) **refuse** le verdict
+propre. Le mode `--staged` analyse les blobs de l'index sans exclusion de
+chemin.
 
 > **Garde d'usage (hook/CI) :** ne pas utiliser `scan()` ni
 > `find_candidates()` tels quels pour un hook ou une CI. Ces deux API lèvent
-> `ScanError` dès qu'un fichier n'a pas pu être analysé, mais elles ne
-> disent rien de ce qui a été **laissé de côté** : un `[]` sur dépôt complet
-> peut masquer un secret contenu dans un **binaire** (contenu non lu, tracé
-> mais pas signalé) ou coupé au-delà de la fenêtre 4 Kio. Un `ScanIncomplet`
-> est émis dans ce cas : le misuse est visible, mais il reste au lecteur.
+> `ScanError` dès qu'un fichier du périmètre strict n'a pas pu être analysé,
+> mais un `[]` peut encore masquer un secret contenu dans un **binaire**
+> (contenu non lu, tracé mais pas signalé) ou coupé au-delà de la fenêtre
+> 4 Kio. Un `ScanIncomplet` est émis dans ce cas : le misuse est visible,
+> mais il reste au lecteur.
 >
-> La garde est donc **programmatique**, pas documentaire : `scan_complet()`
-> (ou `exiger_complet(scan_rapport(...))`) **refuse** un rapport incomplet par
-> `ScanError` — le refus que #29 traduit par le code 2. #29 doit donc
-> consommer `scan_complet()`, scanner tout blob stagé et prouver 0/1/2
-> end-to-end ; en attendant, aucun usage CI du scan réel n'est autorisé (la
-> CLI reste en stub, sortie 2). Voir limites ci-dessous.
+> La garde est **programmatique**, pas documentaire : `scan_complet()` (ou
+> `exiger_complet(scan_rapport(...))`) **refuse** un rapport incomplet par
+> `ScanError` — le refus que #29 traduit par le code 2. La CLI le consomme
+> pour l'arbre de travail et pour les blobs stagés. Voir limites ci-dessous.
 
 ## Empreinte et entropie
 
@@ -308,12 +341,14 @@ jamais 0 ou 1.
   ou PNG n'est pas signalé. Le fichier est **tracé** (chemin journalisé,
   compteur `binaires_ignores`), donc l'auditeur le voit, mais le contenu n'est
   pas lu. C'est la seule catégorie de contenu non analysable tolérée — et
-  elle rend `complet` faux : le verdict « propre » n'est pas fondé.
+  elle rend `complet` faux : le verdict « propre » n'est pas fondé. La CLI en
+  mode arbre refuse alors le verdict (code 2) via `scan_complet()`.
 - La **base VCS** (`.git/`, `.hg/`, `.svn/`) n'est pas parcourue : ses objets
   sont compressés et l'historique n'est pas le contenu du dépôt (c'est le
-  travail de #29/#30, sur le diff indexé). Le répertoire est **tracé**
-  (compteur `hors_perimetre`) et `complet` est donc faux sur une arborescence
-  de travail : #29 audite le périmètre qu'il materialise.
+  travail de #29/#30, sur le diff indexé). En mode bibliothèque, le répertoire
+  est **tracé** (compteur `hors_perimetre`) et `complet` est donc faux sur une
+  arborescence de travail ; le mode strict de la CLI écarte cette base sans la
+  compter, car elle n'est pas du contenu audité.
 - Un fichier **non analysable** dans un arbre de tiers (`.venv`,
   `node_modules`, `vendor`…) est tracé et compté : `scan_rapport()` le expose
   (`non_analyses`), `scan()`/`find_candidates()` lèvent `ScanError`. Ces
@@ -339,13 +374,12 @@ jamais 0 ou 1.
   partagent l'empreinte de leur en-tête.
 - Le scan est fichier par fichier, sans snapshot Git : le branchement diff/index
   et la protection contre les attributs Git (`textconv`) restent à faire avec
-  #29/#30.
-- La CLI `heimdall scan` reste en stub (sortie 2, « voir #29 ») : aucun usage
-  CI du scan réel n'est autorisé avant #29, qui devra prouver propre => 0,
-  secret avéré => 1, erreur => 2, sans écriture. Le refus par défaut (code 2)
-  est donc déjà le comportement : aucun verdict « propre » ne peut sortir du
-  CLI tant que #29 n'a pas branché `scan_complet()` (et sa traduction de
-  `ScanError` en code 2).
+  #30 (le mode `--staged` de #29 lit l'index par blob, sans filtre
+  `textconv` : `git cat-file` rend le contenu brut indexé).
+- La CLI `heimdall scan` est branchée (#29) : elle prouve propre => 0, secret
+  avéré => 1, erreur => 2, **sans écriture** (voir [cli.md](cli.md)). L'arbre
+  de travail est refusé (2) dès que le rapport est incomplet. La validation
+  humaine Y/N/E et le remplacement du secret restent à faire (#32).
 
 ## Preuves locales
 

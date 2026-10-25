@@ -75,7 +75,10 @@ def test_incomplete_scan_never_clean(tmp_path: Path) -> None:
     assert "fail-closed" in src
     assert "NotImplementedError" not in src
 
-    # 5. CLI : codes 0 propre / 1 secret / 2 erreur ; non branché (#29) => 2.
+    # 5. CLI : codes 0 propre / 1 secret / 2 erreur. Le contrat est figé
+    #    dans la docstring de la commande (invariant 11) ; la preuve
+    #    d'exécution (propre => 0, secret => 1, racine absente => 2, aucune
+    #    écriture) est dans `tests/test_cli_scan.py`.
     cli_src = CLI_MAIN.read_text(encoding="utf-8")
     assert "0 propre, 1 secrets détectés, 2 erreur" in cli_src
     assert "raise typer.Exit(code=2)" in cli_src
@@ -299,28 +302,30 @@ def test_the_strict_guard_refuses_an_incomplete_report() -> None:
 
 
 def test_the_cli_never_announces_a_clean_verdict() -> None:
-    """REQ-SEC-07 : la sortie 2 (erreur d'outillage) reste la règle.
+    """REQ-SEC-07 : une erreur d'outillage sort en 2, jamais en 0.
 
-    La CLI `heimdall scan` n'est pas encore branchée (#29) : elle refuse
-    par défaut (code 2), donc aucun verdict « propre » — donc aucun code 0
-    — ne peut sortir du CLI tant que #29 n'a pas branché le scan sur
-    l'API stricte (`scan_complet()`), qui refuse elle aussi un rapport
-    incomplet.
+    La CLI `heimdall scan` est branchée (#29), mais le contrat reste
+    fail-closed : elle consomme l'API stricte ``scan_complet()`` (rapport
+    incomplet => ``ScanError``) et traduit toute erreur en code 2. Un binaire,
+    un lien ou un fichier illisible ne peut donc pas produire un « 0 secret »
+    trompeur.
 
     Le test est **statique** ici : la porte « security model » est isolée
     (``tests/security/requirements.txt``) et n'installe pas les dépendances
-    d'exécution (Typer, MCP, FastAPI). L'invocation réelle de la CLI est
-    couverte par ``tests/test_package.py::test_scan_is_fail_closed_until_29``
-    dans la CI principale, qui installe le projet complet. Ce fichier reste
-    ainsi 100 % stdlib + scanner (aucune dépendance d'exécution cachée).
+    d'exécution (Typer, MCP, FastAPI). L'invocation réelle est couverte par
+    ``tests/test_cli_scan.py`` dans la CI principale, qui installe le projet
+    complet. Ce fichier reste ainsi 100 % stdlib + scanner (aucune dépendance
+    d'exécution cachée).
     """
-    source = CLI_MAIN.read_text(encoding="utf-8")
-    assert "raise typer.Exit(code=2)" in source
-    assert "commande non branchée (voir #29)" in source
-    assert "0 propre, 1 secrets détectés, 2 erreur" in source
-    package_tests = (REPO / "tests" / "test_package.py").read_text(encoding="utf-8")
-    assert "def test_scan_is_fail_closed_until_29" in package_tests
-    assert "self.assertEqual(result.exit_code, 2)" in package_tests
+    main_src = CLI_MAIN.read_text(encoding="utf-8")
+    scan_src = (REPO / "heimdall" / "cli" / "scan.py").read_text(encoding="utf-8")
+    assert "raise typer.Exit(code=2)" in main_src
+    assert "except (ScanError, ToolFailure)" in main_src
+    assert "0 propre, 1 secrets détectés, 2 erreur" in main_src
+    # Le mode arbre consomme la garde stricte, pas un `scan()` tolérant.
+    assert "scan_complet" in scan_src
+    assert "strict=True" in scan_src
+    assert "ScanError" in scan_src
 
 
 def test_obfuscation_corpus_is_mandatory() -> None:

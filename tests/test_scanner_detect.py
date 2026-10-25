@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -28,9 +29,11 @@ from heimdall.scanner.detect import (
     Finding,
     RapportScan,
     ScanError,
+    Scanner,
     ScannerRacine,
     _open_flags,
     _safe_path,
+    _validate_relative_path,
     find_candidates,
     scan,
     scan_rapport,
@@ -41,7 +44,10 @@ from heimdall.scanner.exclusions import (
     classer_chemin,
     classer_repertoire,
     decode_text,
+    is_excluded,
+    is_excluded_directory,
 )
+from heimdall.scanner.finding import validate_relative_path
 from heimdall.scanner.hashing import KEY_ENV, KEY_FILE_ENV, SnippetHasher, load_local_key
 from heimdall.scanner.signatures import SIGNATURES, find_signature_matches
 from heimdall.scanner.signatures.stripe_slack import (
@@ -516,6 +522,67 @@ def test_perimetre_classifie_les_repertoires_sans_exclure_de_fichier() -> None:
     assert classer_chemin(".git/config") is Perimetre.HORS_PERIMETRE
     assert classer_chemin("src/app.py") is Perimetre.STRICT
     assert classer_chemin("app.py") is Perimetre.STRICT
+
+
+def test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries() -> None:
+    for path in (
+        ".coverage",
+        ".gitignore",
+        ".git/config",
+        "package-lock.json",
+        "poetry.lock",
+        "vendor/lib.py",
+        "node_modules/pkg/index.js",
+        "Vendor/lib.py",
+        "image.png",
+        "archive.zip",
+    ):
+        assert is_excluded(path), path
+    for path in (".env", "app.py", "deploy.pem", "requirements.txt", "notes"):
+        assert not is_excluded(path), path
+    assert is_excluded_directory("VENDOR")
+    assert is_excluded_directory(".venv")
+    assert not is_excluded_directory("env")
+    assert not is_excluded_directory("src")
+    assert not is_excluded("")
+    # Revue (LOW) : en strict, un suffixe binaire n'exclut plus à lui seul ;
+    # le contenu décide (un texte mal nommé doit être scanné).
+    assert not is_excluded("image.png", strict=True)
+    assert is_excluded(".coverage", strict=True)
+    assert is_excluded("node_modules/pkg/index.js", strict=True)
+    # Revue (LOW) : les sorties de build textuelles ne sont plus techniques.
+    for path in (
+        "build/output.js",
+        "dist/bundle.js",
+        "target/app.js",
+        "bower_components/lib.js",
+        "htmlcov/index.html",
+    ):
+        assert is_excluded(path), path
+        assert not is_excluded(path, strict=True), path
+    assert is_excluded_directory("build")
+    assert not is_excluded_directory("build", strict=True)
+    assert is_excluded_directory("node_modules", strict=True)
+
+
+def test_detect_path_guard_is_the_finding_contract() -> None:
+    """Revue (LOW) : la garde de chemin du scanner est celle du contrat #14.
+
+    Fuzz court sur les caractères qui distinguent les deux grammaires : toute
+    divergence future (nouveau caractère interdit, longueur, segments) casse
+    ce test au lieu de produire un ``FileTarget``/``Finding`` incohérent.
+    """
+    alphabet = ("a", "/", ".", ":", "\\", "\x00", "\x7f", "\u2028")
+    for length in range(4):
+        for characters in itertools.product(alphabet, repeat=length):
+            chemin = "".join(characters)
+            try:
+                attendu = validate_relative_path(chemin)
+            except ValueError:
+                with pytest.raises(ScanError):
+                    _validate_relative_path(chemin)
+            else:
+                assert _validate_relative_path(chemin) == attendu
 
 
 def test_a_nom_exclu_ne_cache_plus_aucon_secret(tmp_path: Path) -> None:
@@ -1112,6 +1179,17 @@ def test_single_file_root_uses_a_relative_name(tmp_path: Path) -> None:
     findings = scan(path)
     assert isinstance(findings[0], Finding)
     assert [finding.file for finding in findings] == ["one.py"]
+
+
+def test_scanner_refuses_an_expired_deadline(tmp_path: Path) -> None:
+    """Revue (LOW) : la deadline arbre est fail-closed même sans fichier lu.
+
+    La CLI borne le mode arbre comme `--staged` ; le scanner bibliothèque
+    accepte une échéance optionnelle et refuse avant de rendre un résultat.
+    """
+    _write(tmp_path, "app.py", "x = 1\n")
+    with pytest.raises(ScanError):
+        Scanner(tmp_path).scan(deadline=time.monotonic() - 1)
 
 
 def test_invalid_utf8_is_scanned_with_replacement(tmp_path: Path) -> None:

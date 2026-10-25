@@ -28,9 +28,21 @@ Les répertoires sont classés en trois régimes :
 ``HORS_PERIMETRE``
     La base VCS (``.git/``, ``.hg/``, ``.svn/``) : ce n'est pas le contenu du
     dépôt (objets compressés, index, références). Elle n'est pas parcourue et
-    elle est **tracée** : l'auditeur voit qu'elle n'a pas été analysée.
+    elle est **tracée** en mode bibliothèque ; le mode ``strict`` de la CLI
+    (#29) l'écarte sans la compter, car elle est hors du contenu audité.
 
-Le contenu n'est jamais exécuté.
+Le module expose aussi les familles d'exclusions historiques de #59
+(``TECHNICAL_*`` / ``TEXT_*``) et ``is_excluded``. Ces helpers restent pour
+compatibilité et tests de politique, mais **aucun scan ne les consulte pour
+décider du périmètre** : le scanner bibliothèque comme la CLI lisent tout
+contenu et c'est le **contenu** qui décide (voir ``classer_repertoire`` /
+``classer_chemin``). Une exclusion nominale serait un contournement trivial.
+
+Les fichiers texte UTF-8, UTF-16 et UTF-32 (avec ou sans BOM) sont décodés et
+scannés. Un contenu NUL qui n'est ni décodable ni une signature binaire connue
+lève ``ScanError`` : il n'est jamais ignoré silencieusement. Tout autre échec
+de lecture ou de décodage est également fail-closed. Le contenu n'est jamais
+exécuté.
 """
 
 from __future__ import annotations
@@ -56,11 +68,21 @@ class Perimetre(enum.Enum):
     HORS_PERIMETRE = "hors_perimetre"
 
 
-#: Arbres d'état machine, de caches, d'environnements virtuels, de tiers ou
-#: générés : ils sont parcourus, mais un fichier non analysable y est tracé
-#: au lieu d'interrompre le scan.
-ARBRES_TIERS: Final[frozenset[str]] = frozenset(
+#: Base VCS : ce n'est pas le contenu du dépôt. Non parcourue, mais tracée.
+ARBRES_HORS_PERIMETRE: Final[frozenset[str]] = frozenset({".git", ".hg", ".svn"})
+
+#: Répertoires exclus pour raison **technique** : contenu binaire, cache ou
+#: environnement non analysable. Les scanner n'apporterait rien (et lèverait
+#: parfois un ``ScanError`` sur un binaire à signature inconnue) : ils restent
+#: hors périmètre, y compris en mode strict (#29). Les sorties de build
+#: (`build`, `dist`, `target`), `bower_components` et `htmlcov` sont
+#: **textuelles** : elles rejoignent les répertoires tiers, donc scannées en
+#: strict (un secret y est un secret), exclues par la politique #59 seule.
+TECHNICAL_DIRECTORIES: Final[frozenset[str]] = frozenset(
     {
+        ".git",
+        ".hg",
+        ".svn",
         ".mypy_cache",
         ".nox",
         ".pytest_cache",
@@ -68,22 +90,117 @@ ARBRES_TIERS: Final[frozenset[str]] = frozenset(
         ".tox",
         ".venv",
         "__pycache__",
-        "bower_components",
-        "build",
-        "dist",
-        "htmlcov",
         "node_modules",
-        "target",
-        "third-party",
-        "third_party",
-        "vendor",
         "venv",
         "virtualenv",
     }
 )
 
-#: Base VCS : ce n'est pas le contenu du dépôt. Non parcourue, mais tracée.
-ARBRES_HORS_PERIMETRE: Final[frozenset[str]] = frozenset({".git", ".hg", ".svn"})
+#: Répertoires tiers ou **générés textuels** : la politique #59 les exclut
+#: pour limiter le bruit (ou les sorties de build), mais un secret y est un
+#: secret. Le mode strict (#29) les scanne.
+TEXT_DIRECTORIES: Final[frozenset[str]] = frozenset(
+    {
+        "bower_components",
+        "build",
+        "dist",
+        "htmlcov",
+        "target",
+        "third-party",
+        "third_party",
+        "vendor",
+    }
+)
+
+#: Arbres d'état machine, de caches, d'environnements virtuels, de tiers ou
+#: générés : ils sont parcourus par le scanner bibliothèque, mais un fichier
+#: non analysable y est tracé au lieu d'interrompre le scan.
+ARBRES_TIERS: Final[frozenset[str]] = (
+    TECHNICAL_DIRECTORIES - ARBRES_HORS_PERIMETRE
+) | TEXT_DIRECTORIES
+
+#: Politique #59 par défaut : technique **et** contenu texte.
+EXCLUDED_DIRECTORIES: Final[frozenset[str]] = TECHNICAL_DIRECTORIES | TEXT_DIRECTORIES
+
+#: Fichiers exclus pour raison **technique** : format binaire connu
+#: (``.coverage`` est une base SQLite, ``bun.lockb`` un blob binaire).
+TECHNICAL_FILES: Final[frozenset[str]] = frozenset(
+    {
+        ".coverage",
+        "bun.lockb",
+    }
+)
+
+#: Fichiers de contrôle et lockfiles **textuels** : exclus par la politique
+#: #59, scannés en mode strict (#29).
+TEXT_FILES: Final[frozenset[str]] = frozenset(
+    {
+        ".dockerignore",
+        ".gitattributes",
+        ".gitignore",
+        ".npmignore",
+        "composer.lock",
+        "go.sum",
+        "npm-shrinkwrap.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+    }
+)
+
+#: Politique #59 par défaut : technique **et** contenu texte.
+EXCLUDED_FILES: Final[frozenset[str]] = TECHNICAL_FILES | TEXT_FILES
+
+#: Suffixes de fichiers **binaires** : jamais analysables par des expressions
+#: de texte, donc exclus même en mode strict.
+TECHNICAL_SUFFIXES: Final[tuple[str, ...]] = (
+    ".7z",
+    ".avi",
+    ".bin",
+    ".bmp",
+    ".bz2",
+    ".class",
+    ".db",
+    ".der",
+    ".dll",
+    ".dylib",
+    ".eot",
+    ".exe",
+    ".gif",
+    ".gz",
+    ".ico",
+    ".jar",
+    ".jpeg",
+    ".jpg",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".pdf",
+    ".png",
+    ".pyc",
+    ".pyo",
+    ".rar",
+    ".so",
+    ".sqlite",
+    ".sqlite3",
+    ".tar",
+    ".tgz",
+    ".ttf",
+    ".webp",
+    ".whl",
+    ".woff",
+    ".woff2",
+    ".xz",
+    ".zip",
+    ".zst",
+)
+
+#: Suffixes de lockfiles **textuels** : exclus par la politique #59, scannés
+#: en mode strict (#29).
+TEXT_SUFFIXES: Final[tuple[str, ...]] = (
+    # Lockfiles générés, quel que soit leur nom.
+    ".lock",
+)
 
 
 def classer_repertoire(name: str) -> Perimetre:
@@ -108,9 +225,7 @@ def classer_chemin(relative_path: str | PurePosixPath) -> Perimetre:
     hors périmètre même s'il passe par un arbre de tiers.
     """
     path = (
-        relative_path
-        if isinstance(relative_path, PurePosixPath)
-        else PurePosixPath(relative_path)
+        relative_path if isinstance(relative_path, PurePosixPath) else PurePosixPath(relative_path)
     )
     regime = Perimetre.STRICT
     for part in path.parts[:-1]:
@@ -120,6 +235,59 @@ def classer_chemin(relative_path: str | PurePosixPath) -> Perimetre:
         if candidat is Perimetre.TIERS:
             regime = Perimetre.TIERS
     return regime
+
+
+#: Politique #59 par défaut : technique **et** contenu texte.
+EXCLUDED_SUFFIXES: Final[tuple[str, ...]] = TEXT_SUFFIXES + TECHNICAL_SUFFIXES
+
+
+def is_excluded_directory(name: str, *, strict: bool = False) -> bool:
+    """Vrai si un nom de répertoire est hors périmètre (casse ignorée).
+
+    En mode ``strict`` (#29), seules les exclusions **techniques** restent :
+    ``vendor/``, ``third_party/``, ``build/``, ``dist/``, ``target/`` et les
+    autres répertoires textuels sont alors parcourus, parce qu'un secret y
+    est un secret.
+    """
+    folded = name.casefold()
+    if folded in TECHNICAL_DIRECTORIES:
+        return True
+    return not strict and folded in TEXT_DIRECTORIES
+
+
+def has_technical_suffix(name: str) -> bool:
+    """Vrai si le nom (casse ignorée) porte un suffixe binaire connu."""
+    folded = name.casefold()
+    return any(folded.endswith(suffix) for suffix in TECHNICAL_SUFFIXES)
+
+
+def is_excluded(relative_path: str | PurePosixPath, *, strict: bool = False) -> bool:
+    """Vrai si le chemin relatif (séparateurs ``/``) est exclu du scan.
+
+    En mode ``strict`` (#29), les exclusions de **contenu texte** (lockfiles,
+    fichiers de contrôle) sont levées ; les exclusions techniques (binaires)
+    restent. Un suffixe binaire n'est toutefois plus un verdict à lui seul en
+    strict : le contenu est lu, et le suffixe ne sert de repli qu'après un
+    échec de ``decode_text`` (un fichier texte mal nommé ``evil.png`` doit
+    être scanné, comme en ``--staged``). Voir ``Scanner._read_text``.
+    """
+    path = (
+        relative_path if isinstance(relative_path, PurePosixPath) else PurePosixPath(relative_path)
+    )
+    if not path.parts:
+        return False
+    if any(is_excluded_directory(part, strict=strict) for part in path.parts[:-1]):
+        return True
+    name = path.parts[-1].casefold()
+    if name in TECHNICAL_FILES:
+        return True
+    if not strict and name in TEXT_FILES:
+        return True
+    if has_technical_suffix(name):
+        # En strict, le contenu décide en premier ; le suffixe ne redevient
+        # une exclusion qu'après échec de décodage (voir `_read_text`).
+        return not strict
+    return not strict and any(name.endswith(suffix) for suffix in TEXT_SUFFIXES)
 
 
 _TEXT_RATIO_MIN: Final[float] = 0.95
@@ -248,6 +416,19 @@ def _decode_utf16_or_32(data: bytes) -> str | None:
     return None if best is None else best[1]
 
 
+def is_known_binary(data: bytes) -> bool:
+    """Vrai si le contenu est un binaire **connu** et majoritairement binaire.
+
+    Même critère que ``decode_text`` pour rendre ``None`` : une signature
+    magique connue **et** un ratio d'octets binaires ≥ 0,5. Sert de repli
+    explicite au scanner pour un fichier à suffixe technique, sans transformer
+    un binaire inconnu (NUL + texte) en skip silencieux.
+    """
+    return any(data.startswith(magic) for magic in _BINARY_MAGIC) and (
+        _binary_byte_ratio(data) >= _BINARY_RATIO_MIN
+    )
+
+
 def decode_text(data: bytes) -> str | None:
     """Décode un fichier texte ou identifie un binaire connu.
 
@@ -278,7 +459,6 @@ def decode_text(data: bytes) -> str | None:
     decoded = _decode_utf16_or_32(data)
     if decoded is not None:
         return decoded
-    if any(data.startswith(magic) for magic in _BINARY_MAGIC):
-        if _binary_byte_ratio(data) >= _BINARY_RATIO_MIN:
-            return None
+    if is_known_binary(data):
+        return None
     raise ScanError(_DECODE_ERROR)

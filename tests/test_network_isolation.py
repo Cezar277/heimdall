@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import socket
 import ssl
 import stat
@@ -40,10 +41,11 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 from unittest import mock
 
 import pytest
+from support.git_repo import GIT
 from typer.testing import CliRunner
 
 from heimdall.cli.main import app
@@ -85,6 +87,97 @@ class NetworkLedger:
     @property
     def blocked(self) -> list[NetworkAttempt]:
         return [attempt for attempt in self.attempts if attempt.blocked]
+
+
+#: Args **exacts** des lectures git du produit. Toute dérive (nouvelle
+#: option, sous-commande non listée) casse ce test au lieu d'être acceptée
+#: comme « locale » par simple préfixe.
+_GIT_DIFF_ARGUMENTS: Final[tuple[str, ...]] = (
+    "diff",
+    "--cached",
+    "--unified=0",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+)
+_GIT_STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
+    "diff",
+    "--cached",
+    "--raw",
+    "-z",
+    "--no-abbrev",
+    "--no-renames",
+    "--no-ext-diff",
+    "--no-textconv",
+)
+_GIT_OBJECT_RE: Final[re.Pattern[str]] = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+def _git_argv_ok(argv: Any) -> bool:
+    """True pour l'argv figé des invocations git du produit, et lui seul.
+
+    Binaire `git`, neutralisation `core.fsmonitor`, placement `-C <racine>`,
+    puis **allowlist exacte** des arguments de lecture. Un `diff` avec une
+    option d'egress ajoutée, un `cat-file --follow-symlinks` ou un `git log`
+    préfixé valide sont refusés : le garde ne se contente pas du nom de la
+    sous-commande. Noyau partagé par les deux couches d'exécution
+    (`subprocess.Popen` et `os.posix_spawn`, par lequel CPython implémente
+    `Popen`).
+    """
+    if not isinstance(argv, (list, tuple)) or len(argv) < 6:
+        return False
+    if not isinstance(argv[0], str) or os.path.basename(argv[0]) != "git":
+        return False
+    if list(argv[1:4]) != ["-c", "core.fsmonitor=false", "-C"]:
+        return False
+    if not isinstance(argv[4], str):
+        return False
+    tail = tuple(argv[5:])
+    return (
+        tail == ("rev-parse", "--show-toplevel")
+        or tail in (_GIT_DIFF_ARGUMENTS, _GIT_STAGED_RAW_ARGUMENTS)
+        or (
+            len(tail) == 4
+            and tail[:3] == ("check-ignore", "-q", "--")
+            and isinstance(tail[3], str)
+        )
+        or (
+            len(tail) == 4
+            and tail[0] == "cat-file"
+            and tail[1] in ("-s", "blob")
+            and tail[2] == "--"
+            and isinstance(tail[3], str)
+            and _GIT_OBJECT_RE.fullmatch(tail[3]) is not None
+        )
+    )
+
+
+def _is_local_git_call(args: Any, kwargs: Any) -> bool:
+    """True pour les invocations git figées du produit, et elles seules.
+
+    Forme exacte émise par `heimdall/mcp/gitdiff.py` : `argv` ci-dessus, plus
+    `stdin=DEVNULL` — un appel git qui hériterait stdin ne vient pas du
+    produit. Tout le reste (`git fetch`, `git init`, autre binaire, argv non
+    liste) reste refusé.
+    """
+    if not isinstance(args, (list, tuple)) or not args:
+        return False
+    if kwargs.get("stdin") is not subprocess.DEVNULL:
+        return False
+    return _git_argv_ok(args[0])
+
+
+def _is_local_git_spawn(args: Any) -> bool:
+    """True pour l'appel `os.posix_spawn` sous-jacent à un appel produit.
+
+    Même `argv` que ci-dessus (`posix_spawn(path, argv, env, …)`, donc en
+    position 1). Le `stdin=DEVNULL` ne se vérifie pas à cette couche (il est
+    déjà traduit en actions de fichiers) : il est exigé à la couche `Popen`,
+    par laquelle passe tout appel du produit.
+    """
+    if not isinstance(args, (list, tuple)) or len(args) < 2:
+        return False
+    return _git_argv_ok(args[1])
 
 
 @pytest.fixture
@@ -369,6 +462,18 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
         def guarded(*args: Any, **kwargs: Any) -> Any:
             # Un processus enfant peut sortir sur le réseau sans passer par nos
             # patchs : on le refuse et on le journalise au lieu d'espérer.
+            # Seule exception : les invocations git **locales et figées** du
+            # produit (`rev-parse`, `diff`, `cat-file`, `check-ignore`), que
+            # le scan réel exige — à la couche `Popen` comme à la couche
+            # `os.posix_spawn` sous-jacente (CPython y implémente `Popen`).
+            # Tout le reste — `curl`, `git fetch`, `git init`, shell, `fork`
+            # — reste refusé (témoins ci-dessous).
+            if name == "subprocess.Popen" and _is_local_git_call(args, kwargs):
+                assert ledger.original_popen is not None
+                return ledger.original_popen(*args, **kwargs)
+            if name == "posix_spawn" and _is_local_git_spawn(args):
+                assert original_posix_spawn is not None
+                return original_posix_spawn(*args, **kwargs)
             ledger.attempts.append(
                 NetworkAttempt(socket.AF_INET, f"<processus enfant : {name}>", True)
             )
@@ -377,6 +482,7 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
         guarded.__name__ = f"guarded_{name}"
         return guarded
 
+    original_posix_spawn = getattr(os, "posix_spawn", None)
     monkeypatch.setattr(subprocess, "Popen", make_child_process_guard("subprocess.Popen"))
     for child_process_name in (
         "system",
@@ -400,22 +506,127 @@ def loopback_only(monkeypatch: pytest.MonkeyPatch) -> NetworkLedger:  # noqa: PL
     return ledger
 
 
-def test_scan_ci_never_attempts_external_traffic(
-    loopback_only: NetworkLedger, tmp_path: Path
-) -> None:
-    """Une tentative externe reste visible même si la CLI la capture."""
-    result = CliRunner().invoke(app, ["scan", "--ci", str(tmp_path)])
+@pytest.fixture
+def scan_repo(tmp_path: Path) -> Path:
+    """Dépôt git initialisé **hors garde** (le garde interdit tout enfant).
 
-    # Le scanner #22 n'est pas branché sur la CLI (#29) : son refus code 2 est attendu.
-    assert result.exit_code in (0, 2), result.output
-    if result.exit_code == 2:
-        assert "commande non branchée (voir #29)" in result.stderr
+    Ordre garanti : pytest instancie les fixtures dans l'ordre des paramètres,
+    donc `scan_repo` (listé en premier) tourne avant `loopback_only`.
+    """
+    if GIT is None:  # pragma: no cover - garde-fou d'environnement de test.
+        pytest.skip("git requis")
+    assert GIT is not None
+    termine = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+        [GIT, "-C", str(tmp_path), "init", "-q"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert termine.returncode == 0, termine.stderr
+    return tmp_path
+
+
+def test_scan_ci_never_attempts_external_traffic(
+    scan_repo: Path, loopback_only: NetworkLedger
+) -> None:
+    """Une tentative externe reste visible même si la CLI la capture.
+
+    Depuis #29, la commande exécute un **scan réel** : le dépôt vide est
+    propre, donc le code de sortie est 0. Le point du test reste le même :
+    aucune connexion hors boucle locale n'est tentée sur ce chemin — y
+    compris via les sous-processus git (autorisés par l'allowlist car
+    locaux et figés, voir `_is_local_git_call`).
+    """
+    result = CliRunner().invoke(app, ["scan", "--ci", str(scan_repo)])
+
+    # Scan opérationnel sur un dépôt vide : propre => 0 (jamais 2, qui reste
+    # réservé à l'erreur d'outillage).
+    assert result.exit_code == 0, result.output
     assert loopback_only.blocked == []
     assert all(
         not attempt.blocked
         for attempt in loopback_only.attempts
         if attempt.family in (socket.AF_INET, socket.AF_INET6)
     )
+
+
+def test_guard_still_blocks_non_local_child_processes(
+    loopback_only: NetworkLedger, tmp_path: Path
+) -> None:
+    """Témoin de l'allowlist : `curl`, `git fetch`, `git init` restent refusés.
+
+    Sans ces témoins, l'exception git du garde ne prouverait rien : elle
+    laisserait tout passer sous couvert d'invocation git.
+    """
+    if GIT is None:  # pragma: no cover - garde-fou d'environnement de test.
+        pytest.skip("git requis")
+    assert GIT is not None
+    for argv in (
+        ["curl", "https://example.invalid/"],
+        [GIT, "-c", "core.fsmonitor=false", "-C", str(tmp_path), "fetch"],
+        [GIT, "-C", str(tmp_path), "init", "-q"],
+        [GIT, "rev-parse", "--show-toplevel"],
+    ):
+        with pytest.raises(AssertionError, match="hors périmètre"):
+            subprocess.Popen(  # noqa: S603 - témoin volontairement refusé
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+    # Même refus une couche plus bas : CPython implémente `Popen` par
+    # `os.posix_spawn`, et un `fetch` direct ne doit pas passer entre les
+    # mailles.
+    with pytest.raises(AssertionError, match="hors périmètre"):
+        os.posix_spawn(
+            GIT,
+            [GIT, "-c", "core.fsmonitor=false", "-C", str(tmp_path), "fetch"],
+            {},
+        )
+    assert len(loopback_only.blocked) == 5
+
+
+def test_git_allowlist_accepts_only_exact_product_argv(tmp_path: Path) -> None:
+    """Revue (LOW) : l'allowlist couvre l'argv complet, pas le préfixe."""
+    if GIT is None:  # pragma: no cover - garde-fou d'environnement de test.
+        pytest.skip("git requis")
+    root = str(tmp_path)
+    valides = (
+        ("rev-parse", "--show-toplevel"),
+        _GIT_DIFF_ARGUMENTS,
+        _GIT_STAGED_RAW_ARGUMENTS,
+        ("cat-file", "-s", "--", "a" * 40),
+        ("cat-file", "blob", "--", "a" * 64),
+        ("check-ignore", "-q", "--", "a/b"),
+    )
+    for tail in valides:
+        argv = [GIT, "-c", "core.fsmonitor=false", "-C", root, *tail]
+        assert _git_argv_ok(argv), argv
+        assert _is_local_git_call((argv,), {"stdin": subprocess.DEVNULL})
+        assert _is_local_git_spawn([GIT, argv, {}])
+
+    for tail in (
+        (
+            "diff",
+            "--cached",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--upload-pack=evil",
+        ),
+        ("cat-file", "--follow-symlinks", "--", "a" * 40),
+        ("cat-file", "blob", "--", "A" * 40),
+        ("check-ignore", "-q", "--"),
+        ("log", "--format=%H"),
+    ):
+        argv = [GIT, "-c", "core.fsmonitor=false", "-C", root, *tail]
+        assert not _git_argv_ok(argv), argv
+        assert not _is_local_git_call((argv,), {"stdin": subprocess.DEVNULL})
+        assert not _is_local_git_spawn([GIT, argv, {}])
 
 
 @pytest.mark.parametrize(

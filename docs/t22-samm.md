@@ -48,6 +48,13 @@ sont prouvées dans la section « 3ᵉ passage », épinglée sur
 `b2304c645445b9609b5d2ee50aed7a4255a55eef`. Les lignes du tableau principal
 qui portent sur un module modifié (périmètre, fenêtre multi-ligne) sont
 signalées ci-dessous.
+Depuis #29, le mode strict de la CLI (`Scanner(root, strict=True)`) ajoute des
+bornes (fichiers, volume total, Findings) et écarte la base VCS du périmètre
+audité. Il ne réintroduit **aucune exclusion nominale de contenu** : le
+scanner bibliothèque et la CLI lisent `vendor/`, `node_modules/`, les
+lockfiles et les sorties de build par contenu. Les permaliens ci-dessus
+restent valides pour le code #22 tel qu'il a été testé ; l'extension CLI est
+documentée dans [t29-samm.md](t29-samm.md).
 
 | Exigence vérifiée | Implémentation (module + ligne) | Test et preuve permanente | Résultat local |
 |---|---|---|---|

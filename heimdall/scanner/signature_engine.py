@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Final
 
 from heimdall.scanner.entropy import shannon_entropy
+from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import ScanTarget
@@ -34,18 +35,65 @@ MULTILINE_LINES: Final[int] = 3
 #: Nombre minimal de lignes jointes pour qu'une fenêtre existe.
 MULTILINE_MIN_LINES: Final[int] = 2
 
+#: Plafond du nombre de Findings rendus en une passe (#29). Les bornes
+#: d'entrée ne suffisent pas : un dépôt adverse dense en candidats (un millier
+#: de blobs bourrés de matches) ferait gonfler la liste et le tri final en
+#: mémoire et en temps CI. Au-delà, le scan est **refusé** (``ScanError``),
+#: jamais tronqué : un rapport partiel présenté comme complet serait un
+#: faux « propre ». 10 000 Findings sont déjà inexploitables par un humain
+#: comme par un journal CI : le refus force le triage, pas le silence.
+#: Source unique : ``heimdall.scanner.detect`` la réexporte (compatibilité
+#: des appelants qui patchent `detect.MAX_FINDINGS`).
+MAX_FINDINGS: Final[int] = 10_000
+
+#: Refus statique du plafond Findings : même libellé que le scanner
+#: bibliothèque (`detect.py`), invariant 8 (aucune entrée reflétée).
+_MAX_FINDINGS_ERROR: Final[str] = "scan impossible : entrée non analysable"
+#: Refus statique d'un plafond explicite hors contrat (0, négatif, géant).
+_MAX_FINDINGS_INVALID: Final[str] = "plafond de findings hors contrat"
+
 
 class SignatureEngine:
     """Moteur déterministe : signatures du registre, puis Finding v1.
 
     La clé HMAC est chargée **paresseusement** au premier scan : instancier le
     moteur ne crée aucun fichier et ne touche pas au stockage local.
+
+    ``max_findings`` borne le nombre de Findings rendus (**par candidat**,
+    dans ``_append``) : au-delà, ``ScanError``. Le défaut est le plafond
+    partagé (:data:`MAX_FINDINGS`) : un appelant qui analyserait un blob
+    dense sans le renseigner reste fail-closed au lieu d'accumuler sans
+    borne (#29). ``None`` explicite retombe sur ce même défaut borné — il
+    n'existe **aucun** opt-out non borné, comme pour ``Scanner``. Un
+    ``max_findings`` explicite doit rester dans ``1..MAX_FINDINGS`` : un
+    entier géant ne peut pas relever la borne (``ValueError``). La CLI
+    ``--staged`` renseigne explicitement sa propre constante (même valeur,
+    knob documenté côté CLI).
     """
 
-    __slots__ = ("_hasher",)
+    __slots__ = ("_hasher", "_max_findings")
 
-    def __init__(self, hasher: SnippetHasher | None = None) -> None:
+    def __init__(
+        self,
+        hasher: SnippetHasher | None = None,
+        *,
+        max_findings: int | None = None,
+    ) -> None:
         self._hasher = hasher
+        # `None` ne doit jamais désactiver la borne : on retombe sur le
+        # défaut, y compris pour un appelant non typé qui passerait `None`
+        # en croyant conserver l'ancien mode non borné. Un entier explicite
+        # ne peut pas non plus relever le plafond (même refus loud que la
+        # couche scanner).
+        if max_findings is None:
+            max_findings = MAX_FINDINGS
+        if (
+            isinstance(max_findings, bool)
+            or not isinstance(max_findings, int)
+            or not 1 <= max_findings <= MAX_FINDINGS
+        ):
+            raise ValueError(_MAX_FINDINGS_INVALID)
+        self._max_findings = max_findings
 
     def analyser(self, cible: ScanTarget) -> list[Finding]:
         """Analyse la cible et rend un Finding par candidat distinct."""
@@ -145,6 +193,11 @@ class SignatureEngine:
                 snippet_hash=snippet_hash,
             )
         )
+        if len(findings) > self._max_findings:
+            # Compteur vérifié **par candidat** : un seul blob dense ne fait
+            # jamais gonfler la liste avant le refus (#29). `ScanError`
+            # traverse la façade `Scanner` tel quel (contrat #53).
+            raise ScanError(_MAX_FINDINGS_ERROR)
 
     def _get_hasher(self) -> SnippetHasher:
         if self._hasher is None:
@@ -155,4 +208,4 @@ class SignatureEngine:
 #: Alias français, pour les appelants qui parlent du « moteur » de #53.
 MoteurSignatures = SignatureEngine
 
-__all__ = ["MULTILINE_WINDOW", "MoteurSignatures", "SignatureEngine"]
+__all__ = ["MAX_FINDINGS", "MULTILINE_WINDOW", "MoteurSignatures", "SignatureEngine"]

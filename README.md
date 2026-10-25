@@ -32,10 +32,21 @@ SHA-256** dans `requirements.lock` (en-tête du fichier = commandes exactes).
 ```sh
 heimdall --help
 heimdall --version
-heimdall scan             # bloqué tant que le scanner #22 n'est pas livré (fail-closed)
-heimdall scan --ci        # idem : refuse par défaut plutôt que d'inventer un verdict
+heimdall scan             # scan de l'arbre de travail (mode strict, #29)
+heimdall scan --staged    # blobs ajoutés ou modifiés dans l'index git (#29)
+heimdall scan --ci        # mode CI headless : le code de sortie est le verdict
+heimdall scan --json      # rapport JSON sur stdout (contrat heimdall.scan.v1)
 heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 ```
+
+`heimdall scan` est **en lecture seule sur le dépôt** et **déterministe** :
+codes de sortie `0` (aucun secret), `1` (secrets détectés), `2` (erreur
+d'outillage — jamais `0` après une erreur). La seule écriture autorisée est la
+clé d'empreinte locale hors dépôt
+(`$XDG_DATA_HOME/heimdall/snippet-hmac.key`, `0600`) ; si elle ne peut pas
+être créée ou lue (HOME/FS en lecture seule), le scan sort en `2`, jamais en
+`0`. Aucun secret n'est jamais affiché en clair. Le protocole complet est
+dans [docs/cli.md](docs/cli.md).
 
 ### Serveur Vault
 
@@ -189,8 +200,10 @@ heimdall/            paquet unique (#17)
   llm/               client Ollama local, sortie JSON contrainte (#80, T28.2), candidat fail-closed (#81)
   vault/             Vault chiffré ; crypto CONFINÉE à vault/crypto.py (#25, contrat #15)
   cli/               entrée `heimdall` (Typer)
+    scan.py          logique du scan (périmètres, verdicts, rendu) (#29)
 tests/               fumée paquet + confinement crypto + tests/contracts/
                      + tests d'intégration Vault (TestClient, #65 / T255)
+                     + tests de la CLI scan (#29)
 docs/                adr/, contracts/, meetings/
 schemas/             finding.schema.json, mcp-tools.schema.json
 openapi.yaml         contrat Vault API v1 (#15)
@@ -202,6 +215,7 @@ openapi.yaml         contrat Vault API v1 (#15)
 - [Finding v1 et machine d'états du secret](docs/contracts/finding.md)
 - [Interface du scanner et sortie Finding](docs/scanner-interface.md)
 - [Scanner déterministe : signatures, exclusions, Finding (#22)](docs/scanner.md)
+- [CLI `heimdall scan` : périmètres, codes de sortie, sortie JSON (#29)](docs/cli.md)
 - [Outils MCP exposés au LLM (surface strictement limitée)](docs/contracts/mcp-tools.md)
 - [Serveur MCP stdio : lancement, outils, invariants (#27)](docs/mcp-server.md)
 - [ADR-001 : Finding et faux positifs](docs/adr/001-finding-et-etats.md)
@@ -272,10 +286,10 @@ refuse aussi le lancement de processus enfants par les wrappers Python
 (`subprocess.Popen` par attribut, `os.*`) ; les alias précoces
 (`from subprocess import Popen`), les chemins C (`_posixsubprocess`) et un
 binaire ou une extension native appelant directement `fork(2)`/`execve(2)`
-relèvent de la trace `strace -f`. Le
-scan réel reste bloqué par le squelette du scanner #22 ; la trace disponible
-prouve uniquement l'absence de connexion sur ce chemin fail-closed, pas encore
-sur un scan opérationnel.
+relèvent de la trace `strace -f`. Depuis #29, le scan n'est plus un squelette :
+`tests/test_network_isolation.py::test_scan_ci_never_attempts_external_traffic`
+exerce un **scan réel** (`heimdall scan --ci`) sous le garde réseau, et
+prouve l'absence de connexion sur ce chemin opérationnel.
 
 ### Réglages GitHub du dépôt (une fois, non versionnables)
 
@@ -309,13 +323,15 @@ sur un scan opérationnel.
 ## Vérifier
 
 Corpus d'acceptation T21 : [34 cas synthétiques et mesure précision/rappel](tests/fixtures/trap_repo/README.md).
-Exécuter `python -m pytest tests/test_trap_acceptance.py -s -rx` ; l'acceptation
-du scanner reste explicitement en attente tant que T22 n'est pas implémenté.
+Exécuter `python -m pytest tests/test_trap_acceptance.py -s -rx` ; la CLI
+`heimdall scan` (#29) est branchée sur ce scanner — voir
+[docs/cli.md](docs/cli.md).
 
 ```sh
 .venv/bin/python -m pytest                      # squelette + contrats
 .venv/bin/python -m unittest discover -s tests/contracts -v   # contrats seuls
 .venv/bin/python -m pytest tests/test_vault_integration_testclient.py -q   # Vault (TestClient)
+.venv/bin/python -m pytest tests/test_cli_scan.py -q   # CLI scan (#29)
 .venv/bin/python -m pytest tests/test_vault_crypto.py -q               # Vault (AES-256-GCM, nonce unique)
 .venv/bin/python -m pytest tests/test_vault_falsification.py -q           # Vault (falsification AES-GCM)
 .venv/bin/ruff check heimdall tests

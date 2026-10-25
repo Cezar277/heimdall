@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Cezar277/heimdall/schemas/scan.schema.json",
+  "title": "Heimdall scan report v1",
+  "description": "Rapport rendu par `heimdall scan --json` (ticket #29). Le document ne porte aucun secret : chaque Finding ne contient qu'une empreinte HMAC-SHA-256 et une entropie (contrat Finding v1, #14).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "scope",
+    "count",
+    "findings"
+  ],
+  "properties": {
+    "schema": {
+      "const": "heimdall.scan.v1",
+      "description": "Version du contrat de sortie. Un parseur CI DOIT refuser toute autre valeur."
+    },
+    "scope": {
+      "enum": [
+        "working-tree",
+        "staged"
+      ],
+      "description": "Périmètre analysé : arbre de travail (mode strict) ou blobs ajoutés ou modifiés de l'index."
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Nombre de Findings. Un parseur CI DOIT refuser le document si `count` diffère de `len(findings)` : cette égalité est inexprimable en JSON Schema et doit être vérifiée en plus de la validation du schéma."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "finding.schema.json"
+      },
+      "description": "Un Finding v1 par candidat, triés (fichier, ligne, type, empreinte)."
+    }
+  }
+}

@@ -30,13 +30,22 @@ Invariants :
 - les chemins sont relatifs, en ``/``, sans ``..`` ni segment vide ;
 - les liens symboliques ne sont jamais suivis, ni dans le périmètre, ni dans
   le chemin de la racine, et les fichiers restent confinés à la racine résolue ;
-- les lectures sont bornées (1 Mio) et les regex sont linéaires et bornées ;
+- les lectures sont bornées (1 Mio par fichier, :data:`MAX_FILES` fichiers,
+  :data:`MAX_TOTAL_BYTES` octets, :data:`MAX_FINDINGS` Findings) et les regex
+  sont linéaires et bornées ; une deadline globale peut interrompre le scan
+  (#29) ;
 - **aucun nom de fichier n'exclut un fichier du scan** : le contenu décide.
   Un ``evil.png``, un ``package-lock.json`` ou un ``vendor/secret.txt`` dont le
   contenu est du texte est lu et scanné ; seul un contenu réellement binaire
   est ignoré, et il est **tracé** (chemin journalisé, compteur dans le
   rapport) pour qu'un dépôt propre ne soit jamais confondu avec un dépôt dont
   une partie n'a pas été analysée.
+
+Le mode ``strict=True`` de #29 est le mode **CLI de l'arbre de travail** : il
+écarte silencieusement la base VCS (``.git/``, ``.hg/``, ``.svn/``), qui n'est
+pas du contenu audité, mais il applique la même politique de contenu à tout le
+reste — ``vendor/``, ``node_modules/``, ``build/`` et les lockfiles sont lus.
+Il ne rouvre donc aucune exclusion nominale de contenu.
 
 Deux classes portent le nom « scanner » et ne doivent jamais être confondues :
 
@@ -51,6 +60,7 @@ from __future__ import annotations
 import os
 import stat
 import sys
+import time
 import unicodedata
 import warnings
 from collections.abc import Callable, Iterator
@@ -72,17 +82,27 @@ from heimdall.scanner.finding import (
     validate_relative_path,
 )
 from heimdall.scanner.hashing import SnippetHasher
-from heimdall.scanner.interface import FileTarget, Scanner
-from heimdall.scanner.signature_engine import SignatureEngine
+from heimdall.scanner.interface import FileTarget
+from heimdall.scanner.interface import Scanner as _InterfaceScanner
+from heimdall.scanner.signature_engine import MAX_FINDINGS, SignatureEngine
 
 #: Taille maximale d'un fichier analysé (1 Mio). Un fichier plus large est
 #: **refusé** (``ScanError``), jamais tronqué en silence.
 MAX_FILE_BYTES: Final[int] = 1_048_576
+#: Plafond du nombre de fichiers analysés en une passe (#29). Au-delà, le
+#: scan est **refusé** (``ScanError``) : un dépôt adverse avec des milliers de
+#: petits fichiers ne doit pas faire durer une CI sans rendre de verdict.
+MAX_FILES: Final[int] = 50_000
+#: Plafond du volume total lu en une passe, en octets (#29). Sans lui,
+#: ``MAX_FILES`` fichiers de 1 Mio feraient 50 Gio de lecture.
+MAX_TOTAL_BYTES: Final[int] = 256 * 1024 * 1024
 #: Taille de lecture par ``os.read`` : borne de mémoire, pas de sémantique.
 _READ_CHUNK: Final[int] = 65_536
 #: Message statique : ni chemin, ni extrait, ni valeur candidate n'est
 #: jamais reflété (invariant 8).
 _SCAN_ERROR: Final[str] = "scan impossible : entrée non analysable"
+#: Bornes explicites hors contrat (zéro, négatif, au-delà du plafond).
+_BOUNDS_ERROR: Final[str] = "bornes de scan hors contrat"
 #: Message statique du refus « rapport incomplet » : c'est la sortie 2
 #: d'outillage attendue par #29 (jamais 0, jamais 1).
 _SCAN_INCOMPLET: Final[str] = "scan incomplet : verdict propre non fondé"
@@ -117,8 +137,28 @@ _TRACE_PATH_MAX: Final[int] = 256
 #: ferait échouer l'écriture d'un journal en UTF-8 strict.
 _UNSAFE_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
+
+def _checked_bound(value: int | None, default: int) -> int:
+    """Normalise une borne explicite sans permettre de la désactiver.
+
+    ``None`` retombe sur ``default`` (la constante du module, patchable par
+    les tests). Une valeur explicite doit être un entier strictement positif
+    et **inférieur ou égal** au plafond par défaut : un entier géant ne peut
+    donc pas rouvrir un scan non borné. Refus loud (``ValueError``) plutôt
+    que borne silencieusement ignorée.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= default:
+        raise ValueError(_BOUNDS_ERROR)
+    return value
+
+
 __all__ = [
+    "MAX_FILES",
     "MAX_FILE_BYTES",
+    "MAX_FINDINGS",
+    "MAX_TOTAL_BYTES",
     "Finding",
     "FindingSource",
     "FindingStatus",
@@ -126,6 +166,7 @@ __all__ = [
     "RapportScan",
     "ScanError",
     "ScanIncomplet",
+    "Scanner",
     "ScannerRacine",
     "exiger_complet",
     "find_candidates",
@@ -312,26 +353,43 @@ class ScannerRacine:
     Ce qui n'a pas pu être analysé est **tracé** : ``journal`` reçoit une
     ligne par fichier ignoré (chemin seul, jamais de contenu) et le rapport
     rendu par ``analyser()`` porte les compteurs.
+
+    ``strict=True`` (#29) écarte silencieusement la base VCS, qui n'est pas
+    du contenu audité, mais continue de lire tout le reste par contenu.
+    ``max_files``, ``max_bytes``, ``max_findings`` et ``deadline`` bornent le
+    travail : au-delà, ``ScanError`` — jamais un rapport tronqué.
     """
 
     __slots__ = (
         "_binaires",
         "_journal",
         "_liens",
+        "_max_bytes",
+        "_max_files",
+        "_max_findings",
         "_moteur",
         "_non_analyses",
         "_hors_perimetre",
         "_root",
         "_single",
+        "_strict",
+        "_total_bytes",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — surface #29 : racine, journal, mode, bornes.
         self,
         root: str | os.PathLike[str],
         *,
         hasher: SnippetHasher | None = None,
         journal: Callable[[str], None] | None = None,
+        strict: bool = False,
+        max_files: int | None = None,
+        max_bytes: int | None = None,
+        max_findings: int | None = None,
     ) -> None:
+        self._max_files = _checked_bound(max_files, MAX_FILES)
+        self._max_bytes = _checked_bound(max_bytes, MAX_TOTAL_BYTES)
+        self._max_findings = _checked_bound(max_findings, MAX_FINDINGS)
         resolved = _resolve_root(root)
         try:
             est_repertoire = resolved.is_dir()
@@ -348,14 +406,16 @@ class ScannerRacine:
             raise ScanError(_SCAN_ERROR)
         # La clé HMAC est chargée paresseusement par le moteur : instancier le
         # scanner ne crée aucun fichier et ne touche pas au stockage local.
-        self._moteur = Scanner(SignatureEngine(hasher))
+        self._moteur = _InterfaceScanner(SignatureEngine(hasher, max_findings=self._max_findings))
         self._journal = _journal_stderr if journal is None else journal
+        self._strict = strict
         self._binaires = 0
         self._non_analyses = 0
         self._hors_perimetre = 0
         self._liens = 0
+        self._total_bytes = 0
 
-    def analyser(self) -> RapportScan:
+    def analyser(self, *, deadline: float | None = None) -> RapportScan:
         """Analyse tout le périmètre et retourne le bilan complet.
 
         Toute erreur de lecture **du périmètre strict** interrompt le scan :
@@ -366,12 +426,15 @@ class ScannerRacine:
         sur ce qui n'a pas été lu : ``RapportScan.complet`` est vrai quand
         rien n'a été laissé de côté. C'est cette API que #29 doit
         consommer — un verdict « propre » n'est fondé que si ``complet``
-        est vrai.
+        est vrai. ``deadline`` est une échéance ``time.monotonic()`` : une
+        échéance dépassée refuse le scan (``ScanError``).
         """
         self._binaires = 0
         self._non_analyses = 0
         self._hors_perimetre = 0
         self._liens = 0
+        self._total_bytes = 0
+        self._check_deadline(deadline)
         findings: list[Finding] = []
         # Pas de `list()` sur le périmètre : un dépôt adverse avec un très
         # grand nombre de fichiers ne doit pas OOM le hook/CI. Le tri final
@@ -381,8 +444,14 @@ class ScannerRacine:
             if self._single is not None
             else self._iter_files()
         )
-        for path, relative, perimetre in files:
+        for index, (path, relative, perimetre) in enumerate(files):
+            if index >= self._max_files:
+                raise ScanError(_SCAN_ERROR)
+            self._check_deadline(deadline)
             findings.extend(self._analyser_fichier(path, relative, perimetre))
+            if len(findings) > self._max_findings:
+                raise ScanError(_SCAN_ERROR)
+        self._check_deadline(deadline)
         findings.sort(
             key=lambda finding: (
                 finding.file,
@@ -399,7 +468,7 @@ class ScannerRacine:
             liens_ignores=self._liens,
         )
 
-    def analyser_complet(self) -> RapportScan:
+    def analyser_complet(self, *, deadline: float | None = None) -> RapportScan:
         """Analyse et **refuse** un rapport incomplet (``ScanError``).
 
         C'est l'API stricte : elle rend un bilan seulement si rien n'a été
@@ -407,9 +476,9 @@ class ScannerRacine:
         (hook, CI) consomme celle-ci : il ne peut pas obtenir un bilan
         partiel qu'il confondrait avec un dépôt propre.
         """
-        return exiger_complet(self.analyser())
+        return exiger_complet(self.analyser(deadline=deadline))
 
-    def scan(self) -> list[Finding]:
+    def scan(self, *, deadline: float | None = None) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.
 
         **Fail-closed** : dès qu'un fichier du périmètre n'a pas pu être
@@ -429,7 +498,7 @@ class ScannerRacine:
         ``ScanIncomplet`` est émis (message statique, jamais de chemin ni de
         valeur).
         """
-        rapport = self.analyser()
+        rapport = self.analyser(deadline=deadline)
         if rapport.non_analyses:
             raise ScanError(_SCAN_ERROR)
         if not rapport.complet:
@@ -440,12 +509,24 @@ class ScannerRacine:
             )
         return list(rapport.findings)
 
+    def scan_complet(self, *, deadline: float | None = None) -> list[Finding]:
+        """Comme ``scan()``, mais **refuse** un rapport incomplet (§#29)."""
+        return list(self.analyser_complet(deadline=deadline).findings)
+
+    def _check_deadline(self, deadline: float | None) -> None:
+        """Refuse dès que l'échéance monotone est dépassée (fail-closed)."""
+        if deadline is not None and time.monotonic() > deadline:
+            raise ScanError(_SCAN_ERROR)
+
     def _iter_files(self) -> Iterator[tuple[Path, str, Perimetre]]:
         """Parcourt la racine sans jamais suivre un lien symbolique.
 
-        Aucun répertoire n'est exclu *par son nom* : les répertoires de tiers
-        sont parcourus (un secret y est un secret) et la base VCS est écartée
-        mais **tracée**.
+        Aucun répertoire de contenu n'est exclu *par son nom* : les
+        répertoires de tiers sont parcourus (un secret y est un secret) et la
+        base VCS est écartée. Elle est **tracée** dans le mode bibliothèque ;
+        en mode ``strict`` (#29), elle est hors du périmètre audité et n'est
+        pas comptée — sinon aucun dépôt Git ne pourrait rendre un verdict
+        propre.
         """
         for current, directories, filenames in os.walk(
             self._root,
@@ -458,6 +539,11 @@ class ScannerRacine:
             for name in sorted(directories):
                 regime = classer_repertoire(name)
                 if regime is Perimetre.HORS_PERIMETRE:
+                    if self._strict:
+                        # Mode CLI (#29) : la base VCS n'est pas du contenu
+                        # audité. On l'écarte sans la compter comme lacune,
+                        # sinon tout dépôt Git serait « incomplet ».
+                        continue
                     self._hors_perimetre += 1
                     self._tracer(_MOT_HORS_PERIMETRE, self._relatif(current_path / name))
                     continue
@@ -517,6 +603,8 @@ class ScannerRacine:
         if regime is Perimetre.STRICT:
             raise ScanError(_SCAN_ERROR) from None
         if regime is Perimetre.HORS_PERIMETRE:
+            if self._strict:
+                return
             self._hors_perimetre += 1
             self._tracer(_MOT_HORS_PERIMETRE, relatif)
             return
@@ -587,6 +675,12 @@ class ScannerRacine:
             data = self._lire_borne(descriptor, before)
         finally:
             os.close(descriptor)
+        # Plafond de volume global (#29) : il protège la CI d'un dépôt
+        # adverse fait de nombreux fichiers moyens. Le dépassement est fatal
+        # dans tous les régimes : un scan ne continue pas au-delà de sa borne.
+        self._total_bytes += len(data)
+        if self._total_bytes > self._max_bytes:
+            raise ScanError(_SCAN_ERROR) from None
         try:
             return decode_text(data)
         except ScanError:
@@ -655,11 +749,22 @@ class ScannerRacine:
         self._journal(f"{_TRACE_PREFIX} {motif} : {_safe_path(chemin)}")
 
 
-def scan(
+#: Alias de compatibilité #29 : le « tree scanner » est ``ScannerRacine``.
+#: ``heimdall.scanner.interface.Scanner`` reste importé explicitement par le
+#: paquet et n'est jamais confondu avec ce parcours de système de fichiers.
+Scanner = ScannerRacine
+
+
+def scan(  # noqa: PLR0913 — miroir des options de ScannerRacine.
     root: str | os.PathLike[str],
     *,
     hasher: SnippetHasher | None = None,
     journal: Callable[[str], None] | None = None,
+    strict: bool = False,
+    deadline: float | None = None,
+    max_files: int | None = None,
+    max_bytes: int | None = None,
+    max_findings: int | None = None,
 ) -> list[Finding]:
     """Analyse ``root`` et retourne des objets :class:`Finding`.
 
@@ -673,14 +778,27 @@ def scan(
     usage hook/CI, consommer ``scan_complet()`` : il **refuse** (code 2
     attendu) tout rapport incomplet.
     """
-    return ScannerRacine(root, hasher=hasher, journal=journal).scan()
+    return ScannerRacine(
+        root,
+        hasher=hasher,
+        journal=journal,
+        strict=strict,
+        max_files=max_files,
+        max_bytes=max_bytes,
+        max_findings=max_findings,
+    ).scan(deadline=deadline)
 
 
-def scan_rapport(
+def scan_rapport(  # noqa: PLR0913 — miroir des options de ScannerRacine.
     root: str | os.PathLike[str],
     *,
     hasher: SnippetHasher | None = None,
     journal: Callable[[str], None] | None = None,
+    strict: bool = False,
+    deadline: float | None = None,
+    max_files: int | None = None,
+    max_bytes: int | None = None,
+    max_findings: int | None = None,
 ) -> RapportScan:
     """Analyse ``root`` et retourne le bilan complet (Findings + compteurs).
 
@@ -690,14 +808,27 @@ def scan_rapport(
     l'appelant : ``exiger_complet()`` (ou ``scan_complet()``) le fait à sa
     place.
     """
-    return ScannerRacine(root, hasher=hasher, journal=journal).analyser()
+    return ScannerRacine(
+        root,
+        hasher=hasher,
+        journal=journal,
+        strict=strict,
+        max_files=max_files,
+        max_bytes=max_bytes,
+        max_findings=max_findings,
+    ).analyser(deadline=deadline)
 
 
-def scan_complet(
+def scan_complet(  # noqa: PLR0913 — miroir des options de ScannerRacine.
     root: str | os.PathLike[str],
     *,
     hasher: SnippetHasher | None = None,
     journal: Callable[[str], None] | None = None,
+    strict: bool = False,
+    deadline: float | None = None,
+    max_files: int | None = None,
+    max_bytes: int | None = None,
+    max_findings: int | None = None,
 ) -> RapportScan:
     """Analyse ``root`` et rend un bilan **seulement s'il est complet**.
 
@@ -709,7 +840,15 @@ def scan_complet(
     Le refus est l'erreur d'outillage attendue par la CLI : code 2, jamais
     0 ni 1. Un dépôt réellement propre rend un rapport complet et vide.
     """
-    return ScannerRacine(root, hasher=hasher, journal=journal).analyser_complet()
+    return ScannerRacine(
+        root,
+        hasher=hasher,
+        journal=journal,
+        strict=strict,
+        max_files=max_files,
+        max_bytes=max_bytes,
+        max_findings=max_findings,
+    ).analyser_complet(deadline=deadline)
 
 
 def find_candidates(path: str) -> list[dict[str, object]]:
