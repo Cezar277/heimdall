@@ -16,7 +16,7 @@ import pytest
 
 from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
-    RapportScan,
+    Finding,
     ScanError,
     ScanIncomplet,
     exiger_complet,
@@ -161,7 +161,7 @@ def test_a_grounded_clean_verdict_requires_a_complete_report(tmp_path: Path) -> 
     """REQ-SEC-07 : un verdict propre n'est fondé que si le rapport est complet.
 
     Binaire ignoré, lien non suivi, base VCS non parcourue : dans les trois
-    cas, du contenu n'a pas été lu. `RapportScan.complet` est donc faux, et
+    cas, du contenu n'a pas été lu. `Finding.complet` est donc faux, et
     #29 doit refuser (code 2) au lieu d'annoncer un dépôt propre.
     """
     (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
@@ -290,14 +290,14 @@ def test_the_strict_guard_refuses_an_incomplete_report() -> None:
     confondrait avec un dépôt propre.
     """
     for compteur in ("binaires_ignores", "liens_ignores", "hors_perimetre", "non_analyses"):
-        rapport = RapportScan(**{compteur: 1})
+        rapport = Finding(**{compteur: 1})
         try:
             exiger_complet(rapport)
         except ScanError as exc:
             assert str(exc) == "scan incomplet : verdict propre non fondé"
         else:
             raise AssertionError(f"{compteur} : rapport incomplet accepté")
-    complet = RapportScan()
+    complet = Finding()
     assert exiger_complet(complet) is complet
 
 
