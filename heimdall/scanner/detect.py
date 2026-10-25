@@ -45,10 +45,11 @@ from heimdall.scanner.entropy_detection import (
 )
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import (
+    Perimetre,
+    classer_chemin,
+    classer_repertoire,
     decode_text,
     has_technical_suffix,
-    is_excluded,
-    is_excluded_directory,
     is_known_binary,
 )
 from heimdall.scanner.finding import (
@@ -300,19 +301,28 @@ class Scanner:
             followlinks=False,
         ):
             current_path = Path(current)
-            directories[:] = sorted(
-                name
-                for name in directories
-                if not is_excluded_directory(name, strict=self._strict)
-                and _not_link(current_path / name)
-            )
+            kept: list[str] = []
+            for name in sorted(directories):
+                # Le nom ne décide jamais du contenu : un arbre de tiers
+                # (vendor/, node_modules/, .venv/…) est parcouru, car un
+                # secret y est un secret. Seule la base VCS est hors périmètre.
+                if classer_repertoire(name) is Perimetre.HORS_PERIMETRE:
+                    continue
+                if not _not_link(current_path / name):
+                    continue
+                kept.append(name)
+            directories[:] = kept
             for name in sorted(filenames):
                 path = current_path / name
                 try:
                     relative = path.relative_to(self._root).as_posix()
                 except ValueError:
                     raise ScanError(_SCAN_ERROR) from None
-                if is_excluded(relative, strict=self._strict):
+                # Aucun fichier n'est exclu par son nom : le contenu décide.
+                # `classer_chemin` ne sert qu'à écarter un éventuel chemin de
+                # la base VCS (déjà élaguée ci-dessus) : un secret dans un
+                # lockfile, un `.png` textuel ou un `vendor/` reste analysé.
+                if classer_chemin(relative) is Perimetre.HORS_PERIMETRE:
                     continue
                 if not _not_link(path):
                     continue

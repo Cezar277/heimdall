@@ -27,16 +27,12 @@ from heimdall.scanner import hashing
 from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
     Finding,
-    RapportScan,
     ScanError,
     Scanner,
-    ScannerRacine,
     _open_flags,
-    _safe_path,
     _validate_relative_path,
     find_candidates,
     scan,
-    scan_rapport,
 )
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.exclusions import (
@@ -659,63 +655,22 @@ def test_virtualenv_is_a_tier_tree_and_is_still_scanned(tmp_path: Path) -> None:
     ]
 
 
-def test_a_real_binary_is_traced_and_counted_without_leaking_content(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Non-régression MEDIUM : un binaire ignoré reste *visible*.
-
-    Le binaire est le seul contenu non analysable toléré ; il doit laisser une
-    trace (chemin journalisé + compteur) sans jamais laisser fuir une
-    valeur.
-    """
+def test_a_real_binary_is_skipped_without_hiding_text_files(tmp_path: Path) -> None:
+    """Un vrai binaire est ignoré par politique ; le texte reste scanné."""
     _write(tmp_path, "image.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
     _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.binaires_ignores == 1
-    assert rapport.non_analyses == 0
-    # Un binaire n'est pas lu : son contenu peut cacher un secret. Le verdict
-    # « propre » n'est donc **pas** fondé (`complet` faux) tant qu'il
-    # subsiste, même si le fichier est apparemment inoffensif.
-    assert rapport.complet is False
-    assert [finding.file for finding in rapport.findings] == ["app.py"]
-    trace = capsys.readouterr().err
-    assert "image.png" in trace
-    assert "binaire" in trace
-    # Aucune valeur de secret ne fuit dans la trace.
-    assert _aws() not in trace
+    findings = scan(tmp_path)
+    assert [finding.file for finding in findings] == ["app.py"]
+    # Un binaire n'est pas analysé, mais il ne masque aucun fichier textuel.
+    assert all(finding.file != "image.png" for finding in findings)
 
 
-def test_the_report_exposes_what_was_not_analysed(tmp_path: Path) -> None:
-    """Le rapport distingue un dépôt propre d'un dépôt partiellement lu."""
-    _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
-    rapport = scan_rapport(str(tmp_path))
-    assert isinstance(rapport, RapportScan)
-    assert rapport.binaires_ignores == 0
-    assert rapport.non_analyses == 0
-    assert rapport.liens_ignores == 0
-    assert rapport.hors_perimetre == 0
-    assert rapport.complet is True
-
-
-def test_the_vcs_database_is_not_walked_but_is_traced(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """``.git/`` n'est pas le contenu du dépôt : il n'est pas parcouru, mais tracé."""
+def test_the_vcs_database_is_not_walked(tmp_path: Path) -> None:
+    """``.git/`` n'est pas le contenu du dépôt : il n'est pas parcouru."""
     _write(tmp_path, ".git/config", f'AWS = "{_aws("git")}"')
     _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.hors_perimetre == 1
-    assert [finding.file for finding in rapport.findings] == ["app.py"]
-    assert ".git" in capsys.readouterr().err
-
-
-def test_a_file_ignored_in_a_tier_tree_does_not_break_the_scan(tmp_path: Path) -> None:
-    """Un fichier illisible dans un arbre de tiers est tracé, pas fatal."""
-    _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"')
-    _write(tmp_path, "vendor/broken.bin", b"\x00\x01\x02not-decodable")
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.non_analyses == 1
-    assert [finding.file for finding in rapport.findings] == ["vendor/secret.txt"]
+    findings = scan(tmp_path)
+    assert [finding.file for finding in findings] == ["app.py"]
 
 
 def test_a_broken_file_in_the_strict_perimeter_is_fail_closed(tmp_path: Path) -> None:
@@ -725,34 +680,7 @@ def test_a_broken_file_in_the_strict_perimeter_is_fail_closed(tmp_path: Path) ->
         find_candidates(str(tmp_path))
 
 
-def test_an_oversized_file_in_a_tier_tree_is_traced_not_fatal(tmp_path: Path) -> None:
-    """Dans un arbre de tiers, un fichier hors borne est tracé, pas fatal."""
-    _write(tmp_path, "vendor/huge.txt", b"A" * (MAX_FILE_BYTES + 1))
-    _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"')
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.non_analyses == 1
-    assert [finding.file for finding in rapport.findings] == ["vendor/secret.txt"]
-
-
-def test_a_fifo_in_a_tier_tree_is_traced_not_fatal(tmp_path: Path) -> None:
-    """Un fichier non régulier dans un arbre de tiers est tracé, pas fatal."""
-    if not hasattr(os, "mkfifo"):
-        pytest.skip("mkfifo indisponible")
-    (tmp_path / "vendor").mkdir()
-    os.mkfifo(tmp_path / "vendor" / "pipe")
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.non_analyses == 1
-
-
-def test_an_invalid_name_in_a_tier_tree_is_traced_not_fatal(tmp_path: Path) -> None:
-    """Un nom hors contrat dans un arbre de tiers est tracé, pas fatal."""
-    _write(tmp_path, "vendor/bad:name.txt", f'AWS = "{_aws("vendor")}"')
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.non_analyses == 1
-    assert rapport.findings == ()
-
-
-# --- Verdict propre partiel : fail-closed strict ------------------------------
+# --- Fail-closed dans les arbres de tiers ------------------------------------
 
 
 def _arbre_de_tiers_avec_un_fichier_illisible(tmp_path: Path) -> Path:
@@ -766,11 +694,10 @@ def _arbre_de_tiers_avec_un_fichier_illisible(tmp_path: Path) -> Path:
 def test_a_tier_failure_never_becomes_a_clean_list(tmp_path: Path) -> None:
     """Un fichier non analysable en arbre de tiers n'est jamais un `[]` propre.
 
-    `scan()` et `find_candidates()` jetaient les compteurs : un fichier
-    illisible, hors borne, non régulier ou mal nommé dans `vendor/` rendait
-    une liste vide — un **verdict propre inventé** alors qu'une partie du
-    périmètre n'avait pas été lue. Les deux API lèvent désormais
-    `ScanError` ; seul `scan_rapport()` expose le bilan partiel.
+    Un fichier illisible, hors borne, non régulier ou mal nommé dans
+    `vendor/` ne doit jamais rendre une liste vide — un **verdict propre
+    inventé** alors qu'une partie du périmètre n'a pas été lue. `scan()` et
+    `find_candidates()` lèvent `ScanError`.
     """
     _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"')
     _write(tmp_path, "vendor/broken.bin", b"\x00\x01\x02not-decodable")
@@ -779,9 +706,6 @@ def test_a_tier_failure_never_becomes_a_clean_list(tmp_path: Path) -> None:
     assert str(context.value) == "scan impossible : entrée non analysable"
     with pytest.raises(ScanError):
         find_candidates(str(tmp_path))
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.non_analyses == 1
-    assert [finding.file for finding in rapport.findings] == ["vendor/secret.txt"]
 
 
 def test_an_oversized_tier_file_never_becomes_a_clean_list(tmp_path: Path) -> None:
@@ -823,20 +747,17 @@ def test_an_unreadable_tier_file_never_becomes_a_clean_list(tmp_path: Path) -> N
             scan(tmp_path)
         with pytest.raises(ScanError):
             find_candidates(str(tmp_path))
-        rapport = scan_rapport(str(tmp_path))
     finally:
         bloque.chmod(0o600)
-    assert rapport.non_analyses == 1
-    assert [finding.file for finding in rapport.findings] == ["vendor/secret.txt"]
 
 
 @pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="permissions POSIX")
 def test_a_walk_error_in_a_tier_tree_never_becomes_a_clean_list(tmp_path: Path) -> None:
     """Une erreur de parcours en arbre de tiers n'est jamais un `[]` propre.
 
-    Le chemin `_on_walk_error` (répertoire illisible) est le même que celui
-    d'un fichier illisible : le compteur était jeté par `scan()`, donc un
-    dépôt dont un sous-arbre n'a pas été parcouru rendait une liste vide.
+    Le chemin ``_raise_walk_error`` (répertoire illisible) est le même que
+    celui d'un fichier illisible : un dépôt dont un sous-arbre n'a pas été
+    parcouru lève ``ScanError`` au lieu de rendre une liste vide.
     """
     bloque = tmp_path / "vendor" / "bloque"
     bloque.mkdir(parents=True)
@@ -847,21 +768,15 @@ def test_a_walk_error_in_a_tier_tree_never_becomes_a_clean_list(tmp_path: Path) 
             scan(tmp_path)
         with pytest.raises(ScanError):
             find_candidates(str(tmp_path))
-        rapport = scan_rapport(str(tmp_path))
     finally:
         bloque.chmod(0o700)
-    assert rapport.non_analyses == 1
 
 
 @pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="permissions POSIX")
-def test_an_unreadable_tier_directory_at_the_root_is_traced(tmp_path: Path) -> None:
-    """Le répertoire de tiers fautif est classé par son propre nom.
-
-    ``classer_chemin`` classe des **fichiers** et ignore le dernier segment.
-    Pour une erreur de parcours, le dernier segment est le répertoire fautif :
-    un ``vendor/`` illisible à la racine doit être tracé (tiers), pas pris
-    pour le périmètre strict.
-    """
+def test_an_unreadable_tier_directory_at_the_root_never_becomes_a_clean_list(
+    tmp_path: Path,
+) -> None:
+    """Un ``vendor/`` illisible à la racine est fail-closed, jamais un `[]`."""
     vendor = tmp_path / "vendor"
     vendor.mkdir()
     (vendor / "secret.txt").write_text(f'AWS = "{_aws("vendor")}"', encoding="utf-8")
@@ -871,66 +786,13 @@ def test_an_unreadable_tier_directory_at_the_root_is_traced(tmp_path: Path) -> N
             scan(tmp_path)
         with pytest.raises(ScanError):
             find_candidates(str(tmp_path))
-        rapport = scan_rapport(str(tmp_path))
     finally:
         vendor.chmod(0o700)
-    assert rapport.non_analyses == 1
-    assert rapport.complet is False
-    assert rapport.findings == ()
-
-
-def test_the_report_is_not_complete_when_a_binary_was_left_aside(tmp_path: Path) -> None:
-    """Un binaire non lu rend le verdict « propre » non fondé."""
-    _write(tmp_path, "image.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.binaires_ignores == 1
-    assert rapport.complet is False
-
-
-def test_the_report_is_not_complete_when_a_link_was_left_aside(tmp_path: Path) -> None:
-    """Un lien symbolique non suivi rend le verdict « propre » non fondé."""
-    if not hasattr(os, "symlink"):
-        pytest.skip("liens symboliques indisponibles")
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    _write(outside, "leak.py", f'AWS = "{_aws("outside")}"')
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    try:
-        (repository / "link.py").symlink_to(outside / "leak.py")
-    except OSError as error:
-        if getattr(error, "winerror", None) == 1314:
-            pytest.skip("Création de liens symboliques non autorisée sous Windows")
-        raise
-    rapport = scan_rapport(str(repository))
-    assert rapport.liens_ignores == 1
-    assert rapport.complet is False
-
-
-def test_the_report_is_not_complete_when_the_vcs_base_was_left_aside(tmp_path: Path) -> None:
-    """Une base VCS non parcourue rend le verdict « propre » non fondé."""
-    _write(tmp_path, ".git/config", f'AWS = "{_aws("git")}"')
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.hors_perimetre == 1
-    assert rapport.complet is False
-
-
-def test_a_complete_scan_is_the_only_one_that_is_founded(tmp_path: Path) -> None:
-    """Un dépôt entièrement lu (rien de laissé de côté) est `complet`."""
-    _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.complet is True
-    assert rapport.binaires_ignores == 0
-    assert rapport.non_analyses == 0
-    assert rapport.liens_ignores == 0
-    assert rapport.hors_perimetre == 0
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="liens symboliques indisponibles")
-def test_a_symlinked_directory_is_traced_and_never_followed(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Un répertoire symlinké n'est jamais suivi : il est compté et tracé."""
+def test_a_symlinked_directory_is_never_followed(tmp_path: Path) -> None:
+    """Un répertoire symlinké n'est jamais suivi : son contenu reste invisible."""
     outside = tmp_path / "outside"
     outside.mkdir()
     _write(outside, "leak.py", f'AWS = "{_aws("outside")}"')
@@ -943,85 +805,8 @@ def test_a_symlinked_directory_is_traced_and_never_followed(
         if getattr(error, "winerror", None) == 1314:
             pytest.skip("Création de liens symboliques non autorisée sous Windows")
         raise
-    rapport = scan_rapport(str(repository))
-    assert rapport.liens_ignores == 1
-    assert [finding.file for finding in rapport.findings] == ["app.py"]
-    assert "linked" in capsys.readouterr().err
-
-
-def test_the_trace_neutralises_control_characters_in_paths(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Un nom de fichier ne peut pas injecter de fausse ligne de journal."""
-    _write(tmp_path, "vendor/binaire\nFAUSSE LIGNE.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
-    rapport = scan_rapport(str(tmp_path))
-    # Le nom est hors contrat : le fichier n'est pas analysable, mais il est
-    # tracé — sur une seule ligne, sans le retour à la ligne injecté.
-    assert rapport.non_analyses == 1
-    trace = capsys.readouterr().err
-    assert "vendor/binaire?FAUSSE LIGNE.png" in trace
-    assert "\nFAUSSE LIGNE" not in trace
-    assert trace.count("\n") == 1
-
-
-@pytest.mark.parametrize(
-    "separateur",
-    [
-        pytest.param("\u2028", id="U+2028"),
-        pytest.param("\u2029", id="U+2029"),
-        pytest.param("\u0085", id="U+0085"),
-        pytest.param("\u202e", id="U+202E"),
-    ],
-)
-def test_the_trace_neutralises_unicode_separators_in_paths(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], separateur: str
-) -> None:
-    """Un séparateur Unicode ne doit pas injecter de fausse ligne de journal.
-
-    U+2028/U+2029 séparent les lignes pour un lecteur Markdown ou JSON ;
-    U+0085 est un « next line » ; U+202E inverse l'affichage. Aucun de ces
-    caractères ne doit survivre dans la trace : le journal reste une ligne
-    logique par fichier.
-    """
-    _write(
-        tmp_path,
-        f"vendor/binaire{separateur}FAUSSE LIGNE.png",
-        b"\x89PNG\r\n\x1a\n" + bytes(range(256)),
-    )
-    rapport = scan_rapport(str(tmp_path))
-    # Selon le caractère, le nom est hors contrat (U+2028/U+2029 : fichier non
-    # analysé) ou valide (U+0085/U+202E : fichier lu, binaire ignoré). Dans
-    # les deux cas, le fichier laisse **une** trace et une seule.
-    assert rapport.non_analyses + rapport.binaires_ignores == 1
-    trace = capsys.readouterr().err
-    assert separateur not in trace
-    assert "vendor/binaire?FAUSSE LIGNE.png" in trace
-    assert trace.count("\n") == 1
-    # Une seule ligne logique : aucun séparateur Unicode ne subsiste.
-    assert trace.splitlines() == [trace.rstrip("\n")]
-
-
-def test_the_trace_neutralises_surrogates_from_non_utf8_names() -> None:
-    """Un nom POSIX non UTF-8 (surrogate) ne casse pas le journal.
-
-    Python expose les octets invalides d'un nom de fichier sous forme de
-    surrogates (catégorie ``Cs``). Les laisser passer ferait échouer une
-    écriture de journal en UTF-8 strict : ils sont neutralisés comme les
-    autres caractères non sûrs.
-    """
-    assert _safe_path("vendor/binaire\udcff.png") == "vendor/binaire?.png"
-
-
-def test_the_trace_truncates_an_absurdly_long_path(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Un chemin démesuré ne noie pas le journal."""
-    _write(tmp_path, "vendor/" + "/".join("d" * 200 for _ in range(12)) + "/b.png",
-           b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
-    rapport = scan_rapport(str(tmp_path))
-    assert rapport.binaires_ignores == 1
-    trace = capsys.readouterr().err
-    assert len(trace) < 512
+    findings = scan(repository)
+    assert [finding.file for finding in findings] == ["app.py"]
 
 
 def test_utf16_utf32_without_bom_is_scanned(tmp_path: Path) -> None:
@@ -1358,7 +1143,7 @@ def test_a_root_with_a_nul_byte_is_fail_closed() -> None:
     statique, code 2 côté CLI).
     """
     with pytest.raises(ScanError) as context:
-        ScannerRacine("a\x00b")
+        scan("a\x00b")
     assert str(context.value) == "scan impossible : entrée non analysable"
 
 
@@ -1369,7 +1154,7 @@ def test_an_empty_root_is_fail_closed() -> None:
     garde explicite, ``Path("")`` vaut ``.`` et le scanner analyserait le
     répertoire courant à l'insu de l'appelant.
     """
-    for api in (ScannerRacine, scan, find_candidates):
+    for api in (scan, find_candidates):
         with pytest.raises(ScanError) as context:
             api("")
         assert str(context.value) == "scan impossible : entrée non analysable"
@@ -1378,7 +1163,7 @@ def test_an_empty_root_is_fail_closed() -> None:
 def test_a_non_path_root_is_fail_closed() -> None:
     """Un type qui n'est pas un chemin ne fuit pas une ``TypeError`` nue."""
     with pytest.raises(ScanError) as context:
-        ScannerRacine(42)  # type: ignore[arg-type]
+        scan(42)  # type: ignore[arg-type]
     assert str(context.value) == "scan impossible : entrée non analysable"
 
 
@@ -1391,7 +1176,7 @@ def test_open_flags_are_read_only_non_blocking_and_never_follow_links() -> None:
     assert flags & getattr(os, "O_NONBLOCK", 0) == getattr(os, "O_NONBLOCK", 0)
 
 
-def test_report_is_deterministic_and_sorted(tmp_path: Path) -> None:
+def test_findings_are_deterministic_and_sorted(tmp_path: Path) -> None:
     _write(tmp_path, "z.py", f'AWS = "{_aws("z")}"')
     _write(tmp_path, "a.py", f'STRIPE = "{_stripe()}"\nAWS = "{_aws()}"')
     findings = find_candidates(str(tmp_path))
@@ -1432,20 +1217,6 @@ def test_an_unreadable_directory_is_fail_closed(tmp_path: Path) -> None:
             scan(tmp_path)
     finally:
         bloque.chmod(0o700)
-
-
-@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="permissions POSIX")
-def test_an_unreadable_directory_in_a_tier_tree_is_traced(tmp_path: Path) -> None:
-    """Dans un arbre de tiers, un répertoire illisible est tracé, pas fatal."""
-    bloque = tmp_path / "vendor" / "bloque"
-    bloque.mkdir(parents=True)
-    (bloque / "secret.txt").write_text("x", encoding="utf-8")
-    bloque.chmod(0o000)
-    try:
-        rapport = scan_rapport(str(tmp_path))
-    finally:
-        bloque.chmod(0o700)
-    assert rapport.non_analyses == 1
 
 
 def test_a_file_removed_before_being_read_is_fail_closed(

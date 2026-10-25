@@ -31,6 +31,7 @@ désigné : il est donc sans effet sur le code livré.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -175,6 +176,29 @@ def verifier(text: str, racine: Path) -> list[str]:
     return problemes
 
 
+def _resoudre_fiche(fiche: Path, racine: Path) -> Path | None:
+    """Résout ``--fiche`` et la confine strictement au dépôt.
+
+    Un chemin absolu hors dépôt (``/tmp/x``), une remontée (``../../x``) ou
+    un lien symbolique interne pointant à l'extérieur sont refusés : la fiche
+    de preuves ne doit jamais être lue ni écrite hors de la racine.
+    """
+    if not fiche.is_absolute():
+        fiche = racine / fiche
+    try:
+        fiche = fiche.resolve()
+    except (OSError, RuntimeError, ValueError):
+        print(f"fiche invalide : {fiche}", file=sys.stderr)
+        return None
+    if not fiche.is_relative_to(racine):
+        print(f"fiche hors du dépôt : {fiche}", file=sys.stderr)
+        return None
+    if not fiche.is_file():
+        print(f"fiche introuvable : {fiche}", file=sys.stderr)
+        return None
+    return fiche
+
+
 def main(argv: list[str] | None = None) -> int:
     """Point d'entrée : réécrit (ou vérifie) la fiche de preuves."""
     analyseur = argparse.ArgumentParser(description=__doc__)
@@ -196,11 +220,8 @@ def main(argv: list[str] | None = None) -> int:
     arguments = analyseur.parse_args(argv)
 
     racine = Path(__file__).resolve().parents[1]
-    fiche = arguments.fiche
-    if not fiche.is_absolute():
-        fiche = racine / fiche
-    if not fiche.is_file():
-        print(f"fiche introuvable : {fiche}", file=sys.stderr)
+    fiche = _resoudre_fiche(arguments.fiche, racine)
+    if fiche is None:
         return 2
     texte = fiche.read_text(encoding="utf-8")
 
@@ -221,7 +242,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"révision inconnue de l'historique local : {sha}", file=sys.stderr)
         return 2
 
-    fiche.write_text(reecrire(texte, sha, racine), encoding="utf-8")
+    contenu = reecrire(texte, sha, racine)
+    temporaire = fiche.with_suffix(".tmp")
+    try:
+        # Écriture atomique : un crash en cours d'écriture ne doit jamais
+        # laisser une fiche de preuve tronquée. Le `fsync` garantit que les
+        # octets sont sur disque avant le remplacement.
+        with temporaire.open("w", encoding="utf-8", newline="\n") as flux:
+            flux.write(contenu)
+            flux.flush()
+            os.fsync(flux.fileno())
+        os.replace(temporaire, fiche)
+    finally:
+        temporaire.unlink(missing_ok=True)
     print(f"permaliens re-pincés sur {sha} : {fiche.relative_to(racine)}")
     return 0
 
