@@ -55,9 +55,10 @@ Les deux cibles sont figées (immuables) et validées à la construction :
 - un conteneur de lignes ou une ligne malformée est refusé : `lines` doit
   être une suite de couples `(entier, texte)`, et le résultat est normalisé
   en tuple de couples ;
-- `FileTarget.lignes()` découpe comme Git : seul `\n` sépare deux lignes, un
-  `\r` final (CRLF) est retiré, et les autres séparateurs Unicode (`\v`,
-  `\f`, `\u2028`, `\u2029`...) restent dans le contenu de la ligne. Un
+- `FileTarget.lignes()` découpe comme Git : seul `\n` sépare deux lignes. Un
+  `\r` n'est retiré que devant un `\n` (CRLF) ; un `\r` final sans `\n`
+  appartient au contenu. Les autres séparateurs Unicode (`\v`, `\f`,
+  `\u2028`, `\u2029`...) restent aussi dans le contenu de la ligne. Un
   `Finding.line` doit désigner la ligne réelle du fichier, pas une ligne
   artificielle créée par `str.splitlines()`.
 

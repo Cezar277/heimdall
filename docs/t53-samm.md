@@ -64,20 +64,22 @@ consommation. Le canari est vérifié absent du **type**, du **message**, de
 
 ## Suivi de la revue #155
 
-Révision des correctifs après fusion de `main` :
-`2329958b5f4f4eebfae0e59db7932ddc6b2f061f`
-(`merge(main): intègre main dans le suivi de revue #155 (#155)`). Les
+Révision des correctifs après la revue du bot :
+`8dd757702d1b2eff5f57b0f9ea47ffa313413b4c`
+(`fix(scanner): conserver les CR isolés dans FileTarget.lignes (#155)`). Les
 remarques MEDIUM/LOW encore applicables et les tests manquants sont traités
-sans changer le contrat de sortie ni le fail-closed. Les remarques sur
-`find_candidates`/`NotImplementedError` et sur les contrôles `Cf` sont
-devenues sans objet après la fusion : `find_candidates` est implémenté (#22)
-et les chemins bidi sont acceptés puis échappés par la CLI (#22/#24).
+sans changer le contrat de sortie ni le fail-closed. Le découpage ne retire
+un `\r` que devant un `\n` (CRLF) ; un `\r` final isolé reste dans le
+contenu. Les remarques sur `find_candidates`/`NotImplementedError` et sur les
+contrôles `Cf` sont devenues sans objet après la fusion : `find_candidates`
+est implémenté (#22) et les chemins bidi sont acceptés puis échappés par la
+CLI (#22/#24).
 
 | Remarque | Correctif | Preuve |
 |---|---|---|
-| MEDIUM — `FileTarget.lignes()` utilisait `splitlines()` (coupait aussi sur `\v`, `\f`, `\u2028/29`) | découpage sur `\n` seul, `\r\n` normalisé, autres séparateurs conservés dans le contenu | [interface.py:215–229](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/heimdall/scanner/interface.py#L215-L229) + [tests:416–448](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L416-L448) |
-| LOW — `Scanner` relisait `moteur.analyser` à chaque scan (TOCTOU) | méthode liée figée à la construction et appelée ensuite | [interface.py:300–314](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/heimdall/scanner/interface.py#L300-L314), [interface.py:329](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/heimdall/scanner/interface.py#L329) + [tests:500–521](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L500-L521) |
-| Tests manquants | `bool` refusé comme numéro de ligne, `KeyboardInterrupt` non converti, `scan_all` fail-closed sur liste mixte | [tests:376–378](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L376-L378), [tests:569–577](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L569-L577), [tests:724–732](https://github.com/Cezar277/heimdall/blob/2329958b5f4f4eebfae0e59db7932ddc6b2f061f/tests/test_scanner_interface.py#L724-L732) |
+| MEDIUM — `FileTarget.lignes()` utilisait `splitlines()` (coupait aussi sur `\v`, `\f`, `\u2028/29`) | découpage sur `\n` seul ; `\r\n` normalisé, `\r` isolé conservé, autres séparateurs conservés dans le contenu | [interface.py:215–241](https://github.com/Cezar277/heimdall/blob/8dd757702d1b2eff5f57b0f9ea47ffa313413b4c/heimdall/scanner/interface.py#L215-L241) + [tests:416–468](https://github.com/Cezar277/heimdall/blob/8dd757702d1b2eff5f57b0f9ea47ffa313413b4c/tests/test_scanner_interface.py#L416-L468) |
+| LOW — `Scanner` relisait `moteur.analyser` à chaque scan (TOCTOU) | méthode liée figée à la construction et appelée ensuite | [interface.py:311–325](https://github.com/Cezar277/heimdall/blob/8dd757702d1b2eff5f57b0f9ea47ffa313413b4c/heimdall/scanner/interface.py#L311-L325), [interface.py:340](https://github.com/Cezar277/heimdall/blob/8dd757702d1b2eff5f57b0f9ea47ffa313413b4c/heimdall/scanner/interface.py#L340) + [tests:520–541](https://github.com/Cezar277/heimdall/blob/8dd757702d1b2eff5f57b0f9ea47ffa313413b4c/tests/test_scanner_interface.py#L520-L541) |
+| Tests manquants | `bool` refusé comme numéro de ligne, `KeyboardInterrupt` non converti, `scan_all` fail-closed sur liste mixte, séparateurs `\r` isolés/Unicode conservés | [tests:376–378](https://github.com/Cezar277/heimdall/blob/8dd757702d1b2eff5f57b0f9ea47ffa313413b4c/tests/test_scanner_interface.py#L376-L378), [tests:589–597](https://github.com/Cezar277/heimdall/blob/8dd757702d1b2eff5f57b0f9ea47ffa313413b4c/tests/test_scanner_interface.py#L589-L597), [tests:744–752](https://github.com/Cezar277/heimdall/blob/8dd757702d1b2eff5f57b0f9ea47ffa313413b4c/tests/test_scanner_interface.py#L744-L752) |
 
 ## Résultats locaux
 
@@ -86,24 +88,20 @@ Environnement : Linux, Python 3.14.7, venv reconstruit depuis
 
 ```text
 .venv-ci/bin/python -m pytest tests/test_scanner_interface.py
-148 passed
+152 passed
 
 .venv-ci/bin/python -m pytest --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85
-suite complète : 1128 passed, 1 skipped, 1 xfailed (+ 4251 subtests), code retour 0
-couverture Heimdall : 96,31 % (seuil CI 85 %)
-heimdall/scanner/* : 100 % (branches incluses)
+suite complète : 2166 passed, 16 skipped (+ 4480 subtests), code retour 0
+couverture Heimdall : 91,23 % (seuil CI 85 %)
+heimdall/scanner/interface.py : 99 % (branches incluses)
 
 .venv-ci/bin/ruff check heimdall tests        # All checks passed
 .venv-ci/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
-                                            # Success: no issues found in 27 source files
+                                            # Success: no issues found in 44 source files
 .venv-ci/bin/bandit -r heimdall -q             # code retour 0, aucun rapport
 .venv-ci/bin/python docs/security/check_model.py
                                             # OK (48 scénarios, DFD, PNG)
 ```
-
-Le `xfailed` restant est celui de T21 (`tests/test_trap_acceptance.py`) : il
-attend la livraison du scanner #22 et devient un `XPASS(strict)` dès que le
-moteur réel (#54/#59) est branché sur cette interface.
 
 ## Limite assumée : la garde de chemin reste lexicale
 
