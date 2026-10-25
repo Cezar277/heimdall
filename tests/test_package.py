@@ -5,10 +5,16 @@ import os
 import pickle
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 from typer.testing import CliRunner
 
@@ -29,6 +35,21 @@ import heimdall.vault.crypto
 class PackageSmokeTests(unittest.TestCase):
     def test_version_exposed(self) -> None:
         self.assertEqual(heimdall.__version__, "0.1.0")
+
+    def test_tomli_declared_as_runtime_dependency_for_python_310(self) -> None:
+        """`client.py` importe tomli au runtime sur 3.10 : pas seulement en [dev].
+
+        Le pin est volontairement inconditionnel : un marqueur ``< 3.11`` rend
+        ``tomli`` invisible à ``pip --require-hashes`` sur les Python récents,
+        qui refuse alors la contrainte transitive non épinglée.
+        """
+        root = Path(__file__).resolve().parents[1]
+        document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        runtime = document["project"]["dependencies"]
+        normalized = [requirement.replace(" ", "") for requirement in runtime]
+        self.assertIn("tomli==2.5.0", normalized)
+        dev = document["project"]["optional-dependencies"]["dev"]
+        self.assertFalse(any(requirement.startswith("tomli==") for requirement in dev))
 
     def test_subpackages_importable(self) -> None:
         for module in (
@@ -124,10 +145,15 @@ class PackageSmokeTests(unittest.TestCase):
 
     def test_vault_client_allows_loopback_https_only(self) -> None:
         """HIGH : tout hôte non local est rejeté (exfiltration impossible)."""
-        for base_url in ("https://127.0.0.1:8443", "https://[::1]:8443", "https://localhost:8443"):
+        for base_url in ("https://127.0.0.1:8443", "https://[::1]:8443"):
             with self.subTest(base_url=base_url):
                 client = heimdall.vault.client.VaultClient(base_url, "PLACEHOLDER")
                 self.assertEqual(client._base_url, base_url)
+        # localhost accepté mais épinglé vers l'IP à la construction
+        # (anti-rebinding) : jamais de nom d'hôte stocké dans _base_url.
+        pinned = heimdall.vault.client.VaultClient("https://localhost:8443", "PLACEHOLDER")
+        self.assertIn(pinned._base_url, ("https://127.0.0.1:8443", "https://[::1]:8443"))
+        self.assertNotIn("localhost", pinned._base_url)
         for base_url in (
             "https://evil.example",
             "https://127.0.0.1.evil.example",

@@ -50,6 +50,7 @@ varie), environnement confiné, stdin fermé, aucun fetch.
 import os
 import re
 import shutil
+import stat
 import subprocess  # nosec B404
 import threading
 import time
@@ -60,9 +61,10 @@ from typing import Final
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.paths import is_rel_path
-from heimdall.scanner.detect import MAX_FILE_BYTES, _resolve_root
+from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import validate_relative_path
+from heimdall.scanner.interface import _open_flags, _resolve_root
 
 # Options NON négociables (contrat 4.1) — voir le tableau du contrat pour la
 # justification de chacune. `-C` place git dans la racine sans dépendre du
@@ -112,6 +114,15 @@ STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
     "--no-ext-diff",
     "--no-textconv",
 )
+
+#: Modes d'index d'un fichier **ordinaire** suivi : les seuls pour lesquels une
+#: comparaison blob worktree/index a un sens pour la garde CWE-345. Un lien
+#: symbolique (120000) ou un gitlink (160000) n'est pas un fichier de config
+#: lisible : refus fail-closed côté appelant.
+_REGULAR_FILE_MODES: Final[frozenset[str]] = frozenset({"100644", "100755"})
+
+#: Champs de l'en-tête ``git ls-files -s`` : ``mode sha stage``.
+_LS_FILES_HEADER_FIELDS: Final[int] = 3
 
 
 # Environnement minimal du sous-processus git. Aucune variable de
@@ -421,6 +432,106 @@ class GitAccess:
         if completed.returncode == 1:
             return False
         raise ToolFailure("INTERNAL")
+
+    def _checked_index_path(self, *, timeout: float) -> Path:
+        """Chemin réel de l'index git, refusé s'il n'est pas un fichier ordinaire.
+
+        `git rev-parse --git-path index` couvre les dépôts standards, les
+        worktrees liés (`.git` est alors un fichier) et les sous-modules. Le
+        chemin est ensuite passé par la garde unique `_resolve_root` (refus de
+        tout lien symbolique sur le chemin) puis ouvert avec `O_NOFOLLOW` :
+        un index remplacé par un lien n'est jamais suivi en silence.
+        """
+        completed = self.execute(("rev-parse", "--git-path", "index"), timeout=timeout)
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        raw = completed.stdout[:-1] if completed.stdout.endswith(b"\n") else completed.stdout
+        if not raw or b"\x00" in raw or b"\n" in raw:
+            raise ToolFailure("INTERNAL")
+        try:
+            path = Path(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            raise ToolFailure("INTERNAL") from None
+        if not path.is_absolute():
+            path = self._root / path
+        try:
+            resolved = _resolve_root(path)
+            # O_NONBLOCK évite qu'un FIFO placé à la place de l'index ne
+            # bloque l'ouverture ; le fstat ci-dessous refuse tout non-régulier.
+            descriptor = os.open(resolved, _open_flags() | getattr(os, "O_NONBLOCK", 0))
+        except (ScanError, OSError):
+            raise ToolFailure("INTERNAL") from None
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ToolFailure("INTERNAL")
+        except OSError:
+            raise ToolFailure("INTERNAL") from None
+        finally:
+            # `os.close` peut lever `OSError` (EBADF/EINTR sur FS adverse) :
+            # convertir pour garder le contrat `ToolFailure("INTERNAL")`
+            # (invariant 11), comme `allowlist.py` et `scan.py` le font déjà.
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise ToolFailure("INTERNAL") from None
+        return resolved
+
+    def index_entry(
+        self,
+        relative_path: str,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> tuple[str, str] | None:
+        """Entrée d'index d'un fichier suivi, ou ``None`` s'il n'est pas suivi.
+
+        Rend ``(mode, sha)`` pour une entrée de stage 0 dont le mode est un
+        fichier ordinaire (``100644``/``100755``). Un chemin absent, un lien
+        symbolique, un gitlink (sous-module), un index en conflit ou une
+        sortie illisible sont refusés : ``None`` pour l'absence, sinon
+        ``ToolFailure``. Le format binaire DIRC n'est **jamais** reparsé ici :
+        c'est git qui répond, donc les index v2/v3/v4 et leurs extensions sont
+        couverts sans dette de maintenance.
+        """
+        try:
+            validate_relative_path(relative_path)
+        except ValueError:
+            raise ToolFailure("INTERNAL") from None
+        # Refus d'un index symlinké avant de laisser git le lire : `git
+        # ls-files` suivrait le lien sans le dire.
+        self._checked_index_path(timeout=timeout)
+        completed = self.execute(
+            ("ls-files", "-s", "-z", "--", relative_path),
+            timeout=timeout,
+        )
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        entries = [entry for entry in completed.stdout.split(b"\x00") if entry]
+        if not entries:
+            return None
+        if len(entries) != 1:
+            # Index non résolu (plusieurs stages) ou chemin ambigu.
+            raise ToolFailure("INTERNAL")
+        header, separator, path_bytes = entries[0].partition(b"\t")
+        if not separator:
+            raise ToolFailure("INTERNAL")
+        fields = header.split(b" ")
+        if len(fields) != _LS_FILES_HEADER_FIELDS:
+            raise ToolFailure("INTERNAL")
+        mode, sha, stage = fields
+        if stage != b"0":
+            raise ToolFailure("INTERNAL")
+        try:
+            mode_str = mode.decode("ascii")
+            sha_str = sha.decode("ascii")
+            path_str = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ToolFailure("INTERNAL") from None
+        if path_str != relative_path or _OBJECT_PATTERN.fullmatch(sha_str) is None:
+            raise ToolFailure("INTERNAL")
+        if mode_str not in _REGULAR_FILE_MODES:
+            return None
+        return mode_str, sha_str
 
     def staged_diff(self, max_bytes: int) -> tuple[bytes, bool]:
         """Sortie brute de ``git diff --cached``, lue en flux borné à ``max_bytes``.

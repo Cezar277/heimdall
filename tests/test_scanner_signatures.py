@@ -305,7 +305,10 @@ def test_validate_rules_refuses_a_secret_type_outside_the_closed_set() -> None:
 
 def test_every_registered_secret_type_is_in_the_closed_set() -> None:
     """Le registre livré ne produit que des types documentés."""
-    assert {rule.secret_type for rule in RULES} == set(ALLOWED_SECRET_TYPES)
+    assert {rule.secret_type for rule in RULES} == set(ALLOWED_SECRET_TYPES) - {
+        "high_entropy_hex",
+        "high_entropy_base64",
+    }
 
 
 def test_matches_refuses_a_non_string_line() -> None:
@@ -615,14 +618,15 @@ def test_engine_does_not_join_non_consecutive_diff_lines() -> None:
         path="config.py",
         lines=((12, "aws_secret_access_key ="), (15, f'"{secret}"')),
     )
-    assert _findings(target) == []
+    assert [(f.line, f.source) for f in _findings(target)] == [(15, "entropy")]
 
 
 def test_engine_does_not_join_beyond_the_documented_window() -> None:
     """Au-delà de 4 Kio, la jointure n'est pas faite : limite documentée."""
     secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     text = "aws_secret_access_key = " + "x" * 5_000 + f'\n"{secret}"\n'
-    assert _findings(FileTarget(path="config.py", text=text)) == []
+    with pytest.raises(ScanError):
+        _findings(FileTarget(path="config.py", text=text))
 
 
 def test_engine_measures_the_window_in_utf8_bytes() -> None:
@@ -638,7 +642,8 @@ def test_engine_measures_the_window_in_utf8_bytes() -> None:
     text = f'{prefix}{padding}\n"{secret}"\n'
     assert len(prefix) + len(padding) + len(secret) + 2 <= 4096  # caractères
     assert len((prefix + padding + secret + '""').encode("utf-8")) > 4096  # octets
-    assert _findings(FileTarget(path="config.py", text=text)) == []
+    with pytest.raises(ScanError):
+        _findings(FileTarget(path="config.py", text=text))
 
 
 def test_engine_scan_is_deterministic() -> None:
