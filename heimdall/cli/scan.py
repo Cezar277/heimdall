@@ -212,13 +212,16 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
         raise ScanError(_MSG_ROOT_CHANGED)
 
 
-def _read_worktree_file(path: Path) -> bytes | None:
+def _read_worktree_file(path: Path, *, max_bytes: int = MAX_CONFIG_BYTES) -> bytes | None:
     """Lit un fichier du worktree via la garde unique, sans suivre de lien.
 
     Retourne ``None`` au moindre doute : chemin non résoluble, lien
     symbolique, non-régulier, trop gros ou lecture incomplète. La taille est
-    bornée par :data:`MAX_CONFIG_BYTES` (ce helper ne sert qu'à la config).
+    bornée par :data:`MAX_CONFIG_BYTES` pour la config ; le cold start peut
+    demander au plus :data:`MAX_FILE_BYTES` pour un contexte candidat.
     """
+    if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_FILE_BYTES:
+        return None
     try:
         resolved = _resolve_root(path)
         # O_NONBLOCK évite qu'un FIFO placé à la place du fichier ne bloque
@@ -233,7 +236,7 @@ def _read_worktree_file(path: Path) -> bytes | None:
     try:
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_CONFIG_BYTES:
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
                 return None
             expected = metadata.st_size
             chunks: list[bytes] = []

@@ -23,6 +23,7 @@ from typing import Final
 import typer
 
 import heimdall
+from heimdall.cli.cold_start import collect_cold_start, render_cold_start
 from heimdall.cli.scan import (
     EXIT_CLEAN,
     EXIT_FINDINGS,
@@ -187,6 +188,25 @@ def scan(  # noqa: PLR0913, PLR0917
         _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
     raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
+
+
+@app.command("cold-start")
+def cold_start(
+    path: str = typer.Argument(".", help="Racine du dépôt existant à analyser."),
+    ci: bool = typer.Option(False, "--ci", help="Déterministe : aucun appel LLM ni journal."),
+    llm: bool = typer.Option(
+        True, "--llm/--no-llm", help="Qualifie les seuls candidats localement."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Rapport machine sans secret."),
+) -> None:
+    """Premier scan complet : regex/entropie puis avis du LLM local (#107)."""
+    try:
+        report = collect_cold_start(Path(path), ci=ci, llm=llm)
+        typer.echo(render_cold_start(report, json_output=json_output))
+    except Exception:
+        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
+        raise typer.Exit(code=2) from None
+    raise typer.Exit(code=EXIT_FINDINGS if report.scan.findings else EXIT_CLEAN)
 
 
 @app.command()
