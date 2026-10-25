@@ -16,6 +16,7 @@ Invariant 8 : aucun message d'erreur ne reflète une entrée (chemin, contenu,
 candidat). Les messages sont statiques.
 """
 
+import json
 from pathlib import Path
 from typing import Final
 
@@ -32,6 +33,7 @@ from heimdall.cli.scan import (
 )
 from heimdall.cli.vault_client import RUN_CONTEXT_SETTINGS, vault_run
 from heimdall.cli.vault_keys import vault_app
+from heimdall.llm.rejections import RejectionJournal, rejection_summary
 from heimdall.mcp.server import run_stdio
 from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.errors import ScanError
@@ -121,12 +123,11 @@ def scan(  # noqa: PLR0913, PLR0917
 ) -> None:
     """Scanne le dépôt à la recherche de secrets (#29 et #24).
 
-    Par défaut, l'arbre de travail est analysé en **mode strict** : seule la
-    base VCS est écartée, tout le reste est lu par contenu (``vendor/``,
-    ``node_modules/``, lockfiles compris). Un rapport incomplet (binaire,
-    lien, illisible) refuse le verdict propre. Avec ``--staged``, ce sont les
-    blobs **ajoutés ou modifiés** dans l'index git qui sont analysés, sans
-    aucune exclusion de chemin.
+    Par défaut, l'arbre de travail est analysé en **mode strict** : seules
+    les exclusions techniques de #59 restent (binaires, répertoires générés),
+    ``vendor/`` et les lockfiles sont donc parcourus. Avec ``--staged``, ce
+    sont les blobs **ajoutés ou modifiés** dans l'index git qui sont
+    analysés, sans aucune exclusion de chemin.
 
     L'allowlist déterministe (#24) écarte les cas évidents sans passer par
     le LLM et émet une trace pour chaque rejet (règle, fichier, ligne).
@@ -163,18 +164,12 @@ def scan(  # noqa: PLR0913, PLR0917
             typer.echo(render_text(report))
         if ci:
             # Résumé déterministe sur stderr : le journal CI montre toujours
-            # le verdict, les findings ignorés, l'empreinte sha256 de config
-            # et les bases VCS élaguées (jamais présentées comme analysées).
-            hash_info = (
-                f" (config sha256:{report.config_hash})"
-                if report.config_hash
-                else ""
-            )
+            # le verdict, le nombre de findings ignorés et l'empreinte sha256 de config.
+            hash_info = f" (config sha256:{report.config_hash})" if report.config_hash else ""
             typer.echo(
                 f"heimdall scan : périmètre {report.scope}, "
                 f"{len(report.findings)} secret(s) détecté(s), "
-                f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}, "
-                f"{report.vcs_ignored} base(s) VCS élaguée(s).",
+                f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}.",
                 err=True,
             )
     except (ScanError, ToolFailure):
@@ -192,6 +187,23 @@ def scan(  # noqa: PLR0913, PLR0917
         _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
     raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
+
+
+@app.command()
+def rejections(
+    details: bool = typer.Option(False, "--details", help="Affiche les entrées JSONL vérifiées."),
+) -> None:
+    """Vérifie et affiche le journal local des propositions de rejet du LLM (#33)."""
+    try:
+        entries = RejectionJournal().read()
+        typer.echo(rejection_summary(len(entries)))
+        if details:
+            for entry in entries:
+                # Échappement JSON : ni contrôle terminal ni nom trompeur brut.
+                typer.echo(json.dumps(entry, sort_keys=True, ensure_ascii=True, allow_nan=False))
+    except Exception:
+        _echo_stderr_best_effort("heimdall : journal des rejets indisponible ou invalide.")
+        raise typer.Exit(code=2) from None
 
 
 @app.command()

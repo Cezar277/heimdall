@@ -1,5 +1,8 @@
 # CLI `heimdall scan` (#29)
 
+Le journal des propositions de rejet du LLM se consulte avec
+`heimdall rejections [--details]` ; voir [T33](llm-rejections.md).
+
 Statut : livré par le ticket #29 (sous-ticket de l'épic #6 « CLI, hook et CI
 headless »). La commande est **branchée** sur le scanner déterministe #22 et
 sur l'accès git confiné #27. Elle est **en lecture seule sur le dépôt** :

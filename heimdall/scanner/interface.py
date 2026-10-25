@@ -214,8 +214,32 @@ class FileTarget:
         return f"FileTarget(path={self.path!r}, caracteres={len(self.text)})"
 
     def lignes(self) -> tuple[tuple[int, str], ...]:
-        """Les lignes à analyser, numérotées à partir de 1."""
-        return tuple(enumerate(self.text.splitlines(), start=1))
+        """Les lignes à analyser, numérotées à partir de 1.
+
+        Le découpage suit les lignes Git : seul ``\\n`` sépare deux lignes. Un
+        ``\\r`` n'est retiré que s'il termine une ligne réellement suivie d'un
+        ``\\n`` (CRLF) ; un ``\\r`` final sans ``\\n`` appartient au contenu.
+        Les autres séparateurs Unicode (``\\v``, ``\\f``, ``\\u2028``,
+        ``\\u2029``...) restent aussi dans le texte de la ligne : un
+        ``Finding.line`` doit désigner la ligne réelle du fichier, pas une
+        ligne artificielle créée par ``str.splitlines()``.
+        """
+        if not self.text:
+            return ()
+        ends_with_lf = self.text.endswith("\n")
+        lines = self.text.split("\n")
+        if ends_with_lf:
+            # Un \n final ne crée pas de ligne vide supplémentaire.
+            lines.pop()
+        return tuple(
+            (
+                number,
+                line[:-1]
+                if line.endswith("\r") and (number < len(lines) or ends_with_lf)
+                else line,
+            )
+            for number, line in enumerate(lines, start=1)
+        )
 
 
 #: Les deux cibles acceptées par le scanner.
@@ -285,7 +309,7 @@ class Scanner:
     du moteur, ni une valeur candidate, ne sont jamais reflétés (invariant 8).
     """
 
-    __slots__ = ("_moteur",)
+    __slots__ = ("_analyser",)
 
     def __init__(self, moteur: Moteur) -> None:
         echec = False
@@ -296,7 +320,10 @@ class Scanner:
             echec = True
         if echec or not callable(analyser):
             raise ScanError("moteur de détection invalide") from None
-        self._moteur = moteur
+        # La méthode liée est figée à la construction : une mutation de
+        # ``moteur.analyser`` après coup ne peut pas changer le moteur
+        # réellement appelé (défense en profondeur contre un TOCTOU).
+        self._analyser = cast(Callable[[ScanTarget], list[Finding]], analyser)
 
     def scan(self, cible: ScanTarget) -> list[Finding]:
         """Analyse une cible et rend ses Findings, triés de façon stable.
@@ -311,7 +338,7 @@ class Scanner:
         """
         if not isinstance(cible, (DiffTarget, FileTarget)):
             raise InvalidTarget("cible d'analyse non conforme : type")
-        resultat = _guard_call(lambda: self._moteur.analyser(cible), _MSG_ENGINE_FAILURE)
+        resultat = _guard_call(lambda: self._analyser(cible), _MSG_ENGINE_FAILURE)
         if resultat is None:
             raise ScanError(_MSG_BAD_OUTPUT)
         # Rendu non itérable **ou** générateur qui lève à la consommation :
