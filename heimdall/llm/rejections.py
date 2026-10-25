@@ -20,8 +20,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final
 
-from heimdall.llm.qualify import DEFAULT_MODEL, ChatFn, Qualification, qualify_candidate
-from heimdall.mcp.prompts import PROMPT_NAME, prompt_digest
+from heimdall.llm.qualify import (
+    DEFAULT_MODEL,
+    ChatFn,
+    Qualification,
+    QualifyError,
+    qualify_candidate,
+)
+from heimdall.mcp.masking import REDACTION_MARKER
+from heimdall.mcp.prompts import MAX_CANDIDATE_CHARS, PROMPT_NAME, prompt_digest
 from heimdall.scanner.finding import Finding
 
 if sys.platform == "win32":
@@ -73,29 +80,54 @@ def _check_file(descriptor: int) -> None:
         raise JournalError
 
 
-@contextmanager
-def _locked(path: Path) -> Iterator[int]:
-    """Un seul lecteur/rédacteur à la fois ; concurrence refusée, sans attente."""
+def _prepare_path(path: Path, *, create: bool) -> Path | None:
+    """Vérifie les chemins ; seul append peut créer le répertoire privé."""
     if not path.is_absolute() or ".." in path.parts or path.resolve() != path:
         raise JournalError
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    if lock_path.resolve() != lock_path:
+        raise JournalError
+    if create:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    else:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
     if os.name == "posix":
         metadata = path.parent.stat()
         if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
             raise JournalError
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    return lock_path
+
+
+@contextmanager
+def _locked(path: Path, *, create: bool = True) -> Iterator[int | None]:
+    """Verrou exclusif non bloquant ; seule la voie append crée des fichiers.
+
+    En lecture, None représente un journal absent. Un journal existant sans
+    sidecar est une erreur d'intégrité, jamais un historique vide.
+    """
+    lock_path = _prepare_path(path, create=create)
+    if lock_path is None:
+        yield None
+        return
+    flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     # Sidecar stable : le verrou protège aussi la vérification avant append.
-    lock_path = path.with_suffix(".lock")
-    if lock_path.resolve() != lock_path:
-        raise JournalError
-    lock = os.open(lock_path, flags, 0o600)
+    # Windows exige un descripteur inscriptible pour le verrou exclusif,
+    # mais la consultation n'écrit aucun octet dans le sidecar.
+    lock_flags = os.O_RDWR if create or sys.platform == "win32" else os.O_RDONLY
+    if create:
+        lock_flags |= os.O_CREAT
+    lock = os.open(lock_path, flags | lock_flags, 0o600)
     try:
         _check_file(lock)
         if sys.platform == "win32":
             msvcrt.locking(lock, msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        descriptor = os.open(path, flags | os.O_APPEND, 0o600)
+        journal_flags = os.O_RDWR | os.O_CREAT | os.O_APPEND if create else os.O_RDONLY
+        descriptor = os.open(path, flags | journal_flags, 0o600)
         try:
             _check_file(descriptor)
             if path.resolve() != path:
@@ -162,8 +194,8 @@ class RejectionJournal:
     def read(self) -> list[dict[str, Any]]:
         """Relit et vérifie la chaîne ; un journal absent est vide."""
         try:
-            with _locked(self.path) as descriptor:
-                return _entries(descriptor)
+            with _locked(self.path, create=False) as descriptor:
+                return [] if descriptor is None else _entries(descriptor)
         except (OSError, ValueError, RuntimeError, RecursionError):
             raise JournalError from None
 
@@ -173,6 +205,8 @@ class RejectionJournal:
             if not isinstance(model, str) or re.fullmatch(r"[a-zA-Z0-9._:/-]{1,64}", model) is None:
                 raise JournalError
             with _locked(self.path) as descriptor:
+                if descriptor is None:
+                    raise JournalError
                 entries = _entries(descriptor)
                 entry = {
                     "schema": SCHEMA,
@@ -220,6 +254,10 @@ def qualify_finding(  # noqa: PLR0913 -- contexte, politique CI et transport inj
     """
     if ci:
         return Qualification(status="detecte", verdict=None, reason="unavailable")
+    if not isinstance(masked_candidate, str) or REDACTION_MARKER not in masked_candidate:
+        raise QualifyError("empty")
+    if len(masked_candidate) > MAX_CANDIDATE_CHARS:
+        raise QualifyError("too_large")
     result = qualify_candidate(masked_candidate, model=model, chat=chat)
     if result.verdict == "faux_positif":
         (journal if journal is not None else RejectionJournal()).append(finding, model=model)
@@ -230,6 +268,7 @@ def qualify_finding(  # noqa: PLR0913 -- contexte, politique CI et transport inj
 def rejection_summary(count: int) -> str:
     """Résumé explicite : propositions du LLM, pas autorisations de commit."""
     return (
-        f"{count} candidat(s) écarté(s) par le LLM (propositions uniquement) ; "
-        "voir le détail : heimdall rejections --details. Validation humaine requise."
+        f"{count} candidat(s) proposé(s) comme faux positif(s) par le LLM "
+        "(propositions uniquement, validation humaine requise) ; "
+        "voir le détail : heimdall rejections --details."
     )

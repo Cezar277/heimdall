@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,6 +18,7 @@ from heimdall.cli import main as cli_module
 from heimdall.cli.main import app
 from heimdall.cli.scan import ScanReport
 from heimdall.llm import rejections as audit
+from heimdall.llm.qualify import QualifyError
 from heimdall.llm.rejections import JournalError, RejectionJournal, qualify_finding
 from heimdall.scanner.finding import Finding
 
@@ -52,6 +55,18 @@ def test_rejection_is_durable_visible_and_never_removes_finding(
     assert finding.as_dict() == before
     assert "1 candidat(s)" in caplog.text
     assert "heimdall rejections --details" in caplog.text
+    warnings = [record.getMessage() for record in caplog.records if record.name == audit.__name__]
+    assert len(warnings) == 1
+    for fragment in (
+        finding.file,
+        Path(finding.file).name,
+        finding.snippet_hash,
+        finding.snippet_hash[:12],
+        "TOKEN",
+        "REDACTED",
+        "aws:len=20",
+    ):
+        assert fragment not in warnings[0]
     entries = journal.read()
     assert len(entries) == 1
     entry = entries[0]
@@ -195,20 +210,180 @@ def test_cli_summary_and_escaped_details(
     result = CliRunner().invoke(app, ["rejections", "--details"])
     assert result.exit_code == 0
     assert "4 candidat(s)" in result.stdout
+    assert "proposé(s) comme faux positif(s)" in result.stdout
+    assert "écarté(s)" not in result.stdout
     lines = result.stdout.splitlines()
     assert len(lines) == 5
     assert json.loads(lines[-1])["sequence"] == 4
 
 
-def test_cli_corruption_exit_two(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_cli_corruption_exit_two(
+    finding: Finding, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     journal = RejectionJournal()
-    assert journal.read() == []
+    journal.append(finding, model=audit.DEFAULT_MODEL)
     journal.path.write_text("SYNTHETIC_PRIVATE_ERROR\n")
     result = CliRunner().invoke(app, ["rejections", "--details"])
     assert result.exit_code == 2
     assert "SYNTHETIC_PRIVATE_ERROR" not in result.output
     assert "indisponible ou invalide" in result.output
+
+
+@pytest.mark.parametrize("existing_base", [False, True])
+def test_read_absent_journal_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing_base: bool
+) -> None:
+    state = tmp_path / "state"
+    if existing_base:
+        state.mkdir()
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    before = list(tmp_path.rglob("*"))
+    assert RejectionJournal().read() == []
+    result = CliRunner().invoke(app, ["rejections", "--details"])
+    assert result.exit_code == 0
+    assert "0 candidat(s)" in result.stdout
+    assert list(tmp_path.rglob("*")) == before
+
+
+def test_empty_xdg_uses_default_without_creating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", "")
+    monkeypatch.setattr(audit.Path, "home", lambda: tmp_path)
+    assert audit.journal_path() == tmp_path / ".local/state/heimdall/llm-rejections.jsonl"
+    assert RejectionJournal().read() == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_relative_xdg_fails_without_creating_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", "relative")
+    result = CliRunner().invoke(app, ["rejections"])
+    assert result.exit_code == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_existing_journal_read_never_creates_or_writes(
+    finding: Finding, journal: RejectionJournal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal.append(finding, model=audit.DEFAULT_MODEL)
+    original = journal.path.read_bytes()
+    real_open = os.open
+
+    def read_only_open(path: Path, flags: int, mode: int = 0o777) -> int:
+        assert not flags & os.O_CREAT
+        if path == journal.path:
+            assert not flags & (os.O_RDWR | os.O_WRONLY | os.O_APPEND)
+        return real_open(path, flags, mode)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("une consultation ne doit ni creer ni ecrire")
+
+    monkeypatch.setattr(audit.os, "open", read_only_open)
+    monkeypatch.setattr(audit.os, "write", forbidden)
+    monkeypatch.setattr(audit.os, "fsync", forbidden)
+    monkeypatch.setattr(audit.Path, "mkdir", forbidden)
+    assert len(journal.read()) == 1
+    assert journal.path.read_bytes() == original
+
+
+def test_existing_journal_without_lock_is_not_silently_empty(
+    finding: Finding, journal: RejectionJournal
+) -> None:
+    journal.append(finding, model=audit.DEFAULT_MODEL)
+    before = journal.path.read_bytes()
+    lock = journal.path.with_suffix(".lock")
+    lock.unlink()
+    with pytest.raises(JournalError):
+        journal.read()
+    assert not lock.exists()
+    assert journal.path.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="permissions POSIX")
+@pytest.mark.parametrize("existing_journal", [False, True])
+def test_read_in_unwritable_state_never_creates_files(
+    tmp_path: Path, finding: Finding, monkeypatch: pytest.MonkeyPatch, existing_journal: bool
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    journal = RejectionJournal()
+    if existing_journal:
+        journal.append(finding, model=audit.DEFAULT_MODEL)
+        journal.path.chmod(0o400)
+        journal.path.with_suffix(".lock").chmod(0o400)
+    else:
+        journal.path.parent.mkdir(mode=0o700)
+    before = list(tmp_path.rglob("*"))
+    journal.path.parent.chmod(0o500)
+    try:
+        result = CliRunner().invoke(app, ["rejections"])
+        assert result.exit_code == 0
+        assert f"{int(existing_journal)} candidat(s)" in result.stdout
+        assert list(tmp_path.rglob("*")) == before
+    finally:
+        journal.path.parent.chmod(0o700)
+
+
+def test_two_reads_refuse_concurrency_explicitly(
+    finding: Finding, journal: RejectionJournal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal.append(finding, model=audit.DEFAULT_MODEL)
+    entered, release = Event(), Event()
+    real_entries = audit._entries
+
+    def blocked_read(descriptor: int) -> list[dict[str, Any]]:
+        entered.set()
+        assert release.wait(timeout=5)
+        return real_entries(descriptor)
+
+    monkeypatch.setattr(audit, "_entries", blocked_read)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(journal.read)
+        try:
+            assert entered.wait(timeout=5)
+            with pytest.raises(JournalError):
+                journal.read()
+        finally:
+            release.set()
+        assert len(first.result(timeout=5)) == 1
+
+
+@pytest.mark.parametrize(
+    ("candidate", "reason"),
+    [
+        ("<REDACTED:aws:len=20>", None),
+        ("RAW_SYNTHETIC_CANDIDATE", "empty"),
+        ("", "empty"),
+        (None, "empty"),
+        ("<REDACTED:aws:len=20>" + "x" * audit.MAX_CANDIDATE_CHARS, "too_large"),
+    ],
+)
+def test_masking_guard_precedes_model_and_journal(
+    finding: Finding, journal: RejectionJournal, candidate: Any, reason: str | None
+) -> None:
+    calls = []
+    reply = chat_reply()
+
+    def chat(**kwargs: Any) -> SimpleNamespace:
+        calls.append("model")
+        return reply(**kwargs)
+
+    if reason is None:
+        result = qualify_finding(finding, candidate, chat=chat, journal=journal)
+        assert result.verdict == "faux_positif"
+        assert calls == ["model"]
+        assert len(journal.read()) == 1
+    else:
+        with pytest.raises(QualifyError) as error:
+            qualify_finding(finding, candidate, chat=chat, journal=journal)
+        assert error.value.code == reason
+        if candidate:
+            assert candidate not in str(error.value)
+        assert calls == []
+        assert not journal.path.parent.exists()
 
 
 def test_insecure_paths_rejected(tmp_path: Path) -> None:

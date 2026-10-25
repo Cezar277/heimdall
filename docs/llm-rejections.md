@@ -14,12 +14,15 @@ heimdall rejections           # vérifie la chaîne et affiche le nombre de prop
 heimdall rejections --details # ajoute les entrées JSONL vérifiées
 ```
 
-Le résumé affiche « N candidat(s) écarté(s) par le LLM (propositions
-uniquement) ; voir le détail… Validation humaine requise. » Le nombre
+Le résumé affiche « N candidat(s) proposé(s) comme faux positif(s) par le LLM
+(propositions uniquement, validation humaine requise) ; voir le détail… ». Le nombre
 porte sur l'historique local complet, pas sur le dernier scan. Les détails
 utilisent l'échappement JSON ASCII : les noms de fichiers contenant des
 contrôles ou des caractères directionnels ne peuvent pas modifier le terminal.
-Un journal absent donne zéro ; la lecture initialise un fichier vide.
+Un journal absent donne zéro, sans créer de répertoire, de journal ni de
+fichier de verrou. La consultation ouvre les fichiers existants sans
+`O_CREAT` et le journal en lecture seule. Un journal existant sans son
+fichier de verrou est refusé, sans le recréer ni masquer l'historique.
 Une erreur de lecture, d'intégrité ou de rendu sort en **2**, avec un message
 statique et sans afficher de données provenant du journal corrompu.
 
@@ -30,6 +33,15 @@ La frontière d'orchestration est
 L'appelant fournit le Finding déterministe et un extrait **déjà masqué** par
 le MCP (contrat #16), jamais la valeur du secret. Le modèle et le chemin du
 journal appartiennent à la configuration de l'opérateur, pas à la sortie du LLM.
+
+Hors CI, l'orchestration refuse un candidat sans le marqueur `<REDACTED:`
+(`QualifyError("empty")`) ou dépassant `MAX_CANDIDATE_CHARS`
+(`QualifyError("too_large")`), avant tout appel au modèle ou au journal.
+L'appelant conserve alors le Finding et traite cette entrée invalide comme
+une erreur d'outillage. Cette garde minimale ne prouve pas que l'extrait
+entier est masqué : #32 devra tester que **toutes** les valeurs sensibles
+passent par le masquage MCP avant l'appel, même en présence d'un marqueur
+préexistant dans le code source.
 
 ```python
 from heimdall.llm.rejections import qualify_finding
@@ -80,8 +92,10 @@ projet : il reste local et ne doit pas être ajouté à Git.
 
 La chaîne entière est vérifiée avant chaque append et chaque consultation.
 Un verrou système non bloquant sur un fichier `.lock` stable sérialise
-lecteurs et rédacteurs ; un accès concurrent échoue explicitement au lieu
-de créer deux branches de chaîne. Une écriture courte est poursuivie ; une
+lecteurs et rédacteurs ; le verrou reste **exclusif**, y compris entre deux
+consultations simultanées d'un journal existant. Le second accès échoue
+explicitement (code 2 dans la CLI), sans attente ni modification des fichiers.
+Une écriture courte est poursuivie ; une
 écriture interrompue reste détectable et n'est jamais réparée silencieusement.
 Les limites sont 32 Kio par entrée et 16 Mio par journal : au-delà, refus,
 sans troncature ni rotation automatique. Archiver le journal vérifié avant
@@ -106,5 +120,7 @@ outil permettant d'écrire le journal.
 `tests/test_llm_rejections.py` couvre l'append et la relecture, les champs
 de preuve, la non-fuite, les altérations, les réponses hostiles, les erreurs
 I/O, les écritures courtes, la concurrence, les plafonds, les permissions
-POSIX, le résumé et les détails CLI, ainsi que le court-circuit CI.
+POSIX, la consultation sans création (état absent, relatif, vide ou non
+inscriptible), le refus des lectures concurrentes, les gardes de masquage
+avant appel, la non-fuite du résumé, ainsi que le court-circuit CI.
 Tous les appels de modèle sont factices et hors ligne.
