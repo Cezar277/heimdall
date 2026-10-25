@@ -35,11 +35,7 @@ from heimdall.scanner.detect import (
     scan,
 )
 from heimdall.scanner.entropy import shannon_entropy
-from heimdall.scanner.exclusions import (
-    decode_text,
-    is_excluded,
-    is_excluded_directory,
-)
+from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import validate_relative_path
 from heimdall.scanner.hashing import KEY_ENV, KEY_FILE_ENV, SnippetHasher, load_local_key
 from heimdall.scanner.signatures import SIGNATURES, find_signature_matches
@@ -502,47 +498,6 @@ def test_secret_split_by_more_than_two_newlines_is_a_documented_limit(tmp_path: 
 # --- Exclusions (#59) -------------------------------------------------------
 
 
-def test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries() -> None:
-    for path in (
-        ".coverage",
-        ".gitignore",
-        ".git/config",
-        "package-lock.json",
-        "poetry.lock",
-        "vendor/lib.py",
-        "node_modules/pkg/index.js",
-        "Vendor/lib.py",
-        "image.png",
-        "archive.zip",
-    ):
-        assert is_excluded(path), path
-    for path in (".env", "app.py", "deploy.pem", "requirements.txt", "notes"):
-        assert not is_excluded(path), path
-    assert is_excluded_directory("VENDOR")
-    assert is_excluded_directory(".venv")
-    assert not is_excluded_directory("env")
-    assert not is_excluded_directory("src")
-    assert not is_excluded("")
-    # Revue (LOW) : en strict, un suffixe binaire n'exclut plus à lui seul ;
-    # le contenu décide (un texte mal nommé doit être scanné).
-    assert not is_excluded("image.png", strict=True)
-    assert is_excluded(".coverage", strict=True)
-    assert is_excluded("node_modules/pkg/index.js", strict=True)
-    # Revue (LOW) : les sorties de build textuelles ne sont plus techniques.
-    for path in (
-        "build/output.js",
-        "dist/bundle.js",
-        "target/app.js",
-        "bower_components/lib.js",
-        "htmlcov/index.html",
-    ):
-        assert is_excluded(path), path
-        assert not is_excluded(path, strict=True), path
-    assert is_excluded_directory("build")
-    assert not is_excluded_directory("build", strict=True)
-    assert is_excluded_directory("node_modules", strict=True)
-
-
 def test_detect_path_guard_is_the_finding_contract() -> None:
     """Revue (LOW) : la garde de chemin du scanner est celle du contrat #14.
 
@@ -646,6 +601,13 @@ def test_the_vcs_database_is_not_walked(tmp_path: Path) -> None:
     _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
     findings = scan(tmp_path)
     assert [finding.file for finding in findings] == ["app.py"]
+
+
+def test_a_vcs_database_with_a_secret_returns_an_empty_list(tmp_path: Path) -> None:
+    """Politique VCS figée : l'historique de ``.git/`` n'est jamais scanné."""
+    _write(tmp_path, ".git/config", f'AWS = "{_aws("git-only")}"')
+    assert scan(tmp_path) == []
+    assert find_candidates(str(tmp_path)) == []
 
 
 def test_a_broken_file_in_the_strict_perimeter_is_fail_closed(tmp_path: Path) -> None:

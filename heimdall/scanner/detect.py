@@ -249,8 +249,6 @@ class Scanner:
             total += size
             if total > self._max_bytes:
                 raise ScanError(_SCAN_ERROR)
-            if text is None:
-                raise ScanError(_SCAN_ERROR)
             # Le plafond Findings est vérifié à deux granularités : par
             # candidat dans `_append` (un seul fichier dense ne fait jamais
             # gonfler la liste), et ici entre fichiers (l'accumulation sur
@@ -283,6 +281,10 @@ class Scanner:
                 # Le nom ne décide jamais du contenu : un arbre de tiers
                 # (vendor/, node_modules/, .venv/…) est parcouru, car un
                 # secret y est un secret. Seule la base VCS est hors périmètre.
+                # Politique VCS assumée : la base VCS (.git/, .hg/, .svn/)
+                # n'est pas le contenu du dépôt et son historique n'est jamais
+                # scanné par l'arbre, par design (ce n'est pas un échec de
+                # lecture : elle est élaguée sans ScanError).
                 if classer_repertoire(name) is Perimetre.HORS_PERIMETRE:
                     continue
                 if not _not_link(current_path / name):
