@@ -8,12 +8,12 @@ des limites connues du scanner de signatures T21/T22 (tickets #23/#24).
 """
 
 import base64
+import os
 import warnings
 from pathlib import Path
 
-from typer.testing import CliRunner
+import pytest
 
-from heimdall.cli.main import app
 from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
     RapportScan,
@@ -241,6 +241,43 @@ def test_an_incomplete_scan_warns_instead_of_claiming_a_clean_verdict(tmp_path: 
     assert not captures
 
 
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="permissions POSIX non applicables (root)",
+)
+def test_an_unreadable_vcs_base_is_traced_and_refuses_a_clean_verdict(
+    tmp_path: Path, capsys
+) -> None:
+    """REQ-SEC-07 : une base VCS illisible reste une impasse fail-closed.
+
+    ``_on_walk_error`` classe ``.git/`` comme hors périmètre (il n'est pas
+    parcouru par politique) : l'erreur est **tracée** et comptée, jamais
+    silencieuse. Le rapport n'est donc pas complet, ``scan_complet()``
+    refuse, et ``scan()`` avertit au lieu de laisser croire à un dépôt
+    propre. Le test fige ce comportement, y compris le compteur exact.
+    """
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / ".git").chmod(0o000)
+    try:
+        rapport = scan_rapport(str(tmp_path))
+        assert rapport.hors_perimetre == 1
+        assert rapport.non_analyses == 0
+        assert rapport.complet is False
+        trace = capsys.readouterr().err
+        assert ".git" in trace
+        with warnings.catch_warnings(record=True) as captures:
+            warnings.simplefilter("always")
+            assert scan(str(tmp_path)) == []
+        assert any(issubclass(capture.category, ScanIncomplet) for capture in captures)
+        with pytest.raises(ScanError) as context:
+            scan_complet(str(tmp_path))
+        assert str(context.value) == "scan incomplet : verdict propre non fondé"
+    finally:
+        (tmp_path / ".git").chmod(0o700)
+
+
 def test_the_strict_guard_refuses_an_incomplete_report() -> None:
     """REQ-SEC-07 : `exiger_complet()` est la garde, exécutable et testable.
 
@@ -261,7 +298,7 @@ def test_the_strict_guard_refuses_an_incomplete_report() -> None:
     assert exiger_complet(complet) is complet
 
 
-def test_the_cli_never_announces_a_clean_verdict(tmp_path: Path) -> None:
+def test_the_cli_never_announces_a_clean_verdict() -> None:
     """REQ-SEC-07 : la sortie 2 (erreur d'outillage) reste la règle.
 
     La CLI `heimdall scan` n'est pas encore branchée (#29) : elle refuse
@@ -269,10 +306,21 @@ def test_the_cli_never_announces_a_clean_verdict(tmp_path: Path) -> None:
     — ne peut sortir du CLI tant que #29 n'a pas branché le scan sur
     l'API stricte (`scan_complet()`), qui refuse elle aussi un rapport
     incomplet.
+
+    Le test est **statique** ici : la porte « security model » est isolée
+    (``tests/security/requirements.txt``) et n'installe pas les dépendances
+    d'exécution (Typer, MCP, FastAPI). L'invocation réelle de la CLI est
+    couverte par ``tests/test_package.py::test_scan_is_fail_closed_until_29``
+    dans la CI principale, qui installe le projet complet. Ce fichier reste
+    ainsi 100 % stdlib + scanner (aucune dépendance d'exécution cachée).
     """
-    resultat = CliRunner().invoke(app, ["scan", str(tmp_path)])
-    assert resultat.exit_code == 2
-    assert resultat.exit_code != 0
+    source = CLI_MAIN.read_text(encoding="utf-8")
+    assert "raise typer.Exit(code=2)" in source
+    assert "commande non branchée (voir #29)" in source
+    assert "0 propre, 1 secrets détectés, 2 erreur" in source
+    package_tests = (REPO / "tests" / "test_package.py").read_text(encoding="utf-8")
+    assert "def test_scan_is_fail_closed_until_29" in package_tests
+    assert "self.assertEqual(result.exit_code, 2)" in package_tests
 
 
 def test_obfuscation_corpus_is_mandatory() -> None:
