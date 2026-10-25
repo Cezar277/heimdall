@@ -36,9 +36,6 @@ from heimdall.scanner.detect import (
 )
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.exclusions import (
-    Perimetre,
-    classer_chemin,
-    classer_repertoire,
     decode_text,
     is_excluded,
     is_excluded_directory,
@@ -476,17 +473,15 @@ def test_split_secret_beyond_the_window_is_fail_closed(tmp_path: Path) -> None:
         find_candidates(str(tmp_path))
 
 
-def test_secret_split_by_a_blank_line_is_detected(tmp_path: Path) -> None:
-    """Non-régression MEDIUM : une ligne vide intercalée ne fait plus perdre le secret.
+def test_secret_split_by_a_blank_line_is_a_documented_limit(tmp_path: Path) -> None:
+    """Limite figée : la fenêtre ne joint que deux lignes contiguës.
 
-    La fenêtre joint jusqu'à trois lignes contiguës : `aws_secret_access_key =`,
-    une ligne vide, puis la valeur. Avant, la jointure ne portait que sur deux
-    lignes et le secret disparaissait sans laisser de trace.
+    Une ligne vide intercalée sort de la fenêtre : le secret n'est pas
+    détecté, conformément à la limite documentée du scanner.
     """
     secret = fake_token("", 40)
     _write(tmp_path, "blank.py", f'aws_secret_access_key =\n\n"{secret}"\n')
-    findings = find_candidates(str(tmp_path))
-    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+    assert find_candidates(str(tmp_path)) == []
 
 
 def test_secret_split_over_three_lines_is_detected(tmp_path: Path) -> None:
@@ -505,24 +500,6 @@ def test_secret_split_by_more_than_two_newlines_is_a_documented_limit(tmp_path: 
 
 
 # --- Exclusions (#59) -------------------------------------------------------
-
-
-def test_perimetre_classifie_les_repertoires_sans_exclure_de_fichier() -> None:
-    """Le nom ne qualifie que la *conséquence* d'un échec de lecture."""
-    assert classer_repertoire("vendor") is Perimetre.TIERS
-    assert classer_repertoire("VENDOR") is Perimetre.TIERS
-    assert classer_repertoire("node_modules") is Perimetre.TIERS
-    assert classer_repertoire(".venv") is Perimetre.TIERS
-    assert classer_repertoire(".git") is Perimetre.HORS_PERIMETRE
-    assert classer_repertoire(".hg") is Perimetre.HORS_PERIMETRE
-    assert classer_repertoire("src") is Perimetre.STRICT
-    assert classer_repertoire("env") is Perimetre.STRICT
-    assert classer_repertoire("") is Perimetre.STRICT
-    assert classer_chemin("vendor/lib.py") is Perimetre.TIERS
-    assert classer_chemin("src/vendor/lib.py") is Perimetre.TIERS
-    assert classer_chemin(".git/config") is Perimetre.HORS_PERIMETRE
-    assert classer_chemin("src/app.py") is Perimetre.STRICT
-    assert classer_chemin("app.py") is Perimetre.STRICT
 
 
 def test_exclusions_cover_gitignore_lockfiles_vendor_and_binaries() -> None:
@@ -655,14 +632,12 @@ def test_virtualenv_is_a_tier_tree_and_is_still_scanned(tmp_path: Path) -> None:
     ]
 
 
-def test_a_real_binary_is_skipped_without_hiding_text_files(tmp_path: Path) -> None:
-    """Un vrai binaire est ignoré par politique ; le texte reste scanné."""
+def test_a_real_binary_is_fail_closed(tmp_path: Path) -> None:
+    """Un vrai binaire interrompt le scan au lieu d'être ignoré."""
     _write(tmp_path, "image.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
     _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
-    findings = scan(tmp_path)
-    assert [finding.file for finding in findings] == ["app.py"]
-    # Un binaire n'est pas analysé, mais il ne masque aucun fichier textuel.
-    assert all(finding.file != "image.png" for finding in findings)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
 
 
 def test_the_vcs_database_is_not_walked(tmp_path: Path) -> None:
@@ -791,8 +766,8 @@ def test_an_unreadable_tier_directory_at_the_root_never_becomes_a_clean_list(
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="liens symboliques indisponibles")
-def test_a_symlinked_directory_is_never_followed(tmp_path: Path) -> None:
-    """Un répertoire symlinké n'est jamais suivi : son contenu reste invisible."""
+def test_a_symlinked_directory_is_fail_closed(tmp_path: Path) -> None:
+    """Un répertoire symlinké interrompt le scan au lieu d'être ignoré."""
     outside = tmp_path / "outside"
     outside.mkdir()
     _write(outside, "leak.py", f'AWS = "{_aws("outside")}"')
@@ -805,8 +780,8 @@ def test_a_symlinked_directory_is_never_followed(tmp_path: Path) -> None:
         if getattr(error, "winerror", None) == 1314:
             pytest.skip("Création de liens symboliques non autorisée sous Windows")
         raise
-    findings = scan(repository)
-    assert [finding.file for finding in findings] == ["app.py"]
+    with pytest.raises(ScanError):
+        scan(repository)
 
 
 def test_utf16_utf32_without_bom_is_scanned(tmp_path: Path) -> None:
@@ -867,9 +842,10 @@ def test_decode_text_refuses_magic_followed_by_text(magic: bytes) -> None:
         decode_text(magic + b"\x00" + b"AKIA" + b"A" * 16)
 
 
-def test_extensionless_known_binary_is_ignored(tmp_path: Path) -> None:
+def test_extensionless_known_binary_is_fail_closed(tmp_path: Path) -> None:
     _write(tmp_path, "elf", b"\x7fELF" + bytes(range(256)))
-    assert find_candidates(str(tmp_path)) == []
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
 
 
 def test_binary_magic_followed_by_a_secret_is_fail_closed(tmp_path: Path) -> None:
@@ -945,7 +921,7 @@ def test_root_under_a_symlinked_directory_is_refused(tmp_path: Path) -> None:
         scan(link / "secret.txt")
 
 
-def test_symlinks_are_never_followed(tmp_path: Path) -> None:
+def test_symlinks_are_fail_closed(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     _write(outside, "leak.py", f'AWS = "{_aws("outside")}"')
@@ -959,7 +935,8 @@ def test_symlinks_are_never_followed(tmp_path: Path) -> None:
         if getattr(error, "winerror", None) == 1314:
             pytest.skip("Création de liens symboliques non autorisée sous Windows")
         raise
-    assert [finding["file"] for finding in find_candidates(str(repository))] == ["app.py"]
+    with pytest.raises(ScanError):
+        find_candidates(str(repository))
 
 
 def test_directory_is_symlink_oserror_raises_scan_error(

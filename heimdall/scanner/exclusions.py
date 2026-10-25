@@ -6,30 +6,11 @@ nominale est un contournement trivial : il suffit de renommer le fichier
 secret ne soit ni signalé ni refusé. Le **contenu** décide :
 
 - un fichier **textuel** est décodé puis scanné ;
-- un fichier **réellement binaire** (signature magique connue *et* contenu
-  majoritairement binaire) est ignoré, mais **tracé** : son chemin est
-  journalisé et compté dans le rapport de scan — un dépôt propre et un dépôt
-  dont un binaire n'a pas été lu ne sont jamais confondus ;
-- un contenu **NUL non décodable** lève ``ScanError`` : il n'est jamais ignoré
+- un contenu non décodable lève ``ScanError`` : il n'est jamais ignoré
   silencieusement.
 
-Les répertoires sont classés en trois régimes :
-
-``STRICT``
-    Le contenu du dépôt. Un fichier qui ne peut pas être analysé y interrompt
-    le scan (``ScanError``) : un verdict « propre » doit être fondé.
-``TIERS``
-    État machine, caches, environnements virtuels, arbres de tiers et
-    artefacts générés (``vendor/``, ``node_modules/``, ``build/``…). Ces
-    arbres **sont** parcourus — un secret y est un secret — mais un fichier
-    qui ne peut pas y être analysé est **tracé** au lieu d'interrompre le
-    scan : ces arbres sont massifs et tiers, leur contenu n'est pas le code
-    audité.
-``HORS_PERIMETRE``
-    La base VCS (``.git/``, ``.hg/``, ``.svn/``) : ce n'est pas le contenu du
-    dépôt (objets compressés, index, références). Elle n'est pas parcourue et
-    elle est **tracée** en mode bibliothèque ; le mode ``strict`` de la CLI
-    (#29) l'écarte sans la compter, car elle est hors du contenu audité.
+Dans le scanner, seule la base VCS (``.git/``, ``.hg/``, ``.svn/``) est
+écartée : ce n'est pas le contenu du dépôt.
 
 Le module expose aussi les familles d'exclusions historiques de #59
 (``TECHNICAL_*`` / ``TEXT_*``) et ``is_excluded``. Ces helpers restent pour
@@ -39,10 +20,7 @@ contenu et c'est le **contenu** qui décide (voir ``classer_repertoire`` /
 ``classer_chemin``). Une exclusion nominale serait un contournement trivial.
 
 Les fichiers texte UTF-8, UTF-16 et UTF-32 (avec ou sans BOM) sont décodés et
-scannés. Un contenu NUL qui n'est ni décodable ni une signature binaire connue
-lève ``ScanError`` : il n'est jamais ignoré silencieusement. Tout autre échec
-de lecture ou de décodage est également fail-closed. Le contenu n'est jamais
-exécuté.
+scannés. Le contenu n'est jamais exécuté.
 """
 
 from __future__ import annotations
@@ -58,17 +36,14 @@ from heimdall.scanner.errors import ScanError
 class Perimetre(enum.Enum):
     """Régime de périmètre d'un chemin (#59).
 
-    Le régime ne décide pas *si* un fichier est lu : il décide seulement ce
-    qui arrive quand un fichier du périmètre **ne peut pas** être lu. Un
-    fichier textuel est lu et scanné dans les trois régimes.
+    Seule la base VCS est écartée ; tout le reste est scanné.
     """
 
     STRICT = "strict"
-    TIERS = "tiers"
     HORS_PERIMETRE = "hors_perimetre"
 
 
-#: Base VCS : ce n'est pas le contenu du dépôt. Non parcourue, mais tracée.
+#: Base VCS : ce n'est pas le contenu du dépôt, elle n'est pas parcourue.
 ARBRES_HORS_PERIMETRE: Final[frozenset[str]] = frozenset({".git", ".hg", ".svn"})
 
 #: Répertoires exclus pour raison **technique** : contenu binaire, cache ou
@@ -111,13 +86,6 @@ TEXT_DIRECTORIES: Final[frozenset[str]] = frozenset(
         "vendor",
     }
 )
-
-#: Arbres d'état machine, de caches, d'environnements virtuels, de tiers ou
-#: générés : ils sont parcourus par le scanner bibliothèque, mais un fichier
-#: non analysable y est tracé au lieu d'interrompre le scan.
-ARBRES_TIERS: Final[frozenset[str]] = (
-    TECHNICAL_DIRECTORIES - ARBRES_HORS_PERIMETRE
-) | TEXT_DIRECTORIES
 
 #: Politique #59 par défaut : technique **et** contenu texte.
 EXCLUDED_DIRECTORIES: Final[frozenset[str]] = TECHNICAL_DIRECTORIES | TEXT_DIRECTORIES
@@ -206,35 +174,27 @@ TEXT_SUFFIXES: Final[tuple[str, ...]] = (
 def classer_repertoire(name: str) -> Perimetre:
     """Régime de périmètre d'un répertoire, d'après son nom (casse ignorée).
 
-    Le nom ne sert qu'à **qualifier la conséquence** d'un échec de lecture
-    (interrompre le scan ou le tracer) : il ne dispense jamais de lire le
+    Seule la base VCS est écartée ; le nom ne dispense jamais de lire un
     fichier.
     """
     folded = name.casefold()
     if folded in ARBRES_HORS_PERIMETRE:
         return Perimetre.HORS_PERIMETRE
-    if folded in ARBRES_TIERS:
-        return Perimetre.TIERS
     return Perimetre.STRICT
 
 
 def classer_chemin(relative_path: str | PurePosixPath) -> Perimetre:
     """Régime de périmètre d'un chemin relatif (répertoires parents).
 
-    Le régime le plus restrictif l'emporte : un chemin sous ``.git/`` reste
-    hors périmètre même s'il passe par un arbre de tiers.
+    Seule la base VCS est écartée.
     """
     path = (
         relative_path if isinstance(relative_path, PurePosixPath) else PurePosixPath(relative_path)
     )
-    regime = Perimetre.STRICT
     for part in path.parts[:-1]:
-        candidat = classer_repertoire(part)
-        if candidat is Perimetre.HORS_PERIMETRE:
+        if classer_repertoire(part) is Perimetre.HORS_PERIMETRE:
             return Perimetre.HORS_PERIMETRE
-        if candidat is Perimetre.TIERS:
-            regime = Perimetre.TIERS
-    return regime
+    return Perimetre.STRICT
 
 
 #: Politique #59 par défaut : technique **et** contenu texte.
@@ -335,12 +295,6 @@ _BINARY_MAGIC: Final[tuple[bytes, ...]] = (
     b"\xce\xfa\xed\xfe",
     b"\xfe\xed\xfa\xcf",
     b"\xcf\xfa\xed\xfe",
-    # Flux Deflate (zlib) : format binaire connu, frequent dans les archives
-    # Python et les objets Git compresses.
-    b"\x78\x01",
-    b"\x78\x5e",
-    b"\x78\x9c",
-    b"\x78\xda",
 )
 
 

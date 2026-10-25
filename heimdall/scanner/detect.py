@@ -15,8 +15,7 @@ Invariants :
 - les liens symboliques ne sont jamais suivis, ni dans le périmètre, ni dans
   le chemin de la racine, et les fichiers restent confinés à la racine résolue ;
 - les lectures sont bornées (1 Mio) et les regex sont linéaires et bornées ;
-- en mode strict (#29), seules les exclusions **techniques** de #59 restent :
-  les répertoires et fichiers tiers textuels sont parcourus.
+- seule la base VCS est écartée.
 
 L'interface est figée par #53 : ``Finding`` est l'unique classe canonique de
 ``heimdall.scanner.finding`` (réexportée ici pour compatibilité historique),
@@ -49,8 +48,6 @@ from heimdall.scanner.exclusions import (
     classer_chemin,
     classer_repertoire,
     decode_text,
-    has_technical_suffix,
-    is_known_binary,
 )
 from heimdall.scanner.finding import (
     MAX_PATH_LENGTH,
@@ -138,22 +135,12 @@ def _validate_relative_path(relative: str) -> str:
         raise ScanError(_SCAN_ERROR) from None
 
 
-def _decode_data(data: bytes, *, allow_binary_suffix: bool) -> str | None:
-    """Décode le contenu ; un suffixe binaire connu sert de repli.
-
-    Le repli n'est armé qu'en mode strict pour un nom à suffixe technique,
-    et seulement pour un binaire **connu** (magie connue + ratio binaire
-    ≥ 0,5). Un binaire inconnu (NUL + texte) reste fail-closed comme en
-    ``--staged`` : le suffixe ne masque jamais un doute. Un texte mal nommé
-    est rendu et scanné ; sans repli, ``decode_text`` reste fail-closed.
-    """
-    try:
-        return decode_text(data)
-    except ScanError:
-        if allow_binary_suffix and is_known_binary(data):
-            return None
-        raise
-
+def _decode_data(data: bytes) -> str:
+    """Décode le contenu ; un binaire connu est refusé (fail-closed)."""
+    text = decode_text(data)
+    if text is None:
+        raise ScanError(_SCAN_ERROR)
+    return text
 
 
 class Scanner:
@@ -167,12 +154,9 @@ class Scanner:
     Toute erreur de lecture interrompt le scan en ``ScanError`` (fail-closed) :
     aucun résultat partiel n'est jamais retourné.
 
-    ``strict=True`` (mode strict, livré par #29 pour la CLI ``heimdall
-    scan``) ne conserve que les exclusions **techniques** de #59 : les
-    répertoires et fichiers tiers **textuels** (``vendor/``,
-    ``third_party/``, lockfiles, ``.gitignore``…) sont alors parcourus, parce
-    qu'un secret y est un secret. Le comportement par défaut (``strict=False``)
-    reste la politique #59 inchangée.
+    ``strict`` (mode strict, livré par #29 pour la CLI ``heimdall scan``)
+    reste accepté pour compatibilité : seule la base VCS est écartée, quel que
+    soit le mode.
     """
 
     __slots__ = (
@@ -261,19 +245,12 @@ class Scanner:
             count += 1
             if count > self._max_files:
                 raise ScanError(_SCAN_ERROR)
-            # En strict, un suffixe binaire n'exclut plus à lui seul : on lit
-            # d'abord le contenu, et le suffixe ne sert de repli qu'en cas
-            # d'échec de décodage (binaire réel). Un texte nommé `evil.png`
-            # est donc scanné comme en `--staged`.
-            text, size = self._read_text(
-                path,
-                allow_binary_suffix=self._strict and has_technical_suffix(relative),
-            )
+            text, size = self._read_text(path)
             total += size
             if total > self._max_bytes:
                 raise ScanError(_SCAN_ERROR)
             if text is None:
-                continue
+                raise ScanError(_SCAN_ERROR)
             # Le plafond Findings est vérifié à deux granularités : par
             # candidat dans `_append` (un seul fichier dense ne fait jamais
             # gonfler la liste), et ici entre fichiers (l'accumulation sur
@@ -309,7 +286,7 @@ class Scanner:
                 if classer_repertoire(name) is Perimetre.HORS_PERIMETRE:
                     continue
                 if not _not_link(current_path / name):
-                    continue
+                    raise ScanError(_SCAN_ERROR)
                 kept.append(name)
             directories[:] = kept
             for name in sorted(filenames):
@@ -319,31 +296,20 @@ class Scanner:
                 except ValueError:
                     raise ScanError(_SCAN_ERROR) from None
                 # Aucun fichier n'est exclu par son nom : le contenu décide.
-                # `classer_chemin` ne sert qu'à écarter un éventuel chemin de
-                # la base VCS (déjà élaguée ci-dessus) : un secret dans un
-                # lockfile, un `.png` textuel ou un `vendor/` reste analysé.
+                # La base VCS est déjà élaguée ci-dessus ; un chemin qui y
+                # mènerait encore est refusé, jamais sauté silencieusement.
                 if classer_chemin(relative) is Perimetre.HORS_PERIMETRE:
-                    continue
+                    raise ScanError(_SCAN_ERROR)
                 if not _not_link(path):
-                    continue
+                    raise ScanError(_SCAN_ERROR)
                 yield path, _validate_relative_path(relative)
 
-    def _read_text(
-        self,
-        path: Path,
-        *,
-        allow_binary_suffix: bool = False,
-    ) -> tuple[str | None, int]:
-        """Lit un fichier borné ; ``(None, taille)`` signifie binaire exclu.
+    def _read_text(self, path: Path) -> tuple[str, int]:
+        """Lit un fichier borné et rend ``(texte, taille)``.
 
         La taille lue est rendue pour que ``scan()`` borne le **volume total**
-        analysé (#29), pas seulement chaque fichier.
-
-        ``allow_binary_suffix`` n'est vrai qu'en mode strict pour un fichier
-        dont le nom porte un suffixe binaire connu. Le contenu est alors
-        prioritaire : un texte mal nommé est rendu et scanné ; seul un échec
-        de décodage (binaire réel à signature inconnue) est converti en
-        exclusion technique, au lieu de faire échouer tout le scan.
+        analysé (#29), pas seulement chaque fichier. Un contenu non décodable
+        lève ``ScanError`` : aucun fichier n'est ignoré silencieusement.
         """
         try:
             resolved = path.resolve(strict=True)
@@ -390,10 +356,7 @@ class Scanner:
                 os.close(descriptor)
             except OSError:
                 raise ScanError(_SCAN_ERROR) from None
-        return (
-            _decode_data(data, allow_binary_suffix=allow_binary_suffix),
-            len(data),
-        )
+        return _decode_data(data), len(data)
 
     def _scan_text(
         self,
@@ -524,9 +487,8 @@ def scan(
 ) -> list[Finding]:
     """Analyse ``root`` et retourne des objets :class:`Finding`.
 
-    ``strict=True`` (mode strict de #29) ne conserve que les exclusions
-    techniques de #59 : ``vendor/``, lockfiles et fichiers de contrôle sont
-    alors parcourus.
+    ``strict`` (mode strict de #29) reste accepté pour compatibilité : seule
+    la base VCS est écartée, quel que soit le mode.
     """
     return Scanner(
         root, hasher=hasher, strict=strict, entropy_config=entropy_config, allowlist=allowlist

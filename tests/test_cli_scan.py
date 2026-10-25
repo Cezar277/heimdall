@@ -477,11 +477,12 @@ def test_scan_tree_scans_vendor_and_lockfiles(tmp_path: Path) -> None:
     assert "package-lock.json:1" in resultat.stdout
 
 
-def test_scan_tree_keeps_technical_exclusions(tmp_path: Path) -> None:
-    """Les exclusions **techniques** restent (binaire, répertoire généré)."""
+def test_scan_tree_scans_node_modules(tmp_path: Path) -> None:
+    """Même ``node_modules/`` est un arbre de tiers parcouru : un secret y est un secret."""
     racine = _arbre(tmp_path, {"node_modules/pkg/evil.js": f'"{FAKE_AWS_KEY}"\n'})
     resultat = _run("scan", str(racine))
-    assert resultat.exit_code == EXIT_CLEAN
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert "node_modules/pkg/evil.js:1" in resultat.stdout
 
 
 def test_scan_tree_strict_scans_build_outputs(tmp_path: Path) -> None:
@@ -529,16 +530,12 @@ def test_scan_tree_strict_scans_text_with_binary_suffix(git_repo: GitRepo) -> No
     assert FAKE_AWS_KEY not in resultat.output
 
 
-def test_scan_tree_strict_still_skips_real_binary_suffix(git_repo: GitRepo) -> None:
-    """Revue (LOW) : un vrai binaire garde l'exclusion technique par suffixe.
-
-    Le contenu est lu d'abord, mais un PNG réel (magie + majorité binaire)
-    reste écarté sans faire échouer le scan ; le suffixe sert de repli si le
-    décodeur ne peut pas trancher.
-    """
+def test_scan_tree_strict_refuses_real_binary_suffix(git_repo: GitRepo) -> None:
+    """Un vrai binaire interrompt le scan (code 2), jamais un verdict propre."""
     git_repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 512)
     resultat = _run("scan", str(git_repo.root))
-    assert resultat.exit_code == EXIT_CLEAN
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
 def test_scan_tree_strict_refuses_unknown_binary_suffix(git_repo: GitRepo) -> None:

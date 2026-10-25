@@ -150,7 +150,13 @@ def reecrire(text: str, sha_cible: str, racine: Path) -> str:
 
 def _livre(racine: Path, chemin: str) -> bool:
     """Vrai si le fichier visé existe encore dans l'arborescence livrée."""
-    return (racine / chemin).is_file()
+    try:
+        chemin_resolu = (racine / chemin).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if not chemin_resolu.is_relative_to(racine):
+        return False
+    return chemin_resolu.is_file()
 
 
 def verifier(text: str, racine: Path) -> list[str]:
@@ -247,8 +253,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # Écriture atomique : un crash en cours d'écriture ne doit jamais
         # laisser une fiche de preuve tronquée. Le `fsync` garantit que les
-        # octets sont sur disque avant le remplacement.
-        with temporaire.open("w", encoding="utf-8", newline="\n") as flux:
+        # octets sont sur disque avant le remplacement. `O_EXCL` et
+        # `O_NOFOLLOW` empêchent le détournement du fichier temporaire par un
+        # lien symbolique préexistant.
+        descripteur = os.open(
+            temporaire,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+            0o644,
+        )
+        with os.fdopen(descripteur, "w", encoding="utf-8", newline="\n") as flux:
             flux.write(contenu)
             flux.flush()
             os.fsync(flux.fileno())
