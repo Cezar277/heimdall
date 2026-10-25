@@ -296,36 +296,45 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   Durcissement post-2ᵉ relecture : **aucun nom de fichier n'exclut un fichier
   du scan** — une extension binaire, un lockfile ou un répertoire de tiers ne
   peuvent plus cacher un secret (le contenu décide : lu et scanné s'il est
-  textuel) ; tout ce qui n'a pas pu être analysé est **tracé** (chemin
-  journalisé sur `stderr`, sans valeur, et compteur dans le rapport de scan),
-  de sorte qu'un dépôt propre ne soit jamais confondu avec un dépôt
-  partiellement lu ; le verdict « propre » n'est fondé que si le rapport est
-  complet.
+  textuel). Un contenu du périmètre qui ne peut pas être analysé (binaire
+  connu, lien symbolique, fichier illisible, trop gros ou modifié pendant la
+  lecture) lève `ScanError` : aucun `[]` ne peut masquer une lecture
+  partielle. Seule la base VCS (`.git/`, `.hg/`, `.svn/`) est élaguée par
+  politique ; elle n'est jamais parcourue et le compteur
+  `heimdall.scanner.detect.Scanner.vcs_ignored` expose le nombre de bases
+  écartées lors du dernier scan. Le mode arbre ne prétend donc jamais couvrir
+  l'historique : `--staged` couvre le contenu indexé (ce que le commit va
+  contenir), pas les commits déjà écrits.
   Durcissement post-3ᵉ relecture : **aucun verdict propre partiel**. Les
   compteurs ne sont plus jetés par `scan()`/`find_candidates()` : un fichier
-  du périmètre qui n'a pas pu être analysé (y compris dans un arbre de tiers)
-  lève `ScanError` au lieu de rendre une liste vide ; `RapportScan.complet`
-  est vrai seulement si **rien** n'a été laissé de côté (binaire ignoré, lien
-  non suivi, base VCS non parcourue, fichier illisible) ; un fichier tronqué
-  entre le `stat` et l'`open` (même inode) est refusé ; une racine contenant
-  un octet NUL est refusée par `ScanError` et non par une `ValueError` nue ;
-  les séparateurs de ligne Unicode (U+2028/U+2029/U+0085) et l'override
-  U+202E sont neutralisés dans le journal, qui reste une ligne logique par
-  fichier.
-  Preuves : `tests/test_scanner_detect.py`,
-  `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean`,
-  `tests/security/test_scanner_bypass.py::test_named_exclusions_cannot_hide_a_secret`,
-  `tests/security/test_scanner_bypass.py::test_a_binary_ignored_is_traced_and_never_leaks`,
-  `tests/security/test_scanner_bypass.py::test_an_unanalysable_tier_file_never_yields_a_clean_verdict`,
-  `tests/security/test_scanner_bypass.py::test_a_grounded_clean_verdict_requires_a_complete_report`
+  du périmètre qui n'a pas pu être analysé lève `ScanError` au lieu de rendre
+  une liste vide ; un fichier tronqué entre le `stat` et l'`open` (même
+  inode) est refusé ; une racine contenant un octet NUL est refusée par
+  `ScanError` et non par une `ValueError` nue ; en mode fichier unique, la
+  racine parente est re-vérifiée par `lstat` avant lecture (aucun lien suivi).
+  Durcissement post-5ᵉ relecture : un fichier régulier nommé `.git` (gitlink
+  de worktree ou de sous-module, `gitdir: …`) n'est **pas** confondu avec le
+  répertoire `.git/` : seul un segment **parent** classe un chemin hors
+  périmètre, et le fichier `.git` est lu par contenu.
+  Preuves : `tests/test_scanner_detect.py`
+  (`test_the_vcs_database_is_not_walked`,
+  `test_a_vcs_database_with_a_secret_returns_an_empty_list`,
+  `test_the_vcs_skip_is_counted_and_never_claimed_complete`,
+  `test_a_gitlink_file_is_not_mistaken_for_the_vcs_database`,
+  `test_a_real_binary_is_fail_closed`,
+  `test_symlinks_are_fail_closed`,
+  `test_a_broken_file_in_the_strict_perimeter_is_fail_closed`,
+  `test_a_single_file_parent_replaced_by_a_symlink_before_reading_is_fail_closed`,
+  `test_scanner_does_not_consult_the_deprecated_binary_helper`),
+  `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean`
   et la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
   Depuis #29, le contrat 0/1/2 est **exécuté** : `tests/test_cli_scan.py`
   prouve dépôt propre => 0, secret avéré => 1, racine absente => 2, index en
   conflit => 2, blob trop gros => 2, et **aucune écriture** pendant un scan.
   Le mode `--staged` analyse les blobs ajoutés ou modifiés de l'index **sans
   aucune exclusion de chemin** (`vendor/`, lockfiles compris) ; le mode arbre
-  de travail écarte seulement la base VCS et refuse (2) tout rapport
-  incomplet via `scan_complet()`. C'est la correction du point HIGH relevé à
+  de travail écarte seulement la base VCS et refuse (2) tout fichier du
+  périmètre non analysable. C'est la correction du point HIGH relevé à
   la revue de #165, où la politique #59 laissait passer un secret posé dans
   `vendor/evil.py`.
   Limites connues documentées par T21 : base64, concaténation et flux de

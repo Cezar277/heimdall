@@ -48,7 +48,20 @@ sont prouvées dans la section « 3ᵉ passage », épinglée sur
 `b2304c645445b9609b5d2ee50aed7a4255a55eef`. Les lignes du tableau principal
 qui portent sur un module modifié (périmètre, fenêtre multi-ligne) sont
 signalées ci-dessous.
-Depuis #29, le mode strict de la CLI (`Scanner(root, strict=True)`) ajoute des
+
+> **État livré après le 5ᵉ passage (à lire avant les sections historiques).**
+> Les sections 3ᵉ et 4ᵉ passages décrivent un état **historique** du code :
+> `RapportScan`, `scan_complet()`, `exiger_complet()`, les compteurs de
+> contenus « tracés » et les avertissements `ScanIncomplet` **n'existent plus**
+> dans la branche livrée. Le contrat actuel est plus simple et fail-closed :
+> `scan()`/`find_candidates()` lèvent `ScanError` pour tout fichier du
+> périmètre non analysable (binaire connu, lien, illisible, modifié) ; seule
+> la base VCS est élaguée par politique, et
+> `heimdall.scanner.detect.Scanner.vcs_ignored` compte ces bases sans exposer
+> de chemin. La section « 5ᵉ passage » ci-dessous fige cet état et corrige les
+> affirmations devenues fausses.
+Depuis #29, le mode strict de la CLI
+(`heimdall.scanner.detect.Scanner(root, strict=True)`) ajoute des
 bornes (fichiers, volume total, Findings) et écarte la base VCS du périmètre
 audité. Il ne réintroduit **aucune exclusion nominale de contenu** : le
 scanner bibliothèque et la CLI lisent `vendor/`, `node_modules/`, les
@@ -183,17 +196,56 @@ Slack couplees (#22)`) ; les sections antérieures restent épinglées sur
 | **Aux bornes exactes, un jeton préfixé reste détecté** (un seul finding : la forme rotative) ; au-delà, la limite est écrite et figée | [heimdall/scanner/signatures/stripe_slack.py:155–176](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/heimdall/scanner/signatures/stripe_slack.py#L155-L176) | [tests/test_scanner_detect.py:420–452](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/test_scanner_detect.py#L420-L452) |
 | **Les preuves SAMM ne sont pas des liens morts** : dépôt attendu, révision connue, fichier présent à la révision, re-pin outillé | [scripts/repin_samm.py](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/scripts/repin_samm.py) | [tests/security/test_samm_permalinks.py](https://github.com/Cezar277/heimdall/blob/c391cc0b15cd58743e826a2d5947e9743507b9ef/tests/security/test_samm_permalinks.py) |
 
+## Corrections issues de la relecture « APPROVE WITH COMMENTS » (5ᵉ passage)
+
+Cette section décrit le correctif demandé par la relecture du 5ᵉ passage :
+*l'élagage VCS doit être observable*, *un gitlink `.git` légitime ne doit pas
+bloquer le scan*, *la documentation ne doit plus promettre une API absente*,
+*le mode fichier unique doit re-vérifier sa racine*, et *le helper binaire
+nominal ne doit plus pouvoir décider du périmètre*. Les preuves ci-dessous
+sont des **noms de modules et de tests** (pas de permalien sur un SHA
+intermédiaire) ; après le squash, `scripts/repin_samm.py --sha <sha-final>`
+re-pince les liens historiques et `--check` refuse tout lien mort.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| **MEDIUM** — base VCS élaguée silencieusement : un dépôt dont le seul `.git/config` contient un candidat rend `[]`, indistinguable d'un dépôt propre | l'élagage reste une politique (l'historique n'est pas le contenu), mais il est **compté** : `heimdall.scanner.detect.Scanner.vcs_ignored` expose le nombre de bases VCS écartées lors du dernier scan, sans chemin ni valeur. `docs/scanner.md`, `docs/cli.md` et `docs/security/requirements.md` disent explicitement que l'arbre ne couvre jamais l'historique et que `--staged` couvre l'index, pas les commits déjà écrits | `heimdall/scanner/detect.py` (`vcs_ignored`, `_iter_files`) ; `tests/test_scanner_detect.py::test_the_vcs_skip_is_counted_and_never_claimed_complete`, `::test_a_vcs_database_with_a_secret_returns_an_empty_list` |
+| **MEDIUM** — un fichier `.git` gitlink (`gitdir: …`) était classé hors périmètre et levait `ScanError`, bloquant les worktrees et sous-modules légitimes | `classer_chemin` n'examine plus que les segments **parents** : le dernier segment est un fichier. Un `.git` régulier est lu par contenu ; le répertoire `.git/` reste élagué par `classer_repertoire`. Le test fige les deux cas (gitlink légitime sans erreur, contenu `.git` scanné) | `heimdall/scanner/exclusions.py` (`classer_chemin`) ; `tests/test_scanner_detect.py::test_a_gitlink_file_is_not_mistaken_for_the_vcs_database` |
+| **MEDIUM** — `requirements.md` promettait `RapportScan.complet` et `scan_complet()`, API absente du code : preuve SAMM mensongère | la documentation est alignée sur le code : `scan()`/`find_candidates()` lèvent `ScanError` pour tout fichier du périmètre non analysable ; seule la base VCS est élaguée, comptée par `heimdall.scanner.detect.Scanner.vcs_ignored` ; aucune API de rapport complet n'est annoncée tant qu'elle n'est pas livrée. Les références aux tests supprimés (`test_named_exclusions_cannot_hide_a_secret`, `test_a_binary_ignored_is_traced_and_never_leaks`, etc.) sont remplacées par les tests réellement présents | `docs/security/requirements.md` (REQ-SEC-07), `docs/scanner.md`, `docs/cli.md`, `docs/t22-samm.md` ; `tests/test_scanner_detect.py::test_a_real_binary_is_fail_closed`, `::test_symlinks_are_fail_closed`, `::test_a_broken_file_in_the_strict_perimeter_is_fail_closed` |
+| **LOW** — fenêtre TOCTOU en mode fichier unique : `__init__` suit `is_dir()`/`is_file()`, et `_single` ne re-`lstat` pas la racine parente avant lecture | `Scanner.scan()` re-vérifie la racine par `lstat` (répertoire, pas un lien) **avant** toute lecture, y compris en mode fichier unique ; `_read_text` conserve ses gardes (`resolve` + `is_relative_to` + `lstat` + `O_NOFOLLOW` + `fstat`/`mtime_ns`). Aucun contenu n'est lu après un remplacement de la racine parente | `heimdall/scanner/detect.py` (`_recheck_root`, `scan`) ; `tests/test_scanner_detect.py::test_a_single_file_parent_replaced_by_a_symlink_before_reading_is_fail_closed` |
+| **LOW** — `is_known_binary` restait exporté comme si le nom pouvait décider du périmètre | le helper de décision devient interne (`_is_known_binary`), utilisé par `decode_text` ; `is_known_binary` reste un **alias déprécié** de compatibilité, sans autorité. Instrumenter l'alias public ne change donc jamais un verdict : le test le patche pour lever et vérifie qu'un binaire connu reste refusé par `ScanError` | `heimdall/scanner/exclusions.py` (`_is_known_binary`, `is_known_binary`, `decode_text`) ; `tests/test_scanner_detect.py::test_scanner_does_not_consult_the_deprecated_binary_helper` |
+| **LOW** — hygiène de PR : quatre sous-tickets dans une PR | exception **maintenue et signalée** dans la section « Exception de regroupement » ; elle reste à valider par les mainteneurs avant fusion. Aucun nouveau sous-ticket n'est ajouté | `docs/t22-samm.md#exception-de-regroupement` |
+
+### Ce que le correctif permet désormais de prouver
+
+| Exigence vérifiée | Implémentation | Test et preuve permanente |
+|---|---|---|
+| **L'élagage VCS est observable, jamais présenté comme un historique propre** | `heimdall.scanner.detect.Scanner.vcs_ignored` ; docs alignées | `tests/test_scanner_detect.py::test_the_vcs_skip_is_counted_and_never_claimed_complete`, `::test_a_vcs_database_with_a_secret_returns_an_empty_list` |
+| **Un gitlink `.git` légitime ne bloque plus le scan ; son contenu décide** | `classer_chemin` (segments parents seulement) | `tests/test_scanner_detect.py::test_a_gitlink_file_is_not_mistaken_for_the_vcs_database` |
+| **La documentation ne promet aucune API absente** | `docs/security/requirements.md` (REQ-SEC-07), `docs/scanner.md`, `docs/cli.md` | `grep` de contrôle dans la revue ; tests `test_scanner_detect.py` cités dans REQ-SEC-07 |
+| **Aucune lecture après remplacement de la racine parente en mode fichier unique** | `_recheck_root` appelé par `scan()` | `tests/test_scanner_detect.py::test_a_single_file_parent_replaced_by_a_symlink_before_reading_is_fail_closed` |
+| **Le nom public du helper binaire n'a plus d'autorité** | `_is_known_binary` interne + alias déprécié | `tests/test_scanner_detect.py::test_scanner_does_not_consult_the_deprecated_binary_helper` |
+
 ## Révisions à re-pinner après la fusion
 
 Les permaliens de cette fiche sont épinglés sur la révision du code testé
-`c391cc0b15cd58743e826a2d5947e9743507b9ef`. Tant que cette révision est un commit **intermédiaire** de la
-branche, la preuve est rejouable sur la branche mais **pourrit à la fusion**
-(un squash n'apporte pas les commits intermédiaires dans `main`) : les liens
-deviennent morts et la preuve n'est plus vérifiable par un auditeur.
+`c391cc0b15cd58743e826a2d5947e9743507b9ef` (et, pour les sections
+antérieures, sur `b2304c6…`, `5de5140…` et `b38dec1…`). Tant que ces
+révisions sont des commits **intermédiaires** de la branche, la preuve est
+rejouable sur la branche mais **pourrit à la fusion** (un squash n'apporte pas
+les commits intermédiaires dans `main`) : les liens deviennent morts et la
+preuve n'est plus vérifiable par un auditeur.
+
+Le correctif du 5ᵉ passage est appliqué dans l'arbre de travail au-dessus de
+`44bfb191af4c804014eb108eac5c4f995973a1e6` ; il n'a pas encore de SHA propre.
+Ses preuves sont volontairement citées par **nom de test** (section
+« 5ᵉ passage »), sans permalien sur un SHA intermédiaire. Elles seront
+re-pinées avec le reste au SHA du squash.
 
 | Révision | Commit | Passe |
 |---|---|---|
 | `c391cc0b15cd58743e826a2d5947e9743507b9ef` | fix(scanner): garde executable du verdict propre, bornes Slack couplees (#22) | 4ᵉ passage |
+| `44bfb191af4c804014eb108eac5c4f995973a1e6` | Fix(scanner): sécurisation TOCTOU et alignement documentaire | Base du correctif du 5ᵉ passage (non commité) |
 
 Après la fusion (SHA du squash connu), re-pince **en une commande** :
 
@@ -300,20 +352,28 @@ Slack). L'exception reste **à valider explicitement par les mainteneurs**
 avant fusion ; les PR suivantes suivront le découpage habituel (1 PR = 1
 sous-ticket).
 
+La relecture « APPROVE WITH COMMENTS » (5ᵉ passage) **maintient l'exception** :
+le correctif porte sur l'observabilité de l'élagage VCS, le gitlink `.git`,
+l'alignement documentaire et deux gardes de lecture ; il ne change ni le
+découpage ni le périmètre des sous-tickets. L'exception reste **à valider
+explicitement par les mainteneurs** avant fusion.
+
 ## Relecture et PR
 
 - PR : à ouvrir sur la branche
   `22-t22-scanner-regex-de-signatures-et-exclusions` avec `Closes #22`.
 - Relecture inter-domaines et check `CI (/ci)` restent requis avant fusion.
 - La feuille SAMM externe n'est pas accessible depuis le dépôt ; reporter la
-  ligne ci-dessus avec le lien de la PR et le SHA du **code testé**
-  `c391cc0b15cd58743e826a2d5947e9743507b9ef` (le tableau principal reste
+  ligne ci-dessus avec le lien de la PR et le SHA final du **squash** (le
+  correctif du 5ᵉ passage est testé dans l'arbre de travail au-dessus de
+  `44bfb191af4c804014eb108eac5c4f995973a1e6`). Le tableau principal reste
   épinglé sur la révision historique `b38dec179de6baf22fefd50056014e8ea26fc185`,
   signalée par ⚠️ ; les corrections du 2ᵉ passage sont prouvées plus haut,
-  celles du 3ᵉ passage dans la section « 3ᵉ passage », et celles du 4ᵉ
-  passage dans la section « 4ᵉ passage »).
-- **Permaliens du 4ᵉ passage** : épinglés sur `c391cc0b15cd58743e826a2d5947e9743507b9ef` (code testé) ; la
-  présente révision de documentation est celle qui les contient.
+  celles du 3ᵉ passage dans la section « 3ᵉ passage », celles du 4ᵉ passage
+  dans la section « 4ᵉ passage », et celles du 5ᵉ passage dans la section
+  « 5ᵉ passage ».
+- **Permaliens du 5ᵉ passage** : pas de nouveau permalien sur un SHA
+  intermédiaire ; preuves citées par nom de test, re-pinées au SHA du squash.
 - **Après la fusion** : re-pince la fiche sur le SHA du squash (une
   commande, voir « Révisions à re-pinner après la fusion »), puis contrôle
   `python scripts/repin_samm.py --check` : aucun permalien mort ne doit

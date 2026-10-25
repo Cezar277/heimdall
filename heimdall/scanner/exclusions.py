@@ -56,15 +56,18 @@ def classer_repertoire(name: str) -> Perimetre:
 
 
 def classer_chemin(relative_path: str | PurePosixPath) -> Perimetre:
-    """Régime de périmètre d'un chemin relatif (tous ses segments).
+    """Régime de périmètre d'un chemin relatif (segments **parents**).
 
-    Le nom du fichier lui-même est examiné comme ses répertoires parents :
-    seule la base VCS est écartée, où qu'elle apparaisse dans le chemin.
+    Seuls les répertoires parents décident : le dernier segment est un
+    **fichier**, pas une base VCS. Un fichier régulier nommé ``.git`` est un
+    gitlink légitime (worktree, sous-module : ``gitdir: …``) : il est lu
+    comme n'importe quel contenu, jamais confondu avec le répertoire
+    ``.git/`` qui, lui, est élagué par :func:`classer_repertoire`.
     """
     path = (
         relative_path if isinstance(relative_path, PurePosixPath) else PurePosixPath(relative_path)
     )
-    for part in path.parts:
+    for part in path.parts[:-1]:
         if classer_repertoire(part) is Perimetre.HORS_PERIMETRE:
             return Perimetre.HORS_PERIMETRE
     return Perimetre.STRICT
@@ -190,17 +193,31 @@ def _decode_utf16_or_32(data: bytes) -> str | None:
     return None if best is None else best[1]
 
 
-def is_known_binary(data: bytes) -> bool:
+def _is_known_binary(data: bytes) -> bool:
     """Vrai si le contenu est un binaire **connu** et majoritairement binaire.
 
     Même critère que ``decode_text`` pour rendre ``None`` : une signature
-    magique connue **et** un ratio d'octets binaires ≥ 0,5. Sert de repli
-    explicite au scanner pour un fichier à suffixe technique, sans transformer
-    un binaire inconnu (NUL + texte) en skip silencieux.
+    magique connue **et** un ratio d'octets binaires ≥ 0,5. Helper interne :
+    il ne décide jamais du périmètre à lui seul et le scanner ne le consulte
+    pas par son nom. Un binaire inconnu (NUL + texte) reste fail-closed.
     """
     return any(data.startswith(magic) for magic in _BINARY_MAGIC) and (
         _binary_byte_ratio(data) >= _BINARY_RATIO_MIN
     )
+
+
+def is_known_binary(data: bytes) -> bool:
+    """DEPRECATED — helper de politique, sans autorité dans le scanner.
+
+    Conservé uniquement pour compatibilité d'import (documentation et tests
+    historiques). Le scanner utilise :func:`decode_text`, qui appelle le
+    helper **interne** ``_is_known_binary`` : remplacer ou instrumenter ce
+    nom public ne change donc jamais le périmètre d'un scan. Aucun nouvel
+    appelant ne doit s'en servir pour décider qu'un fichier est « ignorable
+    par son nom » : le contenu décide, et un binaire non reconnu lève
+    ``ScanError``.
+    """
+    return _is_known_binary(data)
 
 
 def decode_text(data: bytes) -> str | None:
@@ -232,12 +249,12 @@ def decode_text(data: bytes) -> str | None:
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError:
-            if is_known_binary(data):
+            if _is_known_binary(data):
                 return None
             raise ScanError(_DECODE_ERROR) from None
     decoded = _decode_utf16_or_32(data)
     if decoded is not None:
         return decoded
-    if is_known_binary(data):
+    if _is_known_binary(data):
         return None
     raise ScanError(_DECODE_ERROR)

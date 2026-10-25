@@ -5,9 +5,11 @@ REQ-SEC-10 (preuve visuelle DFD, bug LOW PNG en-tete seul), plus les gardes
 meta : pas d'exigence vague, pas de vrai secret dans les fixtures.
 """
 
+import inspect
 import re
 from pathlib import Path
 
+from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.vault.client import VaultClient
 
 REPO = Path(__file__).resolve().parents[2]
@@ -62,6 +64,36 @@ def test_all_requirements_have_tests() -> None:
         section = req.split(f"### {req_id}", 1)[1].split("### REQ-SEC-", 1)[0]
         assert re.search(r"\bR\d{1,2}\b", section), req_id
         assert "stride.md#" in section, req_id
+
+
+def test_scanner_documentation_matches_the_delivered_api() -> None:
+    """Revue (MEDIUM) : la doc ne promet pas une API absente.
+
+    Le code livré expose `scan()`/`find_candidates()` (fail-closed par
+    `ScanError`) et `heimdall.scanner.detect.Scanner.vcs_ignored` pour rendre
+    l'élagage VCS observable. `RapportScan`/`scan_complet()` n'existent pas :
+    les citer comme une garde exécutable rendrait la preuve SAMM mensongère.
+    La façade publique `heimdall.scanner.Scanner` vise les cibles injectées ;
+    le scanner d'arbre est documenté sous son vrai module.
+    """
+    assert isinstance(inspect.getattr_static(TreeScanner, "vcs_ignored"), property)
+
+    requirements = REQUIREMENTS.read_text(encoding="utf-8")
+    assert "RapportScan" not in requirements
+    assert "scan_complet" not in requirements
+    assert "heimdall.scanner.detect.Scanner.vcs_ignored" in requirements
+
+    scanner_doc = (REPO / "docs" / "scanner.md").read_text(encoding="utf-8")
+    assert "from heimdall.scanner.detect import Scanner as TreeScanner" in scanner_doc
+    assert "TreeScanner.vcs_ignored" in scanner_doc
+    assert re.search(r'(?<!Tree)Scanner\("\."\)', scanner_doc) is None
+
+    cli_doc = (REPO / "docs" / "cli.md").read_text(encoding="utf-8")
+    assert "heimdall.scanner.detect.Scanner.vcs_ignored" in cli_doc
+
+    for name, doc in (("scanner.md", scanner_doc), ("cli.md", cli_doc)):
+        assert "RapportScan" not in doc, name
+        assert "scan_complet" not in doc, name
 
 
 def test_no_vague_requirements() -> None:

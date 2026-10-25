@@ -154,6 +154,12 @@ class Scanner:
     Toute erreur de lecture interrompt le scan en ``ScanError`` (fail-closed) :
     aucun résultat partiel n'est jamais retourné.
 
+    Seule la base VCS (``.git/``, ``.hg/``, ``.svn/``) est écartée, par
+    politique et sans ``ScanError`` ; :attr:`vcs_ignored` compte les bases
+    ainsi élaguées lors du dernier scan. Un fichier régulier nommé ``.git``
+    (gitlink de worktree ou de sous-module) n'est **pas** une base VCS : son
+    contenu est lu comme tout autre fichier.
+
     ``strict`` (mode strict, livré par #29 pour la CLI ``heimdall scan``)
     reste accepté pour compatibilité : seule la base VCS est écartée, quel que
     soit le mode.
@@ -170,6 +176,7 @@ class Scanner:
         "_single",
         "_strict",
         "_traces",
+        "_vcs_ignored",
     )
 
     def __init__(  # noqa: PLR0913 - bornes nommées explicites, cf. MAX_*.
@@ -205,11 +212,40 @@ class Scanner:
         self._strict = strict
         self._allowlist = allowlist if allowlist is not None else Allowlist.empty()
         self._traces: list[AllowlistTrace] = []
+        self._vcs_ignored = 0
 
     @property
     def traces(self) -> tuple[AllowlistTrace, ...]:
         """Traces déterministes des rejets par l'allowlist (#24)."""
         return tuple(self._traces)
+
+    @property
+    def vcs_ignored(self) -> int:
+        """Nombre de bases VCS élaguées lors du dernier scan.
+
+        La base VCS (``.git/``, ``.hg/``, ``.svn/``) n'est pas le contenu du
+        dépôt : elle est écartée par politique, sans ``ScanError``. Ce
+        compteur rend l'élagage **observable** : un ``[]`` ne signifie jamais
+        « historique propre », seulement « rien trouvé dans le périmètre
+        lu ». Pour couvrir le contenu qui va être commité, utiliser
+        ``--staged`` (index git) ; l'historique déjà commité n'est jamais
+        parcouru par l'arbre.
+        """
+        return self._vcs_ignored
+
+    def _recheck_root(self) -> None:
+        """Re-vérifie la racine par ``lstat`` avant toute lecture.
+
+        Entre ``__init__`` et le scan, la racine (ou son parent en mode
+        fichier unique) peut avoir été remplacée par un lien symbolique. Le
+        re-contrôle refuse ce remplacement au lieu de suivre la cible.
+        """
+        try:
+            root_stat = os.lstat(self._root)
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise ScanError(_SCAN_ERROR)
 
     def scan(self, *, deadline: float | None = None) -> list[Finding]:
         """Analyse tout le périmètre et retourne les Findings triés.
@@ -225,9 +261,21 @@ class Scanner:
         dépassée, le scan est refusé (``ScanError``) avant de traiter le
         fichier suivant, et une dernière fois avant de rendre le résultat.
         La CLI ``heimdall scan`` l'utilise pour borner aussi le mode arbre.
+
+        Le retour ne couvre **que** le périmètre lu : la base VCS est
+        élaguée par politique (compteur :attr:`vcs_ignored`) et l'historique
+        n'est jamais parcouru. Un ``[]`` ne prouve donc pas un historique
+        propre ; ``--staged`` couvre le contenu indexé, pas l'historique.
         """
         if deadline is not None and time.monotonic() > deadline:
             raise ScanError(_SCAN_ERROR)
+        # Compteur remis à zéro pour que `vcs_ignored` décrive **ce** scan, pas
+        # une accumulation d'appels successifs sur la même instance.
+        self._vcs_ignored = 0
+        if self._single is not None:
+            # Le mode fichier unique ne passe pas par `_iter_files` : la
+            # racine parente est re-vérifiée ici (aucun lien suivi).
+            self._recheck_root()
         # Pas de `list()` sur le périmètre : un dépôt adverse avec un très
         # grand nombre de fichiers ne doit pas OOM le hook/CI. Le tri final
         # porte sur les findings, pas sur les chemins.
@@ -273,12 +321,7 @@ class Scanner:
         # de ``__init__`` et l'ouverture par ``os.walk``, la racine pourrait
         # être remplacée par un lien symbolique. ``os.walk`` suivrait alors la
         # cible ; ``lstat`` refuse le lien (fail-closed).
-        try:
-            root_stat = os.lstat(self._root)
-        except OSError:
-            raise ScanError(_SCAN_ERROR) from None
-        if not stat.S_ISDIR(root_stat.st_mode):
-            raise ScanError(_SCAN_ERROR)
+        self._recheck_root()
         for current, directories, filenames in os.walk(
             self._root,
             topdown=True,
@@ -296,6 +339,11 @@ class Scanner:
                 # scanné par l'arbre, par design (ce n'est pas un échec de
                 # lecture : elle est élaguée sans ScanError).
                 if classer_repertoire(name) is Perimetre.HORS_PERIMETRE:
+                    # L'élagage est une politique, pas un échec de lecture :
+                    # il est compté pour que l'appelant distingue « aucune
+                    # base VCS » de « base VCS non parcourue ». Aucun chemin
+                    # ni contenu n'est exposé.
+                    self._vcs_ignored += 1
                     continue
                 if not _not_link(current_path / name):
                     raise ScanError(_SCAN_ERROR)
@@ -308,8 +356,11 @@ class Scanner:
                 except ValueError:
                     raise ScanError(_SCAN_ERROR) from None
                 # Aucun fichier n'est exclu par son nom : le contenu décide.
-                # La base VCS est déjà élaguée ci-dessus ; un chemin qui y
-                # mènerait encore est refusé, jamais sauté silencieusement.
+                # La base VCS est un **répertoire** déjà élaguée ci-dessus ;
+                # un fichier régulier nommé `.git` (gitlink) n'est donc pas
+                # classé hors périmètre et sera lu comme tout autre fichier.
+                # Un chemin qui mènerait encore dans une base VCS est refusé,
+                # jamais sauté silencieusement.
                 if classer_chemin(relative) is Perimetre.HORS_PERIMETRE:
                     raise ScanError(_SCAN_ERROR)
                 if not _not_link(path):

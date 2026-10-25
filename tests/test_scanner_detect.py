@@ -23,7 +23,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from support.fake_secrets import fake_token
 
-from heimdall.scanner import hashing
+from heimdall.scanner import exclusions, hashing
 from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
     Finding,
@@ -595,6 +595,27 @@ def test_a_real_binary_is_fail_closed(tmp_path: Path) -> None:
         scan(tmp_path)
 
 
+def test_scanner_does_not_consult_the_deprecated_binary_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : le nom public ``is_known_binary`` n'a plus d'autorité.
+
+    Le scanner passe par le helper interne de ``decode_text``. Instrumenter le
+    nom public (pour lever) ne doit donc pas changer le verdict : un binaire
+    connu reste refusé par ``ScanError``, jamais ignoré ni transformé en
+    exception arbitraire. Un futur appelant ne peut pas réintroduire un
+    contournement nominal en réutilisant ce nom.
+    """
+    _write(tmp_path, "image.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
+
+    def forbidden(_data: bytes) -> bool:
+        raise AssertionError("le scanner ne doit pas appeler is_known_binary")
+
+    monkeypatch.setattr(exclusions, "is_known_binary", forbidden)
+    with pytest.raises(ScanError):
+        scan(tmp_path)
+
+
 def test_the_vcs_database_is_not_walked(tmp_path: Path) -> None:
     """``.git/`` n'est pas le contenu du dépôt : il n'est pas parcouru."""
     _write(tmp_path, ".git/config", f'AWS = "{_aws("git")}"')
@@ -608,6 +629,44 @@ def test_a_vcs_database_with_a_secret_returns_an_empty_list(tmp_path: Path) -> N
     _write(tmp_path, ".git/config", f'AWS = "{_aws("git-only")}"')
     assert scan(tmp_path) == []
     assert find_candidates(str(tmp_path)) == []
+
+
+def test_the_vcs_skip_is_counted_and_never_claimed_complete(tmp_path: Path) -> None:
+    """Revue (MEDIUM) : l'élagage VCS n'est plus silencieux.
+
+    Un dépôt dont la seule base VCS contient un candidat rend ``[]`` : c'est
+    la politique annoncée (l'historique n'est pas le contenu), mais l'appelant
+    doit pouvoir distinguer « aucune base VCS » de « base VCS non parcourue ».
+    ``Scanner.vcs_ignored`` expose ce compteur, sans chemin ni valeur ; un
+    second scan ne cumule pas.
+    """
+    _write(tmp_path, ".git/config", f'AWS = "{_aws("git-only")}"')
+    scanner = Scanner(tmp_path)
+    assert scanner.scan() == []
+    assert scanner.vcs_ignored == 1
+    assert scanner.scan() == []
+    assert scanner.vcs_ignored == 1
+    _write(tmp_path, "app.py", "x = 1\n")
+    assert scanner.scan() == []
+    assert scanner.vcs_ignored == 1
+
+
+def test_a_gitlink_file_is_not_mistaken_for_the_vcs_database(tmp_path: Path) -> None:
+    """Revue (MEDIUM) : un fichier ``.git`` de worktree/sous-module est lu.
+
+    Un gitlink légitime (``gitdir: …``) est un **fichier régulier** : il ne
+    doit pas être classé hors périmètre comme le répertoire ``.git/``, sinon
+    tout dépôt avec worktree ou sous-module sortait en ``ScanError``. Le
+    contenu décide : un texte nommé ``.git`` est scanné comme les autres.
+    """
+    _write(tmp_path, ".git", "gitdir: ../.git/worktrees/example\n")
+    _write(tmp_path, "clean.txt", "x = 1\n")
+    scanner = Scanner(tmp_path)
+    assert scanner.scan() == []
+    assert scanner.vcs_ignored == 0
+
+    _write(tmp_path, ".git", f'AWS = "{_aws("gitlink")}"\n')
+    assert [finding.file for finding in scan(tmp_path)] == [".git"]
 
 
 def test_a_broken_file_in_the_strict_perimeter_is_fail_closed(tmp_path: Path) -> None:
@@ -912,6 +971,39 @@ def test_a_root_replaced_by_a_symlink_before_the_walk_is_fail_closed(
         raise AssertionError("os.walk ne doit pas suivre une racine remplacée")
 
     monkeypatch.setattr("heimdall.scanner.detect.os.walk", forbidden_walk)
+    with pytest.raises(ScanError):
+        scanner.scan()
+
+
+def test_a_single_file_parent_replaced_by_a_symlink_before_reading_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : le mode fichier unique re-vérifie sa racine parente.
+
+    Le re-``lstat`` de ``_iter_files`` ne couvre que le mode arbre. En mode
+    fichier unique, remplacer le répertoire parent par un lien symbolique
+    entre ``__init__`` et ``scan()`` ne doit jamais être suivi : la racine est
+    re-contrôlée avant la moindre lecture de fichier.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write(outside, "leak.py", f'AWS = "{_aws("outside")}"')
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    target = _write(repository, "one.py", "x = 1\n")
+    scanner = Scanner(target)
+    repository.rename(tmp_path / "repo.original")
+    try:
+        repository.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Création de liens symboliques non autorisée sous Windows")
+        raise
+
+    def forbidden_read(_self: Scanner, _path: Path) -> tuple[str, int]:
+        raise AssertionError("aucun fichier ne doit être lu après le remplacement")
+
+    monkeypatch.setattr(Scanner, "_read_text", forbidden_read)
     with pytest.raises(ScanError):
         scanner.scan()
 

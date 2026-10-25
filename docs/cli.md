@@ -100,24 +100,29 @@ bibliothèque (`Scanner`, #22), hors contrat hook/CI.
 
 | Périmètre | Ce qui est analysé | Exclusions |
 | --- | --- | --- |
-| `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **base VCS seule** (`.git/`, `.hg/`, `.svn/` : métadonnées, pas du contenu). Tout le reste (`vendor/`, `node_modules/`, `.venv/`, lockfiles, sorties de build) est lu par contenu ; binaire, lien ou fichier illisible rend le rapport incomplet et sort en **2** |
+| `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **base VCS seule** (`.git/`, `.hg/`, `.svn/` : métadonnées, pas du contenu). Tout le reste (`vendor/`, `node_modules/`, `.venv/`, lockfiles, sorties de build) est lu par contenu ; binaire connu, lien ou fichier illisible est **refusé** (code 2), jamais sauté |
 | `staged` (`--staged`) | le contenu **indexé** de chaque fichier ajouté ou modifié | **aucune exclusion de chemin** : `vendor/`, `third_party/`, `package-lock.json`, `.gitignore`… sont analysés |
 
 « Aucune exclusion de **chemin** » ne veut pas dire « aucune exclusion du
 tout » : un contenu dont la signature magique **et** la majorité sont
-binaires (PNG, PDF, ZIP, ELF…) n'a pas de texte à analyser. En mode arbre, il
-est **tracé** et rend le rapport incomplet : la CLI refuse alors le verdict
-propre (code 2). En `--staged`, le blob binaire connu est sauté — un secret
-placé dans un binaire reste un faux négatif, documenté dans les limites
-ci-dessous. Un contenu inconnu (NUL + texte) reste fail-closed : jamais sauté
-sur simple suffixe.
+binaires (PNG, PDF, ZIP, ELF…) n'a pas de texte à analyser. En mode arbre, le
+fichier est **refusé** (`ScanError`), ce qui rend le verdict propre impossible
+(code 2). En `--staged`, le blob binaire connu est sauté — un secret placé dans
+un binaire reste un faux négatif, documenté dans les limites ci-dessous. Un
+contenu inconnu (NUL + texte) reste fail-closed : jamais sauté sur simple
+suffixe.
 
 Le mode strict est une correction issue de la revue de #165 (point HIGH) :
 la politique #59 excluait `vendor/`, `node_modules/` et les lockfiles, donc un
 secret posé dans `vendor/evil.py` n'était **jamais** signalé. Un secret y est
 un secret : aucun nom de fichier ou de répertoire de contenu n'exclut plus rien,
 et le contenu décide. Seule la base VCS est hors du périmètre audité.
-L'historique VCS (.git/) n'est jamais parcouru par le mode arbre ; l'analyse de l'historique est couverte exclusivement par l'option --staged.
+L'historique VCS (`.git/`) n'est jamais parcouru par le mode arbre, et le
+compteur `heimdall.scanner.detect.Scanner.vcs_ignored` rend cet élagage
+observable. `--staged` couvre le contenu **indexé** (ce que le commit va
+contenir), pas les commits déjà écrits. Un fichier régulier nommé `.git`
+(gitlink de worktree ou de sous-module, `gitdir: …`) n'est pas une base VCS :
+il est lu par contenu.
 
 En mode `--staged`, c'est le **blob indexé** qui est lu, pas la copie de
 travail : c'est ce que le commit va contenir qui est jugé. Le blob entier est
@@ -320,12 +325,12 @@ document si `count != len(findings)` (contrainte explicitée dans la
 
 - Le contenu **binaire** n'est pas analysé : un secret placé dans un
   commentaire PNG ou une archive n'est pas détecté. En mode arbre, le fichier
-  est tracé et la CLI sort en **2** (verdict propre refusé) ; en `--staged`,
-  le blob binaire connu est sauté et un `0` peut être rendu. C'est une
-  impossibilité technique documentée, pas une exclusion de chemin. Les
-  répertoires et fichiers textuels de `node_modules/`, `vendor/`, `.venv/`,
-  `build/`, `dist/`, `target/` ou `htmlcov/` sont, eux, scannés dans les deux
-  périmètres.
+  est **refusé** (`ScanError`) et la CLI sort en **2** (verdict propre
+  impossible) ; en `--staged`, le blob binaire connu est sauté et un `0` peut
+  être rendu. C'est une impossibilité technique documentée, pas une exclusion
+  de chemin. Les répertoires et fichiers textuels de `node_modules/`,
+  `vendor/`, `.venv/`, `build/`, `dist/`, `target/` ou `htmlcov/` sont, eux,
+  scannés dans les deux périmètres.
 - La fenêtre multi-ligne reste bornée à 4 Kio : un secret coupé par un
   retour à la ligne au-delà de cette borne n'est pas recherché.
 - Le mode `--staged` analyse l'**index**, pas l'historique : un secret déjà

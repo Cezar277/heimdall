@@ -9,17 +9,31 @@ est aussi utilisable comme bibliothèque et par les tests d'acceptation T21.
 ## API
 
 ```python
-from heimdall.scanner import Finding, Scanner, find_candidates
+from heimdall.scanner import Finding, find_candidates
+from heimdall.scanner.detect import Scanner as TreeScanner
 
-findings: list[Finding] = Scanner(".").scan()
+findings: list[Finding] = TreeScanner(".").scan()
 payload: list[dict[str, object]] = find_candidates(".")  # contrat #14
 
-# Mode strict (#29) : seules les exclusions techniques restent, les
-# répertoires et fichiers tiers textuels (vendor/, lockfiles) sont analysés.
-strict: list[Finding] = Scanner(".", strict=True).scan()
+# Mode strict (#29) : accepté pour compatibilité ; seule la base VCS est
+# écartée, quel que soit le mode. Tous les autres noms sont lus par contenu.
+strict: list[Finding] = TreeScanner(".", strict=True).scan()
+
+# La base VCS est élaguée par politique, sans ScanError. Le compteur rend
+# cet élagage observable : un [] ne prouve jamais un historique propre.
+scanner = TreeScanner(".")
+findings = scanner.scan()
+bases_vcs_ignorees: int = scanner.vcs_ignored
 ```
 
-`Scanner` accepte un répertoire ou un fichier régulier explicite. `root` est
+Le scanner d'arbre est `heimdall.scanner.detect.Scanner` (alias
+`TreeScanner` ci-dessus) : c'est lui qui porte `vcs_ignored` et les bornes de
+parcours. `heimdall.scanner.Scanner` est une autre surface, la **façade de
+cibles** `DiffTarget`/`FileTarget` avec un moteur injecté (voir
+[scanner-interface.md](scanner-interface.md)) ; `find_candidates()` reste le
+raccourci public pour obtenir directement les dictionnaires du contrat #14.
+
+`TreeScanner` accepte un répertoire ou un fichier régulier explicite. `root` est
 résolu une fois, **sans suivre de lien symbolique** : la racine elle-même et
 chacun de ses ancêtres sont vérifiés par `lstat`, et un lien dans ce chemin
 lève `ScanError` (la cible n'est pas lue à la place de la racine). Chaque
@@ -75,48 +89,36 @@ distinctes** du même type sur la même ligne produisent **deux** Findings
 pas de colonne, mais un candidat ne doit jamais disparaître. Seule une valeur
 strictement identique, déjà vue sur la même ligne, est dédupliquée.
 
-## Exclusions (#59)
+## Périmètre (#59)
 
-Politique explicite, jamais une heuristique :
+Le **contenu** décide, jamais le nom. Aucune extension, aucun lockfile et
+aucun répertoire de tiers (`vendor/`, `node_modules/`, `.venv/`, sorties de
+build…) n'est exclu du scan : un secret y est un secret. Un fichier texte
+nommé `evil.png` est lu et scanné comme un `.txt`.
 
-- fichiers de contrôle : `.gitignore`, `.gitattributes`, `.dockerignore`,
-  `.npmignore`, `.coverage` ;
-- répertoires : `.git`, `.hg`, `.svn`, environnements virtuels (`.venv`, `venv`,
-  `virtualenv`), `vendor`, `node_modules`, `third_party`, `build`, `dist`,
-  `target`, `bower_components`, `htmlcov`, caches Python ;
-- lockfiles : suffixe `.lock`, `package-lock.json`, `yarn.lock`,
-  `pnpm-lock.yaml`, `go.sum`, `bun.lockb` ;
-- binaires : extension connue, ou signature magique connue **et** contenu
-  majoritairement binaire (ELF, PNG, PDF, ZIP…).
+Seule la **base VCS** (`.git/`, `.hg/`, `.svn/`) est élaguée : ce n'est pas le
+contenu du dépôt, et son historique n'est jamais parcouru par le mode arbre.
+Cet élagage est une politique, pas un échec de lecture : il ne lève pas
+`ScanError`, mais il est **compté** dans `TreeScanner.vcs_ignored` pour que
+l'appelant distingue « aucune base VCS » de « base VCS non parcourue ». Un
+`[]` vaut donc « rien trouvé dans le périmètre lu », jamais « historique
+propre » ; `--staged` couvre le contenu indexé (ce que le commit va
+contenir), pas les commits déjà écrits.
 
-Un répertoire nommé `env/` n'est **pas** exclu : seuls les environnements
-virtuels connus le sont. Un dossier de sources `env/` est donc scanné.
+Un fichier régulier nommé `.git` est un **gitlink** légitime (worktree,
+sous-module : `gitdir: …`), pas le répertoire `.git/` : seul un segment
+**parent** de chemin peut classer hors périmètre. Son contenu est lu comme
+celui de tout autre fichier.
 
-`.env`, `.env.example`, `requirements.txt`, les fichiers sans extension et les
-`.pem`/`.key` sont scannés. Les mocks de `tests/` ne sont **pas** exclus
-globalement : ils font partie du corpus de non-régression T21.
+`strict` reste accepté pour compatibilité ; il ne change plus le périmètre
+(seule la base VCS est écartée dans tous les modes). C'est la correction du
+point HIGH relevé à la revue de #165 : la politique #59 laissait passer un
+secret posé dans `vendor/evil.py`, sans jamais le signaler.
 
-### Deux familles d'exclusions, et le mode strict (#29)
-
-Les exclusions ci-dessus se répartissent en deux familles, et cette
-répartition fonde le mode **strict** livré par #29 (`heimdall scan`) :
-
-| Famille | Contenu | Mode strict |
-| --- | --- | --- |
-| **technique** | binaires, dépendances et environnements (`.git`, `node_modules`, `.venv`, `__pycache__`, caches…), `.coverage`, `bun.lockb` | **exclus** (ils sont illisibles ou illisibles par des expressions de texte) |
-| **contenu texte** | `vendor/`, `third_party/`, `third-party/`, sorties de build (`build/`, `dist/`, `target/`, `bower_components/`, `htmlcov/`), lockfiles, `.gitignore` et autres fichiers de contrôle | **analysés** (un secret y est un secret) |
-
-`Scanner(root, strict=True)` (et `scan(root, strict=True)`) ne conserve que la
-première famille. C'est la correction du point HIGH relevé à la revue de #165 :
-la politique #59 seule laissait passer un secret posé dans `vendor/evil.py`,
-sans jamais le signaler. Le mode strict est le comportement par défaut de la
-CLI `heimdall scan` (voir [cli.md](cli.md)).
-
-En strict, l'extension binaire ne prime plus sur le contenu : un fichier texte
-nommé `evil.png` est lu et scanné, comme en `--staged`. Un vrai binaire reste
-exclu par sa signature **connue** (magie + majorité binaire). Un binaire
-inconnu (NUL + texte) reste fail-closed comme en `--staged` : le suffixe ne
-convertit jamais un doute en skip silencieux.
+Un contenu binaire **connu** (signature magique et majorité binaire) n'est pas
+silencieusement ignoré : le scanner lève `ScanError`. Un binaire inconnu
+(NUL + texte) reste fail-closed de la même façon : le nom ni le suffixe ne
+convertissent jamais un doute en skip silencieux.
 
 ### Encodage des fichiers lus
 
@@ -127,7 +129,7 @@ Les fichiers texte sont décodés, pas ignorés :
 | UTF-8 (avec ou sans BOM) | décodage strict ; octet invalide → `ScanError` (#23) |
 | UTF-16 / UTF-32 avec BOM | décodage strict, fichier scanné |
 | UTF-16 / UTF-32 sans BOM | heuristique bornée (proportion ASCII puis caractères imprimables), fichier scanné |
-| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | ignoré par politique |
+| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | `ScanError` en mode arbre (binaire connu, jamais un skip silencieux) ; blob sauté en `--staged` |
 | signature binaire suivie de texte clair | `ScanError` (fail-closed) |
 | contenu NUL non décodable | `ScanError` (fail-closed) |
 
@@ -155,18 +157,20 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` |
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
 | clé HMAC demandée avec `..` dans le chemin | `ScanError` |
-| contenu NUL non décodable (hors binaire réellement binaire) | `ScanError` |
-| fichier ou répertoire symlinké **interne** au périmètre | ignoré par politique (non suivi, non signalé ; voir #59) |
-| fichier exclu ou binaire connu | ignoré par politique |
-| scan réussi sans signature | liste vide (réellement propre **hors exclusions** — voir limites) |
+| contenu NUL non décodable (y compris un binaire connu) | `ScanError` |
+| fichier ou répertoire symlinké **interne** au périmètre | `ScanError` (jamais suivi) |
+| base VCS `.git/`, `.hg/`, `.svn/` | élaguée par politique, comptée dans `TreeScanner.vcs_ignored` |
+| fichier régulier nommé `.git` (gitlink) | lu par contenu, comme tout fichier |
+| scan réussi sans signature | liste vide (**périmètre lu** propre ; l'historique VCS n'est pas couvert) |
 
-> **Garde d'usage (hook/CI) :** le `Scanner` bibliothèque reste en politique
-> #59 (exclusions de contenu texte comprises) : un `[]` sur dépôt complet y
-> vaut « propre **hors exclusions** ». Pour un hook ou une CI, c'est la CLI
-> `heimdall scan` qu'il faut utiliser : elle applique le **mode strict** sur
-> l'arbre de travail et analyse **sans aucune exclusion** les blobs de l'index
-> en mode `--staged` (voir [cli.md](cli.md)). Un scan incomplet y sort en 2,
-> jamais en 0.
+> **Garde d'usage (hook/CI) :** le scanner d'arbre bibliothèque lit tous les
+> noms par contenu ; un `[]` vaut « rien trouvé dans le périmètre lu », jamais
+> « historique propre ». La base VCS est élaguée par politique et comptée
+> dans `TreeScanner.vcs_ignored`. Pour un hook ou une CI, c'est la CLI
+> `heimdall scan` qu'il faut utiliser : elle refuse (code 2) tout fichier du
+> périmètre non analysable et analyse **sans aucune exclusion de chemin** les
+> blobs de l'index en mode `--staged` (voir [cli.md](cli.md)). Un scan
+> incomplet sort en 2, jamais en 0.
 
 Un scan incomplet ne devient donc jamais une liste vide ou partielle. Depuis
 #29, la CLI est branchée : `ScanError` produit le code 2 (erreur d'outillage),
@@ -198,13 +202,15 @@ jamais 0 ni 1.
   des variables : les cas reconstruits de T21 restent des `limite_connue`. Depuis #23,
   deux valeurs encodées sont détectées par entropie, sans décodage :
   rappel 0,75 sur `all`, 1,0 sur `core`. L'allowlist relève de #24.
-- Les fichiers binaires, lockfiles et répertoires tiers sont ignorés par
-  la politique #59 **de la bibliothèque** : un secret qui y serait copié n'est
-  pas signalé. En mode dépôt complet, `[]` vaut donc « propre hors
-  exclusions », jamais « propre absolu ». Depuis #29, la **CLI** applique le
-  mode strict (arbre de travail) ou l'analyse **sans exclusion** des blobs
-  indexés (`--staged`) : ce blocage est levé pour la CLI, il reste entier
-  pour l'usage bibliothèque, et #59 garde la main sur la politique.
+- Les fichiers binaires connus ne sont pas analysés : un secret placé dans un
+  binaire reste un faux négatif. En mode arbre, le scanner **refuse** le
+  fichier (`ScanError`, code 2 pour la CLI) au lieu de l'ignorer
+  silencieusement ; en `--staged`, le blob binaire connu est sauté (limite
+  documentée dans [cli.md](cli.md)). Les répertoires et fichiers textuels de
+  `node_modules/`, `vendor/`, `.venv/`, `build/`, `dist/`, `target/` ou
+  `htmlcov/` sont, eux, scannés dans les deux périmètres : aucun nom de
+  fichier ou de répertoire de contenu n'exclut plus rien. Seule la base VCS
+  est élaguée, et ce n'est pas du contenu.
 - La jointure multi-ligne est bornée à 4 Kio. Une affectation ou un jeton de
   longueur candidate sur une des lignes provoque `ScanError` lorsque cette
   borne est dépassée, sans exception par fournisseur. Les jetons individuels
