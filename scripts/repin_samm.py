@@ -34,10 +34,11 @@ import argparse
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 #: Dépôt attendu : toute permalien vers un autre dépôt est une erreur.
 DEPOT_ATTENDU: tuple[str, str] = ("Cezar277", "heimdall")
@@ -149,14 +150,32 @@ def reecrire(text: str, sha_cible: str, racine: Path) -> str:
 
 
 def _livre(racine: Path, chemin: str) -> bool:
-    """Vrai si le fichier visé existe encore dans l'arborescence livrée."""
+    """Vrai si le fichier visé existe encore dans l'arborescence livrée.
+
+    Aucun lien symbolique n'est suivi, y compris dans les composants
+    intermédiaires : un permalien vers un lien — même interne — n'est pas
+    re-pincé, et un lien planté ne peut pas faire croire qu'un fichier hors
+    dépôt est livré. Les composants ``..``, vides ou absolus sont refusés
+    avant tout accès disque.
+    """
+    relatif = PurePosixPath(chemin)
+    if relatif.is_absolute() or not relatif.parts:
+        return False
+    if any(partie in {"", ".", ".."} for partie in relatif.parts):
+        return False
     try:
-        chemin_resolu = (racine / chemin).resolve()
+        racine = racine.resolve()
+        candidat = racine
+        for partie in relatif.parts:
+            candidat = candidat / partie
+            if stat.S_ISLNK(os.lstat(candidat).st_mode):
+                return False
+        chemin_resolu = candidat.resolve(strict=True)
+        if not chemin_resolu.is_relative_to(racine):
+            return False
+        return stat.S_ISREG(os.stat(chemin_resolu, follow_symlinks=False).st_mode)
     except (OSError, RuntimeError, ValueError):
         return False
-    if not chemin_resolu.is_relative_to(racine):
-        return False
-    return chemin_resolu.is_file()
 
 
 def verifier(text: str, racine: Path) -> list[str]:

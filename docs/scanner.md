@@ -128,6 +128,15 @@ silencieusement ignoré : le scanner lève `ScanError`. Un binaire inconnu
 (NUL + texte) reste fail-closed de la même façon : le nom ni le suffixe ne
 convertissent jamais un doute en skip silencieux.
 
+> **API dépréciée, sans autorité.** `heimdall.scanner.exclusions.is_known_binary`
+> reste importable pour compatibilité historique, mais le scanner ne l'appelle
+> **jamais** : `decode_text` passe par le helper interne `_is_known_binary`.
+> Ne jamais brancher un périmètre, une allowlist ou une décision « ignorer ce
+> fichier » sur ce nom public : un appelant qui l'utiliserait pour exclure un
+> fichier sans analyser son contenu réintroduirait le contournement corrigé
+> par #59. Sa suppression est prévue dans un ticket dédié ; d'ici là, seul le
+> contenu décide.
+
 ### Encodage des fichiers lus
 
 Les fichiers texte sont décodés, pas ignorés :

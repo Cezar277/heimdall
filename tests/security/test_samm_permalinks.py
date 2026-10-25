@@ -170,3 +170,60 @@ def test_the_check_mode_reports_a_wrong_repository_inside_the_repository(
     assert repin.main(["--check", "--fiche", str(fiche)]) == 1
     # La fiche n'a pas été modifiée : `--check` ne réécrit rien.
     assert "Cezarwers" in fiche.read_text(encoding="utf-8")
+
+
+def test_livre_refuses_symlinks_even_inside_the_repository(tmp_path: Path) -> None:
+    """Revue (LOW) : un lien n'est jamais suivi avant le confinement.
+
+    Le fichier visé peut être interne au dépôt : il n'est pas « livré » pour
+    autant, car le permalien pointe un lien, pas un fichier régulier. Un lien
+    planté vers l'extérieur ne peut donc pas faire croire qu'un fichier hors
+    dépôt est livré.
+    """
+    racine = tmp_path / "repo"
+    racine.mkdir()
+    reel = racine / "reel.py"
+    reel.write_text("x = 1\n", encoding="utf-8")
+    interieur = racine / "interieur.py"
+    interieur.symlink_to(reel)
+    dehors = tmp_path / "dehors.py"
+    dehors.write_text("x = 2\n", encoding="utf-8")
+    exterieur = racine / "exterieur.py"
+    exterieur.symlink_to(dehors)
+    passwd = racine / "passwd.py"
+    passwd.symlink_to("/etc/passwd")
+    dossier = racine / "dossier"
+    dossier.mkdir()
+    (dossier / "fichier.py").write_text("x = 3\n", encoding="utf-8")
+    dossier_lie = racine / "dossier_lie"
+    dossier_lie.symlink_to(dossier)
+
+    assert repin._livre(racine, "reel.py") is True
+    assert repin._livre(racine, "interieur.py") is False
+    assert repin._livre(racine, "exterieur.py") is False
+    assert repin._livre(racine, "passwd.py") is False
+    # Un lien intermédiaire est refusé avant même de résoudre le fichier.
+    assert repin._livre(racine, "dossier_lie/fichier.py") is False
+    # Les composants qui sortent du dépôt sont refusés sans les suivre.
+    assert repin._livre(racine, "../dehors.py") is False
+    assert repin._livre(racine, str(dehors)) is False
+
+
+def test_the_repin_never_rewrites_a_permalink_to_a_symlink(tmp_path: Path) -> None:
+    """Un permalien vers un lien reste historique : il n'est pas re-pincé."""
+    sha = "a" * 40
+    historique = "b" * 40
+    racine = tmp_path / "repo"
+    racine.mkdir()
+    cible = racine / "cible.py"
+    cible.write_text("x = 1\n", encoding="utf-8")
+    (racine / "lien.py").symlink_to(cible)
+    texte = (
+        f"[lien](https://github.com/{DEPOT_ATTENDU[0]}/{DEPOT_ATTENDU[1]}/blob/"
+        f"{historique}/lien.py)\n"
+        f"[cible](https://github.com/{DEPOT_ATTENDU[0]}/{DEPOT_ATTENDU[1]}/blob/"
+        f"{historique}/cible.py)\n"
+    )
+    reecrit = repin.reecrire(texte, sha, racine)
+    assert f"blob/{historique}/lien.py" in reecrit
+    assert f"blob/{sha}/cible.py" in reecrit

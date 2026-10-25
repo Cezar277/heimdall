@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import stat
 import time
 import types
@@ -444,15 +445,17 @@ def test_a_maximal_inner_token_stays_detectable_once_prefixed(prefixe: str) -> N
     assert compose[0].value == "xoxe." + interne
 
 
-def test_an_oversized_inner_token_is_a_documented_limit() -> None:
+@pytest.mark.parametrize("charge", [SLACK_PAYLOAD_MAX + 1, 256])
+def test_an_oversized_inner_token_is_a_documented_limit(charge: int) -> None:
     """Limite figée : au-delà de la charge maximale, rien n'est détecté.
 
     Un jeton plus long que la borne documentée n'est detectable **ni seul
     ni préfixé** : la limite est écrite (et non un secret perdu en
-    silence par la garde `xoxe.`). Le comportement est figé ici.
+    silence par la neutralisation `xoxe.`). Le comportement est figé ici,
+    y compris pour la charge 256 citée par la revue.
     """
-    interne = "xapp-" + "a" * (SLACK_PAYLOAD_MAX + 1)
-    assert len(interne) == SLACK_TOKEN_MAX + 1
+    interne = "xapp-" + "a" * charge
+    assert len(interne) > SLACK_TOKEN_MAX
     assert find_signature_matches(interne) == ()
     assert find_signature_matches("xoxe." + interne) == ()
 
@@ -677,6 +680,52 @@ def test_the_vcs_skip_is_counted_and_never_claimed_complete(tmp_path: Path) -> N
     assert scanner.vcs_ignored == 1
     _write(tmp_path, "app.py", "x = 1\n")
     assert scanner.scan() == []
+    assert scanner.vcs_ignored == 1
+
+
+def test_vcs_ignored_is_reset_between_scans(tmp_path: Path) -> None:
+    """Revue : le compteur décrit **ce** scan, pas l'accumulation des appels.
+
+    Un premier scan sans base VCS vaut 0 ; l'ajout d'un ``.git/`` fait passer
+    le second scan à 1 ; sa suppression ramène le troisième à 0. Aucun état
+    d'un scan précédent ne fuit dans le suivant.
+    """
+    scanner = Scanner(tmp_path)
+    assert scanner.scan() == []
+    assert scanner.vcs_ignored == 0
+
+    _write(tmp_path, ".git/config", f'AWS = "{_aws("git-only")}"')
+    assert scanner.scan() == []
+    assert scanner.vcs_ignored == 1
+
+    shutil.rmtree(tmp_path / ".git")
+    assert scanner.scan() == []
+    assert scanner.vcs_ignored == 0
+
+
+def test_gitlink_file_and_vcs_directory_scan_matrix(tmp_path: Path) -> None:
+    """Matrice gitlink : fichier ``.git`` lu, répertoire ``.git/`` élagué.
+
+    Les trois cas sont figés ensemble : un fichier régulier ``.git``
+    (``gitdir: …``) est scanné par contenu ; un répertoire ``.git/`` est
+    élagué et **compté** ; un chemin dont un parent est ``.git/`` est refusé
+    par le prédicat de défense en profondeur.
+    """
+    _write(tmp_path, ".git", "gitdir: ../.git/worktrees/example\n")
+    _write(tmp_path, "a/.git/b.txt", f'AWS = "{_aws("vcs-dir")}"')
+    _write(tmp_path, "a/clean.txt", "x = 1\n")
+
+    assert est_chemin_hors_perimetre(".git") is False
+    assert est_chemin_hors_perimetre("a/.git") is False
+    assert est_chemin_hors_perimetre("a/.git/b.txt") is True
+
+    scanner = Scanner(tmp_path)
+    assert scanner.scan() == []
+    assert scanner.vcs_ignored == 1
+
+    _write(tmp_path, ".git", f'AWS = "{_aws("gitlink")}"\n')
+    findings = scanner.scan()
+    assert [finding.file for finding in findings] == [".git"]
     assert scanner.vcs_ignored == 1
 
 

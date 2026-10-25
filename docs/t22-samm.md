@@ -59,7 +59,9 @@ signalées ci-dessous.
 > la base VCS est élaguée par politique, et
 > `heimdall.scanner.detect.Scanner.vcs_ignored` compte ces bases sans exposer
 > de chemin. La section « 5ᵉ passage » ci-dessous fige cet état et corrige les
-> affirmations devenues fausses.
+> affirmations devenues fausses. Le 6ᵉ passage remplace ensuite la garde regex
+> Slack des sections 3ᵉ/4ᵉ par une neutralisation conditionnelle dans
+> `find_signature_matches` : seule la section « 6ᵉ passage » décrit ce point.
 Depuis #29, le mode strict de la CLI
 (`heimdall.scanner.detect.Scanner(root, strict=True)`) ajoute des
 bornes (fichiers, volume total, Findings) et écarte la base VCS du périmètre
@@ -226,6 +228,36 @@ re-pince les liens historiques et `--check` refuse tout lien mort.
 | **Aucune lecture après remplacement de la racine parente en mode fichier unique** | `_recheck_root` appelé par `scan()` | `tests/test_scanner_detect.py::test_a_single_file_parent_replaced_by_a_symlink_before_reading_is_fail_closed` |
 | **Le nom public du helper binaire n'a plus d'autorité** | `_is_known_binary` interne + alias déprécié | `tests/test_scanner_detect.py::test_scanner_does_not_consult_the_deprecated_binary_helper` |
 
+## Corrections issues de la relecture « APPROVE WITH COMMENTS » (6ᵉ passage)
+
+Cette section décrit le correctif demandé par la relecture du 6ᵉ passage :
+*la neutralisation du jeton interne doit tester la forme rotative complète*,
+*le helper binaire déprécié doit être explicitement interdit dans la doc*,
+*le re-pin ne doit suivre aucun lien symbolique*, et *les tests manquants
+doivent figer le compteur VCS, la matrice gitlink et les bornes Slack*.
+Les preuves ci-dessous sont des **noms de modules et de tests** (pas de
+permalien sur un SHA intermédiaire) ; après le squash,
+`scripts/repin_samm.py --sha <sha-final>` re-pince les liens historiques et
+`--check` refuse tout lien mort.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| **LOW** — la garde rotative neutralisait le jeton interne sans tester la longueur de la forme rotative | la garde regex est supprimée : les règles « seul » reconnaissent le jeton, puis `signatures.find_signature_matches` écarte le doublon **seulement si** une forme `xoxe.` complète a été reconnue et que le jeton interne occupe exactement sa charge. La neutralisation teste donc la longueur et la frontière avale ; un préfixe bourré ou une charge hors bornes ne masque rien | `heimdall/scanner/signatures/stripe_slack.py`, `heimdall/scanner/signatures/__init__.py` ; `tests/test_scanner_detect.py::test_a_maximal_inner_token_stays_detectable_once_prefixed`, `::test_an_oversized_inner_token_is_a_documented_limit`, `::test_a_padded_rotating_prefix_does_not_hide_the_inner_token` |
+| **LOW** — `is_known_binary` restait exporté comme si le nom pouvait décider du périmètre | `docs/scanner.md` interdit explicitement de brancher le périmètre sur ce nom public et rappelle que `decode_text` n'utilise que `_is_known_binary` ; l'alias reste sans autorité et sa suppression est renvoyée à un ticket dédié | `docs/scanner.md` (Périmètre), `heimdall/scanner/exclusions.py` ; `tests/test_scanner_detect.py::test_scanner_does_not_consult_the_deprecated_binary_helper` |
+| **LOW** — `_livre()` suivait les liens symboliques avant le confinement | `_livre()` refuse désormais tout composant symbolique par `lstat` avant de résoudre et de confiner le chemin ; un lien interne, externe ou vers `/etc/passwd` n'est jamais « livré » et n'est donc pas re-pincé | `scripts/repin_samm.py` (`_livre`) ; `tests/security/test_samm_permalinks.py::test_livre_refuses_symlinks_even_inside_the_repository`, `::test_the_repin_never_rewrites_a_permalink_to_a_symlink` |
+| **LOW** — tests manquants : compteur VCS remis à zéro, matrice gitlink, bornes Slack 250/256 | les tests figent le comportement : re-scan après ajout puis suppression de `.git/` (0 → 1 → 0), fichier `.git` lu vs répertoire `.git/` élagué et compté vs `a/.git/b.txt` refusé, jeton interne à charge 250 préfixé (un seul Finding rotatif) et charges 251/256 (limite documentée) | `tests/test_scanner_detect.py::test_vcs_ignored_is_reset_between_scans`, `::test_gitlink_file_and_vcs_directory_scan_matrix`, `::test_a_maximal_inner_token_stays_detectable_once_prefixed`, `::test_an_oversized_inner_token_is_a_documented_limit` |
+| **LOW** — hygiène PR : quatre sous-tickets dans une PR | exception maintenue et signalée ; elle reste à valider par les mainteneurs. Le 6ᵉ passage ne modifie pas le découpage | `docs/t22-samm.md#exception-de-regroupement` |
+| **LOW** — preuves à re-pinner après squash | `repin_samm.py --check` est vert sur l'arbre courant ; le SHA du squash reste la seule valeur à fournir après fusion (`--sha <sha-final>`) | `scripts/repin_samm.py`, `tests/security/test_samm_permalinks.py` |
+
+### Ce que le correctif permet désormais de prouver
+
+| Exigence vérifiée | Implémentation | Test et preuve permanente |
+|---|---|---|
+| **La neutralisation d'un jeton rotatif est conditionnelle à la reconnaissance de la forme complète** (longueur et frontière avale) | `heimdall/scanner/signatures/__init__.py` (`find_signature_matches`, `_matches_rotatifs`), `stripe_slack.py` (bornes dérivées) | `tests/test_scanner_detect.py::test_a_maximal_inner_token_stays_detectable_once_prefixed`, `::test_an_oversized_inner_token_is_a_documented_limit`, `::test_a_padded_rotating_prefix_does_not_hide_the_inner_token` |
+| **Le helper binaire déprécié ne peut pas décider du périmètre** | `docs/scanner.md` (API dépréciée), `exclusions.py` (`_is_known_binary`) | `tests/test_scanner_detect.py::test_scanner_does_not_consult_the_deprecated_binary_helper` |
+| **Le re-pin ne suit aucun lien symbolique et reste confiné** | `scripts/repin_samm.py` (`_livre`, `_resoudre_fiche`) | `tests/security/test_samm_permalinks.py::test_livre_refuses_symlinks_even_inside_the_repository`, `::test_the_repin_never_rewrites_a_permalink_to_a_symlink`, `::test_the_repin_refuses_a_fiche_outside_the_repository` |
+| **Le compteur VCS décrit le scan courant, la matrice gitlink est figée** | `heimdall/scanner/detect.py` (`scan`, `_iter_files`), `exclusions.py` | `tests/test_scanner_detect.py::test_vcs_ignored_is_reset_between_scans`, `::test_gitlink_file_and_vcs_directory_scan_matrix` |
+
 ## Révisions à re-pinner après la fusion
 
 Les permaliens de cette fiche sont épinglés sur la révision du code testé
@@ -236,16 +268,24 @@ rejouable sur la branche mais **pourrit à la fusion** (un squash n'apporte pas
 les commits intermédiaires dans `main`) : les liens deviennent morts et la
 preuve n'est plus vérifiable par un auditeur.
 
-Le correctif du 5ᵉ passage est appliqué dans l'arbre de travail au-dessus de
-`44bfb191af4c804014eb108eac5c4f995973a1e6` ; il n'a pas encore de SHA propre.
-Ses preuves sont volontairement citées par **nom de test** (section
-« 5ᵉ passage »), sans permalien sur un SHA intermédiaire. Elles seront
-re-pinées avec le reste au SHA du squash.
+Le correctif du 5ᵉ passage est intégré dans l'historique de la branche
+(`44bfb19` → `05884f4` → `5be81e4`), puis `eb68425` résout le conflit de
+`main.py`. Ses preuves sont volontairement citées par **nom de test**
+(section « 5ᵉ passage »), sans permalien sur un SHA intermédiaire. Elles
+seront re-pinées avec le reste au SHA du squash.
+
+Le correctif du 6ᵉ passage est appliqué dans l'arbre de travail au-dessus de
+`eb684254ec6544f632a1f4732cd28aa1a14941ee` ; il n'a pas encore de SHA propre.
+Ses preuves sont également citées par **nom de test** (section « 6ᵉ passage »)
+et seront re-pinées avec le reste au SHA du squash. `repin_samm.py --check`
+est vert sur cet arbre ; il ne reste que le SHA final à fournir après fusion.
 
 | Révision | Commit | Passe |
 |---|---|---|
 | `c391cc0b15cd58743e826a2d5947e9743507b9ef` | fix(scanner): garde executable du verdict propre, bornes Slack couplees (#22) | 4ᵉ passage |
-| `44bfb191af4c804014eb108eac5c4f995973a1e6` | Fix(scanner): sécurisation TOCTOU et alignement documentaire | Base du correctif du 5ᵉ passage (non commité) |
+| `44bfb191af4c804014eb108eac5c4f995973a1e6` | Fix(scanner): sécurisation TOCTOU et alignement documentaire | Base du correctif du 5ᵉ passage |
+| `5be81e45529a60e4c59523caf677bc4b90220256` | Fix(scanner): sécurisation finale --staged, observabilité CLI et TOCTOU ancêtres | 5ᵉ passage (intégré) |
+| `eb684254ec6544f632a1f4732cd28aa1a14941ee` | Résolution du conflit dans main.py : conservation de la version en ligne | Base du correctif du 6ᵉ passage (non commité) |
 
 Après la fusion (SHA du squash connu), re-pince **en une commande** :
 
@@ -357,6 +397,12 @@ le correctif porte sur l'observabilité de l'élagage VCS, le gitlink `.git`,
 l'alignement documentaire et deux gardes de lecture ; il ne change ni le
 découpage ni le périmètre des sous-tickets. L'exception reste **à valider
 explicitement par les mainteneurs** avant fusion.
+
+La relecture « APPROVE WITH COMMENTS » (6ᵉ passage) **maintient également
+l'exception** : le correctif porte sur la neutralisation Slack, le helper
+binaire déprécié, le confinement du re-pin et les tests manquants ; il ne
+change ni le découpage ni le périmètre des sous-tickets. L'exception reste
+**à valider explicitement par les mainteneurs** avant fusion.
 
 ## Relecture et PR
 
