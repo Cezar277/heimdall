@@ -10,20 +10,26 @@ Ticket : [#33](https://github.com/Cezar277/heimdall/issues/33).
 | Fail-closed si le journal échoue | `qualify_finding`, propagation `JournalError` | `test_io_failure_never_returns_rejection`, `test_cli_corruption_exit_two` |
 | Visibilité des rejets | `rejection_summary`, commande `rejections` dans `heimdall/cli/main.py` | `test_cli_summary_and_escaped_details` |
 | Aucun rejet LLM en CI | Court-circuit `qualify_finding(ci=True)` ; scan CI déterministe inchangé | `test_ci_never_calls_model_or_journal`, suite `tests/test_cli_scan.py` |
+| Consultation sans effet de bord | `_prepare_path(create=False)`, `_locked(create=False)`, `RejectionJournal.read` | `test_read_absent_journal_creates_nothing`, `test_existing_journal_read_never_creates_or_writes`, `test_read_in_unwritable_state_never_creates_files` |
+| Entrée non masquée ou surdimensionnée | Garde avant appel dans `qualify_finding` | `test_masking_guard_precedes_model_and_journal` |
+| Concurrence lecture / lecture | Verrou exclusif non bloquant conservé | `test_two_reads_refuse_concurrency_explicitly` |
 
 Les limites du chaînage et le raccordement au dialogue #32 sont documentés
 dans [llm-rejections.md](llm-rejections.md). Aucun test ne contacte Ollama.
 
 ## Liens permanents pour la feuille SAMM
 
-Commit d'implémentation : `587fdd80a8a98d8f86ef602c72bf4770d289208f`.
+Commit d'implémentation après revue : `c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b`.
 
-- [Append durable et champs de preuve, rejections.py:170](https://github.com/Cezar277/heimdall/blob/587fdd80a8a98d8f86ef602c72bf4770d289208f/heimdall/llm/rejections.py#L170).
-- [Vérification de chaîne, rejections.py:111](https://github.com/Cezar277/heimdall/blob/587fdd80a8a98d8f86ef602c72bf4770d289208f/heimdall/llm/rejections.py#L111).
-- [Verrou et permissions, rejections.py:77](https://github.com/Cezar277/heimdall/blob/587fdd80a8a98d8f86ef602c72bf4770d289208f/heimdall/llm/rejections.py#L77).
-- [Orchestration et politique CI, rejections.py:205](https://github.com/Cezar277/heimdall/blob/587fdd80a8a98d8f86ef602c72bf4770d289208f/heimdall/llm/rejections.py#L205).
-- [Consultation CLI, main.py:193](https://github.com/Cezar277/heimdall/blob/587fdd80a8a98d8f86ef602c72bf4770d289208f/heimdall/cli/main.py#L193).
-- [Tests T33, test_llm_rejections.py:43](https://github.com/Cezar277/heimdall/blob/587fdd80a8a98d8f86ef602c72bf4770d289208f/tests/test_llm_rejections.py#L43).
+- [Append durable et champs de preuve, rejections.py:202](https://github.com/Cezar277/heimdall/blob/c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b/heimdall/llm/rejections.py#L202).
+- [Vérification de chaîne, rejections.py:143](https://github.com/Cezar277/heimdall/blob/c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b/heimdall/llm/rejections.py#L143).
+- [Verrou et permissions, rejections.py:105](https://github.com/Cezar277/heimdall/blob/c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b/heimdall/llm/rejections.py#L105).
+- [Consultation sans création, rejections.py:194](https://github.com/Cezar277/heimdall/blob/c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b/heimdall/llm/rejections.py#L194).
+- [Orchestration, garde de masquage et politique CI, rejections.py:239](https://github.com/Cezar277/heimdall/blob/c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b/heimdall/llm/rejections.py#L239).
+- [Consultation CLI, main.py:193](https://github.com/Cezar277/heimdall/blob/c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b/heimdall/cli/main.py#L193).
+- [Consultation sans création, test_llm_rejections.py:234](https://github.com/Cezar277/heimdall/blob/c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b/tests/test_llm_rejections.py#L234).
+- [Concurrence lecture / lecture, test_llm_rejections.py:330](https://github.com/Cezar277/heimdall/blob/c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b/tests/test_llm_rejections.py#L330).
+- [Gardes de masquage, test_llm_rejections.py:364](https://github.com/Cezar277/heimdall/blob/c16fd01d2b8e5cbba8f62dd8cbfe40e561f13e3b/tests/test_llm_rejections.py#L364).
 
 ## Résultats locaux — 25 octobre 2026
 
@@ -36,8 +42,8 @@ Environnement de référence : Debian / WSL, Python 3.13.5, installation
 | `ruff format --check heimdall/llm/rejections.py heimdall/cli/main.py tests/test_llm_rejections.py` | 3 fichiers conformes |
 | `mypy heimdall tests/contracts/fastapi_contract_fixture.py` | 45 fichiers, aucune erreur |
 | `bandit -r heimdall -q` | Succès |
-| `pytest --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85` | 2166 passed, 16 skipped, 4480 subtests passed ; couverture globale 91,28 % |
-| `pytest tests/test_llm_rejections.py --cov=heimdall.llm.rejections --cov-branch --cov-report=term-missing --cov-fail-under=85` | 31 passed ; couverture du module 91,28 % |
+| `pytest --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85` | 2189 passed, 16 skipped, 4480 subtests passed ; couverture globale 91,28 % après corrections de revue |
+| `pytest tests/test_llm_rejections.py --cov=heimdall.llm.rejections --cov-branch --cov-report=term-missing --cov-fail-under=85` | 45 passed ; couverture du module 90,78 % après corrections de revue |
 
 Les tests Ollama réels restent désactivés par défaut ; les tests T33 utilisent
 un transport factice, y compris pour les cas d'injection. La suite complète
