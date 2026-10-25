@@ -91,6 +91,24 @@ reproductible : `git show <SHA>:<module>`, puis vérifier que chaque ancre
 réutilisation comme preuve courante. Les liens relatifs et les liens PR/issues
 ne font pas partie des 744 permaliens de code.
 
+Cas T35 vérifié manuellement : `t35-samm.md` ne contient aucun lien HTTP(S),
+seulement des références de modules, symboles et tests ; ses **0 occurrences**
+sont donc attendues. Le motif d'extraction est
+`https://github\.com/Cezar277/heimdall/blob/[^\s)<>]+`, puis la révision est
+contrôlée comme SHA hexadécimal de 7 à 40 caractères. L'absence de lien dans
+cette fiche n'est pas un Pass de preuve permanente ; la ligne T35 du tableau
+consolidé fournit les permaliens courants. L'audit ne prétend pas vérifier
+les références textuelles que ce motif ne sélectionne pas.
+
+La ventilation JUnit est vérifiable depuis les pièces versées :
+[XML expurgé](acceptance/junit.xml), [résultats JSON](acceptance/results.json)
+et [vérificateur](acceptance/recount_junit.py).
+L'ancien XML temporaire n'est pas récupérable depuis son seul hash et le log
+pytest initial ne suffit pas à reconstruire les comptes par module : le XML
+versé provient d'un rejeu identifié séparément, comparé au relevé initial.
+Ces pièces restent des preuves locales de l'auteur ; elles ne remplacent
+ni la CI distante, ni la revue D, ni une attestation de runner éphémère (AC-24).
+
 ## Décision de consolidation
 
 Les preuves du dépôt sont consolidées et la matrice est exécutée ; le verdict

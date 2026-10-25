@@ -16,6 +16,9 @@ complète**, pas des exécutions indépendantes : **2 211 passed, 16 skipped,
 (seuil 85 % atteint). Les sous-tests ne sont pas ajoutés aux 2 211 tests.
 Les comptes et les sélecteurs par module sont dans [results.json](acceptance/results.json),
 la sortie complète dans [pytest.log](acceptance/pytest.log).
+Le rejeu de revue verse un [XML expurgé](acceptance/junit.xml) et un
+[vérificateur indépendant](acceptance/recount_junit.py) pour recalculer les
+comptes par module et groupe ; sa provenance est distincte du relevé initial.
 Tous les cas ci-dessous ont été relevés le **2026-10-25**.
 
 ## Matrice et verdicts
@@ -107,3 +110,6 @@ sont livrées ; l'acceptation globale du MVP reste **non acquise**.
 Chaque échec ou preuve manquante a un ticket de suivi et une action ci-dessus.
 Ne cocher ni « toutes les exigences produit passent », ni « CI distante verte »,
 ni « revue approuvée » à partir de cette validation locale.
+Le [suivi de revue et des conditions de fusion](t42-review.md) conserve AC-24
+ouvert tant que la CI distante, la revue D et le runner jetable ne sont pas
+tous attestés. Le lancement de `/ci` et son résultat sont consignés dans la PR.

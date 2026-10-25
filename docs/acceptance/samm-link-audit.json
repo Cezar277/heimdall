@@ -92,7 +92,8 @@
       "source_sha256": "fa99c296abfd87b32e407d977c848989a25263c440bd81ed57574630d1667484",
       "occurrences": 0,
       "statuses": {},
-      "historical_file_differs_occurrences": 0
+      "historical_file_differs_occurrences": 0,
+      "manual_confirmation": "Aucun lien HTTP(S) dans la fiche : references textuelles de modules, symboles et tests uniquement. Zero occurrence attendu, non un Pass de preuve permanente. Permaliens courants fournis dans samm-v1.md."
     },
     {
       "sheet": "docs/t53-samm.md",
@@ -150,5 +151,6 @@
     "old": "entropy.py#L16-L33",
     "new": "entropy.py#L15-L32"
   },
-  "source_hash_normalization": "SHA-256 du texte UTF-8 avec fins de ligne LF, comme les blobs Git du depot."
+  "source_hash_normalization": "SHA-256 du texte UTF-8 avec fins de ligne LF, comme les blobs Git du depot.",
+  "extraction_pattern": "https://github\\.com/Cezar277/heimdall/blob/[^\\s)<>]+"
 }

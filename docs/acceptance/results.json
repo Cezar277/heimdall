@@ -8,7 +8,7 @@
   },
   "coverage_percent": 91.29,
   "pytest_command": "python -m pytest --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85 --junitxml=/tmp/heimdall-t42-pytest.xml",
-  "junit_sha256": "8b04aad1ce313b8d94444a29df9af028b2d65613f9070349406cd51f791387c0",
+  "junit_sha256": "6d31ce427e626ab173e6cffc7b551efd0f3d7a2873d0d1c583b66653545f478c",
   "groups": [
     {
       "id": "AC-01",
@@ -487,84 +487,84 @@
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[comments-buried]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0986]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[comments-french]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0987]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[comments-ignore]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0988]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[comments-system]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0989]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[comments-uppercase]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0990]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-absolute]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0991]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-traversal]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0992]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-unknown]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0993]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-variable]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0994]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-write]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0995]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[strings_paths-delimiter]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0996]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[strings_paths-filename]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0997]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[strings_paths-inline]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0998]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[strings_paths-long_string]",
+      "name": "test_real_local_model_keeps_every_candidate[case-0999]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     },
     {
       "module": "tests/test_prompt_injection_corpus.py",
-      "name": "test_real_local_model_keeps_every_candidate[strings_paths-role]",
+      "name": "test_real_local_model_keeps_every_candidate[case-1000]",
       "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
     }
   ],
   "subtests_passed": 4480,
   "warnings": 7,
   "duration_seconds": 251.17,
-  "junit_note": "Le JSON archive les comptes JUnit par module et groupe ; le XML temporaire original est identifie par son SHA-256, mais non versionne.",
+  "junit_note": "XML expurgé du rejeu de revue versionné ; comptes par module comparés au relevé initial. Paramètres des noms de tests et hostname retirés, chemins anonymisés. Le hash historique seul ne permet pas de reconstruire le XML initial.",
   "acceptance_cases": [
     {
       "id": "AC-01",
@@ -733,5 +733,100 @@
     "Non exécuté": 4,
     "Fail": 2
   },
-  "overall_acceptance": "non acquise"
+  "overall_acceptance": "non acquise",
+  "original_junit_sha256": "8b04aad1ce313b8d94444a29df9af028b2d65613f9070349406cd51f791387c0",
+  "junit_path": "junit.xml",
+  "junit_replay": {
+    "date": "2026-10-25T20:22:18.912510+00:00",
+    "tested_code_revision": "ad54f025e224c5d3cdfa824a1117b5c616cc6e13",
+    "working_tree_revision": "160ee91fe22020d51d40663dfe5eb05565839fd1",
+    "runtime_files_unchanged": true,
+    "log": "pytest-replay.log",
+    "summary": "2211 passed, 16 skipped, 7 warnings, 4480 subtests passed in 262.76s (0:04:22)",
+    "tmpdir": "/tmp/heimdall-t42-review",
+    "command": "TMPDIR=/tmp/heimdall-t42-review python -m pytest --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85 --junitxml=<raw-output.xml>",
+    "redaction": "hostname et paramètres des noms de tests retirés ; chemins de compte et adresses mémoire anonymisés ; verdicts inchangés."
+  },
+  "initial_skipped_cases": [
+    {
+      "module": "tests/test_llm_qualify_ollama.py",
+      "name": "test_twenty_masked_candidates_yield_valid_json",
+      "reason": "Ollama local (boucle locale) ou gemma3:270m absent : preuve non jouable"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[comments-buried]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[comments-french]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[comments-ignore]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[comments-system]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[comments-uppercase]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-absolute]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-traversal]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-unknown]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-variable]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[mcp_tools-write]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[strings_paths-delimiter]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[strings_paths-filename]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[strings_paths-inline]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[strings_paths-long_string]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    },
+    {
+      "module": "tests/test_prompt_injection_corpus.py",
+      "name": "test_real_local_model_keeps_every_candidate[strings_paths-role]",
+      "reason": "preuve manuelle : HEIMDALL_RUN_LLM_TESTS=1 et Ollama local requis"
+    }
+  ]
 }

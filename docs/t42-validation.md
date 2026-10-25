@@ -15,8 +15,8 @@ une application externe n'est revendiqué.
 ## Environnement et provenance
 
 - Debian sous WSL, Python **3.13.5**, système POSIX conforme à la cible Vault.
-- Dépôt : `/mnt/c/Users/natha/Documents/Codex/heimdall`.
-- Interpréteur : `/home/nathan/heimdall-t33-venv/bin/python`.
+- Dépôt : `/mnt/c/Users/user/project` (chemin anonymisé).
+- Interpréteur : `/home/user/.venv/bin/python` (chemin anonymisé).
 - Environnement virtuel existant : toutes les versions directes runtime et
   `dev` de `pyproject.toml` ont été comparées aux versions installées, sans écart.
   `pip check` réussit. Aucune nouvelle installation avec hashes n'est revendiquée
@@ -47,8 +47,14 @@ Les sept avertissements concernent des connexions SQLite non fermées dans
 les tests existants ; ils ne sont pas présentés comme corrigés.
 Les [comptes JSON](acceptance/results.json) proviennent du XML JUnit de cette
 exécution : ventilation exhaustive par module et par groupe sans double compte.
-Le XML temporaire n'est pas versionné ; son empreinte SHA-256 est conservée
-pour identifier la source de la ventilation. La sortie pytest est versionnée.
+Une seconde exécution de revue archive désormais le [XML JUnit expurgé](acceptance/junit.xml)
+et sa [sortie pytest anonymisée](acceptance/pytest-replay.log). Ses comptes
+par module sont comparés à ceux du relevé initial avant publication.
+Le SHA-256 de ce XML figure dans `results.json` ; le hash de l'ancien XML
+temporaire est conservé comme provenance historique, sans prétendre le reconstruire.
+Les chemins locaux sont remplacés par des chemins génériques dans les pièces
+publiées ; le nom d'hôte et les valeurs de paramètres des noms de tests sont
+retirés du XML. Les verdicts et comptes ne sont pas modifiés par cette expurgation.
 
 ## Reproduire
 
@@ -64,6 +70,7 @@ python -m mypy heimdall tests/contracts/fastapi_contract_fixture.py
 python -m bandit -r heimdall -q
 python docs/security/check_model.py
 python tests/measure_trap.py  # code 1 attendu : critère produit non satisfait
+python docs/acceptance/recount_junit.py
 git diff --check
 ```
 
@@ -71,6 +78,9 @@ L'exécution complète archivée a utilisé ces options pytest et l'interpréteu
 indiqué plus haut, avec redirection vers `/tmp/heimdall-t42-pytest.log`.
 La mesure du corpus a été archivée séparément dans
 [`acceptance/trap-report.json`](acceptance/trap-report.json).
+`checks.log` a été régénéré pendant la revue sur `160ee91` avec le même
+code runtime que `ad54f025` : les modifications entre ces révisions sont
+uniquement documentaires, vérifiées par `git diff ad54f025 160ee91 -- heimdall tests`.
 Pour vérifier les 744 permaliens, la méthode et le périmètre exact sont
 décrits dans [samm-v1.md](samm-v1.md).
 
@@ -80,6 +90,25 @@ le module est le préfixe de `classname` jusqu'à `test_*`, converti en chemin
 les sélecteurs `selectors` de `results.json`. Les 46 modules sont affectés
 une seule fois aux 19 groupes automatisés ; les 6 critères supplémentaires
 proviennent de la mesure indépendante et de l'inspection, pas de pytest.
+Le vérificateur versionné `recount_junit.py` recalcule les comptes depuis le
+XML versé, vérifie son SHA-256, les sélecteurs, les verdicts des groupes et
+l'affectation exhaustive sans doublon. Il ne prouve ni la couverture globale
+ni l'authenticité d'une exécution distante : AC-24 reste une condition distincte.
+Dans ce XML pytest, l'attribut `testsuite.tests=6707` inclut les 4 480
+sous-tests : il correspond à 2 211 réussites + 16 skips + 4 480 sous-tests.
+Le vérificateur ventile les 2 227 éléments `testcase` par module et vérifie
+séparément cette différence ; il ne compte pas les sous-tests deux fois.
+
+Résultat du rejeu de revue : **2 211 passed, 16 skipped, 7 warnings,
+4 480 subtests passed**, couverture **91,29 %**, durée **262,76 s**.
+Les verdicts de la matrice restent inchangés ; `pytest.log` et la durée
+251,17 s du tableau initial restent le relevé de la première exécution.
+
+Pour le rejeu de revue, `TMPDIR=/tmp/heimdall-t42-review` est créé puis exporté
+avant pytest. Les sorties brutes restent hors des pièces versionnées ; les
+chemins publiés sont anonymisés après capture, y compris ceux de la venv
+dans les avertissements. Le répertoire temporaire générique ne suffit pas à
+anonymiser à lui seul le chemin de l'interpréteur.
 
 ## Réserves et livraison
 
@@ -94,5 +123,7 @@ Le résultat attendu de T42 est un état vérifiable, y compris ses échecs.
 L'acceptation globale du MVP reste **non acquise**. Le ticket #43/#125 peut
 reprendre ces pièces comme annexe en conservant les réserves.
 La revue croisée D, la preuve de runner éphémère et le check distant
-`CI (/ci)` sur une PR restent à obtenir avant merge. Aucun merge, clôture de
-ticket, commentaire envoyé à l'équipe ou approbation n'est effectué ici.
+`CI (/ci)` sur une PR restent à obtenir avant merge. Le suivi distant est
+archivé séparément dans [la fiche de revue](t42-review.md) ; un lancement
+de `/ci` ne vaut pas résultat vert. Aucun merge, clôture de ticket ou
+approbation humaine n'est effectué ici.
