@@ -9,29 +9,17 @@ est aussi utilisable comme bibliothèque et par les tests d'acceptation T21.
 ## API
 
 ```python
-from heimdall.scanner import (
-    Finding,
-    RapportScan,
-    ScannerRacine,
-    exiger_complet,
-    find_candidates,
-    scan,
-    scan_complet,
-    scan_rapport,
-)
+from heimdall.scanner import Finding, Scanner, find_candidates
 
-scanner = ScannerRacine(".")
-findings: list[Finding] = scanner.scan()     # fail-closed : ScanError si incomplet
-rapport: RapportScan = scanner.analyser()     # Findings + ce qui n'a pas été lu
-strict: RapportScan = scanner.analyser_complet()  # refuse un rapport incomplet
+findings: list[Finding] = Scanner(".").scan()
 payload: list[dict[str, object]] = find_candidates(".")  # contrat #14
 
-# Mode CLI (#29) : base VCS hors périmètre, mais tout le contenu décide.
-# scan_complet() refuse un rapport incomplet (binaire, lien, illisible).
-findings_ci: list[Finding] = Scanner(".", strict=True).scan_complet()
+# Mode strict (#29) : seules les exclusions techniques restent, les
+# répertoires et fichiers tiers textuels (vendor/, lockfiles) sont analysés.
+strict: list[Finding] = Scanner(".", strict=True).scan()
 ```
 
-`ScannerRacine` accepte un répertoire ou un fichier régulier explicite. `root` est
+`Scanner` accepte un répertoire ou un fichier régulier explicite. `root` est
 résolu une fois, **sans suivre de lien symbolique** : la racine elle-même et
 chacun de ses ancêtres sont vérifiés par `lstat`, et un lien dans ce chemin
 lève `ScanError` (la cible n'est pas lue à la place de la racine). Chaque
@@ -39,75 +27,11 @@ fichier est ensuite revérifié à l'usage (identité du descripteur, chemin ré
 sous la racine, refus des liens symboliques).
 
 Un Finding contient exactement : `file`, `line`, `type`, `entropy`,
-`snippet_hash`, `status` (`detecte`) et `source` (`regex`). **La valeur brute
+`snippet_hash`, `status` (`detecte`) et `source` (`regex` ou `entropy`). **La valeur brute
 n'est jamais conservée** : seule une empreinte HMAC-SHA-256 est produite.
 
-### Trois API, trois contrats
-
-| API | Contrat | Usage |
-| --- | --- | --- |
-| `scan()` / `find_candidates()` | **fail-closed** : `ScanError` dès qu'un fichier du périmètre n'a pas pu être analysé. Un scan incomplet ne devient jamais une liste vide ou partielle. Une liste vide **n'est pas** la preuve d'un dépôt propre : un `ScanIncomplet` est émis si des contenus ont été laissés de côté | appel local, corpus, tests |
-| `analyser()` / `scan_rapport()` | renvoie le bilan **et** les compteurs de ce qui n'a pas été lu | affichage d'audit, tri des compteurs |
-| `analyser_complet()` / `scan_complet()` / `exiger_complet()` | **stricte** : `ScanError` dès que le rapport n'est pas complet (binaire, lien, base VCS, fichier illisible). Un rapport complet et vide est le seul verdict « propre » fondé | **hook et CI** (#29) |
-
-`scan()` et `find_candidates()` ne peuvent pas dire ce qui n'a pas été lu : ils
-lèvent donc `ScanError` plutôt que de rendre une liste qui laisserait croire à
-un dépôt propre, et **avertissent** (`ScanIncomplet`) quand une exclusion de
-politique a laissé du contenu de côté. Un verdict « propre » **fondé** suppose
-`scan_complet()` (ou `scan_rapport()` + `RapportScan.complet`) : la garde est
-**programmatique**, pas une consigne de documentation.
-
-```python
-# #29 : un rapport incomplet doit produire le code 2, jamais 0.
-try:
-    rapport = scan_complet(".")          # ou exiger_complet(scan_rapport("."))
-except ScanError:
-    raise typer.Exit(code=2)             # erreur d'outillage
-```
-
-
-### Le rapport de scan : ce qui a été lu, ce qui ne l'a pas été
-
-`ScannerRacine.analyser()` rend un `RapportScan` : les Findings **et** les
-compteurs de ce que le scan n'a pas pu analyser. Un verdict « propre » n'est
-fondé que si `RapportScan.complet` est vrai.
-
-| Champ | Signification |
-| --- | --- |
-| `findings` | les Findings détectés, triés |
-| `binaires_ignores` | fichiers au contenu binaire connu : ignorés par politique, **tracés** |
-| `non_analyses` | fichiers du périmètre que le scan n'a pas pu lire (illisibles, hors borne, modifiés) |
-| `hors_perimetre` | répertoires non parcourus (base VCS) |
-| `liens_ignores` | liens symboliques non suivis |
-
-`complet` est vrai quand **rien** n'a été laissé de côté : les quatre compteurs
-sont nuls. Un binaire ignoré, un lien non suivi ou une base VCS non parcourue
-sont autant de contenus **non lus** — un secret peut y dormir — donc le verdict
-« propre » ne serait pas fondé. `scan()` et `find_candidates()` lèvent
-`ScanError` dès que `non_analyses` est non nul : un scan *incomplet* ne
-devient jamais une liste vide ou partielle. Pour les trois exclusions de
-politique (binaire, lien, base VCS), ils **avertissent** (`ScanIncomplet`) :
-une liste vide signifie « rien trouvé dans ce qui a été lu », pas « dépôt
-propre ».
-
-La garde stricte `scan_complet()` (ou `exiger_complet(scan_rapport(...))`)
-**refuse** un rapport incomplet : c'est le refus d'outillage que #29 doit
-traduire par le code 2. La règle est donc exécutable, testée, et pas seulement
-énoncée dans ce document.
-
-Chaque élément ignoré est **journalisé sur `stderr`** (une ligne par fichier :
-le chemin seul, jamais de contenu ; les caractères de contrôle, les
-séparateurs Unicode et les surrogates d'un nom non UTF-8 sont neutralisés pour
-ne pas injecter de fausse ligne de journal ni faire échouer une écriture en
-UTF-8 strict). La trace est injectable (`ScannerRacine(root,
-journal=...)`) et le verdict sort sur `stdout`, jamais sur `stderr`.
-
-Règle pour #29 (à implémenter avec le branchement CLI) : **code 2** si le scan
-n'est pas `complet` ou si le moteur échoue, **jamais 0** ; les compteurs du
-rapport sont affichés à l'auditeur. #29 doit auditer le périmètre **qu'il
-materialise** (blobs indexés), pas l'arborescence de travail : la base VCS
-n'est pas le contenu audité, et `complet` est faux dès qu'une base VCS a été
-laissée de côté.
+La détection générique par entropie (#23), ses seuils et ses limites
+sont documentés dans [scanner-entropy.md](scanner-entropy.md).
 
 ## Signatures (#54)
 
@@ -135,39 +59,15 @@ consultées le 2026-10-20) : `xoxb-` (bot), `xoxp-` (user), `xapp-` (app-level),
 `xoxa-`, `xoxr-`, `xoxs-`. Une famille ajoutée ultérieurement par Slack ne
 serait pas couverte avant #23/#24.
 
-Le point (`foo.xapp-…`, `foo.xoxe.…`) n'est **pas** un frontière de mot : un
-jeton collé à un préfixe de domaine ou à une concaténation reste détecté. En
-revanche, le préfixe rotatif `xoxe.` est traité comme un préfixe : le jeton
-qu'il contient n'est signalé qu'une fois (une seule empreinte, donc une seule
-entrée Vault à révoquer). Cette neutralisation est **conditionnelle à
-l'ancrage** du préfixe : elle ne porte que si `xoxe.` est lui-même ancré
-(précédé d'un caractère qui n'est ni lettre, ni chiffre, ni tiret). Un préfixe
-**bourré** (`xxoxe.xapp-…`) n'est pas ancré : le jeton qu'il contient reste un
-vrai secret et est signalé.
-
-La neutralisation ne teste **pas** la longueur de la charge : elle neutralise
-le jeton interne dès que `xoxe.` est ancré. Dans les bornes documentées, cela
-coïncide avec la reconnaissance de la forme rotative — et cette coïncidence
-est **structurelle**, pas fortuite : la borne de la forme rotative est
-**dérivée** de celle du jeton interne (`ROTATING_PAYLOAD_MAX` =
-`SLACK_TOKEN_MAX` = 255 = préfixe interne + 250 de charge), l'invariant est
-vérifié **au chargement** du registre (fail-closed) et **figé par un test**
-(jeton interne à charge maximale : exactement un finding, la forme rotative).
-Un jeton detectable seul reste donc detectable une fois préfixé : le préfixe
-ne peut pas le faire disparaître. Un jeton à charge **hors** bornes (au-delà
-de 250 caractères) n'est detectable ni seul ni préfixé : c'est une limite
-écrite, pas un secret perdu en silence.
-
 **Fenêtre multi-ligne bornée.** Chaque ligne est analysée seule, puis
-jointure avec les lignes **suivantes et contiguës** (au plus trois lignes
-jointes, sans séparateur) si la fenêtre totale ne dépasse pas **4 Kio**. Un
-secret coupé par un retour à la ligne (`aws_secret_access_key =` puis la
-valeur à la ligne suivante) est donc détecté, et le Finding porte la ligne où
-la correspondance commence. Une **ligne vide intercalée** est couverte de la
-même façon (`aws_secret_access_key =`, ligne vide, puis la valeur) : la
-fenêtre joint trois lignes. Au-delà de 4 Kio, ou au-delà de trois lignes
-jointes, la jointure n'est pas faite : c'est une limite documentée et figée
-par un test.
+jointure avec la ligne suivante (sans séparateur) si la fenêtre totale ne
+dépasse pas **4 Kio**. Un secret coupé par un retour à la ligne
+(`aws_secret_access_key =` puis la valeur à la ligne suivante) est donc
+détecté, et le Finding porte la ligne où la correspondance commence. Au-delà
+de 4 Kio, la jointure n'est pas faite. Un délimiteur d'affectation (`:`/`=`)
+ou un jeton de longueur candidate sur une des lignes lève `ScanError` (#23),
+quel que soit le fournisseur. Un jeton individuel > 4096 caractères est
+également refusé avant calcul d'entropie (y compris les longues charges JWT).
 
 Une ligne peut produire plusieurs Findings de types différents. Deux **valeurs
 distinctes** du même type sur la même ligne produisent **deux** Findings
@@ -175,66 +75,48 @@ distinctes** du même type sur la même ligne produisent **deux** Findings
 pas de colonne, mais un candidat ne doit jamais disparaître. Seule une valeur
 strictement identique, déjà vue sur la même ligne, est dédupliquée.
 
-## Périmètre et politique de contenu (#59)
+## Exclusions (#59)
 
-**Aucun nom de fichier n'exclut un fichier du scan.** Une exclusion nominale
-est un contournement trivial : il suffit de renommer le fichier
-(`evil.png`, `package-lock.json`, `vendor/secret.txt`…) pour qu'un secret ne
-soit ni signalé ni refusé. C'est le **contenu** qui décide :
+Politique explicite, jamais une heuristique :
 
-| Contenu | Traitement |
-| --- | --- |
-| texte (UTF-8, UTF-16, UTF-32, avec ou sans BOM) | décodé puis **scanné** |
-| binaire connu (signature magique **et** contenu majoritairement binaire) | ignoré par politique, **tracé** (chemin journalisé + compteur) |
-| contenu NUL non décodable, BOM invalide | `ScanError` (fail-closed) dans le périmètre strict, tracé ailleurs |
+- fichiers de contrôle : `.gitignore`, `.gitattributes`, `.dockerignore`,
+  `.npmignore`, `.coverage` ;
+- répertoires : `.git`, `.hg`, `.svn`, environnements virtuels (`.venv`, `venv`,
+  `virtualenv`), `vendor`, `node_modules`, `third_party`, `build`, `dist`,
+  `target`, `bower_components`, `htmlcov`, caches Python ;
+- lockfiles : suffixe `.lock`, `package-lock.json`, `yarn.lock`,
+  `pnpm-lock.yaml`, `go.sum`, `bun.lockb` ;
+- binaires : extension connue, ou signature magique connue **et** contenu
+  majoritairement binaire (ELF, PNG, PDF, ZIP…).
 
-Un `evil.png` qui contient du texte est donc lu, décodé et scanné ; un vrai
-PNG est ignoré, mais il laisse une trace : un dépôt propre et un dépôt dont
-un binaire n'a pas été lu ne sont jamais confondus.
-
-Les répertoires sont classés en trois régimes :
-
-| Régime | Répertoires | Traitement |
-| --- | --- | --- |
-| **strict** | le contenu du dépôt | un fichier non analysable **interrompt** le scan (`ScanError`) |
-| **tiers** | `.venv`, `venv`, `virtualenv`, `__pycache__`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.tox`, `.nox`, `htmlcov`, `node_modules`, `bower_components`, `vendor`, `third-party`, `third_party`, `build`, `dist`, `target` | **parcourus** (un secret y est un secret) ; un fichier non analysable est **tracé** et **compté** : `scan()` lève alors `ScanError` (pas de verdict propre partiel), `scan_rapport()` expose le bilan |
-| **hors périmètre** | `.git`, `.hg`, `.svn` | base VCS : ce n'est pas le contenu du dépôt ; **non parcourue**, mais **tracée** (compteur `hors_perimetre`) |
-
-Le nom du répertoire ne sert donc qu'à qualifier la **conséquence** d'un échec
-de lecture (interrompre le scan ou le tracer) : il ne dispense jamais de lire
-le fichier. Une erreur de parcours est classée avec le nom du répertoire
-fautif lui-même : un `vendor/` illisible **à la racine** est donc tracé et
-compté comme les autres échecs d'un arbre de tiers, pas traité comme du
-périmètre strict.
-
-Un répertoire nommé `env/` n'est **pas** un cas particulier : seuls les
-environnements virtuels connus sont des arbres de tiers, et ils sont lus.
+Un répertoire nommé `env/` n'est **pas** exclu : seuls les environnements
+virtuels connus le sont. Un dossier de sources `env/` est donc scanné.
 
 `.env`, `.env.example`, `requirements.txt`, les fichiers sans extension et les
 `.pem`/`.key` sont scannés. Les mocks de `tests/` ne sont **pas** exclus
 globalement : ils font partie du corpus de non-régression T21.
 
-### Mode strict de la CLI (#29)
+### Deux familles d'exclusions, et le mode strict (#29)
 
-Le mode `strict=True` est le mode **arbre de travail** de `heimdall scan`. Il
-n'ajoute ni ne retire aucune exclusion de **contenu** : `vendor/`,
-`node_modules/`, `third_party/`, les sorties de build, les lockfiles et les
-fichiers de contrôle sont parcourus, et le contenu décide. La seule différence
-avec le mode bibliothèque est la **base VCS** (`.git/`, `.hg/`, `.svn/`) :
-métadonnées et objets compressés, hors du contenu audité, elle est écartée
-sans être comptée comme une lacune. Sans cela, aucun dépôt Git ne pourrait
-rendre un verdict propre.
+Les exclusions ci-dessus se répartissent en deux familles, et cette
+répartition fonde le mode **strict** livré par #29 (`heimdall scan`) :
 
-La CLI consomme `scan_complet()` : un rapport incomplet (binaire, lien
-symbolique, fichier illisible) devient une erreur d'outillage (code 2), jamais
-un « 0 secret » trompeur. Le mode `--staged` analyse les blobs de l'index sans
-aucune exclusion de chemin.
+| Famille | Contenu | Mode strict |
+| --- | --- | --- |
+| **technique** | binaires, dépendances et environnements (`.git`, `node_modules`, `.venv`, `__pycache__`, caches…), `.coverage`, `bun.lockb` | **exclus** (ils sont illisibles ou illisibles par des expressions de texte) |
+| **contenu texte** | `vendor/`, `third_party/`, `third-party/`, sorties de build (`build/`, `dist/`, `target/`, `bower_components/`, `htmlcov/`), lockfiles, `.gitignore` et autres fichiers de contrôle | **analysés** (un secret y est un secret) |
 
-L'extension binaire ne prime jamais sur le contenu : un fichier texte nommé
-`evil.png` est lu et scanné. Un vrai binaire reste ignoré par sa signature
-**connue** (magie + majorité binaire) et rend le rapport incomplet. Un binaire
-inconnu (NUL + texte) reste fail-closed : le suffixe ne convertit jamais un
-doute en skip silencieux.
+`Scanner(root, strict=True)` (et `scan(root, strict=True)`) ne conserve que la
+première famille. C'est la correction du point HIGH relevé à la revue de #165 :
+la politique #59 seule laissait passer un secret posé dans `vendor/evil.py`,
+sans jamais le signaler. Le mode strict est le comportement par défaut de la
+CLI `heimdall scan` (voir [cli.md](cli.md)).
+
+En strict, l'extension binaire ne prime plus sur le contenu : un fichier texte
+nommé `evil.png` est lu et scanné, comme en `--staged`. Un vrai binaire reste
+exclu par sa signature **connue** (magie + majorité binaire). Un binaire
+inconnu (NUL + texte) reste fail-closed comme en `--staged` : le suffixe ne
+convertit jamais un doute en skip silencieux.
 
 ### Encodage des fichiers lus
 
@@ -242,12 +124,12 @@ Les fichiers texte sont décodés, pas ignorés :
 
 | Cas | Traitement |
 | --- | --- |
-| UTF-8 (avec ou sans BOM) | décodage strict avec BOM, remplacement sans BOM |
+| UTF-8 (avec ou sans BOM) | décodage strict ; octet invalide → `ScanError` (#23) |
 | UTF-16 / UTF-32 avec BOM | décodage strict, fichier scanné |
 | UTF-16 / UTF-32 sans BOM | heuristique bornée (proportion ASCII puis caractères imprimables), fichier scanné |
-| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | ignoré par politique, tracé |
-| signature binaire suivie de texte clair | refus (`ScanError` strict, tracé ailleurs) |
-| contenu NUL non décodable | refus (`ScanError` strict, tracé ailleurs) |
+| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | ignoré par politique |
+| signature binaire suivie de texte clair | `ScanError` (fail-closed) |
+| contenu NUL non décodable | `ScanError` (fail-closed) |
 
 Un secret encodé en UTF-16/UTF-32 est donc détecté ; il n'est plus sauté
 silencieusement. Quatre octets de signature binaire (`PK\x03\x04`, en-tête
@@ -263,58 +145,37 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | Situation | Résultat |
 | --- | --- |
 | racine absente, non régulière ou illisible | `ScanError` |
-| racine invalide (chemin vide, octet NUL, type non chemin, chemin non interprétable) | `ScanError` (jamais une `ValueError`/`TypeError` nue) |
 | racine ou fichier unique symlinké (ou ancêtre symlinké) | `ScanError` |
 | racine non canonique (ex. `/tmp` symlinké vers `/private/tmp` sur macOS) | `ScanError` — passer un chemin canonique (sans lien) |
-| fichier non régulier (FIFO, device) | `ScanError` (tracé dans un arbre de tiers) |
-| fichier régulier remplacé par un FIFO entre le `stat` et l'`open` | `ScanError` (tracé dans un arbre de tiers) — l'ouverture est `O_NONBLOCK`, donc le scan ne bloque jamais ; `fstat` refuse le descripteur non régulier |
-| fichier > 1 Mio | `ScanError` (tracé dans un arbre de tiers) |
-| fichier modifié pendant la lecture | `ScanError` (tracé dans un arbre de tiers) |
-| fichier **tronqué ou réécrit entre le `stat` et l'`open`** (même inode) | `ScanError` (tracé dans un arbre de tiers) — la lecture ne porterait que sur un préfixe |
-| nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` (tracé dans un arbre de tiers) |
+| fichier non régulier (FIFO, device) | `ScanError` |
+| fichier > 1 Mio | `ScanError` |
 | plus de 50 000 fichiers, ou plus de 256 Mio lus au total | `ScanError` (bornes #29) |
 | borne explicite `max_files`/`max_bytes`/`max_findings` hors de `1..plafond` | `ValueError` à la construction (surcharge jamais silencieuse) |
-| deadline globale dépassée (option `deadline`, CLI) | `ScanError` (le scan ne rend pas de verdict partiel) |
+| fichier modifié pendant la lecture | `ScanError` |
+| nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` |
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
 | clé HMAC demandée avec `..` dans le chemin | `ScanError` |
-| contenu NUL non décodable (hors binaire réellement binaire) | `ScanError` (tracé dans un arbre de tiers) |
-| binaire connu | ignoré par politique, **tracé** (compteur `binaires_ignores`) |
-| lien symbolique | jamais suivi, **tracé** (compteur `liens_ignores`) |
-| base VCS (`.git/`, `.hg/`, `.svn/`) | non parcourue, **tracée** (compteur `hors_perimetre`) |
-| rapport incomplet (un compteur non nul) | `ScanError` par `scan_complet()` / `exiger_complet()` |
-| scan réussi sans signature, périmètre complet | liste vide (réellement propre) |
+| contenu NUL non décodable (hors binaire réellement binaire) | `ScanError` |
+| fichier ou répertoire symlinké **interne** au périmètre | ignoré par politique (non suivi, non signalé ; voir #59) |
+| fichier exclu ou binaire connu | ignoré par politique |
+| scan réussi sans signature | liste vide (réellement propre **hors exclusions** — voir limites) |
 
-Un scan incomplet ne devient donc jamais une liste vide ou partielle : dans un
-arbre de tiers, un fichier non analysable est tracé **et** compté, et
-`scan()`/`find_candidates()` lèvent `ScanError` si un fichier du périmètre
-strict n'a pas pu être analysé. Seul `scan_rapport()` rend un bilan avec ses
-compteurs ; il ne doit pas être confondu avec un verdict propre.
+> **Garde d'usage (hook/CI) :** le `Scanner` bibliothèque reste en politique
+> #59 (exclusions de contenu texte comprises) : un `[]` sur dépôt complet y
+> vaut « propre **hors exclusions** ». Pour un hook ou une CI, c'est la CLI
+> `heimdall scan` qu'il faut utiliser : elle applique le **mode strict** sur
+> l'arbre de travail et analyse **sans aucune exclusion** les blobs de l'index
+> en mode `--staged` (voir [cli.md](cli.md)). Un scan incomplet y sort en 2,
+> jamais en 0.
 
-Depuis #29, la CLI est branchée : `ScanError` produit le code 2 (erreur
-d'outillage), jamais 0 ni 1. Le mode arbre de la CLI utilise
-`ScannerRacine(..., strict=True).scan_complet()` : la base VCS est hors du
-périmètre audité (métadonnées), tout le reste est lu par contenu, et un
-rapport incomplet (binaire, lien, fichier illisible) **refuse** le verdict
-propre. Le mode `--staged` analyse les blobs de l'index sans exclusion de
-chemin.
-
-> **Garde d'usage (hook/CI) :** ne pas utiliser `scan()` ni
-> `find_candidates()` tels quels pour un hook ou une CI. Ces deux API lèvent
-> `ScanError` dès qu'un fichier du périmètre strict n'a pas pu être analysé,
-> mais un `[]` peut encore masquer un secret contenu dans un **binaire**
-> (contenu non lu, tracé mais pas signalé) ou coupé au-delà de la fenêtre
-> 4 Kio. Un `ScanIncomplet` est émis dans ce cas : le misuse est visible,
-> mais il reste au lecteur.
->
-> La garde est **programmatique**, pas documentaire : `scan_complet()` (ou
-> `exiger_complet(scan_rapport(...))`) **refuse** un rapport incomplet par
-> `ScanError` — le refus que #29 traduit par le code 2. La CLI le consomme
-> pour l'arbre de travail et pour les blobs stagés. Voir limites ci-dessous.
+Un scan incomplet ne devient donc jamais une liste vide ou partielle. Depuis
+#29, la CLI est branchée : `ScanError` produit le code 2 (erreur d'outillage),
+jamais 0 ni 1.
 
 ## Empreinte et entropie
 
 - `entropy` : Shannon sur les octets UTF-8 du candidat, 0 à 8 bits/octet.
-  Cette valeur est une métadonnée ; la détection par seuil appartient à #23.
+  La détection générique par seuil est livrée par [#23](scanner-entropy.md).
 - `snippet_hash` : HMAC-SHA-256 avec une clé locale de 32 octets hors dépôt
   (`$HEIMDALL_SNIPPET_HMAC_KEY` en hexadécimal ou fichier XDG en `0600`). Le
   fichier doit être un fichier régulier, appartenir à l'utilisateur courant et
@@ -334,41 +195,28 @@ chemin.
 ## Limites connues (honnêtes)
 
 - Le scanner de signatures ne décode pas les base64 et n'analyse pas le flux
-  des variables : les six cas obfusqués de T21 restent des `limite_connue`
-  (rappel 0,625 sur `all`, 1,0 sur le périmètre `core`). Le décodage/entropie
-  relève de #23 et l'allowlist de #24.
-- Un **binaire** n'est pas analysé : un secret glissé dans un commentaire ZIP
-  ou PNG n'est pas signalé. Le fichier est **tracé** (chemin journalisé,
-  compteur `binaires_ignores`), donc l'auditeur le voit, mais le contenu n'est
-  pas lu. C'est la seule catégorie de contenu non analysable tolérée — et
-  elle rend `complet` faux : le verdict « propre » n'est pas fondé. La CLI en
-  mode arbre refuse alors le verdict (code 2) via `scan_complet()`.
-- La **base VCS** (`.git/`, `.hg/`, `.svn/`) n'est pas parcourue : ses objets
-  sont compressés et l'historique n'est pas le contenu du dépôt (c'est le
-  travail de #29/#30, sur le diff indexé). En mode bibliothèque, le répertoire
-  est **tracé** (compteur `hors_perimetre`) et `complet` est donc faux sur une
-  arborescence de travail ; le mode strict de la CLI écarte cette base sans la
-  compter, car elle n'est pas du contenu audité.
-- Un fichier **non analysable** dans un arbre de tiers (`.venv`,
-  `node_modules`, `vendor`…) est tracé et compté : `scan_rapport()` le expose
-  (`non_analyses`), `scan()`/`find_candidates()` lèvent `ScanError`. Ces
-  arbres sont massifs et tiers : un secret placé dans un binaire ou un
-  fichier hors borne n'est donc pas signalé — c'est le prix de la robustesse
-  sur des arbres non audités, et c'est pourquoi le verdict n'est pas fondé.
-- La jointure multi-ligne est bornée à 4 Kio et à **trois lignes jointes** : un
-  secret coupé par plus de deux retours à la ligne consécutifs n'est pas
-  recherché. C'est une limite figée par un test.
-- La charge d'un JWT est bornée à 64 Kio et l'en-tête à 1 Kio : un jeton
-  conforme est détecté, un jeton hors de ces bornes ne l'est pas. Les autres
+  des variables : les cas reconstruits de T21 restent des `limite_connue`. Depuis #23,
+  deux valeurs encodées sont détectées par entropie, sans décodage :
+  rappel 0,75 sur `all`, 1,0 sur `core`. L'allowlist relève de #24.
+- Les fichiers binaires, lockfiles et répertoires tiers sont ignorés par
+  la politique #59 **de la bibliothèque** : un secret qui y serait copié n'est
+  pas signalé. En mode dépôt complet, `[]` vaut donc « propre hors
+  exclusions », jamais « propre absolu ». Depuis #29, la **CLI** applique le
+  mode strict (arbre de travail) ou l'analyse **sans exclusion** des blobs
+  indexés (`--staged`) : ce blocage est levé pour la CLI, il reste entier
+  pour l'usage bibliothèque, et #59 garde la main sur la politique.
+- La jointure multi-ligne est bornée à 4 Kio. Une affectation ou un jeton de
+  longueur candidate sur une des lignes provoque `ScanError` lorsque cette
+  borne est dépassée, sans exception par fournisseur. Les jetons individuels
+  > 4096 caractères provoquent également `ScanError`, jamais un skip.
+- Le motif de signature JWT accepte une charge de 64 Kio et un en-tête de
+  1 Kio, mais le moteur refuse désormais tout jeton lexical > 4096 caractères
+  (`ScanError`, y compris pour un JWT). Les autres
   préfixes AWS (au-delà de `AKIA`/`ASIA`/`ABIA`/`ACCA`) ne sont pas couverts.
 - Seules les familles de jetons Slack publiées par Slack sont couvertes
   (`xoxb-`, `xoxp-`, `xapp-`, `xwfp-`, `xoxe.` et les historiques `xoxa-`,
   `xoxr-`, `xoxs-`) : une famille ajoutée par Slack n'est pas couverte avant
   #23/#24.
-- La charge d'un jeton Slack est bornée à **250 caractères** après son
-  préfixe publié : au-delà, le jeton n'est détecté **ni seul ni préfixé** par
-  `xoxe.`. C'est une borne écrite (et figée par un test), pas un secret que la
-  neutralisation du préfixe rotatif ferait disparaître en silence.
 - La détection PEM porte sur la ligne d'en-tête ; le corps multiligne n'est
   pas hashé. Le Finding ne fuit donc aucune valeur, mais deux clés différentes
   partagent l'empreinte de leur en-tête.
@@ -377,23 +225,36 @@ chemin.
   #30 (le mode `--staged` de #29 lit l'index par blob, sans filtre
   `textconv` : `git cat-file` rend le contenu brut indexé).
 - La CLI `heimdall scan` est branchée (#29) : elle prouve propre => 0, secret
-  avéré => 1, erreur => 2, **sans écriture** (voir [cli.md](cli.md)). L'arbre
-  de travail est refusé (2) dès que le rapport est incomplet. La validation
-  humaine Y/N/E et le remplacement du secret restent à faire (#32).
+  avéré => 1, erreur => 2, **sans écriture** (voir [cli.md](cli.md)). La
+  validation humaine Y/N/E et le remplacement du secret restent à faire
+  (#32).
+
+## Allowlist déterministe (#24)
+
+L'allowlist déterministe écarte les cas évidents (`example`, `changeme`, `dummy`, fixtures de test) sans passer par le LLM, utilisable en local comme en mode CI headless.
+
+- **Fichier de configuration versionné** : [`heimdall.toml`](../heimdall.toml) à la racine du dépôt.
+- **Traçabilité stricte** : aucun rejet sans règle nommée. Chaque rejet émet une trace contenant exactement : règle, fichier, ligne.
+- **Transparence** : le rapport affiche toujours le nombre de findings ignorés par l'allowlist.
+- **Sécurité et anti-piège** : pas d'allowlist aveugle de `tests/` — un secret réel placé dans un fichier de test reste détecté s'il ne correspond pas à une règle spécifique de factice.
+- Voir [t24-samm.md](t24-samm.md) pour les preuves SAMM détaillées.
 
 ## Preuves locales
 
 ```sh
 .venv/bin/python -m pytest tests/test_scanner_detect.py \
-  tests/test_scanner_interface.py tests/test_scanner_signatures.py \
   tests/test_trap_acceptance.py tests/security/test_scanner_bypass.py \
   --cov=heimdall.scanner --cov-branch --cov-report=term-missing \
   --cov-fail-under=85
 .venv/bin/python tests/measure_trap.py
 ```
 
-Résultats de la livraison : **483 tests passés**, couverture du paquet
-`heimdall/scanner` **98,37 %** (branches incluses), suite complète **1 493 tests
-passés**, couverture globale **96,60 %**, mesure T21 `core` précision **1,00**,
-rappel **1,00**, aucune fausse alerte sur les 18 non-leaks.
+Résultats historiques de la livraison #22 : **122 tests passés**, couverture du paquet
+`heimdall/scanner` **91,31 %** (branches incluses), suite complète **936 tests
+passés**, couverture globale **96,69 %**, mesure T21 `core` précision **1,00**,
+rappel **1,00**, aucune fausse alerte sur les 18 non-leaks à cette révision.
+Depuis la correction de revue #23, les étiquettes digest/data URI et UUID
+ne taisent plus les candidats : huit faux positifs sont comptés honnêtement
+sur ce corpus. Les résultats actuels et le seuil de précision non atteint
+sont dans [scanner-entropy.md](scanner-entropy.md).
 Les liens permanents et la fiche SAMM sont dans [t22-samm.md](t22-samm.md).

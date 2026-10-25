@@ -1,0 +1,66 @@
+# Heimdall Configuration - Allowlist déterministe (#24)
+# Écarte les cas évidents sans passer par le LLM (local et CI).
+# Chaque rejet produit une trace auditable : (règle, fichier, ligne).
+#
+# Piège évité : aucun allowlist global de tests/ ; un secret réel dans tests/
+# reste détecté et bloque la CI s'il ne répond pas à une règle spécifique de factice.
+#
+# Contrat fermé :
+# - `version = "1"` est OBLIGATOIRE (jamais implicite) ; un entier ou toute
+#   autre chaîne est refusé en code 2.
+# - `patterns` : une regex doit porter au moins 3 caractères LITTÉRAUX
+#   (hors classes, ancres et quantificateurs) et ne jamais matcher la
+#   chaîne vide. Accepté : `EXAMPLE-[0-9]{4}`. Refusé : `[a-z]+`,
+#   `\w+`, `\d{3}-\d{4}` ou `x{3}y{3}` — motif trop large pour être
+#   auditable : reformuler en portant les marqueurs concrets visés.
+# - `paths` : au plus 10 jokers `*` par motif glob ; un chemin de plus de
+#   1024 caractères n'est pas soumis au filtre (fail-closed, il reste
+#   signalé).
+
+[allowlist]
+version = "1"
+
+[[allowlist.rules]]
+name = "example-placeholders"
+description = "Mots-clés et jetons d'exemple évidents (ex: AKIA...EXAMPLE, your_key_here)"
+# Marqueurs EXACTS (égalité insensible à la casse) : un secret choisi
+# contenant `-example-` délimité (ex. `my-example-key-12345`) reste détecté
+# (invariant 1 : doute → signalé). Ne jamais repasser en `keywords` \b.
+exact_keywords = ["AKIAIOSFODNN7EXAMPLE", "example", "sample", "your_key_here"]
+
+[[allowlist.rules]]
+name = "changeme-passwords"
+description = "Mots de passe ou valeurs de configuration par défaut changeme"
+# Exact : `admin:changeme` reste détecté (credential par défaut = finding).
+exact_keywords = ["changeme"]
+
+[[allowlist.rules]]
+name = "dummy-tokens"
+description = "Valeurs, identifiants et jetons factices dummy"
+# Exact : `prod-dummy-secret` ou `xoxb-dummy-12345` restent détectés.
+exact_keywords = ["dummy"]
+
+[[allowlist.rules]]
+name = "test-fixtures"
+description = "Fixtures et valeurs factices explicites dans les répertoires et fichiers de test"
+# Frontière \b stricte, y compris avec `paths` : `_` est un caractère de mot.
+# `fake_slack_token` ou `my_dummy_key` NE sont PAS ignorés (invariant 1) ;
+# utiliser une valeur exacte (`dummy`) ou un séparateur non-mot (`fake-token`).
+# ZONE DE CLÉMENCE DOCUMENTÉE : sous `tests/` (et `fixtures/`, `support/`),
+# TOUTE valeur contenant un marqueur délimité (`my-dummy-key-12345`,
+# `prod-fake-token`) est ignorée, y compris un mot de passe choisi qui
+# ressemblerait à une fixture. C'est volontaire : les répertoires de test
+# ne doivent jamais contenir de vrais secrets (aucun allowlist aveugle
+# hors de ce périmètre) ; en CI stricte (sans `heimdall.toml`, allowlist
+# vide) tout y est signalé. Ne pas élargir : ni `secret_types` global ni
+# `\b` hors `paths`.
+paths = ["tests/**", "fixtures/**", "**/fixtures/**", "support/**", "**/support/**"]
+keywords = [
+  "fake",
+  "mock",
+  "dummy",
+  "placeholder",
+  "synthetic",
+  "factice",
+  "fixture",
+]

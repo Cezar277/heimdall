@@ -62,9 +62,16 @@ La validation est **fail-closed au chargement du module** :
 - exemple positif reconnu, exemple négatif ignoré ;
 - registre non vide et identifiants uniques ;
 - `secret_type` de chaque règle **dans l'ensemble fermé** `aws` / `stripe` /
-  `slack` / `pat` / `jwt` / `pem` (`ALLOWED_SECRET_TYPES` dans
+  `slack` / `pat` / `jwt` / `pem` / `high_entropy_hex` / `high_entropy_base64`
+  (`ALLOWED_SECRET_TYPES` dans
   [`model.py`](../heimdall/scanner/signatures/model.py)) : un type que rien
   ne documente ne peut pas produire de Finding.
+
+Les types `high_entropy_hex` et `high_entropy_base64` sont gouvernés par ce
+même ensemble fermé, mais produits par le moteur d'entropie #23, avec
+`source="entropy"`. Leurs seuils sont documentés dans
+[scanner-entropy.md](scanner-entropy.md). Le test du registre vérifie
+explicitement que ses six types sont l'ensemble fermé moins ces deux types.
 
 À l'exécution, `Rule.matches()` applique la même logique fail-closed : une
 ligne qui n'est pas un `str` lève une `ScanError` au lieu de rendre un
@@ -90,47 +97,11 @@ motifs ci-dessous décrivent l'ancrage et les bornes, pas un secret utilisable.
 | `stripe_secret_key` | Stripe/Slack #56 | `stripe` | `sk_` ou `rk_`, puis `live`/`test`, puis 16 à 247 caractères `[A-Za-z0-9]` | — |
 | `slack_token` | Stripe/Slack #56 | `slack` | `xoxb-`, `xoxa-`, `xoxp-`, `xoxr-` ou `xoxs-` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
 | `slack_app_token` | Stripe/Slack #56 | `slack` | `xapp-` ou `xwfp-` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
-| `slack_rotating_token` | Stripe/Slack #56 | `slack` | `xoxe.` + 10 à 255 caractères `[A-Za-z0-9-]` — borne **dérivée** : elle couvre un jeton interne entier (préfixe `xapp-`/`xoxb-` + charge ≤ 250) | — |
+| `slack_rotating_token` | Stripe/Slack #56 | `slack` | `xoxe.` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
 | `github_classic_pat` | GitHub/JWT #57 | `pat` | `ghp_`, `gho_`, `ghu_`, `ghs_` ou `ghr_` + exactement 36 caractères `[A-Za-z0-9]` | — |
 | `github_fine_grained_pat` | GitHub/JWT #57 | `pat` | `github_pat_` + 22 à 255 caractères `[A-Za-z0-9_]` | — |
 | `jwt` | GitHub/JWT #57 | `jwt` | en-tête `eyJ` puis trois segments base64url bornés (1024 / 65 536 / 1024) | — |
 | `pem_private_key` | PEM #58 | `pem` | `-----BEGIN` + qualificatif ≤ 64 caractères + `PRIVATE KEY-----` (ou `PRIVATE KEY BLOCK-----`) | — |
-
-La frontière gauche des trois règles Slack est `(?<![A-Za-z0-9-])` : le point
-n'est **pas** une frontière de mot, donc un jeton collé à un préfixe de
-domaine ou à une concaténation (`foo.xapp-…`, `foo.xoxe.…`) reste détecté.
-En revanche, le préfixe rotatif `xoxe.` est traité comme un préfixe : le jeton
-qu'il contient porte une garde `(?<!(?<![A-Za-z0-9-])xoxe\.)` et n'est signalé
-**qu'une fois** (une seule empreinte, donc une seule entrée Vault à révoquer,
-pour un seul secret).
-
-La neutralisation est **conditionnelle à l'ancrage** du préfixe : elle ne
-porte que si le préfixe `xoxe.` est lui-même ancré (précédé d'un caractère
-qui n'est ni lettre, ni chiffre, ni tiret). Un préfixe **bourré**
-(`xxoxe.xapp-…`) n'est donc pas ancré : le jeton qu'il contient reste un vrai
-secret et est signalé.
-
-Ce que la neutralisation **ne** vérifie pas : la longueur de la charge. Elle
-neutralise le jeton interne dès que `xoxe.` est ancré, sans regarder si la
-forme rotative est elle-même reconnue. Dans les bornes documentées, les deux
-coïncident — et cette coïncidence est **structurelle**, pas une coïncidence
-écrite à la main :
-
-- les bornes sont **dérivées** des mêmes constantes
-  (`SLACK_PAYLOAD_MAX` → `SLACK_TOKEN_MAX` = longueur totale d'un jeton
-  detectable seul → `ROTATING_PAYLOAD_MAX`) ;
-- l'invariant « la forme rotative couvre tout jeton detectable seul » est
-  **vérifié au chargement du module** (`_verifier_couplage()`) : un registre
-  incohérent refuse d'être importé (fail-closed) ;
-- il est **figé par un test** aux bornes exactes (jeton interne à charge
-  maximale : exactement un finding, la forme rotative) et au-delà (charge
-  hors bornes : limite écrite, aucun secret perdu en silence).
-
-Un jeton détectable seul (charge ≤ 250) reste donc détectable une fois
-préfixé : le préfixe ne peut pas faire disparaître le secret en portant la
-charge au-delà de la borne. Un jeton **hors** bornes (charge > 250) n'est
-détectable ni seul ni préfixé : c'est une limite documentée, pas un secret
-que la garde ferait disparaître.
 
 Chaque motif est ancré sur un **préfixe publié** ou sur un **nom de paramètre
 explicite**. Une chaîne aléatoire de 40 caractères **sans préfixe ni nom de
@@ -165,9 +136,8 @@ reste sur le nom exact, jamais sur une sous-chaîne.
    valeur répétée sur la même ligne ne produit qu'un candidat, mais deux
    valeurs distinctes du même type restent deux candidats.
 3. `SignatureEngine.analyser(cible)` analyse chaque ligne de la cible, puis
-   joint les lignes suivantes **si elles sont contiguës et si la somme fait au
-   plus 4 Kio (4096 octets UTF-8)** — au plus **trois lignes** jointes au
-   total (voir ci-dessous).
+   joint la ligne suivante **si elle est contiguë et si la somme fait au plus
+   4 Kio (4096 octets UTF-8)** (voir ci-dessous).
 4. Chaque candidat devient un `Finding` #53 : `status="detecte"`,
    `source="regex"`, le type de la règle, l'entropie de Shannon du candidat et
    son empreinte HMAC-SHA-256.
@@ -178,34 +148,28 @@ Le moteur ne lit **aucun fichier** : la cible `DiffTarget` ou `FileTarget` a
 déjà été validée par #53. Le parcours du dépôt, les exclusions et la lecture
 confinée appartiennent à #59.
 
-### Secret coupé sur deux ou trois lignes
+### Secret coupé sur deux lignes
 
 Un secret peut être coupé par un retour à la ligne, par exemple un paramètre
-suivi de sa valeur entre guillemets sur la ligne suivante — ou **par une ligne
-vide intercalée**. Le moteur joint donc jusqu'à **trois lignes dont les numéros
-se suivent**, dans une fenêtre **bornée à 4096 octets UTF-8** :
+suivi de sa valeur entre guillemets sur la ligne suivante. Le moteur joint donc
+deux lignes **dont les numéros se suivent**, dans une fenêtre **bornée à
+4096 octets UTF-8** :
 
-- si `len((ligne + ligne_suivante [+ ligne_suivant2]).encode("utf-8")) > 4096`,
-  la jointure s'arrête à la fenêtre la plus courte qui tient dans la borne
-  (la mesure est en octets, pas en caractères : une ligne pleine d'accents ne
-  peut pas élargir la borne) ;
-- si les entrées ne sont pas contiguës (`numéro_suivant != numéro_courant + 1`),
-  aucune jointure n'est faite : une `DiffTarget` ne contient que les lignes
-  *ajoutées* du diff, et joindre les lignes 12 et 15 fabriquerait une chaîne
-  absente de tout fichier ;
+- si `len((ligne + ligne_suivante).encode("utf-8")) > 4096`, aucune jointure
+  n'est faite (la mesure est en octets, pas en caractères : une ligne pleine
+  d'accents ne peut pas élargir la borne) ;
+- si les deux entrées ne sont pas contiguës (`numéro_suivant != numéro_courant
+  + 1`), aucune jointure n'est faite : une `DiffTarget` ne contient que les
+  lignes *ajoutées* du diff, et joindre les lignes 12 et 15 fabriquerait une
+  chaîne absente de tout fichier ;
 - une correspondance qui commence après la frontière appartient à la ligne
   suivante et est ignorée lors de la jointure, pour ne pas produire de doublon ;
 - le Finding est attribué à la ligne de **début** de la correspondance.
 
-La troisième ligne couvre le cas `aws_secret_access_key =` / *ligne vide* /
-`"valeur"` : sans elle, un secret coupé par plus d'un `\n` disparaissait
-silencieusement.
-
 Cette fenêtre est volontairement limitée : elle couvre les coupures de mise en
 forme courantes sans transformer le scanner en analyseur de fichier entier.
-Un secret étalé sur **plus de trois lignes** (deux `\n` consécutifs ou plus) ou
-au-delà de 4096 octets UTF-8 n'est pas détecté par cette version ; la limite est
-testée.
+Un secret étalé sur trois lignes ou au-delà de 4096 octets UTF-8 n'est pas
+détecté par cette version ; la limite est testée.
 
 ## Jamais de valeur brute
 
@@ -395,12 +359,10 @@ noms qu'elle reconnaît effectivement.
 
 - Pas de parcours de dépôt ni d'exclusion : le moteur reçoit une cible déjà
   construite (#59).
-- Charge des jetons Slack : au-delà de **250 caractères** après le préfixe
-  publié (`xapp-`, `xoxb-`…), le jeton n'est détecté **ni seul ni préfixé** par
-  `xoxe.` — c'est une borne écrite et figée par un test, pas un secret que la
-  garde du préfixe rotatif ferait disparaître en silence.
-- Pas de détection par entropie seule : `entropy` est une métadonnée du
-  Finding, pas un déclencheur.
+- `find_signature_matches` reste limité aux signatures. Le moteur ajoute la
+  détection par entropie seule (#23), documentée dans [scanner-entropy.md](scanner-entropy.md).
+  `SignatureMatch.source` est typé `Literal["regex", "entropy"]` ; le nom
+  d'une règle ne détermine jamais sa source.
 - Jointure limitée à deux lignes **contiguës** et 4096 octets UTF-8.
 - PEM : seul l'en-tête `BEGIN … PRIVATE KEY` est reconnu ; le corps n'est pas
   parsé et un en-tête seul est signalé (c'est le signal utile).
@@ -414,7 +376,9 @@ noms qu'elle reconnaît effectivement.
   moteur porte sur l'empreinte, jamais sur la valeur. Elle n'est jamais
   sérialisée, journalisée ou rendue.
 - Le type d'un Finding produit par le registre est **borné** à l'ensemble
-  `aws` / `stripe` / `slack` / `pat` / `jwt` / `pem` : un nouveau fournisseur
+  `aws` / `stripe` / `slack` / `pat` / `jwt` / `pem` / `high_entropy_hex` /
+  `high_entropy_base64` : les deux derniers sont produits par le moteur
+  d'entropie, les six premiers par le registre de signatures. Un nouveau fournisseur
   implique d'ajouter son type à `ALLOWED_SECRET_TYPES` et de le documenter ici.
 - `find_signature_matches` n'est exportée par **aucun** paquet public :
   `heimdall.scanner` ne l'expose pas, et le registre la tient hors de son

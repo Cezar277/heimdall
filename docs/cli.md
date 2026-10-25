@@ -36,8 +36,58 @@ heimdall scan --json [CHEMIN]       # rapport JSON sur stdout
 | Option | Effet |
 | --- | --- |
 | `--staged` | change le **périmètre** : les blobs **ajoutés ou modifiés** de l'index git, lus blob par blob, **sans aucune exclusion de chemin** |
-| `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr |
-| `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; les erreurs restent sur stderr |
+| `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr (avec décompte des secrets ignorés par l'allowlist) |
+| `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; inclut les traces et décomptes d'allowlist (#24) ; les erreurs restent sur stderr |
+| `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) ; un chemin **hors du dépôt** est accepté : choix opérateur explicite, soumis aux mêmes gardes (`_resolve_root` + `O_NOFOLLOW`, plafond de taille, contrat fermé) |
+| `--no-allowlist` | désactive l'allowlist déterministe pour le scan courant |
+
+En `--ci`, l'allowlist du dépôt ne peut jamais s'auto-attester : si un
+`heimdall.toml` est présent dans le dépôt scanné (versionné à la racine,
+comme ici), `scan --ci` sans option sort en code 2. L'opérateur a deux
+choix explicites : `--config` vers un fichier **hors du dépôt** épinglé
+par l'équipe (mêmes gardes et contrat fermé, recommandé), ou
+`--no-allowlist` (aucune ignorance, verdict maximal). Exemple :
+`heimdall scan --ci --config /opt/ci/allowlist.toml .`
+
+Le fichier d'allowlist est un **contrat fermé** : seule la table racine
+`[allowlist]` est acceptée, `version` est **obligatoire** et doit être le
+littéral `"1"` (un entier `1`, ou une `version` simplement omise, sont
+refusés), et chaque mot-clé doit faire au moins 3 caractères. Toute
+clé racine inconnue (`[tool.foo]`, faute de frappe), tout type incorrect ou
+tout mot-clé trop court est une erreur d'outillage (code 2), jamais un
+passage silencieux. Un `secret_types` doit suivre la grammaire des types
+du contrat Finding (`[a-z][a-z0-9_]*`, 64 caractères max, ex. `aws`) :
+`"AWS"` ou `"../etc"` sont refusés en code 2 au lieu de rendre la règle
+muette. Le critère `exact_keywords` (optionnel) compare à égalité
+insensible à la casse : c'est le SEUL critère valeur autorisé sans
+restriction — le choix auditable pour les marqueurs globaux sans `paths`
+(`example`, `changeme`, `dummy`) : `my-example-key` reste détecté, seul le
+marqueur exact est ignoré. Les `keywords` classiques gardent la frontière
+`\b` stricte mais exigent une restriction conjointe (`paths` et/ou
+`secret_types`, ex. fixtures de test) : une règle `keywords`/`patterns`
+globale est refusée en code 2, jamais silencieusement ignorante.
+
+Les `patterns` ne peuvent pas rendre l'allowlist aveugle : via TOML, chaque
+chaîne est compilée puis validée ; via l'API Python, seules des expressions
+déjà compilées sont acceptées. Un motif qui matche la chaîne vide (`.`, `.*`,
+`^`, `^.*$`…) est refusé, et chaque branche d'alternance doit porter au moins
+3 caractères **littéraux** : `EXAMPLE-[0-9]{4}` est accepté, tandis que
+`[a-z]+`, `\w+`, `\d{3}-\d{4}` ou `x{3}y{3}` sont refusés (motif trop large
+pour être auditable) — reformuler en portant les marqueurs concrets visés.
+Aucun mot-clé ni motif ne peut porter de caractère de contrôle ou invisible
+(`\n` littéral, tabulation, RLO…) : faute de frappe refusée en code 2
+(les échappements regex `\n` restent deux caractères ordinaires et acceptés).
+Les constructions à backtracking non borné (alternance ou groupe imbriqué
+sous quantificateur, quantificateurs consécutifs, références arrière) sont
+refusées en `ScanError` (code 2). Une valeur candidate de plus de 256
+caractères n'est pas soumise aux regex : elle reste signalée (fail-closed),
+ce qui borne l'exposition résiduelle.
+
+Le filtre de chemins est borné des deux côtés : un motif `paths` porte au
+plus 10 jokers `*` (au-delà : code 2), et un chemin de plus de 1024
+caractères n'est pas soumis à `fnmatch` (fail-closed : il reste signalé).
+Sous Python ≥ 3.13, `fnmatch` complète cette borne avec des groupes
+atomiques natifs.
 
 `CHEMIN` vaut `.` par défaut. Il doit être la **racine** d'un dépôt git,
 dans les deux périmètres (sinon : erreur, code 2) : hors dépôt —
@@ -87,10 +137,19 @@ séparateur `--` est accepté par le git de CI et figé par un test e2e
 La **racine elle-même est re-contrôlée** après l'analyse, dans les deux
 périmètres : la garde unique (refus symlink, égalité du résolu) est rejouée
 sur le chemin demandé et comparée à la forme figée à l'entrée — chemin
-résolu **et** identité (`st_dev`, `st_ino` épinglés à la construction). Un
-lien remplacé pendant le scan, comme un dossier remplacé par un autre au
-même chemin (même résolu, autre identité), refuse le verdict au lieu de
-juger le mauvais périmètre.
+résolu **et** identité (`st_dev`, `st_ino`, `st_ctime_ns` épinglés à la
+construction). Un lien remplacé pendant le scan, comme un dossier remplacé
+par un autre au même chemin (même résolu, autre identité), refuse le verdict
+au lieu de juger le mauvais périmètre. Le `ctime` est nécessaire : un
+`rm -rf` suivi d'un `mkdir` peut réattribuer le même inode, mais le dossier
+neuf a un `ctime` postérieur, qu'un `utime` ne peut pas forger. Revers
+assumé sous POSIX : ajouter ou supprimer une entrée **directe** de la racine
+pendant le scan refuse le verdict (code 2, fail-closed) ; sous Windows, le
+`ctime` est la date de création et ce revers n'existe pas. Le scanner d'arbre
+rejoue sa garde sur la forme canonique déjà figée (opération idempotente) ; ce
+second passage n'ouvre pas
+de bypass : toute substitution entre les deux est rattrapée par le
+re-contrôle d'identité final.
 
 Les suppressions et les **gitlinks** (sous-modules, mode `160000`) sont
 ignorés : une suppression n'a plus de blob à scanner, et le SHA d'un gitlink
@@ -120,15 +179,18 @@ candidat).
 
 Les deux périmètres ont aussi une **deadline globale** de 120 s :
 [`MAX_TREE_SECONDS`](../heimdall/cli/scan.py) en arbre (vérifiée entre chaque
-fichier et avant le rendu), [`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py) en
-`--staged`. En arbre, les plafonds de volume ne bornent pas le temps de
+fichier, périodiquement à l'intérieur d'un fichier dense, et avant le rendu),
+[`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py) en `--staged` (vérifiée entre
+blobs **et** à l'intérieur d'un blob, toutes les 256 lignes et 256 candidats,
+comme en arbre : un blob d'1 Mio de lignes vides coûte ~10 s de moteur). En
+arbre, les plafonds de volume ne bornent pas le temps de
 regex + HMAC ; en `--staged`, chaque blob coûte deux appels `git cat-file`
 séquentiels, et 1 000 blobs représenteraient 2 000 processus. Au-delà de la
 deadline, refus (code 2), jamais un job CI qui s'éternise sans verdict. En
 `--staged`, le restant de deadline est propagé comme timeout à chaque appel
 git (borné au timeout unitaire de 30 s), y compris la seconde énumération de
-l'index ; un appel lent ne peut donc pas dépasser la deadline de plus que son
-timeout unitaire.
+l'index. La lecture de la sortie et l'attente de fin partagent ce délai : un
+appel git ne dépasse jamais le restant de deadline qui lui a été passé.
 
 Les bornes d'entrée ne suffisent pas : des blobs denses en candidats
 feraient gonfler la liste des Findings et le tri final en mémoire et en
@@ -184,6 +246,13 @@ Codes de sortie : 0 = aucun secret, 1 = secrets détectés, 2 = erreur d'outilla
 Finding ne porte qu'une empreinte HMAC-SHA-256 et une entropie. L'empreinte
 affiche un préfixe de 12 caractères (le JSON porte la valeur complète) : elle
 permet de rapprocher deux scans du même candidat sans le révéler.
+
+Le **chemin** affiché à l'humain est échappé : les caractères de contrôle et
+les caractères invisibles ou directionnels (U+202A-E, U+2066-9, U+200B-F,
+U+FEFF…) s'affichent en `\uXXXX`. Un nom contenant U+202E (RLO) ne peut donc
+pas faire lire `vendor/evil.py` là où le secret est dans un autre fichier.
+Le contrat autorise ces noms : le chemin n'est pas refusé, seul son affichage
+change. Le JSON garde le chemin exact.
 
 ### JSON (`--json`, stdout)
 
@@ -263,8 +332,10 @@ document si `count != len(findings)` (contrainte explicitée dans la
   `heimdall scan` sur l'arbre de travail, et du job de CI de #37).
 - Un chemin de fichier doit être représentable dans le contrat
   [Finding v1](contracts/finding.md) : au-delà de **4096 caractères**, le
-  scan est refusé (code 2), jamais un chemin tronqué. Les noms contenant une
-  espace ou des caractères Unicode sont, eux, parfaitement acceptés.
+  scan est refusé (code 2), jamais un chemin tronqué. Un nom **non-UTF8**
+  (surrogates issus de `os.walk`, octets invalides en index) est également
+  refusé en code 2 dans les deux périmètres. Les noms contenant une espace ou
+  des caractères Unicode valides sont, eux, parfaitement acceptés.
 - Le scanner de signatures ne décode ni base64 ni concaténation de chaînes :
   ces obfuscations restent des `limite_connue` (#23/#24), comme documenté dans
   [scanner.md](scanner.md#limites-connues-honnêtes).
@@ -274,6 +345,38 @@ document si `count != len(findings)` (contrainte explicitée dans la
   signale, comme il le doit. Un job de CI sur ce dépôt devra donc traiter ces
   fixtures (allowlist, #24) — sinon il échouerait à chaque exécution. C'est un
   choix assumé : mieux vaut un faux positif visible qu'un secret caché.
+- **Zone de clémence `tests/` (allowlist, #24)** : avec un `heimdall.toml`
+  contenant la règle `test-fixtures`, toute valeur sous `tests/`,
+  `fixtures/` ou `support/` qui contient un marqueur délimité (`dummy`,
+  `fake`, `mock`…) est ignorée — y compris un mot de passe choisi comme
+  `my-dummy-key-12345`. C'est volontaire et documenté dans le fichier lui-même :
+  les répertoires de test ne doivent jamais contenir de vrais secrets. En CI
+  stricte (sans `heimdall.toml`, allowlist vide), tout y est signalé.
+- **Non-atomicité assumée du mode arbre (`working-tree`) vs atomicité stricte de `--staged`** :
+  L'arbre de travail est un parcours direct du système de fichiers (`os.walk`), par nature
+  **non atomique** (best-effort). Le re-contrôle final d'identité racine (`st_dev`, `st_ino`,
+  `st_ctime_ns`) détecte tout remplacement ou altération des entrées directes de la racine,
+  mais la mutation d'un fichier imbriqué (ex. substitution walk -> open où un processus
+  concurrent remplace un fichier piégé par un fichier propre avant sa lecture) ne modifie pas
+  le `ctime` racine et aboutit à un verdict propre (0 mélangé). En revanche, le mode
+  `--staged` est **strictement atomique** : il lit des objets immuables dans le dépôt git,
+  adressés par SHA (`cat-file blob <sha>`), et re-vérifie l'état complet de l'index avant de
+  rendre son verdict (toute modification concurrente refuse en code 2). Seul `--staged` est
+  atomique et fait donc foi pour les barrières de sécurité bloquantes (hook de pré-commit et CI).
+- **Mode arbre local indicatif, pas une barrière** : hors `--ci` et hors `--staged`,
+  `heimdall scan` refuse une configuration **stagée**, mais ne vérifie pas que le
+  fichier `heimdall.toml` (ou un `--config` interne) du worktree est propre et suivi
+  dans l'index. Un fichier de configuration local dirty/untracked peut donc fausser le
+  verdict local (jusqu'à 0). Seuls `--ci` (refus de toute configuration interne) et
+  `--staged` (configuration propre et suivie, contenu vérifié lié au parseur) sont
+  opposables ; le hook de pré-commit et la CI doivent utiliser ces modes.
+- **Course résiduelle à l'initialisation de la racine (re-contrôle final garant)** :
+  Dans `GitAccess.__init__`, entre `_resolve_root` et `os.stat`, un échange rapide
+  `dossier` -> `symlink` -> `autre dossier` à la racine pourrait théoriquement échapper
+  au `is_symlink` immédiat si le lien est retiré avant le `stat`. Cette fenêtre résiduelle est
+  assumée : le nouveau dossier porte une identité (`st_ctime_ns` / `st_ino`) différente, et
+  le re-contrôle d'identité final en fin de passe (`_verify_root_unchanged`) refuse
+  systématiquement en code 2 dans les deux périmètres (`working-tree` et `--staged`).
 - La validation humaine (Y/N/E) et le remplacement du secret ne sont pas
   dans ce ticket : `scan` signale, il ne répare pas (#32).
 

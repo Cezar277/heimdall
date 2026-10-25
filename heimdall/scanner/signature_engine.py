@@ -12,28 +12,32 @@ Invariants :
   déduplication porte sur l'empreinte, pas sur la valeur brute ;
 - une même valeur identique n'est produite qu'une fois par ligne, mais deux
   valeurs distinctes du même type restent deux Findings ;
-- la jointure de deux ou trois lignes pour un secret coupé est **bornée** à
-  4 Kio (4096 octets UTF-8) et n'a lieu qu'entre lignes **contiguës** ;
+- la jointure de deux lignes pour un secret coupé est **bornée** à 4 Kio
+  (4096 octets UTF-8) et n'a lieu qu'entre lignes **contiguës** ;
 - les regex du registre sont linéaires et bornées (anti-ReDoS).
 """
 
 from __future__ import annotations
 
+import time
 from typing import Final
 
+from heimdall.scanner.allowlist import Allowlist, AllowlistTrace
 from heimdall.scanner.entropy import shannon_entropy
+from heimdall.scanner.entropy_detection import (
+    DEFAULT_ENTROPY_CONFIG,
+    EntropyConfig,
+    check_multiline_overflow,
+    find_line_matches,
+)
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import ScanTarget
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
-#: Fenêtre maximale de jointure de lignes, en **octets UTF-8** (4 Kio).
+#: Fenêtre maximale de jointure de deux lignes, en **octets UTF-8** (4 Kio).
 MULTILINE_WINDOW: Final[int] = 4096
-#: Nombre de lignes jointes au maximum (la ligne courante comprise).
-MULTILINE_LINES: Final[int] = 3
-#: Nombre minimal de lignes jointes pour qu'une fenêtre existe.
-MULTILINE_MIN_LINES: Final[int] = 2
 
 #: Plafond du nombre de Findings rendus en une passe (#29). Les bornes
 #: d'entrée ne suffisent pas : un dépôt adverse dense en candidats (un millier
@@ -51,6 +55,8 @@ MAX_FINDINGS: Final[int] = 10_000
 _MAX_FINDINGS_ERROR: Final[str] = "scan impossible : entrée non analysable"
 #: Refus statique d'un plafond explicite hors contrat (0, négatif, géant).
 _MAX_FINDINGS_INVALID: Final[str] = "plafond de findings hors contrat"
+#: Refus statique de l'échéance dépassée (même libellé que les autres refus).
+_DEADLINE_ERROR: Final[str] = "scan impossible : entrée non analysable"
 
 
 class SignatureEngine:
@@ -69,17 +75,40 @@ class SignatureEngine:
     entier géant ne peut pas relever la borne (``ValueError``). La CLI
     ``--staged`` renseigne explicitement sa propre constante (même valeur,
     knob documenté côté CLI).
+
+    ``deadline`` (``time.monotonic()``, optionnelle) borne la durée de la
+    passe **à l'intérieur** d'une cible : vérifiée toutes les 256 lignes et
+    tous les 256 Findings, comme ``Scanner._scan_text`` en arbre. Sans elle,
+    un blob d'1 Mio de lignes vides coûte ~10 s de moteur, et la deadline
+    ``--staged`` ne serait vue qu'entre blobs. Au-delà : ``ScanError``. Un
+    moteur construit pour une passe ne se réutilise pas après son échéance.
     """
 
-    __slots__ = ("_hasher", "_max_findings")
+    __slots__ = (
+        "_allowlist",
+        "_deadline",
+        "_entropy_config",
+        "_hasher",
+        "_max_findings",
+        "_traces",
+    )
 
     def __init__(
         self,
         hasher: SnippetHasher | None = None,
+        entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
         *,
         max_findings: int | None = None,
+        deadline: float | None = None,
+        allowlist: Allowlist | None = None,
     ) -> None:
+        self._deadline = deadline
+        if not isinstance(entropy_config, EntropyConfig):
+            raise ValueError("configuration d'entropie invalide")
+        self._entropy_config = entropy_config
         self._hasher = hasher
+        self._allowlist = allowlist
+        self._traces: list[AllowlistTrace] = []
         # `None` ne doit jamais désactiver la borne : on retombe sur le
         # défaut, y compris pour un appelant non typé qui passerait `None`
         # en croyant conserver l'ancien mode non borné. Un entier explicite
@@ -95,6 +124,11 @@ class SignatureEngine:
             raise ValueError(_MAX_FINDINGS_INVALID)
         self._max_findings = max_findings
 
+    @property
+    def traces(self) -> tuple[AllowlistTrace, ...]:
+        """Traces déterministes des rejets par l'allowlist (#24)."""
+        return tuple(self._traces)
+
     def analyser(self, cible: ScanTarget) -> list[Finding]:
         """Analyse la cible et rend un Finding par candidat distinct."""
         findings: list[Finding] = []
@@ -102,18 +136,31 @@ class SignatureEngine:
         # brute n'y entre jamais : elle est hachée à la volée puis oubliée.
         seen: set[tuple[int, str, str]] = set()
         lines = cible.lignes()
+        preceding: tuple[SignatureMatch, ...] = ()
         for index, (line_number, line) in enumerate(lines):
-            for match in find_signature_matches(line):
+            # Contrôle périodique intra-cible (cf. `deadline`) : sans lui, la
+            # deadline `--staged` n'est vue qu'après la fin du blob.
+            if (
+                index % 256 == 0
+                and self._deadline is not None
+                and time.monotonic() > self._deadline
+            ):
+                raise ScanError(_DEADLINE_ERROR)
+            for match in find_line_matches(
+                line, self._entropy_config, preceding, deadline=self._deadline
+            ):
                 self._append(findings, seen, match, line_number, cible.path)
             following = self._joined_window(line, lines, index)
             if following is None:
+                preceding = ()
                 continue
             joined, limit = following
-            for match in find_signature_matches(joined):
-                # Une correspondance qui commence après la jonction appartient
-                # à la ligne suivante : elle y sera déjà signalée.
-                if match.start >= limit:
-                    continue
+            # Réutilisé pour dédupliquer l'entropie de la ligne suivante :
+            # une fenêtre contiguë n'est jamais analysée une seconde fois.
+            preceding = tuple(
+                match for match in find_signature_matches(joined) if match.start < limit
+            )
+            for match in preceding:
                 self._append(findings, seen, match, line_number, cible.path)
         return findings
 
@@ -123,45 +170,31 @@ class SignatureEngine:
         lines: tuple[tuple[int, str], ...],
         index: int,
     ) -> tuple[str, int] | None:
-        """Jointure bornée de deux ou trois lignes **contiguës**.
-
-        Une clé peut être coupée par un retour à la ligne, et même par une
-        ligne vide intercalée (``aws_secret_access_key =`` / ligne vide /
-        ``"valeur"``). La fenêtre joint donc jusqu'à trois lignes
-        consécutives : sans elle, un secret coupé par plus d'un ``\\n``
-        disparaissait silencieusement.
+        """Jointure bornée de deux lignes **contiguës**, pour un secret coupé.
 
         ``DiffTarget`` ne contient que les lignes *ajoutées* du diff : deux
         entrées voisines de la liste peuvent porter des numéros distants
         (12 puis 15). Les joindre fabriquerait une chaîne qui n'existe dans
         aucun fichier et attribuerait le Finding à la mauvaise ligne. La
-        jointure exige donc ``numéro_suivant == numéro_courant + 1`` (et
-        ``+ 2`` pour la troisième ligne).
+        jointure exige donc ``numéro_suivant == numéro_courant + 1``.
 
         La borne est mesurée en octets UTF-8, conformément à la fenêtre de
-        4 Kio documentée. Une ligne qui ferait dépasser la borne est
-        **écartée mais pas fatale** : la jointure plus courte reste valable.
+        4 Kio documentée.
         """
+        if index + 1 >= len(lines):
+            return None
         current_number, _current = lines[index]
-        joined = ""
-        jointes = 0
-        for offset in range(MULTILINE_LINES):
-            position = index + offset
-            if position >= len(lines):
-                break
-            number, text = lines[position]
-            if number != current_number + offset:
-                break
-            candidate = joined + text
-            if len(candidate) > MULTILINE_WINDOW:
-                break
-            # Le nombre de caractères minore le nombre d'octets UTF-8 : le
-            # premier contrôle évite d'encoder les lignes déjà trop longues.
-            if not candidate.isascii() and len(candidate.encode("utf-8")) > MULTILINE_WINDOW:
-                break
-            joined = candidate
-            jointes += 1
-        if jointes < MULTILINE_MIN_LINES:
+        following_number, following = lines[index + 1]
+        if following_number != current_number + 1:
+            return None
+        joined = line + following
+        if len(joined) > MULTILINE_WINDOW:
+            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
+            return None
+        # Le nombre de caractères minore le nombre d'octets UTF-8 : le premier
+        # contrôle évite d'encoder les lignes déjà trop longues.
+        if not joined.isascii() and len(joined.encode("utf-8")) > MULTILINE_WINDOW:
+            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
             return None
         return joined, len(line)
 
@@ -179,11 +212,35 @@ class SignatureEngine:
         # empreintes distinctes (la collision est infaisable en pratique),
         # donc la déduplication est inchangée — mais aucun secret en clair
         # ne survit dans l'ensemble `seen` pendant tout le scan.
+        # Un blob dense peut porter des milliers de candidats : la deadline est
+        # revue aussi tous les 256 Findings, avant le hachage HMAC.
+        if (
+            self._deadline is not None
+            and len(findings) % 256 == 0
+            and time.monotonic() > self._deadline
+        ):
+            raise ScanError(_DEADLINE_ERROR)
         snippet_hash = self._get_hasher().hash(match.value)
         key = (line_number, match.secret_type, snippet_hash)
         if key in seen:
             return
         seen.add(key)
+
+        # Allowlist déterministe (#24) : écarte les cas évidents sans passer
+        # par le LLM. Chaque rejet émet une trace traçable (règle, fichier, ligne).
+        if self._allowlist is not None and not self._allowlist.is_empty():
+            rule_name = self._allowlist.evaluate(
+                value=match.value,
+                file=relative_path,
+                line=line_number,
+                secret_type=match.secret_type,
+            )
+            if rule_name is not None:
+                self._traces.append(
+                    AllowlistTrace(rule=rule_name, file=relative_path, line=line_number)
+                )
+                return
+
         findings.append(
             Finding(
                 file=relative_path,
@@ -191,6 +248,7 @@ class SignatureEngine:
                 type=match.secret_type,
                 entropy=round(shannon_entropy(match.value.encode("utf-8")), 4),
                 snippet_hash=snippet_hash,
+                source=match.source,
             )
         )
         if len(findings) > self._max_findings:

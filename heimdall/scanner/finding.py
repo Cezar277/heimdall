@@ -60,6 +60,10 @@ _HASH_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]*")
 _FORBIDDEN_PATH_CHARACTERS: Final[frozenset[str]] = frozenset({":", "\\"})
 _FIRST_CONTROL: Final[int] = 0x20
 _DELETE: Final[int] = 0x7F
+#: Plage des surrogates UTF-16 (produits par `surrogateescape` pour un nom
+#: non-UTF8) : aucun chemin réel ne peut les contenir en UTF-8 valide.
+_SURROGATE_MIN: Final[int] = 0xD800
+_SURROGATE_MAX: Final[int] = 0xDFFF
 #: Séparateurs de ligne Unicode : exclus comme les contrôles par le schéma.
 _UNICODE_LINE_SEPARATORS: Final[frozenset[int]] = frozenset({0x2028, 0x2029})
 
@@ -69,7 +73,8 @@ def validate_relative_path(value: object) -> str:
 
     Graphe lexical, identique à celui du schéma : chemin **relatif** au
     dépôt, séparateurs ``/``, segments non vides, aucun segment ``.`` ou
-    ``..``, aucun caractère de contrôle, aucune fin de ligne Unicode.
+    ``..``, aucun caractère de contrôle, aucune fin de ligne Unicode, aucun
+    surrogate (nom non-UTF8 issu de ``os.walk``).
 
     Garde lexicale seule, volontairement sans I/O : elle refuse un chemin
     qu'on ne peut pas interpréter sans ambiguïté (``../``, absolu, ``C:``,
@@ -96,6 +101,7 @@ def validate_relative_path(value: object) -> str:
             character in _FORBIDDEN_PATH_CHARACTERS
             or code < _FIRST_CONTROL
             or code == _DELETE
+            or _SURROGATE_MIN <= code <= _SURROGATE_MAX
             or code in _UNICODE_LINE_SEPARATORS
         ):
             raise ValueError("chemin non conforme au contrat Finding v1")

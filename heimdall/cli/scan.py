@@ -12,10 +12,9 @@ verdict propre.
 Deux périmètres, un seul verdict :
 
 - ``working-tree`` (par défaut) : l'arbre de travail, en **mode strict** —
-  seule la base VCS est écartée (métadonnées, pas du contenu) ; ``vendor/``,
-  ``node_modules/``, ``third_party/``, les lockfiles et les fichiers de
-  contrôle sont parcourus et leur contenu décide, parce qu'un secret y est un
-  secret ; un rapport incomplet (binaire, lien, illisible) refuse le verdict ;
+  seules les exclusions *techniques* de #59 restent (binaires, répertoires
+  générés) ; ``vendor/``, ``third_party/``, les lockfiles et les fichiers de
+  contrôle sont parcourus, parce qu'un secret y est un secret ;
 - ``staged`` (``--staged``) : les blobs **ajoutés ou modifiés** dans l'index
   git, lus blob par blob, **sans aucune exclusion de chemin**. C'est ce que
   le commit va contenir, donc ce que le hook et la CI doivent juger.
@@ -33,21 +32,33 @@ résultat partiel n'est jamais présenté comme complet.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
+import stat
 import time
+import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GIT_TIMEOUT_SECONDS, GitAccess
+from heimdall.scanner.allowlist import (
+    MAX_CONFIG_BYTES,
+    Allowlist,
+    AllowlistTrace,
+    load_allowlist,
+    parse_allowlist_bytes,
+)
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.detect import Scanner as TreeScanner
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding
-from heimdall.scanner.hashing import SnippetHasher
-from heimdall.scanner.interface import FileTarget
+from heimdall.scanner.interface import FileTarget, _open_flags, _resolve_root
 from heimdall.scanner.interface import Scanner as TargetScanner
 from heimdall.scanner.signature_engine import SignatureEngine
 
@@ -57,10 +68,13 @@ EXIT_CLEAN: Final[int] = 0
 EXIT_FINDINGS: Final[int] = 1
 EXIT_ERROR: Final[int] = 2
 
+#: Périmètres contractuels du scan (contrat de sortie JSON, `scope`).
+Scope = Literal["working-tree", "staged"]
+
 #: Périmètre « arbre de travail ».
-SCOPE_TREE: Final[str] = "working-tree"
+SCOPE_TREE: Final[Scope] = "working-tree"
 #: Périmètre « index git ».
-SCOPE_STAGED: Final[str] = "staged"
+SCOPE_STAGED: Final[Scope] = "staged"
 
 #: Version du contrat de sortie JSON (``--json``).
 JSON_SCHEMA: Final[str] = "heimdall.scan.v1"
@@ -97,10 +111,16 @@ _MSG_BLOB_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
+_MSG_INVALID_SCOPE: Final[str] = "scan impossible : entrée non analysable"
+
+#: Journal de diagnostic (niveau debug uniquement) : les causes de refus de
+#: la garde anti auto-attestation y sont distinguées par des libellés
+#: statiques (aucune entrée ni secret reflété, invariant 8).
+logger = logging.getLogger("heimdall.cli.scan")
 
 #: Libellés du périmètre, affichés à l'humain.
-_SCOPE_LABELS: Final[dict[str, str]] = {
-    SCOPE_TREE: "arbre de travail (base VCS hors périmètre, contenu décide)",
+_SCOPE_LABELS: Final[dict[Scope, str]] = {
+    SCOPE_TREE: "arbre de travail (mode strict : exclusions techniques seules)",
     SCOPE_STAGED: "index git (blobs ajoutés ou modifiés, aucune exclusion de chemin)",
 }
 
@@ -112,29 +132,65 @@ _CODES_LINE: Final[str] = (
 #: Longueur de l'empreinte affichée à l'humain (le reste est dans le JSON).
 _HASH_PREFIX: Final[int] = 12
 
+#: Catégories Unicode jamais affichées brutes à l'humain : contrôles (Cc),
+#: caractères de format (Cf : marques directionnelles U+202A-E, U+2066-9,
+#: U+200E-F, espaces de largeur nulle U+200B-D, U+FEFF…), séparateurs de
+#: ligne et de paragraphe (Zl, Zp).
+_ESCAPED_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
 
 @dataclass(frozen=True, slots=True)
 class ScanReport:
-    """Le résultat d'un scan : un périmètre et des Findings.
+    """Le résultat d'un scan : un périmètre, des Findings et traces d'allowlist.
 
     Les Findings ne contiennent aucun secret (contrat #14) : les reporter
     tels quels, y compris dans le JSON, ne fuit rien.
+    Les traces d'allowlist (#24) ne portent que : règle, fichier, ligne.
     """
 
-    scope: str
+    scope: Scope
     findings: tuple[Finding, ...]
+    traces: tuple[AllowlistTrace, ...] = ()
+    config_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        # Garde runtime pour les appelants non typés : le `Literal` protège
+        # mypy, cette vérification protège l'exécution (jamais de `KeyError`
+        # ni de `TypeError` hors contrat dans `render_text`).
+        if not isinstance(self.scope, str) or self.scope not in _SCOPE_LABELS:
+            raise ScanError(_MSG_INVALID_SCOPE)
+
+    @property
+    def ignored_count(self) -> int:
+        """Nombre de findings ignorés par l'allowlist déterministe (#24)."""
+        return len(self.traces)
 
 
-def collect(root: Path, *, staged: bool) -> ScanReport:
-    """Analyse ``root`` et rend ses Findings.
+def collect(
+    root: Path,
+    *,
+    staged: bool,
+    config: str | Path | None = None,
+    allowlist: Allowlist | None = None,
+    ci: bool = False,
+) -> ScanReport:
+    """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
     Lève ``ScanError`` (ou ``ToolFailure``) si le périmètre n'a pas pu être
     analysé **en entier** : l'appelant transforme cela en code 2, jamais en
     code 0.
+
+    **Auto-attestation (CWE-345)** : si ``allowlist`` est fourni (API), la
+    garde anti auto-attestation est contournée. Le seul usage légitime dans
+    les chemins CLI/hook est ``Allowlist.empty()`` via ``--no-allowlist``.
+    Pour tout autre ``Allowlist`` injecté, **l'appelant assume** que celui-ci
+    ne provient pas du dépôt scanné et ne doit pas permettre l'auto-attestation
+    de ``heimdall.toml`` interne. En cas de doute, ne pas injecter
+    d'allowlist non-vide ou utiliser ``config`` externe / ``--no-allowlist``.
     """
     if staged:
-        return _collect_staged(root)
-    return _collect_tree(root)
+        return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
+    return _collect_tree(root, config=config, custom_allowlist=allowlist, ci=ci)
 
 
 def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
@@ -143,9 +199,10 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
     `access` fige la racine résolue ET son identité à l'entrée ; une
     reconstruction fraîche refait la garde unique (refus symlink compris).
     Toute différence — chemin résolu différent, identité (`st_dev`,
-    `st_ino`) différente — refuse le verdict : un dossier remplacé par un
-    autre au même chemin a le même résolu mais pas la même identité. Pur
-    `lstat`/`stat`, aucun `git`.
+    `st_ino`, `st_ctime_ns`) différente — refuse le verdict : un dossier
+    remplacé par un autre au même chemin a le même résolu mais pas la même
+    identité, même quand le système lui recycle l'inode. Pur `lstat`/`stat`,
+    aucun `git`.
     """
     try:
         current = GitAccess(root)
@@ -155,41 +212,316 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
         raise ScanError(_MSG_ROOT_CHANGED)
 
 
-def _collect_tree(root: Path) -> ScanReport:
-    """Scanne l'arbre de travail, en mode strict (#29).
+def _read_worktree_file(path: Path) -> bytes | None:
+    """Lit un fichier du worktree via la garde unique, sans suivre de lien.
 
-    Le mode ``strict=True`` écarte seulement la **base VCS** (métadonnées,
-    pas du contenu audité) : ``vendor/``, ``node_modules/``, les lockfiles et
-    les fichiers de contrôle sont parcourus et leur contenu décide. Un secret
-    y est un secret.
+    Retourne ``None`` au moindre doute : chemin non résoluble, lien
+    symbolique, non-régulier, trop gros ou lecture incomplète. La taille est
+    bornée par :data:`MAX_CONFIG_BYTES` (ce helper ne sert qu'à la config).
+    """
+    try:
+        resolved = _resolve_root(path)
+        # O_NONBLOCK évite qu'un FIFO placé à la place du fichier ne bloque
+        # l'ouverture ; le fstat ci-dessous refuse ensuite tout non-régulier.
+        descriptor = os.open(resolved, _open_flags() | getattr(os, "O_NONBLOCK", 0))
+    except (ScanError, OSError):
+        return None
+    # Le `try` interne calcule le résultat, le `finally` ferme toujours le
+    # descripteur, et le `except` externe convertit toute `OSError` (lecture
+    # comme `os.close` en échec — EBADF/EINTR sur FS adverse) en `None`
+    # fail-closed : jamais d'`OSError` brute vers l'appelant.
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_CONFIG_BYTES:
+                return None
+            expected = metadata.st_size
+            chunks: list[bytes] = []
+            remaining = expected + 1  # un octet de plus détecte une croissance
+            while remaining > 0:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            content = b"".join(chunks)
+            # Un fichier qui a rétréci ou grossi pendant la lecture est refusé.
+            if len(content) != expected:
+                return None
+            return content
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return None
 
-    Le verdict « propre » exige un rapport **complet** : un binaire, un lien
-    symbolique ou un fichier illisible rend le scan incomplet et la CLI sort
-    en 2 (``scan_complet``), jamais en 0. Le périmètre contractuel est la
-    **racine d'un dépôt git** : hors dépôt (répertoire quelconque, fichier
-    isolé), pas de verdict « propre » mais une erreur — une CI mal configurée
-    (mauvais chemin) doit échouer loud, pas rendre 0 en silence. Le scan de
-    fichier isolé reste possible en bibliothèque (`Scanner`, #22), hors
-    contrat hook/CI.
+
+def _is_worktree_file_clean_and_tracked(
+    access: GitAccess,
+    rel_path: str,
+    *,
+    timeout: float,
+) -> bytes | None:
+    """Vérifie que le fichier du worktree est suivi dans l'index et non modifié (CWE-345).
+
+    Retourne le contenu vérifié (``bytes``) si et seulement si :
+    1. Le fichier existe, est un fichier ordinaire et est lisible dans l'arbre
+       de travail (ouverture `O_NOFOLLOW` via la garde unique) ;
+    2. Le fichier est présent dans l'index Git au stage 0, en mode fichier
+       ordinaire (git plumbing `ls-files -s`, donc index v2/v3/v4, worktrees
+       et sous-modules couverts sans parseur DIRC maison) ;
+    3. L'empreinte de blob Git du contenu du worktree correspond exactement à
+       l'index (SHA-1 ou SHA-256).
+
+    Le contenu est rendu pour que l'appelant parse exactement les octets
+    vérifiés, sans relire le fichier (fenêtre TOCTOU éliminée). En cas de
+    doute (erreur I/O, index symlinké, format non reconnu, dirty/untracked,
+    sous-module), retourne ``None`` : l'appelant refuse le scan. Chaque
+    cause de refus est journalisée en debug avec un libellé statique
+    (distinguer un `None` légitime d'une panne, sans rien refléter).
+    """
+    content = _read_worktree_file(access.root / rel_path)
+    if content is None:
+        logger.debug("refus anti auto-attestation : lecture worktree impossible (CWE-345)")
+        return None
+    try:
+        entry = access.index_entry(rel_path, timeout=timeout)
+    except ToolFailure:
+        # Index illisible (symlinké, git en échec) : panne d'outillage,
+        # fail-closed comme un untracked, mais journalisée distinctement.
+        logger.debug("refus anti auto-attestation : lecture index impossible (CWE-345)")
+        return None
+    except Exception:
+        logger.debug("refus anti auto-attestation : entrée index inattendue (CWE-345)")
+        return None
+    if entry is None:
+        logger.debug("refus anti auto-attestation : configuration non suivie (CWE-345)")
+        return None
+    verified: bytes | None
+    try:
+        _, index_sha = entry
+        blob_sha1 = hashlib.sha1(
+            f"blob {len(content)}\0".encode("ascii") + content,
+            usedforsecurity=False,
+        ).hexdigest()
+        blob_sha256 = hashlib.sha256(
+            f"blob {len(content)}\0".encode("ascii") + content
+        ).hexdigest()
+        verified = content if index_sha in (blob_sha1, blob_sha256) else None
+        if verified is None:
+            logger.debug("refus anti auto-attestation : configuration divergente (CWE-345)")
+    except Exception:
+        logger.debug("refus anti auto-attestation : empreinte incalculable (CWE-345)")
+        verified = None
+    return verified
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedConfig:
+    """Contenu de configuration vérifié contre l'index (CWE-345)."""
+
+    path: str
+    content: bytes
+
+
+def _default_config_present(root: Path) -> bool:
+    """Vrai si `heimdall.toml` existe à la racine du dépôt.
+
+    `exists()` lève `OSError` sur un répertoire illisible (panne
+    d'outillage) : c'est un `ScanError` statique (code 2, invariant 11),
+    pas une absence silencieuse — comme `load_allowlist` le fait déjà.
+    """
+    try:
+        return (root / "heimdall.toml").exists()
+    except OSError:
+        raise ScanError(_MSG_NOT_A_REPO) from None
+
+
+def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
+    access: GitAccess,
+    *,
+    ci: bool,
+    config: str | Path | None,
+    custom_allowlist: Allowlist | None,
+    staged_changes: Sequence[object],
+    timeout: float,
+    is_staged_scan: bool = False,
+) -> _VerifiedConfig | None:
+    """Protection anti auto-attestation (CWE-345).
+
+    1. En mode CI, la configuration du dépôt scanné ne peut JAMAIS s'auto-attester :
+       - si --config est passé, il DOIT être situé hors du dépôt scanné.
+       - si aucun --config n'est passé et que heimdall.toml existe dans le dépôt,
+         refuser en code 2 (exiger --config externe ou --no-allowlist).
+    2. En mode hors CI :
+       - si la configuration (heimdall.toml ou --config interne) est modifiée/ajoutée
+         dans l'index (staged_changes), refuser en code 2.
+       - en mode --staged, si la configuration du worktree est modifiée (dirty) ou
+         non suivie (untracked) par rapport à l'index, refuser en code 2 (fail-closed).
+         Le contenu vérifié est rendu pour être parsé sans relecture.
+       - en mode arbre local, la propreté du worktree n'est PAS vérifiée
+         (seule une configuration stagée est refusée) : ce périmètre est
+         indicatif, seuls --ci et --staged sont opposables.
+    3. Un `--config` explicite peut vivre hors du dépôt scanné, y compris hors
+       CI : c'est un choix opérateur (disponibilité), équivalent au cas CI.
+       La garde unique `_resolve_root` + `O_NOFOLLOW`, le plafond de taille et
+       le contrat fermé s'appliquent dans les deux cas ; le contenu ne peut
+       pas rendre l'allowlist aveugle (motifs universels refusés).
+
+    Remarque (CWE-345) : si `custom_allowlist` est injecté (API), cette garde
+    est **contournée par conception**. Le chemin CLI ne l'utilise qu'avec
+    `Allowlist.empty()` via `--no-allowlist`. Tout autre injecteur assume la
+    provenance hors dépôt et la responsabilité de l'absence d'auto-attestation.
+    """
+    if custom_allowlist is not None:
+        return None
+
+    root = access.root
+    rel_cfg: str | None = None
+    if config is not None:
+        # `Path()` lève `ValueError` sur un octet NUL : fail-closed en
+        # `ScanError` statique (contrat unique, invariant 11), comme
+        # `_resolve_root` ci-dessous. Le texte est volontairement le message
+        # générique (aucune entrée reflétée, invariant 8).
+        try:
+            cfg_path = Path(config)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            raise ScanError(_MSG_NOT_A_REPO) from None
+        if not cfg_path.is_absolute():
+            cfg_path = root / cfg_path
+        resolved_cfg = _resolve_root(cfg_path)
+        if resolved_cfg.is_relative_to(root):
+            rel_cfg = resolved_cfg.relative_to(root).as_posix()
+    elif _default_config_present(root):
+        rel_cfg = "heimdall.toml"
+
+    if ci:
+        if rel_cfg is not None:
+            if config is None:
+                raise ScanError(
+                    "auto-attestation refusée : en mode --ci, l'allowlist du dépôt exige "
+                    "--config externe ou --no-allowlist (CWE-345)"
+                )
+            raise ScanError(
+                "auto-attestation refusée : en mode --ci, la configuration ne peut pas "
+                "provenir du dépôt scanné (CWE-345)"
+            )
+        return None
+
+    if rel_cfg is not None:
+        # Comparaison stricte sur le chemin normalisé : un `subdir/heimdall.toml`
+        # stagé n'est PAS la config chargée (`rel_cfg == "heimdall.toml"`) et ne
+        # doit pas bloquer le scan (disponibilité). Idem pour `--config`
+        # interne (`subdir/custom.toml` vs `other/subdir/custom.toml`).
+        # Les deux côtés sont déjà normalisés (relatif au dépôt, `/`).
+        is_cfg_staged = any(
+            getattr(change, "path", None) == rel_cfg for change in staged_changes
+        )
+        if is_cfg_staged:
+            # Message strictement statique : `rel_cfg` (entrée opérateur
+            # normalisée) n'est jamais reflété (invariant 8). En CLI le
+            # libellé est de toute façon masqué par le message générique.
+            raise ScanError(
+                "auto-attestation refusée : configuration stagée (CWE-345)"
+            )
+        if is_staged_scan:
+            content = _is_worktree_file_clean_and_tracked(
+                access,
+                rel_cfg,
+                timeout=timeout,
+            )
+            if content is None:
+                raise ScanError(
+                    "auto-attestation refusée : configuration du worktree non propre "
+                    "ou non suivie en mode --staged (CWE-345)"
+                )
+            return _VerifiedConfig(path=rel_cfg, content=content)
+    return None
+
+
+def _load_allowlist_verified(
+    access: GitAccess,
+    verified: _VerifiedConfig,
+) -> Allowlist:
+    """Parse le contenu déjà vérifié, puis re-contrôle le fichier (CWE-345).
+
+    Le parseur ne relit jamais la configuration : il consomme les octets
+    validés contre l'index par la garde. Un second contrôle détecte une
+    substitution concurrente entre la garde et le parsing et refuse en code 2.
+    """
+    allowlist = parse_allowlist_bytes(verified.content)
+    current = _read_worktree_file(access.root / verified.path)
+    if current is None or current != verified.content:
+        # Message strictement statique : `verified.path` (entrée opérateur)
+        # n'est jamais reflété (invariant 8), comme pour la garde ci-dessus.
+        raise ScanError(
+            "auto-attestation refusée : configuration modifiée pendant "
+            "le chargement (CWE-345)"
+        )
+    return allowlist
+
+
+def _collect_tree(
+    root: Path,
+    *,
+    config: str | Path | None = None,
+    custom_allowlist: Allowlist | None = None,
+    ci: bool = False,
+) -> ScanReport:
+    """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
+
+    ``strict=True`` ne conserve que les exclusions **techniques** de #59
+    (binaires, répertoires générés) : ``vendor/``, les lockfiles et les
+    fichiers de contrôle sont parcourus. Un secret y est un secret.
+
+    L'allowlist déterministe (#24) écarte les cas évidents (example,
+    changeme, dummy, fixtures de test) et produit une trace pour chaque rejet.
+
+    Le périmètre contractuel est la **racine d'un dépôt git** : hors dépôt
+    (répertoire quelconque, fichier isolé), pas de verdict « propre » mais
+    une erreur — une CI mal configurée (mauvais chemin) doit échouer loud,
+    pas rendre 0 en silence. Le scan de fichier isolé reste possible en
+    bibliothèque (`Scanner`, #22), hors contrat hook/CI.
     """
     deadline = time.monotonic() + MAX_TREE_SECONDS
     access = GitAccess(root)
     if not access.is_repository(timeout=_call_timeout(deadline)):
         raise ScanError(_MSG_NOT_A_REPO)
-    # `access.root` est la forme **figée** (résolue, symlink refusé) : le
-    # scanner ne re-résout pas l'entrée brute, donc une seule résolution et
-    # une seule course possible, alignée sur l'identité épinglée par
-    # `GitAccess`. La deadline est vérifiée dans la boucle du scanner.
-    # Le hasher est construit **avant** l'analyse : la CLI vérifie ainsi
-    # qu'elle peut produire les empreintes HMAC avant d'annoncer un verdict.
-    # Une clé indisponible est une erreur d'outillage (2), même sur un dépôt
-    # sans candidat — un `0` ne doit pas dépendre d'un stockage non testé.
-    findings = TreeScanner(access.root, strict=True, hasher=SnippetHasher()).scan_complet(
-        deadline=deadline
+
+    staged_changes = access.staged_changes(timeout=_call_timeout(deadline))
+    verified = _guard_anti_self_attestation(
+        access,
+        ci=ci,
+        config=config,
+        custom_allowlist=custom_allowlist,
+        staged_changes=staged_changes,
+        timeout=_call_timeout(deadline),
+        is_staged_scan=False,
     )
+
+    allowlist = (
+        custom_allowlist
+        if custom_allowlist is not None
+        else (
+            _load_allowlist_verified(access, verified)
+            if verified is not None
+            else load_allowlist(
+                access.root,
+                config_file=config,
+                allow_external=ci or config is not None,
+            )
+        )
+    )
+    scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
+    findings = scanner.scan(deadline=deadline)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
-    return ScanReport(scope=SCOPE_TREE, findings=tuple(findings))
+    traces = scanner.traces
+    return ScanReport(
+        scope=SCOPE_TREE,
+        findings=tuple(findings),
+        traces=tuple(traces),
+        config_hash=allowlist.sha256,
+    )
 
 
 def _call_timeout(deadline: float) -> float:
@@ -206,8 +538,14 @@ def _call_timeout(deadline: float) -> float:
     return min(remaining, GIT_TIMEOUT_SECONDS)
 
 
-def _collect_staged(root: Path) -> ScanReport:
-    """Scanne les blobs **ajoutés ou modifiés** de l'index git.
+def _collect_staged(
+    root: Path,
+    *,
+    config: str | Path | None = None,
+    custom_allowlist: Allowlist | None = None,
+    ci: bool = False,
+) -> ScanReport:
+    """Scanne les blobs **ajoutés ou modifiés** de l'index git avec allowlist (#24).
 
     Aucune exclusion de chemin : c'est le contenu que le commit va contenir
     qui est jugé, quel que soit son chemin (``vendor/evil.py``,
@@ -230,12 +568,38 @@ def _collect_staged(root: Path) -> ScanReport:
     changes = access.staged_changes(timeout=_call_timeout(deadline))
     if len(changes) > MAX_STAGED_FILES:
         raise ScanError(_MSG_TOO_MANY_FILES)
-    moteur = TargetScanner(
-        SignatureEngine(
-            SnippetHasher(),
-            max_findings=MAX_STAGED_FINDINGS,
+
+    verified = _guard_anti_self_attestation(
+        access,
+        ci=ci,
+        config=config,
+        custom_allowlist=custom_allowlist,
+        staged_changes=changes,
+        timeout=_call_timeout(deadline),
+        is_staged_scan=True,
+    )
+
+    allowlist = (
+        custom_allowlist
+        if custom_allowlist is not None
+        else (
+            _load_allowlist_verified(access, verified)
+            if verified is not None
+            else load_allowlist(
+                access.root,
+                config_file=config,
+                allow_external=ci or config is not None,
+            )
         )
     )
+    # Même échéance que la passe : un blob dense est interrompu à l'intérieur,
+    # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).
+    engine = SignatureEngine(
+        max_findings=MAX_STAGED_FINDINGS,
+        deadline=deadline,
+        allowlist=allowlist,
+    )
+    moteur = TargetScanner(engine)
     findings: list[Finding] = []
     total = 0
     for change in changes:
@@ -293,27 +657,40 @@ def _collect_staged(root: Path) -> ScanReport:
             finding.snippet_hash,
         )
     )
-    if access.staged_changes(timeout=_call_timeout(deadline)) != changes:
+    if set(access.staged_changes(timeout=_call_timeout(deadline))) != set(changes):
         # L'index a bougé pendant le scan : le snapshot analysé ne décrit
-        # plus ce qui sera committé. Refus, pas de verdict périmé.
+        # plus ce qui sera committé. Refus, pas de verdict périmé. La
+        # comparaison est **insensible à l'ordre** : `diff --cached --raw`
+        # n'offre pas d'ordre contractuel, et une permutation à contenu
+        # identique ne doit pas faire échouer un scan sain.
         raise ScanError(_MSG_INDEX_CHANGED)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
-    return ScanReport(scope=SCOPE_STAGED, findings=tuple(findings))
+    traces = engine.traces
+    return ScanReport(
+        scope=SCOPE_STAGED,
+        findings=tuple(findings),
+        traces=tuple(traces),
+        config_hash=allowlist.sha256,
+    )
 
 
 def render_json(report: ScanReport) -> str:
     """Rend le rapport au format JSON (contrat machine ``--json``).
 
     Le document contient le périmètre, le nombre de Findings et les Findings
-    eux-mêmes (les sept champs du contrat #14). Aucun secret : un Finding ne
-    porte qu'une empreinte et une entropie.
+    eux-mêmes (les sept champs du contrat #14), ainsi que le nombre de
+    findings ignorés et les traces de chaque rejet par l'allowlist (#24).
+    Aucun secret n'est inclus.
     """
     payload = {
         "schema": JSON_SCHEMA,
         "scope": report.scope,
         "count": len(report.findings),
         "findings": [finding.as_dict() for finding in report.findings],
+        "ignored_count": report.ignored_count,
+        "traces": [trace.as_dict() for trace in report.traces],
+        "config_hash": report.config_hash,
     }
     return json.dumps(
         payload,
@@ -324,13 +701,32 @@ def render_json(report: ScanReport) -> str:
     )
 
 
+def _visible(chemin: str) -> str:
+    """Chemin tel qu'il s'affiche : caractères invisibles ou directionnels échappés.
+
+    Un nom de fichier peut porter U+202E (RLO), qui inverse l'ordre visuel de
+    ce qui suit : affiché brut, le nom ment sur le fichier où se trouve le
+    secret, au moment même où l'opérateur valide (Y/N/E). Le contrat Finding v1
+    autorise ces caractères (son schéma ne les exclut pas) : le chemin n'est donc
+    pas refusé, il est échappé **à l'affichage seulement**. Le JSON garde le
+    chemin exact.
+    """
+    return "".join(
+        caractere.encode("unicode_escape").decode("ascii")
+        if unicodedata.category(caractere) in _ESCAPED_CATEGORIES
+        else caractere
+        for caractere in chemin
+    )
+
+
 def render_text(report: ScanReport) -> str:
     """Rend le rapport pour un humain.
 
     Jamais la valeur d'un secret : ni le contenu analysé, ni un extrait de
     ligne — seulement le chemin, le numéro de ligne, le type, l'entropie et
     un début d'empreinte (qui permet de rapprocher deux scans du même
-    candidat sans le révéler).
+    candidat sans le révéler). Le chemin est affiché échappé (:func:`_visible`).
+    Affiche toujours le nombre de findings ignorés par l'allowlist (#24).
     """
     lines = [f"heimdall scan : périmètre {_SCOPE_LABELS[report.scope]}"]
     if not report.findings:
@@ -339,11 +735,17 @@ def render_text(report: ScanReport) -> str:
         lines.append(f"{len(report.findings)} secret(s) détecté(s) :")
         for finding in report.findings:
             lines.append(
-                f"  {finding.file}:{finding.line}  type={finding.type}  "
+                f"  {_visible(finding.file)}:{finding.line}  type={finding.type}  "
                 f"entropie={finding.entropy}  "
                 f"empreinte={finding.snippet_hash[:_HASH_PREFIX]}…  "
                 f"source={finding.source}"
             )
+    if not report.traces:
+        lines.append("Allowlist : 0 finding(s) ignoré(s).")
+    else:
+        lines.append(f"Allowlist : {report.ignored_count} finding(s) ignoré(s) :")
+        for trace in report.traces:
+            lines.append(f"  {_visible(trace.file)}:{trace.line}  règle={trace.rule}")
     lines.append(_CODES_LINE)
     return "\n".join(lines)
 
@@ -361,6 +763,7 @@ __all__ = [
     "SCOPE_STAGED",
     "SCOPE_TREE",
     "ScanReport",
+    "Scope",
     "ToolFailure",
     "collect",
     "render_json",

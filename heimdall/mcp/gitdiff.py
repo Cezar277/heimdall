@@ -8,8 +8,9 @@ verrouillé :
 - **environnement reconstruit de zéro**. ``GIT_DIR``, ``GIT_INDEX_FILE``,
   ``GIT_WORK_TREE``… hérités permettraient de rediriger le dépôt analysé
   sans toucher au code ; ils sont simplement absents de l'environnement
-  passé au sous-processus. Idem ``HOME`` et les configurations
-  système/global ;
+  passé au sous-processus. Idem les configurations système/global ;
+  ``HOME`` pointe vers ``os.devnull``, jamais vers la racine ni vers le ~
+  du développeur ;
 - **découverte plafonnée à la racine**. ``GIT_CEILING_DIRECTORIES`` vaut le
   parent de la racine : git n'y entre jamais, donc aucun dépôt au-dessus de
   la racine n'est découvert — le refus vient de git, pas seulement de
@@ -49,8 +50,10 @@ varie), environnement confiné, stdin fermé, aucun fetch.
 import os
 import re
 import shutil
+import stat
 import subprocess  # nosec B404
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,9 +61,10 @@ from typing import Final
 
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.paths import is_rel_path
-from heimdall.scanner.detect import MAX_FILE_BYTES, _resolve_root
+from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import validate_relative_path
+from heimdall.scanner.interface import _open_flags, _resolve_root
 
 # Options NON négociables (contrat 4.1) — voir le tableau du contrat pour la
 # justification de chacune. `-C` place git dans la racine sans dépendre du
@@ -111,16 +115,29 @@ STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
     "--no-textconv",
 )
 
+#: Modes d'index d'un fichier **ordinaire** suivi : les seuls pour lesquels une
+#: comparaison blob worktree/index a un sens pour la garde CWE-345. Un lien
+#: symbolique (120000) ou un gitlink (160000) n'est pas un fichier de config
+#: lisible : refus fail-closed côté appelant.
+_REGULAR_FILE_MODES: Final[frozenset[str]] = frozenset({"100644", "100755"})
+
+#: Champs de l'en-tête ``git ls-files -s`` : ``mode sha stage``.
+_LS_FILES_HEADER_FIELDS: Final[int] = 3
+
 
 # Environnement minimal du sous-processus git. Aucune variable de
 # redirection de dépôt (GIT_DIR, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY…),
 # aucune variable de configuration (GIT_CONFIG_*), aucun PATH : git est
 # appelé par chemin absolu, donc rien ne peut être trouvé par recherche de
 # binaire, et GIT_TERMINAL_PROMPT coupe toute invite interactive.
-def confined_environment(root: Path) -> dict[str, str]:
+def confined_environment(ceiling: str) -> dict[str, str]:
     return {
         "PATH": "",
-        "HOME": str(root),  # jamais le ~ du développeur (git y lit .gitconfig)
+        # Ni le ~ du développeur, ni la racine scannée : git y lit
+        # `~/.config/git/ignore` et `attributes`, donc le dépôt pouvait se
+        # masquer lui-même via son propre `.config/git/`. `os.devnull` n'est
+        # pas un répertoire : git n'y trouve rien, et n'y peut rien écrire.
+        "HOME": os.devnull,
         "LC_ALL": "C",  # messages et chemins stables, indépendants de la locale
         "LANG": "C",
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -135,6 +152,9 @@ def confined_environment(root: Path) -> dict[str, str]:
         # Plafond de découverte = le PREMIER dossier que git ascendererait,
         # c'est-à-dire le PARENT de la racine : git refuse d'y entrer, donc
         # aucun dépôt au-dessus de la racine n'est découvert (invariant 3).
+        # Il est calculé UNE fois, à la construction de `GitAccess` : un
+        # `resolve()` à chaque appel suivrait un lien posé entre-temps à la
+        # place de la racine et élargirait le plafond vers la cible adverse.
         #
         # Ne pas « corriger » en mettant la racine elle-même : git n'exclut
         # que l'entrée dans un dossier plafond, et il est DÉJÀ dans la
@@ -152,7 +172,7 @@ def confined_environment(root: Path) -> dict[str, str]:
         #
         # Prouvé aussi qu'un worktree lié répond sa propre racine (le `.git`
         # y est un fichier), donc un dépôt à la racine reste découvert.
-        "GIT_CEILING_DIRECTORIES": str(root.resolve().parent),
+        "GIT_CEILING_DIRECTORIES": ceiling,
     }
 
 
@@ -210,16 +230,27 @@ _UNMERGED_PATH: Final[str] = "* Unmerged path "
 _BINARY_UNAMBIGUOUS_PARTS: Final[int] = 2
 
 
-def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
-    """Interrompt un sous-processus et attend sa fin sans bloquer ni lever."""
+def _terminate_process(
+    proc: subprocess.Popen[bytes],
+    *,
+    timeout: float = 0.5,
+) -> None:
+    """Interrompt un sous-processus et attend sa fin sans bloquer au-delà d'un délai."""
     try:
         proc.kill()
     except OSError:
         pass
     try:
-        proc.wait()
+        proc.wait(timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
-        pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=0.1)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
 
 @dataclass(frozen=True)
@@ -247,7 +278,7 @@ class GitAccess:
     usages (`-C`, plafond, comparaisons) partent de cette forme.
     """
 
-    __slots__ = ("_git", "_root", "_root_id")
+    __slots__ = ("_ceiling", "_git", "_root", "_root_id")
 
     def __init__(self, root: Path) -> None:
         try:
@@ -260,18 +291,26 @@ class GitAccess:
             # pourrait refléter l'entrée, est remplacé par le statique.
             raise ToolFailure("INTERNAL") from None
         try:
-            # Identité du dossier (device + inode), suivie après refus des
-            # liens : un `lstat` aurait la même course que le `resolve`, mais
-            # `is_symlink` refuse un lien planté entre les deux, et tout
-            # remplacement (lien, autre dossier, suppression) change
-            # l'identité ou fait échouer le `stat` — le re-contrôle de fin
-            # de scan refuse alors le verdict (#29).
+            # Identité du dossier, suivie après refus des liens : un `lstat`
+            # aurait la même course que le `resolve`, mais `is_symlink` refuse
+            # un lien planté entre les deux, et tout remplacement (lien, autre
+            # dossier, suppression) change l'identité ou fait échouer le `stat`
+            # — le re-contrôle de fin de scan refuse alors le verdict (#29).
+            # Le ctime est indispensable : `rm -rf` puis `mkdir` peut
+            # réattribuer le même inode (ext4), mais le dossier neuf a un ctime
+            # postérieur, qu'`utime` ne peut pas forger (contrairement à mtime).
+            # Revers assumé (POSIX, où ctime = dernier changement de
+            # métadonnées) : ajouter ou supprimer une entrée directe de la
+            # racine pendant le scan refuse le verdict (code 2, fail-closed).
+            # Sous Windows, ctime = date de création : pas de revers.
             if self._root.is_symlink():
                 raise ToolFailure("INTERNAL")
             metadata = os.stat(self._root)
         except OSError:
             raise ToolFailure("INTERNAL") from None
-        self._root_id = (metadata.st_dev, metadata.st_ino)
+        self._root_id = (metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns)
+        # Plafond figé avec la racine (lexical, sans I/O) : voir `confined_environment`.
+        self._ceiling = str(self._root.parent)
         # Jamais le PATH hérité : un PATH compromis (poste, CI, direnv)
         # détournerait le binaire exécuté à chaque outil. `os.defpath`
         # (`/bin:/usr/bin` sur POSIX) est le défaut système sûr, pas une
@@ -282,7 +321,11 @@ class GitAccess:
             # Panne d'outillage : message statique, jamais de chemin ni de
             # contenu reflété (invariant 8).
             raise ToolFailure("INTERNAL")
-        resolved = Path(binary).resolve()
+        try:
+            resolved = Path(binary).resolve()
+            cwd = Path.cwd().resolve()
+        except (OSError, RuntimeError, ValueError):
+            raise ToolFailure("INTERNAL") from None
         # Jamais un binaire sous la racine ni sous le répertoire courant :
         # sur win32, `shutil.which` préfixe le répertoire courant d'office
         # (`path.insert(0, curdir)` dans la stdlib, même avec un `path`
@@ -294,7 +337,7 @@ class GitAccess:
         # Comparaison à la forme **figée** (`self._root`), jamais au
         # paramètre brut : une seule référence canonique, donc une seule
         # fenêtre TOCTOU et aucune divergence si la garde de racine évolue.
-        if resolved.is_relative_to(self._root) or resolved.parent == Path.cwd().resolve():
+        if resolved.is_relative_to(self._root) or resolved.parent == cwd:
             raise ToolFailure("INTERNAL")
         self._git = binary
 
@@ -304,8 +347,8 @@ class GitAccess:
         return self._root
 
     @property
-    def root_id(self) -> tuple[int, int]:
-        """Identité du dossier racine (`st_dev`, `st_ino`) à la construction."""
+    def root_id(self) -> tuple[int, int, int]:
+        """Identité du dossier racine (`st_dev`, `st_ino`, `st_ctime_ns`) à la construction."""
         return self._root_id
 
     def execute(
@@ -343,7 +386,7 @@ class GitAccess:
                 capture_output=True,
                 check=False,
                 timeout=timeout,
-                env=confined_environment(self._root),
+                env=confined_environment(self._ceiling),
             )
         except (OSError, subprocess.TimeoutExpired):
             # Panne d'outillage (binaire absent, délai dépassé) : message
@@ -355,14 +398,24 @@ class GitAccess:
 
         Un code de retour non nul (« not a git repository ») ou une racine
         qui pointe vers un dépôt parent n'est PAS une panne : c'est le diagnostic
-        attendu, traduit en ``NOT_A_GIT_REPO`` par l'appelant. ``timeout`` est
-        le délai restant transmis par une deadline globale.
+        attendu, traduit en ``NOT_A_GIT_REPO`` par l'appelant. Un chemin
+        ``top`` que ``resolve()`` ne sait pas résoudre (boucle de liens,
+        composant illisible) EST une panne : ``ToolFailure``, jamais une
+        exception brute hors contrat. ``timeout`` est le délai restant transmis
+        par une deadline globale.
         """
         completed = self.execute(("rev-parse", "--show-toplevel"), timeout=timeout)
         if completed.returncode != 0:
             return False
         top = completed.stdout.strip().decode("utf-8", errors="replace")
-        return Path(top).resolve() == self._root.resolve()
+        try:
+            # Comparé à la racine **figée** : une racine échangée depuis la
+            # construction ne peut pas redevenir « un dépôt » par resolve().
+            return Path(top).resolve() == self._root
+        except (OSError, RuntimeError, ValueError):
+            # Selon la version de Python, `resolve()` lève sur une boucle de
+            # liens (RuntimeError en 3.10) : ni « pas un dépôt », ni « dépôt ».
+            raise ToolFailure("INTERNAL") from None
 
     def is_ignored(self, relative_path: str) -> bool:
         """True si le chemin est ignoré par les .gitignore du dépôt.
@@ -379,6 +432,106 @@ class GitAccess:
         if completed.returncode == 1:
             return False
         raise ToolFailure("INTERNAL")
+
+    def _checked_index_path(self, *, timeout: float) -> Path:
+        """Chemin réel de l'index git, refusé s'il n'est pas un fichier ordinaire.
+
+        `git rev-parse --git-path index` couvre les dépôts standards, les
+        worktrees liés (`.git` est alors un fichier) et les sous-modules. Le
+        chemin est ensuite passé par la garde unique `_resolve_root` (refus de
+        tout lien symbolique sur le chemin) puis ouvert avec `O_NOFOLLOW` :
+        un index remplacé par un lien n'est jamais suivi en silence.
+        """
+        completed = self.execute(("rev-parse", "--git-path", "index"), timeout=timeout)
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        raw = completed.stdout[:-1] if completed.stdout.endswith(b"\n") else completed.stdout
+        if not raw or b"\x00" in raw or b"\n" in raw:
+            raise ToolFailure("INTERNAL")
+        try:
+            path = Path(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            raise ToolFailure("INTERNAL") from None
+        if not path.is_absolute():
+            path = self._root / path
+        try:
+            resolved = _resolve_root(path)
+            # O_NONBLOCK évite qu'un FIFO placé à la place de l'index ne
+            # bloque l'ouverture ; le fstat ci-dessous refuse tout non-régulier.
+            descriptor = os.open(resolved, _open_flags() | getattr(os, "O_NONBLOCK", 0))
+        except (ScanError, OSError):
+            raise ToolFailure("INTERNAL") from None
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ToolFailure("INTERNAL")
+        except OSError:
+            raise ToolFailure("INTERNAL") from None
+        finally:
+            # `os.close` peut lever `OSError` (EBADF/EINTR sur FS adverse) :
+            # convertir pour garder le contrat `ToolFailure("INTERNAL")`
+            # (invariant 11), comme `allowlist.py` et `scan.py` le font déjà.
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise ToolFailure("INTERNAL") from None
+        return resolved
+
+    def index_entry(
+        self,
+        relative_path: str,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> tuple[str, str] | None:
+        """Entrée d'index d'un fichier suivi, ou ``None`` s'il n'est pas suivi.
+
+        Rend ``(mode, sha)`` pour une entrée de stage 0 dont le mode est un
+        fichier ordinaire (``100644``/``100755``). Un chemin absent, un lien
+        symbolique, un gitlink (sous-module), un index en conflit ou une
+        sortie illisible sont refusés : ``None`` pour l'absence, sinon
+        ``ToolFailure``. Le format binaire DIRC n'est **jamais** reparsé ici :
+        c'est git qui répond, donc les index v2/v3/v4 et leurs extensions sont
+        couverts sans dette de maintenance.
+        """
+        try:
+            validate_relative_path(relative_path)
+        except ValueError:
+            raise ToolFailure("INTERNAL") from None
+        # Refus d'un index symlinké avant de laisser git le lire : `git
+        # ls-files` suivrait le lien sans le dire.
+        self._checked_index_path(timeout=timeout)
+        completed = self.execute(
+            ("ls-files", "-s", "-z", "--", relative_path),
+            timeout=timeout,
+        )
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        entries = [entry for entry in completed.stdout.split(b"\x00") if entry]
+        if not entries:
+            return None
+        if len(entries) != 1:
+            # Index non résolu (plusieurs stages) ou chemin ambigu.
+            raise ToolFailure("INTERNAL")
+        header, separator, path_bytes = entries[0].partition(b"\t")
+        if not separator:
+            raise ToolFailure("INTERNAL")
+        fields = header.split(b" ")
+        if len(fields) != _LS_FILES_HEADER_FIELDS:
+            raise ToolFailure("INTERNAL")
+        mode, sha, stage = fields
+        if stage != b"0":
+            raise ToolFailure("INTERNAL")
+        try:
+            mode_str = mode.decode("ascii")
+            sha_str = sha.decode("ascii")
+            path_str = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ToolFailure("INTERNAL") from None
+        if path_str != relative_path or _OBJECT_PATTERN.fullmatch(sha_str) is None:
+            raise ToolFailure("INTERNAL")
+        if mode_str not in _REGULAR_FILE_MODES:
+            return None
+        return mode_str, sha_str
 
     def staged_diff(self, max_bytes: int) -> tuple[bytes, bool]:
         """Sortie brute de ``git diff --cached``, lue en flux borné à ``max_bytes``.
@@ -407,7 +560,7 @@ class GitAccess:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env=confined_environment(self._root),
+                env=confined_environment(self._ceiling),
             )
         except OSError:
             raise ToolFailure("INTERNAL") from None
@@ -489,14 +642,18 @@ class GitAccess:
 
         ``timeout`` est le délai **restant** d'une éventuelle deadline
         globale : par défaut le timeout unitaire de :data:`GIT_TIMEOUT_SECONDS`.
+        Lecture **et** attente se partagent ce délai : le minuteur est annulé
+        avant `wait`, qui ne reçoit donc que le restant (sinon un git qui
+        ferme stdout tard puis traîne durerait jusqu'à 2 × ``timeout``).
         """
+        deadline = time.monotonic() + timeout
         try:
             proc = subprocess.Popen(  # noqa: S603 # nosec B603
                 [self._git, *GIT_CONFIG_OVERRIDES, "-C", str(self._root), *arguments],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env=confined_environment(self._root),
+                env=confined_environment(self._ceiling),
             )
         except OSError:
             raise ToolFailure("INTERNAL") from None
@@ -509,7 +666,7 @@ class GitAccess:
             if proc.stdout is not None:
                 raw = proc.stdout.read(max_bytes + 1)
         except OSError:
-            _terminate_process(proc)
+            _terminate_process(proc, timeout=max(0.1, deadline - time.monotonic()))
             raise ToolFailure("INTERNAL") from None
         finally:
             timer.cancel()
@@ -517,13 +674,13 @@ class GitAccess:
                 proc.stdout.close()
 
         if len(raw) > max_bytes:
-            _terminate_process(proc)
+            _terminate_process(proc, timeout=max(0.1, deadline - time.monotonic()))
             raise ToolFailure("INTERNAL")
 
         try:
-            ret = proc.wait(timeout=timeout)
+            ret = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         except (subprocess.TimeoutExpired, OSError):
-            _terminate_process(proc)
+            _terminate_process(proc, timeout=max(0.1, deadline - time.monotonic()))
             raise ToolFailure("INTERNAL") from None
 
         if ret != 0:

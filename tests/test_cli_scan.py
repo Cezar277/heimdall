@@ -14,11 +14,14 @@ d'exemple de la documentation AWS, jamais une clé fonctionnelle.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import typer
@@ -34,6 +37,7 @@ from heimdall.cli.scan import (
     EXIT_ERROR,
     EXIT_FINDINGS,
     JSON_SCHEMA,
+    ScanReport,
     _verify_root_unchanged,
 )
 from heimdall.mcp.errors import ToolFailure
@@ -87,7 +91,7 @@ def _retrieve_local(uri: str) -> Resource[object]:
     prefix = "https://github.com/Cezar277/heimdall/schemas/"
     if not uri.startswith(prefix):
         raise ValueError(f"schéma hors périmètre : {uri}")
-    name = uri[len(prefix) :]
+    name = uri[len(prefix):]
     if "/" in name or not name.endswith(".schema.json"):
         raise ValueError(f"schéma hors périmètre : {uri}")
     document = json.loads((REPO / "schemas" / name).read_text(encoding="utf-8"))
@@ -150,7 +154,6 @@ def _cles_denses(nombre: int) -> str:
     ligne = `nombre` Findings, sans l'artefact de la fenêtre multi-ligne.
     """
     return " ".join(f'"AKIA{chr(65 + (i % 26))}{i:015d}"' for i in range(nombre))
-
 
 #: Exemple de clé AWS (documentation AWS) : jamais une clé fonctionnelle.
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
@@ -301,6 +304,28 @@ def test_scan_tool_failure_uses_the_same_static_message(
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
+@pytest.mark.parametrize(
+    "bad_scope",
+    [
+        "invalide",
+        [],
+        {},
+        None,
+        42,
+    ],
+)
+def test_scan_report_refuses_an_unknown_scope(bad_scope: object) -> None:
+    """Revue (LOW) : le `Literal` est doublé d'une garde runtime.
+
+    Un appelant non typé ne doit pas fabriquer un rapport hors contrat qui
+    ferait un `KeyError` ou un `TypeError` (si non hashable comme liste/dict)
+    dans `_SCOPE_LABELS` : `ScanReport(scope=[], ...)` et `scope=None` lèvent
+    `ScanError`, jamais `TypeError` ni `KeyError`.
+    """
+    with pytest.raises(ScanError):
+        ScanReport(scope=bad_scope, findings=())  # type: ignore[arg-type]
+
+
 def test_scan_broken_stderr_still_exits_two(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -331,7 +356,9 @@ def test_scan_broken_stderr_still_exits_two(
     assert resultat.exit_code == EXIT_CLEAN
 
 
-def test_scan_tree_refuses_global_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_tree_refuses_global_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Revue (LOW) : l'arbre est aussi borné en temps, pas seulement en volume.
 
     Un dépôt adverse de petits fichiers ne doit pas faire durer la CI sans
@@ -344,7 +371,9 @@ def test_scan_tree_refuses_global_deadline(tmp_path: Path, monkeypatch: pytest.M
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
-def test_scan_tree_refuses_too_many_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_tree_refuses_too_many_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Revue #166 (LOW) : l'arbre est borné en **nombre de fichiers**.
 
     Un dépôt adverse avec des milliers de petits fichiers ne doit pas faire
@@ -357,7 +386,9 @@ def test_scan_tree_refuses_too_many_files(tmp_path: Path, monkeypatch: pytest.Mo
     assert "scan impossible" in resultat.stderr
 
 
-def test_scan_tree_refuses_too_many_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_tree_refuses_too_many_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Revue #166 (LOW) : l'arbre est borné en **volume total lu**.
 
     La borne par fichier (1 Mio) ne suffit pas : 50 000 fichiers feraient
@@ -381,12 +412,11 @@ def test_collect_tree_uses_the_pinned_root(
     seen: list[tuple[Path, bool]] = []
 
     class ScannerEspion:
-        def __init__(
-            self, root: Path, *, strict: bool, hasher: object | None = None
-        ) -> None:
+        def __init__(self, root: Path, *, strict: bool, **kwargs: object) -> None:
             seen.append((Path(root), strict))
+            self.traces: tuple[object, ...] = ()
 
-        def scan_complet(self, *, deadline: float | None = None) -> list[object]:
+        def scan(self, *, deadline: float | None = None) -> list[object]:
             assert deadline is not None
             return []
 
@@ -397,9 +427,28 @@ def test_collect_tree_uses_the_pinned_root(
     assert seen == [(git_repo.root.resolve(), True)]
 
 
+def test_tree_scanner_resolves_the_same_root_from_raw_or_pinned(
+    git_repo: GitRepo,
+) -> None:
+    """Revue (LOW) : `access.root` et l'entrée brute convergent.
+
+    La seconde résolution est idempotente ; une substitution entre les deux
+    est couverte par le re-contrôle d'identité final.
+    """
+    access = GitAccess(git_repo.root)
+    raw = git_repo.root / ".." / git_repo.root.name
+    assert (
+        TreeScanner(access.root, strict=True)._root
+        == TreeScanner(raw, strict=True)._root
+        == git_repo.root.resolve()
+    )
+
+
 @pytest.mark.parametrize("borne", ["max_files", "max_bytes", "max_findings"])
 @pytest.mark.parametrize("valeur", [0, -1, 10**12])
-def test_scanner_refuses_invalid_explicit_bounds(tmp_path: Path, borne: str, valeur: int) -> None:
+def test_scanner_refuses_invalid_explicit_bounds(
+    tmp_path: Path, borne: str, valeur: int
+) -> None:
     """Revue (LOW) : une surcharge explicite ne relève pas les bornes.
 
     ``None`` retombe sur le défaut ; zéro, négatif ou entier géant sont
@@ -410,7 +459,7 @@ def test_scanner_refuses_invalid_explicit_bounds(tmp_path: Path, borne: str, val
         TreeScanner(racine, **{borne: valeur})
 
 
-# --- mode strict : le contenu décide, seule la base VCS est écartée --------
+# --- mode strict : les exclusions de contenu texte tombent -----------------
 
 
 def test_scan_tree_scans_vendor_and_lockfiles(tmp_path: Path) -> None:
@@ -428,17 +477,11 @@ def test_scan_tree_scans_vendor_and_lockfiles(tmp_path: Path) -> None:
     assert "package-lock.json:1" in resultat.stdout
 
 
-def test_scan_tree_scans_node_modules_by_content(tmp_path: Path) -> None:
-    """Aucun nom de répertoire de contenu n'exclut un secret.
-
-    `node_modules/` est un arbre tiers, pas une métadonnée : en mode strict de
-    la CLI il est parcouru, comme `vendor/` et les lockfiles. Seule la base VCS
-    est hors du contenu audité.
-    """
+def test_scan_tree_keeps_technical_exclusions(tmp_path: Path) -> None:
+    """Les exclusions **techniques** restent (binaire, répertoire généré)."""
     racine = _arbre(tmp_path, {"node_modules/pkg/evil.js": f'"{FAKE_AWS_KEY}"\n'})
     resultat = _run("scan", str(racine))
-    assert resultat.exit_code == EXIT_FINDINGS
-    assert "node_modules/pkg/evil.js:1" in resultat.stdout
+    assert resultat.exit_code == EXIT_CLEAN
 
 
 def test_scan_tree_strict_scans_build_outputs(tmp_path: Path) -> None:
@@ -486,19 +529,16 @@ def test_scan_tree_strict_scans_text_with_binary_suffix(git_repo: GitRepo) -> No
     assert FAKE_AWS_KEY not in resultat.output
 
 
-def test_scan_tree_strict_refuses_a_clean_verdict_on_real_binary(
-    git_repo: GitRepo,
-) -> None:
-    """Un binaire non lu rend le rapport incomplet : refus 2, jamais un faux 0.
+def test_scan_tree_strict_still_skips_real_binary_suffix(git_repo: GitRepo) -> None:
+    """Revue (LOW) : un vrai binaire garde l'exclusion technique par suffixe.
 
-    Le scanner reconnaît le PNG réel (magie + majorité binaire) et le trace,
-    mais un contenu non analysé interdit un verdict « propre » : la CLI stricte
-    sort en erreur d'outillage.
+    Le contenu est lu d'abord, mais un PNG réel (magie + majorité binaire)
+    reste écarté sans faire échouer le scan ; le suffixe sert de repli si le
+    décodeur ne peut pas trancher.
     """
     git_repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 512)
     resultat = _run("scan", str(git_repo.root))
-    assert resultat.exit_code == EXIT_ERROR
-    assert SCAN_ERROR_MESSAGE in resultat.stderr
+    assert resultat.exit_code == EXIT_CLEAN
 
 
 def test_scan_tree_strict_refuses_unknown_binary_suffix(git_repo: GitRepo) -> None:
@@ -564,6 +604,27 @@ def test_scan_staged_accepts_a_long_path(git_repo: GitRepo) -> None:
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_FINDINGS
     assert f"{chemin}:1" in resultat.stdout
+
+
+@pytest.mark.skipif(os.name != "posix", reason="noms non-UTF8 POSIX")
+def test_scan_refuses_non_utf8_paths_in_both_scopes(git_repo: GitRepo) -> None:
+    """Revue (LOW) : un nom non-UTF8 refuse le scan, en arbre comme en index.
+
+    En arbre, `os.walk` rend des surrogates ; la garde unique
+    `validate_relative_path` les refuse désormais explicitement. En index,
+    le décodage UTF-8 strict de `git diff --raw -z` fait déjà échouer le
+    parseur. Les deux périmètres sortent en 2, jamais 0/1 partiel.
+    """
+    raw = os.fsencode(git_repo.root) + b"/bad-\xff.py"
+    descriptor = os.open(raw, os.O_CREAT | os.O_WRONLY, 0o600)
+    os.close(descriptor)
+    resultat = _run("scan", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+    git_repo.git("add", "-A")
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
 
 def test_scan_staged_with_a_sha256_repository() -> None:
@@ -683,7 +744,9 @@ def test_scan_staged_caps_blob_bytes_before_buffering(
     git_repo.write("gros.txt", "A" * (MAX_FILE_BYTES + 1))
     git_repo.stage("gros.txt")
 
-    def taille_mensongere(self: GitAccess, blob: str, **_options: object) -> int:
+    def taille_mensongere(
+        self: GitAccess, blob: str, **_options: object
+    ) -> int:
         return 1
 
     monkeypatch.setattr(GitAccess, "blob_size", taille_mensongere)
@@ -745,19 +808,56 @@ def test_scan_staged_gitlink_does_not_hide_other_secrets(git_repo: GitRepo) -> N
     assert FAKE_AWS_KEY not in resultat.output
 
 
-def test_scan_staged_polyglot_binary_header_is_scanned(git_repo: GitRepo) -> None:
-    """Revue #166 : en-tête binaire + texte clair (sans NUL) -> **scanné**.
-
-    ``decode_text`` ne saute un blob que sur signature binaire **et**
-    contenu majoritairement binaire : un faux PNG qui porte un secret en
-    clair est analysé, pas ignoré en silence.
-    """
-    git_repo.write_bytes("faux.png", b"\x89PNG\r\n\x1a\n" + f'AWS = "{FAKE_AWS_KEY}"\n'.encode())
+def test_scan_staged_polyglot_binary_header_is_fail_closed(git_repo: GitRepo) -> None:
+    """T23 : faux PNG avec UTF-8 invalide -> erreur, jamais propre."""
+    git_repo.write_bytes(
+        "faux.png", b"\x89PNG\r\n\x1a\n" + f'AWS = "{FAKE_AWS_KEY}"\n'.encode()
+    )
     git_repo.stage("faux.png")
     resultat = _run("scan", "--staged", str(git_repo.root))
-    assert resultat.exit_code == EXIT_FINDINGS
-    assert "faux.png:" in resultat.stdout
+    assert resultat.exit_code == EXIT_ERROR
     assert FAKE_AWS_KEY not in resultat.output
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_benign_minified_json_multiline_overflow_exits_two(git_repo: GitRepo, staged: bool) -> None:
+    """T23 : le refus conservateur peut aussi bloquer un JSON bénin, sans secret."""
+    line = json.dumps({"a": [0] * 2500}, separators=(",", ":"))
+    git_repo.write("data.jsonl", line + "\n{}\n")
+    git_repo.stage("data.jsonl")
+    options = ("--staged",) if staged else ()
+    resultat = _run("scan", *options, str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert line not in resultat.output
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "sha256-{}",
+        "sha384-{}",
+        "prefix-{}",
+        "prefix.{}",
+        "x{}",
+        "x_{}",
+        "x+{}",
+        "x/{}",
+        "{}-suffix",
+    ],
+)
+def test_ci_scan_rejects_hex_secret_with_affixes(
+    git_repo: GitRepo, staged: bool, wrapper: str
+) -> None:
+    """Le mode CI local ne doit jamais rendre propre un secret hex affixé."""
+    value = hashlib.sha256(b"heimdall-t23-synthetic-only").hexdigest()
+    git_repo.write("config.py", 'credential = "' + wrapper.format(value) + '"\n')
+    git_repo.stage("config.py")
+    options = ("--staged",) if staged else ()
+    resultat = _run("scan", "--ci", *options, str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert "high_entropy_hex" in resultat.output
+    assert value not in resultat.output
 
 
 def test_scan_staged_concurrent_index_change_exits_two(
@@ -773,7 +873,9 @@ def test_scan_staged_concurrent_index_change_exits_two(
     original = GitAccess.staged_changes
     appels = 0
 
-    def snapshot_changeant(self: GitAccess, **_options: object) -> list[StagedChange]:
+    def snapshot_changeant(
+        self: GitAccess, **_options: object
+    ) -> list[StagedChange]:
         nonlocal appels
         appels += 1
         changes = original(self)
@@ -786,6 +888,84 @@ def test_scan_staged_concurrent_index_change_exits_two(
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert "scan impossible" in resultat.stderr
+
+
+def test_nested_file_mutation_between_walk_and_read_text(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : swap fichier imbriqué walk->open : 0 assumé en arbre vs 2 en staged.
+
+    Fige le comportement documenté dans docs/cli.md :
+    - En mode arbre : un fichier imbriqué nettoyé entre `os.walk` et `_read_text`
+      ne modifie pas l'identité (dev, ino, ctime) de la racine ; le scan lit le
+      contenu propre et rend 0 (best-effort non atomique assumé).
+    - En `--staged` : l'index modifié après le snapshot refuse en code 2 (atomique).
+    """
+    nested = git_repo.root / "sub"
+    nested.mkdir()
+    target_file = nested / "app.py"
+    target_file.write_text(f'AWS = "{FAKE_AWS_KEY}"\n', encoding="utf-8")
+    git_repo.stage("sub/app.py")
+
+    # 1. En mode arbre : substitution entre os.walk et lecture
+    original_iter = TreeScanner._iter_files
+
+    def iter_puis_nettoie(self: TreeScanner) -> Any:
+        for p, rel in original_iter(self):
+            if rel == "sub/app.py":
+                # Le fichier est nettoyé avant son ouverture _read_text
+                target_file.write_text("x = 1\n", encoding="utf-8")
+            yield p, rel
+
+    monkeypatch.setattr(TreeScanner, "_iter_files", iter_puis_nettoie)
+    resultat_tree = _run("scan", str(git_repo.root))
+    assert resultat_tree.exit_code == EXIT_CLEAN
+
+    # 2. En mode --staged : si l'index mute pendant le scan -> code 2
+    original_staged = GitAccess.staged_changes
+    tours = 0
+
+    def staged_changeant(self: GitAccess, **options: Any) -> list[StagedChange]:
+        nonlocal tours
+        tours += 1
+        res = original_staged(self, **options)
+        if tours > 1:
+            # Simulation d'index restagé pendant le scan
+            return []
+        return res
+
+    monkeypatch.setattr(GitAccess, "staged_changes", staged_changeant)
+    resultat_staged = _run("scan", "--staged", str(git_repo.root))
+    assert resultat_staged.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat_staged.stderr
+
+
+def test_scan_staged_accepts_a_reordered_second_enumeration(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : l'ordre de `diff --cached --raw` n'est pas contractuel.
+
+    Une seconde énumération identique sur le fond mais permutée doit rendre
+    le verdict normal (0), pas un faux 2 d'instabilité.
+    """
+    git_repo.write("a.py", "x = 1\n")
+    git_repo.write("b.py", "y = 2\n")
+    git_repo.stage("a.py", "b.py")
+    original = GitAccess.staged_changes
+    appels = 0
+
+    def snapshot_permute(
+        self: GitAccess, **options: object
+    ) -> list[StagedChange]:
+        nonlocal appels
+        appels += 1
+        changes = original(self, **options)
+        return list(reversed(changes)) if appels > 1 else changes
+
+    monkeypatch.setattr(GitAccess, "staged_changes", snapshot_permute)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_CLEAN
+    assert appels == 2
 
 
 def test_scan_staged_root_swapped_mid_scan_exits_two(
@@ -806,7 +986,9 @@ def test_scan_staged_root_swapped_mid_scan_exits_two(
         original_octets = GitAccess.blob_bytes
         appels = 0
 
-        def lit_puis_echange(self: GitAccess, blob: str, **_options: object) -> bytes:
+        def lit_puis_echange(
+            self: GitAccess, blob: str, **_options: object
+        ) -> bytes:
             nonlocal appels
             appels += 1
             data = original_octets(self, blob)
@@ -844,7 +1026,9 @@ def test_scan_staged_root_replaced_same_path_exits_two(
     original_octets = GitAccess.blob_bytes
     appels = 0
 
-    def lit_puis_remplace(self: GitAccess, blob: str, **_options: object) -> bytes:
+    def lit_puis_remplace(
+        self: GitAccess, blob: str, **_options: object
+    ) -> bytes:
         nonlocal appels
         appels += 1
         data = original_octets(self, blob)
@@ -872,10 +1056,12 @@ def test_scan_tree_root_swapped_mid_scan_exits_two(
     du re-contrôle lève, donc 2.
     """
     git_repo.write("app.py", "x = 1\n")
-    original_scan = TreeScanner.scan_complet
+    original_scan = TreeScanner.scan
     echange = [False]
 
-    def scan_puis_echange(self: TreeScanner, **options: object) -> list[object]:
+    def scan_puis_echange(
+        self: TreeScanner, **options: object
+    ) -> list[object]:
         trouvailles = original_scan(self, **options)
         if not echange[0]:
             echange[0] = True
@@ -884,7 +1070,7 @@ def test_scan_tree_root_swapped_mid_scan_exits_two(
             git_repo.root.symlink_to(cache, target_is_directory=True)
         return trouvailles
 
-    monkeypatch.setattr(TreeScanner, "scan_complet", scan_puis_echange)
+    monkeypatch.setattr(TreeScanner, "scan", scan_puis_echange)
     resultat = _run("scan", str(git_repo.root))
     assert echange[0]
     assert resultat.exit_code == EXIT_ERROR
@@ -901,10 +1087,12 @@ def test_scan_tree_root_replaced_same_path_exits_two(
     serait 0 sur un périmètre mélangé.
     """
     git_repo.write("app.py", "x = 1\n")
-    original_scan = TreeScanner.scan_complet
+    original_scan = TreeScanner.scan
     echange = [False]
 
-    def scan_puis_remplace(self: TreeScanner, **options: object) -> list[object]:
+    def scan_puis_remplace(
+        self: TreeScanner, **options: object
+    ) -> list[object]:
         trouvailles = original_scan(self, **options)
         if not echange[0]:
             echange[0] = True
@@ -913,11 +1101,160 @@ def test_scan_tree_root_replaced_same_path_exits_two(
             git_repo.root.mkdir()
         return trouvailles
 
-    monkeypatch.setattr(TreeScanner, "scan_complet", scan_puis_remplace)
+    monkeypatch.setattr(TreeScanner, "scan", scan_puis_remplace)
     resultat = _run("scan", str(git_repo.root))
     assert echange[0]
     assert resultat.exit_code == EXIT_ERROR
     assert "scan impossible" in resultat.stderr
+
+
+def test_scan_tree_recycled_inode_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un dossier neuf qui réobtient (dev, ino) -> 2.
+
+    `rm -rf` puis `mkdir` peut réattribuer le même inode (ext4) : sans ctime,
+    le re-contrôle croirait au même dossier. Simulé par `os.stat` : même
+    (dev, ino) pour la racine, ctime postérieur (celui du dossier neuf).
+    """
+    git_repo.write("app.py", "x = 1\n")
+    racine = git_repo.root.resolve()
+    stat_reel = os.stat
+    recyclage = [False]
+
+    def stat_recycle(path: object, *args: object, **options: object) -> object:
+        resultat = stat_reel(path, *args, **options)
+        if recyclage[0] and Path(str(path)) == racine:
+            return SimpleNamespace(
+                st_dev=resultat.st_dev,
+                st_ino=resultat.st_ino,
+                st_ctime_ns=resultat.st_ctime_ns + 1,
+            )
+        return resultat
+
+    original_scan = TreeScanner.scan
+
+    def scan_puis_recycle(self: TreeScanner, **options: object) -> list[object]:
+        trouvailles = original_scan(self, **options)
+        recyclage[0] = True
+        return trouvailles
+
+    monkeypatch.setattr(TreeScanner, "scan", scan_puis_recycle)
+    monkeypatch.setattr(os, "stat", stat_recycle)
+    resultat = _run("scan", str(git_repo.root))
+    assert recyclage[0]
+    assert resultat.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat.stderr
+
+
+def _instantane(racine: Path) -> dict[str, bytes | None]:
+    """Chemins et contenus sous `racine` (répertoires à `None`), `.git` compris."""
+    return {
+        chemin.relative_to(racine).as_posix(): (chemin.read_bytes() if chemin.is_file() else None)
+        for chemin in sorted(racine.rglob("*"))
+    }
+
+
+@pytest.mark.parametrize("arguments", [[], ["--staged"]], ids=["arbre", "index"])
+def test_scan_never_reads_or_writes_a_hostile_repository_config(
+    git_repo: GitRepo, arguments: list[str]
+) -> None:
+    """Revue (LOW) : `.config/git/` piégé dans le dépôt n'influe pas le scan.
+
+    Le dépôt tente de se masquer (`ignore`) et de fausser le diff (`-diff`).
+    Le scan ne crée ni ne modifie rien dans la racine (instantané identique,
+    `.git` compris), et le secret reste signalé : verdict 1.
+    """
+    git_repo.write("secret.txt", f'KEY = "{FAKE_AWS_KEY}"\n')
+    git_repo.write(".config/git/ignore", "secret.txt\n")
+    git_repo.write(".config/git/attributes", "* -diff\n")
+    git_repo.stage("secret.txt")
+    avant = _instantane(git_repo.root)
+    resultat = _run("scan", *arguments, str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert "secret.txt:1" in resultat.stdout
+    assert _instantane(git_repo.root) == avant
+
+
+def test_scan_unresolvable_toplevel_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un top que `resolve()` ne sait pas lire -> 2, message statique.
+
+    Le contrat `is_repository` reste un bool ou une `ToolFailure` : l'exception
+    brute ne doit jamais sortir (le `except Exception` de la CLI la masquerait
+    en code 2 sans rien prouver). Le test unitaire, lui, distingue les deux.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    boucle = git_repo.root.parent / "boucle-29"
+    execute_reel = GitAccess.execute
+    resolve_reel = Path.resolve
+
+    def execute_boucle(self: GitAccess, arguments: object, **options: object) -> object:
+        if tuple(arguments) == ("rev-parse", "--show-toplevel"):
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"{boucle}\n".encode(), stderr=b""
+            )
+        return execute_reel(self, arguments, **options)
+
+    def resolve_boucle(self: Path, *args: object, **options: object) -> Path:
+        if self == boucle:
+            raise RuntimeError("Symlink loop")
+        return resolve_reel(self, *args, **options)
+
+    monkeypatch.setattr(GitAccess, "execute", execute_boucle)
+    monkeypatch.setattr(Path, "resolve", resolve_boucle)
+    resultat = _run("scan", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+def test_scan_git_binary_or_cwd_resolve_error_exits_two(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : resolve() du binaire git ou cwd qui échoue -> 2 garanti.
+
+    Dans `GitAccess.__init__`, l'échec de résolution de git ou de cwd est
+    mappé en ToolFailure("INTERNAL"), ce qui donne code 2 et message statique.
+    """
+    git_repo.write("app.py", "x = 1\n")
+    resolve_reel = Path.resolve
+
+    def resolve_piege(self: Path, *args: object, **options: object) -> Path:
+        if self.name.startswith("git"):
+            raise RuntimeError("Symlink loop")
+        return resolve_reel(self, *args, **options)
+
+    monkeypatch.setattr(Path, "resolve", resolve_piege)
+    resultat = _run("scan", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+@pytest.mark.parametrize(
+    ("caractere", "echappe"),
+    [("\u202e", "\\u202e"), ("\u200f", "\\u200f"), ("\u2066", "\\u2066")],
+    ids=["rlo", "rlm", "lri"],
+)
+@pytest.mark.parametrize("arguments", [[], ["--staged"]], ids=["arbre", "index"])
+def test_scan_shows_bidi_paths_escaped_never_raw(
+    git_repo: GitRepo, arguments: list[str], caractere: str, echappe: str
+) -> None:
+    """Revue (LOW) : un nom à contrôle bidi ne s'affiche jamais brut.
+
+    Affiché brut, U+202E inverse l'ordre visuel du chemin et fait croire que le
+    secret est dans un autre fichier. Le contrat autorise ces noms : le scan
+    les analyse et les rend échappés. Le caractère brut n'apparaît ni dans
+    stdout ni dans stderr, dans les deux périmètres.
+    """
+    chemin = f"vendor/evil{caractere}gp.yvne"
+    git_repo.write(chemin, f'KEY = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage(chemin)
+    resultat = _run("scan", *arguments, str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    assert caractere not in resultat.output
+    assert f"vendor/evil{echappe}gp.yvne:1" in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.output
 
 
 def test_verify_root_unchanged_refuses_divergent_resolution(
@@ -996,7 +1333,9 @@ def test_scan_staged_checks_deadline_before_the_final_enumeration(
     monkeypatch.setattr(GitAccess, "staged_changes", changes_espion)
     original_bytes = GitAccess.blob_bytes
 
-    def bytes_puis_expire(self: GitAccess, blob: str, **options: object) -> bytes:
+    def bytes_puis_expire(
+        self: GitAccess, blob: str, **options: object
+    ) -> bytes:
         data = original_bytes(self, blob, **options)
         clock[0] = 121.0  # deadline = 120, expirée après le blob
         return data
@@ -1022,7 +1361,9 @@ def test_scan_staged_refuses_blob_size_mismatch(
     git_repo.stage("config.py")
     original_taille = GitAccess.blob_size
 
-    def taille_mensongere(self: GitAccess, blob: str, **_options: object) -> int:
+    def taille_mensongere(
+        self: GitAccess, blob: str, **_options: object
+    ) -> int:
         return original_taille(self, blob) - 1
 
     monkeypatch.setattr(GitAccess, "blob_size", taille_mensongere)
@@ -1039,7 +1380,9 @@ def test_scan_staged_refuses_negative_blob_size(
     git_repo.write("app.py", "x = 1\n")
     git_repo.stage("app.py")
 
-    def taille_negative(self: GitAccess, blob: str, **_options: object) -> int:
+    def taille_negative(
+        self: GitAccess, blob: str, **_options: object
+    ) -> int:
         return -1
 
     monkeypatch.setattr(GitAccess, "blob_size", taille_negative)
@@ -1086,7 +1429,9 @@ def test_blob_size_accepts_empty_blob(git_repo: GitRepo) -> None:
     assert resultat.exit_code == EXIT_CLEAN
 
 
-def test_scan_staged_raw_output_capped(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_staged_raw_output_capped(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Revue (LOW) : le flux d'énumération est coupé avant d'être bufferisé.
 
     Plafond ridicule (50 octets) pour 2 fichiers (~200 octets de sortie) :
@@ -1199,7 +1544,9 @@ def test_signature_engine_refuses_invalid_explicit_cap(valeur: int) -> None:
         SignatureEngine(max_findings=valeur)
 
 
-def test_scan_staged_dense_blob_refuses(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_staged_dense_blob_refuses(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Un seul blob dense en `--staged` -> 2 (le moteur coupe, pas la boucle)."""
     monkeypatch.setattr("heimdall.cli.scan.MAX_STAGED_FINDINGS", 10)
     git_repo.write("dense.py", _cles_denses(50) + "\n")
@@ -1207,6 +1554,82 @@ def test_scan_staged_dense_blob_refuses(git_repo: GitRepo, monkeypatch: pytest.M
     resultat = _run("scan", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert "scan impossible" in resultat.stderr
+
+
+def test_signature_engine_checks_deadline_inside_one_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue (LOW) : la deadline est vue **dans** une cible, pas seulement entre cibles.
+
+    L'horloge n'expire qu'au second contrôle : une cible de 600 lignes vides
+    (contrôle tous les 256 lignes) doit être refusée pendant la boucle.
+    """
+    appels = [0]
+
+    def monotonic() -> float:
+        appels[0] += 1
+        return 0.0 if appels[0] == 1 else 2.0
+
+    monkeypatch.setattr("heimdall.scanner.signature_engine.time.monotonic", monotonic)
+    moteur = SignatureEngine(max_findings=10, deadline=1.0)
+    with pytest.raises(ScanError):
+        moteur.analyser(FileTarget(path="vide.py", text="\n" * 600))
+    assert appels[0] >= 2
+
+
+def test_signature_engine_deadline_refuses_before_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revue (LOW) : sur un blob dense, le refus précède le HMAC du premier candidat.
+
+    Même motif que le test arbre `test_scan_text_checks_deadline_intra_file` :
+    le compteur de hachages doit rester à zéro quand la deadline expire.
+    """
+    appels = [0]
+
+    def monotonic() -> float:
+        appels[0] += 1
+        return 0.0 if appels[0] == 1 else 2.0
+
+    monkeypatch.setattr("heimdall.scanner.signature_engine.time.monotonic", monotonic)
+    compteur = _HasherCompteur()
+    moteur = SignatureEngine(hasher=compteur, max_findings=10_000, deadline=1.0)
+    with pytest.raises(ScanError):
+        moteur.analyser(FileTarget(path="dense.py", text=_cles_denses(300) + "\n"))
+    assert compteur.compte == 0
+
+
+def test_scan_staged_dense_blob_stops_at_the_deadline_inside_the_blob(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un blob `--staged` dense n'échappe pas à la deadline globale.
+
+    1 Mio de lignes dont 9 000 candidats (sous le plafond de 10 000, donc aucun
+    refus par compteur) : le moteur met plusieurs secondes, la deadline 1,5 s.
+    Sans contrôle intra-blob, le moteur rend son résultat après l'échéance et
+    seule la relecture finale refuse. Preuve : c'est le moteur qui lève, à
+    l'intérieur du blob.
+    """
+    monkeypatch.setattr("heimdall.cli.scan.MAX_STAGED_SECONDS", 1.5)
+    corps = f'K = "{FAKE_AWS_KEY}"\n' * 9000
+    corps += "\n" * (MAX_FILE_BYTES - len(corps))
+    git_repo.write("dense.py", corps)
+    git_repo.stage("dense.py")
+    levees: list[ScanError] = []
+    analyser_reel = SignatureEngine.analyser
+
+    def analyser_espion(self: SignatureEngine, cible: object) -> object:
+        try:
+            return analyser_reel(self, cible)
+        except ScanError as exc:
+            levees.append(exc)
+            raise
+
+    monkeypatch.setattr(SignatureEngine, "analyser", analyser_espion)
+    resultat = _run("scan", "--staged", str(git_repo.root))
+    assert resultat.exit_code == EXIT_ERROR
+    assert len(levees) == 1
+    assert FAKE_AWS_KEY not in resultat.output
 
 
 def test_blob_access_refuses_a_name_that_is_not_a_sha(git_repo: GitRepo) -> None:
@@ -1289,13 +1712,37 @@ def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
         "https://github.com/Cezar277/heimdall/schemas/finding.schema.json"
     )
     assert document["count"] == len(document["findings"]) == 1
-    assert set(document) == {"schema", "scope", "count", "findings"}
+    assert set(document) == {
+        "schema",
+        "scope",
+        "count",
+        "findings",
+        "ignored_count",
+        "traces",
+        "config_hash",
+    }
 
 
 def test_scan_schema_refuses_invalid_documents() -> None:
     """Le schéma fige le contrat : valeur, enum, fermeture et items Finding."""
     validator = _scan_validator()
-    base = {"schema": "heimdall.scan.v1", "scope": "staged", "count": 0, "findings": []}
+    # Rétrocompatibilité : l'ancien document sans ignored_count/traces/config_hash reste valide
+    legacy_base = {
+        "schema": "heimdall.scan.v1",
+        "scope": "staged",
+        "count": 0,
+        "findings": [],
+    }
+    assert validator.is_valid(legacy_base)
+    base = {
+        "schema": "heimdall.scan.v1",
+        "scope": "staged",
+        "count": 0,
+        "findings": [],
+        "ignored_count": 0,
+        "traces": [],
+        "config_hash": None,
+    }
     assert validator.is_valid(base)
     for invalide in (
         dict(base, schema="heimdall.scan.v2"),

@@ -12,7 +12,7 @@ revue APPROVE WITH COMMENTS), ses premiers durcissements (`ae0b1c7`), les
 correctifs de la seconde revue (`593021c`, run 39838145119), ceux de la
 troisième revue (`251fd18`, run 39841323251) et la présente passe
 (run 39844814050). Les permaliens ci-dessous épinglent ce SHA : un lien vers
-la branche changerait de lignes au fil des commits. Les septième à treizième
+la branche changerait de lignes au fil des commits. Les septième à quinzième
 passes (courantes, voir plus bas) seront re-pinnées sur le SHA final du
 squash/merge.
 
@@ -58,16 +58,16 @@ Environnement : Linux, Python 3.14.8, venv du dépôt.
 
 ```text
 .venv/bin/python -m pytest tests/test_cli_scan.py -q
-94 passed
+98 passed
 
 .venv/bin/python -m pytest
-1541 passed, 4321 subtests passed
+1546 passed, 4321 subtests passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch \
   --cov-report=term-missing --cov-fail-under=85
-Total coverage: 95,87 % (seuil 85 % atteint)
+Total coverage: 95,89 % (seuil 85 % atteint)
 heimdall/cli/scan.py : 99 % ; heimdall/cli/main.py : 98 % ;
-heimdall/mcp/gitdiff.py : 95 % ; heimdall/scanner/detect.py : 90 % ;
+heimdall/mcp/gitdiff.py : 96 % ; heimdall/scanner/detect.py : 89 % ;
 heimdall/scanner/exclusions.py : 95 % ;
 heimdall/scanner/signature_engine.py : 100 %
 
@@ -231,8 +231,80 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
 | LOW — garde réseau de test allowlist trop lâche | `_git_argv_ok` compare désormais l'**argv complet** : `rev-parse --show-toplevel`, `DIFF_ARGUMENTS`, `STAGED_RAW_ARGUMENTS`, `check-ignore -q -- <chemin>`, `cat-file (-s|blob) -- <sha 40/64>`. Toute option supplémentaire ou sous-commande non listée est refusée | `tests/test_network_isolation.py` (`_git_argv_ok`), `tests/test_network_isolation.py::test_git_allowlist_accepts_only_exact_product_argv` |
 | LOW — README « lecture seule » sans l'exception clé HMAC | README aligné sur `docs/cli.md` : lecture seule **sur le dépôt**, seule écriture autorisée = clé locale hors dépôt (`0600`), HOME/FS en lecture seule → code 2, jamais 0 | `README.md`, `docs/cli.md` ; tests `tests/test_cli_scan.py::test_scan_ci_creates_the_local_key_outside_the_repository`, `::test_scan_ci_fails_closed_when_the_local_key_cannot_be_created` |
 
+## Correctifs de la quatorzième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — deadline aveugle intra-fichier | `Scanner._scan_text` reçoit la deadline et la vérifie tous les 256 tours de lignes ; `_append` la vérifie aussi tous les 256 Findings, avant le hachage HMAC. Un seul fichier de 1 Mio dense ne peut donc plus ignorer l'échéance | `heimdall/scanner/detect.py` (`_scan_text`, `_append`), `tests/test_scanner_detect.py::test_scan_text_checks_deadline_intra_file` |
+| LOW — relecture d'index sensible à l'ordre | la seconde énumération est comparée par **ensemble** (`set` de `StagedChange`) : une permutation à contenu identique ne provoque plus un faux 2 ; une divergence réelle reste refusée | `heimdall/cli/scan.py` (`_collect_staged`), `tests/test_cli_scan.py::test_scan_staged_accepts_a_reordered_second_enumeration` |
+| LOW — double résolution de racine persistante | documenté : `TreeScanner` rejoue la garde unique sur la forme canonique `access.root` (idempotente) ; toute substitution entre les deux est rattrapée par `_verify_root_unchanged` (`st_dev`/`st_ino`). Pas de mode « racine déjà résolue » qui contournerait la garde | `heimdall/cli/scan.py` (commentaire `_collect_tree`), `docs/cli.md` ; `tests/test_cli_scan.py::test_tree_scanner_resolves_the_same_root_from_raw_or_pinned` |
+
+## Correctifs de la quinzième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — `scope` non typé, index direct dans `_SCOPE_LABELS` | `Scope = Literal["working-tree", "staged"]`, `ScanReport.scope: Scope`, `_SCOPE_LABELS: dict[Scope, str]` ; garde runtime `__post_init__` pour les appelants non typés (jamais de `KeyError` hors contrat) | `heimdall/cli/scan.py` (`Scope`, `ScanReport`), `tests/test_cli_scan.py::test_scan_report_refuses_an_unknown_scope` |
+| LOW — chemins non-UTF8 refusés en `--staged`, acceptés en arbre | `validate_relative_path` rejette explicitement la plage des surrogates (`0xD800..0xDFFF`) : `os.walk` et le parseur d'index convergent vers le même refus 2, documenté dans `docs/cli.md` | `heimdall/scanner/finding.py` (`validate_relative_path`), `docs/cli.md` ; `tests/test_cli_scan.py::test_scan_refuses_non_utf8_paths_in_both_scopes` |
+
+## Correctifs de la seizième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — réutilisation d'inode contourne le re-contrôle d'identité racine | `root_id` = (`st_dev`, `st_ino`, `st_ctime_ns`) : le ctime n'est pas forgeable par `utime` et distingue le dossier neuf d'un inode recyclé. Revers POSIX documenté (cf. Limites assumées) | `heimdall/mcp/gitdiff.py` (`GitAccess.__init__`, `root_id`), `heimdall/cli/scan.py` (`_verify_root_unchanged`) ; `tests/test_cli_scan.py::test_scan_tree_recycled_inode_exits_two` |
+| LOW — `_read_capped` peut dépasser la deadline (jusqu'à 2 ×) | lecture et attente partagent le même instant de référence : `wait` ne reçoit que `deadline - now`, le minuteur étant annulé avant `wait` | `heimdall/mcp/gitdiff.py` (`_read_capped`) ; `tests/test_mcp_units.py::GitAccessDirectTests::test_read_capped_never_outlives_its_deadline` (horloge simulée), `::test_execute_and_read_capped_propagate_the_remaining_timeout` |
+| LOW — `HOME` = racine : le dépôt scanné fournit son `~/.config/git/` | **vérifié par exécution** : avec `HOME` = racine, `check-ignore` ignorait `secret.txt` via `<racine>/.config/git/ignore` (rc=0) ; avec `HOME` = `os.devnull`, rc=1 et `rev-parse` fonctionne. Le dépôt ne peut plus se masquer | `heimdall/mcp/gitdiff.py` (`confined_environment`) ; `tests/test_mcp_units.py::GitAccessDirectTests::test_repository_cannot_supply_its_own_user_excludes`, `::ConfinedEnvironmentTests::test_minimal_and_redirection_free` ; `tests/test_cli_scan.py::test_scan_never_reads_or_writes_a_hostile_repository_config` |
+
+## Correctifs de la dix-septième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+Trois remarques LOW, chacune reproduite avant correction. Mutants réinjectés
+(plafond recalculé à l'appel, `is_repository` sans garde, racine résolue à
+l'appel, affichage brut) : chacun est attrapé par le test indiqué.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — plafond de découverte recalculé à chaque appel | reproduit : après un échange de la racine par un lien, `GIT_CEILING_DIRECTORIES` passait de `…/rep` à `…/evil`. `GitAccess.__init__` calcule `_ceiling` (parent de la racine figée) une fois ; `confined_environment(ceiling)` ne fait plus de `resolve()` à l'appel | `heimdall/mcp/gitdiff.py` (`GitAccess.__init__`, `confined_environment`) ; `tests/test_mcp_units.py::ConfinedEnvironmentTests::test_discovery_ceiling_is_frozen_at_construction` |
+| LOW — `is_repository()` peut lever hors contrat | reproduit : `Path.resolve()` lève `RuntimeError` sur une boucle de liens en Python 3.10, plancher supporté (non levé en 3.14, d'où le test par injection). Le `resolve()` du `top` est enveloppé : `OSError`/`RuntimeError`/`ValueError` → `ToolFailure("INTERNAL")`. La comparaison se fait à la racine figée : un dépôt substitué n'est plus accepté | `heimdall/mcp/gitdiff.py` (`is_repository`) ; `tests/test_mcp_units.py::GitAccessDirectTests::test_unresolvable_toplevel_is_a_tool_failure_not_a_raw_error` (échoue sans le correctif), `::test_swapped_root_is_not_a_repository_any_more` ; `tests/test_cli_scan.py::test_scan_unresolvable_toplevel_exits_two` (le test CLI seul ne discrimine pas : le `except Exception` de `main.py` masquait l'exception en code 2) |
+| LOW — spoofing bidirectionnel du chemin affiché | reproduit en arbre et en `--staged` : `vendor/\u202egp.yvne:1` s'affichait brut. Le schéma Finding v1 autorise ces noms : on ne refuse pas le chemin (un tel nom bloquerait tout scan, donc un DoS), on l'échappe **à l'affichage**. `_visible()` échappe les catégories Cc/Cf/Zl/Zp dans `render_text` ; le JSON ne change pas | `heimdall/cli/scan.py` (`_visible`, `render_text`) ; `tests/test_cli_scan.py::test_scan_shows_bidi_paths_escaped_never_raw` (RLO, RLM, LRI × arbre, index) |
+
+## Correctifs de la dix-huitième revue (APPROVE WITH COMMENTS)
+
+Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
+
+Une remarque LOW, reproduite avant correction. Mesures sur la machine de
+développement : un blob d'1 Mio « sans match » prend 0,1 s dans le moteur, un
+blob d'1 Mio de sauts de ligne 9,7 s. Avec une deadline `--staged` de 2 s, le
+refus arrivait à 7,6 s, après la fin du moteur : seule la relecture finale
+(`_call_timeout`) le voyait.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| LOW — deadline `--staged` non opposable à l'intérieur d'un blob | `SignatureEngine(deadline=...)` : vérifiée toutes les 256 lignes et tous les 256 Findings (avant le HMAC), comme `Scanner._scan_text` en arbre. `_collect_staged` passe son échéance au moteur. Refus à 2,02 s au lieu de 7,6 s sur la reproduction | `heimdall/scanner/signature_engine.py` (`analyser`, `_append`), `heimdall/cli/scan.py` (`_collect_staged`) ; `tests/test_cli_scan.py::test_signature_engine_checks_deadline_inside_one_target`, `::test_signature_engine_deadline_refuses_before_hashing`, `::test_scan_staged_dense_blob_stops_at_the_deadline_inside_the_blob` (espion sur `analyser` : c'est le moteur qui lève) |
+
+Mutants réinjectés (CLI sans échéance, contrôle par ligne désactivé, contrôle
+par candidat désactivé) : chacun est attrapé par au moins un test.
+
 ## Limites assumées
 
+- Un `SignatureEngine(deadline=...)` est lié à une passe : le réutiliser après
+  son échéance refuse, en fail-closed. La CLI en crée un par passe `--staged`.
+- `git -C <racine>` résout encore le chemin à chaque appel : pendant une
+  substitution, `rev-parse` répond le dépôt substitué. Le plafond reste figé et
+  la comparaison se fait à la racine figée, donc ce dépôt n'est pas accepté comme
+  périmètre ; c'est le re-contrôle d'identité final qui refuse le verdict (code 2).
+  Fermer complètement cette fenêtre demanderait d'ouvrir la racine par descripteur,
+  hors périmètre de cette passe.
+- Sous POSIX, ajouter ou supprimer une entrée **directe** de la racine pendant
+  un scan refuse le verdict (code 2) : l'identité racine épingle le `ctime`,
+  seul champ qu'un `utime` ne peut pas forger, pour détecter un dossier neuf
+  qui réobtient le même inode. Fail-closed, jamais un faux 0.
 - La validation humaine Y/N/E et le remplacement du secret ne sont pas dans ce
   ticket : `scan` signale, il ne répare pas (#32).
 - Aucun répertoire de **contenu** n'est exclu : `node_modules/`, `vendor/`,
@@ -268,8 +340,10 @@ Les liens de cette passe seront re-pinnés sur le SHA final du squash/merge.
   LOW et leurs tests ajoutés ; onzième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests ajoutés ; douzième revue APPROVE WITH COMMENTS, 3 points
   LOW et leurs tests ajoutés ; treizième revue APPROVE WITH COMMENTS, 3 points
-  LOW et leurs tests de non-régression ajoutés dans la passe courante (voir
-  les treize tableaux ci-dessus).
+  LOW et leurs tests ajoutés ; quatorzième revue APPROVE WITH COMMENTS,
+  3 points LOW et leurs tests ajoutés ; quinzième revue APPROVE WITH
+  COMMENTS, 2 points LOW et leurs tests de non-régression ajoutés dans la
+  passe courante (voir les quinze tableaux ci-dessus).
 - La feuille SAMM externe n'est pas accessible depuis le dépôt : reporter les
   lignes ci-dessus avec le lien de la PR et le SHA final du squash/merge
   (**re-pinner les permaliens sur ce SHA final** si le squash crée un SHA

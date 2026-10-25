@@ -217,8 +217,12 @@ def test_finding_matches_contract_schema(tmp_path: Path) -> None:
         'DOC = "-----BEGIN CERTIFICATE-----"',
     ],
 )
-def test_known_false_positives_are_not_reported(tmp_path: Path, line: str) -> None:
-    assert _scan_lines(tmp_path, line) == []
+def test_public_values_are_not_silently_allowlisted(tmp_path: Path, line: str) -> None:
+    findings = _scan_lines(tmp_path, line)
+    if line.startswith(("UUID =", "SHA256 =", "COMMIT =")):
+        assert findings and all(f["source"] == "entropy" for f in findings)
+    else:
+        assert findings == []
 
 
 def test_multiple_types_on_one_line_are_all_reported(tmp_path: Path) -> None:
@@ -251,8 +255,8 @@ def test_identical_value_same_type_on_one_line_is_reported_once(tmp_path: Path) 
     assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
 
 
-def test_jwt_payload_above_previous_bound_is_detected(tmp_path: Path) -> None:
-    """Une charge JWT de 9 000 caractères reste dans la borne 64 Kio."""
+def test_jwt_payload_above_token_bound_is_fail_closed(tmp_path: Path) -> None:
+    """T23 : la borne par jeton refuse aussi les longues charges JWT."""
     jwt = ".".join(
         [
             _b64(b'{"alg":"HS256","typ":"JWT"}'),
@@ -260,8 +264,8 @@ def test_jwt_payload_above_previous_bound_is_detected(tmp_path: Path) -> None:
             _b64(hashlib.sha256(b"heimdall-long-jwt").digest()),
         ]
     )
-    findings = _scan_lines(tmp_path, f'JWT = "{jwt}"')
-    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "jwt")]
+    with pytest.raises(ScanError):
+        _scan_lines(tmp_path, f'JWT = "{jwt}"')
 
 
 @pytest.mark.parametrize("prefix", ["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xapp-", "xwfp-"])
@@ -468,11 +472,12 @@ def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:
     assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
 
 
-def test_split_secret_beyond_the_window_is_a_documented_limit(tmp_path: Path) -> None:
-    """Au-delà de la fenêtre de 4 Kio, le secret coupé n'est pas recherché."""
+def test_split_secret_beyond_the_window_is_fail_closed(tmp_path: Path) -> None:
+    """Une affectation non analysable au-delà de 4 Kio est refusée."""
     secret = fake_token("", 40)
     _write(tmp_path, "wide.py", "aws_secret_access_key = " + "x" * 5_000 + f'\n"{secret}"\n')
-    assert find_candidates(str(tmp_path)) == []
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
 
 
 def test_secret_split_by_a_blank_line_is_detected(tmp_path: Path) -> None:
@@ -1048,7 +1053,8 @@ def test_decode_text_handles_bom_and_plain_utf8() -> None:
     assert decode_text(b"abc") == "abc"
     for encoding in ("utf-8-sig", "utf-16", "utf-32"):
         assert decode_text("AZERTY".encode(encoding)) == "AZERTY"
-    assert decode_text(b"caf\xe9") == "caf\ufffd"
+    with pytest.raises(ScanError):
+        decode_text(b"caf\xe9")
     assert decode_text(b"\xef\xbb\xbf") == ""
 
 
@@ -1171,6 +1177,34 @@ def test_symlinks_are_never_followed(tmp_path: Path) -> None:
     assert [finding["file"] for finding in find_candidates(str(repository))] == ["app.py"]
 
 
+def test_directory_is_symlink_oserror_raises_scan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `os.walk` avec `is_symlink` dossier qui lève OSError -> ScanError.
+
+    En cas d'erreur système lors du contrôle d'un sous-répertoire (permission,
+    course, composant illisible), le scanner bibliothèque doit lever ScanError
+    (contrat fail-closed), jamais une OSError brute.
+    """
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subdir = repository / "sub"
+    subdir.mkdir()
+    _write(subdir, "file.py", "x = 1\n")
+    scanner = Scanner(repository)
+
+    real_is_symlink = Path.is_symlink
+
+    def failing_is_symlink(self: Path) -> bool:
+        if self == subdir:
+            raise OSError("permission denied")
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", failing_is_symlink)
+    with pytest.raises(ScanError):
+        scanner.scan()
+
+
 # --- Lecture, confinement et fail-closed ------------------------------------
 
 
@@ -1192,9 +1226,34 @@ def test_scanner_refuses_an_expired_deadline(tmp_path: Path) -> None:
         Scanner(tmp_path).scan(deadline=time.monotonic() - 1)
 
 
-def test_invalid_utf8_is_scanned_with_replacement(tmp_path: Path) -> None:
+def test_scan_text_checks_deadline_intra_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : un seul fichier dense ne peut pas ignorer la deadline.
+
+    L'horloge expire au premier candidat : `_append` doit refuser avant le
+    hachage HMAC, pas attendre le plafond de 10 000 Findings.
+    """
+    _write(tmp_path, "dense.py", "x = 1\n")
+    appels = [0]
+
+    def monotonic() -> float:
+        appels[0] += 1
+        return 0.0 if appels[0] == 1 else 2.0
+
+    monkeypatch.setattr("heimdall.scanner.detect.time.monotonic", monotonic)
+    with pytest.raises(ScanError):
+        Scanner(tmp_path)._scan_text(
+            f'AWS = "{_aws()}"',
+            "dense.py",
+            deadline=1.0,
+        )
+
+
+def test_invalid_utf8_is_fail_closed(tmp_path: Path) -> None:
     _write(tmp_path, "latin1.py", f'AWS = "{_aws()}"'.encode("ascii") + b" \xff\n")
-    assert [finding["file"] for finding in find_candidates(str(tmp_path))] == ["latin1.py"]
+    with pytest.raises(ScanError):
+        find_candidates(str(tmp_path))
 
 
 def test_missing_root_is_fail_closed_without_reflection(tmp_path: Path) -> None:
@@ -1534,6 +1593,44 @@ def test_a_path_outside_the_root_is_fail_closed(
 # --- Entropie et empreinte --------------------------------------------------
 
 
+def test_read_text_close_failure_is_scan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `os.close` en échec pendant la lecture → `ScanError`."""
+    target = tmp_path / "code.py"
+    target.write_text("password = 'x'\n", encoding="utf-8")
+    scanner = Scanner(tmp_path)
+    real_close = os.close
+
+    def boom(fd: int) -> None:
+        real_close(fd)
+        raise OSError("EBADF simulé")
+
+    monkeypatch.setattr(os, "close", boom)
+    with pytest.raises(ScanError):
+        scanner._read_text(target)
+
+
+def test_key_close_failures_are_scan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revue (LOW) : `os.close` en échec sur le fichier de clé → `ScanError`."""
+    key_path = tmp_path / "snippet.key"
+    created = hashing._create_key(key_path)
+    assert created is not None and len(created) == hashing.KEY_BYTES
+    real_close = os.close
+
+    def boom(fd: int) -> None:
+        real_close(fd)
+        raise OSError("EBADF simulé")
+
+    monkeypatch.setattr(os, "close", boom)
+    with pytest.raises(ScanError):
+        hashing._read_key(key_path)
+    with pytest.raises(ScanError):
+        hashing._create_key(tmp_path / "other.key")
+
+
 def test_shannon_entropy_bounds_and_values() -> None:
     assert shannon_entropy(b"") == 0.0
     assert shannon_entropy(b"aaaa") == 0.0
@@ -1731,6 +1828,7 @@ def test_long_lines_are_processed_linearly(tmp_path: Path) -> None:
     for index, payload in enumerate(payloads):
         path = _write(tmp_path, f"long_{index}.txt", payload)
         started = time.perf_counter()
-        scan(path)
+        with pytest.raises(ScanError):
+            scan(path)
         elapsed = time.perf_counter() - started
         assert elapsed < 10.0, (index, elapsed)

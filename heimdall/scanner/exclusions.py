@@ -434,7 +434,7 @@ def decode_text(data: bytes) -> str | None:
 
     - BOM UTF-8/UTF-16/UTF-32 : décodage strict ;
     - UTF-16/UTF-32 sans BOM : heuristique bornée, jamais de remplacement ;
-    - UTF-8 invalide sans NUL : remplacement, comme avant (#22) ;
+    - UTF-8 invalide sans NUL : ScanError statique (#23) ;
     - signature binaire **et** contenu majoritairement binaire : ignoré par
       politique (une simple signature suivie de texte clair ne suffit pas :
       ce serait un contournement) ;
@@ -455,7 +455,12 @@ def decode_text(data: bytes) -> str | None:
         if data.startswith(bom):
             return _decode_exact(data, encoding)
     if b"\x00" not in data:
-        return data.decode("utf-8", errors="replace")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            if is_known_binary(data):
+                return None
+            raise ScanError(_DECODE_ERROR) from None
     decoded = _decode_utf16_or_32(data)
     if decoded is not None:
         return decoded
