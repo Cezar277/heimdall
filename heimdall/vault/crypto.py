@@ -21,11 +21,20 @@ l'enregistrement par ``app.register_api_key``.
 AUCUN autre module (scanner, MCP, CLI) ne doit importer ce module ni les
 librairies crypto : la CLI ne manipule que des références (triplet
 ``project/env/name``), jamais de valeurs déchiffrées.
+
+NONCE UNIQUE (ticket #67, sous-ticket de #66 « Module crypto isolé ») : le
+chiffrement au repos est un AES-256-GCM dont le nonce de 96 bits est tiré de
+``os.urandom`` **à chaque chiffrement**. Le blob stocké contient les trois
+parties ensemble (``nonce || ciphertext || tag``) et l'AAD est l'identifiant du
+secret : un blob copié sur un autre secret échoue à l'authentification. Deux
+chiffrements du même texte donnent donc deux blobs différents — c'est la preuve
+archivée dans ``tests/test_vault_crypto.py``.
 """
 
 import base64
 import hashlib
 import hmac
+import os
 import secrets
 
 from cryptography.exceptions import InvalidTag
@@ -34,8 +43,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 _KEY_SIZE_BYTES: int = 32  # AES-256 / KEK 256 bits
-_NONCE_SIZE_BYTES: int = 12  # nonce AES-GCM 96 bits
-_TAG_SIZE_BYTES: int = 16
+_NONCE_SIZE_BYTES: int = 12  # nonce AES-GCM 96 bits, unique par chiffrement (#67)
+_TAG_SIZE_BYTES: int = 16  # étiquette d'authentification GCM, en fin de ciphertext
 # Défense en profondeur : un pepper plus court que 256 bits réduit la
 # résistance hors ligne si les empreintes stockées et le pepper fuient.
 _MIN_PEPPER_BYTES: int = 32
@@ -176,12 +185,35 @@ def decode_encoded_key(encoded: str | bytes) -> bytes:
     return key
 
 
+def _new_nonce() -> bytes:
+    """Tire un nonce AES-GCM de 96 bits dans l'aléatoire du système (ticket #67).
+
+    ``os.urandom`` est le CSPRNG du noyau (getrandom(2)/urandom(2)) : il n'est
+    ni prédictible ni dérivable d'une horloge ou d'un compteur. Un nonce
+    réutilisé avec la même clé rendrait le mode GCM catastrophique (XOR des
+    deux sorties, et forge de l'étiquette d'authentification) : le nonce est
+    donc tiré **à chaque appel**, jamais mémorisé ni réutilisé.
+
+    La taille de 12 octets (96 bits) est celle recommandée par NIST SP
+    800-38D pour GCM : elle évite le calcul de GHASH sur un nonce non
+    aligné. Probabilité de collision par paire : 2^-96 ; sur 2^32
+    chiffrements, la probabilité d'au moins une collision reste de l'ordre de
+    2^-33 (borne du birthday paradox).
+    """
+    return os.urandom(_NONCE_SIZE_BYTES)
+
+
 class VaultCipher:
-    """Chiffrement authentifié AES-256-GCM des valeurs au repos (ticket #25/#26).
+    """Chiffrement authentifié AES-256-GCM des valeurs au repos (ticket #25/#26/#67).
 
     - La KEK est fournie par l'exploitant (``HEIMDALL_VAULT_KEK``), jamais stockée
       dans la base SQLite : la compromission de la base seule ne révèle rien.
-    - Chaque chiffrement utilise un nonce aléatoire de 96 bits.
+    - Chaque chiffrement tire un **nonce neuf de 96 bits** depuis l'aléatoire du
+      système (``os.urandom``, ticket #67) : deux chiffremens du même texte
+      donnent deux blobs différents, et un nonce n'est jamais réutilisé avec la
+      même KEK (cela révélerait le clair par XOR des deux sorties).
+    - Le blob stocké est ``nonce || ciphertext || tag`` (l'étiquette GCM de
+      16 octets est déjà en fin de ciphertext), encodé en base64 URL-safe.
     - L'AAD lie le ciphertext au triplet ``(project, env, name)`` : un blob déplacé
       vers une autre identité échoue à l'authentification.
     - Les erreurs de déchiffrement sont génériques (aucun oracle sur la cause).
@@ -222,19 +254,38 @@ class VaultCipher:
 
     @staticmethod
     def aad(project: str, env: str, name: str) -> bytes:
-        """Contexte authentifié liant un ciphertext à son triplet d'identité."""
+        """Contexte authentifié liant un ciphertext à son triplet d'identité.
+
+        L'identifiant du secret est le triplet ``(project, env, name)`` — l'AAD
+        du ticket #67. Les trois champs sont séparés par un octet NUL, absent
+        des identifiants validés : le triplet est donc non ambigu (deux
+        triplets différents ne produisent jamais le même AAD).
+        """
         return f"{project}\x00{env}\x00{name}".encode()
 
     def encrypt(self, plaintext: bytes, *, aad: bytes = b"") -> str:
-        """Chiffre et encode en base64 URL-safe (nonce || ciphertext || tag)."""
+        """Chiffre et encode en base64 URL-safe (nonce || ciphertext || tag).
+
+        Le nonce est tiré **à chaque appel** par ``_new_nonce`` (96 bits,
+        ``os.urandom``) : il n'est ni dérivé d'une horloge ni repris d'un
+        compteur, donc jamais réutilisé avec la même clé. Le blob retourné
+        contient les trois parties ensemble : ``nonce`` (12 octets) puis
+        ``ciphertext`` (texte chiffré + étiquette GCM de 16 octets).
+        """
         if not isinstance(plaintext, (bytes, bytearray)):
             raise TypeError("La valeur à chiffrer doit être de type bytes.")
-        nonce = secrets.token_bytes(_NONCE_SIZE_BYTES)
+        nonce = _new_nonce()
         ciphertext = self._aead.encrypt(nonce, bytes(plaintext), aad)
         return base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
 
     def decrypt(self, token: str, *, aad: bytes = b"") -> bytes:
-        """Déchiffre un jeton base64 URL-safe ; InvalidTag devient VaultCipherError."""
+        """Déchiffre un jeton base64 URL-safe ; InvalidTag devient VaultCipherError.
+
+        Le jeton est relu comme ``nonce || ciphertext || tag`` : le nonce est
+        repris tel quel, il n'est jamais régénéré. L'AAD doit être **exactement**
+        celui du chiffrement, sinon l'authentification GCM échoue (blob copié sur
+        un autre secret → ``VaultCipherError``).
+        """
         if not isinstance(token, str) or not token:
             raise VaultCipherError("Donnée chiffrée invalide.")
         try:
