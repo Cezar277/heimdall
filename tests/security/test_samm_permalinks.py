@@ -19,11 +19,22 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 FICHE = REPO / "docs" / "t22-samm.md"
 SCRIPT = REPO / "scripts" / "repin_samm.py"
 
 DEPOT_ATTENDU = ("Cezar277", "heimdall")
+
+
+@pytest.fixture
+def depot_bidon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Racine factice : ``main`` confine la fiche à ``parents[1]`` de son script."""
+    racine = tmp_path / "repo"
+    racine.mkdir()
+    monkeypatch.setattr(repin, "__file__", str(racine / "scripts" / "repin_samm.py"))
+    return racine
 
 
 def _charger_script() -> object:
@@ -108,9 +119,9 @@ def test_the_repin_rewrites_only_the_links_of_delivered_files(tmp_path: Path) ->
     assert repin.reecrire(reecrit, sha, REPO) == reecrit
 
 
-def test_the_repin_refuses_an_unknown_revision(tmp_path: Path) -> None:
+def test_the_repin_refuses_an_unknown_revision(depot_bidon: Path) -> None:
     """Un SHA inconnu (ou malformé) est refusé : aucune preuve inventée."""
-    fiche = tmp_path / "t22-samm.md"
+    fiche = depot_bidon / "t22-samm.md"
     fiche.write_text("[x](https://github.com/Cezar277/heimdall/blob/" + "c" * 40 + "/a.py)\n")
     code = repin.main(["--sha", "d" * 40, "--fiche", str(fiche)])
     assert code == 2
@@ -120,9 +131,37 @@ def test_the_repin_refuses_an_unknown_revision(tmp_path: Path) -> None:
     assert "c" * 40 in fiche.read_text(encoding="utf-8")
 
 
-def test_the_check_mode_reports_a_wrong_repository(tmp_path: Path) -> None:
-    """`--check` signale un dépôt inconnu (le cas réel de la faute de frappe)."""
+def test_the_repin_refuses_a_fiche_outside_the_repository(
+    depot_bidon: Path, tmp_path: Path
+) -> None:
+    """Une fiche hors du dépôt est refusée (pas de lecture ni d'écriture)."""
+    dehors = tmp_path / "ailleurs.md"
+    contenu = "[x](https://github.com/Cezar277/heimdall/blob/" + "a" * 40 + "/a.py)\n"
+    dehors.write_text(contenu, encoding="utf-8")
+    assert repin.main(["--check", "--fiche", str(dehors)]) == 2
+    assert repin.main(["--check", "--fiche", "../ailleurs.md"]) == 2
+    # La fiche hors dépôt n'a pas été modifiée.
+    assert dehors.read_text(encoding="utf-8") == contenu
+
+
+def test_the_check_mode_reports_a_wrong_repository(depot_bidon: Path, tmp_path: Path) -> None:
+    """Une fiche hors du dépôt est refusée (code 2) avant toute analyse des liens."""
     fiche = tmp_path / "t22-samm.md"
+    fiche.write_text(
+        "[x](https://github.com/Cezarwers/heimdall/blob/"
+        + "a" * 40
+        + "/heimdall/scanner/detect.py)\n"
+    )
+    assert repin.main(["--check", "--fiche", str(fiche)]) == 2
+    # La fiche n'a pas été modifiée : `--check` ne réécrit rien.
+    assert "Cezarwers" in fiche.read_text(encoding="utf-8")
+
+
+def test_the_check_mode_reports_a_wrong_repository_inside_the_repository(
+    depot_bidon: Path,
+) -> None:
+    """`--check` signale un dépôt inconnu quand la fiche est bien dans le dépôt."""
+    fiche = depot_bidon / "t22-samm.md"
     fiche.write_text(
         "[x](https://github.com/Cezarwers/heimdall/blob/"
         + "a" * 40
