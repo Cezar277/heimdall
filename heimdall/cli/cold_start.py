@@ -17,6 +17,7 @@ from heimdall.cli.scan import (
 )
 from heimdall.llm.qualify import ChatFn, Qualification
 from heimdall.llm.rejections import RejectionJournal, qualify_finding
+from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess
 from heimdall.mcp.masking import mask_text
 from heimdall.mcp.paths import PathEscape, confine
@@ -110,6 +111,24 @@ def qualify_target(  # noqa: PLR0913 - qualification with complete masking conte
 
 
 def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification options
+    root: Path,
+    *,
+    ci: bool = False,
+    llm: bool = True,
+    max_file_bytes: int = MAX_FILE_BYTES,
+    chat: ChatFn | None = None,
+    journal: RejectionJournal | None = None,
+) -> ColdStartReport:
+    """Collect and qualify candidates; Git failures use the scanner contract."""
+    try:
+        return _collect_cold_start(
+            root, ci=ci, llm=llm, max_file_bytes=max_file_bytes, chat=chat, journal=journal
+        )
+    except ToolFailure:
+        raise ScanError("scan impossible : entrée non analysable") from None
+
+
+def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification options
     root: Path,
     *,
     ci: bool = False,

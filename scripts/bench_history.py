@@ -12,7 +12,6 @@ import time
 from pathlib import Path
 
 from heimdall.cli.history import collect_history
-from heimdall.mcp.errors import ToolFailure
 from heimdall.scanner.errors import ScanError
 
 
@@ -23,7 +22,7 @@ def main() -> None:
     started = time.perf_counter()
     try:
         report = collect_history(args.repository, ci=True)
-    except (ScanError, ToolFailure):
+    except ScanError:
         report = None
     print(
         json.dumps(

@@ -2,7 +2,6 @@
 
 import json
 from collections.abc import Iterator
-from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,8 +13,11 @@ from typer.testing import CliRunner
 from heimdall.cli import history
 from heimdall.cli.cold_start import collect_cold_start
 from heimdall.cli.main import app
+from heimdall.cli.scan import collect
 from heimdall.llm.rejections import RejectionJournal
+from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess
+from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
@@ -84,8 +86,8 @@ def test_batches_merge_and_renames(repo: GitRepo, monkeypatch: pytest.MonkeyPatc
     repo.git("merge", "--no-ff", "side", "-m", "merge")
     report = history.collect_history(repo.root, ci=True)
     assert report.commits_scanned == 4
-    assert len(report.findings) == 1
-    assert len(report.findings[0].commits) == 4
+    assert {f.finding.file for f in report.findings} == {"first name.py", "renamed.py"}
+    assert [len(f.commits) for f in report.findings] == [2, 2]
 
 
 def test_ci_disables_llm_and_local_context_is_masked(repo: GitRepo) -> None:
@@ -209,13 +211,11 @@ def test_sha256_repository(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_rejection_is_displayed_and_does_not_remove_finding(
     repo: GitRepo,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     repo.write("config.py", SYNTHETIC + "\n" + SYNTHETIC)
     repo.commit_all("duplicate synthetic")
     journal = RejectionJournal(tmp_path / "private" / "rejections.jsonl")
-    monkeypatch.setattr(history, "qualify_target", partial(history.qualify_target, journal=journal))
     calls = []
 
     def chat(**kwargs: Any) -> SimpleNamespace:
@@ -224,7 +224,7 @@ def test_rejection_is_displayed_and_does_not_remove_finding(
             message=SimpleNamespace(content='{"verdict":"faux_positif","confidence":1}')
         )
 
-    report = history.collect_history(repo.root, chat=chat)
+    report = history.collect_history(repo.root, chat=chat, journal=journal)
     assert len(calls) == len(report.findings) == len(report.opinions) == 1
     assert SYNTHETIC not in calls[0]
     assert "faux_positif" in history.render_history(report)
@@ -257,14 +257,11 @@ def test_malformed_tree_is_refused(raw: bytes) -> None:
         history._entries(raw)
 
 
-def test_symlink_and_submodule_entries_are_never_opened() -> None:
+def test_symlink_blob_is_included_and_submodule_is_excluded() -> None:
     oid = b"a" * 40
-    assert (
-        history._entries(
-            b"120000 blob " + oid + b"\tlink\0" + b"160000 commit " + oid + b"\tsubmodule\0"
-        )
-        == []
-    )
+    assert history._entries(
+        b"120000 blob " + oid + b"\tlink\0" + b"160000 commit " + oid + b"\tsubmodule\0"
+    ) == [("link", "a" * 40)]
 
 
 def test_graft_cannot_hide_deleted_secret(repo: GitRepo) -> None:
@@ -374,3 +371,130 @@ def test_text_commit_list_is_bounded_and_json_is_exhaustive(count: int, width: i
         assert "… (+" not in text
     data = json.loads(history.render_history(report, json_output=True))
     assert data["findings"][0]["commits"] == list(commits)
+
+
+@pytest.mark.parametrize("same_blob", [True, False])
+def test_same_secret_preserves_each_file_after_deletion(repo: GitRepo, same_blob: bool) -> None:
+    repo.write("config.py", SYNTHETIC + "\n")
+    repo.commit_all("first location")
+    first = repo.git_output("rev-parse", "HEAD").strip()
+    repo.write("other.py", SYNTHETIC + ("\n" if same_blob else "\n# second location\n"))
+    repo.commit_all("second location")
+    second = repo.git_output("rev-parse", "HEAD").strip()
+    (repo.root / "config.py").unlink()
+    (repo.root / "other.py").unlink()
+    repo.commit_all("delete both")
+    calls = []
+
+    def chat(**kwargs: Any) -> SimpleNamespace:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            message=SimpleNamespace(content='{"verdict":"secret","confidence":1}')
+        )
+
+    report = history.collect_history(repo.root, chat=chat)
+    locations = {item.finding.file: set(item.commits) for item in report.findings}
+    assert locations == {"config.py": {first, second}, "other.py": {second}}
+    assert len(calls) == 1
+    text = history.render_history(report)
+    assert "config.py" in text and "other.py" in text
+    data = json.loads(history.render_history(report, json_output=True))
+    assert {item["finding"]["file"] for item in data["findings"]} == set(locations)
+    assert SYNTHETIC not in text
+
+
+@pytest.mark.parametrize("collector", ["history", "cold-start", "collect"])
+def test_invalid_root_uses_scan_error(tmp_path: Path, collector: str) -> None:
+    root = tmp_path / "missing"
+    with pytest.raises(ScanError):
+        if collector == "history":
+            history.collect_history(root)
+        elif collector == "cold-start":
+            collect_cold_start(root)
+        else:
+            collect(root, staged=False)
+
+
+@pytest.mark.parametrize("method", ["__init__", "execute", "_read_capped"])
+@pytest.mark.parametrize("collector", ["history", "cold-start", "collect"])
+def test_git_failures_use_scan_error(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    collector: str,
+) -> None:
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise ToolFailure("INTERNAL")
+
+    monkeypatch.setattr(GitAccess, method, fail)
+    with pytest.raises(ScanError):
+        if collector == "history":
+            history.collect_history(repo.root)
+        elif collector == "cold-start":
+            collect_cold_start(repo.root)
+        else:
+            collect(repo.root, staged=False)
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("limit", [True, -1, 0, 10**12])
+def test_collect_invalid_limit_uses_scan_error(repo: GitRepo, staged: bool, limit: int) -> None:
+    with pytest.raises(ScanError, match="limite de fichier invalide"):
+        collect(repo.root, staged=staged, max_file_bytes=limit)
+
+
+@pytest.mark.parametrize("method", ["blob_size", "blob_bytes", "negative-size"])
+def test_history_blob_failures_use_scan_error(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+) -> None:
+    repo.write("config.py", SYNTHETIC)
+    repo.commit_all("synthetic")
+    original = GitAccess._read_capped
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise ToolFailure("INTERNAL")
+
+    def negative(access: GitAccess, args: Any, *rest: Any, **kwargs: Any) -> bytes:
+        if "cat-file" in args and "-s" in args:
+            return b"-1\n"
+        return original(access, args, *rest, **kwargs)
+
+    if method == "negative-size":
+        monkeypatch.setattr(GitAccess, "_read_capped", negative)
+    else:
+        monkeypatch.setattr(GitAccess, method, fail)
+    with pytest.raises(ScanError, match="historique non analysable"):
+        history.collect_history(repo.root, ci=True)
+
+
+def test_ci_does_not_write_injected_journal(repo: GitRepo, tmp_path: Path) -> None:
+    repo.write("config.py", SYNTHETIC)
+    repo.commit_all("synthetic")
+    path = tmp_path / "private" / "journal.jsonl"
+    journal = RejectionJournal(path)
+
+    def forbidden(**kwargs: Any) -> Any:
+        pytest.fail("CI must not call model")
+
+    assert not history.collect_history(repo.root, ci=True, chat=forbidden, journal=journal).opinions
+    assert not path.exists()
+
+
+def test_historical_symlink_target_is_scanned_as_blob(repo: GitRepo) -> None:
+    path = repo.write("blob-input", SYNTHETIC)
+    oid = repo.git_output("hash-object", "-w", "blob-input").strip()
+    path.unlink()
+    repo.git("update-index", "--add", "--cacheinfo", f"120000,{oid},link")
+    staged = collect(repo.root, staged=True, allowlist=Allowlist.empty())
+    assert len(staged.findings) == 1
+    repo.git("commit", "-qm", "synthetic symlink target")
+    secret_commit = repo.git_output("rev-parse", "HEAD").strip()
+    repo.git("rm", "--cached", "link")
+    repo.git("commit", "-qm", "remove link")
+    report = history.collect_history(repo.root, ci=True)
+    assert len(report.findings) == 1
+    assert report.findings[0].finding.file == "link"
+    assert report.findings[0].commits == (secret_commit,)
+    assert not (repo.root / "link").exists()

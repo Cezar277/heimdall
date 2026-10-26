@@ -11,6 +11,7 @@ from pathlib import Path
 from heimdall.cli.cold_start import MAX_QUALIFICATIONS, CandidateOpinion, qualify_target
 from heimdall.cli.scan import _call_timeout, _verify_root_unchanged
 from heimdall.llm.qualify import ChatFn
+from heimdall.llm.rejections import RejectionJournal
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess, _checked_object
 from heimdall.scanner.detect import MAX_FILE_BYTES
@@ -91,9 +92,9 @@ def _entries(raw: bytes) -> list[tuple[str, str]]:
         if not separator or len(fields) != TREE_HEADER_FIELDS:
             raise ScanError("arbre historique non analysable")
         mode, kind, oid = fields
-        if mode in (b"120000", b"160000"):
-            continue  # symlink targets and submodules are never followed
-        if mode not in (b"100644", b"100755") or kind != b"blob":
+        if mode == b"160000":
+            continue  # submodule commits are not blobs
+        if mode not in (b"100644", b"100755", b"120000") or kind != b"blob":
             raise ScanError("arbre historique non analysable")
         try:
             file = path.decode("utf-8")
@@ -105,13 +106,32 @@ def _entries(raw: bytes) -> list[tuple[str, str]]:
     return entries
 
 
-def collect_history(  # noqa: PLR0912, PLR0914, PLR0915 - bounded scan accounting
+def collect_history(  # noqa: PLR0913 - explicit scan and qualification options
     root: Path,
     *,
     max_file_bytes: int = MAX_FILE_BYTES,
     ci: bool = False,
     llm: bool = True,
     chat: ChatFn | None = None,
+    journal: RejectionJournal | None = None,
+) -> HistoryReport:
+    """Scan historical blobs; Git failures become static ScanError errors."""
+    try:
+        return _collect_history(
+            root, max_file_bytes=max_file_bytes, ci=ci, llm=llm, chat=chat, journal=journal
+        )
+    except ToolFailure:
+        raise ScanError("historique non analysable") from None
+
+
+def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan accounting
+    root: Path,
+    *,
+    max_file_bytes: int = MAX_FILE_BYTES,
+    ci: bool = False,
+    llm: bool = True,
+    chat: ChatFn | None = None,
+    journal: RejectionJournal | None = None,
 ) -> HistoryReport:
     """Scan every reachable snapshot, including merges and deleted files.
 
@@ -131,7 +151,8 @@ def collect_history(  # noqa: PLR0912, PLR0914, PLR0915 - bounded scan accountin
     if shallow.strip() != b"false":
         raise ScanError("historique incomplet : clone superficiel")
     tips = _tips(access, deadline)
-    records: dict[tuple[str, str], tuple[Finding, dict[str, None]]] = {}
+    records: dict[tuple[str, str, str], tuple[Finding, dict[str, None]]] = {}
+    qualified: set[tuple[str, str]] = set()
     cache: OrderedDict[str, tuple[Finding, ...] | str] = OrderedDict()
     skipped: list[tuple[str, str, str]] = []
     opinions: list[CandidateOpinion] = []
@@ -199,7 +220,7 @@ def collect_history(  # noqa: PLR0912, PLR0914, PLR0915 - bounded scan accountin
                         cached = tuple(scanner.scan(target))
                         if llm and not ci:
                             unique = {(f.type, f.snippet_hash): f for f in cached}
-                            new = [f for key, f in unique.items() if key not in records]
+                            new = [f for key, f in unique.items() if key not in qualified]
                             if len(opinions) + len(new) > MAX_QUALIFICATIONS:
                                 raise ScanError("trop de candidats pour la qualification locale")
                             opinions.extend(
@@ -207,10 +228,12 @@ def collect_history(  # noqa: PLR0912, PLR0914, PLR0915 - bounded scan accountin
                                     target,
                                     new,
                                     chat=chat,
+                                    journal=journal,
                                     deadline=deadline,
                                     context_findings=list(cached),
                                 )
                             )
+                            qualified.update((f.type, f.snippet_hash) for f in new)
                     cache[oid] = cached
                     cache_findings += 0 if isinstance(cached, str) else len(cached)
                     while len(cache) > CACHE_SIZE or cache_findings > MAX_RECORDS:
@@ -223,7 +246,7 @@ def collect_history(  # noqa: PLR0912, PLR0914, PLR0915 - bounded scan accountin
                     continue
                 for original in cached:
                     finding = replace(original, file=file)
-                    key = (finding.type, finding.snippet_hash)
+                    key = (finding.type, finding.snippet_hash, finding.file)
                     if key not in records:
                         records[key] = (finding, {})
                     related = records[key][1]

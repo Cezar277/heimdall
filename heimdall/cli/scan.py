@@ -178,7 +178,7 @@ def collect(  # noqa: PLR0913 - explicit scan options
 ) -> ScanReport:
     """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
-    Lève ``ScanError`` (ou ``ToolFailure``) si le périmètre n'a pas pu être
+    Lève ``ScanError`` si le périmètre n'a pas pu être
     analysé **en entier** : l'appelant transforme cela en code 2, jamais en
     code 0.
 
@@ -190,16 +190,23 @@ def collect(  # noqa: PLR0913 - explicit scan options
     de ``heimdall.toml`` interne. En cas de doute, ne pas injecter
     d'allowlist non-vide ou utiliser ``config`` externe / ``--no-allowlist``.
     """
-    if staged:
-        return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
-    return _collect_tree(
-        root,
-        config=config,
-        custom_allowlist=allowlist,
-        ci=ci,
-        max_file_bytes=max_file_bytes,
-        skipped_files=skipped_files,
-    )
+    if max_file_bytes is not None and (
+        type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES
+    ):
+        raise ScanError("limite de fichier invalide")
+    try:
+        if staged:
+            return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
+        return _collect_tree(
+            root,
+            config=config,
+            custom_allowlist=allowlist,
+            ci=ci,
+            max_file_bytes=max_file_bytes,
+            skipped_files=skipped_files,
+        )
+    except ToolFailure:
+        raise ScanError(_MSG_NOT_A_REPO) from None
 
 
 def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
