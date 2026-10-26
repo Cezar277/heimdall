@@ -18,6 +18,7 @@ from heimdall.llm.rejections import RejectionJournal
 from heimdall.mcp.gitdiff import GitAccess
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
+from heimdall.scanner.finding import Finding
 
 SYNTHETIC = "AKIAIOSFODNN7EXAMPLE"
 
@@ -312,3 +313,64 @@ def test_reference_mutation_refuses_api_and_cli(
     assert result.exit_code == 2
     assert result.stdout == ""
     assert SYNTHETIC not in result.output
+
+
+@pytest.mark.parametrize("source", ["tips", "head", "rev-list"])
+@pytest.mark.parametrize("payload", [b"\xff", b"invalid-object-id"])
+def test_invalid_history_object_is_static_scan_error(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    payload: bytes,
+) -> None:
+    repo.write("readme", "safe\n")
+    repo.commit_all("root")
+    original_git = history._git
+    original_execute = GitAccess.execute
+
+    def corrupt_git(access: GitAccess, args: tuple[str, ...], cap: int, deadline: float) -> bytes:
+        if (source == "tips" and args[1:] == ("rev-parse", "--all")) or (
+            source == "rev-list" and "rev-list" in args
+        ):
+            return payload + b"\n"
+        return original_git(access, args, cap, deadline)
+
+    def corrupt_head(access: GitAccess, args: Any, **kwargs: Any) -> Any:
+        if source == "head" and args == ("rev-parse", "--verify", "HEAD"):
+            return SimpleNamespace(returncode=0, stdout=payload + b"\n")
+        return original_execute(access, args, **kwargs)
+
+    monkeypatch.setattr(history, "_git", corrupt_git)
+    monkeypatch.setattr(GitAccess, "execute", corrupt_head)
+    with pytest.raises(ScanError, match="^historique non analysable$"):
+        history.collect_history(repo.root, ci=True)
+    result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "invalid-object-id" not in result.output
+
+
+@pytest.mark.parametrize("count", [10, 11, 10_000])
+@pytest.mark.parametrize("width", [40, 64])
+def test_text_commit_list_is_bounded_and_json_is_exhaustive(count: int, width: int) -> None:
+    commits = tuple(f"{number:0{width}x}" for number in range(count))
+    finding = Finding(file="config.py", line=1, type="aws", entropy=3.0, snippet_hash="a" * 64)
+    report = history.HistoryReport(
+        findings=(history.HistoricalFinding(finding, commits),),
+        opinions=(),
+        skipped=(),
+        commits_scanned=count,
+        entries_scanned=count,
+        bytes_scanned=20,
+        elapsed_seconds=0.1,
+    )
+    text = history.render_history(report)
+    assert len(text.encode("utf-8")) < 1200
+    assert all(commit in text for commit in commits[:10])
+    if count > 10:
+        assert commits[10] not in text
+        assert f"… (+{count - 10})" in text
+    else:
+        assert "… (+" not in text
+    data = json.loads(history.render_history(report, json_output=True))
+    assert data["findings"][0]["commits"] == list(commits)

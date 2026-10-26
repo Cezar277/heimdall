@@ -11,6 +11,7 @@ from pathlib import Path
 from heimdall.cli.cold_start import MAX_QUALIFICATIONS, CandidateOpinion, qualify_target
 from heimdall.cli.scan import _call_timeout, _verify_root_unchanged
 from heimdall.llm.qualify import ChatFn
+from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess, _checked_object
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
@@ -29,6 +30,7 @@ MAX_OCCURRENCES = 1_000_000
 MAX_SECONDS = 300.0
 CACHE_SIZE = 4096
 TREE_HEADER_FIELDS = 3
+MAX_TEXT_COMMITS = 10
 WARNING = "considéré compromis, à révoquer et remplacer"
 
 
@@ -57,14 +59,21 @@ def _git(access: GitAccess, args: tuple[str, ...], cap: int, deadline: float) ->
     return access._read_capped(args, cap, timeout=_call_timeout(deadline))
 
 
+def _history_object(value: bytes) -> str:
+    try:
+        return _checked_object(value.decode("ascii"))
+    except (UnicodeDecodeError, ToolFailure):
+        raise ScanError("historique non analysable") from None
+
+
 def _tips(access: GitAccess, deadline: float) -> tuple[str, ...]:
     # Snapshot ref tips; the caller rechecks them before returning a verdict.
     # Annotated tags are peeled by rev-list. Replacements are disabled below.
     raw = _git(access, ("--no-replace-objects", "rev-parse", "--all"), MAX_TREE_BYTES, deadline)
-    tips = [_checked_object(value.decode("ascii")) for value in raw.splitlines()]
+    tips = [_history_object(value) for value in raw.splitlines()]
     head = access.execute(("rev-parse", "--verify", "HEAD"), timeout=_call_timeout(deadline))
     if head.returncode == 0:
-        tips.append(_checked_object(head.stdout.strip().decode("ascii")))
+        tips.append(_history_object(head.stdout.strip()))
     elif tips:
         raise ScanError("historique non analysable")
     return tuple(sorted(set(tips)))
@@ -146,7 +155,7 @@ def collect_history(  # noqa: PLR0912, PLR0914, PLR0915 - bounded scan accountin
         if not batch:
             break
         for value in batch:
-            commit = _checked_object(value.decode("ascii"))
+            commit = _history_object(value)
             commits += 1
             if commits > MAX_COMMITS:
                 raise ScanError("limite historique dépassée")
@@ -263,8 +272,12 @@ def render_history(report: HistoryReport, *, json_output: bool = False) -> str:
         f"{len(report.findings)} secret(s), {report.elapsed_seconds:.3f} s."
     ]
     for item in report.findings:
+        commits = ", ".join(item.commits[:MAX_TEXT_COMMITS])
+        remaining = len(item.commits) - MAX_TEXT_COMMITS
+        if remaining > 0:
+            commits += f", … (+{remaining})"
         lines.append(
-            f"Secret trouvé dans l'historique (commits {', '.join(item.commits)}) : "
+            f"Secret trouvé dans l'historique (commits {commits}) : "
             f"{WARNING}. {json.dumps(item.finding.file, ensure_ascii=True)}:"
             f"{item.finding.line} [{item.finding.type}]"
         )
