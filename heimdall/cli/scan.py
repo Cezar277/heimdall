@@ -264,8 +264,13 @@ def _read_worktree_file(path: Path, *, max_bytes: int = MAX_CONFIG_BYTES) -> byt
                 chunks.append(chunk)
                 remaining -= len(chunk)
             content = b"".join(chunks)
-            # Un fichier qui a rétréci ou grossi pendant la lecture est refusé.
-            if len(content) != expected:
+            # Refuser aussi une réécriture de même taille pendant la lecture.
+            final = os.fstat(descriptor)
+            if (
+                len(content) != expected
+                or final.st_size != metadata.st_size
+                or final.st_mtime_ns != metadata.st_mtime_ns
+            ):
                 return None
             return content
         finally:

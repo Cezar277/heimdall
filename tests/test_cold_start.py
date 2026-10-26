@@ -1,6 +1,7 @@
 """Entonnoir T38 : dépôts jetables et modèle simulé, jamais de vrai secret."""
 
 import json
+import os
 import shutil
 import time
 from collections.abc import Iterator
@@ -209,6 +210,52 @@ def test_reread_respects_configured_size_limit(
     result = CliRunner().invoke(app, ["cold-start", str(repo.root), "--max-file-bytes", "32"])
     assert result.exit_code == 2
     assert SYNTHETIC not in result.output
+
+
+@pytest.mark.parametrize("cli", [False, True])
+def test_same_size_mutation_during_reread_is_refused(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    cli: bool,
+) -> None:
+    original = cold_module._read_worktree_file
+    original_read = os.read
+    content = SYNTHETIC + "\n# context A\n"
+    repo.write("app.py", content)
+    mutations = []
+
+    def racing_read(path: Path, *, max_bytes: int) -> bytes | None:
+        before = path.stat()
+
+        def rewrite_after_read(descriptor: int, size: int) -> bytes:
+            chunk = original_read(descriptor, size)
+            if chunk and not mutations:
+                path.write_text(content.replace("context A", "context B"), encoding="utf-8")
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+                assert path.stat().st_size == before.st_size
+                mutations.append(True)
+            return chunk
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "read", rewrite_after_read)
+            return original(path, max_bytes=max_bytes)
+
+    def forbidden(**kwargs: Any) -> Any:
+        pytest.fail("modified context must not reach LLM")
+
+    monkeypatch.setattr(cold_module, "_read_worktree_file", racing_read)
+    monkeypatch.setattr(
+        main_module, "collect_cold_start", partial(collect_cold_start, chat=forbidden)
+    )
+    if cli:
+        result = CliRunner().invoke(app, ["cold-start", str(repo.root)])
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert SYNTHETIC not in result.output
+    else:
+        with pytest.raises(ScanError, match="^contenu modifié depuis le scan déterministe$"):
+            collect_cold_start(repo.root, chat=forbidden)
+    assert mutations == [True]
 
 
 def test_broken_journal_refuses_api_and_cli(
