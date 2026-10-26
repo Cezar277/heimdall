@@ -119,3 +119,25 @@ Régression complète après correction : **2265 passed**, **16 skipped**,
 **247,31 s**. Journal : `bench-results/t38-review-full-tests.txt`.
 Les deux fichiers de couverture sont distincts. Aucun `/ci` ni déclenchement
 manuel de CI distante n'est effectué.
+
+## Complément de revue LOW — 26 octobre 2026
+
+Commit : `7000236ef4e584d3b6604a206da65f95db07c606`.
+Un décodeur commun valide les SHA des références, de HEAD et de `rev-list` :
+`UnicodeDecodeError` et `ToolFailure` de validation deviennent une `ScanError`
+au message statique « historique non analysable ». La CLI conserve son code 2.
+Le texte affiche au plus dix SHA par finding puis le nombre restant ; le JSON
+conserve toutes les associations.
+
+Six nouveaux cas couvrent les trois sources avec un octet non ASCII ou un
+SHA ASCII invalide, en API et en CLI. Six autres couvrent l'affichage de
+10, 11 et 10 000 commits en SHA-1 et SHA-256, avec une sortie texte de moins
+de 1200 octets pour le finding testé et un JSON exhaustif.
+
+Validation : **66 passed**, couverture ciblée **95,54 %** ; Ruff, Mypy strict
+(48 fichiers) et Bandit passent. Journal : `bench-results/t38-low-targeted-tests.txt`.
+Le mapping SAMM dispose de liens permanents vers ce code et ces tests.
+La suite complète n'est pas relancée pour ce complément limité au décodage
+des identifiants et au rendu ; son dernier résultat archivé ci-dessus reste
+**2265 passed**, couverture **91,51 %**, pour le correctif précédent.
+Aucun `/ci` n'est envoyé.

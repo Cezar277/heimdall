@@ -7,6 +7,7 @@ conformément à la demande de compléter tout T38. Le périmètre initial limit
 fusionner #107 isolément. La relecture croisée reste requise avant fusion.
 
 Code et tests corrigés : `78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe`.
+Complément LOW : `7000236ef4e584d3b6604a206da65f95db07c606` (preuves ci-dessous).
 Les liens ci-dessous désignent ce snapshot, pas la branche mouvante.
 
 | Ticket / pratique SAMM | Exigence et menace | Implémentation permanente | Preuve permanente |
@@ -27,6 +28,19 @@ Résultats complets après correction : voir [t38-completion.md](t38-completion.
 Les mesures historiques de performance ne sont pas des mesures du correctif ;
 les refus sur Flask/Click restent explicitement consignés. Aucune CI distante
 n'est revendiquée ni déclenchée.
+
+## Complément LOW : contrat des SHA et disponibilité de l'affichage
+
+| Pratique SAMM / exigence | Implémentation permanente | Test permanent |
+| --- | --- | --- |
+| Vérification / contrat d'erreur : références, HEAD et rev-list non ASCII ou SHA invalide → `ScanError` statique | [_history_object](https://github.com/Cezar277/heimdall/blob/7000236ef4e584d3b6604a206da65f95db07c606/heimdall/cli/history.py#L62), utilisé par `_tips` et la boucle des commits | [six cas, bibliothèque et CLI](https://github.com/Cezar277/heimdall/blob/7000236ef4e584d3b6604a206da65f95db07c606/tests/test_history.py#L320) |
+| Conception / disponibilité : au plus dix SHA par finding en texte, nombre restant visible ; JSON exhaustif | [rendu borné](https://github.com/Cezar277/heimdall/blob/7000236ef4e584d3b6604a206da65f95db07c606/heimdall/cli/history.py#L275), [JSON exhaustif](https://github.com/Cezar277/heimdall/blob/7000236ef4e584d3b6604a206da65f95db07c606/heimdall/cli/history.py#L258) | [10, 11 et 10 000 commits, SHA-1 et SHA-256 ; texte < 1200 octets dans ces cas et JSON complet](https://github.com/Cezar277/heimdall/blob/7000236ef4e584d3b6604a206da65f95db07c606/tests/test_history.py#L355) |
+
+**66 tests ciblés passent**, couverture cold start + historique **95,54 %**.
+[Journal permanent](https://github.com/Cezar277/heimdall/blob/7000236ef4e584d3b6604a206da65f95db07c606/bench-results/t38-low-targeted-tests.txt#L1).
+Ruff, Mypy strict (48 fichiers) et Bandit passent. Ce complément ne revendique
+pas de nouvelle exécution de la suite complète ni de CI distante ; le dernier
+résultat global archivé reste celui du correctif précédent.
 
 ## Archive : preuve initiale T38.1 / #107, avant extension du périmètre
 

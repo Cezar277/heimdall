@@ -74,6 +74,10 @@ et de couvrir les merges, renommages et fichiers supprimés.
 Un même couple type/empreinte HMAC produit un seul finding, avec la liste
 des commits qui le contiennent. Le finding conserve un emplacement représentatif ;
 la liste ne prétend pas donner tous les emplacements dans chaque commit.
+Le rendu texte affiche au plus dix SHA par finding, puis `… (+N)` pour les
+commits supplémentaires. `--json` conserve la liste complète des commits.
+Les erreurs de décodage ASCII et de validation des SHA lus depuis les
+références, HEAD et `rev-list` deviennent une `ScanError` statique.
 Les sept champs Finding v1 restent inchangés ; les commits et l'alerte sont
 dans l'enveloppe JSON `heimdall.history.v1`. L'allowlist du présent n'est pas
 appliquée au passé : elle ne peut pas masquer rétroactivement un secret.
