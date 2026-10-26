@@ -333,7 +333,8 @@ def test_invalid_history_object_is_static_scan_error(
         return original_git(access, args, cap, deadline)
 
     def corrupt_head(access: GitAccess, args: Any, **kwargs: Any) -> Any:
-        if source == "head" and args == ("rev-parse", "--verify", "HEAD"):
+        if source == "head" and args[-3:] == ("rev-parse", "--verify", "HEAD"):
+            assert args[0] == "--no-replace-objects"
             return SimpleNamespace(returncode=0, stdout=payload + b"\n")
         return original_execute(access, args, **kwargs)
 

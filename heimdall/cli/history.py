@@ -72,7 +72,10 @@ def _tips(access: GitAccess, deadline: float) -> tuple[str, ...]:
     # Annotated tags are peeled by rev-list. Replacements are disabled below.
     raw = _git(access, ("--no-replace-objects", "rev-parse", "--all"), MAX_TREE_BYTES, deadline)
     tips = [_history_object(value) for value in raw.splitlines()]
-    head = access.execute(("rev-parse", "--verify", "HEAD"), timeout=_call_timeout(deadline))
+    head = access.execute(
+        ("--no-replace-objects", "rev-parse", "--verify", "HEAD"),
+        timeout=_call_timeout(deadline),
+    )
     if head.returncode == 0:
         tips.append(_history_object(head.stdout.strip()))
     elif tips:

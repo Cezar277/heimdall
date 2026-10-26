@@ -155,7 +155,7 @@ def test_qualification_limit_inclusive(repo: GitRepo) -> None:
         qualify_target(target, list(report.scan.findings) + [report.scan.findings[0]])
 
 
-@pytest.mark.parametrize("mutation", ["removed", "binary", "unreadable"])
+@pytest.mark.parametrize("mutation", ["removed", "binary", "undecodable", "unreadable"])
 def test_content_mutation_refuses_api_and_cli(
     repo: GitRepo,
     monkeypatch: pytest.MonkeyPatch,
@@ -169,6 +169,8 @@ def test_content_mutation_refuses_api_and_cli(
             repo.write("app.py", "# candidate removed\n")
         elif mutation == "binary":
             repo.write_bytes("app.py", b"\x89PNG\r\n\x1a\n" + b"\x00\xff" * 100)
+        elif mutation == "undecodable":
+            repo.write_bytes("app.py", b"\x00" + SYNTHETIC.encode() + b"\n#")
         else:
             monkeypatch.setattr(cold_module, "_read_worktree_file", lambda *args, **kwargs: None)
         return report
@@ -181,7 +183,7 @@ def test_content_mutation_refuses_api_and_cli(
             assert result.exit_code == 2
             assert SYNTHETIC not in result.output
         else:
-            with pytest.raises(ScanError, match="contenu modifié"):
+            with pytest.raises(ScanError, match="^contenu modifié depuis le scan déterministe$"):
                 collect_cold_start(repo.root, chat=_secret_chat)
 
 

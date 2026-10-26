@@ -163,7 +163,10 @@ def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification opti
         except PathEscape:
             raise ScanError("chemin de qualification hors périmètre") from None
         raw = _read_worktree_file(path, max_bytes=max_file_bytes)
-        text = decode_text(raw) if raw is not None else None
+        try:
+            text = decode_text(raw) if raw is not None else None
+        except ScanError:
+            raise ScanError("contenu modifié depuis le scan déterministe") from None
         if text is None:
             raise ScanError("contenu modifié depuis le scan déterministe")
         target = FileTarget(file, text)
