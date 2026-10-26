@@ -62,7 +62,11 @@ heimdall cold-start . --ci --max-file-bytes 524288
 `cold-start` analyse les fichiers actuels ; `deep-scan` analyse les snapshots
 de tous les commits accessibles depuis les branches, tags et HEAD détaché.
 Exécuter les deux pour vérifier le présent et le passé. Les références sont
-figées au début. Les commits sont énumérés par lots de 128 ; un seul arbre et
+figées au début et relues avant le verdict : une divergence produit une
+`ScanError` statique et un code 2. Cette vérification compare les ensembles de
+SHA observés aux deux instants ; ce n'est pas un verrou des références. Une
+écriture après la vérification finale nécessite de relancer le scan.
+Les commits sont énumérés par lots de 128 ; un seul arbre et
 un seul blob sont lus à la fois. Cette variante de `rev-list` puis lecture
 des snapshots permet aussi d'associer les commits où le secret reste inchangé
 et de couvrir les merges, renommages et fichiers supprimés.
@@ -84,6 +88,12 @@ connus sont exclus. Les objets absents, clones superficiels, sorties invalides
 et dépassements de budget donnent une erreur d'outillage. Les commits devenus
 inaccessibles (objets pendants, reflogs seuls) et les dépôts de sous-modules
 ne font pas partie de ce périmètre.
+
+Un suffixe technique seul n'autorise aucune exclusion : si le décodage
+échoue, le repli exige aussi `is_known_binary(data)`, comme le scanner de
+référence. Un contenu inconnu avec NUL et texte dans `evil.png` est refusé
+en `ScanError` / code 2. Le parseur d'arbres convertit aussi les noms non UTF-8
+et chemins invalides en `ScanError` statique.
 
 ## Taille, lots et mémoire (#109)
 

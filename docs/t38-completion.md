@@ -8,7 +8,7 @@ explicitement ses preuves à T38.1. Ce complément apporte le code et les
 preuves locales des trois autres sous-tickets. Les validations humaines et
 la CI distante ne sont pas déclarées acquises.
 
-## Preuves par exigence
+## Preuves par exigence — état initial du complément
 
 | Ticket / menace | Implémentation | Vérification |
 | --- | --- | --- |
@@ -21,9 +21,10 @@ la CI distante ne sont pas déclarées acquises.
 | #110 : mesure reproductible | `scripts/bench_history.py`, `scripts/bench_history_fixture.py` et `bench-results/t38-*.json` | Temps, mémoire maximale et résultat conservés ci-dessous |
 | LLM consultatif, sans pouvoir en CI | Réutilisation de `qualify_target` et T33, contexte intégralement masqué avant sélection | Aucun appel en CI, dédoublonnage des appels, rejet affiché et journalisé sans supprimer le finding |
 
-Les références module/ligne correspondent à la livraison locale ; les liens
-permanents GitHub avec SHA et les PR par sous-ticket restent à établir lors
-de la publication et de la relecture.
+Ce tableau décrit le premier complément (`64ccb9b`). Le mapping corrigé et
+les liens permanents actuels sont dans [t38-samm.md](t38-samm.md).
+La PR #193 couvre désormais explicitement tout T38 (#107–#110), conformément
+à la demande utilisateur ; son périmètre initial #107 seul est remplacé.
 
 ## Mesures du 26 octobre 2026
 
@@ -92,3 +93,29 @@ les contrôles ciblés exécutés séparément.
 
 La CI distante, la relecture croisée et la fermeture des tickets ne sont
 pas effectuées par cette livraison locale.
+
+## Correction de revue — 26 octobre 2026
+
+Code et tests : `78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe`.
+
+- Repli binaire aligné sur `Scanner._decode_data` : le suffixe technique
+  exige aussi un binaire connu. Les données indécodables inconnues sont refusées.
+- `_entries` transforme noms non UTF-8 et chemins invalides en `ScanError`
+  statique ; aucun `ValueError` ou `UnicodeDecodeError` brut n'est revendiqué
+  comme contrat de parsing.
+- `max_file_bytes` est validé avant tout accès et appliqué à la relecture.
+- Les références sont comparées aux SHA de départ avant le verdict. Un commit
+  concurrent observé produit une erreur ; ce contrôle ne verrouille pas Git
+  et ne couvre pas une écriture après sa dernière observation.
+- Les titres, périmètres et preuves de la PR sont alignés sur #107–#110.
+
+Tests ciblés : **54 passed**, couverture **95,40 %**, journal
+`bench-results/t38-review-targeted-tests.txt` ; Ruff, Mypy strict
+(48 fichiers) et Bandit passent. Format des quatre fichiers Python corrigés
+vérifié avec Ruff ; `git diff --check` passe.
+
+Régression complète après correction : **2265 passed**, **16 skipped**,
+**4480 subtests passed**, 7 avertissements, couverture **91,51 %**, durée
+**247,31 s**. Journal : `bench-results/t38-review-full-tests.txt`.
+Les deux fichiers de couverture sont distincts. Aucun `/ci` ni déclenchement
+manuel de CI distante n'est effectué.

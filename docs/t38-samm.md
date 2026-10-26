@@ -1,4 +1,34 @@
-# T38.1 / #107 — preuves SAMM après revue
+# T38 / #107–#110 — preuves SAMM après revue
+
+Périmètre de la [PR #193](https://github.com/Cezar277/heimdall/pull/193) :
+ensemble du ticket #38, sous-tickets #107, #108, #109 et #110 inclus,
+conformément à la demande de compléter tout T38. Le périmètre initial limité
+à #107 est remplacé par ce périmètre explicite ; la PR ne permet pas de
+fusionner #107 isolément. La relecture croisée reste requise avant fusion.
+
+Code et tests corrigés : `78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe`.
+Les liens ci-dessous désignent ce snapshot, pas la branche mouvante.
+
+| Ticket / pratique SAMM | Exigence et menace | Implémentation permanente | Preuve permanente |
+| --- | --- | --- | --- |
+| #107 / Conception, exigences de sécurité | Divulgation : contexte masqué avant troncature, seuls les candidats sont qualifiés | [candidate_context](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/cold_start.py#L62) | [candidats masqués et contexte borné](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_cold_start.py#L53) |
+| #107 / Gouvernance, politique et conformité | Aucun pouvoir autonome du LLM, aucun appel/journal en CI | [collect_cold_start](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/cold_start.py#L112) | [rejet conservé et journalisé](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_cold_start.py#L82), [CI explicite sans appel/journal](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_cold_start.py#L236) |
+| #107 / Conception, architecture sécurisée | Altération / disponibilité : relecture à la taille configurée, échéance et identité racine | [relecture bornée](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/cold_start.py#L142) | [croissance entre les passes](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_cold_start.py#L188), [deadline](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_cold_start.py#L253), [substitution racine](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_cold_start.py#L286) |
+| #108 / Vérification, tests pilotés par les exigences | Retrouver les secrets supprimés, dédoublonner avec tous les commits | [collect_history](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/history.py#L99) | [suppression et dédoublonnage](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_history.py#L35), [merges et renommages](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_history.py#L72) |
+| #108 / Conception, exigences de sécurité | Refus par défaut : un suffixe technique ne masque pas un blob inconnu | [décodage et repli avec is_known_binary](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/history.py#L181) | [evil.png / evil.zip / evil.txt : ScanError et code 2](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_history.py#L279) |
+| #108 / Vérification, contrat d'erreur | Entrées non fiables : erreurs statiques de parsing, sans UnicodeDecodeError / ValueError bruts | [_entries](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/history.py#L73) | [chemin hors racine, nom et OID non UTF-8, arbres invalides](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_history.py#L254) |
+| #108 / Conception, architecture sécurisée | Altération : références figées et revérifiées avant verdict | [snapshot des tips](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/history.py#L60), [vérification finale](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/history.py#L227) | [commit concurrent : refus API et CLI](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_history.py#L290) |
+| #109 / Conception, disponibilité | Lots et mémoire bornés ; fichier trop gros signalé et scan incomplet en code 2 | [budgets et cache](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/history.py#L22) | [blob jamais lu au-delà du plafond](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_history.py#L108), [budgets](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_history.py#L156), [mesure 5000 commits](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/bench-results/t38-synthetic.json#L1) |
+| #110 / Vérification, preuve opérateur | Alerte compromis/révocation et mesure du temps | [render_history](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/heimdall/cli/history.py#L241) | [alerte et absence de secret brut](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/tests/test_history.py#L35), [mesures et limites](t38-completion.md) |
+
+Tests ciblés après cette correction : **54 passed**, couverture **95,40 %**.
+[Journal permanent](https://github.com/Cezar277/heimdall/blob/78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe/bench-results/t38-review-targeted-tests.txt#L1).
+Résultats complets après correction : voir [t38-completion.md](t38-completion.md).
+Les mesures historiques de performance ne sont pas des mesures du correctif ;
+les refus sur Flask/Click restent explicitement consignés. Aucune CI distante
+n'est revendiquée ni déclenchée.
+
+## Archive : preuve initiale T38.1 / #107, avant extension du périmètre
 
 Périmètre : entonnoir regex/entropie puis LLM local.
 Ticket : [#107](https://github.com/Cezar277/heimdall/issues/107).
