@@ -177,3 +177,22 @@ durée **247,93 s**. Journal : `bench-results/t38-audit-full-tests.txt`.
 Le format des cinq fichiers Python modifiés et `git diff --check` passent.
 Aucune CI distante n'est lancée. Le SHA de merge devra être renseigné après une fusion
 effective ; cette correction ne fusionne pas la PR.
+
+## Complément LOW : HEAD explicite et décodage de relecture
+
+Code et tests : `1de5b13dc9790d9836cf27778e2cccdfe03d75e9`.
+La lecture `rev-parse --verify HEAD` reçoit désormais explicitement
+`--no-replace-objects`, en complément de `GIT_NO_REPLACE_OBJECTS=1` dans
+l'environnement confiné. Les tests de HEAD non ASCII/invalide vérifient cette option.
+Un `ScanError` de décodage pendant la relecture du cold start est converti
+en `ScanError` au message exact « contenu modifié depuis le scan déterministe ».
+Le cas de mutation vers des octets indécodables teste le vrai décodeur,
+le contrat bibliothèque et le refus CLI en code 2.
+
+**94 tests ciblés passent**, couverture **95,72 %** ; journal
+`bench-results/t38-head-decode-tests.txt`. Ruff, format des quatre fichiers
+Python corrigés, Mypy strict (48 fichiers), Bandit et `git diff --check` passent.
+La suite complète n'est pas relancée pour ces deux correctifs locaux ; le
+dernier résultat global reste **2304 passed**, **91,54 %**, avant ce complément.
+Les permaliens SAMM sont actualisés pour ces deux exigences. Aucun `/ci`
+n'est envoyé et aucun SHA de merge n'est inventé avant fusion.

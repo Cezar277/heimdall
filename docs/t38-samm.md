@@ -62,6 +62,23 @@ complète après ce complément : [t38-completion.md](t38-completion.md).
 Le SHA final de merge est encore inconnu : à inscrire ici après la fusion
 effective par le relecteur ; aucun SHA de branche n'est présenté comme SHA de merge.
 
+## Complément LOW : lecture de HEAD et erreur de décodage
+
+Snapshot corrigé : `1de5b13dc9790d9836cf27778e2cccdfe03d75e9`.
+
+| Exigence | Implémentation permanente | Test permanent |
+| --- | --- | --- |
+| Confinement Git : neutralisation explicite des objets remplacés pour HEAD, en plus de l'environnement | [argv HEAD avec --no-replace-objects](https://github.com/Cezar277/heimdall/blob/1de5b13dc9790d9836cf27778e2cccdfe03d75e9/heimdall/cli/history.py#L75) | [les cas HEAD vérifient aussi l'option explicite](https://github.com/Cezar277/heimdall/blob/1de5b13dc9790d9836cf27778e2cccdfe03d75e9/tests/test_history.py#L317) |
+| Contrat d'erreur bibliothèque : échec de décodage à la relecture → ScanError « contenu modifié depuis le scan déterministe » | [conversion du décodage](https://github.com/Cezar277/heimdall/blob/1de5b13dc9790d9836cf27778e2cccdfe03d75e9/heimdall/cli/cold_start.py#L166) | [mutation vers un contenu indécodable, message exact en API, code 2 en CLI](https://github.com/Cezar277/heimdall/blob/1de5b13dc9790d9836cf27778e2cccdfe03d75e9/tests/test_cold_start.py#L159) |
+
+**94 tests ciblés passent**, couverture **95,72 %**.
+[Journal permanent](https://github.com/Cezar277/heimdall/blob/1de5b13dc9790d9836cf27778e2cccdfe03d75e9/bench-results/t38-head-decode-tests.txt#L1).
+Ruff, format des quatre fichiers modifiés, Mypy strict (48 fichiers), Bandit
+et `git diff --check` passent. La suite complète n'est pas relancée pour ce
+complément de deux chemins ; sa dernière preuve globale reste celle de
+`359155d` (**2304 passed**, **91,54 %**). Aucun `/ci` n'est envoyé.
+Le SHA de merge reste à renseigner après fusion effective.
+
 ## Archive : preuve initiale T38.1 / #107, avant extension du périmètre
 
 Périmètre : entonnoir regex/entropie puis LLM local.
