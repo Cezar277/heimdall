@@ -74,6 +74,7 @@ def _not_link(p: Path) -> bool:
     except OSError:
         raise ScanError(_SCAN_ERROR) from None
 
+
 MAX_FILE_BYTES: Final[int] = 1_048_576
 MULTILINE_WINDOW: Final[int] = 4096
 #: Plafond du nombre de fichiers analysés en une passe (#29). Au-delà, le
@@ -154,7 +155,6 @@ def _decode_data(data: bytes, *, allow_binary_suffix: bool) -> str | None:
         raise
 
 
-
 class Scanner:
     """Scanner déterministe d'une racine confinée (couche système #22/#59).
 
@@ -181,6 +181,8 @@ class Scanner:
         "_max_bytes",
         "_max_files",
         "_max_findings",
+        "_max_file_bytes",
+        "_skipped_files",
         "_root",
         "_single",
         "_strict",
@@ -198,12 +200,16 @@ class Scanner:
         max_bytes: int | None = None,
         max_findings: int | None = None,
         allowlist: Allowlist | None = None,
+        max_file_bytes: int | None = None,
+        skipped_files: list[str] | None = None,
     ) -> None:
         # Les bornes sont validées avant tout accès disque : une surcharge
         # explicite ne peut ni annuler ni relever les plafonds par défaut.
         self._max_files = _checked_bound(max_files, MAX_FILES)
         self._max_bytes = _checked_bound(max_bytes, MAX_TOTAL_BYTES)
         self._max_findings = _checked_bound(max_findings, MAX_FINDINGS)
+        self._max_file_bytes = _checked_bound(max_file_bytes, MAX_FILE_BYTES)
+        self._skipped_files = skipped_files
         resolved = _resolve_root(root)
         if resolved.is_dir():
             self._root = resolved
@@ -318,7 +324,7 @@ class Scanner:
                     continue
                 yield path, _validate_relative_path(relative)
 
-    def _read_text(
+    def _read_text(  # noqa: PLR0912 - descriptor identity and size checks
         self,
         path: Path,
         *,
@@ -351,11 +357,16 @@ class Scanner:
         chunks: list[bytes] = []
         try:
             after = os.fstat(descriptor)
-            if not stat.S_ISREG(after.st_mode) or after.st_size > MAX_FILE_BYTES:
+            if not stat.S_ISREG(after.st_mode):
                 raise ScanError(_SCAN_ERROR)
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                 raise ScanError(_SCAN_ERROR)
-            remaining = MAX_FILE_BYTES + 1
+            if after.st_size > self._max_file_bytes:
+                if self._skipped_files is None:
+                    raise ScanError(_SCAN_ERROR)
+                self._skipped_files.append(path.relative_to(self._root).as_posix())
+                return None, 0
+            remaining = self._max_file_bytes + 1
             while remaining > 0:
                 chunk = os.read(descriptor, min(_READ_CHUNK, remaining))
                 if not chunk:
@@ -369,7 +380,7 @@ class Scanner:
                 and final.st_mtime_ns == after.st_mtime_ns
                 and len(data) == after.st_size
             )
-            if not unchanged or len(data) > MAX_FILE_BYTES:
+            if not unchanged or len(data) > self._max_file_bytes:
                 raise ScanError(_SCAN_ERROR)
         except OSError:
             raise ScanError(_SCAN_ERROR) from None
@@ -481,9 +492,7 @@ class Scanner:
                 secret_type=match.secret_type,
             )
             if rule_name is not None:
-                self._traces.append(
-                    AllowlistTrace(rule=rule_name, file=relative, line=line_number)
-                )
+                self._traces.append(AllowlistTrace(rule=rule_name, file=relative, line=line_number))
                 return
 
         findings.append(

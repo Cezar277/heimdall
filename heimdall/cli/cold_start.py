@@ -56,6 +56,7 @@ class CandidateOpinion:
 class ColdStartReport:
     scan: ScanReport
     opinions: tuple[CandidateOpinion, ...]
+    skipped_files: tuple[str, ...] = ()
 
 
 def candidate_context(target: FileTarget, finding: Finding, findings: list[Finding]) -> str:
@@ -76,13 +77,14 @@ def candidate_context(target: FileTarget, finding: Finding, findings: list[Findi
     return "\n".join(context)
 
 
-def qualify_target(
+def qualify_target(  # noqa: PLR0913 - qualification with complete masking context
     target: FileTarget,
     findings: list[Finding],
     *,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
     deadline: float | None = None,
+    context_findings: list[Finding] | None = None,
 ) -> list[CandidateOpinion]:
     """L'avis ne supprime jamais un finding, même en cas de faux positif."""
     if len(findings) > MAX_QUALIFICATIONS:
@@ -93,7 +95,12 @@ def qualify_target(
     for finding in findings:
         _check_deadline(deadline)
         opinion = qualify_finding(
-            finding, candidate_context(target, finding, findings), chat=chat, journal=journal
+            finding,
+            candidate_context(
+                target, finding, findings if context_findings is None else context_findings
+            ),
+            chat=chat,
+            journal=journal,
         )
         # Un appel en cours conserve le timeout réseau de T28 (60 s).
         # Aucun appel suivant n'est lancé après la deadline globale.
@@ -102,22 +109,24 @@ def qualify_target(
     return opinions
 
 
-def collect_cold_start(
+def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification options
     root: Path,
     *,
     ci: bool = False,
     llm: bool = True,
+    max_file_bytes: int = MAX_FILE_BYTES,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:
     # Capturer l'identité AVANT collect ferme aussi l'intervalle entre les
     # deux passes, et pas seulement les substitutions pendant la relecture.
     access = GitAccess(root) if llm and not ci else None
-    scan = collect(root, staged=False, ci=ci)
+    skipped: list[str] = []
+    scan = collect(root, staged=False, ci=ci, max_file_bytes=max_file_bytes, skipped_files=skipped)
     if access is not None:
         _verify_root_unchanged(access, root)
     if access is None or not scan.findings:
-        return ColdStartReport(scan, ())
+        return ColdStartReport(scan, (), tuple(skipped))
     if len(scan.findings) > MAX_QUALIFICATIONS:
         raise ScanError("trop de candidats pour la qualification locale")
     deadline = time.monotonic() + MAX_QUALIFICATION_SECONDS
@@ -149,7 +158,7 @@ def collect_cold_start(
         )
     _verify_root_unchanged(access, root)
     _check_deadline(deadline)
-    return ColdStartReport(scan, tuple(opinions))
+    return ColdStartReport(scan, tuple(opinions), tuple(skipped))
 
 
 def render_cold_start(report: ColdStartReport, *, json_output: bool = False) -> str:
@@ -159,11 +168,18 @@ def render_cold_start(report: ColdStartReport, *, json_output: bool = False) -> 
                 "schema": "heimdall.cold-start.v1",
                 "scan": json.loads(render_json(report.scan)),
                 "opinions": [opinion.as_dict() for opinion in report.opinions],
+                "complete": not report.skipped_files,
+                "skipped_files": report.skipped_files,
             },
             ensure_ascii=True,
             allow_nan=False,
         )
     lines = [render_text(report.scan)]
+    for file in report.skipped_files:
+        lines.append(
+            f"Fichier ignoré {json.dumps(file, ensure_ascii=True)} : "
+            "taille maximale dépassée. Scan incomplet."
+        )
     for opinion in report.opinions:
         result = opinion.qualification
         lines.append(

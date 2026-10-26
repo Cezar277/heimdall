@@ -4,6 +4,8 @@ Périmètre : entonnoir regex/entropie puis LLM local.
 Ticket : [#107](https://github.com/Cezar277/heimdall/issues/107).
 PR : [#193](https://github.com/Cezar277/heimdall/pull/193).
 Les sous-tickets #108–#110 ne sont pas couverts par cette preuve.
+Le complément d'implémentation et les mesures de ces sous-tickets sont dans
+[t38-completion.md](t38-completion.md).
 
 Commit de code vérifié : `808ceab1a855cc82fc76020a0e29507c8fec1fe5`.
 

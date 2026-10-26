@@ -1,0 +1,273 @@
+"""T38: disposable history, synthetic secrets, bounded reads and safe output."""
+
+import json
+from collections.abc import Iterator
+from functools import partial
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from support.git_repo import GitRepo
+from typer.testing import CliRunner
+
+from heimdall.cli import history
+from heimdall.cli.cold_start import collect_cold_start
+from heimdall.cli.main import app
+from heimdall.llm.rejections import RejectionJournal
+from heimdall.mcp.gitdiff import GitAccess
+from heimdall.scanner.detect import MAX_FILE_BYTES
+from heimdall.scanner.errors import ScanError
+
+SYNTHETIC = "AKIAIOSFODNN7EXAMPLE"
+
+
+@pytest.fixture
+def repo(monkeypatch: pytest.MonkeyPatch) -> Iterator[GitRepo]:
+    monkeypatch.setenv("HEIMDALL_SNIPPET_HMAC_KEY", "01" * 32)
+    value = GitRepo("heimdall-history-")
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+def test_deleted_secret_deduplicates_all_snapshots(repo: GitRepo) -> None:
+    repo.write("config.py", f'key = "{SYNTHETIC}"\n')
+    repo.commit_all("synthetic secret")
+    first = repo.git_output("rev-parse", "HEAD").strip()
+    repo.write("readme.txt", "safe\n")
+    repo.commit_all("unchanged secret")
+    second = repo.git_output("rev-parse", "HEAD").strip()
+    (repo.root / "config.py").unlink()
+    repo.commit_all("remove secret")
+    report = history.collect_history(repo.root, ci=True)
+    assert report.complete
+    assert report.commits_scanned == 3
+    assert len(report.findings) == 1
+    assert set(report.findings[0].commits) == {first, second}
+    assert SYNTHETIC not in history.render_history(report, json_output=True)
+    assert "compromis" in history.render_history(report)
+    assert "révoquer et remplacer" in history.render_history(report)
+    result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["complete"] is True
+
+
+def test_all_branches_tags_and_detached_head(repo: GitRepo) -> None:
+    repo.write("readme", "safe")
+    repo.commit_all("root")
+    base = repo.git_output("rev-parse", "HEAD").strip()
+    repo.git("checkout", "-qb", "side")
+    repo.write("hidden.py", SYNTHETIC)
+    repo.commit_all("side secret")
+    repo.git("tag", "-a", "archive", "-m", "archive")
+    repo.git("checkout", "--detach", base)
+    repo.git("branch", "-D", "side")
+    report = history.collect_history(repo.root, ci=True)
+    assert report.commits_scanned == 2
+    assert len(report.findings) == 1
+
+
+def test_batches_merge_and_renames(repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(history, "BATCH_SIZE", 1)
+    repo.write("first name.py", SYNTHETIC)
+    repo.commit_all("root")
+    base = repo.git_output("branch", "--show-current").strip()
+    repo.git("checkout", "-qb", "side")
+    repo.git("mv", "first name.py", "renamed.py")
+    repo.commit_all("rename")
+    repo.git("checkout", base)
+    repo.write("readme", "safe")
+    repo.commit_all("main")
+    repo.git("merge", "--no-ff", "side", "-m", "merge")
+    report = history.collect_history(repo.root, ci=True)
+    assert report.commits_scanned == 4
+    assert len(report.findings) == 1
+    assert len(report.findings[0].commits) == 4
+
+
+def test_ci_disables_llm_and_local_context_is_masked(repo: GitRepo) -> None:
+    repo.write("config.py", SYNTHETIC)
+    repo.commit_all("synthetic")
+    calls = []
+
+    def chat(**kwargs: Any) -> SimpleNamespace:
+        calls.append(json.dumps(kwargs))
+        return SimpleNamespace(
+            message=SimpleNamespace(content='{"verdict":"secret","confidence":1}')
+        )
+
+    assert not history.collect_history(repo.root, ci=True, llm=True, chat=chat).opinions
+    assert not calls
+    report = history.collect_history(repo.root, chat=chat)
+    assert len(calls) == len(report.opinions) == 1
+    assert SYNTHETIC not in calls[0]
+
+
+def test_oversized_blobs_never_read_and_cli_is_incomplete(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo.write("large.txt", "x" * 100)
+    repo.commit_all("large")
+
+    def forbidden(*args: Any, **kwargs: Any) -> bytes:
+        pytest.fail("oversized content must not be read")
+
+    monkeypatch.setattr(GitAccess, "blob_bytes", forbidden)
+    report = history.collect_history(repo.root, ci=True, max_file_bytes=10)
+    assert not report.complete
+    assert report.bytes_scanned == 0
+    assert report.skipped[0][0] == "large.txt"
+    result = CliRunner().invoke(
+        app, ["deep-scan", str(repo.root), "--ci", "--json", "--max-file-bytes", "10"]
+    )
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["complete"] is False
+
+
+def test_cold_start_size_limit_reports_skip(repo: GitRepo) -> None:
+    repo.write("large.txt", "x" * 100)
+    report = collect_cold_start(repo.root, ci=True, max_file_bytes=10)
+    assert report.skipped_files == ("large.txt",)
+    result = CliRunner().invoke(
+        app, ["cold-start", str(repo.root), "--ci", "--json", "--max-file-bytes", "10"]
+    )
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["complete"] is False
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, MAX_FILE_BYTES + 1])
+def test_invalid_file_limit(repo: GitRepo, limit: int) -> None:
+    with pytest.raises(ScanError):
+        history.collect_history(repo.root, max_file_bytes=limit)
+
+
+def test_empty_repo_and_binary(repo: GitRepo) -> None:
+    assert history.collect_history(repo.root, ci=True).commits_scanned == 0
+    repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n\0")
+    repo.commit_all("binary")
+    report = history.collect_history(repo.root, ci=True)
+    assert report.complete and not report.findings
+    assert CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci"]).exit_code == 0
+
+
+def test_bounds_fail_closed(repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo.write("config.py", SYNTHETIC)
+    repo.commit_all("synthetic")
+    for name in (
+        "MAX_COMMITS",
+        "MAX_ENTRIES",
+        "MAX_READ_BYTES",
+        "MAX_RECORDS",
+        "MAX_OCCURRENCES",
+        "MAX_SECONDS",
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(history, name, 0)
+            with pytest.raises(ScanError):
+                history.collect_history(repo.root, ci=True)
+
+
+def test_shallow_repository_refused(repo: GitRepo) -> None:
+    repo.write("readme", "safe")
+    repo.commit_all("root")
+    (repo.root / ".git" / "shallow").write_text(repo.git_output("rev-parse", "HEAD"))
+    result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci"])
+    assert result.exit_code == 2
+    assert "erreur d'outillage" in result.output
+
+
+def test_replacements_cannot_hide_committed_secret(repo: GitRepo) -> None:
+    repo.write("config.py", SYNTHETIC)
+    repo.commit_all("synthetic")
+    secret_blob = repo.git_output("rev-parse", "HEAD:config.py").strip()
+    repo.write("safe", "safe")
+    repo.commit_all("safe blob")
+    safe_blob = repo.git_output("rev-parse", "HEAD:safe").strip()
+    repo.git("replace", secret_blob, safe_blob)
+    assert len(history.collect_history(repo.root, ci=True).findings) == 1
+
+
+def test_no_repository_and_output_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert CliRunner().invoke(app, ["deep-scan", str(tmp_path), "--ci"]).exit_code == 2
+
+
+def test_sha256_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEIMDALL_SNIPPET_HMAC_KEY", "01" * 32)
+    repo = GitRepo("heimdall-history-sha256-", object_format="sha256")
+    try:
+        repo.write("config.py", SYNTHETIC)
+        repo.commit_all("synthetic")
+        report = history.collect_history(repo.root, ci=True)
+        assert len(report.findings[0].commits[0]) == 64
+    finally:
+        repo.close()
+
+
+def test_rejection_is_displayed_and_does_not_remove_finding(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo.write("config.py", SYNTHETIC + "\n" + SYNTHETIC)
+    repo.commit_all("duplicate synthetic")
+    journal = RejectionJournal(tmp_path / "private" / "rejections.jsonl")
+    monkeypatch.setattr(history, "qualify_target", partial(history.qualify_target, journal=journal))
+    calls = []
+
+    def chat(**kwargs: Any) -> SimpleNamespace:
+        calls.append(json.dumps(kwargs))
+        return SimpleNamespace(
+            message=SimpleNamespace(content='{"verdict":"faux_positif","confidence":1}')
+        )
+
+    report = history.collect_history(repo.root, chat=chat)
+    assert len(calls) == len(report.findings) == len(report.opinions) == 1
+    assert SYNTHETIC not in calls[0]
+    assert "faux_positif" in history.render_history(report)
+    assert len(journal.read()) == 1
+
+
+def test_cache_eviction_preserves_commits(repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(history, "CACHE_SIZE", 1)
+    repo.write("config.py", SYNTHETIC)
+    repo.write("readme", "safe")
+    repo.commit_all("first")
+    repo.write("readme", "still safe")
+    repo.commit_all("second")
+    assert len(history.collect_history(repo.root, ci=True).findings[0].commits) == 2
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"100644 blob " + b"a" * 40 + b"\t../escape\0",
+        b"100644 blob " + b"a" * 40 + b"\tfile",
+        b"malformed\0",
+        b"100600 blob " + b"a" * 40 + b"\tfile\0",
+    ],
+)
+def test_malformed_tree_is_refused(raw: bytes) -> None:
+    with pytest.raises((ScanError, ValueError)):
+        history._entries(raw)
+
+
+def test_symlink_and_submodule_entries_are_never_opened() -> None:
+    oid = b"a" * 40
+    assert (
+        history._entries(
+            b"120000 blob " + oid + b"\tlink\0" + b"160000 commit " + oid + b"\tsubmodule\0"
+        )
+        == []
+    )
+
+
+def test_graft_cannot_hide_deleted_secret(repo: GitRepo) -> None:
+    repo.write("config.py", SYNTHETIC)
+    repo.commit_all("synthetic")
+    (repo.root / "config.py").unlink()
+    repo.commit_all("deleted")
+    (repo.root / ".git" / "info" / "grafts").write_text(repo.git_output("rev-parse", "HEAD"))
+    assert history.collect_history(repo.root, ci=True).findings

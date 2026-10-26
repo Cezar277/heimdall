@@ -166,13 +166,15 @@ class ScanReport:
         return len(self.traces)
 
 
-def collect(
+def collect(  # noqa: PLR0913 - explicit scan options
     root: Path,
     *,
     staged: bool,
     config: str | Path | None = None,
     allowlist: Allowlist | None = None,
     ci: bool = False,
+    max_file_bytes: int | None = None,
+    skipped_files: list[str] | None = None,
 ) -> ScanReport:
     """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
@@ -190,7 +192,14 @@ def collect(
     """
     if staged:
         return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
-    return _collect_tree(root, config=config, custom_allowlist=allowlist, ci=ci)
+    return _collect_tree(
+        root,
+        config=config,
+        custom_allowlist=allowlist,
+        ci=ci,
+        max_file_bytes=max_file_bytes,
+        skipped_files=skipped_files,
+    )
 
 
 def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
@@ -306,9 +315,7 @@ def _is_worktree_file_clean_and_tracked(
             f"blob {len(content)}\0".encode("ascii") + content,
             usedforsecurity=False,
         ).hexdigest()
-        blob_sha256 = hashlib.sha256(
-            f"blob {len(content)}\0".encode("ascii") + content
-        ).hexdigest()
+        blob_sha256 = hashlib.sha256(f"blob {len(content)}\0".encode("ascii") + content).hexdigest()
         verified = content if index_sha in (blob_sha1, blob_sha256) else None
         if verified is None:
             logger.debug("refus anti auto-attestation : configuration divergente (CWE-345)")
@@ -416,16 +423,12 @@ def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
         # doit pas bloquer le scan (disponibilité). Idem pour `--config`
         # interne (`subdir/custom.toml` vs `other/subdir/custom.toml`).
         # Les deux côtés sont déjà normalisés (relatif au dépôt, `/`).
-        is_cfg_staged = any(
-            getattr(change, "path", None) == rel_cfg for change in staged_changes
-        )
+        is_cfg_staged = any(getattr(change, "path", None) == rel_cfg for change in staged_changes)
         if is_cfg_staged:
             # Message strictement statique : `rel_cfg` (entrée opérateur
             # normalisée) n'est jamais reflété (invariant 8). En CLI le
             # libellé est de toute façon masqué par le message générique.
-            raise ScanError(
-                "auto-attestation refusée : configuration stagée (CWE-345)"
-            )
+            raise ScanError("auto-attestation refusée : configuration stagée (CWE-345)")
         if is_staged_scan:
             content = _is_worktree_file_clean_and_tracked(
                 access,
@@ -457,18 +460,19 @@ def _load_allowlist_verified(
         # Message strictement statique : `verified.path` (entrée opérateur)
         # n'est jamais reflété (invariant 8), comme pour la garde ci-dessus.
         raise ScanError(
-            "auto-attestation refusée : configuration modifiée pendant "
-            "le chargement (CWE-345)"
+            "auto-attestation refusée : configuration modifiée pendant le chargement (CWE-345)"
         )
     return allowlist
 
 
-def _collect_tree(
+def _collect_tree(  # noqa: PLR0913 - explicit scan options
     root: Path,
     *,
     config: str | Path | None = None,
     custom_allowlist: Allowlist | None = None,
     ci: bool = False,
+    max_file_bytes: int | None = None,
+    skipped_files: list[str] | None = None,
 ) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
@@ -514,7 +518,13 @@ def _collect_tree(
             )
         )
     )
-    scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
+    scanner = TreeScanner(
+        access.root,
+        strict=True,
+        allowlist=allowlist,
+        max_file_bytes=max_file_bytes,
+        skipped_files=skipped_files,
+    )
     findings = scanner.scan(deadline=deadline)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
