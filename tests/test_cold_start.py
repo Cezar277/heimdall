@@ -34,6 +34,12 @@ from heimdall.scanner.signature_engine import SignatureEngine
 SYNTHETIC = "AKIAIOSFODNN7EXAMPLE"
 
 
+@pytest.mark.parametrize("limit", [0, -1, True, 1_048_577])
+def test_invalid_file_limit_is_static(tmp_path: Path, limit: int) -> None:
+    with pytest.raises(ScanError, match="limite de fichier invalide"):
+        collect_cold_start(tmp_path, max_file_bytes=limit)
+
+
 @pytest.fixture
 def repo(monkeypatch: pytest.MonkeyPatch) -> Iterator[GitRepo]:
     monkeypatch.setenv("HEIMDALL_SNIPPET_HMAC_KEY", "01" * 32)
@@ -177,6 +183,30 @@ def test_content_mutation_refuses_api_and_cli(
         else:
             with pytest.raises(ScanError, match="contenu modifié"):
                 collect_cold_start(repo.root, chat=_secret_chat)
+
+
+def test_reread_respects_configured_size_limit(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = cold_module.collect
+
+    def grow_after_scan(*args: Any, **kwargs: Any) -> Any:
+        report = original(*args, **kwargs)
+        repo.write("app.py", SYNTHETIC + "\n#" + " " * 64)
+        return report
+
+    def forbidden(**kwargs: Any) -> None:
+        pytest.fail("file over configured limit must not reach LLM")
+
+    monkeypatch.setattr(cold_module, "collect", grow_after_scan)
+    repo.write("app.py", SYNTHETIC + "\n")
+    with pytest.raises(ScanError, match="contenu modifié"):
+        collect_cold_start(repo.root, max_file_bytes=32, chat=forbidden)
+    repo.write("app.py", SYNTHETIC + "\n")
+    result = CliRunner().invoke(app, ["cold-start", str(repo.root), "--max-file-bytes", "32"])
+    assert result.exit_code == 2
+    assert SYNTHETIC not in result.output
 
 
 def test_broken_journal_refuses_api_and_cli(

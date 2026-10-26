@@ -146,7 +146,7 @@ def test_invalid_file_limit(repo: GitRepo, limit: int) -> None:
 
 def test_empty_repo_and_binary(repo: GitRepo) -> None:
     assert history.collect_history(repo.root, ci=True).commits_scanned == 0
-    repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n\0")
+    repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00\xff" * 100)
     repo.commit_all("binary")
     report = history.collect_history(repo.root, ci=True)
     assert report.complete and not report.findings
@@ -247,10 +247,12 @@ def test_cache_eviction_preserves_commits(repo: GitRepo, monkeypatch: pytest.Mon
         b"100644 blob " + b"a" * 40 + b"\tfile",
         b"malformed\0",
         b"100600 blob " + b"a" * 40 + b"\tfile\0",
+        b"100644 blob " + b"a" * 40 + b"\tbad\xff.png\0",
+        b"100644 blob " + b"\xff" * 40 + b"\tfile\0",
     ],
 )
 def test_malformed_tree_is_refused(raw: bytes) -> None:
-    with pytest.raises((ScanError, ValueError)):
+    with pytest.raises(ScanError, match="arbre historique non analysable"):
         history._entries(raw)
 
 
@@ -271,3 +273,42 @@ def test_graft_cannot_hide_deleted_secret(repo: GitRepo) -> None:
     repo.commit_all("deleted")
     (repo.root / ".git" / "info" / "grafts").write_text(repo.git_output("rev-parse", "HEAD"))
     assert history.collect_history(repo.root, ci=True).findings
+
+
+@pytest.mark.parametrize("suffix", ["png", "zip", "txt"])
+def test_unknown_binary_cannot_hide_secret(repo: GitRepo, suffix: str) -> None:
+    repo.write_bytes(f"evil.{suffix}", b"\x00" + SYNTHETIC.encode() + b"\n#")
+    repo.commit_all("unknown binary with synthetic secret")
+    with pytest.raises(ScanError):
+        history.collect_history(repo.root, ci=True)
+    result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert SYNTHETIC not in result.output
+
+
+def test_reference_mutation_refuses_api_and_cli(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo.write("config.py", "# safe\n")
+    repo.commit_all("root")
+    original = history._tips
+    calls = 0
+
+    def mutate(access: GitAccess, deadline: float) -> tuple[str, ...]:
+        nonlocal calls
+        tips = original(access, deadline)
+        if calls % 2 == 0:
+            repo.write("config.py", SYNTHETIC + f"\n# revision {calls}\n")
+            repo.commit_all("concurrent synthetic secret")
+        calls += 1
+        return tips
+
+    monkeypatch.setattr(history, "_tips", mutate)
+    with pytest.raises(ScanError, match="références modifiées"):
+        history.collect_history(repo.root, ci=True)
+    result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert SYNTHETIC not in result.output

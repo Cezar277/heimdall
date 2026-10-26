@@ -118,6 +118,8 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:
+    if type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES:
+        raise ScanError("limite de fichier invalide")
     # Capturer l'identité AVANT collect ferme aussi l'intervalle entre les
     # deux passes, et pas seulement les substitutions pendant la relecture.
     access = GitAccess(root) if llm and not ci else None
@@ -141,7 +143,7 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
             path = confine(access.root, file).absolute
         except PathEscape:
             raise ScanError("chemin de qualification hors périmètre") from None
-        raw = _read_worktree_file(path, max_bytes=MAX_FILE_BYTES)
+        raw = _read_worktree_file(path, max_bytes=max_file_bytes)
         text = decode_text(raw) if raw is not None else None
         if text is None:
             raise ScanError("contenu modifié depuis le scan déterministe")

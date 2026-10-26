@@ -14,7 +14,7 @@ from heimdall.llm.qualify import ChatFn
 from heimdall.mcp.gitdiff import GitAccess, _checked_object
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
-from heimdall.scanner.exclusions import decode_text, has_technical_suffix
+from heimdall.scanner.exclusions import decode_text, has_technical_suffix, is_known_binary
 from heimdall.scanner.finding import Finding, validate_relative_path
 from heimdall.scanner.interface import FileTarget, Scanner
 from heimdall.scanner.signature_engine import SignatureEngine
@@ -58,7 +58,7 @@ def _git(access: GitAccess, args: tuple[str, ...], cap: int, deadline: float) ->
 
 
 def _tips(access: GitAccess, deadline: float) -> tuple[str, ...]:
-    # Snapshot ref tips once: later ref updates cannot change the scan's scope.
+    # Snapshot ref tips; the caller rechecks them before returning a verdict.
     # Annotated tags are peeled by rev-list. Replacements are disabled below.
     raw = _git(access, ("--no-replace-objects", "rev-parse", "--all"), MAX_TREE_BYTES, deadline)
     tips = [_checked_object(value.decode("ascii")) for value in raw.splitlines()]
@@ -86,9 +86,13 @@ def _entries(raw: bytes) -> list[tuple[str, str]]:
             continue  # symlink targets and submodules are never followed
         if mode not in (b"100644", b"100755") or kind != b"blob":
             raise ScanError("arbre historique non analysable")
-        file = path.decode("utf-8")
-        validate_relative_path(file)
-        entries.append((file, _checked_object(oid.decode("ascii"))))
+        try:
+            file = path.decode("utf-8")
+            validate_relative_path(file)
+            object_id = _checked_object(oid.decode("ascii"))
+        except (UnicodeDecodeError, ValueError):
+            raise ScanError("arbre historique non analysable") from None
+        entries.append((file, object_id))
     return entries
 
 
@@ -175,7 +179,7 @@ def collect_history(  # noqa: PLR0912, PLR0914, PLR0915 - bounded scan accountin
                         try:
                             text = decode_text(data)
                         except ScanError:
-                            if not has_technical_suffix(file):
+                            if not (has_technical_suffix(file) and is_known_binary(data)):
                                 raise
                             text = None
                         # Undecodable blobs are not cached across paths: binary
@@ -220,6 +224,8 @@ def collect_history(  # noqa: PLR0912, PLR0914, PLR0915 - bounded scan accountin
                     if len(records) > MAX_RECORDS or occurrences > MAX_OCCURRENCES:
                         raise ScanError("limite historique dépassée")
     _verify_root_unchanged(access, root)
+    if _tips(access, deadline) != tips:
+        raise ScanError("références modifiées depuis le début du scan")
     _call_timeout(deadline)
     return HistoryReport(
         tuple(HistoricalFinding(f, tuple(ids)) for f, ids in records.values()),
