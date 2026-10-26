@@ -8,6 +8,10 @@ fusionner #107 isolément. La relecture croisée reste requise avant fusion.
 
 Code et tests corrigés : `78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe`.
 Complément LOW : `7000236ef4e584d3b6604a206da65f95db07c606` (preuves ci-dessous).
+Complément d'exhaustivité et d'API : `359155d191fd758431594addbff0a6870213f1d8`
+(section dédiée ci-dessous). Les anciens tableaux restent des preuves de leurs
+snapshots ; le complément remplace notamment la déduplication globale et
+l'exclusion des cibles de liens des premières versions.
 Les liens ci-dessous désignent ce snapshot, pas la branche mouvante.
 
 | Ticket / pratique SAMM | Exigence et menace | Implémentation permanente | Preuve permanente |
@@ -41,6 +45,22 @@ n'est revendiquée ni déclenchée.
 Ruff, Mypy strict (48 fichiers) et Bandit passent. Ce complément ne revendique
 pas de nouvelle exécution de la suite complète ni de CI distante ; le dernier
 résultat global archivé reste celui du correctif précédent.
+
+## Complément : emplacements multiples et contrats de bibliothèque
+
+| Exigence / menace | Implémentation permanente | Preuve permanente |
+| --- | --- | --- |
+| #108 / exhaustivité : conserver chaque fichier contenant la même valeur | [records par type/HMAC/fichier](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/heimdall/cli/history.py#L249) | [copies dans deux fichiers puis suppression, blobs identiques ou distincts, texte et JSON](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/tests/test_history.py#L377) |
+| #108 / contrat d'erreur : racine et appels Git → ScanError statique | [collect_history](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/heimdall/cli/history.py#L109), [collect_cold_start](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/heimdall/cli/cold_start.py#L113), [collect](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/heimdall/cli/scan.py#L169) | [racine absente](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/tests/test_history.py#L407), [pannes constructeur/execute/read_capped](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/tests/test_history.py#L420), [blob_size/blob_bytes et taille négative](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/tests/test_history.py#L447), [limites invalides en arbre et index](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/tests/test_history.py#L441) |
+| Gouvernance / état opérateur : journal injectable, aucune écriture en CI | [propagation journal](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/heimdall/cli/history.py#L231) | [faux positif dans le journal injecté](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/tests/test_history.py#L212), [journal CI absent](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/tests/test_history.py#L472) |
+| #108 / confinement : lire le texte des liens sans suivre leur cible | [120000 inclus, 160000 exclu](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/heimdall/cli/history.py#L95) | [cible contenant le secret, vue par staged et retrouvée après suppression du lien, aucun lien sur disque](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/tests/test_history.py#L485) |
+
+**93 tests ciblés passent**, couverture cold start + historique **95,69 %**.
+[Journal permanent](https://github.com/Cezar277/heimdall/blob/359155d191fd758431594addbff0a6870213f1d8/bench-results/t38-audit-targeted-tests.txt#L1).
+Ruff, Mypy strict (48 fichiers) et Bandit passent. Résultat de la suite
+complète après ce complément : [t38-completion.md](t38-completion.md).
+Le SHA final de merge est encore inconnu : à inscrire ici après la fusion
+effective par le relecteur ; aucun SHA de branche n'est présenté comme SHA de merge.
 
 ## Archive : preuve initiale T38.1 / #107, avant extension du périmètre
 

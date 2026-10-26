@@ -71,9 +71,13 @@ un seul blob sont lus à la fois. Cette variante de `rev-list` puis lecture
 des snapshots permet aussi d'associer les commits où le secret reste inchangé
 et de couvrir les merges, renommages et fichiers supprimés.
 
-Un même couple type/empreinte HMAC produit un seul finding, avec la liste
-des commits qui le contiennent. Le finding conserve un emplacement représentatif ;
-la liste ne prétend pas donner tous les emplacements dans chaque commit.
+Un même triplet type/empreinte HMAC/fichier produit un finding, avec la liste
+des commits qui contiennent cette valeur dans ce fichier. Les copies dans deux
+fichiers, même si elles partagent le même blob Git, restent deux findings.
+Un renommage conserve donc les deux noms avec leurs commits respectifs.
+La ligne du finding est représentative dans le fichier ; il ne s'agit pas
+d'une liste de toutes les lignes de chaque snapshot. La qualification LLM
+reste dédoublonnée par type/valeur et ne supprime aucun emplacement.
 Le rendu texte affiche au plus dix SHA par finding, puis `… (+N)` pour les
 commits supplémentaires. `--json` conserve la liste complète des commits.
 Les erreurs de décodage ASCII et de validation des SHA lus depuis les
@@ -87,7 +91,9 @@ appel et toute journalisation LLM, y compris avec `--llm`.
 
 Le scan ne fait aucun checkout, fetch, filtre textconv ou réécriture.
 Les variables Git héritées, les remplacements et les grafts locaux sont
-neutralisés. Les symlinks et sous-modules ne sont jamais suivis ; les binaires
+neutralisés. Les symlinks ne sont jamais suivis sur le disque : leur blob Git
+`120000`, qui contient le texte de leur cible, est scanné comme en `--staged`.
+Les commits de sous-modules (`160000`) sont exclus ; les binaires
 connus sont exclus. Les objets absents, clones superficiels, sorties invalides
 et dépassements de budget donnent une erreur d'outillage. Les commits devenus
 inaccessibles (objets pendants, reflogs seuls) et les dépôts de sous-modules
@@ -113,8 +119,8 @@ Le traitement est séquentiel : un seul processus Git à la fois, aucun pool
 non borné. Un cache LRU conserve au plus 4096 objets et 10 000 findings,
 uniquement les résultats hachés, jamais les contenus bruts. Les autres budgets
 du deep scan sont : 100 000 commits, 1 000 000 entrées d'arbre cumulées,
-256 Mio de blobs effectivement lus, 10 000 secrets distincts,
-1 000 000 associations secret/commit et 10 000 exclusions de taille.
+256 Mio de blobs effectivement lus, 10 000 constats type/valeur/fichier,
+1 000 000 associations constat/commit et 10 000 exclusions de taille.
 Chaque arbre Git est plafonné à 8 Mio avant parsing ; chaque lecture de blob
 reste plafonnée à 1 Mio. Au-delà : code 2, aucun rapport tronqué présenté comme complet.
 
@@ -122,6 +128,16 @@ La deadline globale est de 300 s, transmise au moteur et aux commandes Git
 (au plus 30 s chacune, réduites au temps restant). En mode LLM, la limite de
 256 qualifications reste applicable et une requête Ollama déjà commencée
 conserve son timeout T28, comme pour `cold-start`.
+
+Les API `collect`, `collect_cold_start` et `collect_history` convertissent
+les pannes Git (`ToolFailure`) en `ScanError` statique. `collect` valide aussi
+la limite de taille explicite avant de déléguer au scanner, y compris avec
+`staged=True`. Les erreurs propres au journal conservent leur type `JournalError`.
+
+En bibliothèque, `collect_history(..., journal=RejectionJournal(chemin))`
+permet de rediriger le journal des propositions de rejet, comme le cold start.
+Sans journal injecté, le chemin opérateur par défaut reste utilisé hors CI.
+`ci=True` interdit aussi toute écriture dans le journal injecté.
 
 ## Alerte et temps (#110)
 

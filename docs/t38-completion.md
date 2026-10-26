@@ -141,3 +141,39 @@ La suite complète n'est pas relancée pour ce complément limité au décodage
 des identifiants et au rendu ; son dernier résultat archivé ci-dessus reste
 **2265 passed**, couverture **91,51 %**, pour le correctif précédent.
 Aucun `/ci` n'est envoyé.
+
+## Complément d'audit : fichiers, erreurs, journal et liens
+
+Code et tests : `359155d191fd758431594addbff0a6870213f1d8`.
+
+Les constats sont regroupés par type/HMAC/fichier. Chaque fichier reste visible
+en texte et en JSON, avec ses commits, y compris pour les blobs identiques
+et pour les deux noms d'un fichier renommé. Le modèle reste qualifié une seule
+fois par type/valeur ; son avis ne retire aucun emplacement.
+
+Les trois collecteurs publics convertissent les pannes Git en `ScanError`
+statique. `collect` valide également `max_file_bytes` avant le moteur, en arbre
+comme en index. Le benchmark n'a plus besoin de catcher `ToolFailure`.
+Les erreurs du journal restent des `JournalError`, distinctes des pannes Git.
+`collect_history` accepte et propage `journal=...` ; les tests de faux positif
+utilisent un journal temporaire, et le test CI vérifie qu'il n'est pas créé.
+
+La divergence des symlinks est confirmée et corrigée : un blob de mode
+`120000` est lu via `cat-file` et scanné comme en `--staged`, sans accès au
+chemin de la cible ni suivi du lien sur disque. Les gitlinks `160000` restent
+exclus. Cette décision remplace l'exclusion des blobs de liens des premières
+versions décrites dans les tableaux historiques ci-dessus.
+
+Validation ciblée : **93 passed**, couverture **95,69 %**, journal
+`bench-results/t38-audit-targeted-tests.txt`. Ruff, Mypy strict (48 fichiers)
+et Bandit passent. Les nouveaux tests vérifient les deux fichiers après
+suppression, les deux formes de blobs, les pannes Git des trois API, les
+limites invalides, la taille de blob négative, le journal injecté et le blob
+de lien supprimé, comparé au scan staged.
+
+Régression complète après ce complément : **2304 passed**, **16 skipped**,
+**4480 subtests passed**, 7 avertissements, couverture **91,54 %**,
+durée **247,93 s**. Journal : `bench-results/t38-audit-full-tests.txt`.
+Le format des cinq fichiers Python modifiés et `git diff --check` passent.
+Aucune CI distante n'est lancée. Le SHA de merge devra être renseigné après une fusion
+effective ; cette correction ne fusionne pas la PR.
