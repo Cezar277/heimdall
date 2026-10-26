@@ -196,3 +196,34 @@ La suite complète n'est pas relancée pour ces deux correctifs locaux ; le
 dernier résultat global reste **2304 passed**, **91,54 %**, avant ce complément.
 Les permaliens SAMM sont actualisés pour ces deux exigences. Aucun `/ci`
 n'est envoyé et aucun SHA de merge n'est inventé avant fusion.
+
+## Complément LOW : environnement Git et mtime à la lecture
+
+Code et tests : `9a757e6d06e00d40d9832b193ac7a694286e88ce`.
+`ConfinedEnvironmentTests.test_minimal_and_redirection_free` exige maintenant
+`GIT_NO_REPLACE_OBJECTS=1` et `GIT_GRAFT_FILE=os.devnull`. La suppression de
+chaque clé par un patch en mémoire fait échouer ce test comme attendu,
+sans altération de la configuration réelle. Résultats dans
+`bench-results/t38-env-mutation-check.txt`.
+
+`_read_worktree_file` compare après lecture la taille et `mtime_ns` aux
+métadonnées initiales du descripteur, en plus de la longueur effectivement lue.
+Une modification de même taille avec changement de mtime renvoie `None`,
+donc le cold start refuse avec son `ScanError` statique / code 2. Le test
+réécrit réellement le fichier pendant la relecture et vérifie aussi l'absence
+d'appel LLM. Cette garde ne prétend pas verrouiller le fichier entre les
+passes ni détecter une altération dont l'auteur restaure les métadonnées.
+
+Validation ciblée : **99 passed**, couverture cold start + historique **95,72 %** ;
+journal `bench-results/t38-mtime-targeted-tests.txt`. Ruff, Mypy strict
+(48 fichiers), Bandit et format des trois fichiers Python corrigés passent.
+Régression complète après ce complément : **2307 passed**, **16 skipped**,
+**4480 subtests passed**, 7 avertissements, couverture **91,56 %**, durée
+**244,93 s**. Journal : `bench-results/t38-mtime-full-tests.txt`.
+Les fichiers de couverture des tests ciblés et de la suite complète sont distincts.
+
+La relecture croisée et la CI verte restent des conditions bloquantes avant
+fusion. Le SHA final de merge sera renseigné après fusion effective, avec
+vérification des liens permanents. Les cases PR correspondantes restent
+décochées tant que leurs preuves externes ne sont pas acquises ; aucune
+approbation ni CI n'est déclarée à partir des seuls tests locaux.

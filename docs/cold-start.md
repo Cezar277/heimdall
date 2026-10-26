@@ -15,6 +15,10 @@ sont qualifiés par Ollama local : cinq lignes de contexte de chaque côté,
 par appel. Les lignes portant des candidats sont entièrement masquées.
 Le fichier est relu sans suivre de lien et les candidats sont revérifiés
 avant la qualification. Aucun fichier entier n'est envoyé au modèle.
+La relecture refuse aussi une modification de taille ou de `mtime_ns`
+entre les deux `fstat` du descripteur, y compris une réécriture de même taille.
+Cette garde est celle de la lecture, pas un verrou du fichier entre les passes ;
+le re-scan d'appartenance reste appliqué aux candidats.
 
 Un avis `faux_positif` est une proposition, affichée et journalisée via T33.
 Il ne retire jamais un finding et ne change pas le code de sortie : 0 propre,

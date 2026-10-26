@@ -79,6 +79,37 @@ complément de deux chemins ; sa dernière preuve globale reste celle de
 `359155d` (**2304 passed**, **91,54 %**). Aucun `/ci` n'est envoyé.
 Le SHA de merge reste à renseigner après fusion effective.
 
+## Complément LOW : environnement Git et course de relecture
+
+Snapshot : `9a757e6d06e00d40d9832b193ac7a694286e88ce`.
+
+| Exigence | Implémentation / garde | Preuve permanente |
+| --- | --- | --- |
+| Confinement : lecture des blobs sans objet remplacé ni greffe | `confined_environment` conserve `GIT_NO_REPLACE_OBJECTS=1` et `GIT_GRAFT_FILE=os.devnull` ; le test exige explicitement ces deux valeurs | [assertions](https://github.com/Cezar277/heimdall/blob/9a757e6d06e00d40d9832b193ac7a694286e88ce/tests/test_mcp_units.py#L358), [suppression simulée de chaque clé : échec attendu du test](https://github.com/Cezar277/heimdall/blob/9a757e6d06e00d40d9832b193ac7a694286e88ce/bench-results/t38-env-mutation-check.txt#L1) |
+| Anti-altération : réécriture de même taille pendant la lecture → refus | [fstat final : taille et mtime_ns inchangés](https://github.com/Cezar277/heimdall/blob/9a757e6d06e00d40d9832b193ac7a694286e88ce/heimdall/cli/scan.py#L268) | [réécriture réelle entre os.read et fstat final, message statique API et code 2 CLI, aucun LLM](https://github.com/Cezar277/heimdall/blob/9a757e6d06e00d40d9832b193ac7a694286e88ce/tests/test_cold_start.py#L216) |
+
+**99 tests ciblés passent**, couverture cold start + historique **95,72 %**.
+[Journal permanent](https://github.com/Cezar277/heimdall/blob/9a757e6d06e00d40d9832b193ac7a694286e88ce/bench-results/t38-mtime-targeted-tests.txt#L1).
+Le test d'environnement est exécuté normalement et vérifié par suppression
+de chaque clé en mémoire ; aucune modification de production n'est utilisée
+pour le contrôle de mutation. Résultat global après correctif :
+[t38-completion.md](t38-completion.md).
+
+## Conditions de fusion du périmètre groupé
+
+La PR #193 conserve le périmètre #107–#110 demandé. Cette dérogation au
+découpage initial ne dispense pas de la relecture croisée : **ne pas fusionner
+avant une approbation effective par un membre d'un autre domaine**. La case
+correspondante dans la PR doit être cochée sur la base de cette preuve, pas
+de la seule validation locale. La CI requise doit aussi être verte avant
+fusion ; aucun `/ci` n'est envoyé par cette livraison.
+
+Après fusion effective, renseigner ici le SHA exact du commit de merge,
+vérifier les liens module/ligne à ce snapshot et reporter le lien de la
+review et le check CI dans la feuille SAMM. En attendant, ces étapes restent
+en attente : aucun SHA de branche ne vaut SHA de merge, aucun test local
+ne vaut CI verte et aucune auto-validation ne vaut relecture croisée.
+
 ## Archive : preuve initiale T38.1 / #107, avant extension du périmètre
 
 Périmètre : entonnoir regex/entropie puis LLM local.
