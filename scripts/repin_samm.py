@@ -52,9 +52,6 @@ PERMALIEN = re.compile(
     r"/blob/(?P<sha>[0-9a-f]{40})/(?P<path>[^)\s#]+)(?P<ancre>#[^)\s]*)?"
 )
 
-#: SHA hexadécimal isolé (40 caractères), utilisé pour les mentions en prose.
-SHA_ISOLE = re.compile(r"\b[0-9a-f]{40}\b")
-
 
 @dataclass(frozen=True, slots=True)
 class Permalien:

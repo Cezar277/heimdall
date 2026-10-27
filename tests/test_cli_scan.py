@@ -557,6 +557,56 @@ def test_scan_tree_reports_the_vcs_skip_in_json_and_ci(tmp_path: Path) -> None:
     assert FAKE_AWS_KEY not in resultat_texte.output
 
 
+def test_scan_tree_vcs_only_is_policy_and_staged_covers_content(
+    git_repo: GitRepo,
+) -> None:
+    """Revue (LOW) : un arbre réduit à ``.git/`` est un 0 assumé, pas un trou.
+
+    La politique d'élagage VCS est figée : la bibliothèque rend ``[]`` avec
+    ``vcs_ignored == 1`` et ``files_scanned == 0``, la CLI rend 0 (un dépôt
+    réellement vide est propre, pas illisible) et le compteur reste
+    observable. Le même test rejoue ensuite ``--staged`` : un secret indexé
+    est bien détecté (code 1), ce qui prouve que seul ``--staged`` couvre le
+    contenu commité — l'arbre ne prétend jamais couvrir l'historique.
+    """
+    git_repo.write(".git/description", f'AWS = "{FAKE_AWS_KEY}"\n')
+
+    scanner = TreeScanner(git_repo.root)
+    assert scanner.scan() == []
+    assert scanner.vcs_ignored == 1
+    assert scanner.files_scanned == 0
+
+    report = collect(git_repo.root, staged=False, allowlist=Allowlist.empty())
+    assert report.findings == ()
+    assert report.vcs_ignored == 1
+
+    resultat = _run("scan", "--no-allowlist", str(git_repo.root))
+    assert resultat.exit_code == EXIT_CLEAN
+    assert "Base VCS : 1 base(s) élaguée(s)" in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.output
+
+    resultat_ci = _run("scan", "--ci", "--no-allowlist", str(git_repo.root))
+    assert resultat_ci.exit_code == EXIT_CLEAN
+    assert "1 base(s) VCS élaguée(s)" in resultat_ci.stderr
+    assert FAKE_AWS_KEY not in resultat_ci.output
+
+    resultat_json = _run("scan", "--json", "--no-allowlist", str(git_repo.root))
+    assert resultat_json.exit_code == EXIT_CLEAN
+    document = json.loads(resultat_json.stdout)
+    assert document["vcs_ignored"] == 1
+    _validate_scan_document(document)
+    assert FAKE_AWS_KEY not in resultat_json.output
+
+    # Le contenu indexé, lui, est analysé par --staged : ce que le commit
+    # va contenir est couvert, même si l'arbre ne contient que le VCS.
+    git_repo.write("app.py", f'AWS = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage("app.py")
+    resultat_staged = _run("scan", "--staged", "--no-allowlist", str(git_repo.root))
+    assert resultat_staged.exit_code == EXIT_FINDINGS
+    assert "app.py:1" in resultat_staged.stdout
+    assert FAKE_AWS_KEY not in resultat_staged.output
+
+
 def test_scan_tree_strict_scans_text_with_binary_suffix(git_repo: GitRepo) -> None:
     """Revue (LOW) : en strict, le contenu prime sur le suffixe binaire.
 

@@ -258,6 +258,38 @@ permalien sur un SHA intermédiaire) ; après le squash,
 | **Le re-pin ne suit aucun lien symbolique et reste confiné** | `scripts/repin_samm.py` (`_livre`, `_resoudre_fiche`) | `tests/security/test_samm_permalinks.py::test_livre_refuses_symlinks_even_inside_the_repository`, `::test_the_repin_never_rewrites_a_permalink_to_a_symlink`, `::test_the_repin_refuses_a_fiche_outside_the_repository` |
 | **Le compteur VCS décrit le scan courant, la matrice gitlink est figée** | `heimdall/scanner/detect.py` (`scan`, `_iter_files`), `exclusions.py` | `tests/test_scanner_detect.py::test_vcs_ignored_is_reset_between_scans`, `::test_gitlink_file_and_vcs_directory_scan_matrix` |
 
+## Corrections issues de la relecture « APPROVE WITH COMMENTS » (7ᵉ passage)
+
+Cette section décrit le correctif demandé par la relecture du 7ᵉ passage
+(run `40239618119`) : *la limite d'un arbre réduit à sa base VCS est figée par
+test plutôt que masquée par le code de sortie* (option explicitement acceptée
+par la revue), *le helper binaire déprécié ne doit pas être exposé comme une
+API de périmètre*, *le code mort du re-pin est supprimé*, et *les tests
+manquants sont figés au niveau du scan et de la CLI*. Les preuves ci-dessous
+sont des **noms de modules et de tests** (pas de permalien sur un SHA
+intermédiaire) ; après le squash,
+`scripts/repin_samm.py --sha <sha-final>` re-pince les liens historiques et
+`--check` refuse tout lien mort.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| **LOW** — un `[]` avec base VCS élaguée restait exit 0 : une automatisation qui ne lit que le code de sortie confondait « propre » et « non parcouru » | la politique est **figée par test** (option acceptée par la revue) : la bibliothèque rend `[]`, `vcs_ignored == 1` et le nouveau `files_scanned == 0` ; la CLI rend 0 pour un arbre réellement vide et rappelle `vcs_ignored` en JSON/`--ci`. Le test rejoue ensuite `--staged` sur le même dépôt et prouve qu'un secret indexé est détecté (code 1) : seul `--staged` couvre le contenu commité. Aucun dépôt vide légitime ne régresse en code 2 | `heimdall/scanner/detect.py` (`files_scanned`), `docs/scanner.md`, `docs/cli.md` ; `tests/test_cli_scan.py::test_scan_tree_vcs_only_is_policy_and_staged_covers_content`, `tests/test_scanner_detect.py::test_files_scanned_describes_the_current_scan` |
+| **LOW** — le helper binaire déprécié restait exporté comme une API de périmètre | la surface publique est **fermée** : `exclusions.__all__` ne contient plus `is_known_binary` (l'alias reste importable pour compatibilité, sans autorité). La documentation interdit explicitement de brancher un périmètre, une allowlist ou un skip sur ce nom ; `decode_text` n'utilise que `_is_known_binary` | `heimdall/scanner/exclusions.py` (`__all__`), `docs/scanner.md` (API dépréciée) ; `tests/test_scanner_detect.py::test_the_deprecated_binary_helper_is_not_exported`, `::test_scanner_does_not_consult_the_deprecated_binary_helper` |
+| **LOW** — `SHA_ISOLE` était du code mort dans un outil de preuve | la regex inutilisée est supprimée ; aucun comportement de `repin_samm.py` ne change | `scripts/repin_samm.py` ; `tests/security/test_samm_permalinks.py` |
+| **LOW** — tests manquants : compteur VCS, matrice gitlink, bornes Slack, non-autorité du helper | les tests figent le re-scan (0 → 1 → 0), les trois cas gitlink (fichier lu, répertoire élagué et compté, parent refusé), les bornes Slack au niveau du scan (`xoxe.` + 250 → un Finding rotatif ; 251/256 → limite documentée) et l'absence d'autorité du helper public | `tests/test_scanner_detect.py::test_vcs_ignored_is_reset_between_scans`, `::test_gitlink_file_and_vcs_directory_scan_matrix`, `::test_the_rotating_bounds_are_frozen_at_scan_level`, `::test_scanner_does_not_consult_the_deprecated_binary_helper` |
+| **LOW** — hygiène PR : quatre sous-tickets dans une PR | exception maintenue et signalée ; elle reste à valider par les mainteneurs. Le 7ᵉ passage ne modifie pas le découpage | `docs/t22-samm.md#exception-de-regroupement` |
+| **LOW** — preuves à re-pinner après squash | `repin_samm.py --check` est vert sur l'arbre courant ; le SHA du squash reste la seule valeur à fournir après fusion (`--sha <sha-final>`) | `scripts/repin_samm.py`, `tests/security/test_samm_permalinks.py` |
+
+### Ce que le correctif permet désormais de prouver
+
+| Exigence vérifiée | Implémentation | Test et preuve permanente |
+|---|---|---|
+| **Un arbre vide reste un 0 assumé ; `--staged` couvre le contenu indexé** (secret indexé => 1) | `heimdall/scanner/detect.py` (`files_scanned`), `heimdall/cli/scan.py` (`_collect_staged`) | `tests/test_cli_scan.py::test_scan_tree_vcs_only_is_policy_and_staged_covers_content` |
+| **Le contenu indexé reste couvert par `--staged`**, indépendamment de l'élagage VCS de l'arbre | `heimdall/cli/scan.py` (`_collect_staged`) | `tests/test_cli_scan.py::test_scan_tree_vcs_only_is_policy_and_staged_covers_content` |
+| **Le helper binaire déprécié n'est pas une API de périmètre** : ni exporté, ni consulté par le scanner | `heimdall/scanner/exclusions.py` (`__all__`, `_is_known_binary`) | `tests/test_scanner_detect.py::test_the_deprecated_binary_helper_is_not_exported`, `::test_scanner_does_not_consult_the_deprecated_binary_helper` |
+| **Les bornes Slack sont figées jusqu'au Finding** (250 détecté une fois, 251/256 limite documentée) | `heimdall/scanner/signatures/stripe_slack.py` (bornes dérivées) | `tests/test_scanner_detect.py::test_the_rotating_bounds_are_frozen_at_scan_level` |
+| **Le compteur VCS décrit le scan courant** et ne compte jamais un fichier de contenu | `heimdall/scanner/detect.py` (`scan`, `files_scanned`, `vcs_ignored`) | `tests/test_scanner_detect.py::test_vcs_ignored_is_reset_between_scans`, `::test_files_scanned_describes_the_current_scan` |
+
 ## Révisions à re-pinner après la fusion
 
 Les permaliens de cette fiche sont épinglés sur la révision du code testé
@@ -404,6 +436,13 @@ binaire déprécié, le confinement du re-pin et les tests manquants ; il ne
 change ni le découpage ni le périmètre des sous-tickets. L'exception reste
 **à valider explicitement par les mainteneurs** avant fusion.
 
+La relecture « APPROVE WITH COMMENTS » (7ᵉ passage) **maintient l'exception** :
+le correctif porte sur le verdict d'un arbre réduit à sa base VCS, la surface
+publique du helper binaire déprécié, le code mort du re-pin et les tests
+manquants ; il ne change ni le découpage ni le périmètre des sous-tickets.
+L'exception reste **à valider explicitement par les mainteneurs** avant
+fusion.
+
 ## Relecture et PR
 
 - PR : à ouvrir sur la branche
@@ -416,10 +455,12 @@ change ni le découpage ni le périmètre des sous-tickets. L'exception reste
   épinglé sur la révision historique `b38dec179de6baf22fefd50056014e8ea26fc185`,
   signalée par ⚠️ ; les corrections du 2ᵉ passage sont prouvées plus haut,
   celles du 3ᵉ passage dans la section « 3ᵉ passage », celles du 4ᵉ passage
-  dans la section « 4ᵉ passage », et celles du 5ᵉ passage dans la section
-  « 5ᵉ passage ».
-- **Permaliens du 5ᵉ passage** : pas de nouveau permalien sur un SHA
-  intermédiaire ; preuves citées par nom de test, re-pinées au SHA du squash.
+  dans la section « 4ᵉ passage », celles du 5ᵉ passage dans la section
+  « 5ᵉ passage », celles du 6ᵉ passage dans la section « 6ᵉ passage » et
+  celles du 7ᵉ passage dans la section « 7ᵉ passage ».
+- **Permaliens des 5ᵉ, 6ᵉ et 7ᵉ passages** : pas de nouveau permalien sur un
+  SHA intermédiaire ; preuves citées par nom de test, re-pinées au SHA du
+  squash.
 - **Après la fusion** : re-pince la fiche sur le SHA du squash (une
   commande, voir « Révisions à re-pinner après la fusion »), puis contrôle
   `python scripts/repin_samm.py --check` : aucun permalien mort ne doit

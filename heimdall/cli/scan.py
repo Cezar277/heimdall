@@ -478,6 +478,9 @@ def _collect_tree(
     lockfiles et les fichiers de contrôle sont parcourus. Un secret y est un
     secret. Un fichier binaire connu est refusé (``ScanError``, code 2),
     comme en ``--staged`` : aucun contenu n'est sauté en silence.
+    Un arbre vide (seule la base VCS existe) reste un verdict 0 : il est
+    réellement vide, pas illisible. ``Scanner.files_scanned`` expose ce cas
+    (0 fichier de contenu lu) et ``--staged`` couvre le contenu indexé.
 
     L'allowlist déterministe (#24) écarte les cas évidents (example,
     changeme, dummy, fixtures de test) et produit une trace pour chaque rejet.

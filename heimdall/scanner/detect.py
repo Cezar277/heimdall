@@ -168,6 +168,7 @@ class Scanner:
         "_allowlist",
         "_hasher",
         "_entropy_config",
+        "_files_scanned",
         "_max_bytes",
         "_max_files",
         "_max_findings",
@@ -227,6 +228,7 @@ class Scanner:
         self._allowlist = allowlist if allowlist is not None else Allowlist.empty()
         self._traces: list[AllowlistTrace] = []
         self._vcs_ignored = 0
+        self._files_scanned = 0
 
     @property
     def traces(self) -> tuple[AllowlistTrace, ...]:
@@ -246,6 +248,19 @@ class Scanner:
         parcouru par l'arbre.
         """
         return self._vcs_ignored
+
+    @property
+    def files_scanned(self) -> int:
+        """Nombre de fichiers effectivement lus lors du dernier scan.
+
+        Un fichier n'est compté qu'après une lecture complète et vérifiée
+        (identité, taille, ``mtime_ns``). Ce compteur décrit donc le
+        **contenu réellement analysé**, hors base VCS élaguée. Il rend
+        observable le cas d'un arbre réduit à sa base VCS (aucun fichier de
+        contenu lu) sans transformer un dépôt vide en erreur : la politique
+        d'élagage reste inchangée, et ``--staged`` couvre le contenu indexé.
+        """
+        return self._files_scanned
 
     def _recheck_root(self) -> None:
         """Re-vérifie la racine **et ses ancêtres** par ``lstat`` avant lecture.
@@ -289,12 +304,16 @@ class Scanner:
         élaguée par politique (compteur :attr:`vcs_ignored`) et l'historique
         n'est jamais parcouru. Un ``[]`` ne prouve donc pas un historique
         propre ; ``--staged`` couvre le contenu indexé, pas l'historique.
+        :attr:`files_scanned` indique combien de fichiers de contenu ont été
+        réellement lus lors de cet appel.
         """
+        # Compteurs remis à zéro pour que `vcs_ignored` et `files_scanned`
+        # décrivent **ce** scan, pas une accumulation d'appels successifs sur
+        # la même instance — y compris si l'échéance refuse avant lecture.
+        self._vcs_ignored = 0
+        self._files_scanned = 0
         if deadline is not None and time.monotonic() > deadline:
             raise ScanError(_SCAN_ERROR)
-        # Compteur remis à zéro pour que `vcs_ignored` décrive **ce** scan, pas
-        # une accumulation d'appels successifs sur la même instance.
-        self._vcs_ignored = 0
         if self._single is not None:
             # Le mode fichier unique ne passe pas par `_iter_files` : la
             # racine parente est re-vérifiée ici (aucun lien suivi).
@@ -318,6 +337,7 @@ class Scanner:
                 raise ScanError(_SCAN_ERROR)
             text, size = self._read_text(path)
             total += size
+            self._files_scanned += 1
             if total > self._max_bytes:
                 raise ScanError(_SCAN_ERROR)
             # Le plafond Findings est vérifié à deux granularités : par

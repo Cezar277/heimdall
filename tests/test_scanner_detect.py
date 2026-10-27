@@ -460,6 +460,35 @@ def test_an_oversized_inner_token_is_a_documented_limit(charge: int) -> None:
     assert find_signature_matches("xoxe." + interne) == ()
 
 
+@pytest.mark.parametrize(
+    ("charge", "attendu"),
+    [
+        (SLACK_PAYLOAD_MAX, 1),
+        (SLACK_PAYLOAD_MAX + 1, 0),
+        (256, 0),
+    ],
+)
+def test_the_rotating_bounds_are_frozen_at_scan_level(
+    tmp_path: Path, charge: int, attendu: int
+) -> None:
+    """Revue (LOW) : les bornes Slack sont figées jusqu'au Finding.
+
+    ``xoxe.`` + charge 250 est **un** secret rotatif (un seul Finding, type
+    ``slack``) ; au-delà de la borne documentée (251, 256), rien n'est
+    détecté. Ce test passe par ``scan()``, pas seulement par le registre :
+    la limite reste écrite et observable, jamais un ``[]`` silencieux
+    présenté comme une couverture sans borne.
+    """
+    token = "xoxe.xapp-" + "a" * charge
+    _write(tmp_path, "slack.txt", f'SLACK = "{token}"\n')
+
+    findings = scan(tmp_path)
+    assert len(findings) == attendu
+    if attendu:
+        assert findings[0].type == "slack"
+        assert findings[0].line == 1
+
+
 def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:
     """Un secret coupé par un retour à la ligne reste détecté (fenêtre 4 Kio)."""
     secret = fake_token("", 40)
@@ -623,6 +652,23 @@ def test_scanner_does_not_consult_the_deprecated_binary_helper(
         scan(tmp_path)
 
 
+def test_the_deprecated_binary_helper_is_not_exported() -> None:
+    """Revue (LOW) : le nom déprécié ne fait pas partie de la surface publique.
+
+    Il reste importable pour compatibilité historique, mais ``__all__`` ne
+    l'expose pas : un nouvel appelant ne peut pas le découvrir comme une API
+    de périmètre et réintroduire une exclusion par nom.
+    """
+    assert hasattr(exclusions, "is_known_binary")
+    assert "is_known_binary" not in exclusions.__all__
+    assert set(exclusions.__all__) == {
+        "ARBRES_HORS_PERIMETRE",
+        "decode_text",
+        "est_base_vcs",
+        "est_chemin_hors_perimetre",
+    }
+
+
 def test_gitlink_file_is_scanned_vs_vcs_directory_matrix(tmp_path: Path) -> None:
     """Revue (LOW) : la décision de périmètre est un prédicat booléen figé.
 
@@ -701,6 +747,33 @@ def test_vcs_ignored_is_reset_between_scans(tmp_path: Path) -> None:
     shutil.rmtree(tmp_path / ".git")
     assert scanner.scan() == []
     assert scanner.vcs_ignored == 0
+
+
+def test_files_scanned_describes_the_current_scan(tmp_path: Path) -> None:
+    """``files_scanned`` compte le contenu réellement lu, jamais la base VCS.
+
+    Ce compteur rend observable le cas d'un arbre réduit à ``.git/`` (aucun
+    fichier de contenu lu) sans transformer un dépôt vide en erreur. Il doit
+    être remis à zéro à chaque scan et ne compter que les fichiers dont le
+    contenu a été lu et vérifié.
+    """
+    scanner = Scanner(tmp_path)
+    assert scanner.scan() == []
+    assert scanner.files_scanned == 0
+
+    _write(tmp_path, "app.py", "x = 1\n")
+    assert scanner.scan() == []
+    assert scanner.files_scanned == 1
+
+    _write(tmp_path, ".git/config", f'AWS = "{_aws("git-only")}"')
+    assert scanner.scan() == []
+    assert scanner.files_scanned == 1  # seul app.py est du contenu
+    assert scanner.vcs_ignored == 1
+
+    (tmp_path / "app.py").unlink()
+    assert scanner.scan() == []
+    assert scanner.files_scanned == 0
+    assert scanner.vcs_ignored == 1
 
 
 def test_gitlink_file_and_vcs_directory_scan_matrix(tmp_path: Path) -> None:

@@ -124,9 +124,12 @@ L'historique VCS (`.git/`) n'est jamais parcouru par le mode arbre, et le
 compteur `heimdall.scanner.detect.Scanner.vcs_ignored` rend cet élagage
 observable. Ce compteur est propagé dans `ScanReport.vcs_ignored`, le champ
 `vcs_ignored` du JSON et le résumé `--ci` sur stderr : une CI peut donc
-distinguer « aucune base VCS » de « base VCS non parcourue ». `--staged`
-couvre le contenu **indexé** (ce que le commit va contenir), pas les commits
-déjà écrits. Un fichier régulier nommé `.git`
+distinguer « aucune base VCS » de « base VCS non parcourue ». Un dépôt réduit
+à `.git/config` reste un **arbre vide** : il rend 0 avec `vcs_ignored == 1`
+et `files_scanned == 0` (compteur de bibliothèque), jamais un `ScanError` —
+un dépôt vide est propre, pas illisible. C'est pourquoi `--staged` est le
+périmètre opposable pour le contenu indexé : il couvre ce que le commit va
+contenir, pas les commits déjà écrits. Un fichier régulier nommé `.git`
 (gitlink de worktree ou de sous-module, `gitdir: …`) n'est pas une base VCS :
 il est lu par contenu.
 

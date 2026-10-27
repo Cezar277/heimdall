@@ -24,6 +24,7 @@ strict: list[Finding] = TreeScanner(".", strict=True).scan()
 scanner = TreeScanner(".")
 findings = scanner.scan()
 bases_vcs_ignorees: int = scanner.vcs_ignored
+fichiers_lus: int = scanner.files_scanned  # contenu réellement analysé
 ```
 
 La CLI propage ce compteur dans `ScanReport.vcs_ignored`, le champ
@@ -113,6 +114,15 @@ l'appelant distingue « aucune base VCS » de « base VCS non parcourue ». Un
 propre » ; `--staged` couvre le contenu indexé (ce que le commit va
 contenir), pas les commits déjà écrits.
 
+`TreeScanner.files_scanned` expose le nombre de fichiers de contenu
+effectivement lus. Un dépôt vide (seule la base VCS existe) reste un verdict
+0 : il est réellement vide, pas illisible. Un arbre réduit à `.git/config`
+rend donc 0 avec `vcs_ignored == 1` et `files_scanned == 0` ; c'est pourquoi
+`--staged` est le périmètre opposable pour le contenu indexé et que le résumé
+`--ci` rappelle toujours le nombre de bases élaguées. Dès qu'au moins un
+fichier de contenu a été lu, l'élagage VCS reste une politique observable
+sans transformer un dépôt réel en erreur.
+
 Un fichier régulier nommé `.git` est un **gitlink** légitime (worktree,
 sous-module : `gitdir: …`), pas le répertoire `.git/` : seul un segment
 **parent** de chemin peut classer hors périmètre. Son contenu est lu comme
@@ -131,11 +141,12 @@ convertissent jamais un doute en skip silencieux.
 > **API dépréciée, sans autorité.** `heimdall.scanner.exclusions.is_known_binary`
 > reste importable pour compatibilité historique, mais le scanner ne l'appelle
 > **jamais** : `decode_text` passe par le helper interne `_is_known_binary`.
-> Ne jamais brancher un périmètre, une allowlist ou une décision « ignorer ce
-> fichier » sur ce nom public : un appelant qui l'utiliserait pour exclure un
-> fichier sans analyser son contenu réintroduirait le contournement corrigé
-> par #59. Sa suppression est prévue dans un ticket dédié ; d'ici là, seul le
-> contenu décide.
+> Il ne figure pas dans `__all__` du module, et aucun nouvel appelant ne doit
+> s'en servir pour décider qu'un fichier est « ignorable par son nom » : le
+> contenu décide, et un binaire non reconnu lève `ScanError`. Un appelant qui
+> l'utiliserait pour exclure un fichier sans analyser son contenu
+> réintroduirait le contournement corrigé par #59. Sa suppression est prévue
+> dans un ticket dédié ; d'ici là, seul le contenu décide.
 
 ### Encodage des fichiers lus
 
@@ -177,17 +188,20 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | contenu NUL non décodable (y compris un binaire connu) | `ScanError` |
 | fichier ou répertoire symlinké **interne** au périmètre | `ScanError` (jamais suivi) |
 | base VCS `.git/`, `.hg/`, `.svn/` | élaguée par politique, comptée dans `TreeScanner.vcs_ignored` |
+| arbre vide (seule la base VCS existe) | liste vide (0) : arbre réellement vide, `files_scanned == 0` et `vcs_ignored == 1` |
 | fichier régulier nommé `.git` (gitlink) | lu par contenu, comme tout fichier |
 | scan réussi sans signature | liste vide (**périmètre lu** propre ; l'historique VCS n'est pas couvert) |
 
 > **Garde d'usage (hook/CI) :** le scanner d'arbre bibliothèque lit tous les
 > noms par contenu ; un `[]` vaut « rien trouvé dans le périmètre lu », jamais
 > « historique propre ». La base VCS est élaguée par politique et comptée
-> dans `TreeScanner.vcs_ignored`. Pour un hook ou une CI, c'est la CLI
-> `heimdall scan` qu'il faut utiliser : elle refuse (code 2) tout fichier du
-> périmètre non analysable et analyse **sans aucune exclusion de chemin** les
-> blobs de l'index en mode `--staged` (voir [cli.md](cli.md)). Un scan
-> incomplet sort en 2, jamais en 0.
+> dans `TreeScanner.vcs_ignored` (+ `files_scanned` pour savoir si un contenu
+> a été lu). Pour un hook ou une CI, c'est la CLI `heimdall scan` qu'il faut
+> utiliser : elle refuse (code 2) tout fichier du périmètre non analysable et
+> analyse **sans aucune exclusion de chemin** les blobs de l'index en mode
+> `--staged` (voir [cli.md](cli.md)). Un scan incomplet sort en 2, jamais en
+> 0 ; un arbre vide reste un 0 assumé, c'est `--staged` qui couvre le
+> contenu indexé.
 
 Un scan incomplet ne devient donc jamais une liste vide ou partielle. Depuis
 #29, la CLI est branchée : `ScanError` produit le code 2 (erreur d'outillage),

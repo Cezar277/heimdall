@@ -32,6 +32,16 @@ from heimdall.scanner.errors import ScanError
 #: Base VCS : ce n'est pas le contenu du dépôt, elle n'est pas parcourue.
 ARBRES_HORS_PERIMETRE: Final[frozenset[str]] = frozenset({".git", ".hg", ".svn"})
 
+#: Surface publique **volontairement fermée** : le helper déprécié
+#: ``is_known_binary`` reste importable pour compatibilité historique, mais
+#: n'est pas exporté. Aucun périmètre ne doit être branché sur ce nom.
+__all__ = [
+    "ARBRES_HORS_PERIMETRE",
+    "decode_text",
+    "est_base_vcs",
+    "est_chemin_hors_perimetre",
+]
+
 
 def est_base_vcs(name: str) -> bool:
     """Vrai si ``name`` désigne une base VCS (casse ignorée).

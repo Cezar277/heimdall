@@ -307,7 +307,11 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   mode arbre ne prétend donc jamais couvrir l'historique : `--staged` couvre
   le contenu indexé (ce que le commit va contenir), pas les commits déjà
   écrits. Un binaire connu est refusé (code 2) dans les deux périmètres : il
-  n'est jamais sauté silencieusement.
+  n'est jamais sauté silencieusement. Un arbre vide (seule la base VCS existe)
+  reste un verdict 0 assumé, avec `files_scanned == 0` et `vcs_ignored == 1`
+  observables en bibliothèque ; un test fige que `--staged` couvre le contenu
+  indexé. Dès qu'un fichier de contenu est analysé, l'élagage VCS reste une
+  politique comptée et un dépôt réellement propre sort en 0.
   Durcissement post-3ᵉ relecture : **aucun verdict propre partiel**. Les
   compteurs ne sont plus jetés par `scan()`/`find_candidates()` : un fichier
   du périmètre qui n'a pas pu être analysé lève `ScanError` au lieu de rendre
@@ -327,6 +331,11 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   (`test_the_vcs_database_is_not_walked`,
   `test_a_vcs_database_with_a_secret_returns_an_empty_list`,
   `test_the_vcs_skip_is_counted_and_never_claimed_complete`,
+  `test_vcs_ignored_is_reset_between_scans`,
+  `test_files_scanned_describes_the_current_scan`,
+  `test_gitlink_file_and_vcs_directory_scan_matrix`,
+  `test_the_rotating_bounds_are_frozen_at_scan_level`,
+  `test_the_deprecated_binary_helper_is_not_exported`,
   `test_a_gitlink_file_is_not_mistaken_for_the_vcs_database`,
   `test_a_real_binary_is_fail_closed`,
   `test_symlinks_are_fail_closed`,
