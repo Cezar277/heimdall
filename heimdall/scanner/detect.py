@@ -30,7 +30,8 @@ from __future__ import annotations
 import os
 import stat
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
+from functools import partial
 from pathlib import Path
 from typing import Final
 
@@ -71,6 +72,11 @@ def _not_link(p: Path) -> bool:
     except OSError:
         raise ScanError(_SCAN_ERROR) from None
 
+
+def _directory_flags() -> int:
+    """Drapeaux d'ouverture d'un répertoire, sans jamais suivre un lien."""
+    return _open_flags() | getattr(os, "O_DIRECTORY", 0)
+
 MAX_FILE_BYTES: Final[int] = 1_048_576
 MULTILINE_WINDOW: Final[int] = 4096
 #: Plafond du nombre de fichiers analysés en une passe (#29). Au-delà, le
@@ -86,6 +92,18 @@ MAX_TOTAL_BYTES: Final[int] = 256 * 1024 * 1024
 _READ_CHUNK: Final[int] = 65_536
 _SCAN_ERROR: Final[str] = "scan impossible : entrée non analysable"
 _BOUNDS_ERROR: Final[str] = "bornes de scan hors contrat"
+
+#: Traversée ancrée sur un descripteur de répertoire (``openat``/``scandir``).
+#: Disponible sur POSIX ; sur une plateforme qui ne l'expose pas, le scanner
+#: retombe sur le parcours par chemin, avec les mêmes gardes par fichier
+#: (``_recheck_root``, ``resolve`` + ``is_relative_to``, ``O_NOFOLLOW``).
+_DIR_FD_SUPPORTED: Final[bool] = (
+    os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd and os.scandir in os.supports_fd
+)
+
+#: Un lecteur de fichier déjà confiné : le descripteur de répertoire parent
+#: (mode ancré) ou le chemin re-vérifié (repli) est capturé à l'itération.
+_FileReader = Callable[[], tuple[str, int]]
 
 
 def _checked_bound(value: int | None, default: int) -> int:
@@ -306,6 +324,14 @@ class Scanner:
         propre ; ``--staged`` couvre le contenu indexé, pas l'historique.
         :attr:`files_scanned` indique combien de fichiers de contenu ont été
         réellement lus lors de cet appel.
+
+        La racine est **ouverte** en ``O_NOFOLLOW|O_DIRECTORY`` puis
+        parcourue par descripteurs (``openat``/``scandir``) : un remplacement
+        de la racine ou d'un sous-répertoire entre la re-vérification et la
+        lecture ne peut pas détourner le parcours vers un autre arbre. Sur
+        une plateforme sans descripteurs de répertoire, le repli par chemin
+        conserve les gardes par fichier (``resolve`` + ``is_relative_to`` +
+        ``O_NOFOLLOW`` + identité ``dev/ino``).
         """
         # Compteurs remis à zéro pour que `vcs_ignored` et `files_scanned`
         # décrivent **ce** scan, pas une accumulation d'appels successifs sur
@@ -314,39 +340,82 @@ class Scanner:
         self._files_scanned = 0
         if deadline is not None and time.monotonic() > deadline:
             raise ScanError(_SCAN_ERROR)
+        # La racine et ses ancêtres sont re-contrôlés avant toute ouverture :
+        # un lien ou un répertoire substitué est refusé, même si la racine
+        # est ensuite ouverte par son chemin.
+        self._recheck_root()
+        if _DIR_FD_SUPPORTED:
+            root_descriptor = self._open_root_dir()
+            try:
+                entries: Iterable[tuple[str, _FileReader]]
+                if self._single is not None:
+                    relative = _validate_relative_path(self._single.name)
+                    entries = (
+                        (
+                            relative,
+                            partial(
+                                self._read_text_at,
+                                root_descriptor,
+                                self._single.name,
+                                relative,
+                            ),
+                        ),
+                    )
+                else:
+                    entries = self._iter_files_at(root_descriptor, "")
+                # Pas de `list()` sur le périmètre : un dépôt adverse avec un
+                # très grand nombre de fichiers ne doit pas OOM le hook/CI.
+                # Le tri final porte sur les findings, pas sur les chemins.
+                return self._scan_entries(entries, deadline=deadline)
+            finally:
+                self._close_dir(root_descriptor)
+        # Repli documenté pour les plateformes sans `openat`/`scandir(fd)` :
+        # chaque lecture reste confinée et re-vérifiée par `_read_text`.
+        path_entries: Iterable[tuple[str, _FileReader]]
         if self._single is not None:
-            # Le mode fichier unique ne passe pas par `_iter_files` : la
-            # racine parente est re-vérifiée ici (aucun lien suivi).
-            self._recheck_root()
-        # Pas de `list()` sur le périmètre : un dépôt adverse avec un très
-        # grand nombre de fichiers ne doit pas OOM le hook/CI. Le tri final
-        # porte sur les findings, pas sur les chemins.
-        files = (
-            [(self._single, _validate_relative_path(self._single.name))]
-            if self._single is not None
-            else self._iter_files()
-        )
+            relative = _validate_relative_path(self._single.name)
+            path_entries = ((relative, partial(self._read_text, self._single)),)
+        else:
+            path_entries = (
+                (relative, partial(self._read_text, path))
+                for path, relative in self._iter_files()
+            )
+        return self._scan_entries(path_entries, deadline=deadline)
+
+    def _scan_entries(
+        self,
+        entries: Iterable[tuple[str, _FileReader]],
+        *,
+        deadline: float | None,
+    ) -> list[Finding]:
+        """Lit et analyse des entrées ``(chemin relatif, lecteur confiné)``."""
         findings: list[Finding] = []
         count = 0
         total = 0
-        for path, relative in files:
-            if deadline is not None and time.monotonic() > deadline:
-                raise ScanError(_SCAN_ERROR)
-            count += 1
-            if count > self._max_files:
-                raise ScanError(_SCAN_ERROR)
-            text, size = self._read_text(path)
-            total += size
-            self._files_scanned += 1
-            if total > self._max_bytes:
-                raise ScanError(_SCAN_ERROR)
-            # Le plafond Findings est vérifié à deux granularités : par
-            # candidat dans `_append` (un seul fichier dense ne fait jamais
-            # gonfler la liste), et ici entre fichiers (l'accumulation sur
-            # tout le périmètre reste bornée).
-            findings.extend(self._scan_text(text, relative, deadline=deadline))
-            if len(findings) > self._max_findings:
-                raise ScanError(_SCAN_ERROR)
+        try:
+            for relative, reader in entries:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise ScanError(_SCAN_ERROR)
+                count += 1
+                if count > self._max_files:
+                    raise ScanError(_SCAN_ERROR)
+                text, size = reader()
+                total += size
+                self._files_scanned += 1
+                if total > self._max_bytes:
+                    raise ScanError(_SCAN_ERROR)
+                # Le plafond Findings est vérifié à deux granularités : par
+                # candidat dans `_append` (un seul fichier dense ne fait jamais
+                # gonfler la liste), et ici entre fichiers (l'accumulation sur
+                # tout le périmètre reste bornée).
+                findings.extend(self._scan_text(text, relative, deadline=deadline))
+                if len(findings) > self._max_findings:
+                    raise ScanError(_SCAN_ERROR)
+        except RecursionError:
+            # Parcours ancré récursif : un arbre d'une profondeur extrême ne
+            # doit pas produire une exception brute (contrat ``ScanError``,
+            # fail-closed, jamais un verdict propre).
+            raise ScanError(_SCAN_ERROR) from None
         if deadline is not None and time.monotonic() > deadline:
             raise ScanError(_SCAN_ERROR)
         findings.sort(
@@ -359,11 +428,137 @@ class Scanner:
         )
         return findings
 
+    def _open_root_dir(self) -> int:
+        """Ouvre la racine en ``O_NOFOLLOW|O_DIRECTORY`` et vérifie son identité.
+
+        L'ouverture est ancrée sur un descripteur : même si un ancêtre ou la
+        racine est renommé/substitué juste après, le parcours reste celui du
+        répertoire effectivement ouvert. ``O_NOFOLLOW`` interdit de suivre un
+        lien sur le dernier composant ; ``fstat`` refuse un non-répertoire ou
+        une identité ``(st_dev, st_ino)`` différente de celle figée.
+        """
+        try:
+            descriptor = os.open(self._root, _directory_flags())
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ScanError(_SCAN_ERROR)
+            if (metadata.st_dev, metadata.st_ino) != self._root_id:
+                raise ScanError(_SCAN_ERROR)
+        except OSError:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise ScanError(_SCAN_ERROR) from None
+        except ScanError:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        return descriptor
+
+    @staticmethod
+    def _close_dir(descriptor: int) -> None:
+        """Ferme un descripteur de répertoire, en gardant le contrat d'erreur."""
+        try:
+            os.close(descriptor)
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+
+    @staticmethod
+    def _list_names(dir_fd: int) -> list[str]:
+        """Liste triée des noms d'un répertoire, sans suivre aucun lien."""
+        try:
+            with os.scandir(dir_fd) as iterator:
+                return sorted(entry.name for entry in iterator)
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+
+    @staticmethod
+    def _lstat_at(dir_fd: int, name: str) -> os.stat_result:
+        """``lstat`` d'une entrée relative à un descripteur (jamais suivie)."""
+        try:
+            return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except (OSError, RuntimeError):
+            # Une plateforme sans ``dir_fd`` lève une erreur d'exécution :
+            # elle est convertie en ``ScanError`` (fail-closed, jamais propre).
+            raise ScanError(_SCAN_ERROR) from None
+
+    def _check_relative(self, relative: str) -> None:
+        """Défense en profondeur du contrat de chemin (cf. ``_iter_files_at``)."""
+        # Le chemin relatif doit rester représentable et ne jamais passer sous
+        # une base VCS. Le parcours ancré ne peut pas produire un tel chemin ;
+        # ce contrôle protège tout futur appelant et refuse un nom invalide.
+        if est_chemin_hors_perimetre(relative):
+            raise ScanError(_SCAN_ERROR)
+        try:
+            (self._root / relative).relative_to(self._root)
+        except ValueError:
+            raise ScanError(_SCAN_ERROR) from None
+        if not _not_link(self._root / relative):
+            raise ScanError(_SCAN_ERROR)
+
+    def _iter_files_at(self, dir_fd: int, prefix: str) -> Iterator[tuple[str, _FileReader]]:
+        """Parcourt un répertoire **par descripteur** (aucun chemin suivi).
+
+        Chaque entrée est classée par ``lstat`` relatif au descripteur ; un
+        sous-répertoire est ouvert en ``O_NOFOLLOW|O_DIRECTORY`` puis comparé
+        à l'identité observée. Un remplacement par un lien, un autre
+        répertoire ou un fichier est donc refusé avant lecture. La base VCS
+        est la seule entrée élaguée (et comptée) ; tous les autres noms sont
+        parcourus, quel que soit leur contenu.
+        """
+        directories: list[tuple[str, os.stat_result]] = []
+        files: list[tuple[str, str]] = []
+        for name in self._list_names(dir_fd):
+            relative = f"{prefix}{name}"
+            metadata = self._lstat_at(dir_fd, name)
+            mode = metadata.st_mode
+            if stat.S_ISLNK(mode):
+                # Un lien nommé comme une base VCS n'est jamais suivi : il est
+                # élagué et compté comme la base elle-même. Tout autre lien est
+                # refusé (fail-closed), jamais traversé.
+                if est_base_vcs(name):
+                    self._vcs_ignored += 1
+                    continue
+                raise ScanError(_SCAN_ERROR)
+            if est_base_vcs(name) and stat.S_ISDIR(mode):
+                self._vcs_ignored += 1
+                continue
+            self._check_relative(relative)
+            if stat.S_ISDIR(mode):
+                directories.append((name, metadata))
+            else:
+                files.append((name, relative))
+        for name, relative in files:
+            validated = _validate_relative_path(relative)
+            yield validated, partial(self._read_text_at, dir_fd, name, relative)
+        for name, expected in directories:
+            try:
+                sub_descriptor = os.open(name, _directory_flags(), dir_fd=dir_fd)
+            except OSError:
+                raise ScanError(_SCAN_ERROR) from None
+            try:
+                metadata = os.fstat(sub_descriptor)
+                if not stat.S_ISDIR(metadata.st_mode) or (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ) != (expected.st_dev, expected.st_ino):
+                    raise ScanError(_SCAN_ERROR)
+                yield from self._iter_files_at(sub_descriptor, f"{prefix}{name}/")
+            finally:
+                self._close_dir(sub_descriptor)
+
     def _iter_files(self) -> Iterator[tuple[Path, str]]:
-        # Re-contrôle de la racine au moment du parcours : entre la résolution
-        # de ``__init__`` et l'ouverture par ``os.walk``, la racine pourrait
-        # être remplacée par un lien symbolique. ``os.walk`` suivrait alors la
-        # cible ; ``lstat`` refuse le lien (fail-closed).
+        # Repli par chemin pour les plateformes sans descripteurs de
+        # répertoire. Re-contrôle de la racine au moment du parcours : entre
+        # la résolution de ``__init__`` et l'ouverture par ``os.walk``, la
+        # racine pourrait être remplacée par un lien symbolique. ``os.walk``
+        # suivrait alors la cible ; ``lstat`` refuse le lien (fail-closed).
         self._recheck_root()
         for current, directories, filenames in os.walk(
             self._root,
@@ -413,8 +608,8 @@ class Scanner:
                     raise ScanError(_SCAN_ERROR)
                 yield path, _validate_relative_path(relative)
 
-    def _read_text(self, path: Path) -> tuple[str, int]:  # noqa: PLR0912
-        """Lit un fichier borné et rend ``(texte, taille)``.
+    def _read_text(self, path: Path) -> tuple[str, int]:
+        """Lit un fichier borné et rend ``(texte, taille)`` (repli par chemin).
 
         La taille lue est rendue pour que ``scan()`` borne le **volume total**
         analysé (#29), pas seulement chaque fichier. Un contenu non décodable
@@ -433,6 +628,34 @@ class Scanner:
             descriptor = os.open(path, _open_flags())
         except OSError:
             raise ScanError(_SCAN_ERROR) from None
+        return self._read_descriptor(descriptor, before)
+
+    def _read_text_at(self, dir_fd: int, name: str, relative: str) -> tuple[str, int]:
+        """Lit un fichier **relatif au descripteur** du répertoire parent.
+
+        ``openat`` + ``O_NOFOLLOW`` interdit de suivre un lien et fige le
+        répertoire parent : le chemin affiché ne peut pas être redirigé vers
+        un autre arbre entre l'énumération et l'ouverture. La résolution du
+        chemin demandé reste contrôlée en défense en profondeur (fail-closed) ;
+        elle ne décide jamais de la lecture, qui reste ancrée sur ``dir_fd``.
+        """
+        try:
+            resolved = (self._root / relative).resolve(strict=True)
+            if not resolved.is_relative_to(self._root):
+                raise ScanError(_SCAN_ERROR)
+            before = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except (OSError, RuntimeError):
+            raise ScanError(_SCAN_ERROR) from None
+        if not stat.S_ISREG(before.st_mode):
+            raise ScanError(_SCAN_ERROR)
+        try:
+            descriptor = os.open(name, _open_flags(), dir_fd=dir_fd)
+        except (OSError, RuntimeError):
+            raise ScanError(_SCAN_ERROR) from None
+        return self._read_descriptor(descriptor, before)
+
+    def _read_descriptor(self, descriptor: int, before: os.stat_result) -> tuple[str, int]:
+        """Lit un descripteur déjà ouvert, vérifie son identité et le ferme."""
         chunks: list[bytes] = []
         try:
             after = os.fstat(descriptor)

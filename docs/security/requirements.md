@@ -308,10 +308,13 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   le contenu indexé (ce que le commit va contenir), pas les commits déjà
   écrits. Un binaire connu est refusé (code 2) dans les deux périmètres : il
   n'est jamais sauté silencieusement. Un arbre vide (seule la base VCS existe)
-  reste un verdict 0 assumé, avec `files_scanned == 0` et `vcs_ignored == 1`
-  observables en bibliothèque ; un test fige que `--staged` couvre le contenu
-  indexé. Dès qu'un fichier de contenu est analysé, l'élagage VCS reste une
-  politique comptée et un dépôt réellement propre sort en 0.
+  reste un verdict 0 assumé **en bibliothèque et en local**, avec
+  `files_scanned == 0` et `vcs_ignored == 1` observables ; en mode `--ci`, il
+  est refusé (code 2) car aucun contenu n'a été lu : une automatisation qui ne
+  lit que le code de sortie ne peut pas confondre « propre » et « non
+  parcouru ». Un test fige que `--staged` couvre le contenu indexé. Dès qu'un
+  fichier de contenu est analysé, l'élagage VCS reste une politique comptée et
+  un dépôt réellement propre sort en 0.
   Durcissement post-3ᵉ relecture : **aucun verdict propre partiel**. Les
   compteurs ne sont plus jetés par `scan()`/`find_candidates()` : un fichier
   du périmètre qui n'a pas pu être analysé lève `ScanError` au lieu de rendre
@@ -322,7 +325,13 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   Avant le walk, la racine **et tous ses ancêtres** sont re-`lstat`és, et
   l'identité `(st_dev, st_ino)` de la racine parcourue doit être celle figée à
   la construction : un ancêtre symlinké ou un répertoire substitué au même
-  chemin est refusé, jamais lu à la place du périmètre.
+  chemin est refusé, jamais lu à la place du périmètre. La racine est ensuite
+  **ouverte** en `O_NOFOLLOW|O_DIRECTORY` et le parcours/lecture sont ancrés
+  sur des descripteurs de répertoire (`openat`/`scandir(fd)`) : la fenêtre
+  résiduelle entre la re-vérification et le walk ne peut plus détourner le
+  périmètre. Le repli par chemin des plateformes sans descripteurs conserve
+  les gardes par fichier (`resolve` + `is_relative_to`, `O_NOFOLLOW`,
+  identité `dev/ino`, taille et `mtime_ns` avant/après).
   Durcissement post-5ᵉ relecture : un fichier régulier nommé `.git` (gitlink
   de worktree ou de sous-module, `gitdir: …`) n'est **pas** confondu avec le
   répertoire `.git/` : seul un segment **parent** classe un chemin hors
@@ -343,6 +352,8 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   `test_a_single_file_parent_replaced_by_a_symlink_before_reading_is_fail_closed`,
   `test_an_ancestor_of_the_root_replaced_by_a_symlink_is_fail_closed`,
   `test_the_root_replaced_by_another_directory_is_fail_closed`,
+  `test_a_root_swapped_between_recheck_and_open_is_fail_closed`,
+  `test_a_root_swapped_after_open_cannot_redirect_the_traversal`,
   `test_gitlink_file_is_scanned_vs_vcs_directory_matrix`,
   `test_scanner_does_not_consult_the_deprecated_binary_helper`),
   `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean`

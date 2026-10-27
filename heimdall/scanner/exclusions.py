@@ -24,6 +24,7 @@ scannés. Le contenu n'est jamais exécuté.
 from __future__ import annotations
 
 import codecs
+import warnings
 from pathlib import PurePosixPath
 from typing import Final
 
@@ -211,8 +212,15 @@ def is_known_binary(data: bytes) -> bool:
     nom public ne change donc jamais le périmètre d'un scan. Aucun nouvel
     appelant ne doit s'en servir pour décider qu'un fichier est « ignorable
     par son nom » : le contenu décide, et un binaire non reconnu lève
-    ``ScanError``.
+    ``ScanError``. Tout appel émet un ``DeprecationWarning`` pour rendre la
+    dépendance visible ; sa suppression est prévue dans un ticket dédié.
     """
+    warnings.warn(
+        "is_known_binary est déprécié et sans autorité : utiliser decode_text "
+        "(le contenu décide, jamais le nom)",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return _is_known_binary(data)
 
 

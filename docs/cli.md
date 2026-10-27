@@ -125,13 +125,16 @@ compteur `heimdall.scanner.detect.Scanner.vcs_ignored` rend cet élagage
 observable. Ce compteur est propagé dans `ScanReport.vcs_ignored`, le champ
 `vcs_ignored` du JSON et le résumé `--ci` sur stderr : une CI peut donc
 distinguer « aucune base VCS » de « base VCS non parcourue ». Un dépôt réduit
-à `.git/config` reste un **arbre vide** : il rend 0 avec `vcs_ignored == 1`
-et `files_scanned == 0` (compteur de bibliothèque), jamais un `ScanError` —
-un dépôt vide est propre, pas illisible. C'est pourquoi `--staged` est le
-périmètre opposable pour le contenu indexé : il couvre ce que le commit va
-contenir, pas les commits déjà écrits. Un fichier régulier nommé `.git`
-(gitlink de worktree ou de sous-module, `gitdir: …`) n'est pas une base VCS :
-il est lu par contenu.
+à `.git/config` reste un **arbre vide** en local : il rend 0 avec
+`vcs_ignored == 1` et `files_scanned == 0` (compteur de bibliothèque) — un
+dépôt vide est propre, pas illisible. En revanche, le mode **`--ci`** est
+strict : dès qu'une base VCS a été élaguée sans **aucun** contenu lu, il rend
+**2** (`ScanError`) pour qu'une automatisation qui ne lit que le code de
+sortie ne confonde jamais « propre » et « non parcouru ». C'est pourquoi
+`--staged` est le périmètre opposable pour le contenu indexé : il couvre ce
+que le commit va contenir, pas les commits déjà écrits. Un fichier régulier
+nommé `.git` (gitlink de worktree ou de sous-module, `gitdir: …`) n'est pas
+une base VCS : il est lu par contenu.
 
 En mode `--staged`, c'est le **blob indexé** qui est lu, pas la copie de
 travail : c'est ce que le commit va contenir qui est jugé. Le blob entier est
@@ -164,7 +167,10 @@ pendant le scan refuse le verdict (code 2, fail-closed) ; sous Windows, le
 rejoue sa garde sur la forme canonique déjà figée (opération idempotente) ; ce
 second passage n'ouvre pas
 de bypass : toute substitution entre les deux est rattrapée par le
-re-contrôle d'identité final.
+re-contrôle d'identité final. Pendant le parcours, la racine et chaque
+sous-répertoire sont en plus **ouverts par descripteur** (`O_NOFOLLOW` +
+`O_DIRECTORY`, `openat`/`scandir(fd)`) : un remplacement entre l'énumération
+et la lecture ne peut pas rediriger le scan vers un autre arbre.
 
 Les suppressions et les **gitlinks** (sous-modules, mode `160000`) sont
 ignorés : une suppression n'a plus de blob à scanner, et le SHA d'un gitlink

@@ -113,6 +113,9 @@ _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INVALID_SCOPE: Final[str] = "scan impossible : entrée non analysable"
+#: Mode CI strict : un arbre réduit à sa base VCS n'a lu aucun contenu. Le
+#: code 2 évite qu'une automatisation ne confonde « propre » et « non parcouru ».
+_MSG_VCS_ONLY: Final[str] = "scan impossible : entrée non analysable"
 
 #: Journal de diagnostic (niveau debug uniquement) : les causes de refus de
 #: la garde anti auto-attestation y sont distinguées par des libellés
@@ -478,9 +481,13 @@ def _collect_tree(
     lockfiles et les fichiers de contrôle sont parcourus. Un secret y est un
     secret. Un fichier binaire connu est refusé (``ScanError``, code 2),
     comme en ``--staged`` : aucun contenu n'est sauté en silence.
-    Un arbre vide (seule la base VCS existe) reste un verdict 0 : il est
-    réellement vide, pas illisible. ``Scanner.files_scanned`` expose ce cas
-    (0 fichier de contenu lu) et ``--staged`` couvre le contenu indexé.
+    Un arbre vide (seule la base VCS existe) reste un verdict 0 en local : il
+    est réellement vide, pas illisible. En revanche, le mode **``--ci``** est
+    strict : dès qu'une base VCS a été élaguée **sans aucun contenu lu**
+    (``vcs_ignored > 0`` et ``files_scanned == 0``), le scan est refusé
+    (``ScanError``, code 2) — une automatisation qui ne lit que le code de
+    sortie ne doit jamais confondre « propre » et « non parcouru ».
+    ``--staged`` reste le périmètre opposable pour le contenu indexé.
 
     L'allowlist déterministe (#24) écarte les cas évidents (example,
     changeme, dummy, fixtures de test) et produit une trace pour chaque rejet.
@@ -522,6 +529,12 @@ def _collect_tree(
     )
     scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
     findings = scanner.scan(deadline=deadline)
+    if ci and scanner.vcs_ignored > 0 and scanner.files_scanned == 0:
+        # Aucun contenu n'a été lu : le seul périmètre observé est une base
+        # VCS élaguée. En CI stricte, un code 0 serait indistinguable d'un
+        # dépôt propre pour une automatisation qui ne lit que la sortie.
+        logger.debug("refus --ci : arbre réduit à sa base VCS (aucun contenu lu)")
+        raise ScanError(_MSG_VCS_ONLY)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
     traces = scanner.traces

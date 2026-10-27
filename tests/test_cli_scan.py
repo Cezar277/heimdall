@@ -560,14 +560,17 @@ def test_scan_tree_reports_the_vcs_skip_in_json_and_ci(tmp_path: Path) -> None:
 def test_scan_tree_vcs_only_is_policy_and_staged_covers_content(
     git_repo: GitRepo,
 ) -> None:
-    """Revue (LOW) : un arbre réduit à ``.git/`` est un 0 assumé, pas un trou.
+    """Revue (LOW) : un arbre réduit à ``.git/`` est refusé en CI stricte.
 
     La politique d'élagage VCS est figée : la bibliothèque rend ``[]`` avec
-    ``vcs_ignored == 1`` et ``files_scanned == 0``, la CLI rend 0 (un dépôt
-    réellement vide est propre, pas illisible) et le compteur reste
-    observable. Le même test rejoue ensuite ``--staged`` : un secret indexé
-    est bien détecté (code 1), ce qui prouve que seul ``--staged`` couvre le
-    contenu commité — l'arbre ne prétend jamais couvrir l'historique.
+    ``vcs_ignored == 1`` et ``files_scanned == 0``, la CLI locale rend 0 (un
+    dépôt réellement vide est propre, pas illisible). En ``--ci``, le même
+    arbre rend **2** : aucune automatisation ne peut confondre « propre » et
+    « non parcouru » en ne lisant que le code de sortie. Le compteur reste
+    observable en JSON et sur stderr. Le test rejoue ensuite ``--staged`` :
+    un secret indexé est bien détecté (code 1), ce qui prouve que seul
+    ``--staged`` couvre le contenu commité — l'arbre ne prétend jamais
+    couvrir l'historique.
     """
     git_repo.write(".git/description", f'AWS = "{FAKE_AWS_KEY}"\n')
 
@@ -586,8 +589,8 @@ def test_scan_tree_vcs_only_is_policy_and_staged_covers_content(
     assert FAKE_AWS_KEY not in resultat.output
 
     resultat_ci = _run("scan", "--ci", "--no-allowlist", str(git_repo.root))
-    assert resultat_ci.exit_code == EXIT_CLEAN
-    assert "1 base(s) VCS élaguée(s)" in resultat_ci.stderr
+    assert resultat_ci.exit_code == EXIT_ERROR
+    assert "scan impossible" in resultat_ci.stderr
     assert FAKE_AWS_KEY not in resultat_ci.output
 
     resultat_json = _run("scan", "--json", "--no-allowlist", str(git_repo.root))
@@ -990,12 +993,14 @@ def test_scan_staged_concurrent_index_change_exits_two(
 def test_nested_file_mutation_between_walk_and_read_text(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Revue (LOW) : swap fichier imbriqué walk->open : 0 assumé en arbre vs 2 en staged.
+    """Revue (LOW) : swap fichier imbriqué énumération->lecture : 0 vs 2 en staged.
 
     Fige le comportement documenté dans docs/cli.md :
-    - En mode arbre : un fichier imbriqué nettoyé entre `os.walk` et `_read_text`
-      ne modifie pas l'identité (dev, ino, ctime) de la racine ; le scan lit le
-      contenu propre et rend 0 (best-effort non atomique assumé).
+    - En mode arbre : un fichier imbriqué nettoyé **en place** entre
+      l'énumération et l'ouverture est relu tel quel ; le scan lit le contenu
+      propre et rend 0 (best-effort non atomique assumé). Le parcours est ancré
+      sur des descripteurs de répertoire : seul le contenu du fichier change,
+      jamais le répertoire parcouru.
     - En `--staged` : l'index modifié après le snapshot refuse en code 2 (atomique).
     """
     nested = git_repo.root / "sub"
@@ -1004,17 +1009,17 @@ def test_nested_file_mutation_between_walk_and_read_text(
     target_file.write_text(f'AWS = "{FAKE_AWS_KEY}"\n', encoding="utf-8")
     git_repo.stage("sub/app.py")
 
-    # 1. En mode arbre : substitution entre os.walk et lecture
-    original_iter = TreeScanner._iter_files
+    # 1. En mode arbre : substitution en place entre l'énumération et la lecture
+    original_iter = TreeScanner._iter_files_at
 
-    def iter_puis_nettoie(self: TreeScanner) -> Any:
-        for p, rel in original_iter(self):
+    def iter_puis_nettoie(self: TreeScanner, dir_fd: int, prefix: str) -> Any:
+        for rel, lecteur in original_iter(self, dir_fd, prefix):
             if rel == "sub/app.py":
-                # Le fichier est nettoyé avant son ouverture _read_text
+                # Le fichier est nettoyé avant son ouverture par le lecteur.
                 target_file.write_text("x = 1\n", encoding="utf-8")
-            yield p, rel
+            yield rel, lecteur
 
-    monkeypatch.setattr(TreeScanner, "_iter_files", iter_puis_nettoie)
+    monkeypatch.setattr(TreeScanner, "_iter_files_at", iter_puis_nettoie)
     resultat_tree = _run("scan", str(git_repo.root))
     assert resultat_tree.exit_code == EXIT_CLEAN
 

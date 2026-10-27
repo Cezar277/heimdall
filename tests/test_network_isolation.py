@@ -532,16 +532,18 @@ def test_scan_ci_never_attempts_external_traffic(
 ) -> None:
     """Une tentative externe reste visible même si la CLI la capture.
 
-    Depuis #29, la commande exécute un **scan réel** : le dépôt vide est
-    propre, donc le code de sortie est 0. Le point du test reste le même :
+    Depuis #29, la commande exécute un **scan réel** : le dépôt contient un
+    fichier texte bénin, donc le code de sortie est 0 (un arbre réduit à sa
+    base VCS serait refusé en ``--ci``). Le point du test reste le même :
     aucune connexion hors boucle locale n'est tentée sur ce chemin — y
     compris via les sous-processus git (autorisés par l'allowlist car
     locaux et figés, voir `_is_local_git_call`).
     """
+    (scan_repo / "app.py").write_text("x = 1\n", encoding="utf-8")
     result = CliRunner().invoke(app, ["scan", "--ci", str(scan_repo)])
 
-    # Scan opérationnel sur un dépôt vide : propre => 0 (jamais 2, qui reste
-    # réservé à l'erreur d'outillage).
+    # Scan opérationnel avec un contenu lisible : propre => 0 (jamais 2, qui
+    # reste réservé à l'erreur d'outillage).
     assert result.exit_code == 0, result.output
     assert loopback_only.blocked == []
     assert all(

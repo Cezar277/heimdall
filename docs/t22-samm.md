@@ -290,6 +290,33 @@ intermédiaire) ; après le squash,
 | **Les bornes Slack sont figées jusqu'au Finding** (250 détecté une fois, 251/256 limite documentée) | `heimdall/scanner/signatures/stripe_slack.py` (bornes dérivées) | `tests/test_scanner_detect.py::test_the_rotating_bounds_are_frozen_at_scan_level` |
 | **Le compteur VCS décrit le scan courant** et ne compte jamais un fichier de contenu | `heimdall/scanner/detect.py` (`scan`, `files_scanned`, `vcs_ignored`) | `tests/test_scanner_detect.py::test_vcs_ignored_is_reset_between_scans`, `::test_files_scanned_describes_the_current_scan` |
 
+## Corrections issues de la relecture « APPROVE WITH COMMENTS » (8ᵉ passage)
+
+Cette section décrit le correctif demandé par la relecture du 8ᵉ passage
+(run `40558402955`) : *un arbre réduit à sa base VCS ne doit plus sortir en 0
+en CI stricte*, *la fenêtre résiduelle entre le re-`lstat` et le walk est
+fermée par descripteur*, et *le helper binaire déprécié signale son usage*.
+Les preuves ci-dessous sont des **noms de modules et de tests** (pas de
+permalien sur un SHA intermédiaire) ; après le squash,
+`scripts/repin_samm.py --sha <sha-final>` re-pince les liens historiques et
+`--check` refuse tout lien mort.
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| **LOW** — un `[]` avec base VCS élaguée restait exit 0, indistinguable de « propre » pour une automatisation qui ne lit que le code de sortie | en mode **`--ci`** uniquement, un arbre avec `vcs_ignored > 0` et `files_scanned == 0` est refusé (`ScanError`, code 2). En local et en bibliothèque, un arbre réellement vide reste un 0 assumé ; `--staged` couvre toujours le contenu indexé | `heimdall/cli/scan.py` (`_collect_tree`) ; `tests/test_cli_scan.py::test_scan_tree_vcs_only_is_policy_and_staged_covers_content` |
+| **LOW** — fenêtre racine entre `_recheck_root` et `os.walk` : un parent inscriptible remplacé après le contrôle pouvait rediriger le parcours | la racine est **ouverte** en `O_NOFOLLOW|O_DIRECTORY`, son identité `(st_dev, st_ino)` est comparée à celle figée, puis le parcours et chaque lecture sont ancrés sur des descripteurs (`openat`/`scandir(fd)`). Un sous-répertoire remplacé est refusé par identité ; un fichier est lu relatif au descripteur parent. Repli par chemin conservé pour les plateformes sans `openat` | `heimdall/scanner/detect.py` (`_open_root_dir`, `_iter_files_at`, `_read_text_at`) ; `tests/test_scanner_detect.py::test_a_root_swapped_between_recheck_and_open_is_fail_closed`, `::test_a_root_swapped_after_open_cannot_redirect_the_traversal` |
+| **LOW** — helper `is_known_binary` encore importable sans avertissement | l'alias reste importable pour compatibilité, mais émet un `DeprecationWarning` ; la documentation interdit explicitement de brancher un périmètre, une allowlist ou un skip sur ce nom. `decode_text` n'utilise que `_is_known_binary` | `heimdall/scanner/exclusions.py` (`is_known_binary`), `docs/scanner.md` ; `tests/test_scanner_detect.py::test_the_deprecated_binary_helper_warns_and_stays_without_authority` |
+| **LOW** — hygiène PR : quatre sous-tickets dans une PR | exception maintenue et signalée ; elle reste à valider par les mainteneurs. Le 8ᵉ passage ne modifie pas le découpage | `docs/t22-samm.md#exception-de-regroupement` |
+| **LOW** — preuves à re-pinner après squash | `repin_samm.py --check` reste la garde ; le SHA du squash est la seule valeur à fournir après fusion (`--sha <sha-final>`) | `scripts/repin_samm.py`, `tests/security/test_samm_permalinks.py` |
+
+### Ce que le correctif permet désormais de prouver
+
+| Exigence vérifiée | Implémentation | Test et preuve permanente |
+|---|---|---|
+| **Un arbre réduit à sa base VCS ne sort plus en 0 en CI stricte** | `heimdall/cli/scan.py` (`_collect_tree`) | `tests/test_cli_scan.py::test_scan_tree_vcs_only_is_policy_and_staged_covers_content` |
+| **Aucun remplacement de la racine ou d'un sous-répertoire entre contrôle et lecture ne détourne le parcours** | `heimdall/scanner/detect.py` (`_open_root_dir`, `_iter_files_at`, `_read_text_at`) | `tests/test_scanner_detect.py::test_a_root_swapped_between_recheck_and_open_is_fail_closed`, `::test_a_root_swapped_after_open_cannot_redirect_the_traversal` |
+| **Le helper binaire déprécié signale son usage et reste sans autorité** | `heimdall/scanner/exclusions.py` (`is_known_binary`) | `tests/test_scanner_detect.py::test_the_deprecated_binary_helper_warns_and_stays_without_authority`, `::test_scanner_does_not_consult_the_deprecated_binary_helper` |
+
 ## Révisions à re-pinner après la fusion
 
 Les permaliens de cette fiche sont épinglés sur la révision du code testé
@@ -442,6 +469,13 @@ publique du helper binaire déprécié, le code mort du re-pin et les tests
 manquants ; il ne change ni le découpage ni le périmètre des sous-tickets.
 L'exception reste **à valider explicitement par les mainteneurs** avant
 fusion.
+
+La relecture « APPROVE WITH COMMENTS » (8ᵉ passage) **maintient l'exception** :
+le correctif porte sur le refus CI d'un arbre réduit à sa base VCS, la
+fermeture de la fenêtre racine par descripteur et l'avertissement du helper
+binaire déprécié ; il ne change ni le découpage ni le périmètre des
+sous-tickets. L'exception reste **à valider explicitement par les mainteneurs**
+avant fusion.
 
 ## Relecture et PR
 

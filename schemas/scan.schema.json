@@ -83,7 +83,7 @@
       "type": "integer",
       "minimum": 0,
       "default": 0,
-      "description": "Nombre de bases VCS (`.git/`, `.hg/`, `.svn/`) élaguées par politique lors d'un scan d'arbre. Toujours 0 en `--staged`, qui ne parcourt pas l'arbre. Un `0` de ce champ signifie « aucune base rencontrée », jamais « historique analysé »."
+      "description": "Nombre de bases VCS (`.git/`, `.hg/`, `.svn/`) élaguées par politique lors d'un scan d'arbre. Toujours 0 en `--staged`, qui ne parcourt pas l'arbre. Un `0` de ce champ signifie « aucune base rencontrée », jamais « historique analysé ». En mode `--ci`, un arbre réduit à sa base VCS sans aucun contenu lu (`vcs_ignored > 0` et aucun fichier analysé) est refusé en code 2 : il ne produit donc pas de document JSON avec un faux verdict propre."
     }
   }
 }

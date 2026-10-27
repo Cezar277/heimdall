@@ -18,7 +18,9 @@ import shutil
 import stat
 import time
 import types
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -652,6 +654,13 @@ def test_scanner_does_not_consult_the_deprecated_binary_helper(
         scan(tmp_path)
 
 
+def test_the_deprecated_binary_helper_warns_and_stays_without_authority() -> None:
+    """Revue (LOW) : un appel au nom déprécié est signalé, jamais silencieux."""
+    data = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
+    with pytest.warns(DeprecationWarning):
+        assert exclusions.is_known_binary(data) is True
+
+
 def test_the_deprecated_binary_helper_is_not_exported() -> None:
     """Revue (LOW) : le nom déprécié ne fait pas partie de la surface publique.
 
@@ -1120,6 +1129,78 @@ def test_the_root_replaced_by_another_directory_is_fail_closed(
         scanner.scan()
 
 
+def test_a_root_swapped_between_recheck_and_open_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """La racine est figée par descripteur : un swap après le re-``lstat`` échoue.
+
+    Il restait une fenêtre entre ``_recheck_root`` et ``os.walk`` : un
+    répertoire substitué au même chemin pouvait être parcouru. La racine est
+    désormais ouverte en ``O_NOFOLLOW|O_DIRECTORY`` et son identité
+    ``(st_dev, st_ino)`` comparée à celle figée. Le test remplace la racine
+    **après** le re-contrôle : l'ouverture doit refuser avant toute lecture.
+    """
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _write(repository, "app.py", "x = 1\n")
+    scanner = Scanner(repository)
+    original_recheck = Scanner._recheck_root
+
+    def recheck_then_swap(self: Scanner) -> None:
+        original_recheck(self)
+        repository.rename(tmp_path / "repo.original")
+        repository.mkdir()
+        _write(repository, "evil.py", f'AWS = "{_aws("swapped")}"')
+
+    monkeypatch.setattr(Scanner, "_recheck_root", recheck_then_swap)
+    with pytest.raises(ScanError):
+        scanner.scan()
+
+
+def test_a_root_swapped_after_open_cannot_redirect_the_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un descripteur de racine déjà ouvert ne lit jamais l'arbre substitué.
+
+    Après l'ouverture, la racine est renommée puis remplacée par un répertoire
+    contenant un fichier du même nom mais un secret. Le parcours ancré lit le
+    fichier d'origine (propre) et ignore le remplaçant : aucune fuite ni faux
+    verdict sur l'arbre substitué.
+    """
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _write(repository, "app.py", "x = 1\n")
+    scanner = Scanner(repository)
+    original_iter = Scanner._iter_files_at
+
+    def iter_after_swap(
+        self: Scanner, dir_fd: int, prefix: str
+    ) -> Iterator[tuple[str, Any]]:
+        repository.rename(tmp_path / "repo.original")
+        repository.mkdir()
+        _write(repository, "app.py", f'AWS = "{_aws("substitute")}"')
+        yield from original_iter(self, dir_fd, prefix)
+
+    monkeypatch.setattr(Scanner, "_iter_files_at", iter_after_swap)
+    assert scanner.scan() == []
+
+
+def test_extreme_depth_in_anchored_traversal_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un arbre trop profond lève ``ScanError``, jamais une exception brute."""
+    _write(tmp_path, "app.py", "x = 1\n")
+    scanner = Scanner(tmp_path)
+
+    def too_deep(self: Scanner, dir_fd: int, prefix: str) -> Iterator[tuple[str, Any]]:
+        raise RecursionError
+        yield from ()  # pragma: no cover - le générateur échoue avant tout yield
+
+    monkeypatch.setattr(Scanner, "_iter_files_at", too_deep)
+    with pytest.raises(ScanError):
+        scanner.scan()
+
+
 def test_symlinked_single_file_root_is_refused(tmp_path: Path) -> None:
     target = _write(tmp_path, "outside.txt", f'AWS = "{_aws("outside")}"')
     link = tmp_path / "link.txt"
@@ -1387,9 +1468,10 @@ def test_a_file_truncated_between_the_stat_and_the_open_is_fail_closed(
         nonlocal calls
         metadata = real_fstat(descriptor)
         calls += 1
-        if calls == 1:
-            # Le fichier a été tronqué après le `stat` : même inode, taille
-            # réduite, date de modification inchangée.
+        if calls == 2:
+            # Le premier `fstat` porte sur la racine ouverte en `O_DIRECTORY` ;
+            # le suivant est celui du fichier, tronqué après son `stat` :
+            # même inode, taille réduite, date de modification inchangée.
             return types.SimpleNamespace(
                 st_mode=metadata.st_mode,
                 st_size=metadata.st_size // 2,

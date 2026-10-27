@@ -29,7 +29,10 @@ fichiers_lus: int = scanner.files_scanned  # contenu réellement analysé
 
 La CLI propage ce compteur dans `ScanReport.vcs_ignored`, le champ
 `vcs_ignored` du JSON `--json` et le résumé `--ci` sur stderr (voir
-[cli.md](cli.md)).
+[cli.md](cli.md)). En mode `--ci`, un arbre réduit à sa base VCS
+(`vcs_ignored > 0` et `files_scanned == 0`) est refusé (code 2) : un code 0
+ne peut plus être confondu avec « non parcouru » par une automatisation qui
+ne lit que le code de sortie.
 
 Le scanner d'arbre est `heimdall.scanner.detect.Scanner` (alias
 `TreeScanner` ci-dessus) : c'est lui qui porte `vcs_ignored` et les bornes de
@@ -41,13 +44,16 @@ raccourci public pour obtenir directement les dictionnaires du contrat #14.
 `TreeScanner` accepte un répertoire ou un fichier régulier explicite. `root` est
 résolu une fois, **sans suivre de lien symbolique** : la racine elle-même et
 chacun de ses ancêtres sont vérifiés par `lstat`, et un lien dans ce chemin
-lève `ScanError` (la cible n'est pas lue à la place de la racine). Chaque
-fichier est ensuite revérifié à l'usage (identité du descripteur, chemin résolu
-sous la racine, refus des liens symboliques). La racine parcourue est
-re-contrôlée avant le walk, **ancêtres compris**, et son identité
-(`st_dev`, `st_ino`) doit être celle figée à la construction : un ancêtre
-remplacé par un lien ou un répertoire substitué au même chemin est refusé
-avant toute lecture.
+lève `ScanError` (la cible n'est pas lue à la place de la racine). La racine
+parcourue est re-contrôlée, **ancêtres compris**, puis **ouverte** en
+`O_NOFOLLOW|O_DIRECTORY` ; son identité (`st_dev`, `st_ino`) doit être celle
+figée à la construction. Le parcours et chaque lecture sont ensuite ancrés sur
+des descripteurs de répertoire (`openat`/`scandir(fd)`) : un ancêtre, la racine
+ou un sous-répertoire remplacé par un lien ou un autre répertoire entre la
+vérification et la lecture ne peut pas détourner le périmètre. Sur une
+plateforme sans descripteurs de répertoire, le repli par chemin conserve les
+gardes par fichier (résolution sous la racine, `O_NOFOLLOW`, identité
+`dev/ino`, taille et `mtime_ns` avant/après lecture).
 
 Un Finding contient exactement : `file`, `line`, `type`, `entropy`,
 `snippet_hash`, `status` (`detecte`) et `source` (`regex` ou `entropy`). **La valeur brute
@@ -116,12 +122,14 @@ contenir), pas les commits déjà écrits.
 
 `TreeScanner.files_scanned` expose le nombre de fichiers de contenu
 effectivement lus. Un dépôt vide (seule la base VCS existe) reste un verdict
-0 : il est réellement vide, pas illisible. Un arbre réduit à `.git/config`
-rend donc 0 avec `vcs_ignored == 1` et `files_scanned == 0` ; c'est pourquoi
-`--staged` est le périmètre opposable pour le contenu indexé et que le résumé
-`--ci` rappelle toujours le nombre de bases élaguées. Dès qu'au moins un
-fichier de contenu a été lu, l'élagage VCS reste une politique observable
-sans transformer un dépôt réel en erreur.
+0 **en bibliothèque et en local** : il est réellement vide, pas illisible. Un
+arbre réduit à `.git/config` rend donc 0 avec `vcs_ignored == 1` et
+`files_scanned == 0` en mode local ; **en `--ci`**, le même arbre est refusé
+(code 2) car aucun contenu n'a été lu. C'est pourquoi `--staged` est le
+périmètre opposable pour le contenu indexé et que le résumé `--ci` rappelle
+toujours le nombre de bases élaguées. Dès qu'au moins un fichier de contenu a
+été lu, l'élagage VCS reste une politique observable sans transformer un dépôt
+réel en erreur.
 
 Un fichier régulier nommé `.git` est un **gitlink** légitime (worktree,
 sous-module : `gitdir: …`), pas le répertoire `.git/` : seul un segment
@@ -188,7 +196,8 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | contenu NUL non décodable (y compris un binaire connu) | `ScanError` |
 | fichier ou répertoire symlinké **interne** au périmètre | `ScanError` (jamais suivi) |
 | base VCS `.git/`, `.hg/`, `.svn/` | élaguée par politique, comptée dans `TreeScanner.vcs_ignored` |
-| arbre vide (seule la base VCS existe) | liste vide (0) : arbre réellement vide, `files_scanned == 0` et `vcs_ignored == 1` |
+| arbre vide (seule la base VCS existe) en bibliothèque/local | liste vide (0) : arbre réellement vide, `files_scanned == 0` et `vcs_ignored == 1` |
+| arbre réduit à la base VCS en `--ci` | `ScanError` (code 2) : aucun contenu lu, un 0 serait ambigu |
 | fichier régulier nommé `.git` (gitlink) | lu par contenu, comme tout fichier |
 | scan réussi sans signature | liste vide (**périmètre lu** propre ; l'historique VCS n'est pas couvert) |
 
@@ -200,7 +209,8 @@ Toute situation non analysable lève `ScanError` avec un message statique
 > utiliser : elle refuse (code 2) tout fichier du périmètre non analysable et
 > analyse **sans aucune exclusion de chemin** les blobs de l'index en mode
 > `--staged` (voir [cli.md](cli.md)). Un scan incomplet sort en 2, jamais en
-> 0 ; un arbre vide reste un 0 assumé, c'est `--staged` qui couvre le
+> 0 ; un arbre vide reste un 0 assumé en local, mais `--ci` refuse (2) un
+> arbre réduit à sa base VCS sans contenu lu. C'est `--staged` qui couvre le
 > contenu indexé.
 
 Un scan incomplet ne devient donc jamais une liste vide ou partielle. Depuis
