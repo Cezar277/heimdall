@@ -2,7 +2,7 @@
 
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -11,6 +11,7 @@ import pytest
 from support.git_repo import GitRepo
 from typer.testing import CliRunner
 
+from heimdall.cli import review as review_module
 from heimdall.cli.main import app
 from heimdall.cli.review import (
     _ENV_REFERENCE,
@@ -971,3 +972,110 @@ def test_injected_journal_static_errors_are_preserved(proposal: Proposal, error:
         review_proposal(
             proposal, ask=ask, journal=cast(DecisionJournal, BrokenJournal()), stream=TTY
         )
+
+
+# --- Durcissements LOW : environnement, producteur, rendu (revue 5) ----------
+
+
+def test_journal_rejects_a_null_byte_path() -> None:
+    """`Path` accepte un octet NUL ; la garde doit refuser avant tout I/O."""
+    with pytest.raises(JournalError) as excinfo:
+        DecisionJournal(Path("\x00/heimdall/review-decisions.jsonl"))
+    assert excinfo.value.__cause__ is None
+
+
+def test_journal_path_rejects_an_unavailable_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+
+    def broken_home() -> Path:
+        raise RuntimeError("HOME indisponible")
+
+    monkeypatch.setattr(Path, "home", staticmethod(broken_home))
+    with pytest.raises(JournalError):
+        DecisionJournal()
+
+
+def test_journal_rejects_a_non_path_argument(tmp_path: Path) -> None:
+    with pytest.raises(JournalError):
+        DecisionJournal(cast(Path, "relative.jsonl"))
+
+
+def test_review_proposal_normalizes_a_broken_default_journal(
+    proposal: Proposal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_journal(_path: object = None) -> None:
+        raise RuntimeError("HOME indisponible")
+
+    monkeypatch.setattr(review_module, "DecisionJournal", broken_journal)
+    ask, _prompts = _asker(["n"])
+
+    with pytest.raises(JournalError) as excinfo:
+        review_proposal(proposal, ask=ask, stream=TTY)
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize("proposals", [None, 123, object()])
+def test_review_proposals_rejects_a_non_iterable(proposals: object) -> None:
+    with pytest.raises(ReviewError):
+        review_proposals(cast(Iterable[Proposal], proposals), ci=True)
+
+
+def test_review_proposals_normalizes_a_failing_producer() -> None:
+    def broken() -> Iterator[Proposal]:
+        raise OSError("échec SYNTHETIC_ONLY_VALUE")
+        yield  # pragma: no cover - jamais atteint
+
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposals(broken(), ci=True)
+
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize("error", [MemoryError(), KeyboardInterrupt()])
+def test_render_failure_in_the_loop_is_static(
+    proposal: Proposal,
+    journal: DecisionJournal,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    def broken_mask(_text: str) -> tuple[str, int]:
+        raise error
+
+    monkeypatch.setattr(review_module, "mask_text", broken_mask)
+    ask, _prompts = _asker(["y"])
+
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(proposal, ask=ask, apply=lambda _p: None, journal=journal, stream=TTY)
+
+    assert excinfo.value.__cause__ is None
+    assert journal.read() == []
+
+
+@pytest.mark.parametrize("error", [MemoryError(), KeyboardInterrupt()])
+def test_render_failure_in_the_report_is_static(
+    proposal: Proposal, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    report = review_proposals((proposal,), ci=True)
+
+    def broken_mask(_text: str) -> tuple[str, int]:
+        raise error
+
+    monkeypatch.setattr(review_module, "mask_text", broken_mask)
+    with pytest.raises(ReviewError) as excinfo:
+        report.render()
+
+    assert excinfo.value.__cause__ is None
+
+
+def test_review_proposal_preserves_a_static_journal_error(
+    proposal: Proposal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_journal(_path: object = None) -> None:
+        raise JournalError
+
+    monkeypatch.setattr(review_module, "DecisionJournal", broken_journal)
+    ask, _prompts = _asker(["n"])
+
+    with pytest.raises(JournalError):
+        review_proposal(proposal, ask=ask, stream=TTY)

@@ -209,6 +209,22 @@ def render_diff(proposal: Proposal) -> str:
     return "\n".join(lines)
 
 
+def _render(proposal: Proposal) -> str:
+    """Rendu défensif : une panne de masquage ou de diff reste statique.
+
+    ``_secret_pattern`` normalise déjà ``re.error`` ; ``mask_text`` et
+    ``difflib`` sur des snapshots volumineux peuvent lever autre chose
+    (``MemoryError``, ``KeyboardInterrupt`` opérateur). Aucune valeur ne
+    doit ressortir avec la traceback (invariants 8 et 11).
+    """
+    try:
+        return render_diff(proposal)
+    except ReviewError:
+        raise
+    except BaseException:  # refus par défaut, jamais de traceback de rendu
+        raise ReviewError from None
+
+
 class Choice(str, Enum):
     """Les trois actions humaines de #88 ; aucune n'est un défaut implicite."""
 
@@ -292,13 +308,28 @@ class Decision:
 
 
 def decision_journal_path() -> Path:
-    """État local opérateur, hors dépôt ; jamais un chemin choisi par un outil."""
-    base = os.environ.get("XDG_STATE_HOME")
-    return (
-        (Path(base) if base else Path.home() / ".local" / "state")
-        / "heimdall"
-        / "review-decisions.jsonl"
-    )
+    """État local opérateur, hors dépôt ; jamais un chemin choisi par un outil.
+
+    ``XDG_STATE_HOME`` est un environnement opérateur : une valeur invalide
+    (octet NUL) ou un ``HOME`` indisponible ne doit pas produire de traceback
+    non statique (invariant 8).
+    """
+    try:
+        base = os.environ.get("XDG_STATE_HOME")
+        path = (
+            (Path(base) if base else Path.home() / ".local" / "state")
+            / "heimdall"
+            / "review-decisions.jsonl"
+        )
+        # `Path` accepte un octet NUL ; il n'échouerait qu'au premier appel
+        # système, hors du contrat d'erreur statique.
+        if "\x00" in str(path):
+            raise JournalError
+        return path
+    except JournalError:
+        raise
+    except BaseException:  # refus par défaut, jamais de message d'environnement
+        raise JournalError from None
 
 
 _DECISION_FIELDS: Final[frozenset[str]] = frozenset(
@@ -359,7 +390,14 @@ class DecisionJournal:
     """Journal local chaîné des choix humains (#88), sans valeur de secret."""
 
     def __init__(self, path: Path | None = None) -> None:
-        self.path = decision_journal_path() if path is None else path
+        try:
+            if path is not None and (not isinstance(path, Path) or "\x00" in str(path)):
+                raise JournalError
+            self.path = decision_journal_path() if path is None else path
+        except JournalError:
+            raise
+        except BaseException:  # refus par défaut, jamais de traceback de chemin
+            raise JournalError from None
 
     def read(self) -> list[dict[str, Any]]:
         """Relit et vérifie la chaîne ; un journal absent est vide."""
@@ -443,6 +481,16 @@ def _ask(ask_fn: AskFn, prompt: str) -> str:
         raise
     except BaseException:  # refus par défaut, jamais de message d'entrée
         raise ReviewError from None
+
+
+def _resolve_journal(journal: DecisionJournal | None) -> DecisionJournal:
+    """Résout le journal par défaut sans traceback de chemin (invariant 8)."""
+    try:
+        return DecisionJournal() if journal is None else journal
+    except JournalError:
+        raise
+    except BaseException:  # refus par défaut, jamais de traceback de chemin
+        raise JournalError from None
 
 
 def _journal(journal_fn: DecisionJournal, decision: Decision) -> None:
@@ -533,17 +581,23 @@ class ReviewReport:
         return len(self.outcomes) - self.applied
 
     def render(self) -> str:
-        lines: list[str] = []
-        if not self.interactive:
-            lines.append(NON_INTERACTIVE)
-        for outcome in self.outcomes:
-            lines.append(render_diff(outcome.proposal))
-            lines.append(_status(outcome))
-        lines.append(
-            f"{len(self.outcomes)} proposition(s), {self.applied} appliquée(s), "
-            f"{self.remaining} restante(s)."
-        )
-        return "\n".join(lines)
+        """Rapport masqué ; une panne de rendu reste une erreur statique."""
+        try:
+            lines: list[str] = []
+            if not self.interactive:
+                lines.append(NON_INTERACTIVE)
+            for outcome in self.outcomes:
+                lines.append(_render(outcome.proposal))
+                lines.append(_status(outcome))
+            lines.append(
+                f"{len(self.outcomes)} proposition(s), {self.applied} appliquée(s), "
+                f"{self.remaining} restante(s)."
+            )
+            return "\n".join(lines)
+        except ReviewError:
+            raise
+        except BaseException:  # refus par défaut, jamais de traceback de rendu
+            raise ReviewError from None
 
 
 def _status(outcome: ReviewOutcome) -> str:
@@ -586,7 +640,7 @@ def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
         return ReviewOutcome(None, False, 0, proposal)
     ask_fn = _stdin_ask if ask is None else ask
     notify_fn = _stderr_notify if notify is None else notify
-    journal_fn = DecisionJournal() if journal is None else journal
+    journal_fn = _resolve_journal(journal)
     current = proposal
     edits = 0
     prompts = 0
@@ -596,7 +650,7 @@ def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
             raise ReviewError
         # Une lecture impossible (EOF, terminal fermé) interrompt la boucle :
         # ce n'est pas une réponse invalide, donc pas de redemande en aveugle.
-        raw = _ask(ask_fn, render_diff(current) + "\n" + PROMPT)
+        raw = _ask(ask_fn, _render(current) + "\n" + PROMPT)
         try:
             choice = parse_choice(raw)
         except ReviewError:
@@ -638,6 +692,23 @@ def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
         current = edited
 
 
+def _bounded_proposals(proposals: Iterable[Proposal]) -> list[Proposal]:
+    """Consomme paresseusement, borne à ``MAX_PROPOSALS``, erreurs statiques."""
+    items: list[Proposal] = []
+    try:
+        for item in proposals:
+            if len(items) >= MAX_PROPOSALS:
+                raise ReviewError
+            if not isinstance(item, Proposal):
+                raise ReviewError
+            items.append(item)
+    except ReviewError:
+        raise
+    except BaseException:  # producteur non itérable ou qui lève : statique
+        raise ReviewError from None
+    return items
+
+
 def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
     proposals: Iterable[Proposal],
     *,
@@ -658,13 +729,7 @@ def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
     Au-delà, c'est une erreur d'outillage (code 2), jamais une troncature
     silencieuse.
     """
-    items: list[Proposal] = []
-    for item in proposals:
-        if len(items) >= MAX_PROPOSALS:
-            raise ReviewError
-        if not isinstance(item, Proposal):
-            raise ReviewError
-        items.append(item)
+    items = _bounded_proposals(proposals)
     if not isinstance(ci, bool) or (interactive is not None and not isinstance(interactive, bool)):
         raise ReviewError
     # `interactive=True` explicite ne contourne ni `--ci` ni l'absence de TTY.
