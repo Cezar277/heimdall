@@ -272,3 +272,12 @@ def rejection_summary(count: int) -> str:
         "(propositions uniquement, validation humaine requise) ; "
         "voir le détail : heimdall rejections --details."
     )
+
+
+# --- Primitives génériques du journal, réutilisées par le journal des
+# décisions humaines de T32 (#88). Alias publics ajoutés en **fin** de
+# module : aucune ligne existante ne bouge, donc les permaliens T33
+# (docs/t33-samm.md, module + ligne) restent valides.
+journal_locked = _locked
+journal_encode = _encode
+journal_digest = _digest

@@ -2,9 +2,10 @@
 
 Les sous-commandes réelles arrivent avec leurs tickets :
 ``scan`` (#29 branche le scanner #22),
-``vault`` (#25/#26/#64), ``mcp`` (#27). La validation Y/N/E (#32) et le
-remplacement du secret arrivent plus tard : ``scan`` est aujourd'hui une
-lecture seule, sans dialogue.
+``vault`` (#25/#26/#64), ``mcp`` (#27). La boucle Y/N/E (#32) est livrée
+comme API de ``heimdall.cli.review`` (rendu masqué, choix humain, journal,
+mode non interactif) ; sa commande CLI et le remplacement du secret
+arrivent avec T30 (#83–#86). ``scan`` reste une lecture seule, sans dialogue.
 
 Codes de sortie (invariant 11) : 0 propre, 1 secrets détectés, 2 erreur
 d'outillage. Une commande non branchée est une panne d'outillage, donc 2 —
