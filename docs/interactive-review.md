@@ -21,7 +21,7 @@ changements dans la proposition affichée. Le moteur de remplacement T30
 (#83–#86) n'est pas encore livré sur cette branche : cette interface ne
 génère pas de remplacements et n'ouvre aucun fichier source.
 
-Preuve locale : `python -m pytest tests/test_cli_review.py` (99 tests pour #87–#90).
+Preuve locale : `python -m pytest tests/test_cli_review.py` (109 tests pour #87–#90).
 
 ## Boucle Y/N/E (#88)
 
@@ -123,6 +123,12 @@ documentée au `CliRunner(input=...)` de Typer) et couvre :
 - `isatty` levant `KeyboardInterrupt`/`SystemExit` : non interactif ;
 - `ask` injecté levant `SystemExit("<valeur>")` : `ReviewError` statique,
   stderr vide, journal vide ;
+- `apply`/`edit` levant `SystemExit`/`KeyboardInterrupt` : statique, stderr
+  vide, journal `applied:false` ;
+- journal injecté levant `OSError` avec valeur et chemin, ou sans `append` :
+  `JournalError` statique, stderr vide ;
+- générateur infini de propositions : borné à `MAX_PROPOSALS + 1` éléments
+  consommés, `ReviewError`, aucune écriture ;
 - `XDG_STATE_HOME` relatif ou contenant `..` : `JournalError` statique ;
 - masquage borné : total des valeurs > `MAX_SECRET_BYTES` refusé, 256 valeurs
   longues acceptées et masquées ;
@@ -152,3 +158,6 @@ mypy heimdall tests/test_cli_review.py
 | [LOW] `is_interactive` laissait passer `BaseException` | `except BaseException` → refus par défaut (non interactif), sans traceback |
 | [LOW] `_ask` laissait passer `SystemExit("<valeur>")`, imprimé sur stderr par l'interpréteur | `_ask` capture `BaseException` → `ReviewError` statique, sans message d'entrée ni code de sortie choisi par l'appelant |
 | Choix `_notify` | `Exception` seul, volontairement : aucune entrée lue, donc `Ctrl-C`/`SystemExit` peuvent interrompre entre deux propositions (documenté) |
+| [LOW] `apply`/`edit` ne capturaient que `Exception` | `BaseException` → journal `applied:false` puis `ReviewError` statique (couvre `SystemExit("<valeur>")`) |
+| [LOW] journal injecté non normalisé | `_journal` réémet `JournalError`/`ReviewError` et convertit tout le reste en `JournalError from None` |
+| [LOW] `review_proposals` matérialisait tout | consommation paresseuse bornée par `MAX_PROPOSALS` (1024), `ReviewError` au-delà, jamais de troncature silencieuse |
