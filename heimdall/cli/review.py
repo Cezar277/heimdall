@@ -39,6 +39,8 @@ MAX_SECRET_BYTES: Final[int] = 262_144
 #: Bornes de la boucle : aucune réponse par défaut, aucune boucle infinie.
 MAX_PROMPTS: Final[int] = 16
 MAX_EDITS: Final[int] = 8
+#: Nombre maximal de propositions par session (disponibilité locale).
+MAX_PROPOSALS: Final[int] = 1024
 #: Longueur maximale acceptée pour une réponse clavier (refus du bruit).
 MAX_ANSWER_CHARS: Final[int] = 16
 #: Longueur maximale d'une date ISO 8601 acceptée par le journal.
@@ -443,6 +445,22 @@ def _ask(ask_fn: AskFn, prompt: str) -> str:
         raise ReviewError from None
 
 
+def _journal(journal_fn: DecisionJournal, decision: Decision) -> None:
+    """Défense en profondeur sur le point d'injection ``journal``.
+
+    ``DecisionJournal.append`` rend déjà un :class:`JournalError` statique ;
+    un journal injecté par l'appelant (tests, futur CLI T30) peut lever
+    n'importe quoi, y compris avec une valeur ou un chemin dans le message.
+    Seules les erreurs déjà statiques sont réémises telles quelles.
+    """
+    try:
+        journal_fn.append(decision)
+    except (JournalError, ReviewError):
+        raise
+    except BaseException:  # refus par défaut, jamais de message d'entrée
+        raise JournalError from None
+
+
 def _notify(notify_fn: NotifyFn, message: str) -> None:
     """Avertissement best-effort : seul un message constant est transmis.
 
@@ -586,28 +604,29 @@ def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
             _notify(notify_fn, INVALID_CHOICE)
             continue
         if choice is Choice.IGNORE:
-            journal_fn.append(Decision.now(choice, current.finding))
+            _journal(journal_fn, Decision.now(choice, current.finding))
             return ReviewOutcome(choice, False, edits, current)
         if choice is Choice.VALIDATE:
             if apply is None:
                 raise ReviewError
             try:
                 apply(current)
-            except Exception:
+            except BaseException:
                 # Trace honnête : la tentative n'a pas abouti. Le message du
-                # backend (valeur, chemin, traceback) ne sort jamais.
-                journal_fn.append(Decision.now(choice, current.finding, applied=False))
+                # backend (valeur, chemin, traceback) ne sort jamais, même
+                # via `SystemExit("<valeur>")` ou `KeyboardInterrupt`.
+                _journal(journal_fn, Decision.now(choice, current.finding, applied=False))
                 raise ReviewError from None
-            journal_fn.append(Decision.now(choice, current.finding, applied=True))
+            _journal(journal_fn, Decision.now(choice, current.finding, applied=True))
             return ReviewOutcome(choice, True, edits, current)
         if edit is None:
             raise ReviewError
         try:
             edited = edit(current)
-        except Exception:
-            journal_fn.append(Decision.now(choice, current.finding, applied=False))
+        except BaseException:
+            _journal(journal_fn, Decision.now(choice, current.finding, applied=False))
             raise ReviewError from None
-        journal_fn.append(Decision.now(choice, current.finding, applied=False))
+        _journal(journal_fn, Decision.now(choice, current.finding, applied=False))
         if edited is None:
             _notify(notify_fn, EDIT_CANCELLED)
             continue
@@ -631,10 +650,21 @@ def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
     notify: NotifyFn | None = None,
     stream: object | None = None,
 ) -> ReviewReport:
-    """Session complète ; ``ci`` et l'absence de TTY gagnent toujours."""
-    items = tuple(proposals)
-    if not all(isinstance(item, Proposal) for item in items):
-        raise ReviewError
+    """Session complète ; ``ci`` et l'absence de TTY gagnent toujours.
+
+    L'itérable est consommé **paresseusement** et borné par
+    :data:`MAX_PROPOSALS` : un producteur qui générerait des dizaines de
+    milliers de propositions ne gonfle ni la mémoire ni le temps de réponse.
+    Au-delà, c'est une erreur d'outillage (code 2), jamais une troncature
+    silencieuse.
+    """
+    items: list[Proposal] = []
+    for item in proposals:
+        if len(items) >= MAX_PROPOSALS:
+            raise ReviewError
+        if not isinstance(item, Proposal):
+            raise ReviewError
+        items.append(item)
     if not isinstance(ci, bool) or (interactive is not None and not isinstance(interactive, bool)):
         raise ReviewError
     # `interactive=True` explicite ne contourne ni `--ci` ni l'absence de TTY.

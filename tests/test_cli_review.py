@@ -2,6 +2,7 @@
 
 import os
 import stat
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -17,6 +18,7 @@ from heimdall.cli.review import (
     EDIT_CANCELLED,
     INVALID_CHOICE,
     MAX_PROMPTS,
+    MAX_PROPOSALS,
     MAX_SECRETS,
     MAX_TEXT_CHARS,
     NON_INTERACTIVE,
@@ -855,3 +857,117 @@ def test_injected_ask_system_exit_is_static(
     assert excinfo.value.__cause__ is None
     assert capsys.readouterr().err == ""
     assert journal.read() == []
+
+
+# --- Durcissements LOW sur apply/edit/journal et borne de session (revue 4) ---
+
+
+@pytest.mark.parametrize("error", [SystemExit("SYNTHETIC_ONLY_VALUE"), KeyboardInterrupt()])
+def test_apply_base_exception_is_static_and_journaled(
+    proposal: Proposal,
+    journal: DecisionJournal,
+    capsys: pytest.CaptureFixture[str],
+    error: BaseException,
+) -> None:
+    def boom(_proposal: Proposal) -> None:
+        raise error
+
+    ask, _prompts = _asker(["y"])
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(proposal, ask=ask, apply=boom, journal=journal, stream=TTY)
+
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert capsys.readouterr().err == ""
+    entries = journal.read()
+    assert [(entry["action"], entry["applied"]) for entry in entries] == [("y", False)]
+
+
+@pytest.mark.parametrize("error", [SystemExit("SYNTHETIC_ONLY_VALUE"), KeyboardInterrupt()])
+def test_edit_base_exception_is_static_and_journaled(
+    proposal: Proposal,
+    journal: DecisionJournal,
+    capsys: pytest.CaptureFixture[str],
+    error: BaseException,
+) -> None:
+    def boom(_proposal: Proposal) -> Proposal | None:
+        raise error
+
+    ask, _prompts = _asker(["e"])
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(proposal, ask=ask, edit=boom, journal=journal, stream=TTY)
+
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert capsys.readouterr().err == ""
+    assert [(entry["action"], entry["applied"]) for entry in journal.read()] == [("e", False)]
+
+
+def test_injected_journal_failure_is_static(
+    proposal: Proposal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class BrokenJournal:
+        def append(self, _decision: object) -> None:
+            raise OSError("échec SYNTHETIC_ONLY_VALUE dans /etc/passwd")
+
+    ask, _prompts = _asker(["n"])
+    with pytest.raises(JournalError) as excinfo:
+        review_proposal(
+            proposal,
+            ask=ask,
+            journal=cast(DecisionJournal, BrokenJournal()),
+            stream=TTY,
+        )
+
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert "/etc/passwd" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert capsys.readouterr().err == ""
+
+
+def test_injected_journal_without_append_is_static(proposal: Proposal) -> None:
+    ask, _prompts = _asker(["n"])
+
+    with pytest.raises(JournalError):
+        review_proposal(proposal, ask=ask, journal=cast(DecisionJournal, object()), stream=TTY)
+
+
+def test_review_proposals_is_bounded_and_lazy(proposal: Proposal, journal: DecisionJournal) -> None:
+    consumed = 0
+
+    def flood() -> Iterator[Proposal]:
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield proposal
+
+    with pytest.raises(ReviewError):
+        review_proposals(flood(), ci=True, journal=journal)
+
+    # Consommation paresseuse : MAX_PROPOSALS + 1 au pire, jamais 100 000.
+    assert consumed == MAX_PROPOSALS + 1
+    assert journal.read() == []
+
+
+def test_review_proposals_accepts_exactly_the_bound(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    report = review_proposals((proposal,) * MAX_PROPOSALS, ci=True, journal=journal)
+
+    assert len(report.outcomes) == MAX_PROPOSALS
+    assert report.remaining == MAX_PROPOSALS
+
+
+@pytest.mark.parametrize("error", [JournalError(), ReviewError()])
+def test_injected_journal_static_errors_are_preserved(proposal: Proposal, error: Exception) -> None:
+    """Une erreur déjà statique n'est pas réemballée."""
+
+    class BrokenJournal:
+        def append(self, _decision: object) -> None:
+            raise error
+
+    ask, _prompts = _asker(["n"])
+    with pytest.raises(type(error)):
+        review_proposal(
+            proposal, ask=ask, journal=cast(DecisionJournal, BrokenJournal()), stream=TTY
+        )
