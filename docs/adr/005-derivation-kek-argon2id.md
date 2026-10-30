@@ -148,6 +148,6 @@ et documentée, pas revendiquée comme une protection supplémentaire.
   `derive_kek_from_master_key`, `VaultCipher.from_master_key`),
   `heimdall/vault/app.py` (`VaultSettings.master_key`, `VaultSettings.kek_salt`,
   `_resolve_vault_cipher`).
-- Tests : `tests/test_vault_kek_derivation.py` (27 tests), dont le critère
+- Tests : `tests/test_vault_kek_derivation.py` (29 tests), dont le critère
   « Fait quand » (`test_same_master_key_and_same_salt_derive_the_same_kek`).
 - Fiche SAMM : [`docs/t262-samm.md`](../t262-samm.md).
