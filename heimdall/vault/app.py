@@ -599,6 +599,7 @@ class VaultSettings(BaseSettings):
     )
     kek_salt: str | None = Field(
         default=None,
+        repr=False,
         description=(
             "Sel public Argon2id de 16 octets encodé base64 URL-safe (ticket #262), "
             "persisté à côté de HEIMDALL_VAULT_MASTER_KEY et stable entre les "

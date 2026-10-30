@@ -242,6 +242,8 @@ def _normalize_master_key(master_key: str | bytes) -> bytes:
         raw = bytes(master_key)
         if not raw.strip():
             raise ValueError("Clé maîtresse invalide : valeur vide ou blanche.")
+        if raw != raw.strip():
+            raise ValueError("Clé maîtresse invalide : espaces de début ou de fin interdits.")
     else:
         raise ValueError("Clé maîtresse invalide : chaîne ou octets attendus.")
     if len(raw) < MIN_MASTER_KEY_BYTES:

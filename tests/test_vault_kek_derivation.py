@@ -467,5 +467,30 @@ class StartupDerivationTests(unittest.TestCase):
                 self.assertNotIn(payload["value"], read.text)
 
 
+class T262ReviewHygieneTests(unittest.TestCase):
+    """Verrous d'hygiène demandés par la revue (LOW, non bloquants)."""
+
+    def test_bytes_master_key_with_surrounding_whitespace_is_rejected(self) -> None:
+        """Le chemin ``bytes`` applique la même règle d'espaces que ``str``."""
+        padded = b"  correct horse battery staple  "
+        with self.assertRaises(ValueError) as ctx:
+            derive_kek_from_master_key(padded, _SALT_A)
+        self.assertIn("espaces", str(ctx.exception))
+
+    def test_settings_repr_hides_master_key_salt_and_pepper(self) -> None:
+        """``repr(VaultSettings)`` ne divulgue ni clé, ni sel, ni pepper."""
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=_PEPPER,
+        )
+        rendered = repr(settings)
+        for secret in (_MASTER_KEY, _SALT_A, _PEPPER):
+            self.assertNotIn(secret, rendered)
+        kek = generate_encryption_key()
+        legacy = VaultSettings(kek=kek, api_key_pepper=_PEPPER)
+        self.assertNotIn(kek, repr(legacy))
+
+
 if __name__ == "__main__":
     unittest.main()
