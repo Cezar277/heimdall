@@ -21,7 +21,7 @@ changements dans la proposition affichée. Le moteur de remplacement T30
 (#83–#86) n'est pas encore livré sur cette branche : cette interface ne
 génère pas de remplacements et n'ouvre aucun fichier source.
 
-Preuve locale : `python -m pytest tests/test_cli_review.py` (98 tests pour #87–#90).
+Preuve locale : `python -m pytest tests/test_cli_review.py` (99 tests pour #87–#90).
 
 ## Boucle Y/N/E (#88)
 
@@ -121,6 +121,8 @@ documentée au `CliRunner(input=...)` de Typer) et couvre :
 - `ask`/`notify` injectés qui lèvent avec une valeur dans le message : rien
   sur stderr, `ReviewError` statique, journal vide ou intact ;
 - `isatty` levant `KeyboardInterrupt`/`SystemExit` : non interactif ;
+- `ask` injecté levant `SystemExit("<valeur>")` : `ReviewError` statique,
+  stderr vide, journal vide ;
 - `XDG_STATE_HOME` relatif ou contenant `..` : `JournalError` statique ;
 - masquage borné : total des valeurs > `MAX_SECRET_BYTES` refusé, 256 valeurs
   longues acceptées et masquées ;
@@ -148,3 +150,5 @@ mypy heimdall tests/test_cli_review.py
 | [LOW] `_stdin_ask`/`is_interactive` trop étroits | `EOFError`/`OSError`/`ValueError`/`KeyboardInterrupt` → `ReviewError` ; `isatty` en erreur → non interactif |
 | [LOW] exceptions d'un `ask`/`notify` injecté non normalisées | `_ask` convertit toute exception (hors `ReviewError`) en erreur statique ; `_notify` reste best-effort et ne laisse jamais ressortir son exception |
 | [LOW] `is_interactive` laissait passer `BaseException` | `except BaseException` → refus par défaut (non interactif), sans traceback |
+| [LOW] `_ask` laissait passer `SystemExit("<valeur>")`, imprimé sur stderr par l'interpréteur | `_ask` capture `BaseException` → `ReviewError` statique, sans message d'entrée ni code de sortie choisi par l'appelant |
+| Choix `_notify` | `Exception` seul, volontairement : aucune entrée lue, donc `Ctrl-C`/`SystemExit` peuvent interrompre entre deux propositions (documenté) |
