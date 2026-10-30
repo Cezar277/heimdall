@@ -110,6 +110,21 @@ refléter dans un `ValidationError`. Python ne garantit pas une zeroization
 fiable des chaînes immuables (copies internes, GC) : cette limite est assumée
 et documentée, pas revendiquée comme une protection supplémentaire.
 
+### 6. Forme canonique NFC de la clé maîtresse
+
+La clé maîtresse (chemin `str`) est **canonisée NFC** avant l'encodage UTF-8,
+à la fois dans `_normalize_master_key` (`crypto.py`) et dans le validateur
+`VaultSettings.validate_master_key` (`app.py`). Deux formes Unicode
+canoniquement équivalentes — « é » précomposé et « e » + accent combinant,
+typiques d'un copier-coller entre OS ou outils — encodent donc en octets
+identiques et **dérivent la même KEK**. Sans cette normalisation, la même
+phrase de passe ressaisie sous une autre forme rendrait les secrets existants
+illisibles (échec de re-démarrage, piège d'une migration #71). C'est cohérent
+avec la canonisation NFC des **valeurs** de secrets (décision #62) : la KEK
+chiffre des octets NFC ; la matière qui la produit est NFC elle aussi.
+Les octets bruts (`bytes`) ne subissent aucune normalisation : ils sont
+utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
+
 ## Compatibilité et non-régression
 
 - **Mode historique conservé** : `HEIMDALL_VAULT_KEK` (32 octets base64) reste
@@ -148,6 +163,9 @@ et documentée, pas revendiquée comme une protection supplémentaire.
   `derive_kek_from_master_key`, `VaultCipher.from_master_key`),
   `heimdall/vault/app.py` (`VaultSettings.master_key`, `VaultSettings.kek_salt`,
   `_resolve_vault_cipher`).
-- Tests : `tests/test_vault_kek_derivation.py` (29 tests), dont le critère
-  « Fait quand » (`test_same_master_key_and_same_salt_derive_the_same_kek`).
+- Tests : `tests/test_vault_kek_derivation.py` (32 tests), dont le critère
+  « Fait quand » (`test_same_master_key_and_same_salt_derive_the_same_kek`),
+  l'égalité NFC/NFD (`test_nfc_and_nfd_master_keys_derive_the_same_kek`) et le
+  verrou « KDF en panne ⇒ démarrage refusé »
+  (`test_kdf_failure_is_fail_closed_at_startup`).
 - Fiche SAMM : [`docs/t262-samm.md`](../t262-samm.md).
