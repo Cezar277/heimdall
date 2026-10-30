@@ -26,6 +26,11 @@ les liens permanents actuels sont dans [t38-samm.md](t38-samm.md).
 La PR #193 couvre désormais explicitement tout T38 (#107–#110), conformément
 à la demande utilisateur ; son périmètre initial #107 seul est remplacé.
 
+La branche de livraison `32-t32-diff-interactif-yne` (PR #192) intègre ce
+même ensemble T38 par fusion des commits ci-dessus : code, tests et preuves
+sont identiques, sans réécriture ni nouveau snapshot. Les mesures ci-dessous
+restent celles des commits d'origine.
+
 ## Mesures du 26 octobre 2026
 
 Machine : AMD Ryzen 7 9800X3D (8 cœurs / 16 threads), WSL2 Debian,
@@ -227,3 +232,15 @@ fusion. Le SHA final de merge sera renseigné après fusion effective, avec
 vérification des liens permanents. Les cases PR correspondantes restent
 décochées tant que leurs preuves externes ne sont pas acquises ; aucune
 approbation ni CI n'est déclarée à partir des seuls tests locaux.
+
+## Vérification sur la branche de livraison `32-t32-diff-interactif-yne`
+
+Après fusion de l'ensemble T38 dans cette branche, la suite complète a été
+relancée : **2324 passed**, **15 skipped**, **4480 subtests passed**, aucune
+couverture recalculée ici. `ruff check heimdall tests scripts`, `mypy` strict
+(49 fichiers) et `bandit -r heimdall` passent. Contrôles fonctionnels :
+un secret supprimé du code est retrouvé une seule fois avec ses trois commits,
+un blob au-delà de `--max-file-bytes` est signalé « taille maximale
+dépassée » avec code 2, et l'alerte « considéré compromis, à révoquer et
+remplacer » ainsi que le temps de scan sont affichés. Ces vérifications
+locales ne valent pas CI verte ni relecture croisée.

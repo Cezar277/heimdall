@@ -6,6 +6,14 @@ conformément à la demande de compléter tout T38. Le périmètre initial limit
 à #107 est remplacé par ce périmètre explicite ; la PR ne permet pas de
 fusionner #107 isolément. La relecture croisée reste requise avant fusion.
 
+Intégration dans la branche de livraison `32-t32-diff-interactif-yne` :
+l'ensemble T38 y est fusionné tel quel (mêmes commits, mêmes preuves,
+permaliens inchangés) et se présente donc aussi via la
+[PR #192](https://github.com/Cezar277/heimdall/pull/192). Les deux PR portent
+le même périmètre #107–#110 ; la première fusionnée clôt les quatre
+sous-tickets. Aucune preuve n'est réécrite par cette intégration : les
+sections ci-dessous restent les snapshots d'origine.
+
 Code et tests corrigés : `78c7f7f0af1b6565bc91c2c24bfa0c8ffb42dbfe`.
 Complément LOW : `7000236ef4e584d3b6604a206da65f95db07c606` (preuves ci-dessous).
 Complément d'exhaustivité et d'API : `359155d191fd758431594addbff0a6870213f1d8`
@@ -97,7 +105,7 @@ pour le contrôle de mutation. Résultat global après correctif :
 
 ## Conditions de fusion du périmètre groupé
 
-La PR #193 conserve le périmètre #107–#110 demandé. Cette dérogation au
+Les PR #192 et #193 portent le périmètre #107–#110 demandé. Cette dérogation au
 découpage initial ne dispense pas de la relecture croisée : **ne pas fusionner
 avant une approbation effective par un membre d'un autre domaine**. La case
 correspondante dans la PR doit être cochée sur la base de cette preuve, pas

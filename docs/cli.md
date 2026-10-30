@@ -3,6 +3,12 @@
 Le journal des propositions de rejet du LLM se consulte avec
 `heimdall rejections [--details]` ; voir [T33](llm-rejections.md).
 
+Le premier lancement sur un dépôt existant dispose de deux commandes
+associées, décrites dans [cold-start.md](cold-start.md) (T38, #107–#110) :
+`heimdall cold-start` (entonnoir regex/entropie puis avis LLM sur les seuls
+candidats) et `heimdall deep-scan` (historique complet, alerte de
+révocation et mesure du temps).
+
 Statut : livré par le ticket #29 (sous-ticket de l'épic #6 « CLI, hook et CI
 headless »). La commande est **branchée** sur le scanner déterministe #22 et
 sur l'accès git confiné #27. Elle est **en lecture seule sur le dépôt** :
