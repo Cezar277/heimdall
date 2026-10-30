@@ -423,6 +423,35 @@ def _stdin_ask(prompt: str) -> str:
         raise ReviewError from None
 
 
+def _ask(ask_fn: AskFn, prompt: str) -> str:
+    """Défense en profondeur sur le point d'injection ``ask``.
+
+    Un appelant (CLI T30) peut fournir son propre lecteur : son exception
+    peut porter une valeur ou un chemin. Elle ne sort jamais telle quelle
+    (invariant 8), seul le message statique de :class:`ReviewError` subsiste.
+    """
+    try:
+        return ask_fn(prompt)
+    except ReviewError:
+        raise
+    except (Exception, KeyboardInterrupt):
+        raise ReviewError from None
+
+
+def _notify(notify_fn: NotifyFn, message: str) -> None:
+    """Avertissement best-effort : seul un message constant est transmis.
+
+    L'avertissement ne doit jamais interrompre la boucle, et l'exception
+    d'un notifieur injecté ne doit jamais ressortir avec son message.
+    """
+    # Best-effort volontaire : le message est constant et l'exception d'un
+    # notifieur injecté ne doit jamais ressortir ni interrompre la boucle.
+    try:
+        notify_fn(message)
+    except Exception:  # noqa: S110 # nosec B110
+        pass
+
+
 def is_interactive(*, ci: bool = False, stream: object | None = None) -> bool:
     """Refus par défaut : sans TTY sûr, aucune écriture n'est autorisée (#89)."""
     if not isinstance(ci, bool):
@@ -435,9 +464,10 @@ def is_interactive(*, ci: bool = False, stream: object | None = None) -> bool:
         return False
     try:
         return bool(isatty())
-    except Exception:
-        # Refus par défaut : un flux exotique (RuntimeError, fermeture) ne
-        # doit jamais produire de traceback ni passer pour un terminal.
+    except BaseException:  # refus par défaut, jamais de traceback
+        # Refus par défaut : un flux exotique (RuntimeError, fermeture,
+        # KeyboardInterrupt, SystemExit) ne doit jamais produire de traceback
+        # ni passer pour un terminal. Aucune valeur n'est en jeu ici.
         return False
 
 
@@ -539,12 +569,12 @@ def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
             raise ReviewError
         # Une lecture impossible (EOF, terminal fermé) interrompt la boucle :
         # ce n'est pas une réponse invalide, donc pas de redemande en aveugle.
-        raw = ask_fn(render_diff(current) + "\n" + PROMPT)
+        raw = _ask(ask_fn, render_diff(current) + "\n" + PROMPT)
         try:
             choice = parse_choice(raw)
         except ReviewError:
             # Entrée invalide : on redemande, on ne devine jamais.
-            notify_fn(INVALID_CHOICE)
+            _notify(notify_fn, INVALID_CHOICE)
             continue
         if choice is Choice.IGNORE:
             journal_fn.append(Decision.now(choice, current.finding))
@@ -570,7 +600,7 @@ def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
             raise ReviewError from None
         journal_fn.append(Decision.now(choice, current.finding, applied=False))
         if edited is None:
-            notify_fn(EDIT_CANCELLED)
+            _notify(notify_fn, EDIT_CANCELLED)
             continue
         if not isinstance(edited, Proposal):
             raise ReviewError

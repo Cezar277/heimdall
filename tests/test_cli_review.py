@@ -757,3 +757,81 @@ def test_journal_rejects_an_inconsistent_applied_flag(tmp_path: Path) -> None:
 
     with pytest.raises(JournalError):
         DecisionJournal(path).read()
+
+
+# --- Durcissements LOW sur les points d'injection (revue 2) -------------------
+
+
+def test_injected_ask_failure_is_static(
+    proposal: Proposal,
+    journal: DecisionJournal,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def broken(_prompt: str) -> str:
+        raise OSError("échec SYNTHETIC_ONLY_VALUE dans /etc/passwd")
+
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(proposal, ask=broken, apply=lambda _p: None, journal=journal, stream=TTY)
+
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert "/etc/passwd" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert capsys.readouterr().err == ""
+    assert journal.read() == []
+
+
+def test_injected_ask_review_error_is_preserved(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    def broken(_prompt: str) -> str:
+        raise ReviewError
+
+    with pytest.raises(ReviewError):
+        review_proposal(proposal, ask=broken, apply=lambda _p: None, journal=journal, stream=TTY)
+
+    assert journal.read() == []
+
+
+def test_injected_notify_failure_never_leaks(
+    proposal: Proposal,
+    journal: DecisionJournal,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def broken_notify(_message: str) -> None:
+        raise OSError("échec SYNTHETIC_ONLY_VALUE dans /etc/passwd")
+
+    ask, _prompts = _asker(["x", "y"])
+    outcome = review_proposal(
+        proposal,
+        ask=ask,
+        apply=lambda _p: None,
+        journal=journal,
+        notify=broken_notify,
+        stream=TTY,
+    )
+
+    assert outcome.applied is True
+    assert capsys.readouterr().err == ""
+    assert [entry["applied"] for entry in journal.read()] == [True]
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), SystemExit(1)])
+def test_is_interactive_refuses_base_exceptions(error: BaseException) -> None:
+    class Weird:
+        def isatty(self) -> bool:
+            raise error
+
+    assert is_interactive(stream=Weird()) is False
+
+
+@pytest.mark.parametrize("kind", ["relative", "parent"])
+def test_journal_refuses_unsafe_state_paths(kind: str, proposal: Proposal, tmp_path: Path) -> None:
+    """Garde `_prepare_path` réutilisée de T33 : chemin relatif ou `..` refusés."""
+    path = Path("relative.jsonl") if kind == "relative" else tmp_path / "sub" / ".." / "j.jsonl"
+    unsafe = DecisionJournal(path)
+    decision = Decision.now(Choice.IGNORE, proposal.finding)
+
+    with pytest.raises(JournalError):
+        unsafe.append(decision)
+    with pytest.raises(JournalError):
+        unsafe.read()
