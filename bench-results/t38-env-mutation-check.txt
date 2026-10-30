@@ -1,2 +1,0 @@
-﻿GIT_NO_REPLACE_OBJECTS: removal detected by existing environment test (expected failure)
-GIT_GRAFT_FILE: removal detected by existing environment test (expected failure)

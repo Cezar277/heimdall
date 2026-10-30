@@ -23,8 +23,6 @@ from typing import Final
 import typer
 
 import heimdall
-from heimdall.cli.cold_start import collect_cold_start, render_cold_start
-from heimdall.cli.history import collect_history, render_history
 from heimdall.cli.scan import (
     EXIT_CLEAN,
     EXIT_FINDINGS,
@@ -188,60 +186,6 @@ def scan(  # noqa: PLR0913, PLR0917
         # best-effort (invariant 8).
         _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
-    raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
-
-
-@app.command("cold-start")
-def cold_start(
-    path: str = typer.Argument(".", help="Racine du dépôt existant à analyser."),
-    ci: bool = typer.Option(False, "--ci", help="Déterministe : aucun appel LLM ni journal."),
-    llm: bool = typer.Option(
-        True, "--llm/--no-llm", help="Qualifie les seuls candidats localement."
-    ),
-    json_output: bool = typer.Option(False, "--json", help="Rapport machine sans secret."),
-    max_file_bytes: int = typer.Option(
-        1_048_576,
-        "--max-file-bytes",
-        min=1,
-        max=1_048_576,
-        help="Taille maximale par fichier, en octets.",
-    ),
-) -> None:
-    """Premier scan complet : regex/entropie puis avis du LLM local (#107)."""
-    try:
-        report = collect_cold_start(Path(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes)
-        typer.echo(render_cold_start(report, json_output=json_output))
-    except Exception:
-        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
-        raise typer.Exit(code=2) from None
-    if report.skipped_files:
-        raise typer.Exit(code=2)
-    raise typer.Exit(code=EXIT_FINDINGS if report.scan.findings else EXIT_CLEAN)
-
-
-@app.command("deep-scan")
-def deep_scan(
-    path: str = typer.Argument(".", help="Racine du dépôt dont l'historique est analysé."),
-    ci: bool = typer.Option(False, "--ci", help="Aucun appel LLM ni journal."),
-    llm: bool = typer.Option(True, "--llm/--no-llm", help="Avis local consultatif."),
-    json_output: bool = typer.Option(False, "--json", help="Rapport historique sans secret."),
-    max_file_bytes: int = typer.Option(
-        1_048_576,
-        "--max-file-bytes",
-        min=1,
-        max=1_048_576,
-        help="Taille maximale par blob, en octets.",
-    ),
-) -> None:
-    """Scanne tous les commits accessibles et signale les secrets à révoquer (#108–#110)."""
-    try:
-        report = collect_history(Path(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes)
-        typer.echo(render_history(report, json_output=json_output))
-    except Exception:
-        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
-        raise typer.Exit(code=2) from None
-    if not report.complete:
-        raise typer.Exit(code=2)
     raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
 
 

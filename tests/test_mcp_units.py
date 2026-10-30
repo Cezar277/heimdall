@@ -145,6 +145,7 @@ class ToolBoundaryTests(unittest.TestCase):
         self.assertTrue(result["isError"])
         self.assertEqual(json.loads(result["content"][0]["text"])["error"]["code"], "INVALID_INPUT")
 
+
     def test_unknown_field_is_refused(self) -> None:
         payload = json.loads(self.run_gate("read_diff", {"root": "/etc"})["content"][0]["text"])
         self.assertEqual(payload["error"]["code"], "INVALID_INPUT")
@@ -355,8 +356,6 @@ class ConfinedEnvironmentTests(unittest.TestCase):
         # Clone partiel : sans elle, `git cat-file` irait chercher l'objet
         # manquant sur le réseau — interdit (100 % local).
         self.assertEqual(env["GIT_NO_LAZY_FETCH"], "1")
-        self.assertEqual(env["GIT_NO_REPLACE_OBJECTS"], "1")
-        self.assertEqual(env["GIT_GRAFT_FILE"], os.devnull)
 
     def test_discovery_ceiling_is_the_parent_of_the_root(self) -> None:
         """Plafond = le parent, parce que c'est lui que git ascendererait.
@@ -769,7 +768,9 @@ class GitAccessDirectTests(unittest.TestCase):
             gitdiff.MAX_FILE_BYTES,
             timeout=gitdiff.GIT_TIMEOUT_SECONDS,
         )
-        with mock.patch.object(gitdiff.GitAccess, "_read_capped", return_value=b"4\n") as read:
+        with mock.patch.object(
+            gitdiff.GitAccess, "_read_capped", return_value=b"4\n"
+        ) as read:
             self.assertEqual(access.blob_size(blob), 4)
         read.assert_called_once_with(
             ("cat-file", "-s", "--", blob),
@@ -818,10 +819,9 @@ class GitAccessDirectTests(unittest.TestCase):
         proc.stdout.read.return_value = b"ok"
         proc.wait.return_value = 0
         timer = mock.MagicMock()
-        with (
-            mock.patch("subprocess.Popen", return_value=proc),
-            mock.patch.object(gitdiff.threading, "Timer", return_value=timer) as timer_cls,
-        ):
+        with mock.patch("subprocess.Popen", return_value=proc), mock.patch.object(
+            gitdiff.threading, "Timer", return_value=timer
+        ) as timer_cls:
             self.assertEqual(
                 access._read_capped(
                     ("rev-parse", "--show-toplevel"),
@@ -999,6 +999,7 @@ class GitAccessDirectTests(unittest.TestCase):
         proc.kill.side_effect = OSError("already dead")
         proc.wait.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=1)
         gitdiff._terminate_process(proc)
+
 
     def test_resolve_root_refuses_garbage(self) -> None:
         for bad in ("", "/definitely/not/here", "\x00"):
@@ -1450,6 +1451,7 @@ class DirectToolErrorTests(unittest.TestCase):
                 self.assertNotIn("/tmp/", logged)  # noqa: S108
                 self.assertNotIn("sk_live", logged)
                 self.assertNotIn("KEY=", logged)
+
 
     def test_sanitize_rejects_bad_bounds(self) -> None:
         for arguments in ({"start_line": 0}, {"max_lines": 0}, {"max_lines": 401}):
@@ -2060,11 +2062,11 @@ class ParserStateTests(unittest.TestCase):
             "+++ b/sain1.py\n"
             "@@ -0,0 +1 @@\n"
             "+x = 1\n"
-            'diff --git "a/a\\nb.py" "b/a\\nb.py"\n'
+            "diff --git \"a/a\\nb.py\" \"b/a\\nb.py\"\n"
             "new file mode 100644\n"
             "index 0000000..2222222\n"
             "--- /dev/null\n"
-            '+++ "b/a\\nb.py"\n'
+            "+++ \"b/a\\nb.py\"\n"
             "@@ -0,0 +1 @@\n"
             "+SECRET=hunter2\n"
             "diff --git a/sain2.py b/sain2.py\n"

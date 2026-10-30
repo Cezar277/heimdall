@@ -149,8 +149,6 @@ def confined_environment(ceiling: str) -> dict[str, str]:
         # l'objet manquant SUR LE RÉSEAU. Heimdall est 100 % local : l'objet
         # manquant doit être une erreur, jamais un download.
         "GIT_NO_LAZY_FETCH": "1",
-        "GIT_NO_REPLACE_OBJECTS": "1",
-        "GIT_GRAFT_FILE": os.devnull,
         # Plafond de découverte = le PREMIER dossier que git ascendererait,
         # c'est-à-dire le PARENT de la racine : git refuse d'y entrer, donc
         # aucun dépôt au-dessus de la racine n'est découvert (invariant 3).

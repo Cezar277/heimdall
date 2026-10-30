@@ -35,8 +35,6 @@ heimdall --version
 heimdall scan             # scan de l'arbre de travail (mode strict, #29)
 heimdall scan --staged    # blobs ajoutés ou modifiés dans l'index git (#29)
 heimdall scan --ci        # mode CI headless : le code de sortie est le verdict
-heimdall cold-start . --ci # premier scan déterministe du dépôt existant
-heimdall deep-scan . --ci  # historique complet accessible, alerte de révocation
 heimdall scan --json      # rapport JSON sur stdout (contrat heimdall.scan.v1)
 heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 ```
