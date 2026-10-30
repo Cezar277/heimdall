@@ -429,12 +429,17 @@ def _ask(ask_fn: AskFn, prompt: str) -> str:
     Un appelant (CLI T30) peut fournir son propre lecteur : son exception
     peut porter une valeur ou un chemin. Elle ne sort jamais telle quelle
     (invariant 8), seul le message statique de :class:`ReviewError` subsiste.
+
+    ``BaseException`` est capturé volontairement : ``SystemExit("<valeur>")``
+    ferait imprimer son message sur stderr par l'interpréteur, et
+    ``KeyboardInterrupt`` sortirait en code 1 (réservé aux secrets avérés).
+    Une lecture impossible est une erreur d'outillage statique, point.
     """
     try:
         return ask_fn(prompt)
     except ReviewError:
         raise
-    except (Exception, KeyboardInterrupt):
+    except BaseException:  # refus par défaut, jamais de message d'entrée
         raise ReviewError from None
 
 
@@ -443,6 +448,10 @@ def _notify(notify_fn: NotifyFn, message: str) -> None:
 
     L'avertissement ne doit jamais interrompre la boucle, et l'exception
     d'un notifieur injecté ne doit jamais ressortir avec son message.
+
+    Seul ``Exception`` est capturé ici, volontairement : ``_notify`` ne lit
+    aucune entrée, donc laisser passer ``KeyboardInterrupt``/``SystemExit``
+    permet à l'opérateur d'interrompre la session entre deux propositions.
     """
     # Best-effort volontaire : le message est constant et l'exception d'un
     # notifieur injecté ne doit jamais ressortir ni interrompre la boucle.

@@ -835,3 +835,23 @@ def test_journal_refuses_unsafe_state_paths(kind: str, proposal: Proposal, tmp_p
         unsafe.append(decision)
     with pytest.raises(JournalError):
         unsafe.read()
+
+
+def test_injected_ask_system_exit_is_static(
+    proposal: Proposal,
+    journal: DecisionJournal,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`SystemExit("<valeur>")` ferait imprimer son message sur stderr."""
+
+    def broken(_prompt: str) -> str:
+        raise SystemExit("échec SYNTHETIC_ONLY_VALUE dans /etc/passwd")
+
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(proposal, ask=broken, apply=lambda _p: None, journal=journal, stream=TTY)
+
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert "/etc/passwd" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert capsys.readouterr().err == ""
+    assert journal.read() == []
