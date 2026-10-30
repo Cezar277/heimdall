@@ -62,9 +62,16 @@ La validation est **fail-closed au chargement du module** :
 - exemple positif reconnu, exemple négatif ignoré ;
 - registre non vide et identifiants uniques ;
 - `secret_type` de chaque règle **dans l'ensemble fermé** `aws` / `stripe` /
-  `slack` / `pat` / `jwt` / `pem` (`ALLOWED_SECRET_TYPES` dans
+  `slack` / `pat` / `jwt` / `pem` / `high_entropy_hex` / `high_entropy_base64`
+  (`ALLOWED_SECRET_TYPES` dans
   [`model.py`](../heimdall/scanner/signatures/model.py)) : un type que rien
   ne documente ne peut pas produire de Finding.
+
+Les types `high_entropy_hex` et `high_entropy_base64` sont gouvernés par ce
+même ensemble fermé, mais produits par le moteur d'entropie #23, avec
+`source="entropy"`. Leurs seuils sont documentés dans
+[scanner-entropy.md](scanner-entropy.md). Le test du registre vérifie
+explicitement que ses six types sont l'ensemble fermé moins ces deux types.
 
 À l'exécution, `Rule.matches()` applique la même logique fail-closed : une
 ligne qui n'est pas un `str` lève une `ScanError` au lieu de rendre un
@@ -352,8 +359,10 @@ noms qu'elle reconnaît effectivement.
 
 - Pas de parcours de dépôt ni d'exclusion : le moteur reçoit une cible déjà
   construite (#59).
-- Pas de détection par entropie seule : `entropy` est une métadonnée du
-  Finding, pas un déclencheur.
+- `find_signature_matches` reste limité aux signatures. Le moteur ajoute la
+  détection par entropie seule (#23), documentée dans [scanner-entropy.md](scanner-entropy.md).
+  `SignatureMatch.source` est typé `Literal["regex", "entropy"]` ; le nom
+  d'une règle ne détermine jamais sa source.
 - Jointure limitée à deux lignes **contiguës** et 4096 octets UTF-8.
 - PEM : seul l'en-tête `BEGIN … PRIVATE KEY` est reconnu ; le corps n'est pas
   parsé et un en-tête seul est signalé (c'est le signal utile).
@@ -367,7 +376,9 @@ noms qu'elle reconnaît effectivement.
   moteur porte sur l'empreinte, jamais sur la valeur. Elle n'est jamais
   sérialisée, journalisée ou rendue.
 - Le type d'un Finding produit par le registre est **borné** à l'ensemble
-  `aws` / `stripe` / `slack` / `pat` / `jwt` / `pem` : un nouveau fournisseur
+  `aws` / `stripe` / `slack` / `pat` / `jwt` / `pem` / `high_entropy_hex` /
+  `high_entropy_base64` : les deux derniers sont produits par le moteur
+  d'entropie, les six premiers par le registre de signatures. Un nouveau fournisseur
   implique d'ajouter son type à `ALLOWED_SECRET_TYPES` et de le documenter ici.
 - `find_signature_matches` n'est exportée par **aucun** paquet public :
   `heimdall.scanner` ne l'expose pas, et le registre la tient hors de son

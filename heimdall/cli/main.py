@@ -16,6 +16,7 @@ Invariant 8 : aucun message d'erreur ne reflète une entrée (chemin, contenu,
 candidat). Les messages sont statiques.
 """
 
+import json
 from pathlib import Path
 from typing import Final
 
@@ -30,8 +31,11 @@ from heimdall.cli.scan import (
     render_json,
     render_text,
 )
+from heimdall.cli.vault_client import RUN_CONTEXT_SETTINGS, vault_run
 from heimdall.cli.vault_keys import vault_app
+from heimdall.llm.rejections import RejectionJournal, rejection_summary
 from heimdall.mcp.server import run_stdio
+from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.errors import ScanError
 
 #: Libellé **unique** du code 2 : une panne anticipée (`ScanError`,
@@ -45,8 +49,22 @@ app = typer.Typer(
     no_args_is_help=True,
     invoke_without_command=True,  # `--version` seul ne doit pas exiger de sous-commande.
 )
-# Administration du Vault (clés API de projet, ticket #64).
+# Administration du Vault (clés API de projet, ticket #64) et client (ticket #35).
 app.add_typer(vault_app, name="vault")
+
+# Exécution avec injection en mémoire (ticket #101). Voie canonique :
+# `heimdall run`. L'alias `heimdall vault run` (vault_keys.py) partage le
+# même callback et les mêmes réglages (RUN_CONTEXT_SETTINGS) — voir
+# docs/t35-samm.md §5.
+app.command(
+    "run",
+    help=(
+        "Lance une commande avec les secrets injectés en mémoire (ticket #101).\n\n"
+        "Limite de sécurité : sous Linux, les variables d'environnement d'un processus sont "
+        "visibles par les processus du même utilisateur via /proc/<pid>/environ."
+    ),
+    context_settings=RUN_CONTEXT_SETTINGS,
+)(vault_run)
 
 
 def _echo_stderr_best_effort(message: str) -> None:
@@ -75,8 +93,18 @@ def _root(
 
 
 @app.command()
-def scan(
+def scan(  # noqa: PLR0913, PLR0917
     path: str = typer.Argument(".", help="Chemin du dépôt à analyser."),
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        help="Chemin explicite du fichier de configuration (heimdall.toml par défaut).",
+    ),
+    no_allowlist: bool = typer.Option(
+        False,
+        "--no-allowlist",
+        help="Désactive l'allowlist déterministe.",
+    ),
     ci: bool = typer.Option(
         False,
         "--ci",
@@ -93,13 +121,16 @@ def scan(
         help="Sortie JSON sur stdout (contrat machine heimdall.scan.v1).",
     ),
 ) -> None:
-    """Scanne le dépôt à la recherche de secrets (#29).
+    """Scanne le dépôt à la recherche de secrets (#29 et #24).
 
     Par défaut, l'arbre de travail est analysé en **mode strict** : seules
     les exclusions techniques de #59 restent (binaires, répertoires générés),
     ``vendor/`` et les lockfiles sont donc parcourus. Avec ``--staged``, ce
     sont les blobs **ajoutés ou modifiés** dans l'index git qui sont
     analysés, sans aucune exclusion de chemin.
+
+    L'allowlist déterministe (#24) écarte les cas évidents sans passer par
+    le LLM et émet une trace pour chaque rejet (règle, fichier, ligne).
 
     ``--ci`` active le mode headless : aucun dialogue, aucun LLM, aucun
     réseau — le verdict est le code de sortie, et un résumé déterministe est
@@ -109,8 +140,19 @@ def scan(
     En cas de doute, **refus par défaut** : une entrée non analysable (racine
     absente, index en conflit, fichier illisible) sort en 2, jamais en 0.
     """
+    if config is not None and no_allowlist:
+        _echo_stderr_best_effort("options incompatibles : --config et --no-allowlist")
+        raise typer.Exit(code=2)
+
     try:
-        report = collect(Path(path), staged=staged)
+        custom_allowlist = Allowlist.empty() if no_allowlist else None
+        report = collect(
+            Path(path),
+            staged=staged,
+            config=config,
+            allowlist=custom_allowlist,
+            ci=ci,
+        )
         # Le **rendu** et le résumé --ci sont dans le même try que la
         # collecte : un échec de rendu (bug futur, panne mémoire, écriture
         # refusée) est une erreur d'outillage, jamais l'exit 1 réservé aux
@@ -122,10 +164,12 @@ def scan(
             typer.echo(render_text(report))
         if ci:
             # Résumé déterministe sur stderr : le journal CI montre toujours
-            # le verdict, même si stdout est consommé par un parseur.
+            # le verdict, le nombre de findings ignorés et l'empreinte sha256 de config.
+            hash_info = f" (config sha256:{report.config_hash})" if report.config_hash else ""
             typer.echo(
                 f"heimdall scan : périmètre {report.scope}, "
-                f"{len(report.findings)} secret(s) détecté(s).",
+                f"{len(report.findings)} secret(s) détecté(s), "
+                f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}.",
                 err=True,
             )
     except (ScanError, ToolFailure):
@@ -143,6 +187,23 @@ def scan(
         _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
     raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
+
+
+@app.command()
+def rejections(
+    details: bool = typer.Option(False, "--details", help="Affiche les entrées JSONL vérifiées."),
+) -> None:
+    """Vérifie et affiche le journal local des propositions de rejet du LLM (#33)."""
+    try:
+        entries = RejectionJournal().read()
+        typer.echo(rejection_summary(len(entries)))
+        if details:
+            for entry in entries:
+                # Échappement JSON : ni contrôle terminal ni nom trompeur brut.
+                typer.echo(json.dumps(entry, sort_keys=True, ensure_ascii=True, allow_nan=False))
+    except Exception:
+        _echo_stderr_best_effort("heimdall : journal des rejets indisponible ou invalide.")
+        raise typer.Exit(code=2) from None
 
 
 @app.command()

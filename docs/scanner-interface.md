@@ -54,7 +54,13 @@ Les deux cibles sont figées (immuables) et validées à la construction :
   `DiffEntry.lines`) ;
 - un conteneur de lignes ou une ligne malformée est refusé : `lines` doit
   être une suite de couples `(entier, texte)`, et le résultat est normalisé
-  en tuple de couples.
+  en tuple de couples ;
+- `FileTarget.lignes()` découpe comme Git : seul `\n` sépare deux lignes. Un
+  `\r` n'est retiré que devant un `\n` (CRLF) ; un `\r` final sans `\n`
+  appartient au contenu. Les autres séparateurs Unicode (`\v`, `\f`,
+  `\u2028`, `\u2029`...) restent aussi dans le contenu de la ligne. Un
+  `Finding.line` doit désigner la ligne réelle du fichier, pas une ligne
+  artificielle créée par `str.splitlines()`.
 
 Un chemin refusé est une **erreur** (`InvalidTarget`), pas un fichier ignoré
 en silence : une cible illisible ne doit jamais devenir « aucun secret ».
@@ -164,6 +170,10 @@ vides, donc la traceback journalisée ne ressuscite pas le message du moteur.
 Seule exception : les `BaseException` (`KeyboardInterrupt`, `SystemExit`) ne
 sont pas capturées — une interruption doit rester une interruption.
 
+La méthode `analyser` est liée et figée à la construction de `Scanner` :
+remplacer `moteur.analyser` après coup ne change pas le moteur réellement
+appelé (défense en profondeur contre un TOCTOU).
+
 ## Ce que ce ticket ne fait pas
 
 - **Aucune I/O.** L'interface ne lit aucun fichier et n'ouvre aucun
@@ -185,8 +195,9 @@ sont pas capturées — une interruption doit rester une interruption.
 
 La validation locale reproduit la grammaire du schéma #14, et le test
 `tests/test_scanner_interface.py` compare les deux sur un corpus de cas
-valides et invalides : **accord sur tous les cas**, sauf deux écarts assumés,
-où le code est plus strict que le schéma (il refuse, il ne répare pas) :
+valides et invalides : **accord sur tous les cas**, sauf deux écarts
+assumés, où le code est plus strict que le schéma (il refuse, il ne répare
+pas) :
 
 | Cas | Schéma | Code |
 | --- | --- | --- |

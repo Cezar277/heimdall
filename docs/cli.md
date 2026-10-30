@@ -1,5 +1,8 @@
 # CLI `heimdall scan` (#29)
 
+Le journal des propositions de rejet du LLM se consulte avec
+`heimdall rejections [--details]` ; voir [T33](llm-rejections.md).
+
 Statut : livré par le ticket #29 (sous-ticket de l'épic #6 « CLI, hook et CI
 headless »). La commande est **branchée** sur le scanner déterministe #22 et
 sur l'accès git confiné #27. Elle est **en lecture seule sur le dépôt** :
@@ -36,8 +39,58 @@ heimdall scan --json [CHEMIN]       # rapport JSON sur stdout
 | Option | Effet |
 | --- | --- |
 | `--staged` | change le **périmètre** : les blobs **ajoutés ou modifiés** de l'index git, lus blob par blob, **sans aucune exclusion de chemin** |
-| `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr |
-| `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; les erreurs restent sur stderr |
+| `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr (avec décompte des secrets ignorés par l'allowlist) |
+| `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; inclut les traces et décomptes d'allowlist (#24) ; les erreurs restent sur stderr |
+| `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) ; un chemin **hors du dépôt** est accepté : choix opérateur explicite, soumis aux mêmes gardes (`_resolve_root` + `O_NOFOLLOW`, plafond de taille, contrat fermé) |
+| `--no-allowlist` | désactive l'allowlist déterministe pour le scan courant |
+
+En `--ci`, l'allowlist du dépôt ne peut jamais s'auto-attester : si un
+`heimdall.toml` est présent dans le dépôt scanné (versionné à la racine,
+comme ici), `scan --ci` sans option sort en code 2. L'opérateur a deux
+choix explicites : `--config` vers un fichier **hors du dépôt** épinglé
+par l'équipe (mêmes gardes et contrat fermé, recommandé), ou
+`--no-allowlist` (aucune ignorance, verdict maximal). Exemple :
+`heimdall scan --ci --config /opt/ci/allowlist.toml .`
+
+Le fichier d'allowlist est un **contrat fermé** : seule la table racine
+`[allowlist]` est acceptée, `version` est **obligatoire** et doit être le
+littéral `"1"` (un entier `1`, ou une `version` simplement omise, sont
+refusés), et chaque mot-clé doit faire au moins 3 caractères. Toute
+clé racine inconnue (`[tool.foo]`, faute de frappe), tout type incorrect ou
+tout mot-clé trop court est une erreur d'outillage (code 2), jamais un
+passage silencieux. Un `secret_types` doit suivre la grammaire des types
+du contrat Finding (`[a-z][a-z0-9_]*`, 64 caractères max, ex. `aws`) :
+`"AWS"` ou `"../etc"` sont refusés en code 2 au lieu de rendre la règle
+muette. Le critère `exact_keywords` (optionnel) compare à égalité
+insensible à la casse : c'est le SEUL critère valeur autorisé sans
+restriction — le choix auditable pour les marqueurs globaux sans `paths`
+(`example`, `changeme`, `dummy`) : `my-example-key` reste détecté, seul le
+marqueur exact est ignoré. Les `keywords` classiques gardent la frontière
+`\b` stricte mais exigent une restriction conjointe (`paths` et/ou
+`secret_types`, ex. fixtures de test) : une règle `keywords`/`patterns`
+globale est refusée en code 2, jamais silencieusement ignorante.
+
+Les `patterns` ne peuvent pas rendre l'allowlist aveugle : via TOML, chaque
+chaîne est compilée puis validée ; via l'API Python, seules des expressions
+déjà compilées sont acceptées. Un motif qui matche la chaîne vide (`.`, `.*`,
+`^`, `^.*$`…) est refusé, et chaque branche d'alternance doit porter au moins
+3 caractères **littéraux** : `EXAMPLE-[0-9]{4}` est accepté, tandis que
+`[a-z]+`, `\w+`, `\d{3}-\d{4}` ou `x{3}y{3}` sont refusés (motif trop large
+pour être auditable) — reformuler en portant les marqueurs concrets visés.
+Aucun mot-clé ni motif ne peut porter de caractère de contrôle ou invisible
+(`\n` littéral, tabulation, RLO…) : faute de frappe refusée en code 2
+(les échappements regex `\n` restent deux caractères ordinaires et acceptés).
+Les constructions à backtracking non borné (alternance ou groupe imbriqué
+sous quantificateur, quantificateurs consécutifs, références arrière) sont
+refusées en `ScanError` (code 2). Une valeur candidate de plus de 256
+caractères n'est pas soumise aux regex : elle reste signalée (fail-closed),
+ce qui borne l'exposition résiduelle.
+
+Le filtre de chemins est borné des deux côtés : un motif `paths` porte au
+plus 10 jokers `*` (au-delà : code 2), et un chemin de plus de 1024
+caractères n'est pas soumis à `fnmatch` (fail-closed : il reste signalé).
+Sous Python ≥ 3.13, `fnmatch` complète cette borne avec des groupes
+atomiques natifs.
 
 `CHEMIN` vaut `.` par défaut. Il doit être la **racine** d'un dépôt git,
 dans les deux périmètres (sinon : erreur, code 2) : hors dépôt —
@@ -293,6 +346,13 @@ document si `count != len(findings)` (contrainte explicitée dans la
   signale, comme il le doit. Un job de CI sur ce dépôt devra donc traiter ces
   fixtures (allowlist, #24) — sinon il échouerait à chaque exécution. C'est un
   choix assumé : mieux vaut un faux positif visible qu'un secret caché.
+- **Zone de clémence `tests/` (allowlist, #24)** : avec un `heimdall.toml`
+  contenant la règle `test-fixtures`, toute valeur sous `tests/`,
+  `fixtures/` ou `support/` qui contient un marqueur délimité (`dummy`,
+  `fake`, `mock`…) est ignorée — y compris un mot de passe choisi comme
+  `my-dummy-key-12345`. C'est volontaire et documenté dans le fichier lui-même :
+  les répertoires de test ne doivent jamais contenir de vrais secrets. En CI
+  stricte (sans `heimdall.toml`, allowlist vide), tout y est signalé.
 - **Non-atomicité assumée du mode arbre (`working-tree`) vs atomicité stricte de `--staged`** :
   L'arbre de travail est un parcours direct du système de fichiers (`os.walk`), par nature
   **non atomique** (best-effort). Le re-contrôle final d'identité racine (`st_dev`, `st_ino`,
@@ -304,6 +364,13 @@ document si `count != len(findings)` (contrainte explicitée dans la
   adressés par SHA (`cat-file blob <sha>`), et re-vérifie l'état complet de l'index avant de
   rendre son verdict (toute modification concurrente refuse en code 2). Seul `--staged` est
   atomique et fait donc foi pour les barrières de sécurité bloquantes (hook de pré-commit et CI).
+- **Mode arbre local indicatif, pas une barrière** : hors `--ci` et hors `--staged`,
+  `heimdall scan` refuse une configuration **stagée**, mais ne vérifie pas que le
+  fichier `heimdall.toml` (ou un `--config` interne) du worktree est propre et suivi
+  dans l'index. Un fichier de configuration local dirty/untracked peut donc fausser le
+  verdict local (jusqu'à 0). Seuls `--ci` (refus de toute configuration interne) et
+  `--staged` (configuration propre et suivie, contenu vérifié lié au parseur) sont
+  opposables ; le hook de pré-commit et la CI doivent utiliser ces modes.
 - **Course résiduelle à l'initialisation de la racine (re-contrôle final garant)** :
   Dans `GitAccess.__init__`, entre `_resolve_root` et `os.stat`, un échange rapide
   `dossier` -> `symlink` -> `autre dossier` à la racine pourrait théoriquement échapper
