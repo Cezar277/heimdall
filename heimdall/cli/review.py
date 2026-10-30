@@ -34,6 +34,8 @@ from heimdall.scanner.finding import Finding, validate_relative_path
 MAX_CHANGES: Final[int] = 32
 MAX_TEXT_CHARS: Final[int] = 100_000
 MAX_SECRETS: Final[int] = 256
+#: Taille totale des valeurs connues : borne le motif de masquage (DoS local).
+MAX_SECRET_BYTES: Final[int] = 262_144
 #: Bornes de la boucle : aucune réponse par défaut, aucune boucle infinie.
 MAX_PROMPTS: Final[int] = 16
 MAX_EDITS: Final[int] = 8
@@ -48,11 +50,12 @@ EDIT_CANCELLED: Final[str] = "Édition annulée : aucune modification, réponse 
 NON_INTERACTIVE: Final[str] = (
     "Mode non interactif : rapport seul, aucune écriture, aucune action appliquée."
 )
-_VARIABLE: Final[re.Pattern[str]] = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
+#: Invariant 2 : au moins deux caractères, commence par une lettre majuscule.
+_VARIABLE: Final[re.Pattern[str]] = re.compile(r"[A-Z][A-Z0-9_]{1,63}")
 _ENV_REFERENCE: Final[re.Pattern[str]] = re.compile(
-    r"(?:os\.getenv\([\"'][A-Z_][A-Z0-9_]{0,63}[\"']\)"
-    r"|os\.environ\[[\"'][A-Z_][A-Z0-9_]{0,63}[\"']\]"
-    r"|process\.env\.[A-Z_][A-Z0-9_]{0,63})"
+    r"(?:os\.getenv\([\"'][A-Z][A-Z0-9_]{1,63}[\"']\)"
+    r"|os\.environ\[[\"'][A-Z][A-Z0-9_]{1,63}[\"']\]"
+    r"|process\.env\.[A-Z][A-Z0-9_]{1,63})"
 )
 
 
@@ -84,9 +87,11 @@ class TextChange:
         except ValueError:
             raise ReviewError from None
         # Le fichier .env contient les vraies valeurs et ne doit pas être rendu.
-        if any(part == ".git" for part in self.file.split("/")) or (
-            self.file.split("/")[-1].startswith(".env")
-            and self.file.split("/")[-1] != ".env.example"
+        # Comparaison insensible à la casse : sur macOS/Windows, `.Git/config`
+        # ou `.ENV.local` désignent les mêmes fichiers.
+        parts = [part.lower() for part in self.file.split("/")]
+        if any(part == ".git" for part in parts) or (
+            parts[-1].startswith(".env") and parts[-1] != ".env.example"
         ):
             raise ReviewError
         if any(
@@ -124,6 +129,10 @@ class Proposal:
             )
         ):
             raise ReviewError
+        # Borne AVANT compilation : un motif géant serait un DoS local et
+        # pourrait faire fuiter les valeurs dans un `re.error`.
+        if sum(len(secret) for secret in self.secrets) > MAX_SECRET_BYTES:
+            raise ReviewError
         names = [change.file for change in self.changes]
         if len(set(names)) != len(names) or self.finding.file not in names:
             raise ReviewError
@@ -138,13 +147,27 @@ def _visible(text: str) -> str:
     )
 
 
-def _masked(text: str, secrets: tuple[str, ...]) -> str:
+def _secret_pattern(secrets: tuple[str, ...]) -> re.Pattern[str] | None:
+    """Motif unique, compilé une seule fois par rendu (jamais par ligne).
+
+    La taille totale est déjà bornée par :class:`Proposal`
+    (:data:`MAX_SECRET_BYTES`) ; un échec de compilation reste une erreur
+    statique, jamais un ``re.error`` portant le motif (donc les valeurs).
+    """
+    values = sorted(set(secrets), key=len, reverse=True)
+    if not values:
+        return None
+    try:
+        return re.compile("|".join(re.escape(value) for value in values))
+    except re.error:  # pragma: no cover - motif borné et échappé par construction
+        raise ReviewError from None
+
+
+def _masked(text: str, pattern: re.Pattern[str] | None) -> str:
     # Un seul passage : une valeur courte ne peut altérer le marqueur d'une
     # valeur déjà masquée. Les valeurs qui se chevauchent sont triées par taille.
-    pattern = re.compile(
-        "|".join(re.escape(value) for value in sorted(set(secrets), key=len, reverse=True))
-    )
-    text = pattern.sub(lambda match: f"<MASKED_{len(match[0])}>", text)
+    if pattern is not None:
+        text = pattern.sub(lambda match: f"<MASKED_{len(match[0])}>", text)
     # Le masque MCP est volontairement très conservateur sur les appels.
     # Préserver uniquement la grammaire fermée des références d'environnement,
     # après suppression des valeurs connues, garde le remplacement lisible.
@@ -159,17 +182,18 @@ def _masked(text: str, secrets: tuple[str, ...]) -> str:
 
 def render_diff(proposal: Proposal) -> str:
     """Diff unifié masqué AVANT calcul, sans contrôles terminal ni ANSI."""
+    pattern = _secret_pattern(proposal.secrets)
 
     def label(text: str) -> str:
-        return _visible(_masked(text, proposal.secrets))
+        return _visible(_masked(text, pattern))
 
     lines = [
         f"Proposition : {label(proposal.finding.file)}:{proposal.finding.line}",
         f"Variable : {label(proposal.variable)}",
     ]
     for change in proposal.changes:
-        before = [_visible(line) for line in _masked(change.before, proposal.secrets).splitlines()]
-        after = [_visible(line) for line in _masked(change.after, proposal.secrets).splitlines()]
+        before = [_visible(line) for line in _masked(change.before, pattern).splitlines()]
+        after = [_visible(line) for line in _masked(change.after, pattern).splitlines()]
         lines.extend(
             difflib.unified_diff(
                 before,
@@ -229,26 +253,35 @@ def _valid_date(value: object) -> bool:
 
 @dataclass(frozen=True)
 class Decision:
-    """Choix humain journalisé : fichier, ligne, action, date (jamais de valeur)."""
+    """Choix humain journalisé : fichier, ligne, action, date, résultat.
+
+    ``applied`` dit ce qui s'est **réellement** passé : le journal ne
+    prétend jamais qu'une tentative a abouti (audit non répudiable).
+    """
 
     action: Choice
     finding: Finding
     date: str
+    applied: bool
 
     def __post_init__(self) -> None:
         if not isinstance(self.action, Choice) or not isinstance(self.finding, Finding):
             raise ReviewError
-        if not _valid_date(self.date):
+        if not isinstance(self.applied, bool) or not _valid_date(self.date):
+            raise ReviewError
+        # Seul Y peut aboutir à une application ; N et E n'écrivent rien.
+        if self.applied and self.action is not Choice.VALIDATE:
             raise ReviewError
 
     @classmethod
-    def now(cls, action: Choice, finding: Finding) -> Decision:
-        return cls(action, finding, datetime.now(timezone.utc).isoformat())
+    def now(cls, action: Choice, finding: Finding, *, applied: bool = False) -> Decision:
+        return cls(action, finding, datetime.now(timezone.utc).isoformat(), applied)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "schema": DECISION_SCHEMA,
             "action": self.action.value,
+            "applied": self.applied,
             "file": self.finding.file,
             "line": self.finding.line,
             "snippet_hash": self.finding.snippet_hash,
@@ -272,6 +305,7 @@ _DECISION_FIELDS: Final[frozenset[str]] = frozenset(
         "sequence",
         "date",
         "action",
+        "applied",
         "file",
         "line",
         "snippet_hash",
@@ -309,6 +343,8 @@ def _decision_entries(descriptor: int) -> list[dict[str, Any]]:
             if (
                 set(entry) != _DECISION_FIELDS
                 or entry["action"] not in _CHOICE_VALUES
+                or not isinstance(entry["applied"], bool)
+                or (entry["applied"] and entry["action"] != Choice.VALIDATE.value)
                 or not _valid_date(entry["date"])
             ):
                 raise JournalError
@@ -376,10 +412,14 @@ def _stderr_notify(message: str) -> None:
 
 
 def _stdin_ask(prompt: str) -> str:
-    """Lecture clavier ; une entrée fermée est une erreur, jamais un défaut."""
+    """Lecture clavier ; une entrée fermée est une erreur, jamais un défaut.
+
+    ``KeyboardInterrupt`` est converti aussi : Ctrl-C ne doit jamais sortir
+    en code 1 (réservé aux secrets avérés) ni afficher de traceback.
+    """
     try:
         return input(prompt)
-    except EOFError:
+    except (EOFError, OSError, ValueError, KeyboardInterrupt):
         raise ReviewError from None
 
 
@@ -395,7 +435,9 @@ def is_interactive(*, ci: bool = False, stream: object | None = None) -> bool:
         return False
     try:
         return bool(isatty())
-    except (OSError, ValueError):
+    except Exception:
+        # Refus par défaut : un flux exotique (RuntimeError, fermeture) ne
+        # doit jamais produire de traceback ni passer pour un terminal.
         return False
 
 
@@ -466,16 +508,23 @@ def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
     journal: DecisionJournal | None = None,
     interactive: bool = True,
     notify: NotifyFn | None = None,
+    stream: object | None = None,
 ) -> ReviewOutcome:
     """Boucle Y/N/E (#88) ; aucune action par défaut, aucune écriture non tracée.
 
+    ``interactive=True`` ne suffit **jamais** : il faut aussi un TTY sûr
+    (:func:`is_interactive`). Un appelant qui force l'interactif sur un
+    stdin pipé (`echo y | heimdall review`) retombe donc en mode non
+    interactif au lieu d'y voir une validation humaine (#89).
+
     ``apply`` et ``edit`` sont fournis par le backend T30 (#83–#86) : cette
-    interface ne calcule ni ne pose aucun patch. Le journal est écrit
-    **avant** l'application : sans trace, aucune modification.
+    interface ne calcule ni ne pose aucun patch. Toute exception du backend
+    est convertie en :class:`ReviewError` statique (invariant 8), et le
+    journal n'est écrit qu'**après** l'action, avec son résultat réel.
     """
     if not isinstance(proposal, Proposal) or not isinstance(interactive, bool):
         raise ReviewError
-    if not interactive:
+    if not interactive or not is_interactive(stream=stream):
         # #89 : rapport seul, ni backend, ni journal, ni écriture.
         return ReviewOutcome(None, False, 0, proposal)
     ask_fn = _stdin_ask if ask is None else ask
@@ -503,13 +552,23 @@ def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
         if choice is Choice.VALIDATE:
             if apply is None:
                 raise ReviewError
-            journal_fn.append(Decision.now(choice, current.finding))
-            apply(current)
+            try:
+                apply(current)
+            except Exception:
+                # Trace honnête : la tentative n'a pas abouti. Le message du
+                # backend (valeur, chemin, traceback) ne sort jamais.
+                journal_fn.append(Decision.now(choice, current.finding, applied=False))
+                raise ReviewError from None
+            journal_fn.append(Decision.now(choice, current.finding, applied=True))
             return ReviewOutcome(choice, True, edits, current)
         if edit is None:
             raise ReviewError
-        journal_fn.append(Decision.now(choice, current.finding))
-        edited = edit(current)
+        try:
+            edited = edit(current)
+        except Exception:
+            journal_fn.append(Decision.now(choice, current.finding, applied=False))
+            raise ReviewError from None
+        journal_fn.append(Decision.now(choice, current.finding, applied=False))
         if edited is None:
             notify_fn(EDIT_CANCELLED)
             continue
@@ -531,14 +590,16 @@ def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
     edit: EditFn | None = None,
     journal: DecisionJournal | None = None,
     notify: NotifyFn | None = None,
+    stream: object | None = None,
 ) -> ReviewReport:
-    """Session complète ; ``ci`` force le mode non interactif même si demandé."""
+    """Session complète ; ``ci`` et l'absence de TTY gagnent toujours."""
     items = tuple(proposals)
     if not all(isinstance(item, Proposal) for item in items):
         raise ReviewError
     if not isinstance(ci, bool) or (interactive is not None and not isinstance(interactive, bool)):
         raise ReviewError
-    mode = False if ci else (is_interactive() if interactive is None else interactive)
+    # `interactive=True` explicite ne contourne ni `--ci` ni l'absence de TTY.
+    mode = False if ci or interactive is False else is_interactive(stream=stream)
     outcomes = tuple(
         review_proposal(
             item,
@@ -548,6 +609,7 @@ def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
             journal=journal,
             interactive=mode,
             notify=notify,
+            stream=stream,
         )
         for item in items
     )

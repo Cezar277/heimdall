@@ -12,9 +12,12 @@ from typer.testing import CliRunner
 
 from heimdall.cli.main import app
 from heimdall.cli.review import (
+    _ENV_REFERENCE,
+    DECISION_SCHEMA,
     EDIT_CANCELLED,
     INVALID_CHOICE,
     MAX_PROMPTS,
+    MAX_SECRETS,
     MAX_TEXT_CHARS,
     NON_INTERACTIVE,
     AskFn,
@@ -33,7 +36,7 @@ from heimdall.cli.review import (
     review_proposal,
     review_proposals,
 )
-from heimdall.llm.rejections import JournalError
+from heimdall.llm.rejections import GENESIS, JournalError, journal_digest, journal_encode
 from heimdall.scanner.finding import Finding
 
 
@@ -126,6 +129,16 @@ def test_short_and_overlapping_secrets_are_fully_masked(proposal: Proposal) -> N
 # --- #88 / #89 / #90 : boucle Y/N/E, mode non interactif, tests du flux -------
 
 
+class _Tty:
+    """Faux terminal : la boucle exige un TTY sûr, même en test."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+TTY = _Tty()
+
+
 def _asker(answers: list[str]) -> tuple[AskFn, list[str]]:
     """Simule le clavier (alternative documentée à ``CliRunner(input=...)``)."""
     prompts: list[str] = []
@@ -149,7 +162,7 @@ def journal(tmp_path: Path) -> DecisionJournal:
 def test_validate_applies_after_journaling(proposal: Proposal, journal: DecisionJournal) -> None:
     applied: list[Proposal] = []
     ask, prompts = _asker(["y"])
-    outcome = review_proposal(proposal, ask=ask, apply=applied.append, journal=journal)
+    outcome = review_proposal(proposal, ask=ask, apply=applied.append, journal=journal, stream=TTY)
 
     assert outcome.action is Choice.VALIDATE
     assert outcome.applied is True
@@ -166,7 +179,14 @@ def test_validate_applies_after_journaling(proposal: Proposal, journal: Decision
 
 def test_ignore_never_calls_the_backend(proposal: Proposal, journal: DecisionJournal) -> None:
     ask, _prompts = _asker(["n"])
-    outcome = review_proposal(proposal, ask=ask, apply=_forbidden, edit=_forbidden, journal=journal)
+    outcome = review_proposal(
+        proposal,
+        ask=ask,
+        apply=_forbidden,
+        edit=_forbidden,
+        journal=journal,
+        stream=TTY,
+    )
 
     assert outcome.action is Choice.IGNORE
     assert outcome.applied is False
@@ -181,7 +201,12 @@ def test_edit_redisplays_the_diff_then_validates(
     ask, prompts = _asker(["e", "y"])
 
     outcome = review_proposal(
-        proposal, ask=ask, apply=applied.append, edit=lambda _p: edited, journal=journal
+        proposal,
+        ask=ask,
+        apply=applied.append,
+        edit=lambda _p: edited,
+        journal=journal,
+        stream=TTY,
     )
 
     assert outcome.proposal is edited
@@ -202,6 +227,7 @@ def test_invalid_answer_is_asked_again(proposal: Proposal, journal: DecisionJour
         apply=lambda _p: None,
         journal=journal,
         notify=notices.append,
+        stream=TTY,
     )
 
     assert outcome.action is Choice.VALIDATE
@@ -220,6 +246,7 @@ def test_invalid_answers_exhaust_the_loop(proposal: Proposal, journal: DecisionJ
             apply=lambda _p: None,
             journal=journal,
             notify=notices.append,
+            stream=TTY,
         )
 
     assert len(notices) == MAX_PROMPTS
@@ -230,7 +257,7 @@ def test_validate_without_backend_is_refused(proposal: Proposal, journal: Decisi
     ask, _prompts = _asker(["y"])
 
     with pytest.raises(ReviewError):
-        review_proposal(proposal, ask=ask, journal=journal)
+        review_proposal(proposal, ask=ask, journal=journal, stream=TTY)
 
     # Refus avant journal : aucune trace d'une action impossible.
     assert journal.read() == []
@@ -240,7 +267,7 @@ def test_edit_without_backend_is_refused(proposal: Proposal, journal: DecisionJo
     ask, _prompts = _asker(["e"])
 
     with pytest.raises(ReviewError):
-        review_proposal(proposal, ask=ask, journal=journal)
+        review_proposal(proposal, ask=ask, journal=journal, stream=TTY)
 
     assert journal.read() == []
 
@@ -255,6 +282,7 @@ def test_cancelled_edit_asks_again(proposal: Proposal, journal: DecisionJournal)
         edit=lambda _p: None,
         journal=journal,
         notify=notices.append,
+        stream=TTY,
     )
 
     assert outcome.action is Choice.IGNORE
@@ -265,7 +293,9 @@ def test_cancelled_edit_asks_again(proposal: Proposal, journal: DecisionJournal)
 
 def test_edit_loop_is_bounded(proposal: Proposal, journal: DecisionJournal) -> None:
     with pytest.raises(ReviewError):
-        review_proposal(proposal, ask=lambda _prompt: "e", edit=lambda p: p, journal=journal)
+        review_proposal(
+            proposal, ask=lambda _prompt: "e", edit=lambda p: p, journal=journal, stream=TTY
+        )
 
 
 def test_edit_returning_a_foreign_object_is_refused(
@@ -274,7 +304,13 @@ def test_edit_returning_a_foreign_object_is_refused(
     ask, _prompts = _asker(["e"])
 
     with pytest.raises(ReviewError):
-        review_proposal(proposal, ask=ask, edit=lambda _p: cast(Proposal, "nope"), journal=journal)
+        review_proposal(
+            proposal,
+            ask=ask,
+            edit=lambda _p: cast(Proposal, "nope"),
+            journal=journal,
+            stream=TTY,
+        )
 
 
 def test_non_interactive_never_writes(proposal: Proposal, journal: DecisionJournal) -> None:
@@ -427,13 +463,21 @@ def test_is_interactive_rejects_a_non_boolean_ci() -> None:
 
 
 def test_decision_rejects_invalid_metadata(proposal: Proposal) -> None:
+    stamp = "2026-01-01T00:00:00+00:00"
     for date in ("pas une date", "2026-01-01T00:00:00", "x" * 41):
         with pytest.raises(ReviewError):
-            Decision(Choice.IGNORE, proposal.finding, date)
+            Decision(Choice.IGNORE, proposal.finding, date, False)
     with pytest.raises(ReviewError):
-        Decision(cast(Choice, "y"), proposal.finding, "2026-01-01T00:00:00+00:00")
+        Decision(cast(Choice, "y"), proposal.finding, stamp, False)
     with pytest.raises(ReviewError):
-        Decision(Choice.IGNORE, cast(Finding, "nope"), "2026-01-01T00:00:00+00:00")
+        Decision(Choice.IGNORE, cast(Finding, "nope"), stamp, False)
+    with pytest.raises(ReviewError):
+        Decision(Choice.IGNORE, proposal.finding, stamp, cast(bool, "yes"))
+    # Un journal ne prétend jamais qu'une action autre que Y a été appliquée.
+    with pytest.raises(ReviewError):
+        Decision(Choice.IGNORE, proposal.finding, stamp, True)
+    with pytest.raises(ReviewError):
+        Decision(Choice.EDIT, proposal.finding, stamp, True)
 
 
 def test_decision_journal_path_follows_xdg_state_home(
@@ -467,7 +511,7 @@ def test_ask_eof_aborts_without_journal(
 
     monkeypatch.setattr("builtins.input", broken_input)
     with pytest.raises(ReviewError):
-        review_proposal(proposal, apply=lambda _p: None, journal=journal)
+        review_proposal(proposal, apply=lambda _p: None, journal=journal, stream=TTY)
     assert journal.read() == []
 
 
@@ -482,7 +526,9 @@ def test_broken_stderr_never_breaks_the_loop(proposal: Proposal, journal: Decisi
     ask, _prompts = _asker(["x", "y"])
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("sys.stderr", BrokenStderr())
-        outcome = review_proposal(proposal, ask=ask, apply=lambda _p: None, journal=journal)
+        outcome = review_proposal(
+            proposal, ask=ask, apply=lambda _p: None, journal=journal, stream=TTY
+        )
     assert outcome.applied is True
 
 
@@ -495,6 +541,7 @@ def test_outcome_and_status_cover_every_action(
         ask=_asker(["n", "y"])[0],
         apply=lambda _p: None,
         journal=journal,
+        stream=TTY,
     )
     statuses = report.render()
     assert "ignorée par l'opérateur" in statuses
@@ -513,3 +560,200 @@ def test_text_change_is_bounded() -> None:
 def test_status_reports_an_unconfirmed_application(proposal: Proposal) -> None:
     outcome = ReviewOutcome(Choice.VALIDATE, False, 0, proposal)
     assert "application non confirmée" in ReviewReport((outcome,), True).render()
+
+
+# --- Correctifs de revue : TTY, backend, masquage, grammaires, casse ---------
+
+
+class _Pipe:
+    """stdin pipé : pas de terminal, donc aucune validation possible."""
+
+    def isatty(self) -> bool:
+        return False
+
+
+def test_explicit_interactive_does_not_bypass_a_pipe(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    report = review_proposals(
+        (proposal,),
+        interactive=True,
+        ask=_forbidden,
+        apply=_forbidden,
+        edit=_forbidden,
+        journal=journal,
+        stream=_Pipe(),
+    )
+
+    assert report.interactive is False
+    assert report.applied == 0
+    assert report.remaining == 1
+    assert journal.read() == []
+
+
+def test_default_stream_without_tty_is_non_interactive(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    """Sous pytest, `sys.stdin` n'est pas un TTY : `interactive=True` ne suffit pas."""
+    report = review_proposals(
+        (proposal,), interactive=True, ask=_forbidden, apply=_forbidden, journal=journal
+    )
+
+    assert report.interactive is False
+    assert journal.read() == []
+
+
+def test_review_proposal_alone_also_requires_a_tty(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    outcome = review_proposal(
+        proposal,
+        ask=_forbidden,
+        apply=_forbidden,
+        journal=journal,
+        interactive=True,
+        stream=_Pipe(),
+    )
+
+    assert outcome.action is None
+    assert outcome.applied is False
+    assert journal.read() == []
+
+
+def test_backend_failure_is_static_and_journal_is_truthful(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    def boom(_proposal: Proposal) -> None:
+        raise RuntimeError("échec SYNTHETIC_ONLY_VALUE dans /etc/passwd")
+
+    ask, _prompts = _asker(["y"])
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(proposal, ask=ask, apply=boom, journal=journal, stream=TTY)
+
+    message = str(excinfo.value)
+    assert "SYNTHETIC_ONLY_VALUE" not in message
+    assert "/etc/passwd" not in message
+    assert excinfo.value.__cause__ is None
+    entries = journal.read()
+    assert [entry["action"] for entry in entries] == ["y"]
+    assert entries[0]["applied"] is False
+    assert "SYNTHETIC_ONLY_VALUE" not in journal.path.read_text(encoding="ascii")
+
+
+def test_edit_failure_is_static_and_journal_is_truthful(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    def boom(_proposal: Proposal) -> Proposal | None:
+        raise RuntimeError("échec SYNTHETIC_ONLY_VALUE")
+
+    ask, _prompts = _asker(["e"])
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(proposal, ask=ask, edit=boom, journal=journal, stream=TTY)
+
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    entries = journal.read()
+    assert [entry["action"] for entry in entries] == ["e"]
+    assert entries[0]["applied"] is False
+
+
+def test_validated_decision_is_journaled_as_applied(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    ask, _prompts = _asker(["y"])
+    review_proposal(proposal, ask=ask, apply=lambda _p: None, journal=journal, stream=TTY)
+
+    entries = journal.read()
+    assert [(entry["action"], entry["applied"]) for entry in entries] == [("y", True)]
+
+
+@pytest.mark.parametrize("error", [OSError("stdin fermé"), KeyboardInterrupt()])
+def test_stdin_failures_become_static_errors(
+    proposal: Proposal,
+    journal: DecisionJournal,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    def broken(_prompt: str) -> str:
+        raise error
+
+    monkeypatch.setattr("builtins.input", broken)
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(proposal, apply=lambda _p: None, journal=journal, stream=TTY)
+
+    assert "stdin fermé" not in str(excinfo.value)
+    assert journal.read() == []
+
+
+def test_is_interactive_treats_runtime_errors_as_no_tty() -> None:
+    class Weird:
+        def isatty(self) -> bool:
+            raise RuntimeError("flux exotique")
+
+    assert is_interactive(stream=Weird()) is False
+
+
+def test_masking_pattern_is_bounded(proposal: Proposal) -> None:
+    with pytest.raises(ReviewError):
+        replace(proposal, secrets=("a" * 100_000, "b" * 100_000, "c" * 100_000))
+
+
+def test_masking_supports_the_maximum_number_of_secrets(proposal: Proposal) -> None:
+    secrets = tuple(f"{index:04d}" + "z" * 996 for index in range(MAX_SECRETS))
+    changed = replace(
+        proposal,
+        secrets=secrets,
+        changes=(TextChange("app.py", secrets[0], "safe"),),
+    )
+
+    diff = render_diff(changed)
+
+    assert secrets[0] not in diff
+    assert "<MASKED_" in diff
+
+
+@pytest.mark.parametrize("variable", ["_", "__", "A", "_A", "a" * 65])
+def test_variable_grammar_matches_invariant_2(proposal: Proposal, variable: str) -> None:
+    with pytest.raises(ReviewError):
+        replace(proposal, variable=variable)
+
+
+def test_env_reference_grammar_matches_the_variable_contract() -> None:
+    assert _ENV_REFERENCE.fullmatch('os.getenv("APP_TOKEN")')
+    assert _ENV_REFERENCE.fullmatch('os.environ["APP_TOKEN"]')
+    assert _ENV_REFERENCE.fullmatch("process.env.APP_TOKEN")
+    assert not _ENV_REFERENCE.fullmatch('os.getenv("_")')
+    assert not _ENV_REFERENCE.fullmatch('os.getenv("A")')
+    assert not _ENV_REFERENCE.fullmatch('os.getenv("_APP")')
+
+
+@pytest.mark.parametrize(
+    "file", [".Git/config", ".ENV", ".Env.local", "src/.GIT/config", "sub/.ENV.prod"]
+)
+def test_private_paths_are_rejected_case_insensitively(file: str) -> None:
+    with pytest.raises(ReviewError):
+        TextChange(file, "", "")
+
+
+def test_env_example_is_allowed_in_any_case() -> None:
+    assert TextChange(".ENV.EXAMPLE", "", "APP_TOKEN=\n").file == ".ENV.EXAMPLE"
+
+
+def test_journal_rejects_an_inconsistent_applied_flag(tmp_path: Path) -> None:
+    """Défense en profondeur : même avec un hash valide, `n` ne peut être appliqué."""
+    path = tmp_path / "review-decisions.jsonl"
+    entry = {
+        "schema": DECISION_SCHEMA,
+        "sequence": 1,
+        "date": "2026-01-01T00:00:00+00:00",
+        "action": "n",
+        "applied": True,
+        "file": "app.py",
+        "line": 1,
+        "snippet_hash": "0" * 64,
+        "previous_hash": GENESIS,
+    }
+    path.write_bytes(journal_encode({**entry, "hash": journal_digest(entry)}) + b"\n")
+
+    with pytest.raises(JournalError):
+        DecisionJournal(path).read()
