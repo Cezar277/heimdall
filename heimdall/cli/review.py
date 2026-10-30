@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, Final
 
@@ -164,7 +165,12 @@ def _net(text: str) -> str:
     ``secrets``. Ce rendu n'affiche donc qu'un marqueur de longueur fixe.
     """
     masked, _ = mask_text(text)
-    return _REDACTION.sub(MASKED_MARKER, masked)
+    masked = _REDACTION.sub(MASKED_MARKER, masked)
+    if "<REDACTED:" in masked:
+        # Marqueur non reconnu : refus plutôt que réaffichage d'un type ou
+        # d'une longueur (fail-closed).
+        raise ReviewError
+    return masked
 
 
 def _secret_pattern(secrets: tuple[str, ...]) -> re.Pattern[str] | None:
@@ -372,7 +378,11 @@ _CHOICE_VALUES: Final[frozenset[str]] = frozenset(choice.value for choice in Cho
 #: Empreinte Finding v1 : 64 caractères hexadécimaux minuscules.
 _HASH: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
 #: Marqueur du filet MCP, ramené à une longueur constante dans ce rendu.
-_REDACTION: Final[re.Pattern[str]] = re.compile(r"<REDACTED:[a-z][a-z0-9_]*:len=[0-9]+>")
+#: Motif volontairement large : un futur type hors `[a-z_]` doit être
+#: réécrit lui aussi, sinon `type` et `len` fuiraient à nouveau. Un marqueur
+#: malformé (imbrication non fermée produite par ``mask_text``) est refusé
+#: par la post-condition de :func:`_net`.
+_REDACTION: Final[re.Pattern[str]] = re.compile(r"<REDACTED:[^<>]*>")
 
 
 def _valid_target(entry: dict[str, Any]) -> bool:
@@ -497,12 +507,18 @@ def _stderr_notify(message: str) -> None:
     try:
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
-    except (OSError, ValueError):  # pragma: no cover - canal déjà fermé
+    except BaseException:  # noqa: S110 - canal déjà fermé : silence
+        # Un `sys.stderr` exotique peut lever `SystemExit("<valeur>")` :
+        # l'interpréteur l'imprimerait et choisirait le code de sortie.
         pass
 
 
-def _stdin_ask(prompt: str) -> str:
-    """Lecture clavier **bornée** ; une entrée fermée n'est jamais un défaut.
+def _stdin_ask(prompt: str, stream: object | None = None) -> str:
+    """Lecture clavier **bornée** sur le flux vérifié par ``is_interactive``.
+
+    Lire ``sys.stdin`` alors que le contrôle TTY a porté sur un autre objet
+    permettrait une auto-validation (`stream` sûr + stdin pipé). Le même
+    objet est donc contrôlé **et** lu.
 
     ``readline`` limite la lecture à :data:`MAX_ANSWER_CHARS` + 2 octets :
     un collage de plusieurs mégaoctets n'est pas matérialisé avant le refus.
@@ -510,18 +526,19 @@ def _stdin_ask(prompt: str) -> str:
     en code 1 (réservé aux secrets avérés) ni afficher de traceback.
     """
     try:
-        stream = sys.stdin
+        candidate = sys.stdin if stream is None else stream
         output = sys.stdout
-        if stream is None or output is None:
+        reader = getattr(candidate, "readline", None)
+        if output is None or not callable(reader):
             raise ReviewError
         output.write(prompt)
         output.flush()
-        answer = stream.readline(MAX_ANSWER_CHARS + 2)
+        answer = reader(MAX_ANSWER_CHARS + 2)
     except ReviewError:
         raise
-    except (EOFError, OSError, ValueError, KeyboardInterrupt):
+    except BaseException:  # refus par défaut, jamais de message d'entrée
         raise ReviewError from None
-    if not answer:
+    if not isinstance(answer, str) or not answer:
         raise ReviewError
     return answer
 
@@ -738,7 +755,7 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
     if not interactive or not is_interactive(stream=stream):
         # #89 : rapport seul, ni backend, ni journal, ni écriture.
         return ReviewOutcome(None, False, 0, proposal)
-    ask_fn = _stdin_ask if ask is None else ask
+    ask_fn = partial(_stdin_ask, stream=stream) if ask is None else ask
     notify_fn = _stderr_notify if notify is None else notify
     journal_fn = _resolve_journal(journal)
     current = proposal
@@ -808,10 +825,18 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
 
 
 def _proposal_bytes(proposal: Proposal) -> int:
-    """Volume retenu par une proposition (snapshots et valeurs connues)."""
-    return sum(len(change.before) + len(change.after) for change in proposal.changes) + sum(
-        len(secret) for secret in proposal.secrets
-    )
+    """Volume **UTF-8** retenu par une proposition (snapshots et valeurs).
+
+    Compter les caractères sous-estimerait jusqu'à 4× la mémoire réelle :
+    la borne porte donc sur les octets encodés.
+    """
+    total = 0
+    for change in proposal.changes:
+        total += len(change.before.encode("utf-8", "surrogatepass"))
+        total += len(change.after.encode("utf-8", "surrogatepass"))
+    for secret in proposal.secrets:
+        total += len(secret.encode("utf-8", "surrogatepass"))
+    return total
 
 
 def _review_all(  # noqa: PLR0913 - injections explicites de la session

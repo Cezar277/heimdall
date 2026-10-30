@@ -25,7 +25,7 @@ changements dans la proposition affichée. Le moteur de remplacement T30
 (#83–#86) n'est pas encore livré sur cette branche : cette interface ne
 génère pas de remplacements et n'ouvre aucun fichier source.
 
-Preuve locale : `python -m pytest tests/test_cli_review.py` (149 tests pour #87–#90).
+Preuve locale : `python -m pytest tests/test_cli_review.py` (159 tests pour #87–#90).
 
 ## Boucle Y/N/E (#88)
 
@@ -159,6 +159,12 @@ documentée au `CliRunner(input=...)` de Typer) et couvre :
 - `apply` réussi puis journal en panne : `JournalError`, avertissement
   `UNAPPLIED_TRACE`, journal vide ;
 - volume de session au-delà de `MAX_SESSION_BYTES` : `ReviewError` ;
+- `stream` TTY vérifié avec `sys.stdin` pipé : la lecture porte sur le flux
+  vérifié, jamais sur le pipe ;
+- marqueur `<REDACTED:...>` de type exotique réécrit ; marqueur malformé
+  refusé (`ReviewError`) ;
+- volume compté en octets UTF-8 (`é` = 2 octets) ;
+- `sys.stderr` levant `SystemExit("<valeur>")` : silence, boucle poursuivie ;
 - `XDG_STATE_HOME` relatif ou contenant `..` : `JournalError` statique ;
 - masquage borné : total des valeurs > `MAX_SECRET_BYTES` refusé, 256 valeurs
   longues acceptées et masquées ;
@@ -205,3 +211,7 @@ mypy heimdall tests/test_cli_review.py
 | [LOW] filet MCP `mask_text` révélait `type` + `len` | `_net` ramène `<REDACTED:type:len=N>` au marqueur constant `<MASKED>` |
 | [LOW] patch appliqué sans trace si le journal échoue après `apply` | `_journal_applied` : avertissement statique `UNAPPLIED_TRACE` puis `JournalError` ; atomicité patch+journal non garantie, documentée |
 | [LOW] session matérialisée (1024 × 32 × 100 Ko) | traitement **en flux** (`_review_all`) + borne de volume `MAX_SESSION_BYTES` (64 Mio), `ReviewError` au-delà |
+| [LOW] TTY vérifié sur `stream` mais lecture sur `sys.stdin` | `_stdin_ask(prompt, stream)` lit **le même objet** que celui contrôlé par `is_interactive` |
+| [LOW] `_REDACTION` trop étroit (type hors `[a-z_]`) | motif large `<REDACTED:[^<>]*>` + post-condition fail-closed si un marqueur reste |
+| [LOW] volume compté en caractères | `_proposal_bytes` compte les **octets UTF-8** (jusqu'à 4× plus qu'en caractères) |
+| [LOW] `_stderr_notify` laissait passer `BaseException` | `except BaseException` : un `sys.stderr` exotique ne peut ni imprimer ni choisir le code de sortie |

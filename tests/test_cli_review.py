@@ -1,5 +1,6 @@
 """Preuves T32 avec valeurs entièrement synthétiques."""
 
+import io
 import os
 import stat
 from collections.abc import Iterable, Iterator
@@ -37,6 +38,7 @@ from heimdall.cli.review import (
     ReviewOutcome,
     ReviewReport,
     TextChange,
+    _net,
     _stdin_ask,
     decision_journal_path,
     is_interactive,
@@ -1448,3 +1450,103 @@ def test_session_volume_accepts_a_normal_proposal(
     report = review_proposals((proposal,), ci=True, journal=journal)
 
     assert len(report.outcomes) == 1
+
+
+# --- Durcissements LOW : flux lu, filet large, octets, stderr (revue 10) -----
+
+
+def test_ask_reads_the_same_stream_that_was_checked(
+    proposal: Proposal, journal: DecisionJournal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`stream` vérifié TTY mais `sys.stdin` pipé : on lit le flux vérifié."""
+
+    class TtyStream:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def isatty(self) -> bool:
+            return True
+
+        def readline(self, _limit: int = -1) -> str:
+            self.reads += 1
+            return "y\n"
+
+    class Pipe:
+        def isatty(self) -> bool:
+            return False
+
+        def readline(self, _limit: int = -1) -> str:
+            pytest.fail("le pipe ne doit jamais être lu")
+
+    tty = TtyStream()
+    monkeypatch.setattr("sys.stdin", Pipe())
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+
+    applied: list[Proposal] = []
+    outcome = review_proposal(proposal, apply=applied.append, journal=journal, stream=tty)
+
+    assert outcome.applied is True
+    assert tty.reads == 1
+    assert applied == [proposal]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "<REDACTED:github:len=40>",
+        "<REDACTED:Type-X:len=12>",
+        "<REDACTED:a.b:len=3>",
+        "<REDACTED:>",
+    ],
+)
+def test_net_rewrites_every_redaction_marker(marker: str) -> None:
+    """Motif large : un type hors `[a-z_]` est réécrit comme les autres."""
+    assert _net(f"avant {marker} après") == f"avant {MASKED_MARKER} après"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "avant <REDACTED: après",  # marqueur non fermé
+        "avant <REDACTED:url_password:len=8> après",  # imbriqué, non fermé
+        "avant <REDACTED:<REDACTED:x:len=1>> après",  # imbriqué, non fermé
+    ],
+)
+def test_net_refuses_an_unrecognized_marker(text: str) -> None:
+    """Filet non reconnu : refus plutôt que réaffichage d'un type/longueur."""
+    with pytest.raises(ReviewError):
+        _net(text)
+
+
+def test_session_volume_counts_utf8_bytes(
+    proposal: Proposal, journal: DecisionJournal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`é` = 2 octets : 200 caractères valent 400 octets, pas 200."""
+    monkeypatch.setattr(review_module, "MAX_SESSION_BYTES", 300)
+    non_ascii = replace(
+        proposal,
+        changes=(TextChange("app.py", "é" * 100, "é" * 100),),
+        secrets=("é",),
+    )
+
+    with pytest.raises(ReviewError):
+        review_proposals((non_ascii,), ci=True, journal=journal)
+
+
+def test_stderr_notify_silences_base_exceptions(
+    proposal: Proposal, journal: DecisionJournal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un `sys.stderr` levant `SystemExit("<valeur>")` ne doit rien laisser sortir."""
+
+    class HostileStderr:
+        def write(self, _text: str) -> int:
+            raise SystemExit("SYNTHETIC_ONLY_VALUE /etc/passwd")
+
+        def flush(self) -> None:
+            raise SystemExit("SYNTHETIC_ONLY_VALUE /etc/passwd")
+
+    ask, _prompts = _asker(["x", "y"])
+    monkeypatch.setattr("sys.stderr", HostileStderr())
+    outcome = review_proposal(proposal, ask=ask, apply=lambda _p: None, journal=journal, stream=TTY)
+
+    assert outcome.applied is True
