@@ -21,7 +21,7 @@ changements dans la proposition affichée. Le moteur de remplacement T30
 (#83–#86) n'est pas encore livré sur cette branche : cette interface ne
 génère pas de remplacements et n'ouvre aucun fichier source.
 
-Preuve locale : `python -m pytest tests/test_cli_review.py` (109 tests pour #87–#90).
+Preuve locale : `python -m pytest tests/test_cli_review.py` (122 tests pour #87–#90).
 
 ## Boucle Y/N/E (#88)
 
@@ -129,6 +129,12 @@ documentée au `CliRunner(input=...)` de Typer) et couvre :
   `JournalError` statique, stderr vide ;
 - générateur infini de propositions : borné à `MAX_PROPOSALS + 1` éléments
   consommés, `ReviewError`, aucune écriture ;
+- producteur `None`/entier/objet, ou générateur qui lève : `ReviewError`
+  statique, pas de `TypeError` fuyant ;
+- chemin de journal avec octet NUL, `HOME` indisponible, argument non-`Path`,
+  journal par défaut cassé : `JournalError` statique ;
+- rendu en `MemoryError`/`KeyboardInterrupt` (boucle et rapport) :
+  `ReviewError` statique, journal vide ;
 - `XDG_STATE_HOME` relatif ou contenant `..` : `JournalError` statique ;
 - masquage borné : total des valeurs > `MAX_SECRET_BYTES` refusé, 256 valeurs
   longues acceptées et masquées ;
@@ -161,3 +167,6 @@ mypy heimdall tests/test_cli_review.py
 | [LOW] `apply`/`edit` ne capturaient que `Exception` | `BaseException` → journal `applied:false` puis `ReviewError` statique (couvre `SystemExit("<valeur>")`) |
 | [LOW] journal injecté non normalisé | `_journal` réémet `JournalError`/`ReviewError` et convertit tout le reste en `JournalError from None` |
 | [LOW] `review_proposals` matérialisait tout | consommation paresseuse bornée par `MAX_PROPOSALS` (1024), `ReviewError` au-delà, jamais de troncature silencieuse |
+| [LOW] résolution du journal hors contrat (`Path.home()` en `RuntimeError`, `Path` acceptant NUL) | `decision_journal_path`/`DecisionJournal` encadrent la résolution, refusent un chemin non-`Path` ou contenant NUL ; `_resolve_journal` garantit un `JournalError` statique |
+| [LOW] producteur non itérable (`TypeError` brut) | `_bounded_proposals` encadre l'itération et rend une `ReviewError` statique |
+| [LOW] rendu non gardé (`MemoryError`, `KeyboardInterrupt`) | `_render` encadre `render_diff`, `ReviewReport.render` encadre le rapport |
