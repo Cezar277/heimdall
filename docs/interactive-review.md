@@ -21,7 +21,7 @@ changements dans la proposition affichée. Le moteur de remplacement T30
 (#83–#86) n'est pas encore livré sur cette branche : cette interface ne
 génère pas de remplacements et n'ouvre aucun fichier source.
 
-Preuve locale : `python -m pytest tests/test_cli_review.py` (130 tests pour #87–#90).
+Preuve locale : `python -m pytest tests/test_cli_review.py` (134 tests pour #87–#90).
 
 ## Boucle Y/N/E (#88)
 
@@ -142,6 +142,10 @@ documentée au `CliRunner(input=...)` de Typer) et couvre :
   seul élément ;
 - `os.fstat` en `MemoryError`/`KeyboardInterrupt` sur `read` et `append` :
   `JournalError` statique ;
+- `edit` rendant un `finding` déplacé ou des `secrets` réduits : `ReviewError`,
+  journal `e:false` ; ajout de valeurs accepté ;
+- rendu au plafond (`MAX_CHANGES` textes dont un à `MAX_TEXT_CHARS`) : masqué
+  et borné, en ~2 s ;
 - `XDG_STATE_HOME` relatif ou contenant `..` : `JournalError` statique ;
 - masquage borné : total des valeurs > `MAX_SECRET_BYTES` refusé, 256 valeurs
   longues acceptées et masquées ;
@@ -181,3 +185,4 @@ mypy heimdall tests/test_cli_review.py
 | [LOW] `__context__` backend conservée sur double faute | drapeau + erreur statique levée **hors** du `except` ; `_journal_failure` absorbe la panne du journal, `__context__`/`__cause__` nuls |
 | [LOW] options validées après consommation du producteur | validation `ci`/`interactive` **avant** `_bounded_proposals` |
 | [LOW] `read`/`append` ne capturaient pas `MemoryError`/`KeyboardInterrupt` | `BaseException` capturé, `JournalError` réémis ou converti |
+| [LOW] `edit` pouvait changer le `finding` ou réduire `secrets` | ré-ancrage : `edited.finding == current.finding` et `current.secrets ⊆ edited.secrets` (ajout permis, retrait refusé), sinon `ReviewError` statique |
