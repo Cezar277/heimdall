@@ -46,6 +46,8 @@ MAX_ANSWER_CHARS: Final[int] = 16
 #: Longueur maximale d'une date ISO 8601 acceptée par le journal.
 MAX_DATE_CHARS: Final[int] = 40
 DECISION_SCHEMA: Final[str] = "heimdall.review-decision.v1"
+#: Marqueur de masquage à longueur constante (aucun oracle de taille).
+MASKED_MARKER: Final[str] = "<MASKED>"
 PROMPT: Final[str] = "Valider (Y), ignorer (N) ou éditer (E) ? "
 INVALID_CHOICE: Final[str] = "Réponse invalide : répondre Y, N ou E (aucune action par défaut)."
 EDIT_CANCELLED: Final[str] = "Édition annulée : aucune modification, réponse attendue."
@@ -169,7 +171,10 @@ def _masked(text: str, pattern: re.Pattern[str] | None) -> str:
     # Un seul passage : une valeur courte ne peut altérer le marqueur d'une
     # valeur déjà masquée. Les valeurs qui se chevauchent sont triées par taille.
     if pattern is not None:
-        text = pattern.sub(lambda match: f"<MASKED_{len(match[0])}>", text)
+        # Marqueur CONSTANT : révéler `len(valeur)` serait un oracle de
+        # longueur (deux secrets de même famille deviendraient distincts
+        # sur un écran partagé ou un journal de session).
+        text = pattern.sub(MASKED_MARKER, text)
     # Le masque MCP est volontairement très conservateur sur les appels.
     # Préserver uniquement la grammaire fermée des références d'environnement,
     # après suppression des valeurs connues, garde le remplacement lisible.
@@ -348,6 +353,28 @@ _DECISION_FIELDS: Final[frozenset[str]] = frozenset(
 _CHOICE_VALUES: Final[frozenset[str]] = frozenset(choice.value for choice in Choice)
 
 
+#: Empreinte Finding v1 : 64 caractères hexadécimaux minuscules.
+_HASH: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
+
+
+def _valid_target(entry: dict[str, Any]) -> bool:
+    """Types du contrat fermé : `file`, `line` et `snippet_hash` relus.
+
+    Une réécriture complète du fichier d'état avec une chaîne recalculée
+    (modèle de menace non couvert, comme T33) ne doit pas pouvoir y placer
+    des types arbitraires.
+    """
+    try:
+        validate_relative_path(entry["file"])
+    except (KeyError, ValueError):
+        return False
+    line = entry.get("line")
+    if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+        return False
+    digest = entry.get("snippet_hash")
+    return isinstance(digest, str) and _HASH.fullmatch(digest) is not None
+
+
 def _decision_entries(descriptor: int) -> list[dict[str, Any]]:
     """Relit la chaîne complète ; contrat fermé, aucune réparation implicite."""
     if os.fstat(descriptor).st_size > MAX_JOURNAL_BYTES:
@@ -379,6 +406,7 @@ def _decision_entries(descriptor: int) -> list[dict[str, Any]]:
                 or not isinstance(entry["applied"], bool)
                 or (entry["applied"] and entry["action"] != Choice.VALIDATE.value)
                 or not _valid_date(entry["date"])
+                or not _valid_target(entry)
             ):
                 raise JournalError
             previous = digest
@@ -456,15 +484,28 @@ def _stderr_notify(message: str) -> None:
 
 
 def _stdin_ask(prompt: str) -> str:
-    """Lecture clavier ; une entrée fermée est une erreur, jamais un défaut.
+    """Lecture clavier **bornée** ; une entrée fermée n'est jamais un défaut.
 
+    ``readline`` limite la lecture à :data:`MAX_ANSWER_CHARS` + 2 octets :
+    un collage de plusieurs mégaoctets n'est pas matérialisé avant le refus.
     ``KeyboardInterrupt`` est converti aussi : Ctrl-C ne doit jamais sortir
     en code 1 (réservé aux secrets avérés) ni afficher de traceback.
     """
     try:
-        return input(prompt)
+        stream = sys.stdin
+        output = sys.stdout
+        if stream is None or output is None:
+            raise ReviewError
+        output.write(prompt)
+        output.flush()
+        answer = stream.readline(MAX_ANSWER_CHARS + 2)
+    except ReviewError:
+        raise
     except (EOFError, OSError, ValueError, KeyboardInterrupt):
         raise ReviewError from None
+    if not answer:
+        raise ReviewError
+    return answer
 
 
 def _ask(ask_fn: AskFn, prompt: str) -> str:

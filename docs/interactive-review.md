@@ -9,8 +9,10 @@ en mémoire : aucun manifeste contenant des secrets n'est écrit sur disque.
 Les contenus et valeurs sont exclus de `repr`.
 
 `render_diff` utilise `difflib.unified_diff`. Les valeurs connues sont entièrement
-masquées avant le calcul du diff ; le masque conservateur MCP ajoute un filet
-pour les autres candidats. Les références `os.getenv`, `os.environ` et
+masquées avant le calcul du diff, avec le marqueur **constant** `<MASKED>`
+(aucun oracle de longueur : `len(valeur)` ne fuit ni à l'écran ni dans un
+journal de session) ; le masque conservateur MCP ajoute un filet pour les
+autres candidats. Les références `os.getenv`, `os.environ` et
 `process.env` restent lisibles. Le diff comprend les fichiers de code,
 `.env.example` et `.gitignore` fournis par le producteur. Le contenu des `.env`
 et de `.git` est refusé. Les contrôles terminal et caractères directionnels
@@ -21,7 +23,7 @@ changements dans la proposition affichée. Le moteur de remplacement T30
 (#83–#86) n'est pas encore livré sur cette branche : cette interface ne
 génère pas de remplacements et n'ouvre aucun fichier source.
 
-Preuve locale : `python -m pytest tests/test_cli_review.py` (134 tests pour #87–#90).
+Preuve locale : `python -m pytest tests/test_cli_review.py` (145 tests pour #87–#90).
 
 ## Boucle Y/N/E (#88)
 
@@ -146,6 +148,11 @@ documentée au `CliRunner(input=...)` de Typer) et couvre :
   journal `e:false` ; ajout de valeurs accepté ;
 - rendu au plafond (`MAX_CHANGES` textes dont un à `MAX_TEXT_CHARS`) : masqué
   et borné, en ~2 s ;
+- marqueur constant : `<MASKED>` sans chiffre, quelle que soit la longueur ;
+- lecture clavier bornée : `readline(MAX_ANSWER_CHARS + 2)`, EOF et flux
+  absents en erreur statique ;
+- journal relu avec `file`/`line`/`snippet_hash` de types arbitraires :
+  `JournalError` statique ;
 - `XDG_STATE_HOME` relatif ou contenant `..` : `JournalError` statique ;
 - masquage borné : total des valeurs > `MAX_SECRET_BYTES` refusé, 256 valeurs
   longues acceptées et masquées ;
@@ -186,3 +193,6 @@ mypy heimdall tests/test_cli_review.py
 | [LOW] options validées après consommation du producteur | validation `ci`/`interactive` **avant** `_bounded_proposals` |
 | [LOW] `read`/`append` ne capturaient pas `MemoryError`/`KeyboardInterrupt` | `BaseException` capturé, `JournalError` réémis ou converti |
 | [LOW] `edit` pouvait changer le `finding` ou réduire `secrets` | ré-ancrage : `edited.finding == current.finding` et `current.secrets ⊆ edited.secrets` (ajout permis, retrait refusé), sinon `ReviewError` statique |
+| [LOW] marqueur `<MASKED_N>` révélait `len(valeur)` | marqueur **constant** `<MASKED>`, documenté |
+| [LOW] `input()` lisait une réponse non bornée | `sys.stdin.readline(MAX_ANSWER_CHARS + 2)` : un collage volumineux n'est pas matérialisé |
+| [LOW] relecture du journal sans contrôle de types | `_valid_target` : `file` conforme au contrat Finding, `line` entier ≥ 1, `snippet_hash` hex 64, sinon `JournalError` |

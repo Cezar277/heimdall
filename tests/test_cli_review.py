@@ -18,6 +18,8 @@ from heimdall.cli.review import (
     DECISION_SCHEMA,
     EDIT_CANCELLED,
     INVALID_CHOICE,
+    MASKED_MARKER,
+    MAX_ANSWER_CHARS,
     MAX_CHANGES,
     MAX_PROMPTS,
     MAX_PROPOSALS,
@@ -33,6 +35,7 @@ from heimdall.cli.review import (
     ReviewOutcome,
     ReviewReport,
     TextChange,
+    _stdin_ask,
     decision_journal_path,
     is_interactive,
     parse_choice,
@@ -713,7 +716,7 @@ def test_masking_supports_the_maximum_number_of_secrets(proposal: Proposal) -> N
     diff = render_diff(changed)
 
     assert secrets[0] not in diff
-    assert "<MASKED_" in diff
+    assert MASKED_MARKER in diff
 
 
 @pytest.mark.parametrize("variable", ["_", "__", "A", "_A", "a" * 65])
@@ -1265,5 +1268,116 @@ def test_maximal_proposal_renders_and_masks(proposal: Proposal) -> None:
     diff = render_diff(maximal)
 
     assert valeur not in diff
-    assert "<MASKED_" in diff
+    assert MASKED_MARKER in diff
     assert len(diff) <= 2 * MAX_TEXT_CHARS + 4096
+
+
+# --- Durcissements LOW : marqueur, lecture bornée, journal (revue 8) ---------
+
+
+def test_masked_marker_reveals_no_length(proposal: Proposal) -> None:
+    """Le marqueur ne doit pas donner `len(valeur)` (oracle de longueur)."""
+    court = replace(
+        proposal,
+        secrets=("A" * 8,),
+        changes=(TextChange("app.py", "x = AAAAAAAA\n", "x = safe\n"),),
+    )
+    long = replace(
+        proposal,
+        secrets=("B" * 40,),
+        changes=(TextChange("app.py", f"x = {'B' * 40}\n", "x = safe\n"),),
+    )
+
+    diff_court = render_diff(court)
+    diff_long = render_diff(long)
+
+    assert MASKED_MARKER in diff_court
+    assert MASKED_MARKER in diff_long
+    assert "<MASKED_8>" not in diff_court
+    assert "<MASKED_40>" not in diff_long
+    assert "A" * 8 not in diff_court
+    assert "B" * 40 not in diff_long
+
+
+def test_stdin_ask_reads_a_bounded_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un collage volumineux n'est pas matérialisé avant le refus."""
+    limits: list[int] = []
+
+    class FakeStdin:
+        def readline(self, limit: int = -1) -> str:
+            limits.append(limit)
+            return "y" * (limit - 1) + "\n"
+
+    class FakeStdout:
+        def write(self, _text: str) -> int:
+            return 0
+
+        def flush(self) -> None:
+            pass
+
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+    monkeypatch.setattr("sys.stdout", FakeStdout())
+
+    answer = _stdin_ask("prompt")
+
+    assert limits == [MAX_ANSWER_CHARS + 2]
+    assert len(answer) == MAX_ANSWER_CHARS + 2
+    with pytest.raises(ReviewError):
+        parse_choice(answer)
+
+
+def test_stdin_ask_without_streams_is_static(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.stdin", None)
+    with pytest.raises(ReviewError):
+        _stdin_ask("prompt")
+
+
+def test_stdin_ask_on_eof_is_static(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeStdin:
+        def readline(self, _limit: int = -1) -> str:
+            return ""
+
+    class FakeStdout:
+        def write(self, _text: str) -> int:
+            return 0
+
+        def flush(self) -> None:
+            pass
+
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+    monkeypatch.setattr("sys.stdout", FakeStdout())
+    with pytest.raises(ReviewError):
+        _stdin_ask("prompt")
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"file": 123},
+        {"file": "../evil"},
+        {"line": "x"},
+        {"line": 0},
+        {"line": True},
+        {"snippet_hash": "pas-un-hash"},
+        {"snippet_hash": "A" * 64},
+    ],
+)
+def test_journal_rejects_foreign_field_types(tmp_path: Path, updates: dict[str, object]) -> None:
+    """Chaîne valide recalculée mais types arbitraires : refus statique."""
+    path = tmp_path / "review-decisions.jsonl"
+    entry: dict[str, object] = {
+        "schema": DECISION_SCHEMA,
+        "sequence": 1,
+        "date": "2026-01-01T00:00:00+00:00",
+        "action": "n",
+        "applied": False,
+        "file": "app.py",
+        "line": 1,
+        "snippet_hash": "0" * 64,
+        "previous_hash": GENESIS,
+    }
+    entry.update(updates)
+    path.write_bytes(journal_encode({**entry, "hash": journal_digest(entry)}) + b"\n")
+
+    with pytest.raises(JournalError):
+        DecisionJournal(path).read()
