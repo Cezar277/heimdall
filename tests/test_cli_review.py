@@ -18,6 +18,7 @@ from heimdall.cli.review import (
     DECISION_SCHEMA,
     EDIT_CANCELLED,
     INVALID_CHOICE,
+    MAX_CHANGES,
     MAX_PROMPTS,
     MAX_PROPOSALS,
     MAX_SECRETS,
@@ -1197,3 +1198,72 @@ def test_journal_append_normalizes_base_exceptions(
     with pytest.raises(JournalError) as excinfo:
         journal.append(Decision.now(Choice.IGNORE, proposal.finding))
     assert excinfo.value.__cause__ is None
+
+
+# --- Ré-ancrage de l'édition (revue 7) ---------------------------------------
+
+
+def test_edit_cannot_change_the_finding(proposal: Proposal, journal: DecisionJournal) -> None:
+    """Un éditeur bogué ne doit pas déplacer la proposition de périmètre."""
+    # Même fichier (donc `Proposal` valide) mais autre ligne : périmètre déplacé.
+    other = replace(proposal.finding, line=9, snippet_hash="1" * 64)
+    edited = replace(proposal, finding=other)
+    ask, _prompts = _asker(["e"])
+
+    with pytest.raises(ReviewError):
+        review_proposal(proposal, ask=ask, edit=lambda _p: edited, journal=journal, stream=TTY)
+
+    assert [(entry["action"], entry["applied"]) for entry in journal.read()] == [("e", False)]
+
+
+def test_edit_cannot_drop_known_secrets(proposal: Proposal, journal: DecisionJournal) -> None:
+    """Réduire `secrets` affaiblirait le masquage du ré-affichage."""
+    edited = replace(proposal, secrets=("AUTRE_VALEUR",))
+    ask, _prompts = _asker(["e"])
+
+    with pytest.raises(ReviewError):
+        review_proposal(proposal, ask=ask, edit=lambda _p: edited, journal=journal, stream=TTY)
+
+    assert [(entry["action"], entry["applied"]) for entry in journal.read()] == [("e", False)]
+
+
+def test_edit_may_add_known_secrets(proposal: Proposal, journal: DecisionJournal) -> None:
+    """Ajouter une valeur connue reste permis : le masquage ne s'affaiblit pas."""
+    edited = replace(proposal, secrets=(*proposal.secrets, "CONTEXTE_SECRET"))
+    applied: list[Proposal] = []
+    ask, _prompts = _asker(["e", "y"])
+
+    outcome = review_proposal(
+        proposal, ask=ask, apply=applied.append, edit=lambda _p: edited, journal=journal, stream=TTY
+    )
+
+    assert outcome.proposal is edited
+    assert applied == [edited]
+    assert [(entry["action"], entry["applied"]) for entry in journal.read()] == [
+        ("e", False),
+        ("y", True),
+    ]
+
+
+def test_maximal_proposal_renders_and_masks(proposal: Proposal) -> None:
+    """Plafond de rendu : `MAX_CHANGES` textes dont un à `MAX_TEXT_CHARS`."""
+    valeur = "SYNTHETIC_ONLY_VALUE"
+    remplissage = "x" * (MAX_TEXT_CHARS - len(valeur) - 2)
+    changes = [
+        TextChange("fichier_0.py", f"{valeur}{remplissage}\n", f"{valeur}{remplissage}y\n"),
+    ]
+    changes.extend(
+        TextChange(f"fichier_{index}.py", f"{valeur}\n", f"{valeur}y\n")
+        for index in range(1, MAX_CHANGES)
+    )
+    maximal = replace(
+        proposal,
+        changes=tuple(changes),
+        finding=replace(proposal.finding, file="fichier_0.py"),
+    )
+
+    diff = render_diff(maximal)
+
+    assert valeur not in diff
+    assert "<MASKED_" in diff
+    assert len(diff) <= 2 * MAX_TEXT_CHARS + 4096

@@ -712,6 +712,14 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
             continue
         if not isinstance(edited, Proposal):
             raise ReviewError
+        # Ré-ancrage : un éditeur ne change ni le finding (périmètre) ni le
+        # jeu de valeurs connues. Sinon le ré-affichage suivant ne masquerait
+        # plus qu'avec un sous-ensemble, et le seul filet restant serait
+        # l'heuristique `mask_text`. Ajouter des valeurs reste permis.
+        if edited.finding != current.finding:
+            raise ReviewError
+        if not set(current.secrets) <= set(edited.secrets):
+            raise ReviewError
         edits += 1
         if edits > MAX_EDITS:
             raise ReviewError
