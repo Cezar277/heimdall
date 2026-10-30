@@ -210,7 +210,23 @@ def _masked(text: str, pattern: re.Pattern[str] | None) -> str:
 
 
 def render_diff(proposal: Proposal) -> str:
-    """Diff unifié masqué AVANT calcul, sans contrôles terminal ni ANSI."""
+    """Diff unifié masqué AVANT calcul, sans contrôles terminal ni ANSI.
+
+    C'est le chemin **durci** : toute panne de masquage ou de ``difflib``
+    (``MemoryError``, ``KeyboardInterrupt`` opérateur, ``re.error``…) devient
+    une :class:`ReviewError` statique, donc un code d'outillage 2 chez
+    l'appelant. Aucune valeur ne ressort avec une traceback (invariants 8
+    et 11).
+    """
+    try:
+        return _render_diff(proposal)
+    except ReviewError:
+        raise
+    except BaseException:  # refus par défaut, jamais de traceback de rendu
+        raise ReviewError from None
+
+
+def _render_diff(proposal: Proposal) -> str:
     pattern = _secret_pattern(proposal.secrets)
 
     def label(text: str) -> str:
@@ -234,22 +250,6 @@ def render_diff(proposal: Proposal) -> str:
             )
         )
     return "\n".join(lines)
-
-
-def _render(proposal: Proposal) -> str:
-    """Rendu défensif : une panne de masquage ou de diff reste statique.
-
-    ``_secret_pattern`` normalise déjà ``re.error`` ; ``mask_text`` et
-    ``difflib`` sur des snapshots volumineux peuvent lever autre chose
-    (``MemoryError``, ``KeyboardInterrupt`` opérateur). Aucune valeur ne
-    doit ressortir avec la traceback (invariants 8 et 11).
-    """
-    try:
-        return render_diff(proposal)
-    except ReviewError:
-        raise
-    except BaseException:  # refus par défaut, jamais de traceback de rendu
-        raise ReviewError from None
 
 
 class Choice(str, Enum):
@@ -630,15 +630,20 @@ def _notify(notify_fn: NotifyFn, message: str) -> None:
     L'avertissement ne doit jamais interrompre la boucle, et l'exception
     d'un notifieur injecté ne doit jamais ressortir avec son message.
 
-    Seul ``Exception`` est capturé ici, volontairement : ``_notify`` ne lit
-    aucune entrée, donc laisser passer ``KeyboardInterrupt``/``SystemExit``
-    permet à l'opérateur d'interrompre la session entre deux propositions.
+    Contrat d'interruption, identique en appel solo et en session :
+
+    - ``KeyboardInterrupt`` est **réémis** : Ctrl-C est une intention de
+      l'opérateur, pas une panne d'outillage ;
+    - ``SystemExit`` est absorbé : un composant ne choisit ni le code de
+      sortie ni le message imprimé par l'interpréteur (invariant 8).
     """
     # Best-effort volontaire : le message est constant et l'exception d'un
     # notifieur injecté ne doit jamais ressortir ni interrompre la boucle.
     try:
         notify_fn(message)
-    except Exception:  # noqa: S110 # nosec B110
+    except KeyboardInterrupt:
+        raise
+    except (Exception, SystemExit):  # noqa: S110 - best-effort, message constant
         pass
 
 
@@ -704,7 +709,7 @@ class ReviewReport:
             if not self.interactive:
                 lines.append(NON_INTERACTIVE)
             for outcome in self.outcomes:
-                lines.append(_render(outcome.proposal))
+                lines.append(render_diff(outcome.proposal))
                 lines.append(_status(outcome))
             lines.append(
                 f"{len(self.outcomes)} proposition(s), {self.applied} appliquée(s), "
@@ -767,7 +772,7 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
             raise ReviewError
         # Une lecture impossible (EOF, terminal fermé) interrompt la boucle :
         # ce n'est pas une réponse invalide, donc pas de redemande en aveugle.
-        raw = _ask(ask_fn, _render(current) + "\n" + PROMPT)
+        raw = _ask(ask_fn, render_diff(current) + "\n" + PROMPT)
         try:
             choice = parse_choice(raw)
         except ReviewError:
@@ -882,6 +887,9 @@ def _review_all(  # noqa: PLR0913 - injections explicites de la session
             )
         return outcomes
     except (ReviewError, JournalError):
+        raise
+    except KeyboardInterrupt:
+        # Même contrat qu'en appel solo : Ctrl-C interrompt la session.
         raise
     except BaseException:  # noqa: S110 - producteur non itérable ou qui lève
         pass

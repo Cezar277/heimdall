@@ -1550,3 +1550,119 @@ def test_stderr_notify_silences_base_exceptions(
     outcome = review_proposal(proposal, ask=ask, apply=lambda _p: None, journal=journal, stream=TTY)
 
     assert outcome.applied is True
+
+
+# --- Durcissements LOW : render_diff public, contrat d'interruption (revue 11) -
+
+
+@pytest.mark.parametrize("error", [MemoryError(), KeyboardInterrupt()])
+def test_render_diff_is_hardened_directly(
+    proposal: Proposal, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    """`render_diff` est le chemin durci, pas seulement un wrapper privé."""
+
+    def broken_mask(_text: str) -> tuple[str, int]:
+        raise error
+
+    monkeypatch.setattr(review_module, "mask_text", broken_mask)
+    with pytest.raises(ReviewError) as excinfo:
+        render_diff(proposal)
+
+    assert excinfo.value.__cause__ is None
+
+
+def test_notify_keyboard_interrupt_interrupts_a_solo_call(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    """Ctrl-C d'un notifieur injecté interrompt l'appel solo."""
+
+    def interrupt(_message: str) -> None:
+        raise KeyboardInterrupt
+
+    ask, _prompts = _asker(["x", "y"])
+    with pytest.raises(KeyboardInterrupt):
+        review_proposal(
+            proposal,
+            ask=ask,
+            apply=lambda _p: None,
+            journal=journal,
+            notify=interrupt,
+            stream=TTY,
+        )
+
+
+def test_notify_keyboard_interrupt_interrupts_a_session(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    """Même contrat en session : Ctrl-C n'est pas converti en code 2."""
+
+    def interrupt(_message: str) -> None:
+        raise KeyboardInterrupt
+
+    ask, _prompts = _asker(["x", "y"])
+    with pytest.raises(KeyboardInterrupt):
+        review_proposals(
+            (proposal,),
+            interactive=True,
+            ask=ask,
+            apply=lambda _p: None,
+            journal=journal,
+            notify=interrupt,
+            stream=TTY,
+        )
+
+
+def test_notify_system_exit_is_absorbed_in_a_solo_call(
+    proposal: Proposal, journal: DecisionJournal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Un composant ne choisit ni le code de sortie ni le message imprimé."""
+
+    def hostile(_message: str) -> None:
+        raise SystemExit("SYNTHETIC_ONLY_VALUE /etc/passwd")
+
+    ask, _prompts = _asker(["x", "y"])
+    outcome = review_proposal(
+        proposal,
+        ask=ask,
+        apply=lambda _p: None,
+        journal=journal,
+        notify=hostile,
+        stream=TTY,
+    )
+
+    assert outcome.applied is True
+    assert capsys.readouterr().err == ""
+
+
+def test_notify_system_exit_is_absorbed_in_a_session(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    def hostile(_message: str) -> None:
+        raise SystemExit("SYNTHETIC_ONLY_VALUE")
+
+    ask, _prompts = _asker(["x", "y"])
+    report = review_proposals(
+        (proposal,),
+        interactive=True,
+        ask=ask,
+        apply=lambda _p: None,
+        journal=journal,
+        notify=hostile,
+        stream=TTY,
+    )
+
+    assert report.applied == 1
+
+
+def test_producer_system_exit_becomes_a_static_error(journal: DecisionJournal) -> None:
+    """`SystemExit` d'un producteur ne sort jamais de la session."""
+
+    def producer() -> Iterator[Proposal]:
+        raise SystemExit("SYNTHETIC_ONLY_VALUE")
+        yield  # pragma: no cover - jamais atteint : rend la fonction génératrice
+
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposals(producer(), ci=True, journal=journal)
+
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert excinfo.value.__context__ is None

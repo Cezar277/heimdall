@@ -25,7 +25,7 @@ changements dans la proposition affichée. Le moteur de remplacement T30
 (#83–#86) n'est pas encore livré sur cette branche : cette interface ne
 génère pas de remplacements et n'ouvre aucun fichier source.
 
-Preuve locale : `python -m pytest tests/test_cli_review.py` (159 tests pour #87–#90).
+Preuve locale : `python -m pytest tests/test_cli_review.py` (166 tests pour #87–#90).
 
 ## Boucle Y/N/E (#88)
 
@@ -165,6 +165,11 @@ documentée au `CliRunner(input=...)` de Typer) et couvre :
   refusé (`ReviewError`) ;
 - volume compté en octets UTF-8 (`é` = 2 octets) ;
 - `sys.stderr` levant `SystemExit("<valeur>")` : silence, boucle poursuivie ;
+- `render_diff` appelé directement avec `mask_text` en `MemoryError` :
+  `ReviewError` statique ;
+- `notify` levant `KeyboardInterrupt` : interrompu en solo **et** en session ;
+- `notify` levant `SystemExit("<valeur>")` : absorbé en solo **et** en
+  session, rien sur stderr ; `SystemExit` d'un producteur → `ReviewError` ;
 - `XDG_STATE_HOME` relatif ou contenant `..` : `JournalError` statique ;
 - masquage borné : total des valeurs > `MAX_SECRET_BYTES` refusé, 256 valeurs
   longues acceptées et masquées ;
@@ -215,3 +220,5 @@ mypy heimdall tests/test_cli_review.py
 | [LOW] `_REDACTION` trop étroit (type hors `[a-z_]`) | motif large `<REDACTED:[^<>]*>` + post-condition fail-closed si un marqueur reste |
 | [LOW] volume compté en caractères | `_proposal_bytes` compte les **octets UTF-8** (jusqu'à 4× plus qu'en caractères) |
 | [LOW] `_stderr_notify` laissait passer `BaseException` | `except BaseException` : un `sys.stderr` exotique ne peut ni imprimer ni choisir le code de sortie |
+| [LOW] `render_diff` publique non gardée (seul `_render` l'était) | `render_diff` **est** le chemin durci ; `_render` supprimé |
+| [LOW] interruption incohérente entre appel solo et session | contrat unifié : `KeyboardInterrupt` est réémis partout, `SystemExit` est absorbé partout (un composant ne choisit ni code de sortie ni message) |
