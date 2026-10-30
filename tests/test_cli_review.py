@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from support.fake_secrets import FAKE_GITHUB_TOKEN
 from support.git_repo import GitRepo
 from typer.testing import CliRunner
 
@@ -26,6 +27,7 @@ from heimdall.cli.review import (
     MAX_SECRETS,
     MAX_TEXT_CHARS,
     NON_INTERACTIVE,
+    UNAPPLIED_TRACE,
     AskFn,
     Choice,
     Decision,
@@ -1381,3 +1383,68 @@ def test_journal_rejects_foreign_field_types(tmp_path: Path, updates: dict[str, 
 
     with pytest.raises(JournalError):
         DecisionJournal(path).read()
+
+
+# --- Durcissements LOW : filet MCP, trace après apply, volume (revue 9) ------
+
+
+def test_heuristic_net_uses_a_constant_marker(proposal: Proposal) -> None:
+    """Un candidat heuristique hors `secrets` ne doit pas révéler type ni len."""
+    heuristique = FAKE_GITHUB_TOKEN
+    changed = replace(
+        proposal,
+        changes=(TextChange("app.py", f"token = {heuristique}\n", "token = safe\n"),),
+    )
+
+    diff = render_diff(changed)
+
+    assert heuristique not in diff
+    assert "len=" not in diff
+    assert "<REDACTED:" not in diff
+    assert MASKED_MARKER in diff
+
+
+def test_apply_success_then_journal_failure_is_reported(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    """Patch appliqué mais journal en panne : trace signalée, erreur statique."""
+    applied: list[Proposal] = []
+    notices: list[str] = []
+
+    class BrokenJournal:
+        def append(self, _decision: object) -> None:
+            raise OSError("disque plein SYNTHETIC_ONLY_VALUE")
+
+    ask, _prompts = _asker(["y"])
+    with pytest.raises(JournalError) as excinfo:
+        review_proposal(
+            proposal,
+            ask=ask,
+            apply=applied.append,
+            journal=cast(DecisionJournal, BrokenJournal()),
+            notify=notices.append,
+            stream=TTY,
+        )
+
+    assert applied == [proposal]
+    assert notices == [UNAPPLIED_TRACE]
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert excinfo.value.__context__ is None
+    assert journal.read() == []
+
+
+def test_session_volume_is_bounded(
+    proposal: Proposal, journal: DecisionJournal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(review_module, "MAX_SESSION_BYTES", 64)
+
+    with pytest.raises(ReviewError):
+        review_proposals((proposal,), ci=True, journal=journal)
+
+
+def test_session_volume_accepts_a_normal_proposal(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    report = review_proposals((proposal,), ci=True, journal=journal)
+
+    assert len(report.outcomes) == 1

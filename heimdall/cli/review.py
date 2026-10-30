@@ -41,6 +41,8 @@ MAX_PROMPTS: Final[int] = 16
 MAX_EDITS: Final[int] = 8
 #: Nombre maximal de propositions par session (disponibilité locale).
 MAX_PROPOSALS: Final[int] = 1024
+#: Volume maximal retenu par session, en octets (disponibilité locale).
+MAX_SESSION_BYTES: Final[int] = 64 * 1024 * 1024
 #: Longueur maximale acceptée pour une réponse clavier (refus du bruit).
 MAX_ANSWER_CHARS: Final[int] = 16
 #: Longueur maximale d'une date ISO 8601 acceptée par le journal.
@@ -51,6 +53,9 @@ MASKED_MARKER: Final[str] = "<MASKED>"
 PROMPT: Final[str] = "Valider (Y), ignorer (N) ou éditer (E) ? "
 INVALID_CHOICE: Final[str] = "Réponse invalide : répondre Y, N ou E (aucune action par défaut)."
 EDIT_CANCELLED: Final[str] = "Édition annulée : aucune modification, réponse attendue."
+UNAPPLIED_TRACE: Final[str] = (
+    "Modification appliquée mais non journalisée : trace d'audit incomplète."
+)
 NON_INTERACTIVE: Final[str] = (
     "Mode non interactif : rapport seul, aucune écriture, aucune action appliquée."
 )
@@ -151,6 +156,17 @@ def _visible(text: str) -> str:
     )
 
 
+def _net(text: str) -> str:
+    """Filet MCP ramené au marqueur constant.
+
+    ``mask_text`` émet ``<REDACTED:type:len=N>`` : le type et la longueur
+    exacte seraient un oracle pour un candidat heuristique non listé dans
+    ``secrets``. Ce rendu n'affiche donc qu'un marqueur de longueur fixe.
+    """
+    masked, _ = mask_text(text)
+    return _REDACTION.sub(MASKED_MARKER, masked)
+
+
 def _secret_pattern(secrets: tuple[str, ...]) -> re.Pattern[str] | None:
     """Motif unique, compilé une seule fois par rendu (jamais par ligne).
 
@@ -181,9 +197,9 @@ def _masked(text: str, pattern: re.Pattern[str] | None) -> str:
     chunks: list[str] = []
     start = 0
     for match in _ENV_REFERENCE.finditer(text):
-        chunks.extend((mask_text(text[start : match.start()])[0], match[0]))
+        chunks.extend((_net(text[start : match.start()]), match[0]))
         start = match.end()
-    chunks.append(mask_text(text[start:])[0])
+    chunks.append(_net(text[start:]))
     return "".join(chunks)
 
 
@@ -355,6 +371,8 @@ _CHOICE_VALUES: Final[frozenset[str]] = frozenset(choice.value for choice in Cho
 
 #: Empreinte Finding v1 : 64 caractères hexadécimaux minuscules.
 _HASH: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
+#: Marqueur du filet MCP, ramené à une longueur constante dans ce rendu.
+_REDACTION: Final[re.Pattern[str]] = re.compile(r"<REDACTED:[a-z][a-z0-9_]*:len=[0-9]+>")
 
 
 def _valid_target(entry: dict[str, Any]) -> bool:
@@ -535,6 +553,28 @@ def _resolve_journal(journal: DecisionJournal | None) -> DecisionJournal:
     except JournalError:
         raise
     except BaseException:  # refus par défaut, jamais de traceback de chemin
+        raise JournalError from None
+
+
+def _journal_applied(
+    journal_fn: DecisionJournal,
+    choice: Choice,
+    finding: Finding,
+    notify_fn: NotifyFn,
+) -> None:
+    """Trace une application **réussie** ; une panne est signalée puis propagée.
+
+    Le patch a déjà eu lieu : on ne peut pas le défaire. Le message statique
+    prévient l'opérateur que la trace d'audit est incomplète, puis
+    ``JournalError`` est levée pour que l'appelant sorte en code 2.
+    """
+    failed = False
+    try:
+        _journal(journal_fn, Decision.now(choice, finding, applied=True))
+    except BaseException:
+        failed = True
+    if failed:
+        _notify(notify_fn, UNAPPLIED_TRACE)
         raise JournalError from None
 
 
@@ -734,7 +774,7 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
             if failed:
                 _journal_failure(journal_fn, choice, current.finding)
                 raise ReviewError from None
-            _journal(journal_fn, Decision.now(choice, current.finding, applied=True))
+            _journal_applied(journal_fn, choice, current.finding, notify_fn)
             return ReviewOutcome(choice, True, edits, current)
         if edit is None:
             raise ReviewError
@@ -767,18 +807,56 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
         current = edited
 
 
-def _bounded_proposals(proposals: Iterable[Proposal]) -> list[Proposal]:
-    """Consomme paresseusement, borne à ``MAX_PROPOSALS``, erreurs statiques."""
-    items: list[Proposal] = []
+def _proposal_bytes(proposal: Proposal) -> int:
+    """Volume retenu par une proposition (snapshots et valeurs connues)."""
+    return sum(len(change.before) + len(change.after) for change in proposal.changes) + sum(
+        len(secret) for secret in proposal.secrets
+    )
+
+
+def _review_all(  # noqa: PLR0913 - injections explicites de la session
+    proposals: Iterable[Proposal],
+    *,
+    mode: bool,
+    ask: AskFn | None,
+    apply: ApplyFn | None,
+    edit: EditFn | None,
+    journal: DecisionJournal | None,
+    notify: NotifyFn | None,
+    stream: object | None,
+) -> list[ReviewOutcome]:
+    """Traite en **flux**, borné en nombre (`MAX_PROPOSALS`) et en volume.
+
+    Aucune liste de propositions n'est matérialisée avant traitement : seule
+    la liste des résultats est retenue (pour le rapport). Le volume retenu
+    est plafonné par :data:`MAX_SESSION_BYTES`, sinon une erreur d'outillage
+    statique est rendue au lieu d'un épuisement mémoire.
+    """
+    outcomes: list[ReviewOutcome] = []
+    volume = 0
     try:
         for item in proposals:
-            if len(items) >= MAX_PROPOSALS:
+            if len(outcomes) >= MAX_PROPOSALS:
                 raise ReviewError
             if not isinstance(item, Proposal):
                 raise ReviewError
-            items.append(item)
-        return items
-    except ReviewError:
+            volume += _proposal_bytes(item)
+            if volume > MAX_SESSION_BYTES:
+                raise ReviewError
+            outcomes.append(
+                review_proposal(
+                    item,
+                    ask=ask,
+                    apply=apply,
+                    edit=edit,
+                    journal=journal,
+                    interactive=mode,
+                    notify=notify,
+                    stream=stream,
+                )
+            )
+        return outcomes
+    except (ReviewError, JournalError):
         raise
     except BaseException:  # noqa: S110 - producteur non itérable ou qui lève
         pass
@@ -799,30 +877,26 @@ def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
 ) -> ReviewReport:
     """Session complète ; ``ci`` et l'absence de TTY gagnent toujours.
 
-    L'itérable est consommé **paresseusement** et borné par
-    :data:`MAX_PROPOSALS` : un producteur qui générerait des dizaines de
-    milliers de propositions ne gonfle ni la mémoire ni le temps de réponse.
-    Au-delà, c'est une erreur d'outillage (code 2), jamais une troncature
-    silencieuse.
+    L'itérable est consommé **en flux** et borné par :data:`MAX_PROPOSALS`
+    et :data:`MAX_SESSION_BYTES` : un producteur qui générerait des dizaines
+    de milliers de propositions, ou des propositions démesurées, ne gonfle
+    ni la mémoire ni le temps de réponse. Au-delà, c'est une erreur
+    d'outillage (code 2), jamais une troncature silencieuse.
     """
     # Valider les options AVANT de consommer le producteur : un producteur
     # coûteux ou infini ne doit pas être parcouru pour rejeter `ci=1`.
     if not isinstance(ci, bool) or (interactive is not None and not isinstance(interactive, bool)):
         raise ReviewError
-    items = _bounded_proposals(proposals)
     # `interactive=True` explicite ne contourne ni `--ci` ni l'absence de TTY.
     mode = False if ci or interactive is False else is_interactive(stream=stream)
-    outcomes = tuple(
-        review_proposal(
-            item,
-            ask=ask,
-            apply=apply,
-            edit=edit,
-            journal=journal,
-            interactive=mode,
-            notify=notify,
-            stream=stream,
-        )
-        for item in items
+    outcomes = _review_all(
+        proposals,
+        mode=mode,
+        ask=ask,
+        apply=apply,
+        edit=edit,
+        journal=journal,
+        notify=notify,
+        stream=stream,
     )
-    return ReviewReport(outcomes, mode)
+    return ReviewReport(tuple(outcomes), mode)

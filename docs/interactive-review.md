@@ -11,8 +11,10 @@ Les contenus et valeurs sont exclus de `repr`.
 `render_diff` utilise `difflib.unified_diff`. Les valeurs connues sont entièrement
 masquées avant le calcul du diff, avec le marqueur **constant** `<MASKED>`
 (aucun oracle de longueur : `len(valeur)` ne fuit ni à l'écran ni dans un
-journal de session) ; le masque conservateur MCP ajoute un filet pour les
-autres candidats. Les références `os.getenv`, `os.environ` et
+journal de session). Le masque conservateur MCP ajoute un filet pour les
+autres candidats, lui aussi ramené au marqueur constant : son
+`<REDACTED:type:len=N>` est réécrit par `_net`, donc ni le type ni la
+longueur exacte d'un candidat heuristique ne sont affichés. Les références `os.getenv`, `os.environ` et
 `process.env` restent lisibles. Le diff comprend les fichiers de code,
 `.env.example` et `.gitignore` fournis par le producteur. Le contenu des `.env`
 et de `.git` est refusé. Les contrôles terminal et caractères directionnels
@@ -23,7 +25,7 @@ changements dans la proposition affichée. Le moteur de remplacement T30
 (#83–#86) n'est pas encore livré sur cette branche : cette interface ne
 génère pas de remplacements et n'ouvre aucun fichier source.
 
-Preuve locale : `python -m pytest tests/test_cli_review.py` (145 tests pour #87–#90).
+Preuve locale : `python -m pytest tests/test_cli_review.py` (149 tests pour #87–#90).
 
 ## Boucle Y/N/E (#88)
 
@@ -153,6 +155,10 @@ documentée au `CliRunner(input=...)` de Typer) et couvre :
   absents en erreur statique ;
 - journal relu avec `file`/`line`/`snippet_hash` de types arbitraires :
   `JournalError` statique ;
+- candidat heuristique hors `secrets` : `<MASKED>` sans `len=` ni type ;
+- `apply` réussi puis journal en panne : `JournalError`, avertissement
+  `UNAPPLIED_TRACE`, journal vide ;
+- volume de session au-delà de `MAX_SESSION_BYTES` : `ReviewError` ;
 - `XDG_STATE_HOME` relatif ou contenant `..` : `JournalError` statique ;
 - masquage borné : total des valeurs > `MAX_SECRET_BYTES` refusé, 256 valeurs
   longues acceptées et masquées ;
@@ -196,3 +202,6 @@ mypy heimdall tests/test_cli_review.py
 | [LOW] marqueur `<MASKED_N>` révélait `len(valeur)` | marqueur **constant** `<MASKED>`, documenté |
 | [LOW] `input()` lisait une réponse non bornée | `sys.stdin.readline(MAX_ANSWER_CHARS + 2)` : un collage volumineux n'est pas matérialisé |
 | [LOW] relecture du journal sans contrôle de types | `_valid_target` : `file` conforme au contrat Finding, `line` entier ≥ 1, `snippet_hash` hex 64, sinon `JournalError` |
+| [LOW] filet MCP `mask_text` révélait `type` + `len` | `_net` ramène `<REDACTED:type:len=N>` au marqueur constant `<MASKED>` |
+| [LOW] patch appliqué sans trace si le journal échoue après `apply` | `_journal_applied` : avertissement statique `UNAPPLIED_TRACE` puis `JournalError` ; atomicité patch+journal non garantie, documentée |
+| [LOW] session matérialisée (1024 × 32 × 100 Ko) | traitement **en flux** (`_review_all`) + borne de volume `MAX_SESSION_BYTES` (64 Mio), `ReviewError` au-delà |
