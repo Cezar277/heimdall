@@ -404,7 +404,9 @@ class DecisionJournal:
         try:
             with journal_locked(self.path, create=False) as descriptor:
                 return [] if descriptor is None else _decision_entries(descriptor)
-        except (OSError, ValueError, RuntimeError, RecursionError):
+        except JournalError:
+            raise
+        except BaseException:  # `MemoryError`, `KeyboardInterrupt` compris
             raise JournalError from None
 
     def append(self, decision: Decision) -> None:
@@ -432,7 +434,9 @@ class DecisionJournal:
                         raise JournalError
                     payload = payload[written:]
                 os.fsync(descriptor)
-        except (OSError, ValueError, RuntimeError, RecursionError):
+        except JournalError:
+            raise
+        except BaseException:  # `MemoryError`, `KeyboardInterrupt` compris
             raise JournalError from None
 
 
@@ -493,6 +497,19 @@ def _resolve_journal(journal: DecisionJournal | None) -> DecisionJournal:
         raise JournalError from None
 
 
+def _journal_failure(journal_fn: DecisionJournal, choice: Choice, finding: Finding) -> None:
+    """Trace une tentative non aboutie, sans jamais chaîner l'erreur d'origine.
+
+    Appelée depuis un `except` : une panne du journal ne doit ni masquer
+    l'erreur principale, ni conserver une exception backend (valeur, chemin)
+    dans la chaîne `__context__` de ce qui s'échappe ensuite.
+    """
+    try:
+        _journal(journal_fn, Decision.now(choice, finding, applied=False))
+    except BaseException:  # noqa: S110 - panne secondaire, erreur principale gardée
+        pass
+
+
 def _journal(journal_fn: DecisionJournal, decision: Decision) -> None:
     """Défense en profondeur sur le point d'injection ``journal``.
 
@@ -534,15 +551,17 @@ def is_interactive(*, ci: bool = False, stream: object | None = None) -> bool:
     if ci:
         return False
     candidate = sys.stdin if stream is None else stream
-    isatty = getattr(candidate, "isatty", None)
-    if not callable(isatty):
-        return False
     try:
+        # `getattr` avec défaut ne supprime que `AttributeError` : un flux
+        # dont `__getattr__` lève doit aussi retomber sur le refus par défaut.
+        isatty = getattr(candidate, "isatty", None)
+        if not callable(isatty):
+            return False
         return bool(isatty())
     except BaseException:  # refus par défaut, jamais de traceback
-        # Refus par défaut : un flux exotique (RuntimeError, fermeture,
-        # KeyboardInterrupt, SystemExit) ne doit jamais produire de traceback
-        # ni passer pour un terminal. Aucune valeur n'est en jeu ici.
+        # Un flux exotique (RuntimeError, fermeture, KeyboardInterrupt,
+        # SystemExit) ne doit jamais produire de traceback ni passer pour un
+        # terminal. Aucune valeur n'est en jeu ici.
         return False
 
 
@@ -610,7 +629,7 @@ def _status(outcome: ReviewOutcome) -> str:
     return "Statut : validée, application non confirmée."
 
 
-def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
+def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections explicites
     proposal: Proposal,
     *,
     ask: AskFn | None = None,
@@ -663,22 +682,29 @@ def review_proposal(  # noqa: PLR0912, PLR0913 - boucle et injections explicites
         if choice is Choice.VALIDATE:
             if apply is None:
                 raise ReviewError
+            failed = False
             try:
                 apply(current)
             except BaseException:
-                # Trace honnête : la tentative n'a pas abouti. Le message du
-                # backend (valeur, chemin, traceback) ne sort jamais, même
-                # via `SystemExit("<valeur>")` ou `KeyboardInterrupt`.
-                _journal(journal_fn, Decision.now(choice, current.finding, applied=False))
+                # Le drapeau évite de lever DANS le `except` : l'erreur
+                # statique n'hérite alors d'aucune `__context__` backend
+                # (valeur, chemin), même si le journal échoue aussi.
+                failed = True
+            if failed:
+                _journal_failure(journal_fn, choice, current.finding)
                 raise ReviewError from None
             _journal(journal_fn, Decision.now(choice, current.finding, applied=True))
             return ReviewOutcome(choice, True, edits, current)
         if edit is None:
             raise ReviewError
+        failed = False
+        edited: Proposal | None = None
         try:
             edited = edit(current)
         except BaseException:
-            _journal(journal_fn, Decision.now(choice, current.finding, applied=False))
+            failed = True
+        if failed:
+            _journal_failure(journal_fn, choice, current.finding)
             raise ReviewError from None
         _journal(journal_fn, Decision.now(choice, current.finding, applied=False))
         if edited is None:
@@ -702,11 +728,12 @@ def _bounded_proposals(proposals: Iterable[Proposal]) -> list[Proposal]:
             if not isinstance(item, Proposal):
                 raise ReviewError
             items.append(item)
+        return items
     except ReviewError:
         raise
-    except BaseException:  # producteur non itérable ou qui lève : statique
-        raise ReviewError from None
-    return items
+    except BaseException:  # noqa: S110 - producteur non itérable ou qui lève
+        pass
+    raise ReviewError from None
 
 
 def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
@@ -729,9 +756,11 @@ def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
     Au-delà, c'est une erreur d'outillage (code 2), jamais une troncature
     silencieuse.
     """
-    items = _bounded_proposals(proposals)
+    # Valider les options AVANT de consommer le producteur : un producteur
+    # coûteux ou infini ne doit pas être parcouru pour rejeter `ci=1`.
     if not isinstance(ci, bool) or (interactive is not None and not isinstance(interactive, bool)):
         raise ReviewError
+    items = _bounded_proposals(proposals)
     # `interactive=True` explicite ne contourne ni `--ci` ni l'absence de TTY.
     mode = False if ci or interactive is False else is_interactive(stream=stream)
     outcomes = tuple(

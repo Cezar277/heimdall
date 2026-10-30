@@ -1079,3 +1079,121 @@ def test_review_proposal_preserves_a_static_journal_error(
 
     with pytest.raises(JournalError):
         review_proposal(proposal, ask=ask, stream=TTY)
+
+
+# --- Durcissements LOW : getattr, double faute, ordre, journal (revue 6) -----
+
+
+def test_is_interactive_refuses_a_raising_getattr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Hostile:
+        def __getattr__(self, _name: str) -> object:
+            raise SystemExit("échec SYNTHETIC_ONLY_VALUE dans /etc/passwd")
+
+    assert is_interactive(stream=Hostile()) is False
+    assert capsys.readouterr().err == ""
+
+
+def test_double_failure_has_no_exception_chain(
+    proposal: Proposal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Backend ET journal qui lèvent : erreur statique, aucune `__context__`."""
+
+    class BrokenJournal:
+        def append(self, _decision: object) -> None:
+            raise OSError("journal SYNTHETIC_ONLY_VALUE")
+
+    def boom(_proposal: Proposal) -> None:
+        raise RuntimeError("backend SYNTHETIC_ONLY_VALUE /etc/passwd")
+
+    ask, _prompts = _asker(["y"])
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(
+            proposal,
+            ask=ask,
+            apply=boom,
+            journal=cast(DecisionJournal, BrokenJournal()),
+            stream=TTY,
+        )
+
+    assert "SYNTHETIC_ONLY_VALUE" not in str(excinfo.value)
+    assert excinfo.value.__context__ is None
+    assert excinfo.value.__cause__ is None
+    assert capsys.readouterr().err == ""
+
+
+def test_double_failure_on_edit_has_no_exception_chain(
+    proposal: Proposal,
+) -> None:
+    class BrokenJournal:
+        def append(self, _decision: object) -> None:
+            raise OSError("journal SYNTHETIC_ONLY_VALUE")
+
+    def boom(_proposal: Proposal) -> Proposal | None:
+        raise RuntimeError("éditeur SYNTHETIC_ONLY_VALUE")
+
+    ask, _prompts = _asker(["e"])
+    with pytest.raises(ReviewError) as excinfo:
+        review_proposal(
+            proposal,
+            ask=ask,
+            edit=boom,
+            journal=cast(DecisionJournal, BrokenJournal()),
+            stream=TTY,
+        )
+
+    assert excinfo.value.__context__ is None
+    assert excinfo.value.__cause__ is None
+
+
+def test_invalid_options_are_rejected_before_consuming_the_producer() -> None:
+    consumed = 0
+
+    def flood() -> Iterator[Proposal]:
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield cast(Proposal, None)
+
+    with pytest.raises(ReviewError):
+        review_proposals(flood(), ci=cast(bool, "yes"))
+    assert consumed == 0
+
+    with pytest.raises(ReviewError):
+        review_proposals(flood(), interactive=cast(bool, "yes"))
+    assert consumed == 0
+
+
+@pytest.mark.parametrize("error", [MemoryError(), KeyboardInterrupt()])
+def test_journal_read_normalizes_base_exceptions(
+    proposal: Proposal,
+    journal: DecisionJournal,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    journal.append(Decision.now(Choice.IGNORE, proposal.finding))
+
+    def broken_fstat(_descriptor: int) -> object:
+        raise error
+
+    monkeypatch.setattr("os.fstat", broken_fstat)
+    with pytest.raises(JournalError) as excinfo:
+        journal.read()
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize("error", [MemoryError(), KeyboardInterrupt()])
+def test_journal_append_normalizes_base_exceptions(
+    proposal: Proposal,
+    journal: DecisionJournal,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    def broken_fstat(_descriptor: int) -> object:
+        raise error
+
+    monkeypatch.setattr("os.fstat", broken_fstat)
+    with pytest.raises(JournalError) as excinfo:
+        journal.append(Decision.now(Choice.IGNORE, proposal.finding))
+    assert excinfo.value.__cause__ is None
