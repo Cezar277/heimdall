@@ -47,6 +47,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import unicodedata
 
 import argon2.low_level
 from cryptography.exceptions import InvalidTag
@@ -223,11 +224,12 @@ def decode_kek_salt(salt: str | bytes) -> bytes:
 def _normalize_master_key(master_key: str | bytes) -> bytes:
     """Normalise la clé maîtresse en octets sans jamais l'écho dans une erreur.
 
-    Une chaîne est une phrase de passe encodée en UTF-8 ; des octets sont
-    utilisés bruts (utile aux tests et aux appelants qui détiennent déjà une clé
-    aléatoire). La longueur minimale de 128 bits est une défense en profondeur
-    contre une phrase de passe triviale : Argon2id ralentit l'attaque hors ligne
-    mais ne compense pas une clé maîtresse sans entropie.
+    Une chaîne est une phrase de passe UTF-8 **canonisée NFC** avant encodage ;
+    des octets sont utilisés bruts (utile aux tests et aux appelants qui
+    détiennent déjà une clé aléatoire). La longueur minimale de 128 bits est une
+    défense en profondeur contre une phrase de passe triviale : Argon2id
+    ralentit l'attaque hors ligne mais ne compense pas une clé maîtresse sans
+    entropie.
     """
     if isinstance(master_key, str):
         if not master_key or not master_key.strip():
@@ -235,7 +237,9 @@ def _normalize_master_key(master_key: str | bytes) -> bytes:
         if master_key != master_key.strip():
             raise ValueError("Clé maîtresse invalide : espaces de début ou de fin interdits.")
         try:
-            raw = master_key.encode("utf-8")
+            # Forme canonique NFC (ticket #262) : « é » précomposé et « e » +
+            # accent combinant doivent dériver la même KEK (ADR-005).
+            raw = unicodedata.normalize("NFC", master_key).encode("utf-8")
         except UnicodeEncodeError:
             raise ValueError("Clé maîtresse invalide : encodage UTF-8 impossible.") from None
     elif isinstance(master_key, (bytes, bytearray)):

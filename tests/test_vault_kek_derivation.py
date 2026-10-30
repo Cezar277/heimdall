@@ -21,6 +21,7 @@ synthétiques. Aucun secret réel n'est présent dans ce fichier.
 
 import base64
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -490,6 +491,47 @@ class T262ReviewHygieneTests(unittest.TestCase):
         kek = generate_encryption_key()
         legacy = VaultSettings(kek=kek, api_key_pepper=_PEPPER)
         self.assertNotIn(kek, repr(legacy))
+
+
+class T262UnicodeAndFailClosedTests(unittest.TestCase):
+    """Normalisation Unicode de la clé maîtresse et échec KDF fail-closed (revue LOW)."""
+
+    def test_nfc_and_nfd_master_keys_derive_the_same_kek(self) -> None:
+        """Deux formes canoniquement équivalentes dérivent la même KEK."""
+        phrase = "café résumé hérisson naïf éclair"  # ≥ 16 octets une fois NFC
+        nfc = unicodedata.normalize("NFC", phrase)
+        nfd = unicodedata.normalize("NFD", phrase)
+        # Garde : les deux formes ont des octets réellement différents, sinon
+        # le test n'éprouverait rien (sous-test d'hypothèse).
+        self.assertNotEqual(nfc.encode("utf-8"), nfd.encode("utf-8"))
+        first = derive_kek_from_master_key(nfc, _SALT_A)
+        second = derive_kek_from_master_key(nfd, _SALT_A)
+        self.assertEqual(first, second)
+
+    def test_settings_master_key_is_stored_nfc_canonical(self) -> None:
+        """`VaultSettings` canonise la clé maîtresse NFC dès la validation."""
+        nfd = unicodedata.normalize("NFD", _MASTER_KEY)
+        settings = VaultSettings(master_key=nfd, kek_salt=_SALT_A, api_key_pepper=_PEPPER)
+        self.assertEqual(settings.master_key, unicodedata.normalize("NFC", _MASTER_KEY))
+
+    def test_kdf_failure_is_fail_closed_at_startup(self) -> None:
+        """Une panne de la KDF lève au démarrage : jamais de repli silencieux.
+
+        Ni KEK éphémère (backend mémoire), ni bascule vers le mode historique :
+        l'exception traverse ``create_app`` et le serveur ne démarre pas.
+        """
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=_PEPPER,
+        )
+        with patch(
+            "heimdall.vault.crypto.argon2.low_level.hash_secret_raw",
+            side_effect=MemoryError("KDF indisponible (test)"),
+        ):
+            with self.assertRaises(MemoryError) as ctx:
+                create_app(settings)
+        self.assertIn("KDF", str(ctx.exception))
 
 
 if __name__ == "__main__":

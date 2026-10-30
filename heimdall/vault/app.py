@@ -755,7 +755,9 @@ class VaultSettings(BaseSettings):
 
         Le seuil de 16 octets est une défense en profondeur : Argon2id ralentit
         une attaque hors ligne mais ne rend pas une phrase de passe triviale
-        résistante. La valeur n'est jamais écho dans un message d'erreur.
+        résistante. La valeur n'est jamais écho dans un message d'erreur. La
+        valeur retournée est canonisée NFC (ticket #262) : deux formes Unicode
+        équivalentes (précomposée vs combinée) produisent la même KEK.
         """
         if value is None:
             return None
@@ -764,7 +766,11 @@ class VaultSettings(BaseSettings):
         if value != value.strip():
             raise ValueError("La clé maîtresse ne doit pas comporter d'espaces de début ou de fin.")
         try:
-            raw = value.encode("utf-8")
+            # Forme canonique NFC (ticket #262) : cohérente avec la canonisation
+            # NFC des valeurs de secrets (décision #62) et avec la normalisation
+            # appliquée par `_normalize_master_key` (ADR-005).
+            normalized = unicodedata.normalize("NFC", value)
+            raw = normalized.encode("utf-8")
         except UnicodeEncodeError:
             raise ValueError("La clé maîtresse doit être encodable en UTF-8.") from None
         if len(raw) < MIN_MASTER_KEY_BYTES:
@@ -772,7 +778,7 @@ class VaultSettings(BaseSettings):
                 f"La clé maîtresse doit comporter au moins {MIN_MASTER_KEY_BYTES} "
                 "octets (128 bits)."
             )
-        return value
+        return normalized
 
     @field_validator("kek_salt")
     @classmethod
@@ -1524,7 +1530,11 @@ def create_app(
     - `settings` : Configuration VaultSettings (défaut : get_settings()).
     - `secret_store` : Magasin de secrets explicite (défaut : résolu par
       `settings.storage_backend` — SQLite chiffré en production, mémoire chiffré
-      hors production).
+      hors production). **Réservé aux tests** : avec un store explicite,
+      `_resolve_vault_cipher` n'est pas appelée, donc le contrôle « KEK dérivée
+      == pepper » (brut + base64, invariant 5) n'est exécuté que sur le chemin
+      par défaut. Ne jamais appeler `create_app` avec un store explicite en
+      production.
     - `api_key_hashes` : Dictionnaire {hash_hmac_hex: project_id} de clés pré-hachées.
       Chaque clé DOIT être une chaîne hexadécimale de 64 caractères (^[0-9a-f]{64}$).
       Les clés brutes sont expressément refusées pour éviter toute confusion de format.
