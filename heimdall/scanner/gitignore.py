@@ -160,12 +160,15 @@ def _terminate(process: subprocess.Popen[bytes]) -> None:
         return
     try:
         process.wait(timeout=1.0)
-    except subprocess.TimeoutExpired:
-        # Processus non interruptible (D-state) : ne jamais bloquer le scan.
+    except (subprocess.TimeoutExpired, OSError):
+        # Processus non interruptible (D-state) ou déjà récolté : ne jamais
+        # bloquer le scan.
         pass
 
 
-def _run_git(root: Path, arguments: tuple[str, ...], deadline: float | None) -> bytes | None:
+def _run_git(  # noqa: PLR0911 - refus explicite à chaque panne, jamais un skip.
+    root: Path, arguments: tuple[str, ...], deadline: float | None
+) -> bytes | None:
     """Exécute une commande Git figée et rend sa sortie, ou ``None``.
 
     ``None`` couvre tous les cas où les exclusions ne sont **pas** connues
@@ -189,7 +192,9 @@ def _run_git(root: Path, arguments: tuple[str, ...], deadline: float | None) -> 
     except (OSError, ValueError):
         return None
     stdout = process.stdout
-    assert stdout is not None  # stdout=PIPE
+    if stdout is None:  # pragma: no cover - stdout=PIPE ne rend jamais None.
+        _terminate(process)
+        return None
     holder: list[bytes | None] = []
 
     def read_output() -> None:
@@ -215,6 +220,14 @@ def _run_git(root: Path, arguments: tuple[str, ...], deadline: float | None) -> 
         # franchie est une erreur fail-closed.
         timed_out = True
         _terminate(process)
+    except (OSError, subprocess.SubprocessError):
+        # Panne d'attente (processus déjà récolté, état invalide) : aucune
+        # liste fiable, donc parcours complet. L'échéance reste fail-closed.
+        _terminate(process)
+        reader.join(timeout=1.0)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ScanError(_ERROR) from None
+        return None
     reader.join(timeout=1.0)
     if timed_out:
         if deadline is not None and time.monotonic() >= deadline:
@@ -320,7 +333,11 @@ def collect_git_exclusions(
     exclusions par défense en profondeur, et un répertoire ignoré qui
     contient un fichier suivi n'est jamais élagué.
     """
-    path = Path(root)
+    try:
+        path = Path(root)
+    except (TypeError, ValueError, OSError):
+        # Entrée hors contrat : aucune exclusion fiable, parcours complet.
+        return None
     # Le scanner fournit déjà une racine absolue et résolue. Un appelant
     # public qui passerait un chemin relatif obtient le parcours complet :
     # ``GIT_CEILING_DIRECTORIES`` et la forme des chemins rendus par Git

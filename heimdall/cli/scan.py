@@ -12,9 +12,10 @@ verdict propre.
 Deux périmètres, un seul verdict :
 
 - ``working-tree`` (par défaut) : l'arbre de travail, en **mode strict** —
-  seules les exclusions *techniques* de #59 restent (binaires, répertoires
-  générés) ; ``vendor/``, ``third_party/``, les lockfiles et les fichiers de
-  contrôle sont parcourus, parce qu'un secret y est un secret ;
+  la base VCS et les entrées **non suivies** qu'un ``.gitignore`` du dépôt
+  déclare ignorées sont écartées ; ``vendor/``, ``third_party/``, les
+  lockfiles et les fichiers de contrôle sont parcourus dès qu'ils sont
+  suivis ou non ignorés, parce qu'un secret y est un secret ;
 - ``staged`` (``--staged``) : les blobs **ajoutés ou modifiés** dans l'index
   git, lus blob par blob, **sans aucune exclusion de chemin**. C'est ce que
   le commit va contenir, donc ce que le hook et la CI doivent juger.
@@ -124,7 +125,7 @@ logger = logging.getLogger("heimdall.cli.scan")
 
 #: Libellés du périmètre, affichés à l'humain.
 _SCOPE_LABELS: Final[dict[Scope, str]] = {
-    SCOPE_TREE: "arbre de travail (mode strict : exclusions techniques seules)",
+    SCOPE_TREE: "arbre de travail (base VCS et entrées .gitignore non suivies écartées)",
     SCOPE_STAGED: "index git (blobs ajoutés ou modifiés, aucune exclusion de chemin)",
 }
 

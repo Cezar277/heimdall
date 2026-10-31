@@ -247,6 +247,43 @@ def test_respect_gitignore_false_restores_the_full_scan(repo: GitRepo) -> None:
     assert scanner.git_ignored == 0
 
 
+@pytest.mark.parametrize("invalid", ["yes", "false", 1, 0, None, object()])
+def test_an_invalid_respect_gitignore_policy_is_refused(
+    tmp_path: Path, invalid: object
+) -> None:
+    """Une valeur non booléenne ne peut ni activer ni désactiver l'exclusion."""
+    with pytest.raises(ValueError, match="politique d'exclusions Git invalide"):
+        Scanner(tmp_path, respect_gitignore=invalid)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "vendor/evil.py",
+        "node_modules/evil.js",
+        "package-lock.json",
+        "evil.png",
+        "dist/evil.txt",
+    ),
+)
+def test_a_technical_looking_name_is_scanned_when_not_ignored(
+    repo: GitRepo, relative: str
+) -> None:
+    """Correctif #165 : aucun nom ne suffit à exclure un secret.
+
+    Ces chemins sont précisément ceux qu'une liste nominale laisserait passer.
+    Non suivis **et non ignorés**, ils peuvent partir dans un commit : ils
+    doivent donc être lus, quel que soit leur nom.
+    """
+    repo.write(".gitignore", "*.tmp\n")
+    repo.stage(".gitignore")
+    repo.commit_all("base")
+    _secret_file(repo, relative)
+    scanner = Scanner(repo.root)
+    assert [finding.file for finding in scanner.scan()] == [relative]
+    assert scanner.git_ignored == 0
+
+
 def test_single_file_mode_ignores_gitignore(repo: GitRepo) -> None:
     """Un fichier passé explicitement est toujours scanné, même ignoré."""
     repo.write(".gitignore", "config.py\n")
@@ -323,6 +360,19 @@ def test_git_ignored_is_reset_between_scans(repo: GitRepo) -> None:
 def test_a_relative_root_disables_exclusions(tmp_path: Path) -> None:
     """Un chemin relatif n'est pas une base fiable pour Git : parcours complet."""
     assert collect_git_exclusions(Path("relative")) is None
+
+
+def test_an_invalid_root_type_disables_exclusions() -> None:
+    """Une entrée hors contrat rend ``None``, jamais une exception brute."""
+    assert collect_git_exclusions(None) is None  # type: ignore[arg-type]
+
+
+def test_a_broken_git_binary_falls_back_to_a_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un binaire Git absent à l'exécution n'invente aucune exclusion."""
+    monkeypatch.setattr(gitignore, "_GIT", str(tmp_path / "missing-git"))
+    assert collect_git_exclusions(tmp_path) is None
 
 
 def test_a_non_repository_root_disables_exclusions(tmp_path: Path) -> None:
