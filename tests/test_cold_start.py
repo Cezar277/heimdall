@@ -103,7 +103,7 @@ def test_ci_does_not_call_model_or_write_journal(repo: GitRepo, tmp_path: Path) 
         pytest.fail("modèle interdit en CI")
 
     report = collect_cold_start(
-        repo.root, ci=True, chat=forbidden, journal=RejectionJournal(journal_file)
+        repo.root, ci=True, llm=True, chat=forbidden, journal=RejectionJournal(journal_file)
     )
     assert len(report.scan.findings) == 1
     assert report.opinions == ()
@@ -111,6 +111,56 @@ def test_ci_does_not_call_model_or_write_journal(repo: GitRepo, tmp_path: Path) 
     result = CliRunner().invoke(app, ["cold-start", str(repo.root), "--ci", "--json"])
     assert result.exit_code == 1
     assert json.loads(result.stdout)["opinions"] == []
+
+
+def test_direct_qualify_target_ci_never_calls_model_or_journal(
+    repo: GitRepo,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = FileTarget("app.py", f'key = "{SYNTHETIC}"\n')
+    findings = Scanner(SignatureEngine()).scan(target)
+    assert findings
+    journal_file = tmp_path / "private" / "rejections.jsonl"
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("model and journal forbidden for direct CI qualification")
+
+    monkeypatch.setattr(RejectionJournal, "append", forbidden)
+    opinions = qualify_target(
+        target,
+        findings,
+        ci=True,
+        chat=forbidden,
+        journal=RejectionJournal(journal_file),
+    )
+    assert [opinion.finding for opinion in opinions] == findings
+    assert all(opinion.qualification.verdict is None for opinion in opinions)
+    assert all(opinion.qualification.reason == "unavailable" for opinion in opinions)
+    assert not journal_file.parent.exists()
+
+
+@pytest.mark.parametrize("command", ["cold-start", "deep-scan"])
+def test_help_documents_default_rejection_journal(command: str) -> None:
+    result = CliRunner().invoke(app, [command, "--help"])
+    assert result.exit_code == 0
+    output = " ".join(result.output.split())
+    assert "faux_positif" in output
+    assert "chemin opérateur par défaut" in output
+    assert "--ci ou --no-llm" in output
+
+
+@pytest.mark.parametrize("line", [-1, 0, 2])
+def test_candidate_context_refuses_forged_out_of_range_line(
+    repo: GitRepo,
+    line: int,
+) -> None:
+    target = FileTarget("app.py", f'key = "{SYNTHETIC}"\n')
+    finding = Scanner(SignatureEngine()).scan(target)[0]
+    # Finding validates normal construction; emulate an untyped forged caller.
+    object.__setattr__(finding, "line", line)
+    with pytest.raises(ScanError, match="^contexte de qualification invalide$"):
+        cold_module.candidate_context(target, finding, [finding])
 
 
 def test_unavailable_model_retains_finding(repo: GitRepo) -> None:

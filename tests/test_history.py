@@ -1,5 +1,6 @@
 """T38: disposable history, synthetic secrets, bounded reads and safe output."""
 
+import errno
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -15,6 +16,7 @@ from heimdall.cli.cold_start import collect_cold_start
 from heimdall.cli.main import app
 from heimdall.cli.scan import collect
 from heimdall.llm.rejections import RejectionJournal
+from heimdall.mcp import gitdiff
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess
 from heimdall.scanner.allowlist import Allowlist
@@ -470,6 +472,28 @@ def test_history_blob_failures_use_scan_error(
         history.collect_history(repo.root, ci=True)
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"max_file_bytes": 10},
+        {"max_file_bytes": MAX_FILE_BYTES},
+        {"skipped_files": []},
+        {"max_file_bytes": 10, "skipped_files": []},
+    ],
+)
+def test_staged_rejects_tree_options_before_git_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    options: dict[str, Any],
+) -> None:
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("invalid staged options must be refused before Git access")
+
+    monkeypatch.setattr(GitAccess, "__init__", forbidden)
+    with pytest.raises(ScanError, match="^limite de fichier invalide$"):
+        collect(tmp_path, staged=True, **options)
+
+
 def test_ci_does_not_write_injected_journal(repo: GitRepo, tmp_path: Path) -> None:
     repo.write("config.py", SYNTHETIC)
     repo.commit_all("synthetic")
@@ -499,3 +523,36 @@ def test_historical_symlink_target_is_scanned_as_blob(repo: GitRepo) -> None:
     assert report.findings[0].finding.file == "link"
     assert report.findings[0].commits == (secret_commit,)
     assert not (repo.root / "link").exists()
+
+
+def test_many_tips_argv_failure_is_static_and_cli_exits_two(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo.write("readme", "safe\n")
+    repo.commit_all("root")
+    tips = tuple(f"{number:040x}" for number in range(1, 20_001))
+    monkeypatch.setattr(history, "BATCH_SIZE", 1)
+    monkeypatch.setattr(history, "_tips", lambda access, deadline: tips)
+    original = gitdiff.subprocess.Popen
+    attempts = 0
+
+    def reject_large_argv(args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        if "rev-list" in args:
+            assert args[-len(tips) - 1 : -1] == list(tips)
+            assert args[-1] == "--"
+            assert "--max-count=1" in args
+            attempts += 1
+            raise OSError(errno.E2BIG, SYNTHETIC)
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(gitdiff.subprocess, "Popen", reject_large_argv)
+    with pytest.raises(ScanError, match="^historique non analysable$"):
+        history.collect_history(repo.root, ci=True)
+    result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert SYNTHETIC not in result.output
+    assert "erreur d'outillage" in result.output
+    assert attempts == 2
