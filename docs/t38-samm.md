@@ -208,6 +208,29 @@ Les correctifs du code sont publiés dans le commit
   [test des 20 000 tips et E2BIG](https://github.com/Cezar277/heimdall/blob/084577412c497a8cde88224380667f094778d625/tests/test_history.py#L528).
 
 Ces permaliens prouvent la présence des changements et des tests, pas leur
-réussite : l'exécution des nouveaux tests reste à effectuer. Les copies
-accidentelles à la racine et `tests/cold-start.md` doivent être retirées ;
-elles ne constituent aucune preuve de comportement du paquet livré.
+réussite : l'exécution des nouveaux tests reste à effectuer. Les neuf copies
+accidentelles à la racine et `tests/cold-start.md` ont été retirées au plus
+tard au commit `d2300d8694fbd8371861688580ee6d087cb711ef`.
+
+### Dernière relecture — 31 octobre 2026
+
+Le contrôle `rev-parse --is-shallow-repository` utilise désormais le préfixe
+`--no-replace-objects`, comme les autres lectures Git de l'historique.
+Les journaux `bench-results/t38-*-full-tests.txt` et
+`bench-results/t38-full-tests.txt` concernés ont leurs préfixes de chemins
+locaux remplacés par `<venv>/` et `<system-lib>/` ; les résultats et les
+avertissements historiques sont conservés. Cette anonymisation ne constitue
+pas une nouvelle exécution des tests.
+
+Les deux tests suggérés par cette relecture existent déjà :
+`test_many_tips_argv_failure_is_static_and_cli_exits_two` et
+`test_staged_rejects_tree_options_before_git_access`, référencés ci-dessus.
+Ils restent non exécutés dans cette session. Contrôles disponibles :
+`git diff --check` et absence de `/home/` et `/usr/lib/` dans `bench-results/`.
+L'exception multi-tickets reste documentée ; la relecture croisée effective,
+la CI verte et le SHA de merge final restent à obtenir avant/après fusion
+selon les conditions déjà décrites. Aucun `/ci` n'est demandé ici.
+
+Livraison de cette relecture :
+[contrôle Git](https://github.com/Cezar277/heimdall/commit/2dea5b3c52ccab0b5355e3c879d9d67b64bba249)
+et [journaux anonymisés](https://github.com/Cezar277/heimdall/commit/c412c98c30bf7f6cc894021bcc7fb28bba6c3a1c).
