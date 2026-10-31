@@ -36,43 +36,43 @@
 .......................................................................                   [100%]
 =============================== warnings summary ===============================
 tests/test_vault_auth.py::ApiKeyVerificationTests::test_explicit_secret_store_path_is_shared_by_auth
-  /usr/lib/python3.13/typing.py:2371: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feaae6890>
+  <system-lib>/python3.13/typing.py:2371: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feaae6890>
     def cast(typ, val):
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
 
 tests/test_vault_auth.py::VaultKeyCliTests::test_list_on_empty_registry_says_nothing_registered
-  /home/nathan/heimdall-t33-venv/lib/python3.13/site-packages/typer/_click/core.py:956: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feaae7a60>
+  <venv>/lib/python3.13/site-packages/typer/_click/core.py:956: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feaae7a60>
     def convert(value: Any) -> Any:
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
 
 tests/test_vault_auth.py::VaultKeyCliTests::test_revoke_works_without_a_server_pepper
-  /usr/lib/python3.13/typing.py:429: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feb6b16c0>
+  <system-lib>/python3.13/typing.py:429: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feb6b16c0>
     return _caches[func](*args, **kwds)
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
 
 tests/test_vault_availability.py::DatabaseAvailabilityTests::test_auth_access_error_is_503_but_unknown_key_is_401
-  /usr/lib/python3.13/traceback.py:311: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feb2f58a0>
+  <system-lib>/python3.13/traceback.py:311: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feb2f58a0>
     self._code = kwargs.get("_code")
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
 
 tests/test_vault_integration_testclient.py::VaultInvalidApiKeyTests::test_missing_unknown_revoked_and_malformed_keys_are_rejected
-  /usr/lib/python3.13/pathlib/_local.py:128: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feb2f6980>
+  <system-lib>/python3.13/pathlib/_local.py:128: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feb2f6980>
     path = os.fspath(arg)
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
 
 tests/test_vault_integration_testclient.py::VaultCrossProjectAccessTests::test_forbidden_is_decided_before_the_resource_lookup
-  /home/nathan/heimdall-t33-venv/lib/python3.13/site-packages/coverage/collector.py:236: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755febc85d50>
+  <venv>/lib/python3.13/site-packages/coverage/collector.py:236: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755febc85d50>
     def lock_data(self) -> None:
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
 
 tests/test_vault_integration_testclient.py::VaultOpenapiContractTests::test_live_error_bodies_carry_the_contract_required_fields
-  /usr/lib/python3.13/pathlib/_local.py:128: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feaae7c40>
+  <system-lib>/python3.13/pathlib/_local.py:128: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x755feaae7c40>
     path = os.fspath(arg)
   Enable tracemalloc to get traceback where the object was allocated.
   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
