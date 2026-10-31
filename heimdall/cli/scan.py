@@ -108,10 +108,14 @@ _MSG_TOO_MANY_FILES: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_LARGE: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_MANY_FINDINGS: Final[str] = "scan impossible : entrée non analysable"
 _MSG_BLOB_CHANGED: Final[str] = "scan impossible : entrée non analysable"
+_MSG_BINARY: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INVALID_SCOPE: Final[str] = "scan impossible : entrée non analysable"
+#: Mode CI strict : un arbre réduit à sa base VCS n'a lu aucun contenu. Le
+#: code 2 évite qu'une automatisation ne confonde « propre » et « non parcouru ».
+_MSG_VCS_ONLY: Final[str] = "scan impossible : entrée non analysable"
 
 #: Journal de diagnostic (niveau debug uniquement) : les causes de refus de
 #: la garde anti auto-attestation y sont distinguées par des libellés
@@ -152,12 +156,15 @@ class ScanReport:
     findings: tuple[Finding, ...]
     traces: tuple[AllowlistTrace, ...] = ()
     config_hash: str | None = None
+    vcs_ignored: int = 0
 
     def __post_init__(self) -> None:
         # Garde runtime pour les appelants non typés : le `Literal` protège
         # mypy, cette vérification protège l'exécution (jamais de `KeyError`
         # ni de `TypeError` hors contrat dans `render_text`).
         if not isinstance(self.scope, str) or self.scope not in _SCOPE_LABELS:
+            raise ScanError(_MSG_INVALID_SCOPE)
+        if type(self.vcs_ignored) is not int or self.vcs_ignored < 0:
             raise ScanError(_MSG_INVALID_SCOPE)
 
     @property
@@ -166,19 +173,24 @@ class ScanReport:
         return len(self.traces)
 
 
-def collect(
+def collect(  # noqa: PLR0913 - explicit scan options
     root: Path,
     *,
     staged: bool,
     config: str | Path | None = None,
     allowlist: Allowlist | None = None,
     ci: bool = False,
+    max_file_bytes: int | None = None,
+    skipped_files: list[str] | None = None,
 ) -> ScanReport:
     """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
-    Lève ``ScanError`` (ou ``ToolFailure``) si le périmètre n'a pas pu être
+    Lève ``ScanError`` si le périmètre n'a pas pu être
     analysé **en entier** : l'appelant transforme cela en code 2, jamais en
     code 0.
+
+    ``max_file_bytes`` et ``skipped_files`` sont réservés au mode arbre.
+    Les fournir avec ``staged=True`` lève ``ScanError`` avant tout accès Git.
 
     **Auto-attestation (CWE-345)** : si ``allowlist`` est fourni (API), la
     garde anti auto-attestation est contournée. Le seul usage légitime dans
@@ -188,9 +200,25 @@ def collect(
     de ``heimdall.toml`` interne. En cas de doute, ne pas injecter
     d'allowlist non-vide ou utiliser ``config`` externe / ``--no-allowlist``.
     """
-    if staged:
-        return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
-    return _collect_tree(root, config=config, custom_allowlist=allowlist, ci=ci)
+    if staged and (max_file_bytes is not None or skipped_files is not None):
+        raise ScanError("limite de fichier invalide")
+    if max_file_bytes is not None and (
+        type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES
+    ):
+        raise ScanError("limite de fichier invalide")
+    try:
+        if staged:
+            return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
+        return _collect_tree(
+            root,
+            config=config,
+            custom_allowlist=allowlist,
+            ci=ci,
+            max_file_bytes=max_file_bytes,
+            skipped_files=skipped_files,
+        )
+    except ToolFailure:
+        raise ScanError(_MSG_NOT_A_REPO) from None
 
 
 def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
@@ -212,13 +240,16 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
         raise ScanError(_MSG_ROOT_CHANGED)
 
 
-def _read_worktree_file(path: Path) -> bytes | None:
+def _read_worktree_file(path: Path, *, max_bytes: int = MAX_CONFIG_BYTES) -> bytes | None:
     """Lit un fichier du worktree via la garde unique, sans suivre de lien.
 
     Retourne ``None`` au moindre doute : chemin non résoluble, lien
     symbolique, non-régulier, trop gros ou lecture incomplète. La taille est
-    bornée par :data:`MAX_CONFIG_BYTES` (ce helper ne sert qu'à la config).
+    bornée par :data:`MAX_CONFIG_BYTES` pour la config ; le cold start peut
+    demander au plus :data:`MAX_FILE_BYTES` pour un contexte candidat.
     """
+    if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_FILE_BYTES:
+        return None
     try:
         resolved = _resolve_root(path)
         # O_NONBLOCK évite qu'un FIFO placé à la place du fichier ne bloque
@@ -233,7 +264,7 @@ def _read_worktree_file(path: Path) -> bytes | None:
     try:
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_CONFIG_BYTES:
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
                 return None
             expected = metadata.st_size
             chunks: list[bytes] = []
@@ -245,8 +276,13 @@ def _read_worktree_file(path: Path) -> bytes | None:
                 chunks.append(chunk)
                 remaining -= len(chunk)
             content = b"".join(chunks)
-            # Un fichier qui a rétréci ou grossi pendant la lecture est refusé.
-            if len(content) != expected:
+            # Refuser aussi une réécriture de même taille pendant la lecture.
+            final = os.fstat(descriptor)
+            if (
+                len(content) != expected
+                or final.st_size != metadata.st_size
+                or final.st_mtime_ns != metadata.st_mtime_ns
+            ):
                 return None
             return content
         finally:
@@ -303,9 +339,7 @@ def _is_worktree_file_clean_and_tracked(
             f"blob {len(content)}\0".encode("ascii") + content,
             usedforsecurity=False,
         ).hexdigest()
-        blob_sha256 = hashlib.sha256(
-            f"blob {len(content)}\0".encode("ascii") + content
-        ).hexdigest()
+        blob_sha256 = hashlib.sha256(f"blob {len(content)}\0".encode("ascii") + content).hexdigest()
         verified = content if index_sha in (blob_sha1, blob_sha256) else None
         if verified is None:
             logger.debug("refus anti auto-attestation : configuration divergente (CWE-345)")
@@ -413,16 +447,12 @@ def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
         # doit pas bloquer le scan (disponibilité). Idem pour `--config`
         # interne (`subdir/custom.toml` vs `other/subdir/custom.toml`).
         # Les deux côtés sont déjà normalisés (relatif au dépôt, `/`).
-        is_cfg_staged = any(
-            getattr(change, "path", None) == rel_cfg for change in staged_changes
-        )
+        is_cfg_staged = any(getattr(change, "path", None) == rel_cfg for change in staged_changes)
         if is_cfg_staged:
             # Message strictement statique : `rel_cfg` (entrée opérateur
             # normalisée) n'est jamais reflété (invariant 8). En CLI le
             # libellé est de toute façon masqué par le message générique.
-            raise ScanError(
-                "auto-attestation refusée : configuration stagée (CWE-345)"
-            )
+            raise ScanError("auto-attestation refusée : configuration stagée (CWE-345)")
         if is_staged_scan:
             content = _is_worktree_file_clean_and_tracked(
                 access,
@@ -454,24 +484,34 @@ def _load_allowlist_verified(
         # Message strictement statique : `verified.path` (entrée opérateur)
         # n'est jamais reflété (invariant 8), comme pour la garde ci-dessus.
         raise ScanError(
-            "auto-attestation refusée : configuration modifiée pendant "
-            "le chargement (CWE-345)"
+            "auto-attestation refusée : configuration modifiée pendant le chargement (CWE-345)"
         )
     return allowlist
 
 
-def _collect_tree(
+def _collect_tree(  # noqa: PLR0913 - explicit scan options
     root: Path,
     *,
     config: str | Path | None = None,
     custom_allowlist: Allowlist | None = None,
     ci: bool = False,
+    max_file_bytes: int | None = None,
+    skipped_files: list[str] | None = None,
 ) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
-    ``strict=True`` ne conserve que les exclusions **techniques** de #59
-    (binaires, répertoires générés) : ``vendor/``, les lockfiles et les
-    fichiers de contrôle sont parcourus. Un secret y est un secret.
+    ``strict=True`` ne change plus le périmètre : seule la base VCS est
+    écartée (comptée dans :attr:`ScanReport.vcs_ignored`) ; ``vendor/``, les
+    lockfiles et les fichiers de contrôle sont parcourus. Un secret y est un
+    secret. Un fichier binaire connu est refusé (``ScanError``, code 2),
+    comme en ``--staged`` : aucun contenu n'est sauté en silence.
+    Un arbre vide (seule la base VCS existe) reste un verdict 0 en local : il
+    est réellement vide, pas illisible. En revanche, le mode **``--ci``** est
+    strict : dès qu'une base VCS a été élaguée **sans aucun contenu lu**
+    (``vcs_ignored > 0`` et ``files_scanned == 0``), le scan est refusé
+    (``ScanError``, code 2) — une automatisation qui ne lit que le code de
+    sortie ne doit jamais confondre « propre » et « non parcouru ».
+    ``--staged`` reste le périmètre opposable pour le contenu indexé.
 
     L'allowlist déterministe (#24) écarte les cas évidents (example,
     changeme, dummy, fixtures de test) et produit une trace pour chaque rejet.
@@ -511,8 +551,24 @@ def _collect_tree(
             )
         )
     )
-    scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
+    scanner = TreeScanner(
+        access.root,
+        strict=True,
+        allowlist=allowlist,
+        max_file_bytes=max_file_bytes,
+        skipped_files=skipped_files,
+    )
+    skipped_before = len(skipped_files) if skipped_files is not None else 0
     findings = scanner.scan(deadline=deadline)
+    skipped_now = len(skipped_files) - skipped_before if skipped_files is not None else 0
+    if ci and scanner.vcs_ignored > 0 and scanner.files_scanned == 0 and skipped_now == 0:
+        # Aucun contenu n'a été lu : le seul périmètre observé est une base
+        # VCS élaguée. En CI stricte, un code 0 serait indistinguable d'un
+        # dépôt propre pour une automatisation qui ne lit que la sortie.
+        # Le cold start rend explicitement les fichiers trop volumineux dans
+        # un rapport incomplet (code 2) : ce cas n'est pas un arbre VCS seul.
+        logger.debug("refus --ci : arbre réduit à sa base VCS (aucun contenu lu)")
+        raise ScanError(_MSG_VCS_ONLY)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
     traces = scanner.traces
@@ -521,6 +577,7 @@ def _collect_tree(
         findings=tuple(findings),
         traces=tuple(traces),
         config_hash=allowlist.sha256,
+        vcs_ignored=scanner.vcs_ignored,
     )
 
 
@@ -549,8 +606,10 @@ def _collect_staged(
 
     Aucune exclusion de chemin : c'est le contenu que le commit va contenir
     qui est jugé, quel que soit son chemin (``vendor/evil.py``,
-    ``package-lock.json``…). Un blob binaire connu est ignoré (rien à
-    analyser) ; un blob illisible ou trop gros est une **erreur** (code 2).
+    ``package-lock.json``…). Un blob binaire connu est **refusé** (code 2),
+    exactement comme un fichier binaire connu en mode arbre : il n'y a pas de
+    texte à analyser, donc aucun verdict propre ne peut être rendu. Un blob
+    illisible ou trop gros est également une **erreur** (code 2).
 
     Les lectures sont adressées par SHA : un ``git add`` concurrent ne peut
     pas corrompre un blob déjà lu, mais la **liste** figée au départ peut
@@ -634,9 +693,11 @@ def _collect_staged(
         # mémoire, pas les 32 Mio du périmètre. `text`, `data` et `target`
         # sont réassignés à chaque tour ; rien ne les accumule.
         if text is None:
-            # Binaire reconnu : aucun texte à analyser. Ce n'est pas une
-            # exclusion de chemin, c'est une impossibilité technique.
-            continue
+            # Binaire reconnu : aucun texte à analyser. Contrairement à une
+            # exclusion de chemin, ce n'est pas une raison de rendre un
+            # verdict propre : un secret peut vivre dans le binaire (même
+            # limite qu'en mode arbre). Refus fail-closed, code 2.
+            raise ScanError(_MSG_BINARY)
         # `FileTarget` valide le chemin (contrat #14) : un chemin que le
         # contrat ne sait pas représenter est une erreur, pas un fichier
         # ignoré en silence.
@@ -680,8 +741,9 @@ def render_json(report: ScanReport) -> str:
 
     Le document contient le périmètre, le nombre de Findings et les Findings
     eux-mêmes (les sept champs du contrat #14), ainsi que le nombre de
-    findings ignorés et les traces de chaque rejet par l'allowlist (#24).
-    Aucun secret n'est inclus.
+    findings ignorés et les traces de chaque rejet par l'allowlist (#24), et
+    le nombre de bases VCS élaguées (``vcs_ignored``, toujours 0 en
+    ``--staged``). Aucun secret n'est inclus.
     """
     payload = {
         "schema": JSON_SCHEMA,
@@ -691,6 +753,7 @@ def render_json(report: ScanReport) -> str:
         "ignored_count": report.ignored_count,
         "traces": [trace.as_dict() for trace in report.traces],
         "config_hash": report.config_hash,
+        "vcs_ignored": report.vcs_ignored,
     }
     return json.dumps(
         payload,
@@ -746,6 +809,12 @@ def render_text(report: ScanReport) -> str:
         lines.append(f"Allowlist : {report.ignored_count} finding(s) ignoré(s) :")
         for trace in report.traces:
             lines.append(f"  {_visible(trace.file)}:{trace.line}  règle={trace.rule}")
+    # L'élagage VCS est une politique, pas un résultat : l'afficher évite de
+    # lire un « aucun secret » comme une couverture de l'historique.
+    lines.append(
+        f"Base VCS : {report.vcs_ignored} base(s) élaguée(s) "
+        "(historique non parcouru)."
+    )
     lines.append(_CODES_LINE)
     return "\n".join(lines)
 
