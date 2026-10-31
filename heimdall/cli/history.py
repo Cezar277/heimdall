@@ -16,7 +16,7 @@ from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess, _checked_object
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
-from heimdall.scanner.exclusions import decode_text, has_technical_suffix, is_known_binary
+from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding, validate_relative_path
 from heimdall.scanner.interface import FileTarget, Scanner
 from heimdall.scanner.signature_engine import SignatureEngine
@@ -211,16 +211,11 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                         data = access.blob_bytes(oid, timeout=_call_timeout(deadline))
                         if len(data) != size:
                             raise ScanError("objet historique modifié")
-                        try:
-                            text = decode_text(data)
-                        except ScanError:
-                            if not (has_technical_suffix(file) and is_known_binary(data)):
-                                raise
-                            text = None
-                        # Undecodable blobs are not cached across paths: binary
-                        # suffix fallback must not hide the same blob as .txt.
+                        text = decode_text(data)
+                        # Match the working-tree and staged scanners: a binary
+                        # blob cannot yield a clean verdict, regardless of name.
                         if text is None:
-                            continue
+                            raise ScanError("historique non analysable")
                         target = FileTarget(file, text)
                         cached = tuple(scanner.scan(target))
                         if llm and not ci:

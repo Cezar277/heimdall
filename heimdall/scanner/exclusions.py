@@ -1,214 +1,72 @@
-"""Exclusions déterministes du scanner (#59).
+"""Périmètre et politique de contenu du scanner (#59).
 
-Le périmètre est une politique explicite, pas une heuristique :
+Le périmètre n'est **jamais** décidé par le nom d'un fichier. Une exclusion
+nominale est un contournement trivial : il suffit de renommer le fichier
+(``evil.png``, ``package-lock.json``, ``vendor/secret.txt``…) pour qu'un
+secret ne soit ni signalé ni refusé. Le **contenu** décide :
 
-- fichiers de contrôle de version et d'outillage (``.gitignore``, ...) ;
-- répertoires générés ou tiers (``.git``, ``vendor``, ``node_modules``, ...) ;
-- lockfiles et sommes de contrôle générées ;
-- binaires à extension connue ou signature magique connue.
+- un fichier **textuel** est décodé puis scanné ;
+- un contenu non décodable lève ``ScanError`` ; un binaire **connu** est
+  reconnu comme non textuel (``None``) et le scanner le refuse en
+  ``ScanError`` : il n'est jamais ignoré silencieusement.
 
-Les exclusions sont réparties en deux familles, et cette répartition est le
-fondement du mode **strict** livré par #29 (``heimdall scan``) :
-
-- **techniques** : le contenu est binaire, généré ou non analysable (``.git``,
-  ``node_modules``, ``.venv``, images, archives, ``.coverage``…). Les garder
-  hors périmètre évite un ``ScanError`` sur un binaire inconnu et n'enlève
-  aucun secret lisible ;
-- **de contenu texte** : ``vendor/``, ``third_party/``, lockfiles et fichiers
-  de contrôle. La politique #59 les exclut pour limiter le bruit, mais un
-  secret y est un secret : en mode strict, **seules les exclusions techniques
-  restent**.
+Dans le scanner, seule la base VCS (``.git/``, ``.hg/``, ``.svn/``) est
+écartée : ce n'est pas le contenu du dépôt. Aucune exclusion nominale n'est
+appliquée : le nom d'un fichier ne décide jamais du périmètre, c'est le
+**contenu** qui décide (voir ``est_base_vcs`` /
+``est_chemin_hors_perimetre`` et ``decode_text``). Une exclusion nominale
+serait un contournement trivial.
 
 Les fichiers texte UTF-8, UTF-16 et UTF-32 (avec ou sans BOM) sont décodés et
-scannés. Un contenu NUL qui n'est ni décodable ni une signature binaire connue
-lève ``ScanError`` : il n'est jamais ignoré silencieusement. Tout autre échec
-de lecture ou de décodage est également fail-closed. Le contenu n'est jamais
-exécuté.
+scannés. Le contenu n'est jamais exécuté.
 """
 
 from __future__ import annotations
 
 import codecs
+import warnings
 from pathlib import PurePosixPath
 from typing import Final
 
 from heimdall.scanner.errors import ScanError
 
-#: Répertoires exclus pour raison **technique** : contenu binaire, cache ou
-#: environnement non analysable. Les scanner n'apporterait rien (et lèverait
-#: parfois un ``ScanError`` sur un binaire à signature inconnue) : ils restent
-#: hors périmètre, y compris en mode strict (#29). Les sorties de build
-#: (`build`, `dist`, `target`), `bower_components` et `htmlcov` sont
-#: **textuelles** : elles rejoignent les répertoires tiers, donc scannées en
-#: strict (un secret y est un secret), exclues par la politique #59 seule.
-TECHNICAL_DIRECTORIES: Final[frozenset[str]] = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        ".venv",
-        ".tox",
-        ".nox",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        "__pycache__",
-        "node_modules",
-        "venv",
-        "virtualenv",
-    }
-)
+#: Base VCS : ce n'est pas le contenu du dépôt, elle n'est pas parcourue.
+ARBRES_HORS_PERIMETRE: Final[frozenset[str]] = frozenset({".git", ".hg", ".svn"})
 
-#: Répertoires tiers ou **générés textuels** : la politique #59 les exclut
-#: pour limiter le bruit (ou les sorties de build), mais un secret y est un
-#: secret. Le mode strict (#29) les scanne.
-TEXT_DIRECTORIES: Final[frozenset[str]] = frozenset(
-    {
-        "bower_components",
-        "build",
-        "dist",
-        "htmlcov",
-        "target",
-        "third-party",
-        "third_party",
-        "vendor",
-    }
-)
-
-#: Politique #59 par défaut : technique **et** contenu texte.
-EXCLUDED_DIRECTORIES: Final[frozenset[str]] = TECHNICAL_DIRECTORIES | TEXT_DIRECTORIES
-
-#: Fichiers exclus pour raison **technique** : format binaire connu
-#: (``.coverage`` est une base SQLite, ``bun.lockb`` un blob binaire).
-TECHNICAL_FILES: Final[frozenset[str]] = frozenset(
-    {
-        ".coverage",
-        "bun.lockb",
-    }
-)
-
-#: Fichiers de contrôle et lockfiles **textuels** : exclus par la politique
-#: #59, scannés en mode strict (#29).
-TEXT_FILES: Final[frozenset[str]] = frozenset(
-    {
-        ".dockerignore",
-        ".gitattributes",
-        ".gitignore",
-        ".npmignore",
-        "composer.lock",
-        "go.sum",
-        "npm-shrinkwrap.json",
-        "package-lock.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-    }
-)
-
-#: Politique #59 par défaut : technique **et** contenu texte.
-EXCLUDED_FILES: Final[frozenset[str]] = TECHNICAL_FILES | TEXT_FILES
-
-#: Suffixes de fichiers **binaires** : jamais analysables par des expressions
-#: de texte, donc exclus même en mode strict.
-TECHNICAL_SUFFIXES: Final[tuple[str, ...]] = (
-    ".7z",
-    ".avi",
-    ".bin",
-    ".bmp",
-    ".bz2",
-    ".class",
-    ".db",
-    ".der",
-    ".dll",
-    ".dylib",
-    ".eot",
-    ".exe",
-    ".gif",
-    ".gz",
-    ".ico",
-    ".jar",
-    ".jpeg",
-    ".jpg",
-    ".mov",
-    ".mp3",
-    ".mp4",
-    ".pdf",
-    ".png",
-    ".pyc",
-    ".pyo",
-    ".rar",
-    ".so",
-    ".sqlite",
-    ".sqlite3",
-    ".tar",
-    ".tgz",
-    ".ttf",
-    ".webp",
-    ".whl",
-    ".woff",
-    ".woff2",
-    ".xz",
-    ".zip",
-    ".zst",
-)
-
-#: Suffixes de lockfiles **textuels** : exclus par la politique #59, scannés
-#: en mode strict (#29).
-TEXT_SUFFIXES: Final[tuple[str, ...]] = (
-    # Lockfiles générés, quel que soit leur nom.
-    ".lock",
-)
-
-#: Politique #59 par défaut : technique **et** contenu texte.
-EXCLUDED_SUFFIXES: Final[tuple[str, ...]] = TEXT_SUFFIXES + TECHNICAL_SUFFIXES
+#: Surface publique **volontairement fermée** : le helper déprécié
+#: ``is_known_binary`` reste importable pour compatibilité historique, mais
+#: n'est pas exporté. Aucun périmètre ne doit être branché sur ce nom.
+__all__ = [
+    "ARBRES_HORS_PERIMETRE",
+    "decode_text",
+    "est_base_vcs",
+    "est_chemin_hors_perimetre",
+]
 
 
-def is_excluded_directory(name: str, *, strict: bool = False) -> bool:
-    """Vrai si un nom de répertoire est hors périmètre (casse ignorée).
+def est_base_vcs(name: str) -> bool:
+    """Vrai si ``name`` désigne une base VCS (casse ignorée).
 
-    En mode ``strict`` (#29), seules les exclusions **techniques** restent :
-    ``vendor/``, ``third_party/``, ``build/``, ``dist/``, ``target/`` et les
-    autres répertoires textuels sont alors parcourus, parce qu'un secret y
-    est un secret.
+    Seule la base VCS est écartée ; ce prédicat est la **seule** décision de
+    périmètre par nom du scanner. Tous les autres noms sont parcourus, quel
+    que soit leur contenu.
     """
-    folded = name.casefold()
-    if folded in TECHNICAL_DIRECTORIES:
-        return True
-    return not strict and folded in TEXT_DIRECTORIES
+    return name.casefold() in ARBRES_HORS_PERIMETRE
 
 
-def has_technical_suffix(name: str) -> bool:
-    """Vrai si le nom (casse ignorée) porte un suffixe binaire connu."""
-    folded = name.casefold()
-    return any(folded.endswith(suffix) for suffix in TECHNICAL_SUFFIXES)
+def est_chemin_hors_perimetre(relative_path: str | PurePosixPath) -> bool:
+    """Vrai si un **parent** du chemin relatif est une base VCS.
 
-
-def is_excluded(relative_path: str | PurePosixPath, *, strict: bool = False) -> bool:
-    """Vrai si le chemin relatif (séparateurs ``/``) est exclu du scan.
-
-    En mode ``strict`` (#29), les exclusions de **contenu texte** (lockfiles,
-    fichiers de contrôle) sont levées ; les exclusions techniques (binaires)
-    restent. Un suffixe binaire n'est toutefois plus un verdict à lui seul en
-    strict : le contenu est lu, et le suffixe ne sert de repli qu'après un
-    échec de ``decode_text`` (un fichier texte mal nommé ``evil.png`` doit
-    être scanné, comme en ``--staged``). Voir ``Scanner._read_text``.
+    Seuls les répertoires parents décident : le dernier segment est un
+    **fichier**, pas une base VCS. Un fichier régulier nommé ``.git`` est un
+    gitlink légitime (worktree, sous-module : ``gitdir: …``) : il est lu
+    comme n'importe quel contenu, jamais confondu avec le répertoire
+    ``.git/`` qui, lui, est élagué par :func:`est_base_vcs`.
     """
     path = (
         relative_path if isinstance(relative_path, PurePosixPath) else PurePosixPath(relative_path)
     )
-    if not path.parts:
-        return False
-    if any(is_excluded_directory(part, strict=strict) for part in path.parts[:-1]):
-        return True
-    name = path.parts[-1].casefold()
-    if name in TECHNICAL_FILES:
-        return True
-    if not strict and name in TEXT_FILES:
-        return True
-    if has_technical_suffix(name):
-        # En strict, le contenu décide en premier ; le suffixe ne redevient
-        # une exclusion qu'après échec de décodage (voir `_read_text`).
-        return not strict
-    return not strict and any(name.endswith(suffix) for suffix in TEXT_SUFFIXES)
+    return any(est_base_vcs(part) for part in path.parts[:-1])
 
 
 _TEXT_RATIO_MIN: Final[float] = 0.95
@@ -220,9 +78,10 @@ _HIGH_BIT: Final[int] = 0x80
 _TEXT_BYTES: Final[frozenset[int]] = frozenset({0x09, 0x0A, 0x0D})
 _DECODE_ERROR: Final[str] = "scan impossible : entrée non analysable"
 
-# Signatures fortes de formats binaires connus. Un fichier sans extension qui
-# porte l'une d'elles est ignoré par politique ; les autres contenus NUL non
-# décodables lèvent ``ScanError`` (fail-closed).
+# Signatures fortes de formats binaires connus. Un contenu qui porte l'une
+# d'elles ET reste majoritairement binaire est reconnu comme non textuel par
+# ``decode_text`` (retour ``None``) : le scanner d'arbre et la CLI ``--staged``
+# le refusent alors en ``ScanError`` (fail-closed), jamais un skip silencieux.
 _BINARY_MAGIC: Final[tuple[bytes, ...]] = (
     b"\x7fELF",
     b"\x89PNG\r\n\x1a\n",
@@ -331,17 +190,38 @@ def _decode_utf16_or_32(data: bytes) -> str | None:
     return None if best is None else best[1]
 
 
-def is_known_binary(data: bytes) -> bool:
+def _is_known_binary(data: bytes) -> bool:
     """Vrai si le contenu est un binaire **connu** et majoritairement binaire.
 
     Même critère que ``decode_text`` pour rendre ``None`` : une signature
-    magique connue **et** un ratio d'octets binaires ≥ 0,5. Sert de repli
-    explicite au scanner pour un fichier à suffixe technique, sans transformer
-    un binaire inconnu (NUL + texte) en skip silencieux.
+    magique connue **et** un ratio d'octets binaires ≥ 0,5. Helper interne :
+    il ne décide jamais du périmètre à lui seul et le scanner ne le consulte
+    pas par son nom. Un binaire inconnu (NUL + texte) reste fail-closed.
     """
     return any(data.startswith(magic) for magic in _BINARY_MAGIC) and (
         _binary_byte_ratio(data) >= _BINARY_RATIO_MIN
     )
+
+
+def is_known_binary(data: bytes) -> bool:
+    """DEPRECATED — helper de politique, sans autorité dans le scanner.
+
+    Conservé uniquement pour compatibilité d'import (documentation et tests
+    historiques). Le scanner utilise :func:`decode_text`, qui appelle le
+    helper **interne** ``_is_known_binary`` : remplacer ou instrumenter ce
+    nom public ne change donc jamais le périmètre d'un scan. Aucun nouvel
+    appelant ne doit s'en servir pour décider qu'un fichier est « ignorable
+    par son nom » : le contenu décide, et un binaire non reconnu lève
+    ``ScanError``. Tout appel émet un ``DeprecationWarning`` pour rendre la
+    dépendance visible ; sa suppression est prévue dans un ticket dédié.
+    """
+    warnings.warn(
+        "is_known_binary est déprécié et sans autorité : utiliser decode_text "
+        "(le contenu décide, jamais le nom)",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _is_known_binary(data)
 
 
 def decode_text(data: bytes) -> str | None:
@@ -350,10 +230,13 @@ def decode_text(data: bytes) -> str | None:
     - BOM UTF-8/UTF-16/UTF-32 : décodage strict ;
     - UTF-16/UTF-32 sans BOM : heuristique bornée, jamais de remplacement ;
     - UTF-8 invalide sans NUL : ScanError statique (#23) ;
-    - signature binaire **et** contenu majoritairement binaire : ignoré par
-      politique (une simple signature suivie de texte clair ne suffit pas :
-      ce serait un contournement) ;
+    - signature binaire **et** contenu majoritairement binaire : reconnu
+      comme non textuel (``None``), l'appelant le refuse (une simple signature
+      suivie de texte clair ne suffit pas : ce serait un contournement) ;
     - NUL sans décodage possible : ``ScanError``.
+
+    Le nom du fichier n'intervient jamais : un ``evil.png`` dont le contenu
+    est du texte est décodé et scanné comme un ``.txt``.
     """
     if not data:
         return ""
@@ -370,12 +253,12 @@ def decode_text(data: bytes) -> str | None:
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError:
-            if is_known_binary(data):
+            if _is_known_binary(data):
                 return None
             raise ScanError(_DECODE_ERROR) from None
     decoded = _decode_utf16_or_32(data)
     if decoded is not None:
         return decoded
-    if is_known_binary(data):
+    if _is_known_binary(data):
         return None
     raise ScanError(_DECODE_ERROR)

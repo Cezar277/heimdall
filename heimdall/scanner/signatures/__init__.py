@@ -18,8 +18,13 @@ from typing import Final, Literal
 
 from heimdall.scanner.signatures.aws_cloud import RULES as AWS_CLOUD_RULES
 from heimdall.scanner.signatures.github_jwt import RULES as GITHUB_JWT_RULES
-from heimdall.scanner.signatures.model import Rule, validate_rules
+from heimdall.scanner.signatures.model import Rule, RuleMatch, validate_rules
 from heimdall.scanner.signatures.pem import RULES as PEM_RULES
+from heimdall.scanner.signatures.stripe_slack import (
+    ROTATING_INNER_RULE_IDS,
+    ROTATING_PREFIX_LEN,
+    ROTATING_RULE_ID,
+)
 from heimdall.scanner.signatures.stripe_slack import RULES as STRIPE_SLACK_RULES
 
 #: Les quatre familles du découpage #22.2.1 à #22.2.4, dans un ordre stable.
@@ -89,6 +94,21 @@ def rules_for_family(family: str) -> tuple[Rule, ...]:
     raise KeyError(f"famille de signatures inconnue : {family!r}")
 
 
+def _matches_rotatifs(line: str) -> tuple[RuleMatch, ...]:
+    """Correspondances de la règle rotative, calculées une seule fois.
+
+    Le registre a besoin de leurs bornes **avant** de traiter les règles
+    « jeton interne », qui les précèdent dans l'ordre du registre. Les
+    recalculer dans la boucle principale doublerait le coût de la regex ; les
+    calculer une fois puis n'en garder que les bornes garde la neutralisation
+    en O(1) par candidat.
+    """
+    for rule in RULES:
+        if rule.id == ROTATING_RULE_ID:
+            return rule.matches(line)
+    return ()
+
+
 def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:
     """Signatures présentes dans une ligne, dédupliquées par (type, valeur).
 
@@ -97,16 +117,35 @@ def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:
     doit jamais en masquer un autre). L'ordre du registre est conservé, puis
     l'ordre des occurrences dans la ligne.
 
+    Le jeton interne d'une forme rotative ``xoxe.`` n'est émis qu'une fois :
+    la forme rotative le neutralise **si elle est elle-même reconnue** et que
+    le jeton interne occupe exactement sa charge (longueur et frontière avale
+    comprises). Un préfixe ``xoxe.`` suivi d'une charge hors bornes ne peut
+    donc pas faire disparaître un jeton interne par avance. La déduplication
+    par valeur a lieu après cette neutralisation : le filtrage ne modifie
+    jamais l'ensemble des valeurs autonomes conservées.
+
     .. warning::
        Le retour contient la **valeur brute** du candidat
        (``SignatureMatch.value``). Ces données sont sensibles : ne jamais les
        journaliser, les sérialiser ni les transmettre à un LLM. Le moteur les
        hache immédiatement et ne rend que des ``Finding`` sans valeur.
     """
+    rotatifs = _matches_rotatifs(line)
+    # Bornes des formes rotatives **effectivement reconnues** : la
+    # neutralisation ne teste pas le seul préfixe `xoxe.`, elle exige que la
+    # charge complète (longueur et frontière avale) ait été reconnue.
+    bornes_rotatives = {(match.start("value"), match.end("value")) for match in rotatifs}
     matches: list[SignatureMatch] = []
     seen: set[tuple[str, str]] = set()
     for rule in RULES:
-        for match in rule.matches(line):
+        rule_matches = rotatifs if rule.id == ROTATING_RULE_ID else rule.matches(line)
+        for match in rule_matches:
+            if rule.id in ROTATING_INNER_RULE_IDS:
+                debut = match.start("value")
+                fin = match.end("value")
+                if (debut - ROTATING_PREFIX_LEN, fin) in bornes_rotatives:
+                    continue
             value = match.group("value")
             key = (rule.secret_type, value)
             if key in seen:

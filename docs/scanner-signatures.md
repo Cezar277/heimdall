@@ -97,11 +97,18 @@ motifs ci-dessous décrivent l'ancrage et les bornes, pas un secret utilisable.
 | `stripe_secret_key` | Stripe/Slack #56 | `stripe` | `sk_` ou `rk_`, puis `live`/`test`, puis 16 à 247 caractères `[A-Za-z0-9]` | — |
 | `slack_token` | Stripe/Slack #56 | `slack` | `xoxb-`, `xoxa-`, `xoxp-`, `xoxr-` ou `xoxs-` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
 | `slack_app_token` | Stripe/Slack #56 | `slack` | `xapp-` ou `xwfp-` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
-| `slack_rotating_token` | Stripe/Slack #56 | `slack` | `xoxe.` + 10 à 250 caractères `[A-Za-z0-9-]` | — |
+| `slack_rotating_token` | Stripe/Slack #56 | `slack` | `xoxe.` + 10 à 255 caractères `[A-Za-z0-9-]` (la charge couvre le jeton interne entier, préfixe compris) | — |
 | `github_classic_pat` | GitHub/JWT #57 | `pat` | `ghp_`, `gho_`, `ghu_`, `ghs_` ou `ghr_` + exactement 36 caractères `[A-Za-z0-9]` | — |
 | `github_fine_grained_pat` | GitHub/JWT #57 | `pat` | `github_pat_` + 22 à 255 caractères `[A-Za-z0-9_]` | — |
 | `jwt` | GitHub/JWT #57 | `jwt` | en-tête `eyJ` puis trois segments base64url bornés (1024 / 65 536 / 1024) | — |
 | `pem_private_key` | PEM #58 | `pem` | `-----BEGIN` + qualificatif ≤ 64 caractères + `PRIVATE KEY-----` (ou `PRIVATE KEY BLOCK-----`) | — |
+
+Une forme rotative `xoxe.` **reconnue** neutralise le jeton interne qu'elle
+porte : le registre n'émet qu'un Finding pour un seul secret. La neutralisation
+n'a lieu qu'après reconnaissance de la forme **complète** (longueur et
+frontière avale comprises), jamais sur le seul ancrage du préfixe ; un jeton
+interne autonome reste signalé, et un préfixe bourré (`xxoxe.…`) ne masque
+rien.
 
 Chaque motif est ancré sur un **préfixe publié** ou sur un **nom de paramètre
 explicite**. Une chaîne aléatoire de 40 caractères **sans préfixe ni nom de

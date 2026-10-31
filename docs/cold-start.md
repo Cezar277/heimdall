@@ -98,23 +98,21 @@ Les variables Git héritées, les remplacements et les grafts locaux sont
 neutralisés. Les symlinks ne sont jamais suivis sur le disque : leur blob Git
 `120000`, qui contient le texte de leur cible, est scanné comme en `--staged`.
 Les commits de sous-modules (`160000`) sont exclus ; les binaires
-connus sont exclus. Les objets absents, clones superficiels, sorties invalides
+connus sont refusés (code 2), comme dans les scans arbre et index. Les objets
+absents, clones superficiels, sorties invalides
 et dépassements de budget donnent une erreur d'outillage. Les commits devenus
 inaccessibles (objets pendants, reflogs seuls) et les dépôts de sous-modules
 ne font pas partie de ce périmètre.
 
-Un suffixe technique seul n'autorise aucune exclusion : si le décodage
-échoue, le repli exige aussi `is_known_binary(data)`, comme le scanner de
-référence. Un contenu inconnu avec NUL et texte dans `evil.png` est refusé
+Le nom du fichier n'autorise aucune exclusion : un contenu binaire ou
+indécodable est refusé, quel que soit son suffixe. Un contenu inconnu avec
+NUL et texte dans `evil.png` est refusé
 en `ScanError` / code 2. Le parseur d'arbres convertit aussi les noms non UTF-8
 et chemins invalides en `ScanError` statique.
 
-`complete=True` signifie complet dans ce périmètre : les exclusions binaires
-techniques restent compatibles avec ce statut, sans entrée dans `skipped`.
-Un blob indécodable n'est exclu que si son suffixe est technique et que
-`is_known_binary(data)` est vrai. Il n'est pas mis en cache afin que le même
-blob sous un nom non technique soit revérifié et refusé. Ces exclusions ne
-prouvent donc pas que tous les blobs ont été analysés comme du texte.
+`complete=True` signifie complet dans ce périmètre : aucun binaire ou blob
+indécodable ne peut produire un rapport propre. Les fichiers trop volumineux
+sont signalés dans `skipped`, avec `complete=False` et un code de sortie 2.
 
 ## Taille, lots et mémoire (#109)
 

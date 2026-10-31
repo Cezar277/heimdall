@@ -149,13 +149,16 @@ def test_invalid_file_limit(repo: GitRepo, limit: int) -> None:
         history.collect_history(repo.root, max_file_bytes=limit)
 
 
-def test_empty_repo_and_binary(repo: GitRepo) -> None:
+@pytest.mark.parametrize("filename", ["image.png", "archive.zip", "binary.txt", "binary"])
+def test_empty_repo_and_binary(repo: GitRepo, filename: str) -> None:
     assert history.collect_history(repo.root, ci=True).commits_scanned == 0
-    repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00\xff" * 100)
+    repo.write_bytes(filename, b"\x89PNG\r\n\x1a\n" + b"\x00\xff" * 100)
     repo.commit_all("binary")
-    report = history.collect_history(repo.root, ci=True)
-    assert report.complete and not report.findings
-    assert CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci"]).exit_code == 0
+    with pytest.raises(ScanError):
+        history.collect_history(repo.root, ci=True)
+    result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
+    assert result.exit_code == 2
+    assert result.stdout == ""
 
 
 def test_bounds_fail_closed(repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
