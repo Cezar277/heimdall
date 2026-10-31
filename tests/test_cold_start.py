@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from click import unstyle
 from support.git_repo import GitRepo
 from typer.testing import CliRunner
 
@@ -141,10 +142,22 @@ def test_direct_qualify_target_ci_never_calls_model_or_journal(
 
 
 @pytest.mark.parametrize("command", ["cold-start", "deep-scan"])
-def test_help_documents_default_rejection_journal(command: str) -> None:
+@pytest.mark.parametrize("force_color", [False, True], ids=["plain", "ansi"])
+def test_help_documents_default_rejection_journal(
+    command: str, force_color: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if force_color:
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+    else:
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        monkeypatch.setenv("NO_COLOR", "1")
     result = CliRunner().invoke(app, [command, "--help"])
     assert result.exit_code == 0
-    output = " ".join(result.output.split())
+    if force_color:
+        assert "\x1b[" in result.output
+    # Rich styles option names separately, inserting ANSI within the prose.
+    output = " ".join(unstyle(result.output).split())
     assert "faux_positif" in output
     assert "chemin opérateur par défaut" in output
     assert "--ci ou --no-llm" in output
