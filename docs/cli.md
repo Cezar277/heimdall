@@ -125,7 +125,10 @@ Le mode strict est une correction issue de la revue de #165 (point HIGH) :
 la politique #59 excluait `vendor/`, `node_modules/` et les lockfiles, donc un
 secret posé dans `vendor/evil.py` n'était **jamais** signalé. Un secret y est
 un secret : aucun nom de fichier ou de répertoire de contenu n'exclut plus rien,
-et le contenu décide. Seule la base VCS est hors du périmètre audité.
+et le contenu décide. Seule la base VCS est hors du périmètre audité. Le
+paramètre de bibliothèque `strict` n'ouvre pas un second régime :
+`Scanner(root, strict=True)` et `Scanner(root, strict=False)` rendent le même
+périmètre (test `test_strict_mode_never_changes_the_content_perimeter`).
 L'historique VCS (`.git/`) n'est jamais parcouru par le mode arbre, et le
 compteur `heimdall.scanner.detect.Scanner.vcs_ignored` rend cet élagage
 observable. Ce compteur est propagé dans `ScanReport.vcs_ignored`, le champ

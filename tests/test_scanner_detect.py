@@ -859,6 +859,42 @@ def test_a_gitlink_file_is_not_mistaken_for_the_vcs_database(tmp_path: Path) -> 
     assert [finding.file for finding in scan(tmp_path)] == [".git"]
 
 
+def test_strict_mode_never_changes_the_content_perimeter(tmp_path: Path) -> None:
+    """Revue (LOW) : ``strict`` n'ouvre pas un second régime de périmètre.
+
+    Le paramètre reste accepté pour compatibilité avec #29, mais il ne change
+    rien : seule la base VCS est élaguée, et tous les fichiers de contenu
+    (``vendor/``, ``node_modules/``, lockfile, sortie de build, ``evil.png``
+    textuel) sont lus par contenu. Le test fige l'équivalence exacte des
+    Findings et des compteurs entre ``strict=True`` et ``strict=False`` :
+    aucun futur appelant ne peut croire durcir le scan en passant ce drapeau.
+    """
+    _write(tmp_path, "app.py", "x = 1\n")
+    _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"\n')
+    _write(tmp_path, "node_modules/pkg/index.js", f'AWS = "{_aws("node")}"\n')
+    _write(tmp_path, "package-lock.json", f'AWS = "{_aws("lock")}"\n')
+    _write(tmp_path, "build/output.js", f'AWS = "{_aws("build")}"\n')
+    _write(tmp_path, "evil.png", f'AWS = "{_aws("png-text")}"\n')
+    _write(tmp_path, ".git/config", f'AWS = "{_aws("git-only")}"\n')
+
+    strict_scanner = Scanner(tmp_path, strict=True)
+    default_scanner = Scanner(tmp_path, strict=False)
+    strict_findings = strict_scanner.scan()
+    default_findings = default_scanner.scan()
+
+    assert strict_findings == default_findings
+    assert scan(tmp_path, strict=True) == scan(tmp_path, strict=False)
+    assert strict_scanner.vcs_ignored == default_scanner.vcs_ignored == 1
+    assert strict_scanner.files_scanned == default_scanner.files_scanned == 6
+    assert [finding.file for finding in strict_findings] == [
+        "build/output.js",
+        "evil.png",
+        "node_modules/pkg/index.js",
+        "package-lock.json",
+        "vendor/secret.txt",
+    ]
+
+
 def test_a_broken_file_in_the_strict_perimeter_is_fail_closed(tmp_path: Path) -> None:
     """Dans le contenu du dépôt, un fichier illisible reste fatal."""
     _write(tmp_path, "broken.bin", b"\x00\x01\x02not-decodable")

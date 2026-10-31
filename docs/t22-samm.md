@@ -37,6 +37,14 @@ livraison `b2304c6…` et y ajoute le correctif du 4ᵉ passage de la relecture
 (« APPROVE WITH COMMENTS » : garde **exécutable** du verdict propre, bornes
 Slack couplées par construction, re-pin des permaliens outillé).
 
+Révision finale re-pinnée : `69bad3a11b911185e70bc11da27c5df8c82596f0`
+(merge commit de la PR #154), complétée par `76a0e79` (mise à jour
+documentaire des permaliens). `python scripts/repin_samm.py --check` est vert
+sur `main` : les liens vers les fichiers encore livrés pointent `69bad3a…`,
+les preuves historiques restent sur leur révision d'origine. La 9ᵉ relecture
+(run `40565541009`) ne change ni le périmètre ni le code de détection ; elle
+ajoute le test d'équivalence de `strict` et clôt le re-pin.
+
 Les permaliens du tableau principal épinglent `b38dec1…` ; ceux de documentation
 épinglent `f4dc3c8…` (ADR-002) et `81a67df…` (ADR-001). **Ces permaliens
 décrivent la livraison précédente** : la relecture « REQUEST CHANGES » (2ᵉ
@@ -317,46 +325,52 @@ permalien sur un SHA intermédiaire) ; après le squash,
 | **Aucun remplacement de la racine ou d'un sous-répertoire entre contrôle et lecture ne détourne le parcours** | `heimdall/scanner/detect.py` (`_open_root_dir`, `_iter_files_at`, `_read_text_at`) | `tests/test_scanner_detect.py::test_a_root_swapped_between_recheck_and_open_is_fail_closed`, `::test_a_root_swapped_after_open_cannot_redirect_the_traversal` |
 | **Le helper binaire déprécié signale son usage et reste sans autorité** | `heimdall/scanner/exclusions.py` (`is_known_binary`) | `tests/test_scanner_detect.py::test_the_deprecated_binary_helper_warns_and_stays_without_authority`, `::test_scanner_does_not_consult_the_deprecated_binary_helper` |
 
-## Révisions à re-pinner après la fusion
+## Corrections issues de la relecture finale (9ᵉ passage, run `40565541009`)
 
-Les permaliens de cette fiche sont épinglés sur la révision du code testé
-`c391cc0b15cd58743e826a2d5947e9743507b9ef` (et, pour les sections
-antérieures, sur `b2304c6…`, `5de5140…` et `b38dec1…`). Tant que ces
-révisions sont des commits **intermédiaires** de la branche, la preuve est
-rejouable sur la branche mais **pourrit à la fusion** (un squash n'apporte pas
-les commits intermédiaires dans `main`) : les liens deviennent morts et la
-preuve n'est plus vérifiable par un auditeur.
+Cette relecture porte sur `a97f151` et ne demande aucun changement de
+comportement : les quatre points sont des LOW d'observabilité, de documentation
+et d'hygiène. Le périmètre « contenu décide » et les gardes fail-closed sont
+confirmés par exécution ; les preuves ci-dessous sont citées par nom de test.
 
-Le correctif du 5ᵉ passage est intégré dans l'historique de la branche
-(`44bfb19` → `05884f4` → `5be81e4`), puis `eb68425` résout le conflit de
-`main.py`. Ses preuves sont volontairement citées par **nom de test**
-(section « 5ᵉ passage »), sans permalien sur un SHA intermédiaire. Elles
-seront re-pinées avec le reste au SHA du squash.
-
-Le correctif du 6ᵉ passage est appliqué dans l'arbre de travail au-dessus de
-`eb684254ec6544f632a1f4732cd28aa1a14941ee` ; il n'a pas encore de SHA propre.
-Ses preuves sont également citées par **nom de test** (section « 6ᵉ passage »)
-et seront re-pinées avec le reste au SHA du squash. `repin_samm.py --check`
-est vert sur cet arbre ; il ne reste que le SHA final à fournir après fusion.
-
-| Révision | Commit | Passe |
+| Remarque | Correctif | Preuve |
 |---|---|---|
-| `c391cc0b15cd58743e826a2d5947e9743507b9ef` | fix(scanner): garde executable du verdict propre, bornes Slack couplees (#22) | 4ᵉ passage |
-| `44bfb191af4c804014eb108eac5c4f995973a1e6` | Fix(scanner): sécurisation TOCTOU et alignement documentaire | Base du correctif du 5ᵉ passage |
-| `5be81e45529a60e4c59523caf677bc4b90220256` | Fix(scanner): sécurisation finale --staged, observabilité CLI et TOCTOU ancêtres | 5ᵉ passage (intégré) |
-| `eb684254ec6544f632a1f4732cd28aa1a14941ee` | Résolution du conflit dans main.py : conservation de la version en ligne | Base du correctif du 6ᵉ passage (non commité) |
+| **LOW** — `[]` avec base VCS élaguée reste `exit 0` en local | politique inchangée (un arbre réellement vide est propre en local) ; `--ci` refuse déjà (code 2) un arbre `vcs_ignored > 0` / `files_scanned == 0`, et le test fige que `--staged` couvre le contenu indexé. La documentation interdit de consommer `scan()` nu en hook/CI | `heimdall/cli/scan.py` (`_collect_tree`), `docs/scanner.md`, `docs/cli.md` ; `tests/test_cli_scan.py::test_scan_tree_vcs_only_is_policy_and_staged_covers_content` |
+| **LOW** — helper nominal déprécié encore importable | `is_known_binary` reste importable pour compatibilité mais émet un `DeprecationWarning`, n'est pas dans `__all__`, et `docs/scanner.md` interdit explicitement de brancher un périmètre dessus ; le scanner n'utilise que `_is_known_binary` | `heimdall/scanner/exclusions.py`, `docs/scanner.md` ; `tests/test_scanner_detect.py::test_the_deprecated_binary_helper_warns_and_stays_without_authority`, `::test_scanner_does_not_consult_the_deprecated_binary_helper`, `::test_the_deprecated_binary_helper_is_not_exported` |
+| **LOW** — paramètre `strict` sans effet | documenté « strict ignoré, seul régime = contenu décide + VCS élaguée » et désormais figé par un test d'équivalence exacte des Findings et des compteurs entre `strict=True` et `strict=False` | `heimdall/scanner/detect.py` (`Scanner`), `docs/scanner.md`, `docs/cli.md` ; `tests/test_scanner_detect.py::test_strict_mode_never_changes_the_content_perimeter` |
+| **LOW** — hygiène PR (4 sous-tickets) et preuves à re-pinner | exception de regroupement maintenue et tracée pour validation par les mainteneurs ; le re-pin est exécuté sur le merge commit `69bad3a…` et `repin_samm.py --check` est vert. Les preuves historiques restent épinglées sur leur révision d'origine | `docs/t22-samm.md#exception-de-regroupement`, `scripts/repin_samm.py`, `tests/security/test_samm_permalinks.py` |
 
-Après la fusion (SHA du squash connu), re-pince **en une commande** :
+### Ce que le correctif permet désormais de prouver
+
+| Exigence vérifiée | Implémentation | Test et preuve permanente |
+|---|---|---|
+| **`strict` ne change jamais le périmètre** : mêmes Findings, mêmes compteurs | `heimdall/scanner/detect.py` (`Scanner`) | `tests/test_scanner_detect.py::test_strict_mode_never_changes_the_content_perimeter` |
+| **Un arbre VCS-only reste un 0 local assumé, mais `--ci` refuse et `--staged` couvre l'index** | `heimdall/cli/scan.py` (`_collect_tree`, `_collect_staged`) | `tests/test_cli_scan.py::test_scan_tree_vcs_only_is_policy_and_staged_covers_content` |
+| **Le helper binaire déprécié reste sans autorité** | `heimdall/scanner/exclusions.py` (`is_known_binary`, `_is_known_binary`) | `tests/test_scanner_detect.py::test_the_deprecated_binary_helper_warns_and_stays_without_authority`, `::test_scanner_does_not_consult_the_deprecated_binary_helper` |
+| **Les permaliens de preuve ne pourrissent plus après fusion** | `docs/t22-samm.md` re-pinnée sur `69bad3a…` | `python scripts/repin_samm.py --check` (code 0), `tests/security/test_samm_permalinks.py` |
+
+## Re-pin après fusion (effectué)
+
+La PR #154 a été fusionnée par le merge commit
+`69bad3a11b911185e70bc11da27c5df8c82596f0` ; `76a0e79` a ensuite ré-écrit les
+permalinks de cette fiche. `python scripts/repin_samm.py --check` est vert sur
+`main` : les liens vers les fichiers encore livrés pointent `69bad3a…`, et les
+preuves historiques (fichier déplacé ou supprimé depuis) restent épinglées sur
+leur révision d'origine.
+
+Les SHA intermédiaires des passages 2 à 8 restent cités dans les sections
+historiques ci-dessous ; ils documentent la revue, pas le code livré. Le
+tableau principal reste volontairement épinglé sur `b38dec1…` (livraison
+historique signalée par ⚠️), tandis que les liens vers les modules encore
+livrés ont été re-pincés. La procédure reste rejouable :
 
 ```sh
-python scripts/repin_samm.py --sha <sha-du-squash>   # ré-écrit la fiche
-python scripts/repin_samm.py --check                 # contrôle : 0 permutation
+python scripts/repin_samm.py --sha <sha-final>
+python scripts/repin_samm.py --check
 ```
 
 Le re-pin ne touche qu'aux permaliens dont le fichier est **encore livré** :
-les preuves historiques (fichier déplacé ou supprimé depuis) restent épinglées
-sur leur révision d'origine, sinon elles deviendraient des liens morts. La
-table ci-dessus est alors vidée, et `tests/security/test_samm_permalinks.py`
+les preuves historiques restent sur leur révision d'origine, sinon elles
+deviendraient des liens morts. `tests/security/test_samm_permalinks.py`
 vérifie qu'aucun permalien mort ne subsiste.
 
 ## Durcissements de l'amont conservés au rebase
@@ -477,28 +491,26 @@ binaire déprécié ; il ne change ni le découpage ni le périmètre des
 sous-tickets. L'exception reste **à valider explicitement par les mainteneurs**
 avant fusion.
 
+La relecture finale (9ᵉ passage, run `40565541009`) **maintient l'exception** :
+elle ne demande aucun nouveau découpage et confirme que le correctif restant
+est un test d'équivalence de `strict` plus la clôture du re-pin. L'exception
+reste **à valider explicitement par les mainteneurs**.
+
 ## Relecture et PR
 
-- PR : à ouvrir sur la branche
-  `22-t22-scanner-regex-de-signatures-et-exclusions` avec `Closes #22`.
-- Relecture inter-domaines et check `CI (/ci)` restent requis avant fusion.
-- La feuille SAMM externe n'est pas accessible depuis le dépôt ; reporter la
-  ligne ci-dessus avec le lien de la PR et le SHA final du **squash** (le
-  correctif du 5ᵉ passage est testé dans l'arbre de travail au-dessus de
-  `44bfb191af4c804014eb108eac5c4f995973a1e6`). Le tableau principal reste
-  épinglé sur la révision historique `b38dec179de6baf22fefd50056014e8ea26fc185`,
-  signalée par ⚠️ ; les corrections du 2ᵉ passage sont prouvées plus haut,
-  celles du 3ᵉ passage dans la section « 3ᵉ passage », celles du 4ᵉ passage
-  dans la section « 4ᵉ passage », celles du 5ᵉ passage dans la section
-  « 5ᵉ passage », celles du 6ᵉ passage dans la section « 6ᵉ passage » et
-  celles du 7ᵉ passage dans la section « 7ᵉ passage ».
-- **Permaliens des 5ᵉ, 6ᵉ et 7ᵉ passages** : pas de nouveau permalien sur un
-  SHA intermédiaire ; preuves citées par nom de test, re-pinées au SHA du
-  squash.
-- **Après la fusion** : re-pince la fiche sur le SHA du squash (une
-  commande, voir « Révisions à re-pinner après la fusion »), puis contrôle
-  `python scripts/repin_samm.py --check` : aucun permalien mort ne doit
-  subsister.
+- PR #154 fusionnée sur `main` (merge commit
+  `69bad3a11b911185e70bc11da27c5df8c82596f0`) ; la branche
+  `22-t22-scanner-regex-de-signatures-et-exclusions` est intégrée.
+- Relecture inter-domaines et check `CI (/ci)` effectués avant fusion.
+- La feuille SAMM externe n'est pas accessible depuis le dépôt ; la ligne
+  ci-dessus est reportable avec le lien de la PR et le SHA final `69bad3a…`.
+  Le tableau principal reste épinglé sur la révision historique
+  `b38dec179de6baf22fefd50056014e8ea26fc185`, signalée par ⚠️ ; les
+  corrections des passages 2 à 9 sont prouvées dans leurs sections
+  respectives.
+- **Permaliens** : le re-pin a été exécuté sur `69bad3a…` (voir « Re-pin
+  après fusion (effectué) ») ; `python scripts/repin_samm.py --check` est
+  vert et aucun permalien mort ne subsiste.
 
 ## Correctifs de la revue finale (run 40220479006)
 
