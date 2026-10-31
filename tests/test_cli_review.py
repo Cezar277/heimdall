@@ -1182,10 +1182,13 @@ def test_journal_read_normalizes_base_exceptions(
 ) -> None:
     journal.append(Decision.now(Choice.IGNORE, proposal.finding))
 
-    def broken_fstat(_descriptor: int) -> object:
+    def broken_check(_descriptor: int) -> None:
         raise error
 
-    monkeypatch.setattr("os.fstat", broken_fstat)
+    # Cible le garde du journal, pas ``os.fstat`` global : pytest 9.2+ utilise
+    # ``os.fstat`` pour sa capture, et un patch global ferait planter le runner
+    # au lieu de tester la normalisation de l'exception par le journal.
+    monkeypatch.setattr("heimdall.llm.rejections._check_file", broken_check)
     with pytest.raises(JournalError) as excinfo:
         journal.read()
     assert excinfo.value.__cause__ is None
@@ -1198,10 +1201,10 @@ def test_journal_append_normalizes_base_exceptions(
     monkeypatch: pytest.MonkeyPatch,
     error: BaseException,
 ) -> None:
-    def broken_fstat(_descriptor: int) -> object:
+    def broken_check(_descriptor: int) -> None:
         raise error
 
-    monkeypatch.setattr("os.fstat", broken_fstat)
+    monkeypatch.setattr("heimdall.llm.rejections._check_file", broken_check)
     with pytest.raises(JournalError) as excinfo:
         journal.append(Decision.now(Choice.IGNORE, proposal.finding))
     assert excinfo.value.__cause__ is None
