@@ -361,9 +361,21 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
         Verrouille LOW n°1 : ``peek`` + ``check_authenticated`` unique ne
         laissent aucune fenêtre inter-transactions (5×404 + 5×429 exacts,
         mémoire comme SQLite partagé).
+
+        Le busy-timeout SQLite de production (250 ms) est volontairement
+        fail-fast : sous 10 requêtes concurrentes, il peut produire des 503
+        transitoires avant même d'atteindre la décision de débit. Ce test
+        mesure l'atomicité du rate-limit, pas cette politique d'indisponibilité
+        (couverte par ``test_vault_availability``). On allonge donc uniquement
+        le busy-timeout ici pour rendre la rafale déterministe : les écritures
+        SQLite se sérialisent, puis les 5 admissions et les 5 refus sont exacts.
         """
         for backend in ("memory", "sqlite"):
-            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmp:
+            with (
+                self.subTest(backend=backend),
+                tempfile.TemporaryDirectory() as tmp,
+                patch("heimdall.vault.database.SQLITE_TIMEOUT_SECONDS", 5.0),
+            ):
                 target = create_app(
                     VaultSettings(
                         db_path=str(Path(tmp) / f"{backend}.db"),
