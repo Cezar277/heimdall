@@ -106,6 +106,14 @@ def scan(  # noqa: PLR0913, PLR0917
         "--no-allowlist",
         help="Désactive l'allowlist déterministe.",
     ),
+    no_gitignore: bool = typer.Option(
+        False,
+        "--no-gitignore",
+        help=(
+            "Scanne aussi les fichiers non suivis ignorés par .gitignore "
+            "(aucune exclusion Git). Sans effet avec --staged."
+        ),
+    ),
     ci: bool = typer.Option(
         False,
         "--ci",
@@ -122,13 +130,16 @@ def scan(  # noqa: PLR0913, PLR0917
         help="Sortie JSON sur stdout (contrat machine heimdall.scan.v1).",
     ),
 ) -> None:
-    """Scanne le dépôt à la recherche de secrets (#29 et #24).
+    """Scanne le dépôt à la recherche de secrets (#29, #24 et #59).
 
-    Par défaut, l'arbre de travail est analysé en **mode strict** : seules
-    les exclusions techniques de #59 restent (binaires, répertoires générés),
-    ``vendor/`` et les lockfiles sont donc parcourus. Avec ``--staged``, ce
-    sont les blobs **ajoutés ou modifiés** dans l'index git qui sont
-    analysés, sans aucune exclusion de chemin.
+    Par défaut, l'arbre de travail est analysé en **mode strict** : la base
+    VCS et les entrées non suivies qu'un ``.gitignore`` du dépôt déclare
+    ignorées sont écartées (compteurs ``vcs_ignored`` et ``git_ignored``).
+    Un fichier **suivi** est toujours analysé, même s'il matche un
+    ``.gitignore`` (``git add -f``) ; ``vendor/`` et les lockfiles non ignorés
+    sont donc parcourus. ``--no-gitignore`` restaure un parcours intégral.
+    Avec ``--staged``, ce sont les blobs **ajoutés ou modifiés** dans l'index
+    git qui sont analysés, sans aucune exclusion de chemin.
 
     L'allowlist déterministe (#24) écarte les cas évidents sans passer par
     le LLM et émet une trace pour chaque rejet (règle, fichier, ligne).
@@ -153,6 +164,7 @@ def scan(  # noqa: PLR0913, PLR0917
             config=config,
             allowlist=custom_allowlist,
             ci=ci,
+            respect_gitignore=not no_gitignore,
         )
         # Le **rendu** et le résumé --ci sont dans le même try que la
         # collecte : un échec de rendu (bug futur, panne mémoire, écriture
@@ -173,7 +185,8 @@ def scan(  # noqa: PLR0913, PLR0917
                 f"{len(report.findings)} secret(s) détecté(s), "
                 f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}, "
                 f"{report.vcs_ignored} base(s) VCS élaguée(s) "
-                "(historique non parcouru).",
+                "(historique non parcouru), "
+                f"{report.git_ignored} entrée(s) ignorée(s) par .gitignore.",
                 err=True,
             )
     except (ScanError, ToolFailure):

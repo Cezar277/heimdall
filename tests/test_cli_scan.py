@@ -335,6 +335,13 @@ def test_scan_report_refuses_an_invalid_vcs_ignored_count() -> None:
             ScanReport(scope="working-tree", findings=(), vcs_ignored=invalid)  # type: ignore[arg-type]
 
 
+def test_scan_report_refuses_an_invalid_git_ignored_count() -> None:
+    """Le champ ``git_ignored`` reste un entier positif ou nul au runtime."""
+    for invalid in (-1, True, 1.0, "1"):
+        with pytest.raises(ScanError):
+            ScanReport(scope="working-tree", findings=(), git_ignored=invalid)  # type: ignore[arg-type]
+
+
 def test_scan_broken_stderr_still_exits_two(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -425,6 +432,7 @@ def test_collect_tree_uses_the_pinned_root(
             seen.append((Path(root), strict))
             self.traces: tuple[object, ...] = ()
             self.vcs_ignored = 0
+            self.git_ignored = 0
 
         def scan(self, *, deadline: float | None = None) -> list[object]:
             assert deadline is not None
@@ -625,6 +633,128 @@ def test_scan_tree_strict_scans_text_with_binary_suffix(git_repo: GitRepo) -> No
     assert resultat.exit_code == EXIT_FINDINGS
     assert "evil.png:1" in resultat.stdout
     assert FAKE_AWS_KEY not in resultat.output
+
+
+def test_scan_tree_skips_a_gitignored_untracked_secret(git_repo: GitRepo) -> None:
+    """#59 : un fichier non suivi et ignoré est écarté et **compté**.
+
+    Le compteur ``git_ignored`` rend l'exclusion observable dans le JSON, le
+    texte et le résumé ``--ci``. ``--no-gitignore`` rétablit le parcours
+    intégral : le secret ignoré est alors détecté (code 1), pas un faux 0.
+    """
+    git_repo.write(".gitignore", ".env\n")
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage(".gitignore", "app.py")
+    git_repo.commit_all("base")
+    git_repo.write(".env", f'AWS = "{FAKE_AWS_KEY}"\n')
+
+    resultat = _run("scan", "--json", "--no-allowlist", str(git_repo.root))
+    assert resultat.exit_code == EXIT_CLEAN
+    document = json.loads(resultat.stdout)
+    assert document["findings"] == []
+    assert document["git_ignored"] == 1
+    _validate_scan_document(document)
+    assert FAKE_AWS_KEY not in resultat.output
+
+    resultat_texte = _run("scan", "--no-allowlist", str(git_repo.root))
+    assert resultat_texte.exit_code == EXIT_CLEAN
+    assert "Gitignore : 1 entrée(s)" in resultat_texte.stdout
+
+    resultat_ci = _run("scan", "--ci", "--no-allowlist", str(git_repo.root))
+    assert resultat_ci.exit_code == EXIT_CLEAN
+    assert "1 entrée(s) ignorée(s) par .gitignore" in resultat_ci.stderr
+
+    resultat_integral = _run(
+        "scan",
+        "--json",
+        "--no-allowlist",
+        "--no-gitignore",
+        str(git_repo.root),
+    )
+    assert resultat_integral.exit_code == EXIT_FINDINGS
+    document_integral = json.loads(resultat_integral.stdout)
+    assert document_integral["git_ignored"] == 0
+    assert [finding["file"] for finding in document_integral["findings"]] == [".env"]
+    assert FAKE_AWS_KEY not in resultat_integral.output
+
+
+def test_scan_tree_always_scans_a_tracked_file_matching_gitignore(
+    git_repo: GitRepo,
+) -> None:
+    """#59 : ``git add -f`` rend le fichier suivi ; le motif ne le cache pas."""
+    git_repo.write(".gitignore", "config.py\n")
+    git_repo.stage(".gitignore")
+    git_repo.commit_all("base")
+    git_repo.write("config.py", f'AWS = "{FAKE_AWS_KEY}"\n')
+    git_repo.git("add", "-f", "config.py")
+    git_repo.commit_all("tracked")
+
+    resultat = _run("scan", "--json", "--no-allowlist", str(git_repo.root))
+    assert resultat.exit_code == EXIT_FINDINGS
+    document = json.loads(resultat.stdout)
+    assert document["git_ignored"] == 0
+    assert [finding["file"] for finding in document["findings"]] == ["config.py"]
+    assert FAKE_AWS_KEY not in resultat.output
+
+
+def test_scan_tree_ignored_binary_is_skipped_without_code_two(
+    git_repo: GitRepo,
+) -> None:
+    """#59 : un binaire ignoré n'est pas ouvert ; ``--no-gitignore`` le refuse."""
+    git_repo.write(".gitignore", "image.png\n")
+    git_repo.stage(".gitignore")
+    git_repo.commit_all("base")
+    git_repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 512)
+
+    resultat = _run("scan", "--no-allowlist", str(git_repo.root))
+    assert resultat.exit_code == EXIT_CLEAN
+    assert "Gitignore : 1 entrée(s)" in resultat.stdout
+
+    resultat_integral = _run("scan", "--no-allowlist", "--no-gitignore", str(git_repo.root))
+    assert resultat_integral.exit_code == EXIT_ERROR
+    assert resultat_integral.stderr.strip() == SCAN_ERROR_MESSAGE
+
+
+def test_scan_ci_refuses_a_tree_with_only_gitignored_content(
+    git_repo: GitRepo,
+) -> None:
+    """#59 : aucune entrée lue => code 2 en CI, jamais un faux « propre ».
+
+    Le ``.gitignore`` s'ignore lui-même : l'arbre ne contient que des entrées
+    non suivies et ignorées. En local, il reste un arbre vide (0) ; en CI, le
+    verdict serait indistinguable d'un dépôt propre sans contenu analysé.
+    """
+    git_repo.write(".gitignore", ".gitignore\n.env\n")
+    git_repo.write(".env", f'AWS = "{FAKE_AWS_KEY}"\n')
+    resultat_local = _run("scan", "--json", "--no-allowlist", str(git_repo.root))
+    assert resultat_local.exit_code == EXIT_CLEAN
+    document = json.loads(resultat_local.stdout)
+    assert document["git_ignored"] == 2
+    assert document["count"] == 0
+
+    resultat_ci = _run("scan", "--ci", "--no-allowlist", str(git_repo.root))
+    assert resultat_ci.exit_code == EXIT_ERROR
+    assert resultat_ci.stderr.strip() == SCAN_ERROR_MESSAGE
+    assert FAKE_AWS_KEY not in resultat_ci.output
+
+
+def test_scan_staged_scans_a_gitignored_secret(git_repo: GitRepo) -> None:
+    """#59 : ``.gitignore`` ne réduit jamais le périmètre ``--staged``.
+
+    Le fichier ignoré est ajouté de force dans l'index : c'est exactement ce
+    que le commit va contenir, donc il doit être analysé, options comprises.
+    """
+    git_repo.write(".gitignore", ".env\n")
+    git_repo.stage(".gitignore")
+    git_repo.commit_all("base")
+    git_repo.write(".env", f'AWS = "{FAKE_AWS_KEY}"\n')
+    git_repo.git("add", "-f", ".env")
+
+    for options in ((), ("--no-gitignore",)):
+        resultat = _run("scan", "--staged", "--no-allowlist", *options, str(git_repo.root))
+        assert resultat.exit_code == EXIT_FINDINGS
+        assert ".env:1" in resultat.stdout
+        assert FAKE_AWS_KEY not in resultat.output
 
 
 def test_scan_tree_strict_refuses_real_binary_suffix(git_repo: GitRepo) -> None:
@@ -1823,6 +1953,7 @@ def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
         "traces",
         "config_hash",
         "vcs_ignored",
+        "git_ignored",
     }
 
 
@@ -1846,6 +1977,7 @@ def test_scan_schema_refuses_invalid_documents() -> None:
         "traces": [],
         "config_hash": None,
         "vcs_ignored": 0,
+        "git_ignored": 0,
     }
     assert validator.is_valid(base)
     for invalide in (
@@ -1857,6 +1989,8 @@ def test_scan_schema_refuses_invalid_documents() -> None:
         dict(base, extra=True),  # contrat fermé
         dict(base, vcs_ignored=-1),
         dict(base, vcs_ignored="1"),
+        dict(base, git_ignored=-1),
+        dict(base, git_ignored="1"),
     ):
         assert not validator.is_valid(invalide), invalide
     # `count` cohérent avec `findings` : inexprimable en JSON Schema pur,

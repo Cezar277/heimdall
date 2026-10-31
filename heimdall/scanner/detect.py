@@ -15,7 +15,9 @@ Invariants :
 - les liens symboliques ne sont jamais suivis, ni dans le périmètre, ni dans
   le chemin de la racine, et les fichiers restent confinés à la racine résolue ;
 - les lectures sont bornées (1 Mio) et les regex sont linéaires et bornées ;
-- seule la base VCS est écartée.
+- la base VCS est écartée, et les seules autres entrées écartées sont les
+  fichiers **non suivis** qu'un ``.gitignore`` du dépôt déclare ignorés :
+  un fichier suivi reste toujours lu, même si un motif le matche.
 
 L'interface est figée par #53 : ``Finding`` est l'unique classe canonique de
 ``heimdall.scanner.finding`` (réexportée ici pour compatibilité historique),
@@ -56,6 +58,7 @@ from heimdall.scanner.finding import (
     FindingStatus,
     validate_relative_path,
 )
+from heimdall.scanner.gitignore import GitExclusions, collect_git_exclusions
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import _open_flags, _resolve_root
 from heimdall.scanner.signature_engine import MAX_FINDINGS
@@ -171,15 +174,26 @@ class Scanner:
     Toute erreur de lecture interrompt le scan en ``ScanError`` (fail-closed) :
     aucun résultat partiel n'est jamais retourné.
 
-    Seule la base VCS (``.git/``, ``.hg/``, ``.svn/``) est écartée, par
+    Seule la base VCS (``.git/``, ``.hg/``, ``.svn/``) est écartée par
     politique et sans ``ScanError`` ; :attr:`vcs_ignored` compte les bases
     ainsi élaguées lors du dernier scan. Un fichier régulier nommé ``.git``
     (gitlink de worktree ou de sous-module) n'est **pas** une base VCS : son
-    contenu est lu comme tout autre fichier.
+    contenu est lu comme tout autre fichier. Les entrées **non suivies** et
+    ignorées par un ``.gitignore`` du dépôt sont également écartées
+    (:attr:`git_ignored`), mais jamais un fichier suivi : voir
+    ``respect_gitignore``.
 
     ``strict`` (mode strict, livré par #29 pour la CLI ``heimdall scan``)
     reste accepté pour compatibilité : seule la base VCS est écartée, quel que
     soit le mode.
+
+    ``respect_gitignore`` (défaut ``True``) active les **exclusions Git sûres**
+    de #59 : un fichier non suivi qu'un ``.gitignore`` du dépôt déclare
+    ignoré n'est pas lu. Un fichier **suivi** reste toujours scanné, même si
+    un ``.gitignore`` le matche (``git add -f``) : aucun nom ne peut donc
+    cacher un secret qui peut partir dans un commit. Une panne de Git
+    (binaire absent, dépôt invalide) désactive ces exclusions et parcourt tout
+    l'arbre — le scanner lit plus, jamais moins.
     """
 
     __slots__ = (
@@ -187,9 +201,12 @@ class Scanner:
         "_hasher",
         "_entropy_config",
         "_files_scanned",
+        "_git_exclusions",
+        "_git_ignored",
         "_max_bytes",
         "_max_files",
         "_max_findings",
+        "_respect_gitignore",
         "_root",
         "_root_id",
         "_single",
@@ -209,7 +226,12 @@ class Scanner:
         max_bytes: int | None = None,
         max_findings: int | None = None,
         allowlist: Allowlist | None = None,
+        respect_gitignore: bool = True,
     ) -> None:
+        # Un booléen strict : une chaîne ou un entier ne doit jamais activer
+        # ou désactiver les exclusions par accident.
+        if not isinstance(respect_gitignore, bool):
+            raise ValueError("politique d'exclusions Git invalide")
         # Les bornes sont validées avant tout accès disque : une surcharge
         # explicite ne peut ni annuler ni relever les plafonds par défaut.
         self._max_files = _checked_bound(max_files, MAX_FILES)
@@ -243,8 +265,11 @@ class Scanner:
             raise ValueError("configuration d'entropie invalide")
         self._entropy_config = entropy_config
         self._strict = strict
+        self._respect_gitignore = respect_gitignore
         self._allowlist = allowlist if allowlist is not None else Allowlist.empty()
         self._traces: list[AllowlistTrace] = []
+        self._git_exclusions: GitExclusions | None = None
+        self._git_ignored = 0
         self._vcs_ignored = 0
         self._files_scanned = 0
 
@@ -279,6 +304,66 @@ class Scanner:
         d'élagage reste inchangée, et ``--staged`` couvre le contenu indexé.
         """
         return self._files_scanned
+
+    @property
+    def git_ignored(self) -> int:
+        """Entrées non suivies ignorées par ``.gitignore`` lors du dernier scan.
+
+        Chaque répertoire élagué compte pour **une** entrée (Git le rend
+        comme une seule entrée ``--directory``), chaque fichier ignoré pour
+        une. Un fichier **suivi** n'est jamais compté : il reste scanné.
+        Ce compteur rend observable une exclusion qui, sans lui, produirait
+        un ``[]`` indistinguable d'un arbre réellement propre. Il est remis
+        à zéro à chaque scan et vaut toujours 0 avec
+        ``respect_gitignore=False``.
+        """
+        return self._git_ignored
+
+    def _collect_exclusions(self, deadline: float | None) -> None:
+        """Collecte les exclusions Git en re-vérifiant l'identité de la racine.
+
+        Git lit le dépôt par son chemin : un remplacement de la racine entre
+        la re-vérification et cet appel pourrait faire calculer les
+        exclusions sur un autre arbre. L'identité ``(st_dev, st_ino)`` est
+        donc comparée **avant et après** la collecte ; toute divergence lève
+        ``ScanError`` (aucun verdict sur un périmètre substitué).
+        """
+        self._git_exclusions = None
+        if not self._respect_gitignore or self._single is not None:
+            return
+        try:
+            before = os.lstat(self._root)
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+        exclusions = collect_git_exclusions(self._root, deadline=deadline)
+        try:
+            after = os.lstat(self._root)
+        except OSError:
+            raise ScanError(_SCAN_ERROR) from None
+        if (
+            (before.st_dev, before.st_ino) != self._root_id
+            or (after.st_dev, after.st_ino) != self._root_id
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        ):
+            raise ScanError(_SCAN_ERROR)
+        self._git_exclusions = exclusions
+
+    def _skip_git_excluded(self, relative: str, *, is_dir: bool) -> bool:
+        """Vrai si l'entrée est une exclusion Git et doit être sautée.
+
+        L'appelant a déjà classé l'entrée (``lstat``). Un fichier suivi
+        n'est jamais dans les ensembles d'exclusions (Git le rend
+        ``--cached``) ; la décision ne dépend donc jamais du nom.
+        """
+        exclusions = self._git_exclusions
+        if exclusions is None:
+            return False
+        skipped = (
+            exclusions.skip_dir(f"{relative}/") if is_dir else exclusions.skip_file(relative)
+        )
+        if skipped:
+            self._git_ignored += 1
+        return skipped
 
     def _recheck_root(self) -> None:
         """Re-vérifie la racine **et ses ancêtres** par ``lstat`` avant lecture.
@@ -319,11 +404,13 @@ class Scanner:
         La CLI ``heimdall scan`` l'utilise pour borner aussi le mode arbre.
 
         Le retour ne couvre **que** le périmètre lu : la base VCS est
-        élaguée par politique (compteur :attr:`vcs_ignored`) et l'historique
-        n'est jamais parcouru. Un ``[]`` ne prouve donc pas un historique
-        propre ; ``--staged`` couvre le contenu indexé, pas l'historique.
-        :attr:`files_scanned` indique combien de fichiers de contenu ont été
-        réellement lus lors de cet appel.
+        élaguée par politique (compteur :attr:`vcs_ignored`), les entrées non
+        suivies ignorées par ``.gitignore`` sont écartées (compteur
+        :attr:`git_ignored`) et l'historique n'est jamais parcouru. Un ``[]``
+        ne prouve donc pas un historique propre ; ``--staged`` couvre le
+        contenu indexé, pas l'historique. :attr:`files_scanned` indique
+        combien de fichiers de contenu ont été réellement lus lors de cet
+        appel.
 
         La racine est **ouverte** en ``O_NOFOLLOW|O_DIRECTORY`` puis
         parcourue par descripteurs (``openat``/``scandir``) : un remplacement
@@ -333,10 +420,13 @@ class Scanner:
         conserve les gardes par fichier (``resolve`` + ``is_relative_to`` +
         ``O_NOFOLLOW`` + identité ``dev/ino``).
         """
-        # Compteurs remis à zéro pour que `vcs_ignored` et `files_scanned`
-        # décrivent **ce** scan, pas une accumulation d'appels successifs sur
-        # la même instance — y compris si l'échéance refuse avant lecture.
+        # Compteurs remis à zéro pour que `vcs_ignored`, `git_ignored` et
+        # `files_scanned` décrivent **ce** scan, pas une accumulation d'appels
+        # successifs sur la même instance — y compris si l'échéance refuse
+        # avant lecture.
         self._vcs_ignored = 0
+        self._git_ignored = 0
+        self._git_exclusions = None
         self._files_scanned = 0
         if deadline is not None and time.monotonic() > deadline:
             raise ScanError(_SCAN_ERROR)
@@ -344,6 +434,9 @@ class Scanner:
         # un lien ou un répertoire substitué est refusé, même si la racine
         # est ensuite ouverte par son chemin.
         self._recheck_root()
+        # Exclusions Git sûres (#59) : uniquement des entrées non suivies et
+        # ignorées. Une panne de Git rend `None` et le parcours reste complet.
+        self._collect_exclusions(deadline)
         if _DIR_FD_SUPPORTED:
             root_descriptor = self._open_root_dir()
             try:
@@ -509,8 +602,10 @@ class Scanner:
         sous-répertoire est ouvert en ``O_NOFOLLOW|O_DIRECTORY`` puis comparé
         à l'identité observée. Un remplacement par un lien, un autre
         répertoire ou un fichier est donc refusé avant lecture. La base VCS
-        est la seule entrée élaguée (et comptée) ; tous les autres noms sont
-        parcourus, quel que soit leur contenu.
+        est élaguée (et comptée) ; les entrées non suivies ignorées par
+        ``.gitignore`` sont aussi écartées (et comptées), mais jamais un
+        fichier suivi ; tous les autres noms sont parcourus, quel que soit
+        leur contenu.
         """
         directories: list[tuple[str, os.stat_result]] = []
         files: list[tuple[str, str]] = []
@@ -518,6 +613,12 @@ class Scanner:
             relative = f"{prefix}{name}"
             metadata = self._lstat_at(dir_fd, name)
             mode = metadata.st_mode
+            # Exclusions Git (#59) : une entrée non suivie et ignorée n'est
+            # jamais lue. Le prédicat porte sur l'état Git, jamais sur le nom.
+            # Un lien ignoré est donc écarté sans être suivi ; un lien suivi ou
+            # non ignoré reste refusé par la garde ci-dessous.
+            if self._skip_git_excluded(relative, is_dir=stat.S_ISDIR(mode)):
+                continue
             if stat.S_ISLNK(mode):
                 # Un lien nommé comme une base VCS n'est jamais suivi : il est
                 # élagué et compté comme la base elle-même. Tout autre lien est
@@ -571,7 +672,9 @@ class Scanner:
             for name in sorted(directories):
                 # Le nom ne décide jamais du contenu : un arbre de tiers
                 # (vendor/, node_modules/, .venv/…) est parcouru, car un
-                # secret y est un secret. Seule la base VCS est hors périmètre.
+                # secret y est un secret. Seule la base VCS est hors
+                # périmètre par son nom ; une exclusion Git (#59) dépend de
+                # l'état **suivi/ignoré**, jamais du nom seul.
                 # Politique VCS assumée : la base VCS (.git/, .hg/, .svn/)
                 # n'est pas le contenu du dépôt et son historique n'est jamais
                 # scanné par l'arbre, par design (ce n'est pas un échec de
@@ -583,6 +686,12 @@ class Scanner:
                     # ni contenu n'est exposé.
                     self._vcs_ignored += 1
                     continue
+                try:
+                    relative_dir = (current_path / name).relative_to(self._root).as_posix()
+                except ValueError:
+                    raise ScanError(_SCAN_ERROR) from None
+                if self._skip_git_excluded(relative_dir, is_dir=True):
+                    continue
                 if not _not_link(current_path / name):
                     raise ScanError(_SCAN_ERROR)
                 kept.append(name)
@@ -593,10 +702,13 @@ class Scanner:
                     relative = path.relative_to(self._root).as_posix()
                 except ValueError:
                     raise ScanError(_SCAN_ERROR) from None
-                # Aucun fichier n'est exclu par son nom : le contenu décide.
-                # La base VCS est un **répertoire** déjà élaguée ci-dessus ;
-                # un fichier régulier nommé `.git` (gitlink) n'est donc pas
-                # classé hors périmètre et sera lu comme tout autre fichier.
+                # Exclusions Git (#59) : uniquement des entrées non suivies
+                # et ignorées, jamais un nom de fichier. La base VCS est un
+                # **répertoire** déjà élaguée ci-dessus ; un fichier régulier
+                # nommé `.git` (gitlink) n'est donc pas classé hors périmètre
+                # et sera lu comme tout autre fichier.
+                if self._skip_git_excluded(relative, is_dir=False):
+                    continue
                 # Un chemin qui mènerait encore dans une base VCS est refusé,
                 # jamais sauté silencieusement. Défense en profondeur : ce
                 # chemin est inatteignable via `os.walk` (le répertoire VCS

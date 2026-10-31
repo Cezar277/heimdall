@@ -83,7 +83,13 @@
       "type": "integer",
       "minimum": 0,
       "default": 0,
-      "description": "Nombre de bases VCS (`.git/`, `.hg/`, `.svn/`) élaguées par politique lors d'un scan d'arbre. Toujours 0 en `--staged`, qui ne parcourt pas l'arbre. Un `0` de ce champ signifie « aucune base rencontrée », jamais « historique analysé ». En mode `--ci`, un arbre réduit à sa base VCS sans aucun contenu lu (`vcs_ignored > 0` et aucun fichier analysé) est refusé en code 2 : il ne produit donc pas de document JSON avec un faux verdict propre."
+      "description": "Nombre de bases VCS (`.git/`, `.hg/`, `.svn/`) élaguées par politique lors d'un scan d'arbre. Toujours 0 en `--staged`, qui ne parcourt pas l'arbre. Un `0` de ce champ signifie « aucune base rencontrée », jamais « historique analysé ». En mode `--ci`, un arbre sans aucun contenu lu alors qu'une exclusion a été appliquée (`vcs_ignored > 0` ou `git_ignored > 0`) est refusé en code 2 : il ne produit donc pas de document JSON avec un faux verdict propre."
+    },
+    "git_ignored": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Nombre d'entrées non suivies et ignorées par un `.gitignore` du dépôt, écartées lors d'un scan d'arbre (#59) : un fichier ignoré compte pour une entrée, un répertoire ignoré élagué compte aussi pour une. Un fichier suivi n'est jamais compté ni écarté, même si un `.gitignore` le matche (`git add -f`) : il reste analysé. Toujours 0 en `--staged` et avec `--no-gitignore`. En mode `--ci`, un arbre dont aucune entrée de contenu n'a été lue (exclusions seules) est refusé en code 2."
     }
   }
 }

@@ -15,8 +15,9 @@ from heimdall.scanner.detect import Scanner as TreeScanner
 findings: list[Finding] = TreeScanner(".").scan()
 payload: list[dict[str, object]] = find_candidates(".")  # contrat #14
 
-# Mode strict (#29) : accepté pour compatibilité ; seule la base VCS est
-# écartée, quel que soit le mode. Tous les autres noms sont lus par contenu.
+# Mode strict (#29) : accepté pour compatibilité ; la base VCS et les entrées
+# non suivies ignorées sont écartées, quel que soit le mode. Tous les autres
+# noms sont lus par contenu.
 strict: list[Finding] = TreeScanner(".", strict=True).scan()
 
 # La base VCS est élaguée par politique, sans ScanError. Le compteur rend
@@ -25,14 +26,21 @@ scanner = TreeScanner(".")
 findings = scanner.scan()
 bases_vcs_ignorees: int = scanner.vcs_ignored
 fichiers_lus: int = scanner.files_scanned  # contenu réellement analysé
+
+# Exclusions Git sûres (#59) : seules les entrées non suivies et ignorées
+# par un .gitignore du dépôt sont écartées. Un fichier suivi reste scanné.
+entrees_ignorees_git: int = scanner.git_ignored
+integral: list[Finding] = TreeScanner(".", respect_gitignore=False).scan()
 ```
 
-La CLI propage ce compteur dans `ScanReport.vcs_ignored`, le champ
-`vcs_ignored` du JSON `--json` et le résumé `--ci` sur stderr (voir
-[cli.md](cli.md)). En mode `--ci`, un arbre réduit à sa base VCS
-(`vcs_ignored > 0` et `files_scanned == 0`) est refusé (code 2) : un code 0
-ne peut plus être confondu avec « non parcouru » par une automatisation qui
-ne lit que le code de sortie.
+La CLI propage ces compteurs dans `ScanReport.vcs_ignored` et
+`ScanReport.git_ignored`, les champs `vcs_ignored` et `git_ignored` du JSON
+`--json`, le texte et le résumé `--ci` sur stderr (voir [cli.md](cli.md)).
+En mode `--ci`, un arbre dont **aucun** contenu n'a été lu alors qu'une
+exclusion a été appliquée (`vcs_ignored > 0` ou `git_ignored > 0`, et
+`files_scanned == 0`) est refusé (code 2) : un code 0 ne peut plus être
+confondu avec « non parcouru » par une automatisation qui ne lit que le code
+de sortie.
 
 Le scanner d'arbre est `heimdall.scanner.detect.Scanner` (alias
 `TreeScanner` ci-dessus) : c'est lui qui porte `vcs_ignored` et les bornes de
@@ -108,15 +116,58 @@ strictement identique, déjà vue sur la même ligne, est dédupliquée.
 
 Le **contenu** décide, jamais le nom. Aucune extension, aucun lockfile et
 aucun répertoire de tiers (`vendor/`, `node_modules/`, `.venv/`, sorties de
-build…) n'est exclu du scan : un secret y est un secret. Un fichier texte
-nommé `evil.png` est lu et scanné comme un `.txt`.
+build…) n'est exclu **par son nom** : un secret y est un secret. Un fichier
+texte nommé `evil.png` est lu et scanné comme un `.txt`. La seule exclusion
+automatique de contenu est l'état Git décrit ci-dessous, et elle ne peut
+jamais viser un fichier suivi.
 
-Seule la **base VCS** (`.git/`, `.hg/`, `.svn/`) est élaguée : ce n'est pas le
-contenu du dépôt, et son historique n'est jamais parcouru par le mode arbre.
-Cet élagage est une politique, pas un échec de lecture : il ne lève pas
-`ScanError`, mais il est **compté** dans `TreeScanner.vcs_ignored` pour que
-l'appelant distingue « aucune base VCS » de « base VCS non parcourue ». Un
-`[]` vaut donc « rien trouvé dans le périmètre lu », jamais « historique
+### Exclusions Git sûres (#59)
+
+Le scanner d'arbre écarte les entrées **non suivies et ignorées par un
+`.gitignore` du dépôt** (motifs imbriqués et négations compris). Git est
+l'unique juge : le code ne contient aucune liste de noms, d'extensions ou de
+répertoires. La règle de sûreté est celle du commit :
+
+- un fichier **suivi** est **toujours** scanné, même si un `.gitignore` le
+  matche (`git add -f`) ou s'il vit dans un répertoire ignoré : c'est lui qui
+  peut partir dans un commit ;
+- un fichier **non suivi et non ignoré** est scanné : il peut être ajouté au
+  prochain commit ;
+- un fichier **non suivi et ignoré** est écarté : il ne peut pas partir dans
+  un commit sans devenir suivi, et sera alors scanné.
+
+Une seule commande Git (`git ls-files -t -z --cached --others --ignored
+--exclude-per-directory=.gitignore --directory`) rend un **snapshot unique**
+des entrées suivies et ignorées. Les fichiers suivis sont retirés des
+exclusions, et un répertoire ignoré qui contient un fichier suivi n'est
+jamais élagué. La liste est **configurable par le dépôt** : ses `.gitignore`
+versionnés. Les exclusions **globales** de la machine (`.git/info/exclude`,
+`core.excludesFile`, `~/.config/git/ignore`) ne sont **pas** honorées : elles
+varient d'un poste à l'autre et rendraient le verdict non déterministe. Pour
+les appliquer, l'opérateur les recopie dans un `.gitignore` versionné.
+
+L'appel Git est confiné (binaire résolu hors `PATH` hérité, argv figé, sans
+shell, environnement reconstruit, configuration système/globale neutralisée,
+`core.fsmonitor` et `core.untrackedCache` désactivés, stdin fermé, timeout
+et sortie bornés). Une **panne de Git** (binaire absent, dépôt invalide,
+sortie hors bornes) désactive les exclusions et **parcourt tout l'arbre** :
+le scanner lit plus, jamais moins. Seul le dépassement de l'échéance du scan
+lève `ScanError` (fail-closed).
+
+`TreeScanner.git_ignored` compte les entrées écartées lors du dernier scan
+(une par fichier ignoré, une par répertoire ignoré élagué) ; il est remis à
+zéro à chaque scan et vaut 0 avec `respect_gitignore=False`. Le mode
+**fichier unique** ne consulte jamais `.gitignore` : un fichier passé
+explicitement est toujours scanné. La CLI expose ce compteur dans
+`ScanReport.git_ignored`, le JSON `--json`, le texte et le résumé `--ci`, et
+`--no-gitignore` rétablit un parcours intégral (voir [cli.md](cli.md)).
+
+La **base VCS** (`.git/`, `.hg/`, `.svn/`) est également élaguée : ce n'est
+pas le contenu du dépôt, et son historique n'est jamais parcouru par le mode
+arbre. Cet élagage est une politique, pas un échec de lecture : il ne lève
+pas `ScanError`, mais il est **compté** dans `TreeScanner.vcs_ignored` pour
+que l'appelant distingue « aucune base VCS » de « base VCS non parcourue ».
+Un `[]` vaut donc « rien trouvé dans le périmètre lu », jamais « historique
 propre » ; `--staged` couvre le contenu indexé (ce que le commit va
 contenir), pas les commits déjà écrits.
 
@@ -124,22 +175,27 @@ contenir), pas les commits déjà écrits.
 effectivement lus. Un dépôt vide (seule la base VCS existe) reste un verdict
 0 **en bibliothèque et en local** : il est réellement vide, pas illisible. Un
 arbre réduit à `.git/config` rend donc 0 avec `vcs_ignored == 1` et
-`files_scanned == 0` en mode local ; **en `--ci`**, le même arbre est refusé
-(code 2) car aucun contenu n'a été lu. C'est pourquoi `--staged` est le
-périmètre opposable pour le contenu indexé et que le résumé `--ci` rappelle
-toujours le nombre de bases élaguées. Dès qu'au moins un fichier de contenu a
-été lu, l'élagage VCS reste une politique observable sans transformer un dépôt
-réel en erreur.
+`files_scanned == 0` en mode local ; un arbre dont toutes les entrées sont
+non suivies et ignorées rend 0 avec `git_ignored > 0` et
+`files_scanned == 0`. **En `--ci`**, ces deux arbres sont refusés (code 2)
+car aucun contenu n'a été lu. C'est pourquoi `--staged` est le périmètre
+opposable pour le contenu indexé et que le résumé `--ci` rappelle toujours
+les nombres de bases élaguées et d'entrées ignorées. Dès qu'au moins un
+fichier de contenu a été lu, ces exclusions restent une politique observable
+sans transformer un dépôt réel en erreur.
 
 Un fichier régulier nommé `.git` est un **gitlink** légitime (worktree,
 sous-module : `gitdir: …`), pas le répertoire `.git/` : seul un segment
 **parent** de chemin peut classer hors périmètre. Son contenu est lu comme
 celui de tout autre fichier.
 
-`strict` reste accepté pour compatibilité ; il ne change plus le périmètre
-(seule la base VCS est écartée dans tous les modes). C'est la correction du
-point HIGH relevé à la revue de #165 : la politique #59 laissait passer un
-secret posé dans `vendor/evil.py`, sans jamais le signaler.
+`strict` reste accepté pour compatibilité ; il ne change plus le périmètre :
+la base VCS et les entrées non suivies ignorées sont écartées dans tous les
+modes, et `respect_gitignore=False` rétablit un parcours intégral. C'est la
+correction du point HIGH relevé à la revue de #165 : une exclusion **par le
+nom** laissait passer un secret posé dans `vendor/evil.py`, sans jamais le
+signaler. Seul l'état Git (suivi ou non) peut désormais écarter une entrée,
+jamais son nom.
 
 Un contenu binaire **connu** (signature magique et majorité binaire) n'est pas
 silencieusement ignoré : le scanner lève `ScanError`. Un binaire inconnu
@@ -196,22 +252,25 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | contenu NUL non décodable (y compris un binaire connu) | `ScanError` |
 | fichier ou répertoire symlinké **interne** au périmètre | `ScanError` (jamais suivi) |
 | base VCS `.git/`, `.hg/`, `.svn/` | élaguée par politique, comptée dans `TreeScanner.vcs_ignored` |
+| entrée **non suivie et ignorée** par un `.gitignore` du dépôt | écartée et comptée dans `TreeScanner.git_ignored` ; un fichier **suivi** n'est jamais écarté |
+| Git absent, dépôt invalide ou sortie Git hors bornes | exclusions désactivées, **parcours complet** (le scanner lit plus, jamais moins) |
 | arbre vide (seule la base VCS existe) en bibliothèque/local | liste vide (0) : arbre réellement vide, `files_scanned == 0` et `vcs_ignored == 1` |
-| arbre réduit à la base VCS en `--ci` | `ScanError` (code 2) : aucun contenu lu, un 0 serait ambigu |
+| arbre dont toutes les entrées sont exclues (base VCS ou `.gitignore`) en `--ci` | `ScanError` (code 2) : aucun contenu lu, un 0 serait ambigu |
 | fichier régulier nommé `.git` (gitlink) | lu par contenu, comme tout fichier |
 | scan réussi sans signature | liste vide (**périmètre lu** propre ; l'historique VCS n'est pas couvert) |
 
 > **Garde d'usage (hook/CI) :** le scanner d'arbre bibliothèque lit tous les
 > noms par contenu ; un `[]` vaut « rien trouvé dans le périmètre lu », jamais
 > « historique propre ». La base VCS est élaguée par politique et comptée
-> dans `TreeScanner.vcs_ignored` (+ `files_scanned` pour savoir si un contenu
-> a été lu). Pour un hook ou une CI, c'est la CLI `heimdall scan` qu'il faut
+> dans `TreeScanner.vcs_ignored`, les entrées non suivies ignorées dans
+> `TreeScanner.git_ignored` (+ `files_scanned` pour savoir si un contenu a
+> été lu). Pour un hook ou une CI, c'est la CLI `heimdall scan` qu'il faut
 > utiliser : elle refuse (code 2) tout fichier du périmètre non analysable et
 > analyse **sans aucune exclusion de chemin** les blobs de l'index en mode
 > `--staged` (voir [cli.md](cli.md)). Un scan incomplet sort en 2, jamais en
 > 0 ; un arbre vide reste un 0 assumé en local, mais `--ci` refuse (2) un
-> arbre réduit à sa base VCS sans contenu lu. C'est `--staged` qui couvre le
-> contenu indexé.
+> arbre réduit à des exclusions (base VCS ou `.gitignore`) sans contenu lu.
+> C'est `--staged` qui couvre le contenu indexé.
 
 Un scan incomplet ne devient donc jamais une liste vide ou partielle. Depuis
 #29, la CLI est branchée : `ScanError` produit le code 2 (erreur d'outillage),
@@ -244,13 +303,16 @@ jamais 0 ni 1.
   deux valeurs encodées sont détectées par entropie, sans décodage :
   rappel 0,75 sur `all`, 1,0 sur `core`. L'allowlist relève de #24.
 - Les fichiers binaires connus ne sont pas analysés : un secret placé dans un
-  binaire reste un faux négatif. Dans **les deux périmètres**, le scanner
-  **refuse** le fichier ou le blob (`ScanError`, code 2 pour la CLI) au lieu
-  de l'ignorer silencieusement. Les répertoires et fichiers textuels de
-  `node_modules/`, `vendor/`, `.venv/`, `build/`, `dist/`, `target/` ou
-  `htmlcov/` sont, eux, scannés dans les deux périmètres : aucun nom de
-  fichier ou de répertoire de contenu n'exclut plus rien. Seule la base VCS
-  est élaguée, et ce n'est pas du contenu.
+  binaire reste un faux négatif. Dans **les deux périmètres**, un binaire du
+  périmètre est **refusé** (`ScanError`, code 2 pour la CLI) au lieu d'être
+  ignoré silencieusement. Une entrée **non suivie et ignorée** par Git est
+  écartée avant lecture et comptée dans `TreeScanner.git_ignored` : elle ne
+  peut pas être commitée sans devenir suivie, donc sans être scannée. Les
+  répertoires et fichiers textuels de `node_modules/`, `vendor/`, `.venv/`,
+  `build/`, `dist/`, `target/` ou `htmlcov/` sont, eux, scannés dans les deux
+  périmètres : aucun nom de fichier ou de répertoire de contenu n'exclut
+  quoi que ce soit. Seules la base VCS et les entrées non suivies ignorées
+  sont élaguées, et ni l'une ni les autres ne sont du contenu commité.
 - La jointure multi-ligne est bornée à 4 Kio. Une affectation ou un jeton de
   longueur candidate sur une des lignes provoque `ScanError` lorsque cette
   borne est dépassée, sans exception par fournisseur. Les jetons individuels
