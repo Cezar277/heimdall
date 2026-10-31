@@ -140,11 +140,12 @@ Une seule commande Git (`git ls-files -t -z --cached --others --ignored
 --exclude-per-directory=.gitignore --directory`) rend un **snapshot unique**
 des entrées suivies et ignorées. Les fichiers suivis sont retirés des
 exclusions, et un répertoire ignoré qui contient un fichier suivi n'est
-jamais élagué. La liste est **configurable par le dépôt** : ses `.gitignore`
-versionnés. Les exclusions **globales** de la machine (`.git/info/exclude`,
-`core.excludesFile`, `~/.config/git/ignore`) ne sont **pas** honorées : elles
-varient d'un poste à l'autre et rendraient le verdict non déterministe. Pour
-les appliquer, l'opérateur les recopie dans un `.gitignore` versionné.
+jamais élagué. La liste est **configurable par le dépôt** : ses fichiers
+`.gitignore` (versionnés ou locaux), lus par Git. Les exclusions **globales**
+de la machine (`.git/info/exclude`, `core.excludesFile`, `~/.config/git/ignore`)
+ne sont **pas** honorées : elles varient d'un poste à l'autre et rendraient le
+verdict non déterministe. Pour les appliquer, l'opérateur les recopie dans un
+`.gitignore` du dépôt.
 
 L'appel Git est confiné (binaire résolu hors `PATH` hérité, argv figé, sans
 shell, environnement reconstruit, configuration système/globale neutralisée,

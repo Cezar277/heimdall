@@ -36,7 +36,7 @@ est donc livré sans aucune liste nominale :
 Les catégories demandées (`vendor/`, `node_modules/`, lockfiles, binaires)
 sont donc écartées **uniquement lorsque Git les déclare non suivies et
 ignorées**. La liste est configurable par le dépôt : ce sont ses fichiers
-`.gitignore` versionnés, motifs imbriqués et négations compris.
+`.gitignore` (versionnés ou locaux), motifs imbriqués et négations compris.
 
 ## 2. Traçabilité du ticket
 
@@ -132,7 +132,7 @@ prouvent le JSON, le texte, `--ci`, `--staged` et `--no-gitignore`.
 - Les exclusions **globales** de la machine ne sont pas honorées
   (`.git/info/exclude`, `core.excludesFile`, `~/.config/git/ignore`) : elles
   rendraient le verdict dépendant du poste. Pour les appliquer, les recopier
-  dans un `.gitignore` versionné.
+  dans un `.gitignore` du dépôt.
 - Le snapshot Git est pris **avant** le parcours. Une modification
   concurrente de l'index (par exemple `git add -f` pendant le scan) n'est pas
   détectée par le mode arbre ; c'est le périmètre `--staged` qui fait foi pour
