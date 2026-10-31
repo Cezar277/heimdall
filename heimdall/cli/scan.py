@@ -173,19 +173,24 @@ class ScanReport:
         return len(self.traces)
 
 
-def collect(
+def collect(  # noqa: PLR0913 - explicit scan options
     root: Path,
     *,
     staged: bool,
     config: str | Path | None = None,
     allowlist: Allowlist | None = None,
     ci: bool = False,
+    max_file_bytes: int | None = None,
+    skipped_files: list[str] | None = None,
 ) -> ScanReport:
     """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
-    Lève ``ScanError`` (ou ``ToolFailure``) si le périmètre n'a pas pu être
+    Lève ``ScanError`` si le périmètre n'a pas pu être
     analysé **en entier** : l'appelant transforme cela en code 2, jamais en
     code 0.
+
+    ``max_file_bytes`` et ``skipped_files`` sont réservés au mode arbre.
+    Les fournir avec ``staged=True`` lève ``ScanError`` avant tout accès Git.
 
     **Auto-attestation (CWE-345)** : si ``allowlist`` est fourni (API), la
     garde anti auto-attestation est contournée. Le seul usage légitime dans
@@ -195,9 +200,25 @@ def collect(
     de ``heimdall.toml`` interne. En cas de doute, ne pas injecter
     d'allowlist non-vide ou utiliser ``config`` externe / ``--no-allowlist``.
     """
-    if staged:
-        return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
-    return _collect_tree(root, config=config, custom_allowlist=allowlist, ci=ci)
+    if staged and (max_file_bytes is not None or skipped_files is not None):
+        raise ScanError("limite de fichier invalide")
+    if max_file_bytes is not None and (
+        type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES
+    ):
+        raise ScanError("limite de fichier invalide")
+    try:
+        if staged:
+            return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
+        return _collect_tree(
+            root,
+            config=config,
+            custom_allowlist=allowlist,
+            ci=ci,
+            max_file_bytes=max_file_bytes,
+            skipped_files=skipped_files,
+        )
+    except ToolFailure:
+        raise ScanError(_MSG_NOT_A_REPO) from None
 
 
 def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
@@ -219,13 +240,16 @@ def _verify_root_unchanged(access: GitAccess, root: Path) -> None:
         raise ScanError(_MSG_ROOT_CHANGED)
 
 
-def _read_worktree_file(path: Path) -> bytes | None:
+def _read_worktree_file(path: Path, *, max_bytes: int = MAX_CONFIG_BYTES) -> bytes | None:
     """Lit un fichier du worktree via la garde unique, sans suivre de lien.
 
     Retourne ``None`` au moindre doute : chemin non résoluble, lien
     symbolique, non-régulier, trop gros ou lecture incomplète. La taille est
-    bornée par :data:`MAX_CONFIG_BYTES` (ce helper ne sert qu'à la config).
+    bornée par :data:`MAX_CONFIG_BYTES` pour la config ; le cold start peut
+    demander au plus :data:`MAX_FILE_BYTES` pour un contexte candidat.
     """
+    if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_FILE_BYTES:
+        return None
     try:
         resolved = _resolve_root(path)
         # O_NONBLOCK évite qu'un FIFO placé à la place du fichier ne bloque
@@ -240,7 +264,7 @@ def _read_worktree_file(path: Path) -> bytes | None:
     try:
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_CONFIG_BYTES:
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
                 return None
             expected = metadata.st_size
             chunks: list[bytes] = []
@@ -252,8 +276,13 @@ def _read_worktree_file(path: Path) -> bytes | None:
                 chunks.append(chunk)
                 remaining -= len(chunk)
             content = b"".join(chunks)
-            # Un fichier qui a rétréci ou grossi pendant la lecture est refusé.
-            if len(content) != expected:
+            # Refuser aussi une réécriture de même taille pendant la lecture.
+            final = os.fstat(descriptor)
+            if (
+                len(content) != expected
+                or final.st_size != metadata.st_size
+                or final.st_mtime_ns != metadata.st_mtime_ns
+            ):
                 return None
             return content
         finally:
@@ -310,9 +339,7 @@ def _is_worktree_file_clean_and_tracked(
             f"blob {len(content)}\0".encode("ascii") + content,
             usedforsecurity=False,
         ).hexdigest()
-        blob_sha256 = hashlib.sha256(
-            f"blob {len(content)}\0".encode("ascii") + content
-        ).hexdigest()
+        blob_sha256 = hashlib.sha256(f"blob {len(content)}\0".encode("ascii") + content).hexdigest()
         verified = content if index_sha in (blob_sha1, blob_sha256) else None
         if verified is None:
             logger.debug("refus anti auto-attestation : configuration divergente (CWE-345)")
@@ -420,16 +447,12 @@ def _guard_anti_self_attestation(  # noqa: PLR0912, PLR0913
         # doit pas bloquer le scan (disponibilité). Idem pour `--config`
         # interne (`subdir/custom.toml` vs `other/subdir/custom.toml`).
         # Les deux côtés sont déjà normalisés (relatif au dépôt, `/`).
-        is_cfg_staged = any(
-            getattr(change, "path", None) == rel_cfg for change in staged_changes
-        )
+        is_cfg_staged = any(getattr(change, "path", None) == rel_cfg for change in staged_changes)
         if is_cfg_staged:
             # Message strictement statique : `rel_cfg` (entrée opérateur
             # normalisée) n'est jamais reflété (invariant 8). En CLI le
             # libellé est de toute façon masqué par le message générique.
-            raise ScanError(
-                "auto-attestation refusée : configuration stagée (CWE-345)"
-            )
+            raise ScanError("auto-attestation refusée : configuration stagée (CWE-345)")
         if is_staged_scan:
             content = _is_worktree_file_clean_and_tracked(
                 access,
@@ -461,18 +484,19 @@ def _load_allowlist_verified(
         # Message strictement statique : `verified.path` (entrée opérateur)
         # n'est jamais reflété (invariant 8), comme pour la garde ci-dessus.
         raise ScanError(
-            "auto-attestation refusée : configuration modifiée pendant "
-            "le chargement (CWE-345)"
+            "auto-attestation refusée : configuration modifiée pendant le chargement (CWE-345)"
         )
     return allowlist
 
 
-def _collect_tree(
+def _collect_tree(  # noqa: PLR0913 - explicit scan options
     root: Path,
     *,
     config: str | Path | None = None,
     custom_allowlist: Allowlist | None = None,
     ci: bool = False,
+    max_file_bytes: int | None = None,
+    skipped_files: list[str] | None = None,
 ) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
@@ -527,12 +551,22 @@ def _collect_tree(
             )
         )
     )
-    scanner = TreeScanner(access.root, strict=True, allowlist=allowlist)
+    scanner = TreeScanner(
+        access.root,
+        strict=True,
+        allowlist=allowlist,
+        max_file_bytes=max_file_bytes,
+        skipped_files=skipped_files,
+    )
+    skipped_before = len(skipped_files) if skipped_files is not None else 0
     findings = scanner.scan(deadline=deadline)
-    if ci and scanner.vcs_ignored > 0 and scanner.files_scanned == 0:
+    skipped_now = len(skipped_files) - skipped_before if skipped_files is not None else 0
+    if ci and scanner.vcs_ignored > 0 and scanner.files_scanned == 0 and skipped_now == 0:
         # Aucun contenu n'a été lu : le seul périmètre observé est une base
         # VCS élaguée. En CI stricte, un code 0 serait indistinguable d'un
         # dépôt propre pour une automatisation qui ne lit que la sortie.
+        # Le cold start rend explicitement les fichiers trop volumineux dans
+        # un rapport incomplet (code 2) : ce cas n'est pas un arbre VCS seul.
         logger.debug("refus --ci : arbre réduit à sa base VCS (aucun contenu lu)")
         raise ScanError(_MSG_VCS_ONLY)
     _call_timeout(deadline)

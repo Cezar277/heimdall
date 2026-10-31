@@ -26,6 +26,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from support.fake_secrets import fake_token
 
+from heimdall.scanner import detect as detect_module
 from heimdall.scanner import exclusions, hashing
 from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
@@ -67,6 +68,35 @@ def _fixed_hmac_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _aws(seed: str = "aws", prefix: str = "AKIA") -> str:
     return prefix + hashlib.sha256(f"heimdall-t22-{seed}".encode()).hexdigest()[:16].upper()
+
+
+@pytest.mark.parametrize("anchored", [False, True])
+@pytest.mark.parametrize("single", [False, True])
+def test_size_skip_preserves_confined_readers_and_file_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, anchored: bool, single: bool
+) -> None:
+    if anchored and not detect_module._DIR_FD_SUPPORTED:
+        pytest.skip("directory descriptors required")
+    monkeypatch.setattr(detect_module, "_DIR_FD_SUPPORTED", anchored)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    oversized = nested / "large.txt"
+    oversized.write_bytes(b"x" * 100)
+    (nested / "small.txt").write_bytes(b"safe\n")
+    original_read = os.read
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        assert os.fstat(descriptor).st_size <= 32, "oversized file must never be read"
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(os, "read", bounded_read)
+    skipped: list[str] = []
+    scanner = Scanner(oversized if single else tmp_path, max_file_bytes=32, skipped_files=skipped)
+    assert scanner.scan() == []
+    assert skipped == ["large.txt" if single else "nested/large.txt"]
+    assert scanner.files_scanned == (0 if single else 1)
+    with pytest.raises(ScanError):
+        Scanner(oversized if single else tmp_path, max_file_bytes=32).scan()
 
 
 def _stripe(seed: str = "stripe") -> str:
