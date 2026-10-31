@@ -1,0 +1,134 @@
+............................................... [  2%]
+......... [  2%]
+............................ [  3%]
+........................................................................ [  6%]
+........................................................................ [  9%]
+........................................................................ [ 12%]
+........................................................................ [ 16%]
+..................................................... [ 18%]
+........................................................................ [ 21%]
+........................................................................ [ 24%]
+........s............................................................................................................ [ 29%]
+......................... [ 30%]
+............................................ [ 32%]
+........................................................................................ [ 36%]
+.................................. [ 37%]
+............................................................ [ 40%]
+............................................................................................................. [ 45%]
+...................................sssssssssssssss...................... [ 48%]
+........................................................................ [ 51%]
+........................................................................ [ 54%]
+........................................................................ [ 57%]
+........................................................................ [ 60%]
+........................................................................ [ 63%]
+........................................................................ [ 66%]
+........................................................................ [ 69%]
+........................................................................ [ 72%]
+........................................................................................................... [ 77%]
+.............................................................................................................................. [ 82%]
+........................................ [ 84%]
+................................................................. [ 87%]
+.............. [ 88%]
+................................................ [ 90%]
+.................................................................... [ 93%]
+........................................................................................................................................... [ 99%]
+......................                                      [100%]
+=============================== warnings summary ===============================
+tests/test_vault_auth.py::ApiKeyVerificationTests::test_explicit_secret_store_path_is_shared_by_auth
+  <system-lib>/python3.13/traceback.py:311: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7d415580ac50>
+    self._code = kwargs.get("_code")
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_vault_auth.py::VaultKeyCliTests::test_list_on_empty_registry_says_nothing_registered
+  <venv>/lib/python3.13/site-packages/typer/core.py:686: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7d41558093f0>
+    def resolve_envvar_value(self, ctx: _click.Context) -> str | None:
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_vault_auth.py::VaultKeyCliTests::test_revoke_works_without_a_server_pepper
+  <system-lib>/python3.13/typing.py:429: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7d4157377c40>
+    return _caches[func](*args, **kwds)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_vault_availability.py::DatabaseAvailabilityTests::test_auth_access_error_is_503_but_unknown_key_is_401
+  <system-lib>/python3.13/traceback.py:293: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7d414d84c130>
+    def __init__(self, filename, lineno, name, *, lookup_line=True,
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_vault_integration_testclient.py::VaultInvalidApiKeyTests::test_missing_unknown_revoked_and_malformed_keys_are_rejected
+  <system-lib>/python3.13/contextlib.py:387: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7d415580b790>
+    async def __aenter__(self):
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_vault_integration_testclient.py::VaultCrossProjectAccessTests::test_forbidden_is_decided_before_the_resource_lookup
+  <system-lib>/python3.13/asyncio/locks.py:168: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7d415436cb80>
+    self._waiters = collections.deque()
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+tests/test_vault_integration_testclient.py::VaultOpenapiContractTests::test_live_error_bodies_carry_the_contract_required_fields
+  <system-lib>/python3.13/threading.py:593: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7d4156507010>
+    self._cond = Condition(Lock())
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================================ tests coverage ================================
+_______________ coverage: platform linux, python 3.13.5-final-0 ________________
+
+Name                                          Stmts   Miss Branch BrPart  Cover   Missing
+-----------------------------------------------------------------------------------------
+heimdall/__init__.py                              2      0      0      0   100%
+heimdall/cli/__init__.py                          0      0      0      0   100%
+heimdall/cli/cold_start.py                      113      3     34      3    96%   71, 94, 203
+heimdall/cli/history.py                         198      6     76      6    96%   82, 211, 217, 228, 248, 311
+heimdall/cli/main.py                             96      1     16      0    99%   292
+heimdall/cli/scan.py                            261     10     82      3    96%   240, 260->266, 317-319, 334-336, 409-410, 655
+heimdall/cli/vault_client.py                    372     54    140     22    84%   270-274, 333-338, 358-362, 426->428, 488-489, 545-549, 553-558, 559->561, 562-566, 570-575, 579-584, 637-641, 653-657, 674-678, 680-684, 686-690, 727-728, 773, 804-813, 816-820, 824-829, 831->833, 858, 934-935, 942-947, 984-985
+heimdall/cli/vault_keys.py                       80      9     12      0    90%   119-123, 154-156, 185-187
+heimdall/llm/__init__.py                          0      0      0      0   100%
+heimdall/llm/qualify.py                         121      0     26      0   100%
+heimdall/llm/rejections.py                      152      9     54     10    91%   35, 76, 97->101, 100, 126, 134, 145, 182, 209, 232
+heimdall/mcp/__init__.py                          3      0      0      0   100%
+heimdall/mcp/__main__.py                         20      0      0      0   100%
+heimdall/mcp/errors.py                           13      0      0      0   100%
+heimdall/mcp/gitdiff.py                         533     30    196     11    94%   309, 311-312, 449, 452, 455-456, 469-471, 478-479, 510, 522, 530-531, 660-661, 668->674, 670-672, 675->678, 689, 719-720, 841-842, 844, 853, 864-865
+heimdall/mcp/masking.py                         134      0     56      0   100%
+heimdall/mcp/paths.py                            43      0     20      0   100%
+heimdall/mcp/prompts/__init__.py                 30      0      4      0   100%
+heimdall/mcp/server.py                          281      0    104      0   100%
+heimdall/scanner/__init__.py                      9      0      0      0   100%
+heimdall/scanner/allowlist.py                   476     65    246     37    84%   57, 182, 185-186, 190, 208, 216-220, 224, 228, 231, 234, 238, 243-247, 250-252, 261, 278-279, 281-282, 286, 305, 314-315, 321, 325->327, 337, 376, 379, 383-396, 496, 518, 526, 632, 734-735, 782, 799, 819, 824, 846, 890, 921-922, 932, 969-970
+heimdall/scanner/detect.py                      210     18     78     10    90%   68, 154, 221, 265, 290, 319-320, 347, 349-350, 355-356, 361, 363, 370->376, 386, 420, 461, 478
+heimdall/scanner/entropy.py                      17      0      8      0   100%
+heimdall/scanner/entropy_detection.py           106      1     60      1    99%   139
+heimdall/scanner/errors.py                        3      0      0      0   100%
+heimdall/scanner/exclusions.py                  107      4     44      5    94%   264, 271, 278, 329->312, 374
+heimdall/scanner/finding.py                      88      0     30      0   100%
+heimdall/scanner/hashing.py                     149      4     50      3    96%   79, 109, 110->126, 188-189
+heimdall/scanner/interface.py                   136      1     42      1    99%   68
+heimdall/scanner/signature_engine.py             90      2     36      1    98%   198, 222
+heimdall/scanner/signatures/__init__.py          45      0     10      0   100%
+heimdall/scanner/signatures/aws_cloud.py          6      0      0      0   100%
+heimdall/scanner/signatures/github_jwt.py         7      0      0      0   100%
+heimdall/scanner/signatures/model.py            121      0     32      0   100%
+heimdall/scanner/signatures/pem.py                5      0      0      0   100%
+heimdall/scanner/signatures/stripe_slack.py       8      0      0      0   100%
+heimdall/vault/__init__.py                        3      0      0      0   100%
+heimdall/vault/app.py                           507     11    148      9    97%   636, 696, 874->879, 884, 911, 1005, 1061-1062, 1281, 1283, 1490->1492, 1496, 1573
+heimdall/vault/atomic.py                        458    127    170     38    71%   73->75, 75->78, 79->81, 95, 109-110, 113-116, 120-121, 146->148, 163-164, 170, 173->183, 179-180, 184-187, 212, 215, 218, 221->223, 223->225, 225->228, 230-231, 234-235, 237, 245, 249, 255-295, 301, 309-310, 320, 326-331, 337-338, 346-347, 355-356, 364-365, 380-381, 407, 415->417, 417->419, 422, 431-444, 467, 469, 471, 502, 513-514, 569-570, 584, 588-589, 592, 599, 633, 636-637, 639->645, 642-643, 646, 649-650, 672->665, 688-689, 691, 720-721, 734-736, 755-756, 786-787, 801-812, 823, 830-831
+heimdall/vault/auth.py                          328      8    110      8    96%   204-205, 574->576, 611, 619->622, 703, 731, 797, 835, 870
+heimdall/vault/client.py                        553     66    208     36    85%   51, 140->163, 200, 228->241, 230, 243, 248-249, 256->262, 259-260, 263, 291-294, 320, 323, 335, 344->351, 347->351, 358, 369-371, 379->382, 400, 403, 474-476, 511->513, 520->522, 546, 602-603, 623-624, 633-634, 636, 643, 654-657, 664, 675-693, 700, 715-717, 722, 818, 823, 828, 841-842, 904-905, 933, 987, 1054->1058, 1056-1057
+heimdall/vault/crypto.py                        124     16     32      6    85%   83, 111-112, 142, 167, 170-175, 179-180, 230, 243, 276, 333
+heimdall/vault/database.py                      413     17    100     11    95%   375, 381, 393-394, 476-477, 666, 686, 694, 727, 759, 832, 843, 984, 1100, 1117-1121
+heimdall/vault/init_db.py                        56      1     12      2    96%   140->145, 151
+heimdall/vault/ratelimit.py                     172     16     70     12    88%   51, 53, 71, 85, 135-142, 166-173, 208, 210, 232, 287-294, 323, 339, 380
+heimdall/vault/store.py                         103      5     22      1    95%   68-69, 255, 270-271
+-----------------------------------------------------------------------------------------
+TOTAL                                          6752    484   2328    236    92%
+Required test coverage of 85% reached. Total coverage: 91.56%
+2307 passed, 16 skipped, 7 warnings, 4480 subtests passed in 244.93s (0:04:04)

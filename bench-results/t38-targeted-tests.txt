@@ -1,0 +1,12 @@
+...........................................                              [100%]
+================================ tests coverage ================================
+_______________ coverage: platform linux, python 3.13.5-final-0 ________________
+
+Name                         Stmts   Miss Branch BrPart  Cover   Missing
+------------------------------------------------------------------------
+heimdall/cli/cold_start.py     102      3     32      3    96%   70, 93, 179
+heimdall/cli/history.py        173      6     72      6    95%   69, 174, 179, 191, 209, 266
+------------------------------------------------------------------------
+TOTAL                          275      9    104      9    95%
+Required test coverage of 85% reached. Total coverage: 95.25%
+43 passed in 3.22s

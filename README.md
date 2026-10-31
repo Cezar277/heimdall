@@ -35,6 +35,8 @@ heimdall --version
 heimdall scan             # scan de l'arbre de travail (mode strict, #29)
 heimdall scan --staged    # blobs ajoutés ou modifiés dans l'index git (#29)
 heimdall scan --ci        # mode CI headless : le code de sortie est le verdict
+heimdall cold-start . --ci # premier scan déterministe du dépôt existant
+heimdall deep-scan . --ci  # historique complet accessible, alerte de révocation
 heimdall scan --json      # rapport JSON sur stdout (contrat heimdall.scan.v1)
 heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 ```
@@ -193,7 +195,8 @@ heimdall/            paquet unique (#17)
   scanner/           détection déterministe regex + entropie (#22, contrat #14)
     interface.py     cible (diff indexé ou fichier) + scan(cible) -> list[Finding] (#53)
     finding.py       sortie Finding conforme au schéma #14 par construction (#53)
-    exclusions.py    politique d'exclusions déterministes (#22 / #59)
+    exclusions.py    périmètre et politique de contenu (#22 / #59)
+    detect.py        parcours confiné d'une racine + rapport de scan (#22 / #59)
   mcp/               serveur MCP stdio, 4 outils lecture seule (#27, contrat #16)
     prompts/         prompt système versionné du trieur (qualify_v1, #80)
   llm/               client Ollama local, sortie JSON contrainte (#80, T28.2), candidat fail-closed (#81)

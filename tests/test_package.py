@@ -102,14 +102,18 @@ class PackageSmokeTests(unittest.TestCase):
                                 check=False,
                             )
                             self.assertEqual(completed.returncode, 0, completed.stderr)
+                        # Un fichier de contenu évite le refus ``--ci`` d'un
+                        # arbre réduit à sa base VCS (aucun contenu lu).
+                        Path(tmp, "app.py").write_text("x = 1\n", encoding="utf-8")
                         result = runner.invoke(heimdall.cli.main.app, argv)
                     finally:
                         os.chdir(previous)
-                    # Un dépôt vide est réellement propre : 0, pas 2.
+                    # Contenu bénin lu : propre => 0, pas 2.
                     self.assertEqual(result.exit_code, 0)
-                    # Le scan est une lecture : seul `.git` (créé par le test)
-                    # est présent, rien d'autre n'a été écrit.
-                    self.assertEqual(sorted(os.listdir(tmp)), [".git"])
+                    # Le scan est une lecture : seuls `.git` (créé par le test)
+                    # et le fichier bénin sont présents, rien d'autre n'a été
+                    # écrit.
+                    self.assertEqual(sorted(os.listdir(tmp)), [".git", "app.py"])
 
     def test_scan_reports_on_stderr(self) -> None:
         """Erreur d'outillage : message sur stderr, code 2 (jamais 0, jamais 1)."""

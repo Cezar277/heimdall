@@ -3,6 +3,12 @@
 Le journal des propositions de rejet du LLM se consulte avec
 `heimdall rejections [--details]` ; voir [T33](llm-rejections.md).
 
+Le premier lancement sur un dépôt existant dispose de deux commandes
+associées, décrites dans [cold-start.md](cold-start.md) (T38, #107–#110) :
+`heimdall cold-start` (entonnoir regex/entropie puis avis LLM sur les seuls
+candidats) et `heimdall deep-scan` (historique complet, alerte de
+révocation et mesure du temps).
+
 Statut : livré par le ticket #29 (sous-ticket de l'épic #6 « CLI, hook et CI
 headless »). La commande est **branchée** sur le scanner déterministe #22 et
 sur l'accès git confiné #27. Elle est **en lecture seule sur le dépôt** :
@@ -39,7 +45,7 @@ heimdall scan --json [CHEMIN]       # rapport JSON sur stdout
 | Option | Effet |
 | --- | --- |
 | `--staged` | change le **périmètre** : les blobs **ajoutés ou modifiés** de l'index git, lus blob par blob, **sans aucune exclusion de chemin** |
-| `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr (avec décompte des secrets ignorés par l'allowlist) |
+| `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr (secrets ignorés par l'allowlist et bases VCS élaguées) |
 | `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; inclut les traces et décomptes d'allowlist (#24) ; les erreurs restent sur stderr |
 | `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) ; un chemin **hors du dépôt** est accepté : choix opérateur explicite, soumis aux mêmes gardes (`_resolve_root` + `O_NOFOLLOW`, plafond de taille, contrat fermé) |
 | `--no-allowlist` | désactive l'allowlist déterministe pour le scan courant |
@@ -103,21 +109,41 @@ bibliothèque (`Scanner`, #22), hors contrat hook/CI.
 
 | Périmètre | Ce qui est analysé | Exclusions |
 | --- | --- | --- |
-| `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **techniques** seulement : binaires, caches et environnements (`.git`, `node_modules`, `.venv`, `__pycache__`…). `vendor/`, les lockfiles et les sorties de build textuelles (`build/`, `dist/`, `target/`) sont analysés |
-| `staged` (`--staged`) | le contenu **indexé** de chaque fichier ajouté ou modifié | **aucune exclusion de chemin** : `vendor/`, `third_party/`, `package-lock.json`, `.gitignore`… sont analysés |
+| `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **base VCS seule** (`.git/`, `.hg/`, `.svn/` : métadonnées, pas du contenu). Tout le reste (`vendor/`, `node_modules/`, `.venv/`, lockfiles, sorties de build) est lu par contenu ; binaire connu, lien ou fichier illisible est **refusé** (code 2), jamais sauté |
+| `staged` (`--staged`) | le contenu **indexé** de chaque fichier ajouté ou modifié | **aucune exclusion de chemin** : `vendor/`, `third_party/`, `package-lock.json`, `.gitignore`… sont analysés ; un binaire connu est **refusé** (code 2), jamais sauté |
 
 « Aucune exclusion de **chemin** » ne veut pas dire « aucune exclusion du
-tout » : les blobs dont le contenu est **binaire** (signature magique connue
-et contenu majoritairement binaire : PNG, PDF, ZIP, ELF…) n'ont pas de texte
-à analyser et sont sautés — un secret placé dans un binaire reste donc un
-faux négatif, dans les **deux** périmètres. C'est une impossibilité technique,
-pas une politique de chemin ; elle est tracée dans les limites ci-dessous.
+tout » : un contenu dont la signature magique **et** la majorité sont
+binaires (PNG, PDF, ZIP, ELF…) n'a pas de texte à analyser. Dans **les deux
+périmètres**, ce contenu est **refusé** (`ScanError`), ce qui rend le verdict
+propre impossible (code 2) : un secret placé dans un commentaire PNG ou une
+archive ne devient jamais un faux négatif silencieux. Un contenu inconnu
+(NUL + texte) reste fail-closed de la même façon : jamais sauté sur simple
+suffixe.
 
 Le mode strict est une correction issue de la revue de #165 (point HIGH) :
-la politique #59 excluait `vendor/` et les lockfiles, donc un secret posé
-dans `vendor/evil.py` n'était **jamais** signalé. Un secret y est un secret :
-seules les exclusions *techniques* (contenu binaire ou généré) restent, car
-les scanner n'y gagnerait rien et lèverait parfois une erreur de décodage.
+la politique #59 excluait `vendor/`, `node_modules/` et les lockfiles, donc un
+secret posé dans `vendor/evil.py` n'était **jamais** signalé. Un secret y est
+un secret : aucun nom de fichier ou de répertoire de contenu n'exclut plus rien,
+et le contenu décide. Seule la base VCS est hors du périmètre audité. Le
+paramètre de bibliothèque `strict` n'ouvre pas un second régime :
+`Scanner(root, strict=True)` et `Scanner(root, strict=False)` rendent le même
+périmètre (test `test_strict_mode_never_changes_the_content_perimeter`).
+L'historique VCS (`.git/`) n'est jamais parcouru par le mode arbre, et le
+compteur `heimdall.scanner.detect.Scanner.vcs_ignored` rend cet élagage
+observable. Ce compteur est propagé dans `ScanReport.vcs_ignored`, le champ
+`vcs_ignored` du JSON et le résumé `--ci` sur stderr : une CI peut donc
+distinguer « aucune base VCS » de « base VCS non parcourue ». Un dépôt réduit
+à `.git/config` reste un **arbre vide** en local : il rend 0 avec
+`vcs_ignored == 1` et `files_scanned == 0` (compteur de bibliothèque) — un
+dépôt vide est propre, pas illisible. En revanche, le mode **`--ci`** est
+strict : dès qu'une base VCS a été élaguée sans **aucun** contenu lu, il rend
+**2** (`ScanError`) pour qu'une automatisation qui ne lit que le code de
+sortie ne confonde jamais « propre » et « non parcouru ». C'est pourquoi
+`--staged` est le périmètre opposable pour le contenu indexé : il couvre ce
+que le commit va contenir, pas les commits déjà écrits. Un fichier régulier
+nommé `.git` (gitlink de worktree ou de sous-module, `gitdir: …`) n'est pas
+une base VCS : il est lu par contenu.
 
 En mode `--staged`, c'est le **blob indexé** qui est lu, pas la copie de
 travail : c'est ce que le commit va contenir qui est jugé. Le blob entier est
@@ -150,7 +176,10 @@ pendant le scan refuse le verdict (code 2, fail-closed) ; sous Windows, le
 rejoue sa garde sur la forme canonique déjà figée (opération idempotente) ; ce
 second passage n'ouvre pas
 de bypass : toute substitution entre les deux est rattrapée par le
-re-contrôle d'identité final.
+re-contrôle d'identité final. Pendant le parcours, la racine et chaque
+sous-répertoire sont en plus **ouverts par descripteur** (`O_NOFOLLOW` +
+`O_DIRECTORY`, `openat`/`scandir(fd)`) : un remplacement entre l'énumération
+et la lecture ne peut pas rediriger le scan vers un autre arbre.
 
 Les suppressions et les **gitlinks** (sous-modules, mode `160000`) sont
 ignorés : une suppression n'a plus de blob à scanner, et le SHA d'un gitlink
@@ -271,6 +300,10 @@ change. Le JSON garde le chemin exact.
       "type": "aws"
     }
   ],
+  "ignored_count": 0,
+  "traces": [],
+  "config_hash": null,
+  "vcs_ignored": 0,
   "schema": "heimdall.scan.v1",
   "scope": "staged"
 }
@@ -278,7 +311,9 @@ change. Le JSON garde le chemin exact.
 
 Le document porte le périmètre (`scope`), le nombre de Findings (`count`) et
 les Findings eux-mêmes, avec **exactement les sept champs** du contrat
-Finding v1 (#14). Il n'y a rien d'autre : pas de valeur de secret, pas de
+Finding v1 (#14). Il porte aussi les décomptes d'allowlist (#24) et
+`vcs_ignored`, le nombre de bases VCS élaguées par le mode arbre (toujours 0
+en `--staged`). Il n'y a rien d'autre : pas de valeur de secret, pas de
 champ libre, pas d'extrait de ligne.
 
 Le contrat machine est figé par [`schemas/scan.schema.json`](../schemas/scan.schema.json)
@@ -318,14 +353,14 @@ document si `count != len(findings)` (contrainte explicitée dans la
 
 ## Limites connues (honnêtes)
 
-- Les exclusions **techniques** restent : un secret dans `node_modules/`,
-  `.venv/`, `__pycache__/` ou dans un fichier binaire n'est pas signalé.
-  C'est un choix assumé (dépendances, environnements, lecture binaire), pas
-  un oubli. En particulier, un blob **binaire** est sauté dans les deux
-  périmètres : un secret placé dans un commentaire PNG ou une archive n'est
-  pas détecté. Les sorties de build textuelles (`build/`, `dist/`,
-  `target/`, `bower_components/`, `htmlcov/`) sont désormais scannées en
-  strict, comme en `--staged`.
+- Le contenu **binaire** n'est pas analysé : un secret placé dans un
+  commentaire PNG ou une archive n'est pas détecté. Dans **les deux
+  périmètres**, le fichier ou le blob est **refusé** (`ScanError`) et la CLI
+  sort en **2** (verdict propre impossible) : il n'existe plus de `0` propre
+  pour un contenu binaire non analysable. C'est une impossibilité technique
+  documentée, pas une exclusion de chemin. Les répertoires et fichiers
+  textuels de `node_modules/`, `vendor/`, `.venv/`, `build/`, `dist/`,
+  `target/` ou `htmlcov/` sont, eux, scannés dans les deux périmètres.
 - La fenêtre multi-ligne reste bornée à 4 Kio : un secret coupé par un
   retour à la ligne au-delà de cette borne n'est pas recherché.
 - Le mode `--staged` analyse l'**index**, pas l'historique : un secret déjà
