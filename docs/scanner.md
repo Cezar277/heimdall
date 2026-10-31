@@ -139,7 +139,11 @@ celui de tout autre fichier.
 `strict` reste accepté pour compatibilité ; il ne change plus le périmètre
 (seule la base VCS est écartée dans tous les modes). C'est la correction du
 point HIGH relevé à la revue de #165 : la politique #59 laissait passer un
-secret posé dans `vendor/evil.py`, sans jamais le signaler.
+secret posé dans `vendor/evil.py`, sans jamais le signaler. L'équivalence est
+figée par `tests/test_scanner_detect.py::test_strict_mode_never_changes_the_content_perimeter` :
+`Scanner(root, strict=True).scan()` et `Scanner(root, strict=False).scan()`
+rendent les mêmes Findings et les mêmes compteurs (`vcs_ignored`,
+`files_scanned`).
 
 Un contenu binaire **connu** (signature magique et majorité binaire) n'est pas
 silencieusement ignoré : le scanner lève `ScanError`. Un binaire inconnu
