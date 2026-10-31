@@ -150,7 +150,9 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     access = GitAccess(root)
     if not access.is_repository(timeout=_call_timeout(deadline)):
         raise ScanError("historique non analysable")
-    shallow = _git(access, ("rev-parse", "--is-shallow-repository"), 16, deadline)
+    shallow = _git(
+        access, ("--no-replace-objects", "rev-parse", "--is-shallow-repository"), 16, deadline
+    )
     if shallow.strip() != b"false":
         raise ScanError("historique incomplet : clone superficiel")
     tips = _tips(access, deadline)
