@@ -210,7 +210,11 @@ def cold_start(
         help="Taille maximale par fichier, en octets.",
     ),
 ) -> None:
-    """Premier scan complet : regex/entropie puis avis du LLM local (#107)."""
+    """Premier scan complet : regex/entropie puis avis du LLM local (#107).
+
+    Hors CI avec LLM, les propositions faux_positif sont journalisées au
+    chemin opérateur par défaut. --ci ou --no-llm désactive ce journal.
+    """
     try:
         report = collect_cold_start(Path(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes)
         typer.echo(render_cold_start(report, json_output=json_output))
@@ -236,7 +240,11 @@ def deep_scan(
         help="Taille maximale par blob, en octets.",
     ),
 ) -> None:
-    """Scanne tous les commits accessibles et signale les secrets à révoquer (#108–#110)."""
+    """Scanne tous les commits accessibles et signale les secrets à révoquer (#108–#110).
+
+    Hors CI avec LLM, les propositions faux_positif sont journalisées au
+    chemin opérateur par défaut. --ci ou --no-llm désactive ce journal.
+    """
     try:
         report = collect_history(Path(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes)
         typer.echo(render_history(report, json_output=json_output))

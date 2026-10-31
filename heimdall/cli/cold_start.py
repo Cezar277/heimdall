@@ -67,7 +67,7 @@ def candidate_context(target: FileTarget, finding: Finding, findings: list[Findi
     est masqué AVANT d'être tronqué, comme pour les outils MCP.
     """
     lines = target.lignes()
-    if finding.file != target.path or finding.line > len(lines):
+    if finding.file != target.path or not 1 <= finding.line <= len(lines):
         raise ScanError("contexte de qualification invalide")
     sensitive = {item.line for item in findings}
     selected = lines[max(0, finding.line - CONTEXT_LINES - 1) : finding.line + CONTEXT_LINES]
@@ -82,6 +82,7 @@ def qualify_target(  # noqa: PLR0913 - qualification with complete masking conte
     target: FileTarget,
     findings: list[Finding],
     *,
+    ci: bool = False,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
     deadline: float | None = None,
@@ -102,6 +103,7 @@ def qualify_target(  # noqa: PLR0913 - qualification with complete masking conte
             ),
             chat=chat,
             journal=journal,
+            ci=ci,
         )
         # Un appel en cours conserve le timeout réseau de T28 (60 s).
         # Aucun appel suivant n'est lancé après la deadline globale.
@@ -178,7 +180,7 @@ def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification opti
         if any(finding not in current for finding in findings):
             raise ScanError("contenu modifié depuis le scan déterministe")
         opinions.extend(
-            qualify_target(target, findings, chat=chat, journal=journal, deadline=deadline)
+            qualify_target(target, findings, ci=ci, chat=chat, journal=journal, deadline=deadline)
         )
     _verify_root_unchanged(access, root)
     _check_deadline(deadline)

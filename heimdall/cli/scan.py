@@ -182,6 +182,9 @@ def collect(  # noqa: PLR0913 - explicit scan options
     analysé **en entier** : l'appelant transforme cela en code 2, jamais en
     code 0.
 
+    ``max_file_bytes`` et ``skipped_files`` sont réservés au mode arbre.
+    Les fournir avec ``staged=True`` lève ``ScanError`` avant tout accès Git.
+
     **Auto-attestation (CWE-345)** : si ``allowlist`` est fourni (API), la
     garde anti auto-attestation est contournée. Le seul usage légitime dans
     les chemins CLI/hook est ``Allowlist.empty()`` via ``--no-allowlist``.
@@ -190,6 +193,8 @@ def collect(  # noqa: PLR0913 - explicit scan options
     de ``heimdall.toml`` interne. En cas de doute, ne pas injecter
     d'allowlist non-vide ou utiliser ``config`` externe / ``--no-allowlist``.
     """
+    if staged and (max_file_bytes is not None or skipped_files is not None):
+        raise ScanError("limite de fichier invalide")
     if max_file_bytes is not None and (
         type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES
     ):

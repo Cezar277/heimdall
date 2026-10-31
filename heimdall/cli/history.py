@@ -234,6 +234,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                                     journal=journal,
                                     deadline=deadline,
                                     context_findings=list(cached),
+                                    ci=ci,
                                 )
                             )
                             qualified.update((f.type, f.snippet_hash) for f in new)
