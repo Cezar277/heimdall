@@ -79,7 +79,7 @@ uniques : elle vérifie surtout la pagination, le cache et les associations.
 ## Validation locale
 
 Environnement : Python 3.13.5, environnement de développement existant
-`/home/nathan/heimdall-t33-venv`, imports du clone neuf. Les tests LLM sont
+`<venv>`, imports du clone neuf. Les tests LLM sont
 simulés ; aucun serveur Ollama n'est contacté par les tests ciblés.
 
 | Contrôle | Résultat |

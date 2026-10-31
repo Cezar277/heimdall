@@ -143,7 +143,7 @@ Commit de code vérifié : `808ceab1a855cc82fc76020a0e29507c8fec1fe5`.
 ## Résultats locaux — 25 octobre 2026
 
 Environnement : Debian / WSL, Python 3.13.5, dépendances de développement
-du projet installées dans `/home/nathan/heimdall-t33-venv`.
+du projet installées dans `<venv>`.
 Les modèles sont simulés : aucun test ciblé ne contacte Ollama.
 
 | Contrôle | Résultat |
@@ -234,3 +234,28 @@ selon les conditions déjà décrites. Aucun `/ci` n'est demandé ici.
 Livraison de cette relecture :
 [contrôle Git](https://github.com/Cezar277/heimdall/commit/2dea5b3c52ccab0b5355e3c879d9d67b64bba249)
 et [journaux anonymisés](https://github.com/Cezar277/heimdall/commit/c412c98c30bf7f6cc894021bcc7fb28bba6c3a1c).
+
+### Vérification du dernier retour de revue — 31 octobre 2026
+
+Les chemins de poste restants dans `docs/t38-completion.md` et ce document
+sont anonymisés sous la forme `<venv>`.
+
+Les deux tests signalés comme manquants sont déjà présents dans le contenu
+revu au SHA `7f05ff57c70a78f0cbb4e281f586bc5522188b1a` :
+
+- [Grand nombre de références et échec ARG_MAX](https://github.com/Cezar277/heimdall/blob/7f05ff57c70a78f0cbb4e281f586bc5522188b1a/tests/test_history.py#L528) :
+  `test_many_tips_argv_failure_is_static_and_cli_exits_two` injecte 20 000 tips,
+  fixe `BATCH_SIZE=1`, puis provoque `OSError(errno.E2BIG, ...)` dans `Popen`.
+  Il attend `ScanError("historique non analysable")` côté API et le code 2
+  côté CLI, sans sortie JSON ni reflet du message injecté.
+- [Options staged refusées avant Git](https://github.com/Cezar277/heimdall/blob/7f05ff57c70a78f0cbb4e281f586bc5522188b1a/tests/test_history.py#L475) :
+  `test_staged_rejects_tree_options_before_git_access` paramètre quatre
+  combinaisons de `max_file_bytes` et `skipped_files`, interdit la construction
+  de `GitAccess` et attend `ScanError("limite de fichier invalide")`.
+
+Il s'agit de preuves de présence et d'assertions à exécuter, pas de résultats
+pytest : aucun interpréteur Python utilisable dans cette session. Ces tests
+ne sont pas dupliqués. Le contrôle local de cette correction documentaire
+est `git diff --check`. L'exception multi-tickets et les conditions de fusion
+(relecture croisée effective et CI verte) restent applicables ; aucun `/ci`
+n'est lancé et le SHA de merge ne sera renseigné qu'après fusion réelle.
