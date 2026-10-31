@@ -109,6 +109,13 @@ référence. Un contenu inconnu avec NUL et texte dans `evil.png` est refusé
 en `ScanError` / code 2. Le parseur d'arbres convertit aussi les noms non UTF-8
 et chemins invalides en `ScanError` statique.
 
+`complete=True` signifie complet dans ce périmètre : les exclusions binaires
+techniques restent compatibles avec ce statut, sans entrée dans `skipped`.
+Un blob indécodable n'est exclu que si son suffixe est technique et que
+`is_known_binary(data)` est vrai. Il n'est pas mis en cache afin que le même
+blob sous un nom non technique soit revérifié et refusé. Ces exclusions ne
+prouvent donc pas que tous les blobs ont été analysés comme du texte.
+
 ## Taille, lots et mémoire (#109)
 
 `--max-file-bytes` est configurable entre 1 octet et **1 Mio**, valeur par défaut,
@@ -142,6 +149,20 @@ En bibliothèque, `collect_history(..., journal=RejectionJournal(chemin))`
 permet de rediriger le journal des propositions de rejet, comme le cold start.
 Sans journal injecté, le chemin opérateur par défaut reste utilisé hors CI.
 `ci=True` interdit aussi toute écriture dans le journal injecté.
+
+Hors CI avec LLM activé (par défaut), les propositions `faux_positif` sont
+journalisées et synchronisées sur disque au chemin opérateur par défaut,
+même sans journal injecté. `--ci` ou `--no-llm` désactive ce journal pour
+`cold-start` et `deep-scan` ; ces options ne désactivent pas la détection.
+L'aide des deux commandes mentionne cette écriture. L'API `qualify_target`
+accepte aussi `ci=True` et le transmet à `qualify_finding`, sans appel au
+modèle ni écriture journal, même lorsqu'elle est appelée directement.
+
+Dans l'API `collect`, les options `max_file_bytes` et `skipped_files` sont
+réservées au mode arbre : les fournir avec `staged=True` est refusé avant
+tout accès Git (`ScanError("limite de fichier invalide")`). Le mode staged
+conserve sa limite de taille fixe. `collect_cold_start` et `collect_history`
+n'exposent pas de paramètre `staged`.
 
 ## Alerte et temps (#110)
 

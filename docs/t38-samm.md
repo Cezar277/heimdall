@@ -164,3 +164,50 @@ L'échéance de 300 s est coopérative : une requête Ollama déjà en cours con
 son timeout réseau T28 de 60 s. Aucun nouveau candidat n'est lancé après
 expiration ; le dépassement donne un code 2. Voir
 [cold-start.md](cold-start.md) pour le contrat opérateur et les commandes Windows.
+
+## Compléments de revue — 31 octobre 2026 (validation en attente)
+
+- `heimdall/cli/cold_start.py::qualify_target` expose `ci` et le transmet à
+  `qualify_finding`. Les collecteurs cold start et historique le transmettent
+  également ; les gardes existantes restent en place.
+  Test : `test_direct_qualify_target_ci_never_calls_model_or_journal` dans
+  `tests/test_cold_start.py` (Finding conservé, modèle et append interdits,
+  aucun répertoire de journal créé).
+- `heimdall/cli/scan.py::collect` refuse les options réservées au mode arbre
+  avec `staged=True`, avant accès Git. Test paramétré :
+  `test_staged_rejects_tree_options_before_git_access` dans `tests/test_history.py`.
+- `test_many_tips_argv_failure_is_static_and_cli_exits_two` dans
+  `tests/test_history.py` injecte 20 000 tips et une erreur `E2BIG` à la
+  création du processus `rev-list`, pour vérifier la conversion API statique
+  et le code 2 CLI sans reflet du message d'erreur.
+- `docs/cold-start.md` précise les exclusions compatibles avec `complete=True`.
+  L'aide de `cold-start` et `deep-scan` décrit le journal par défaut hors CI ;
+  `test_help_documents_default_rejection_journal` en fige la mention.
+
+Ces nouveaux tests sont préparés, **non exécutés dans cette session** : aucun
+interpréteur Python utilisable dans le terminal et accès WSL refusé.
+`git diff --check` est le contrôle local disponible ; aucun succès pytest,
+Ruff, mypy, Bandit ni aucune CI verte n'est revendiqué pour ces changements.
+L'exception multi-tickets demeure celle demandée par l'utilisateur.
+La relecture croisée effective et la CI requise verte restent bloquantes
+avant fusion. Le SHA de merge final et les permaliens de cette livraison
+doivent être renseignés après leur création réelle, jamais anticipés.
+
+### Livraison dans les chemins effectifs du paquet
+
+Les correctifs du code sont publiés dans le commit
+`bd2716687317b1c2bc42f957be725c8e2e001bb0`, les tests dans
+`084577412c497a8cde88224380667f094778d625` :
+
+- [Contexte : refus des lignes hors bornes](https://github.com/Cezar277/heimdall/blob/bd2716687317b1c2bc42f957be725c8e2e001bb0/heimdall/cli/cold_start.py#L70),
+  [qualification directe avec CI](https://github.com/Cezar277/heimdall/blob/bd2716687317b1c2bc42f957be725c8e2e001bb0/heimdall/cli/cold_start.py#L81).
+- [Refus des options arbre en staged](https://github.com/Cezar277/heimdall/blob/bd2716687317b1c2bc42f957be725c8e2e001bb0/heimdall/cli/scan.py#L196),
+  [transmission CI historique](https://github.com/Cezar277/heimdall/blob/bd2716687317b1c2bc42f957be725c8e2e001bb0/heimdall/cli/history.py#L237).
+- [Tests qualification, aide et lignes forgées](https://github.com/Cezar277/heimdall/blob/084577412c497a8cde88224380667f094778d625/tests/test_cold_start.py#L116),
+  [tests staged](https://github.com/Cezar277/heimdall/blob/084577412c497a8cde88224380667f094778d625/tests/test_history.py#L484),
+  [test des 20 000 tips et E2BIG](https://github.com/Cezar277/heimdall/blob/084577412c497a8cde88224380667f094778d625/tests/test_history.py#L528).
+
+Ces permaliens prouvent la présence des changements et des tests, pas leur
+réussite : l'exécution des nouveaux tests reste à effectuer. Les copies
+accidentelles à la racine et `tests/cold-start.md` doivent être retirées ;
+elles ne constituent aucune preuve de comportement du paquet livré.
