@@ -365,4 +365,6 @@ Depuis la correction de revue #23, les étiquettes digest/data URI et UUID
 ne taisent plus les candidats : huit faux positifs sont comptés honnêtement
 sur ce corpus. Les résultats actuels et le seuil de précision non atteint
 sont dans [scanner-entropy.md](scanner-entropy.md).
-Les liens permanents et la fiche SAMM sont dans [t22-samm.md](t22-samm.md).
+Les liens permanents et la fiche SAMM de l'épic sont dans [t22-samm.md](t22-samm.md) ;
+les preuves dédiées aux exclusions #59 (module + ligne, tests et limites) sont
+dans [t59-samm.md](t59-samm.md).
