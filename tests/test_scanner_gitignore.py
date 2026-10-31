@@ -21,7 +21,10 @@ d'exemple de la documentation AWS, jamais une clé fonctionnelle.
 
 from __future__ import annotations
 
+import io
 import os
+import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -30,9 +33,12 @@ from support.git_repo import GitRepo
 
 from heimdall.scanner import gitignore
 from heimdall.scanner.detect import MAX_FILE_BYTES, Scanner
+from heimdall.scanner.errors import ScanError
 from heimdall.scanner.gitignore import (
     GitExclusions,
     _parse_tagged_nul_list,
+    _read_bounded,
+    _remaining,
     collect_git_exclusions,
 )
 
@@ -52,6 +58,41 @@ def repo() -> Iterator[GitRepo]:
 
 def _secret_file(repo: GitRepo, relative: str) -> None:
     repo.write(relative, f'AWS = "{AWS}"\n')
+
+
+class _FakeGitProcess:
+    """Processus Git minimal pour éprouver les chemins de panne de ``_run_git``."""
+
+    def __init__(self, stdout: bytes, *, wait_error: BaseException | None = None) -> None:
+        self.stdout = io.BytesIO(stdout)
+        self.returncode: int | None = 0
+        self.killed = False
+        self._wait_error = wait_error
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        if self._wait_error is not None:
+            error = self._wait_error
+            self._wait_error = None
+            raise error
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+def _run_fake_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process: _FakeGitProcess,
+    *,
+    deadline: float | None = None,
+) -> bytes | None:
+    monkeypatch.setattr(gitignore, "_GIT", "git")
+    monkeypatch.setattr(gitignore.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    return gitignore._run_git(tmp_path, ("ls-files",), deadline)
 
 
 # --- catégories du ticket ---------------------------------------------------
@@ -400,6 +441,84 @@ def test_the_parser_accepts_only_the_tagged_nul_format() -> None:
         b"? bad-\xff\x00",  # non UTF-8
     ):
         assert _parse_tagged_nul_list(invalid) is None
+
+
+def test_a_parse_failure_disables_exclusions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Une sortie Git invalide rend le parcours complet, jamais une exclusion."""
+    monkeypatch.setattr(gitignore, "_run_git", lambda *_args, **_kwargs: b"? .env")
+    assert collect_git_exclusions(tmp_path) is None
+
+
+def test_an_expired_deadline_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Une deadline déjà franchie refuse la collecte, même sans lancer Git."""
+    monkeypatch.setattr(gitignore, "_GIT", "git")
+    with pytest.raises(ScanError):
+        _remaining(time.monotonic() - 1.0)
+    with pytest.raises(ScanError):
+        collect_git_exclusions(tmp_path, deadline=time.monotonic() - 1.0)
+
+
+def test_the_bounded_reader_refuses_an_oversized_output() -> None:
+    """Le plafond est strict : un octet de trop rend ``None``, pas une liste."""
+    assert _read_bounded(io.BytesIO(b"abcde"), 5) == b"abcde"
+    assert _read_bounded(io.BytesIO(b"abcdef"), 5) is None
+
+
+@pytest.mark.parametrize("error", [OSError, ValueError])
+def test_the_bounded_reader_swallows_stream_errors(error: type[Exception]) -> None:
+    """Une lecture de tube cassée n'expose jamais d'exception brute."""
+
+    class Broken:
+        def read(self, _size: int) -> bytes:
+            raise error("tube cassé")
+
+    assert _read_bounded(Broken(), 10) is None  # type: ignore[arg-type]
+
+
+def test_a_git_timeout_falls_back_to_a_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un Git qui dépasse le timeout unitaire est tué, puis tout est parcouru."""
+    process = _FakeGitProcess(
+        b"", wait_error=subprocess.TimeoutExpired("git", 1.0)
+    )
+    assert _run_fake_git(tmp_path, monkeypatch, process) is None
+    assert process.killed is True
+
+
+def test_an_expired_scan_deadline_after_a_git_timeout_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """La panne Git reste un repli, sauf si la deadline du scan est franchie."""
+    monkeypatch.setattr(gitignore, "_remaining", lambda _deadline: 0.001)
+    process = _FakeGitProcess(
+        b"", wait_error=subprocess.TimeoutExpired("git", 0.001)
+    )
+    with pytest.raises(ScanError):
+        _run_fake_git(tmp_path, monkeypatch, process, deadline=-1.0)
+
+
+def test_a_git_wait_error_falls_back_to_a_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Une panne d'attente ne rend jamais une liste partielle."""
+    process = _FakeGitProcess(b"", wait_error=OSError("processus récolté"))
+    assert _run_fake_git(tmp_path, monkeypatch, process) is None
+    assert process.killed is True
+
+
+def test_an_oversized_git_output_is_abandoned_and_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Au-delà du plafond, Git est tué et le parcours complet reprend."""
+    monkeypatch.setattr(gitignore, "MAX_GIT_LIST_BYTES", 3)
+    process = _FakeGitProcess(b"abcd")
+    assert _run_fake_git(tmp_path, monkeypatch, process) is None
+    assert process.killed is True
 
 
 def test_a_tracked_file_prevents_pruning_its_ignored_directory(
