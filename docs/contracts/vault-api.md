@@ -391,7 +391,7 @@ pas être utilisées pour contourner les codes ci-dessus.
 
 ## Vérifier le contrat
 
-Depuis la racine du dépôt, Python 3.10 ou supérieur, Node.js et npm/npx :
+Depuis la racine du dépôt, Python 3.10 ou supérieur, Node.js 22 ou 24+ (requis par Spectral 6.17.0) et npm/npx :
 
 Windows / PowerShell :
 
@@ -402,6 +402,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m bandit tests/contracts/fastapi_contract_fixture.py
 .venv/Scripts/python.exe -m ruff check --select S tests/contracts/fastapi_contract_fixture.py
 npm ci --no-audit --no-fund
+npm run test:js
 ./node_modules/.bin/spectral lint openapi.yaml --fail-severity warn
 git diff --check
 ```
@@ -415,9 +416,13 @@ python3 -m venv .venv
 .venv/bin/bandit tests/contracts/fastapi_contract_fixture.py
 .venv/bin/ruff check --select S tests/contracts/fastapi_contract_fixture.py
 npm ci --no-audit --no-fund
+npm run test:js
 ./node_modules/.bin/spectral lint openapi.yaml --fail-severity warn
 git diff --check
 ```
+
+`npm ci` applique `engine-strict=true` (`.npmrc`) : une version de Node non
+supportée échoue immédiatement.
 
 `tests/contracts/requirements.txt` est compilé avec hashes SHA-256
 (`requirements.in` + `pip-compile --generate-hashes`, LOW-4) et installé

@@ -5,6 +5,9 @@
   "description": "Compat shim exposing patched minimatch >= 11 through the callable CommonJS API expected by @stoplight/spectral-core.",
   "main": "index.js",
   "license": "ISC",
+  "engines": {
+    "node": "18 || 20 || >=22"
+  },
   "dependencies": {
     "minimatch-v11": "npm:minimatch@11.0.3"
   }

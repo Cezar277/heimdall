@@ -37,10 +37,19 @@ Ce shim réexporte la fonction `minimatch` de `minimatch@11` comme
   `glob@7 -> minimatch@3` utilisée par le bundler de rulesets Spectral.
   Le plugin 29 n'utilise plus `glob`.
 
+## Node
+
+`@stoplight/spectral-cli@6.17.0` exige Node `^22.0 || >=24.0` ; le champ
+`engines` de la racine reprend cette contrainte et `.npmrc` active
+`engine-strict=true` pour que `npm ci` échoue tôt sur une version non
+supportée. Le shim reste, lui, compatible avec les versions déclarées par
+`minimatch@11` (`18 || 20 || >=22`).
+
 ## Vérifications
 
 ```bash
 npm ci --no-audit --no-fund
+npm run test:js    # shim, lockfile et bundler Spectral
 npm run lint
 npm audit          # doit afficher 0 vulnérabilité
 ```

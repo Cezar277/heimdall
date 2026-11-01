@@ -13,3 +13,5 @@
 const { minimatch } = require('minimatch-v11');
 
 module.exports = minimatch;
+// Certains consommateurs utilisent l'export nommé de minimatch >= 9.
+module.exports.minimatch = minimatch;

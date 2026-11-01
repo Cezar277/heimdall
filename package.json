@@ -4,7 +4,8 @@
   "private": true,
   "description": "Lint OpenAPI du contrat Vault (#15) — version figée via package-lock.json (LOW-4).",
   "scripts": {
-    "lint": "spectral lint openapi.yaml --fail-severity warn"
+    "lint": "spectral lint openapi.yaml --fail-severity warn",
+    "test:js": "node --test \"tests/js/*.test.js\""
   },
   "devDependencies": {
     "@stoplight/spectral-cli": "6.17.0",
@@ -15,6 +16,6 @@
     "@rollup/plugin-commonjs": "29.0.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": "^22.0 || >=24.0"
   }
 }
