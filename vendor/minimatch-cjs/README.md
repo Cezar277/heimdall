@@ -1,0 +1,53 @@
+# minimatch-cjs
+
+Compat shim local, sans code métier, qui expose `minimatch >= 11` via l'API
+CommonJS appelable attendue par `@stoplight/spectral-core`.
+
+## Pourquoi ce paquet existe
+
+L'alerte Dependabot `GHSA-g3hv-75wg-m249` (CVE-2026-118764) concerne
+`minimatch < 11.0.1`. La dernière version de `@stoplight/spectral-cli`
+(6.17.0) dépend de `@stoplight/spectral-core@1.24.0`, qui épingle encore
+`minimatch@^3.1.4`. Aucune version publiée de Spectral ne permet donc de
+monter `minimatch` sans override.
+
+Le code compilé de `spectral-core` fait :
+
+```js
+const minimatch_1 = tslib.__importDefault(require('minimatch'));
+minimatch_1.default(source, pattern, { matchBase: true });
+```
+
+Or le build CommonJS de `minimatch >= 9` expose un namespace ES
+(`__esModule: true`, pas d'export `default`). Un override direct vers
+`minimatch@11` ferait donc échouer Spectral avec
+`minimatch_1.default is not a function`.
+
+Ce shim réexporte la fonction `minimatch` de `minimatch@11` comme
+`module.exports`. `tslib.__importDefault()` la transforme alors en
+`{ default: fn }`, ce qui restaure le contrat attendu par `spectral-core`.
+
+## Chaîne de dépendances
+
+- `package.json` (racine) déclare `minimatch: file:./vendor/minimatch-cjs`
+  en `devDependency` et l'override global `"minimatch": "$minimatch"`.
+- Ce paquet dépend de l'alias `minimatch-v11` (`npm:minimatch@11.0.3`) pour
+  éviter que l'override global ne s'applique à sa propre dépendance.
+- L'override `@rollup/plugin-commonjs@29.0.3` supprime l'ancienne chaîne
+  `glob@7 -> minimatch@3` utilisée par le bundler de rulesets Spectral.
+  Le plugin 29 n'utilise plus `glob`.
+
+## Vérifications
+
+```bash
+npm ci --no-audit --no-fund
+npm run lint
+npm audit          # doit afficher 0 vulnérabilité
+```
+
+## Quand supprimer ce shim
+
+Dès qu'une version publiée de `@stoplight/spectral-core` déclare
+`minimatch >= 11` (ou publie un correctif compatible), supprimer
+`vendor/minimatch-cjs`, la `devDependency` `minimatch` et l'override
+`"minimatch": "$minimatch"`, puis régénérer `package-lock.json`.

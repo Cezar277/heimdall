@@ -1,0 +1,11 @@
+{
+  "name": "minimatch-cjs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Compat shim exposing patched minimatch >= 11 through the callable CommonJS API expected by @stoplight/spectral-core.",
+  "main": "index.js",
+  "license": "ISC",
+  "dependencies": {
+    "minimatch-v11": "npm:minimatch@11.0.3"
+  }
+}
