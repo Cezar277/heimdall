@@ -139,9 +139,11 @@ distinguer « aucune base VCS » de « base VCS non parcourue ». Un dépôt ré
 à `.git/config` reste un **arbre vide** en local : il rend 0 avec
 `vcs_ignored == 1` et `files_scanned == 0` (compteur de bibliothèque) — un
 dépôt vide est propre, pas illisible. En revanche, le mode **`--ci`** est
-strict : dès qu'une base VCS a été élaguée sans **aucun** contenu lu, il rend
-**2** (`ScanError`) pour qu'une automatisation qui ne lit que le code de
-sortie ne confonde jamais « propre » et « non parcouru ». C'est pourquoi
+strict : dès qu'une base VCS **ou une entrée non suivie ignorée par
+`.gitignore`** a été élaguée sans **aucun** contenu lu, il rend **2**
+(`ScanError`) pour qu'une
+automatisation qui ne lit que le code de sortie ne confonde jamais « propre »
+et « non parcouru ». C'est pourquoi
 `--staged` est le périmètre opposable pour le contenu indexé : il couvre ce
 que le commit va contenir, pas les commits déjà écrits. Un fichier régulier
 nommé `.git` (gitlink de worktree ou de sous-module, `gitdir: …`) n'est pas
@@ -359,8 +361,12 @@ document si `count != len(findings)` (contrainte explicitée dans la
   environnement reconstruit (aucun `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`
   hérité), la configuration système/globale neutralisée, `core.fsmonitor` et
   `core.untrackedCache` désactivés, stdin fermé, un timeout et une sortie
-  bornés. Une panne de Git parcourt tout l'arbre : elle n'exclut jamais un
-  fichier en silence.
+  bornés. Après le parcours, un second snapshot vérifie que **toutes** les
+  entrées sautées sont encore ignorées : une promotion concurrente
+  (`git add -f`) refuse le scan en code 2, jamais un verdict périmé. Une
+  panne de Git au premier snapshot parcourt tout l'arbre : elle n'exclut
+  jamais un fichier en silence ; une panne au second snapshot après un skip
+  est fail-closed (code 2).
 - **Racine sans lien symbolique, dans les deux périmètres** : une seule
   garde (celle du mode arbre, `Scanner._resolve_root`), rejouée à
   l'entrée comme en fin de scan. `scan` et `scan --staged` disent la même

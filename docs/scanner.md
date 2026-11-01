@@ -147,6 +147,16 @@ ne sont **pas** honorées : elles varient d'un poste à l'autre et rendraient le
 verdict non déterministe. Pour les appliquer, l'opérateur les recopie dans un
 `.gitignore` du dépôt.
 
+Le snapshot initial ne fige pas l'**index** : un `git add -f` concurrent
+pourrait promouvoir une entrée déjà sautée, qui serait alors absente du
+rapport tout en pouvant partir dans un commit. Après le parcours, un second
+snapshot vérifie donc que **toutes** les exclusions appliquées sont encore
+ignorées ; toute divergence (ou un second snapshot impossible) lève
+`ScanError` (code 2), jamais un verdict périmé. Ce contrôle ne s'exécute que
+si au moins une entrée a été sautée. La fenêtre résiduelle après ce second
+snapshot relève de la même limite que tout scan d'arbre : `--staged` reste le
+périmètre opposable pour ce que le commit va réellement contenir.
+
 L'appel Git est confiné (binaire résolu hors `PATH` hérité, argv figé, sans
 shell, environnement reconstruit, configuration système/globale neutralisée,
 `core.fsmonitor` et `core.untrackedCache` désactivés, stdin fermé, timeout

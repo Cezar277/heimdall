@@ -305,11 +305,13 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   motif le matche (`git add -f`) ou s'il vit dans un répertoire ignoré :
   aucune exclusion ne peut cacher un secret qui peut partir dans un commit.
   Les fichiers suivis sont retirés des exclusions et un répertoire ignoré
-  contenant un fichier suivi n'est jamais élagué. Les exclusions globales de
-  la machine (`.git/info/exclude`, `core.excludesFile`,
-  `~/.config/git/ignore`) ne sont **pas** honorées : le verdict reste
-  déterministe. Une panne de Git (binaire absent, dépôt invalide) désactive
-  l'exclusion et parcourt tout l'arbre. Le compteur
+  contenant un fichier suivi n'est jamais élagué. Un second snapshot Git,
+  pris après le parcours, refuse (code 2) toute entrée sautée qui ne serait
+  plus ignorée : un `git add -f` concurrent ne peut pas produire un faux
+  négatif silencieux. Les exclusions globales de la machine
+  (`.git/info/exclude`, `core.excludesFile`, `~/.config/git/ignore`) ne sont
+  **pas** honorées : le verdict reste déterministe. Une panne de Git (binaire
+  absent, dépôt invalide) désactive l'exclusion et parcourt tout l'arbre. Le compteur
   `heimdall.scanner.detect.Scanner.vcs_ignored` expose les bases VCS
   écartées et `heimdall.scanner.detect.Scanner.git_ignored` les entrées
   `.gitignore` écartées ; les deux sont propagés par la CLI dans
