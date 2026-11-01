@@ -416,6 +416,46 @@ def test_a_broken_git_binary_falls_back_to_a_full_scan(
     assert collect_git_exclusions(tmp_path) is None
 
 
+def test_git_resolution_ignores_relative_defpath_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un ``.`` de ``os.defpath`` ne doit jamais faire exécuter le dépôt.
+
+    Windows met ``.`` en tête de ``os.defpath`` : un dépôt contenant un
+    ``git`` exécutable serait lancé si le chemin relatif était accepté.
+    """
+    trusted = str(tmp_path / "bin")
+    seen: list[str] = []
+
+    def fake_which(_cmd: str, path: str | None = None) -> str | None:
+        assert path is not None
+        seen.append(path)
+        return str(Path(path) / "git")
+
+    monkeypatch.setattr(gitignore.os, "defpath", f".{os.pathsep}{trusted}")
+    monkeypatch.setattr(gitignore.shutil, "which", fake_which)
+    assert gitignore._resolve_git() == str(Path(trusted) / "git")
+    assert "." not in seen
+
+
+def test_git_resolution_requires_an_absolute_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Même un ``which`` qui rend ``git`` relatif est refusé (fail-closed)."""
+    monkeypatch.setattr(gitignore.os, "defpath", "/usr/bin")
+    monkeypatch.setattr(gitignore.shutil, "which", lambda *_args, **_kwargs: "git")
+    assert gitignore._resolve_git() is None
+
+
+def test_git_resolution_without_a_trusted_candidate_disables_exclusions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aucun répertoire absolu ou aucun Git : parcours complet, pas de skip."""
+    monkeypatch.setattr(gitignore.os, "defpath", f".{os.pathsep}relative")
+    monkeypatch.setattr(gitignore.shutil, "which", lambda *_args, **_kwargs: "git")
+    assert gitignore._resolve_git() is None
+
+
 def test_a_non_repository_root_disables_exclusions(tmp_path: Path) -> None:
     """Hors dépôt, Git échoue : aucune exclusion n'est inventée."""
     plain = tmp_path / "plain"

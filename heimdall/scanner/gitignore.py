@@ -45,10 +45,30 @@ from typing import IO, Final
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import validate_relative_path
 
+
+def _resolve_git() -> str | None:
+    """Résout Git dans les répertoires **absolus** de ``os.defpath``.
+
+    ``shutil.which(..., path=os.defpath)`` peut rendre un chemin relatif quand
+    ``os.defpath`` contient ``.`` (cas de Windows : ``.;C:\\bin``) : exécuter
+    un ``git`` fourni par le dépôt scanné serait une exécution de code
+    arbitraire. Les entrées relatives sont donc ignorées, et le résultat doit
+    lui-même être absolu. Aucun candidat sûr : ``None``, donc aucune exclusion
+    Git et un parcours complet — jamais un skip silencieux.
+    """
+    for directory in os.defpath.split(os.pathsep):
+        if not os.path.isabs(directory):
+            continue
+        candidate = shutil.which("git", path=directory)
+        if candidate is not None and os.path.isabs(candidate):
+            return candidate
+    return None
+
+
 #: Binaire Git résolu **hors** du ``PATH`` hérité : un ``PATH`` compromis ne
 #: détourne pas l'exécutable. Absent du défaut système : aucune exclusion Git
 #: n'est appliquée (parcours complet), jamais un skip silencieux.
-_GIT: Final[str | None] = shutil.which("git", path=os.defpath)
+_GIT: Final[str | None] = _resolve_git()
 
 #: Timeout unitaire d'une commande Git (le scanner a sa propre deadline).
 GIT_TIMEOUT_SECONDS: Final[float] = 30.0
