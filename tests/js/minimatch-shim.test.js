@@ -36,6 +36,13 @@ test('le lockfile ne contient plus aucune version vulnérable de minimatch', () 
   assert.equal(patched.name, 'minimatch');
   assert.equal(patched.version, '11.0.3');
 
+  // spectral-core@1.24.0 déclare encore minimatch@^3.1.4 dans ses métadonnées ;
+  // c'est l'override `$minimatch` qui garantit qu'aucune version 3.x n'est
+  // installée. On fige cette déclaration amont pour éviter un faux positif
+  // lors d'un audit `grep` sur le lockfile.
+  const spectralCore = packages['node_modules/@stoplight/spectral-core'];
+  assert.equal(spectralCore.dependencies.minimatch, '^3.1.4');
+
   for (const [name, pkg] of Object.entries(packages)) {
     if (name !== 'node_modules/minimatch' && !name.endsWith('/node_modules/minimatch')) {
       continue;
@@ -53,8 +60,9 @@ test('npm ls ne remonte aucune version 3.x de minimatch', () => {
   const result = spawnSync(
     npm,
     ['ls', 'minimatch', 'minimatch-v11', '--json'],
-    { cwd: ROOT, encoding: 'utf8' },
+    { cwd: ROOT, encoding: 'utf8', timeout: 30_000 },
   );
+  assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, result.stderr || result.stdout);
 
   const tree = JSON.parse(result.stdout);
@@ -96,15 +104,39 @@ test('les motifs à accolades imbriquées restent bornés', () => {
   assert.equal(typeof minimatch('x', pattern, { braceExpandMax: 1000 }), 'boolean');
 });
 
+test('les helpers filter/match/braceExpand appliquent la borne par défaut', () => {
+  const pattern = '{a,b,c,d,e,f,g,h,i,j}'.repeat(10);
+
+  const expanded = minimatch.braceExpand(pattern);
+  assert.ok(expanded.length <= 1000, `expanded=${expanded.length}`);
+
+  const limited = minimatch.braceExpand(pattern, { braceExpandMax: 50 });
+  assert.ok(limited.length <= 50, `expanded=${limited.length}`);
+
+  const simple = '{a,b}';
+  const predicate = minimatch.filter(simple);
+  assert.equal(typeof predicate, 'function');
+  assert.equal(predicate('a'), true);
+  assert.equal(predicate('z'), false);
+
+  assert.deepEqual(minimatch.match(['a', 'z'], simple), ['a']);
+});
+
 test('le préprocessing optimizationLevel 2 reste borné par défaut', () => {
   const pattern = '**/../a/b/'.repeat(200) + 'x';
 
   const bounded = new minimatch.Minimatch(pattern, { optimizationLevel: 2 });
-  assert.ok(bounded.set.length <= 1000, `globParts=${bounded.set.length}`);
+  assert.equal(bounded.set.length, 1000);
 
   const overridden = new minimatch.Minimatch(pattern, {
     optimizationLevel: 2,
     braceExpandMax: 50,
   });
-  assert.ok(overridden.set.length <= 50, `globParts=${overridden.set.length}`);
+  assert.equal(overridden.set.length, 50);
+
+  const combined = new minimatch.Minimatch(
+    '{a,b}'.repeat(20) + '/**/../a/b/x',
+    { optimizationLevel: 2 },
+  );
+  assert.ok(combined.set.length <= 1000, `globParts=${combined.set.length}`);
 });
