@@ -26,6 +26,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from support.fake_secrets import fake_token
 
+from heimdall.scanner import detect as detect_module
 from heimdall.scanner import exclusions, hashing
 from heimdall.scanner.detect import (
     MAX_FILE_BYTES,
@@ -67,6 +68,35 @@ def _fixed_hmac_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _aws(seed: str = "aws", prefix: str = "AKIA") -> str:
     return prefix + hashlib.sha256(f"heimdall-t22-{seed}".encode()).hexdigest()[:16].upper()
+
+
+@pytest.mark.parametrize("anchored", [False, True])
+@pytest.mark.parametrize("single", [False, True])
+def test_size_skip_preserves_confined_readers_and_file_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, anchored: bool, single: bool
+) -> None:
+    if anchored and not detect_module._DIR_FD_SUPPORTED:
+        pytest.skip("directory descriptors required")
+    monkeypatch.setattr(detect_module, "_DIR_FD_SUPPORTED", anchored)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    oversized = nested / "large.txt"
+    oversized.write_bytes(b"x" * 100)
+    (nested / "small.txt").write_bytes(b"safe\n")
+    original_read = os.read
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        assert os.fstat(descriptor).st_size <= 32, "oversized file must never be read"
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(os, "read", bounded_read)
+    skipped: list[str] = []
+    scanner = Scanner(oversized if single else tmp_path, max_file_bytes=32, skipped_files=skipped)
+    assert scanner.scan() == []
+    assert skipped == ["large.txt" if single else "nested/large.txt"]
+    assert scanner.files_scanned == (0 if single else 1)
+    with pytest.raises(ScanError):
+        Scanner(oversized if single else tmp_path, max_file_bytes=32).scan()
 
 
 def _stripe(seed: str = "stripe") -> str:
@@ -827,6 +857,42 @@ def test_a_gitlink_file_is_not_mistaken_for_the_vcs_database(tmp_path: Path) -> 
 
     _write(tmp_path, ".git", f'AWS = "{_aws("gitlink")}"\n')
     assert [finding.file for finding in scan(tmp_path)] == [".git"]
+
+
+def test_strict_mode_never_changes_the_content_perimeter(tmp_path: Path) -> None:
+    """Revue (LOW) : ``strict`` n'ouvre pas un second régime de périmètre.
+
+    Le paramètre reste accepté pour compatibilité avec #29, mais il ne change
+    rien : seule la base VCS est élaguée, et tous les fichiers de contenu
+    (``vendor/``, ``node_modules/``, lockfile, sortie de build, ``evil.png``
+    textuel) sont lus par contenu. Le test fige l'équivalence exacte des
+    Findings et des compteurs entre ``strict=True`` et ``strict=False`` :
+    aucun futur appelant ne peut croire durcir le scan en passant ce drapeau.
+    """
+    _write(tmp_path, "app.py", "x = 1\n")
+    _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"\n')
+    _write(tmp_path, "node_modules/pkg/index.js", f'AWS = "{_aws("node")}"\n')
+    _write(tmp_path, "package-lock.json", f'AWS = "{_aws("lock")}"\n')
+    _write(tmp_path, "build/output.js", f'AWS = "{_aws("build")}"\n')
+    _write(tmp_path, "evil.png", f'AWS = "{_aws("png-text")}"\n')
+    _write(tmp_path, ".git/config", f'AWS = "{_aws("git-only")}"\n')
+
+    strict_scanner = Scanner(tmp_path, strict=True)
+    default_scanner = Scanner(tmp_path, strict=False)
+    strict_findings = strict_scanner.scan()
+    default_findings = default_scanner.scan()
+
+    assert strict_findings == default_findings
+    assert scan(tmp_path, strict=True) == scan(tmp_path, strict=False)
+    assert strict_scanner.vcs_ignored == default_scanner.vcs_ignored == 1
+    assert strict_scanner.files_scanned == default_scanner.files_scanned == 6
+    assert [finding.file for finding in strict_findings] == [
+        "build/output.js",
+        "evil.png",
+        "node_modules/pkg/index.js",
+        "package-lock.json",
+        "vendor/secret.txt",
+    ]
 
 
 def test_a_broken_file_in_the_strict_perimeter_is_fail_closed(tmp_path: Path) -> None:

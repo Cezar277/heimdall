@@ -3,6 +3,12 @@
 Le journal des propositions de rejet du LLM se consulte avec
 `heimdall rejections [--details]` ; voir [T33](llm-rejections.md).
 
+Le premier lancement sur un dépôt existant dispose de deux commandes
+associées, décrites dans [cold-start.md](cold-start.md) (T38, #107–#110) :
+`heimdall cold-start` (entonnoir regex/entropie puis avis LLM sur les seuls
+candidats) et `heimdall deep-scan` (historique complet, alerte de
+révocation et mesure du temps).
+
 Statut : livré par le ticket #29 (sous-ticket de l'épic #6 « CLI, hook et CI
 headless »). La commande est **branchée** sur le scanner déterministe #22 et
 sur l'accès git confiné #27. Elle est **en lecture seule sur le dépôt** :
@@ -118,39 +124,28 @@ archive ne devient jamais un faux négatif silencieux. Un contenu inconnu
 suffixe.
 
 Le mode strict est une correction issue de la revue de #165 (point HIGH) :
-une exclusion **par le nom** écartait `vendor/`, `node_modules/` et les
-lockfiles, donc un secret posé dans `vendor/evil.py` n'était **jamais**
-signalé. Aucun nom de fichier ou de répertoire de contenu n'exclut plus rien :
-le contenu décide pour tout fichier **suivi ou non ignoré**. La seule
-exclusion de contenu du mode arbre est l'état Git : une entrée **non suivie
-et ignorée** par un `.gitignore` du dépôt est écartée (motifs imbriqués et
-négations compris). Un fichier **suivi** reste toujours analysé, même si un
-`.gitignore` le matche (`git add -f`) ; il ne peut donc pas cacher un secret
-qui peut partir dans un commit. La liste est configurable par le dépôt ; les
-exclusions globales (`.git/info/exclude`, `core.excludesFile`,
-`~/.config/git/ignore`) ne sont **pas** honorées pour garder un verdict
-déterministe. Une panne de Git (binaire absent, dépôt invalide) désactive
-l'exclusion et parcourt tout l'arbre : le scanner lit plus, jamais moins.
-`--no-gitignore` force ce parcours intégral.
-
-L'historique VCS (`.git/`) n'est jamais parcouru par le mode arbre, et les
-compteurs `heimdall.scanner.detect.Scanner.vcs_ignored` et
-`heimdall.scanner.detect.Scanner.git_ignored` rendent ces élagages
-observables. Ils sont propagés dans `ScanReport.vcs_ignored` /
-`ScanReport.git_ignored`, les champs `vcs_ignored` / `git_ignored` du JSON,
-le texte et le résumé `--ci` sur stderr : une CI peut donc distinguer
-« aucune base VCS / aucune entrée ignorée » de « contenu non parcouru ». Un
-dépôt réduit à `.git/config` ou à des entrées `.gitignore` reste un **arbre
-vide** en local : il rend 0 avec `vcs_ignored`/`git_ignored > 0` et
-`files_scanned == 0` (compteur de bibliothèque) — un dépôt vide est propre,
-pas illisible. En revanche, le mode **`--ci`** est strict : dès qu'une
-exclusion a été appliquée sans **aucun** contenu lu, il rend **2**
-(`ScanError`) pour qu'une automatisation qui ne lit que le code de sortie ne
-confonde jamais « propre » et « non parcouru ». C'est pourquoi `--staged` est
-le périmètre opposable pour le contenu indexé : il couvre ce que le commit va
-contenir, pas les commits déjà écrits. Un fichier régulier nommé `.git`
-(gitlink de worktree ou de sous-module, `gitdir: …`) n'est pas une base VCS :
-il est lu par contenu.
+la politique #59 excluait `vendor/`, `node_modules/` et les lockfiles, donc un
+secret posé dans `vendor/evil.py` n'était **jamais** signalé. Un secret y est
+un secret : aucun nom de fichier ou de répertoire de contenu n'exclut plus rien,
+et le contenu décide. Seule la base VCS est hors du périmètre audité. Le
+paramètre de bibliothèque `strict` n'ouvre pas un second régime :
+`Scanner(root, strict=True)` et `Scanner(root, strict=False)` rendent le même
+périmètre (test `test_strict_mode_never_changes_the_content_perimeter`).
+L'historique VCS (`.git/`) n'est jamais parcouru par le mode arbre, et le
+compteur `heimdall.scanner.detect.Scanner.vcs_ignored` rend cet élagage
+observable. Ce compteur est propagé dans `ScanReport.vcs_ignored`, le champ
+`vcs_ignored` du JSON et le résumé `--ci` sur stderr : une CI peut donc
+distinguer « aucune base VCS » de « base VCS non parcourue ». Un dépôt réduit
+à `.git/config` reste un **arbre vide** en local : il rend 0 avec
+`vcs_ignored == 1` et `files_scanned == 0` (compteur de bibliothèque) — un
+dépôt vide est propre, pas illisible. En revanche, le mode **`--ci`** est
+strict : dès qu'une base VCS a été élaguée sans **aucun** contenu lu, il rend
+**2** (`ScanError`) pour qu'une automatisation qui ne lit que le code de
+sortie ne confonde jamais « propre » et « non parcouru ». C'est pourquoi
+`--staged` est le périmètre opposable pour le contenu indexé : il couvre ce
+que le commit va contenir, pas les commits déjà écrits. Un fichier régulier
+nommé `.git` (gitlink de worktree ou de sous-module, `gitdir: …`) n'est pas
+une base VCS : il est lu par contenu.
 
 En mode `--staged`, c'est le **blob indexé** qui est lu, pas la copie de
 travail : c'est ce que le commit va contenir qui est jugé. Le blob entier est

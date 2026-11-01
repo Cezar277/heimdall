@@ -91,13 +91,21 @@ def test_every_samm_permalink_is_alive_or_declared() -> None:
 
 
 def test_the_fiche_declares_the_repin_procedure() -> None:
-    """La fiche expose la procédure de re-pin (elle ne peut pas pourrir en silence)."""
+    """La fiche expose la procédure de re-pin, avant ou après fusion.
+
+    Tant que la fusion n'a pas eu lieu, elle liste les révisions à re-pinner.
+    Une fois le re-pin exécuté, elle déclare explicitement son achèvement :
+    la procédure et la commande de contrôle restent écrites, la fiche ne peut
+    donc pas pourrir en silence.
+    """
     texte = FICHE.read_text(encoding="utf-8")
     assert "scripts/repin_samm.py" in texte
     assert "--sha" in texte
     assert "--check" in texte
-    bas = texte.casefold().find("révisions à re-pinner après la fusion")
-    assert bas >= 0, "la fiche ne déclare pas les révisions à re-pinner"
+    bas = texte.casefold()
+    assert (
+        "révisions à re-pinner après la fusion" in bas or "re-pin après fusion (effectué)" in bas
+    ), "la fiche ne déclare ni les révisions à re-pinner ni la clôture du re-pin"
 
 
 def test_the_repin_rewrites_only_the_links_of_delivered_files(tmp_path: Path) -> None:

@@ -80,6 +80,7 @@ def _directory_flags() -> int:
     """Drapeaux d'ouverture d'un répertoire, sans jamais suivre un lien."""
     return _open_flags() | getattr(os, "O_DIRECTORY", 0)
 
+
 MAX_FILE_BYTES: Final[int] = 1_048_576
 MULTILINE_WINDOW: Final[int] = 4096
 #: Plafond du nombre de fichiers analysés en une passe (#29). Au-delà, le
@@ -106,7 +107,7 @@ _DIR_FD_SUPPORTED: Final[bool] = (
 
 #: Un lecteur de fichier déjà confiné : le descripteur de répertoire parent
 #: (mode ancré) ou le chemin re-vérifié (repli) est capturé à l'itération.
-_FileReader = Callable[[], tuple[str, int]]
+_FileReader = Callable[[], tuple[str | None, int]]
 
 
 def _checked_bound(value: int | None, default: int) -> int:
@@ -206,7 +207,8 @@ class Scanner:
         "_max_bytes",
         "_max_files",
         "_max_findings",
-        "_respect_gitignore",
+        "_max_file_bytes",
+        "_skipped_files",
         "_root",
         "_root_id",
         "_single",
@@ -226,7 +228,8 @@ class Scanner:
         max_bytes: int | None = None,
         max_findings: int | None = None,
         allowlist: Allowlist | None = None,
-        respect_gitignore: bool = True,
+        max_file_bytes: int | None = None,
+        skipped_files: list[str] | None = None,
     ) -> None:
         # Un booléen strict : une chaîne ou un entier ne doit jamais activer
         # ou désactiver les exclusions par accident.
@@ -237,6 +240,8 @@ class Scanner:
         self._max_files = _checked_bound(max_files, MAX_FILES)
         self._max_bytes = _checked_bound(max_bytes, MAX_TOTAL_BYTES)
         self._max_findings = _checked_bound(max_findings, MAX_FINDINGS)
+        self._max_file_bytes = _checked_bound(max_file_bytes, MAX_FILE_BYTES)
+        self._skipped_files = skipped_files
         resolved = _resolve_root(root)
         try:
             resolved_stat = os.lstat(resolved)
@@ -493,6 +498,8 @@ class Scanner:
                 if count > self._max_files:
                     raise ScanError(_SCAN_ERROR)
                 text, size = reader()
+                if text is None:
+                    continue
                 total += size
                 self._files_scanned += 1
                 if total > self._max_bytes:
@@ -720,7 +727,7 @@ class Scanner:
                     raise ScanError(_SCAN_ERROR)
                 yield path, _validate_relative_path(relative)
 
-    def _read_text(self, path: Path) -> tuple[str, int]:
+    def _read_text(self, path: Path) -> tuple[str | None, int]:
         """Lit un fichier borné et rend ``(texte, taille)`` (repli par chemin).
 
         La taille lue est rendue pour que ``scan()`` borne le **volume total**
@@ -740,9 +747,9 @@ class Scanner:
             descriptor = os.open(path, _open_flags())
         except OSError:
             raise ScanError(_SCAN_ERROR) from None
-        return self._read_descriptor(descriptor, before)
+        return self._read_descriptor(descriptor, before, path.relative_to(self._root).as_posix())
 
-    def _read_text_at(self, dir_fd: int, name: str, relative: str) -> tuple[str, int]:
+    def _read_text_at(self, dir_fd: int, name: str, relative: str) -> tuple[str | None, int]:
         """Lit un fichier **relatif au descripteur** du répertoire parent.
 
         ``openat`` + ``O_NOFOLLOW`` interdit de suivre un lien et fige le
@@ -764,14 +771,21 @@ class Scanner:
             descriptor = os.open(name, _open_flags(), dir_fd=dir_fd)
         except (OSError, RuntimeError):
             raise ScanError(_SCAN_ERROR) from None
-        return self._read_descriptor(descriptor, before)
+        return self._read_descriptor(descriptor, before, relative)
 
-    def _read_descriptor(self, descriptor: int, before: os.stat_result) -> tuple[str, int]:
-        """Lit un descripteur déjà ouvert, vérifie son identité et le ferme."""
+    def _read_descriptor(  # noqa: PLR0912 - descriptor identity and size checks
+        self, descriptor: int, before: os.stat_result, relative: str
+    ) -> tuple[str | None, int]:
+        """Lit un descripteur déjà ouvert, vérifie son identité et le ferme.
+
+        Avec un collecteur explicite, un fichier trop volumineux est signalé
+        par son chemin relatif et ``(None, 0)``, sans lire son contenu. Les
+        autres refus restent des ``ScanError``, y compris les binaires.
+        """
         chunks: list[bytes] = []
         try:
             after = os.fstat(descriptor)
-            if not stat.S_ISREG(after.st_mode) or after.st_size > MAX_FILE_BYTES:
+            if not stat.S_ISREG(after.st_mode):
                 raise ScanError(_SCAN_ERROR)
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                 raise ScanError(_SCAN_ERROR)
@@ -780,7 +794,12 @@ class Scanner:
             # changer l'identité. Refus avant toute lecture partielle.
             if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
                 raise ScanError(_SCAN_ERROR)
-            remaining = MAX_FILE_BYTES + 1
+            if after.st_size > self._max_file_bytes:
+                if self._skipped_files is None:
+                    raise ScanError(_SCAN_ERROR)
+                self._skipped_files.append(relative)
+                return None, 0
+            remaining = self._max_file_bytes + 1
             while remaining > 0:
                 chunk = os.read(descriptor, min(_READ_CHUNK, remaining))
                 if not chunk:
@@ -794,7 +813,7 @@ class Scanner:
                 and final.st_mtime_ns == after.st_mtime_ns
                 and len(data) == after.st_size
             )
-            if not unchanged or len(data) > MAX_FILE_BYTES:
+            if not unchanged or len(data) > self._max_file_bytes:
                 raise ScanError(_SCAN_ERROR)
         except OSError:
             raise ScanError(_SCAN_ERROR) from None
@@ -903,9 +922,7 @@ class Scanner:
                 secret_type=match.secret_type,
             )
             if rule_name is not None:
-                self._traces.append(
-                    AllowlistTrace(rule=rule_name, file=relative, line=line_number)
-                )
+                self._traces.append(AllowlistTrace(rule=rule_name, file=relative, line=line_number))
                 return
 
         findings.append(
