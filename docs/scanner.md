@@ -157,6 +157,19 @@ si au moins une entrée a été sautée. La fenêtre résiduelle après ce secon
 snapshot relève de la même limite que tout scan d'arbre : `--staged` reste le
 périmètre opposable pour ce que le commit va réellement contenir.
 
+La racine du snapshot est **épinglée par descripteur** : elle est ouverte en
+`O_DIRECTORY|O_NOFOLLOW`, son identité `(st_dev, st_ino)` est vérifiée, puis
+Git reçoit ce descripteur via `/proc/self/fd/N` (ou `/dev/fd/N`) et non le
+chemin re-résolu. Un échange `A → B → A` du chemin autour de l'appel Git ne
+peut donc pas faire calculer les exclusions sur `B` alors que les deux
+`lstat` voient `A`. Si l'épinglage échoue alors que la plateforme le permet
+(lien symbolique, droits, course), aucune exclusion n'est calculée : parcours
+complet, jamais un repli silencieux par chemin. Sur une plateforme sans
+descripteur de répertoire (Windows), le repli par chemin conserve la double
+vérification `lstat` avant/après ; la précondition **« racine et index figés
+pendant le scan »** y reste alors explicite. Dans tous les cas, un index promu
+pendant le parcours est refusé par le second snapshot.
+
 L'appel Git est confiné (binaire résolu hors `PATH` hérité, argv figé, sans
 shell, environnement reconstruit, configuration système/globale neutralisée,
 `core.fsmonitor` et `core.untrackedCache` désactivés, stdin fermé, timeout

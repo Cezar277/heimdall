@@ -26,8 +26,10 @@ et de la livraison initiale
 (`feat(scanner): exclusions Git sûres et observables (#59)`).
 
 Les permaliens de cette fiche épinglent `cae99ec…`, la révision qui contient
-le code **et** les tests cités. Après une fusion par squash, re-pincer la fiche
-sur le SHA présent dans `main` :
+le code **et** les tests cités. Le correctif de revue « racine épinglée par
+descripteur » est décrit dans [scanner.md](scanner.md) ; les permaliens
+ci-dessous restent ceux de la révision `cae99ec…`. Après une fusion par
+squash, re-pincer la fiche sur le SHA présent dans `main` :
 
 ```sh
 python scripts/repin_samm.py --fiche docs/t59-samm.md --sha <sha-final>
@@ -161,6 +163,16 @@ texte, `--ci`, `--staged` et `--no-gitignore`.
   un verdict périmé. La fenêtre résiduelle après ce second snapshot reste
   couverte par `--staged`, seul périmètre opposable pour le contenu
   réellement commité.
+- La racine du snapshot est épinglée par un descripteur
+  `O_DIRECTORY|O_NOFOLLOW` vérifié : Git reçoit `/proc/self/fd/N` (ou
+  `/dev/fd/N`) et lit l'inode déjà contrôlé, jamais le chemin re-résolu. Un
+  échange `A → B → A` du chemin autour de l'appel Git ne peut donc pas
+  substituer `B`. Si l'épinglage échoue alors que la plateforme le permet
+  (lien symbolique, droits, course), le parcours est complet, sans repli par
+  chemin. Sur une plateforme sans descripteur de répertoire (Windows), le
+  repli par chemin conserve la double vérification `lstat` et la précondition
+  « racine et index figés pendant le scan » documentée dans
+  [scanner.md](scanner.md).
 - Un répertoire ignoré élagué compte pour **une** entrée dans `git_ignored`,
   pas pour le nombre de fichiers qu'il contient.
 - Sans Git, le scanner lit **plus** (tout l'arbre) : le verdict reste

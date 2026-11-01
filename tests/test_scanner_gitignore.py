@@ -415,10 +415,19 @@ def test_an_index_change_during_the_scan_is_refused(
     calls = 0
 
     def changing(
-        root: str | os.PathLike[str], *, deadline: float | None = None
+        root: str | os.PathLike[str],
+        *,
+        deadline: float | None = None,
+        root_fd: int | None = None,
+        expected_root_id: tuple[int, int] | None = None,
     ) -> GitExclusions | None:
         nonlocal calls
-        result = original(root, deadline=deadline)
+        result = original(
+            root,
+            deadline=deadline,
+            root_fd=root_fd,
+            expected_root_id=expected_root_id,
+        )
         if calls == 0:
             repo.git("add", "-f", ".env")
         calls += 1
@@ -429,6 +438,63 @@ def test_an_index_change_during_the_scan_is_refused(
     with pytest.raises(ScanError):
         scanner.scan()
     assert calls == 2
+
+
+def test_a_root_swap_around_the_git_snapshot_reads_the_scanned_root(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un échange ``A → B → A`` autour de Git ne fait jamais lire ``B``.
+
+    La racine est épinglée par descripteur : Git reçoit ``/proc/self/fd/N``
+    (ou ``/dev/fd/N``), pas le chemin. Le remplaçant ``B`` n'est pas un dépôt :
+    un appel par chemin échouerait, désactiverait les exclusions et ferait
+    lire le secret de ``A``. Le test exige donc l'absence de Finding et
+    ``git_ignored == 1``, jamais un verdict sur l'arbre substitué.
+    """
+    if not hasattr(os, "O_DIRECTORY") or not (
+        os.path.isdir("/proc/self/fd") or os.path.isdir("/dev/fd")
+    ):
+        pytest.skip("descripteurs de répertoire indisponibles")
+    repo.write(".gitignore", ".env\n")
+    repo.stage(".gitignore")
+    repo.commit_all("base")
+    _secret_file(repo, ".env")
+
+    parent = repo.root.parent
+    held = parent / "root-held"
+    replacement = parent / "root-replacement"
+    replacement.mkdir()
+    original_popen = subprocess.Popen
+
+    def swapping_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        os.rename(repo.root, held)
+        os.rename(replacement, repo.root)
+        try:
+            process = original_popen(*args, **kwargs)  # type: ignore[arg-type]
+        except BaseException:
+            os.rename(repo.root, replacement)
+            os.rename(held, repo.root)
+            raise
+        original_wait = process.wait
+        restored = False
+
+        def restoring_wait(timeout: float | None = None) -> int:
+            nonlocal restored
+            try:
+                return original_wait(timeout=timeout)
+            finally:
+                if not restored:
+                    os.rename(repo.root, replacement)
+                    os.rename(held, repo.root)
+                    restored = True
+
+        process.wait = restoring_wait  # type: ignore[method-assign]
+        return process
+
+    monkeypatch.setattr(gitignore.subprocess, "Popen", swapping_popen)
+    scanner = Scanner(repo.root)
+    assert scanner.scan() == []
+    assert scanner.git_ignored == 1
 
 
 def test_a_second_snapshot_failure_is_fail_closed(
@@ -449,12 +515,21 @@ def test_a_second_snapshot_failure_is_fail_closed(
     calls = 0
 
     def changing(
-        root: str | os.PathLike[str], *, deadline: float | None = None
+        root: str | os.PathLike[str],
+        *,
+        deadline: float | None = None,
+        root_fd: int | None = None,
+        expected_root_id: tuple[int, int] | None = None,
     ) -> GitExclusions | None:
         nonlocal calls
         calls += 1
         if calls == 1:
-            return original(root, deadline=deadline)
+            return original(
+                root,
+                deadline=deadline,
+                root_fd=root_fd,
+                expected_root_id=expected_root_id,
+            )
         return None
 
     monkeypatch.setattr(detect_module, "collect_git_exclusions", changing)
@@ -534,6 +609,171 @@ def test_a_non_repository_root_disables_exclusions(tmp_path: Path) -> None:
     assert collect_git_exclusions(plain) is None
 
 
+def test_a_missing_or_non_directory_root_cannot_be_pinned(tmp_path: Path) -> None:
+    """Un descripteur n'est rendu que pour un répertoire réellement ouvert."""
+    assert gitignore._open_directory(tmp_path / "missing") is None
+    plain = tmp_path / "file.txt"
+    plain.write_text("x = 1\n", encoding="utf-8")
+    assert gitignore._open_directory(plain) is None
+
+
+def test_a_failed_pin_never_falls_back_to_the_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un lien racine refuse l'épinglage : Git n'est jamais relancé par chemin."""
+    if not gitignore._ROOT_FD_SUPPORTED or not hasattr(os, "O_NOFOLLOW"):
+        pytest.skip("épinglage par descripteur indisponible")
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("liens symboliques indisponibles")
+    called = False
+
+    def forbidden(*_args: object, **_kwargs: object) -> bytes:
+        nonlocal called
+        called = True
+        raise AssertionError("Git ne doit pas être relancé sur le chemin")
+
+    monkeypatch.setattr(gitignore, "_run_git", forbidden)
+    assert collect_git_exclusions(link) is None
+    assert called is False
+
+
+def test_a_descriptor_for_another_root_is_refused_before_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un descripteur qui ne porte pas l'identité attendue rend ``None``.
+
+    Le contrôle est fait **avant** de lancer Git : aucune exclusion ne peut
+    être calculée sur un inode substitué.
+    """
+    descriptor = gitignore._open_directory(tmp_path)
+    if descriptor is None:
+        pytest.skip("descripteurs de répertoire indisponibles")
+    called = False
+
+    def forbidden(*_args: object, **_kwargs: object) -> bytes:
+        nonlocal called
+        called = True
+        raise AssertionError("Git ne doit pas être lancé sur un descripteur substitué")
+
+    monkeypatch.setattr(gitignore, "_run_git", forbidden)
+    try:
+        assert (
+            collect_git_exclusions(
+                tmp_path,
+                root_fd=descriptor,
+                expected_root_id=(0, 0),
+            )
+            is None
+        )
+    finally:
+        os.close(descriptor)
+    assert called is False
+
+
+def test_an_owned_descriptor_is_used_then_closed_after_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Le descripteur ouvert par ``collect`` est transmis à Git puis fermé."""
+    descriptor = gitignore._open_directory(tmp_path)
+    if descriptor is None:
+        pytest.skip("descripteurs de répertoire indisponibles")
+    seen: list[object] = []
+
+    def capture(root: object, *_args: object, **_kwargs: object) -> bytes:
+        seen.append(root)
+        return b""
+
+    monkeypatch.setattr(gitignore, "_open_directory", lambda _path: descriptor)
+    monkeypatch.setattr(gitignore, "_run_git", capture)
+    assert collect_git_exclusions(tmp_path) == GitExclusions()
+    assert len(seen) == 1
+    assert isinstance(seen[0], gitignore._PinnedRoot)
+    assert seen[0].descriptor == descriptor
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_a_descriptor_for_another_path_is_refused_without_expected_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sans identité attendue, le descripteur est confronté au chemin annoncé."""
+    other = tmp_path / "other"
+    other.mkdir()
+    descriptor = gitignore._open_directory(other)
+    if descriptor is None:
+        pytest.skip("descripteurs de répertoire indisponibles")
+    called = False
+
+    def forbidden(*_args: object, **_kwargs: object) -> bytes:
+        nonlocal called
+        called = True
+        raise AssertionError("Git ne doit pas être lancé sur un descripteur substitué")
+
+    monkeypatch.setattr(gitignore, "_run_git", forbidden)
+    try:
+        assert collect_git_exclusions(tmp_path, root_fd=descriptor) is None
+    finally:
+        os.close(descriptor)
+    assert called is False
+
+
+def test_a_pinned_root_without_an_fd_path_never_falls_back_to_the_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un descripteur épinglé sans chemin de descripteur rend ``None``.
+
+    Le repli par chemin serait exactement la course que l'épinglage ferme :
+    mieux vaut un parcours complet qu'un Git relancé sur le chemin.
+    """
+    descriptor = gitignore._open_directory(tmp_path)
+    if descriptor is None:
+        pytest.skip("descripteurs de répertoire indisponibles")
+    called = False
+
+    def forbidden(*_args: object, **_kwargs: object) -> bytes:
+        nonlocal called
+        called = True
+        raise AssertionError("aucun Git ne doit être lancé sans chemin de descripteur")
+
+    monkeypatch.setattr(gitignore, "_directory_fd_path", lambda _fd: None)
+    monkeypatch.setattr(gitignore, "_run_git_command", forbidden)
+    pinned = gitignore._PinnedRoot(tmp_path, descriptor, (0, 0))
+    try:
+        assert gitignore._run_git(pinned, ("ls-files",), None) is None
+    finally:
+        os.close(descriptor)
+    assert called is False
+
+
+def test_fd_helpers_fall_back_without_a_descriptor_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sans ``/proc/self/fd`` ni ``/dev/fd``, le repli reste explicite."""
+    monkeypatch.setattr(gitignore.os.path, "isdir", lambda _path: False)
+    assert gitignore._directory_fd_path(3) is None
+
+    monkeypatch.setattr(gitignore.os, "readlink", lambda _path: "relative")
+    assert gitignore._fd_real_path("fd") is None
+
+    deleted = f"{tmp_path}/root (deleted)"
+    monkeypatch.setattr(gitignore.os, "readlink", lambda _path: deleted)
+    assert gitignore._fd_real_path("fd") == f"{tmp_path}/root"
+
+    def broken(_path: str) -> str:
+        raise OSError
+
+    monkeypatch.setattr(gitignore.os, "readlink", broken)
+    assert gitignore._fd_real_path("fd") is None
+
+    monkeypatch.setattr(gitignore, "_fd_real_path", lambda _path: None)
+    assert gitignore._ceiling_for("fd", tmp_path) == str(tmp_path.parent)
+
+
 def test_the_parser_accepts_only_the_tagged_nul_format() -> None:
     """Le parseur refuse toute forme inattendue, jamais une approximation."""
     ignored, tracked = _parse_tagged_nul_list(b"? .env\x00? vendor/\x00H keep.py\x00")
@@ -550,6 +790,19 @@ def test_the_parser_accepts_only_the_tagged_nul_format() -> None:
         b"? bad-\xff\x00",  # non UTF-8
     ):
         assert _parse_tagged_nul_list(invalid) is None
+
+
+def test_the_parser_treats_resolve_undo_entries_as_tracked() -> None:
+    """``U`` (resolve-undo) est une entrée d'index : elle n'est jamais exclue.
+
+    La table est épinglée sur ``git ls-files -t`` (Git 2.54) : ``U`` désigne
+    un fichier suivi avec information de résolution, pas une entrée non
+    suivie. Le traiter comme suivi évite un parcours complet inutile, sans
+    ouvrir la porte à une exclusion.
+    """
+    ignored, tracked = _parse_tagged_nul_list(b"U resolve.py\x00")
+    assert ignored == frozenset()
+    assert tracked == frozenset({"resolve.py"})
 
 
 def test_a_parse_failure_disables_exclusions(

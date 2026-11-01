@@ -29,12 +29,21 @@ système/globale neutralisée, ``core.fsmonitor`` désactivé (il exécute une
 commande du dépôt), stdin fermé, timeout et sortie bornés. Une panne de Git
 n'exclut rien : le scanner retombe sur un parcours complet (il lit **plus**,
 jamais moins), sauf dépassement de l'échéance qui est une erreur fail-closed.
+
+La racine est **épinglée par descripteur** : Git reçoit ``-C /proc/self/fd/N``
+(ou ``/dev/fd/N``) sur un descripteur ouvert ``O_DIRECTORY|O_NOFOLLOW`` et
+vérifié par ``fstat``, jamais le chemin re-résolu. Un échange ``A → B → A`` du
+chemin pendant l'appel ne peut donc pas faire lire les exclusions de ``B``.
+Sur une plateforme sans descripteur de répertoire, le repli par chemin
+conserve la double vérification ``lstat`` de l'appelant ; la précondition
+« racine et index figés pendant le scan » y reste explicite (docs/scanner.md).
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess  # nosec B404 - argv figé, aucun shell.
 import threading
 import time
@@ -95,6 +104,32 @@ _GIT_OPTIONS: Final[tuple[str, ...]] = (
     "core.quotepath=false",
 )
 
+#: La plateforme peut épingler une racine par descripteur de répertoire.
+#: Ailleurs (Windows), le repli par chemin reste la seule option.
+_ROOT_FD_SUPPORTED: Final[bool] = hasattr(os, "O_DIRECTORY")
+
+
+@dataclass(frozen=True, slots=True)
+class _PinnedRoot(os.PathLike[str]):
+    """Racine épinglée : chemin transparent + descripteur déjà vérifié.
+
+    Les appelants qui ne connaissent pas ce type continuent d'utiliser
+    l'objet comme un chemin (``Path(root)``, ``str(root)``). Le descripteur
+    n'est lu que par :func:`_run_git`, ce qui préserve la signature
+    historique ``_run_git(root, arguments, deadline)`` et empêche un chemin
+    re-résolu de se substituer à l'inode contrôlé.
+    """
+
+    path: Path
+    descriptor: int
+    root_id: tuple[int, int]
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+    def __str__(self) -> str:
+        return str(self.path)
+
 
 @dataclass(frozen=True, slots=True)
 class GitExclusions:
@@ -132,13 +167,79 @@ class GitExclusions:
         )
 
 
-def _git_environment(root: Path) -> dict[str, str]:
+def _open_directory(path: Path) -> int | None:
+    """Ouvre un répertoire sans jamais suivre un lien, ou rend ``None``.
+
+    ``O_DIRECTORY`` n'existe pas sur toutes les plateformes (Windows) : le
+    repli par chemin reste alors utilisé par l'appelant. Un descripteur ouvert
+    est vérifié par ``fstat`` pour refuser un non-répertoire.
+    """
+    if not _ROOT_FD_SUPPORTED:
+        return None
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError
+    except OSError:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        return None
+    return descriptor
+
+
+def _directory_fd_path(descriptor: int) -> str | None:
+    """Chemin magique qui désigne **ce descripteur**, jamais le chemin d'origine.
+
+    Linux expose ``/proc/self/fd`` ; macOS/FreeBSD exposent ``/dev/fd``. Git
+    reçoit ce chemin avec ``pass_fds`` : même si la racine est renommée ou
+    remplacée entre l'ouverture et ``exec``, il ouvre l'inode déjà vérifié.
+    Aucun de ces répertoires : ``None`` (l'appelant garde le repli par chemin).
+    """
+    for base in ("/proc/self/fd", "/dev/fd"):
+        if os.path.isdir(base):
+            return f"{base}/{descriptor}"
+    return None
+
+
+def _fd_real_path(fd_path: str) -> str | None:
+    """Chemin réel derrière un descripteur, ou ``None`` si non résolvable."""
+    try:
+        target = os.readlink(fd_path)
+    except OSError:
+        return None
+    if target.endswith(" (deleted)"):
+        target = target[: -len(" (deleted)")]
+    return target if os.path.isabs(target) else None
+
+
+def _ceiling_for(fd_path: str, root: Path) -> str:
+    """Plafond de découverte Git, aligné sur la racine **réellement** ouverte.
+
+    Sans déplacement, c'est le parent de la racine (comportement historique).
+    Si la racine a été renommée, le parent réel du descripteur évite de
+    laisser Git remonter au-delà de l'emplacement courant. En cas de
+    résolution impossible, le parent d'origine reste le repli.
+    """
+    real = _fd_real_path(fd_path)
+    if real is None:
+        return str(root.parent)
+    return str(Path(real).parent)
+
+
+def _git_environment(root: Path, *, ceiling: str | None = None) -> dict[str, str]:
     """Environnement minimal : aucune redirection de dépôt héritée.
 
-    ``GIT_CEILING_DIRECTORIES`` vaut le parent de la racine : Git ne
-    découvre jamais un dépôt situé au-dessus du périmètre demandé (même
-    garde que ``heimdall.mcp.gitdiff``). ``HOME`` pointe sur ``os.devnull`` :
-    aucune configuration personnelle n'influence le verdict.
+    ``GIT_CEILING_DIRECTORIES`` vaut le parent de la racine (ou le parent réel
+    du descripteur épinglé) : Git ne découvre jamais un dépôt situé au-dessus
+    du périmètre demandé (même garde que ``heimdall.mcp.gitdiff``). ``HOME``
+    pointe sur ``os.devnull`` : aucune configuration personnelle n'influence le
+    verdict.
     """
     return {
         "PATH": "",
@@ -151,7 +252,7 @@ def _git_environment(root: Path) -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_NO_LAZY_FETCH": "1",
-        "GIT_CEILING_DIRECTORIES": str(root.parent),
+        "GIT_CEILING_DIRECTORIES": str(root.parent) if ceiling is None else ceiling,
     }
 
 
@@ -200,10 +301,14 @@ def _terminate(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _run_git(  # noqa: PLR0911 - refus explicite à chaque panne, jamais un skip.
-    root: Path, arguments: tuple[str, ...], deadline: float | None
+def _run_git_command(  # noqa: PLR0911 - refus explicite à chaque panne, jamais un skip.
+    command: list[str],
+    *,
+    environment: dict[str, str],
+    pass_fds: tuple[int, ...],
+    deadline: float | None,
 ) -> bytes | None:
-    """Exécute une commande Git figée et rend sa sortie, ou ``None``.
+    """Exécute un argv Git figé et rend sa sortie, ou ``None``.
 
     ``None`` couvre tous les cas où les exclusions ne sont **pas** connues
     avec certitude (git absent, dépôt invalide, sortie trop grande, lecture
@@ -211,17 +316,16 @@ def _run_git(  # noqa: PLR0911 - refus explicite à chaque panne, jamais un skip
     l'arbre. Seule une deadline de scan dépassée lève ``ScanError``
     (fail-closed).
     """
-    if _GIT is None:
-        return None
     timeout = _remaining(deadline)
     try:
         process = subprocess.Popen(  # noqa: S603 # nosec B603 - argv figé, aucun shell.
-            [_GIT, "-C", str(root), *_GIT_OPTIONS, *arguments],
+            command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            env=_git_environment(root),
+            env=environment,
             close_fds=True,
+            pass_fds=pass_fds,
         )
     except (OSError, ValueError):
         return None
@@ -278,12 +382,52 @@ def _run_git(  # noqa: PLR0911 - refus explicite à chaque panne, jamais un skip
     return holder[0]
 
 
-#: Étiquettes rendues par ``git ls-files -t`` pour une entrée **suivie**
-#: (index). ``?`` est la seule étiquette d'une entrée non suivie ; toute
-#: autre étiquette inconnue fait échouer le parsing (parcours complet).
-_TRACKED_TAGS: Final[frozenset[bytes]] = frozenset(
-    {b"H", b"S", b"M", b"R", b"C", b"K"}
-)
+def _run_git(
+    root: Path | _PinnedRoot,
+    arguments: tuple[str, ...],
+    deadline: float | None,
+) -> bytes | None:
+    """Exécute Git sur la racine, épinglée si ``root`` porte un descripteur.
+
+    Avec un :class:`_PinnedRoot`, ``-C`` reçoit ``/proc/self/fd/N`` (ou
+    ``/dev/fd/N``) et le descripteur est transmis par ``pass_fds`` : Git lit
+    l'inode déjà vérifié, pas le chemin re-résolu. Sans descripteur —
+    plateforme sans répertoire de descripteurs, ou appel unitaire historique
+    — le chemin est utilisé et la double vérification ``lstat`` de l'appelant
+    reste la garde. Un descripteur sans chemin de descripteur rend ``None``
+    (parcours complet) : jamais un repli silencieux par chemin après
+    épinglage.
+    """
+    if _GIT is None:
+        return None
+    descriptor = root.descriptor if isinstance(root, _PinnedRoot) else None
+    path = Path(root)
+    if descriptor is None:
+        return _run_git_command(
+            [_GIT, "-C", str(path), *_GIT_OPTIONS, *arguments],
+            environment=_git_environment(path),
+            pass_fds=(),
+            deadline=deadline,
+        )
+    fd_path = _directory_fd_path(descriptor)
+    if fd_path is None:
+        return None
+    return _run_git_command(
+        [_GIT, "-C", fd_path, *_GIT_OPTIONS, *arguments],
+        environment=_git_environment(path, ceiling=_ceiling_for(fd_path, path)),
+        pass_fds=(descriptor,),
+        deadline=deadline,
+    )
+
+
+#: Étiquettes rendues par ``git ls-files -t`` (Git 2.54, ``git help
+#: ls-files``) : ``H`` suivi, ``S`` skip-worktree, ``M`` unmerged, ``R``
+#: suppression non indexée, ``C`` modification non indexée, ``K`` conflit
+#: fichier/répertoire (non suivi, mais jamais une exclusion), ``U``
+#: resolve-undo. ``?`` est la seule étiquette d'une entrée non suivie. Les
+#: minuscules n'apparaissent qu'avec ``-v``/``-f``, jamais avec l'argv figé
+#: ci-dessus. Toute autre étiquette fait échouer le parsing (parcours complet).
+_TRACKED_TAGS: Final[frozenset[bytes]] = frozenset({b"H", b"S", b"M", b"R", b"C", b"K", b"U"})
 _IGNORED_TAG: Final[bytes] = b"?"
 
 
@@ -349,8 +493,12 @@ def _tracked_directories(tracked: frozenset[str]) -> frozenset[str]:
     return frozenset(prefixes)
 
 
-def collect_git_exclusions(
-    root: str | os.PathLike[str], *, deadline: float | None = None
+def collect_git_exclusions(  # noqa: PLR0911, PLR0912 - refus explicite à chaque panne.
+    root: str | os.PathLike[str],
+    *,
+    deadline: float | None = None,
+    root_fd: int | None = None,
+    expected_root_id: tuple[int, int] | None = None,
 ) -> GitExclusions | None:
     """Collecte les entrées non suivies ignorées par les ``.gitignore``.
 
@@ -358,6 +506,16 @@ def collect_git_exclusions(
     ou hors dépôt, commande en échec ou sortie hors bornes. L'appelant doit
     alors scanner **tout** l'arbre. Un ``GitExclusions`` vide signifie
     « aucune entrée ignorée », pas « rien à scanner ».
+
+    ``root_fd`` permet à l'appelant (le scanner) de fournir un descripteur
+    déjà ouvert ``O_DIRECTORY|O_NOFOLLOW`` et vérifié : Git lit alors cet
+    inode, jamais le chemin re-résolu. ``expected_root_id`` re-vérifie que ce
+    descripteur désigne bien la racine figée ; une divergence rend ``None``
+    (l'appelant décide fail-closed). Sans ``root_fd``, la fonction ouvre son
+    propre descripteur ; le repli par chemin n'est utilisé que sur une
+    plateforme qui n'expose pas de descripteur de répertoire (Windows). Si
+    l'ouverture échoue alors que la plateforme sait épingler (lien, droits,
+    course), la fonction rend ``None`` : jamais un Git relancé sur le chemin.
 
     Une **seule** commande Git rend à la fois les entrées ignorées (``?``)
     et les entrées suivies qui matchent un motif (``H``/``S``/…). Ce
@@ -367,6 +525,7 @@ def collect_git_exclusions(
     exclusions par défense en profondeur, et un répertoire ignoré qui
     contient un fichier suivi n'est jamais élagué.
     """
+    pinned = root if isinstance(root, _PinnedRoot) else None
     try:
         path = Path(root)
     except (TypeError, ValueError, OSError):
@@ -378,20 +537,55 @@ def collect_git_exclusions(
     # dépendent du répertoire courant, donc aucune exclusion n'est fiable.
     if not path.is_absolute():
         return None
-    raw = _run_git(
-        path,
-        (
-            "ls-files",
-            "-t",
-            "-z",
-            "--cached",
-            "--others",
-            "--ignored",
-            "--exclude-per-directory=.gitignore",
-            "--directory",
-        ),
-        deadline,
-    )
+    descriptor = pinned.descriptor if pinned is not None else root_fd
+    expected = pinned.root_id if pinned is not None else expected_root_id
+    owned = False
+    if descriptor is None:
+        descriptor = _open_directory(path)
+        if descriptor is None and _ROOT_FD_SUPPORTED:
+            # L'épinglage est disponible mais a échoué : un repli par chemin
+            # rouvrirait exactement la course que le descripteur ferme.
+            return None
+        owned = descriptor is not None
+    try:
+        if descriptor is not None:
+            try:
+                metadata = os.fstat(descriptor)
+            except (OSError, TypeError, ValueError):
+                return None
+            identity = (metadata.st_dev, metadata.st_ino)
+            if expected is None:
+                # Descripteur fourni sans identité attendue : il doit désigner
+                # le chemin annoncé, sinon Git lirait un autre arbre.
+                try:
+                    current = os.lstat(path)
+                except OSError:
+                    return None
+                expected = (current.st_dev, current.st_ino)
+            if identity != expected:
+                return None
+            if pinned is None:
+                pinned = _PinnedRoot(path, descriptor, identity)
+        raw = _run_git(
+            pinned if pinned is not None else path,
+            (
+                "ls-files",
+                "-t",
+                "-z",
+                "--cached",
+                "--others",
+                "--ignored",
+                "--exclude-per-directory=.gitignore",
+                "--directory",
+            ),
+            deadline,
+        )
+    finally:
+        if owned and descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     if raw is None:
         return None
     parsed = _parse_tagged_nul_list(raw)

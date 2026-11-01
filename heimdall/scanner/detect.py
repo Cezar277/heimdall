@@ -58,7 +58,7 @@ from heimdall.scanner.finding import (
     FindingStatus,
     validate_relative_path,
 )
-from heimdall.scanner.gitignore import GitExclusions, collect_git_exclusions
+from heimdall.scanner.gitignore import GitExclusions, _PinnedRoot, collect_git_exclusions
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import _open_flags, _resolve_root
 from heimdall.scanner.signature_engine import MAX_FINDINGS
@@ -104,6 +104,11 @@ _BOUNDS_ERROR: Final[str] = "bornes de scan hors contrat"
 _DIR_FD_SUPPORTED: Final[bool] = (
     os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd and os.scandir in os.supports_fd
 )
+
+#: La racine peut être épinglée par descripteur pour le snapshot Git. Windows
+#: n'expose pas ``O_DIRECTORY`` : le repli par chemin garde la double
+#: vérification ``lstat`` documentée (précondition « racine figée »).
+_ROOT_FD_SUPPORTED: Final[bool] = hasattr(os, "O_DIRECTORY")
 
 #: Un lecteur de fichier déjà confiné : le descripteur de répertoire parent
 #: (mode ancré) ou le chemin re-vérifié (repli) est capturé à l'itération.
@@ -327,30 +332,49 @@ class Scanner:
         return self._git_ignored
 
     def _snapshot_exclusions(self, deadline: float | None) -> GitExclusions | None:
-        """Prend un snapshot Git en re-vérifiant l'identité de la racine.
+        """Prend un snapshot Git sur une racine **épinglée par descripteur**.
 
-        Git lit le dépôt par son chemin : un remplacement de la racine entre
-        la re-vérification et cet appel pourrait faire calculer les
-        exclusions sur un autre arbre. L'identité ``(st_dev, st_ino)`` est
-        donc comparée **avant et après** la collecte ; toute divergence lève
+        Le chemin seul ne suffit pas : un échange ``A → B → A`` autour de
+        l'appel Git ferait lire les exclusions de ``B`` alors que les deux
+        ``lstat`` voient ``A``. La racine est donc ouverte en
+        ``O_DIRECTORY|O_NOFOLLOW``, son identité ``(st_dev, st_ino)`` est
+        vérifiée, puis Git reçoit ce descripteur (``/proc/self/fd/N``) : il
+        lit l'inode déjà contrôlé, jamais le chemin re-résolu. L'identité est
+        en plus re-contrôlée après la collecte ; toute divergence lève
         ``ScanError`` (aucun verdict sur un périmètre substitué).
+
+        Sur une plateforme sans ``O_DIRECTORY``, le repli par chemin conserve
+        la comparaison ``lstat`` avant/après et la précondition documentée
+        « racine et index figés pendant le scan ».
         """
+        descriptor: int | None = None
+        if _ROOT_FD_SUPPORTED:
+            descriptor = self._open_root_dir()
         try:
-            before = os.lstat(self._root)
-        except OSError:
-            raise ScanError(_SCAN_ERROR) from None
-        exclusions = collect_git_exclusions(self._root, deadline=deadline)
-        try:
-            after = os.lstat(self._root)
-        except OSError:
-            raise ScanError(_SCAN_ERROR) from None
-        if (
-            (before.st_dev, before.st_ino) != self._root_id
-            or (after.st_dev, after.st_ino) != self._root_id
-            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
-        ):
-            raise ScanError(_SCAN_ERROR)
-        return exclusions
+            try:
+                before = os.lstat(self._root)
+            except OSError:
+                raise ScanError(_SCAN_ERROR) from None
+            if (before.st_dev, before.st_ino) != self._root_id:
+                raise ScanError(_SCAN_ERROR)
+            snapshot_root: Path | _PinnedRoot = (
+                self._root
+                if descriptor is None
+                else _PinnedRoot(self._root, descriptor, self._root_id)
+            )
+            exclusions = collect_git_exclusions(snapshot_root, deadline=deadline)
+            try:
+                after = os.lstat(self._root)
+            except OSError:
+                raise ScanError(_SCAN_ERROR) from None
+            if (after.st_dev, after.st_ino) != self._root_id:
+                raise ScanError(_SCAN_ERROR)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise ScanError(_SCAN_ERROR)
+            return exclusions
+        finally:
+            if descriptor is not None:
+                self._close_dir(descriptor)
 
     def _collect_exclusions(self, deadline: float | None) -> None:
         """Collecte les exclusions Git avant le parcours."""
