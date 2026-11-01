@@ -71,9 +71,11 @@ jobs:
           npm ci --no-audit --no-fund
 
       - name: Test shim minimatch et bundler Spectral
+        timeout-minutes: 5
         run: npm run test:js
 
       - name: Audit npm (dev)
+        timeout-minutes: 2
         run: npm audit --audit-level=moderate
 
       - name: Lint OpenAPI
