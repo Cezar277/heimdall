@@ -230,6 +230,7 @@ class Scanner:
         allowlist: Allowlist | None = None,
         max_file_bytes: int | None = None,
         skipped_files: list[str] | None = None,
+        respect_gitignore: bool = True,
     ) -> None:
         # Un booléen strict : une chaîne ou un entier ne doit jamais activer
         # ou désactiver les exclusions par accident.
