@@ -215,6 +215,7 @@ class Scanner:
         "_strict",
         "_traces",
         "_vcs_ignored",
+        "_respect_gitignore",
     )
 
     def __init__(  # noqa: PLR0913 - bornes nommées explicites, cf. MAX_*.
