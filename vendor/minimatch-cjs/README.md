@@ -27,6 +27,19 @@ Ce shim réexporte la fonction `minimatch` de `minimatch@11` comme
 `module.exports`. `tslib.__importDefault()` la transforme alors en
 `{ default: fn }`, ce qui restaure le contrat attendu par `spectral-core`.
 
+## Borne DoS
+
+`minimatch@11.0.3` garde un `braceExpandMax` par défaut de 100 000. Le shim
+force `braceExpandMax: 1000` pour l'appel callable et pour la classe
+`Minimatch` ; un appelant peut toujours fournir une valeur explicite. Cela
+borne `firstPhasePreProcess`/`secondPhasePreProcess` sur le chemin `files:`
+de Spectral, sans changer les motifs légitimes du contrat.
+
+Le contenu de `vendor/minimatch-cjs/` est couvert par `.github/CODEOWNERS`
+(revue obligatoire du mainteneur, si la protection de `main` active
+« Require review from Code Owners ») et par les tests
+`tests/js/minimatch-shim.test.js`.
+
 ## Chaîne de dépendances
 
 - `package.json` (racine) déclare `minimatch: file:./vendor/minimatch-cjs`

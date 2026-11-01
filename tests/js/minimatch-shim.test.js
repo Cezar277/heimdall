@@ -90,23 +90,21 @@ test('npm ls ne remonte aucune version 3.x de minimatch', () => {
 
 test('les motifs à accolades imbriquées restent bornés', () => {
   const pattern = '{'.repeat(100) + 'a,b' + '}'.repeat(100);
-  const started = Date.now();
-  const result = minimatch('x', pattern, { braceExpandMax: 1000 });
-  const elapsed = Date.now() - started;
+  const expanded = minimatch.braceExpand(pattern, { braceExpandMax: 1000 });
 
-  assert.equal(typeof result, 'boolean');
-  assert.ok(elapsed < 5000, `expansion trop longue : ${elapsed} ms`);
+  assert.ok(expanded.length <= 1000, `expanded=${expanded.length}`);
+  assert.equal(typeof minimatch('x', pattern, { braceExpandMax: 1000 }), 'boolean');
 });
 
-test('le préprocessing optimizationLevel 2 reste borné', () => {
-  const pattern = '**/../a/b/'.repeat(50) + 'x';
-  const started = Date.now();
-  const mm = new minimatch.Minimatch(pattern, {
-    optimizationLevel: 2,
-    braceExpandMax: 1000,
-  });
-  const elapsed = Date.now() - started;
+test('le préprocessing optimizationLevel 2 reste borné par défaut', () => {
+  const pattern = '**/../a/b/'.repeat(200) + 'x';
 
-  assert.ok(mm.set.length <= 1000, `globParts=${mm.set.length}`);
-  assert.ok(elapsed < 5000, `préprocessing trop long : ${elapsed} ms`);
+  const bounded = new minimatch.Minimatch(pattern, { optimizationLevel: 2 });
+  assert.ok(bounded.set.length <= 1000, `globParts=${bounded.set.length}`);
+
+  const overridden = new minimatch.Minimatch(pattern, {
+    optimizationLevel: 2,
+    braceExpandMax: 50,
+  });
+  assert.ok(overridden.set.length <= 50, `globParts=${overridden.set.length}`);
 });

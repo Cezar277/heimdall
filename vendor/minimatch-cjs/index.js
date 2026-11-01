@@ -10,8 +10,33 @@
 // returns that namespace as-is and `.default` is undefined. Exporting the
 // callable function directly gives the wrapper the shape it expects, while
 // keeping the named helpers (Minimatch, filter, match, ...) attached.
-const { minimatch } = require('minimatch-v11');
+//
+// minimatch@11.0.3 defaults `braceExpandMax` to 100_000. On the Spectral
+// `files:` path a hostile `**/../` pattern can still spend seconds in
+// firstPhasePreProcess/secondPhasePreProcess. Spectral only passes
+// `{ matchBase: true }`, so the shim injects a much lower bound by default.
+// Callers can still override it explicitly.
+const { minimatch, Minimatch } = require('minimatch-v11');
 
-module.exports = minimatch;
+const DEFAULT_OPTIONS = Object.freeze({ braceExpandMax: 1000 });
+
+function withDefaults(options) {
+  return { ...DEFAULT_OPTIONS, ...options };
+}
+
+function shim(source, pattern, options) {
+  return minimatch(source, pattern, withDefaults(options));
+}
+
+class ShimMinimatch extends Minimatch {
+  constructor(pattern, options) {
+    super(pattern, withDefaults(options));
+  }
+}
+
+Object.assign(shim, minimatch);
+shim.Minimatch = ShimMinimatch;
 // Certains consommateurs utilisent l'export nommé de minimatch >= 9.
-module.exports.minimatch = minimatch;
+shim.minimatch = shim;
+
+module.exports = shim;

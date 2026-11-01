@@ -1,0 +1,5 @@
+# Le shim vendor/minimatch-cjs est consommé via une dépendance `file:` :
+# npm ci ne vérifie pas son contenu par un hash registre. Toute modification
+# exige donc une revue explicite du mainteneur.
+# Nécessite « Require review from Code Owners » dans la protection de main.
+/vendor/ @Cezar277
