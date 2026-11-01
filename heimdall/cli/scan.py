@@ -114,9 +114,10 @@ _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INVALID_SCOPE: Final[str] = "scan impossible : entrée non analysable"
-#: Mode CI strict : un arbre réduit à sa base VCS n'a lu aucun contenu. Le
-#: code 2 évite qu'une automatisation ne confonde « propre » et « non parcouru ».
-_MSG_VCS_ONLY: Final[str] = "scan impossible : entrée non analysable"
+#: Mode CI strict : un arbre réduit à ses exclusions (base VCS ou entrées
+#: `.gitignore`) n'a lu aucun contenu. Le code 2 évite qu'une automatisation
+#: ne confonde « propre » et « non parcouru ».
+_MSG_NO_CONTENT_READ: Final[str] = "scan impossible : entrée non analysable"
 
 #: Journal de diagnostic (niveau debug uniquement) : les causes de refus de
 #: la garde anti auto-attestation y sont distinguées par des libellés
@@ -186,6 +187,7 @@ def collect(  # noqa: PLR0913 - explicit scan options
     ci: bool = False,
     max_file_bytes: int | None = None,
     skipped_files: list[str] | None = None,
+    respect_gitignore: bool = True,
 ) -> ScanReport:
     """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
@@ -195,6 +197,12 @@ def collect(  # noqa: PLR0913 - explicit scan options
 
     ``max_file_bytes`` et ``skipped_files`` sont réservés au mode arbre.
     Les fournir avec ``staged=True`` lève ``ScanError`` avant tout accès Git.
+
+    ``respect_gitignore`` (défaut ``True``) est la politique d'exclusion du
+    mode arbre : ``False`` restaure un parcours intégral (``--no-gitignore``).
+    Une valeur non booléenne est refusée (``ScanError``) au lieu d'activer ou
+    de désactiver l'exclusion par accident. L'option est sans effet avec
+    ``staged=True`` : ce périmètre ne consulte jamais ``.gitignore``.
 
     **Auto-attestation (CWE-345)** : si ``allowlist`` est fourni (API), la
     garde anti auto-attestation est contournée. Le seul usage légitime dans
@@ -210,6 +218,8 @@ def collect(  # noqa: PLR0913 - explicit scan options
         type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES
     ):
         raise ScanError("limite de fichier invalide")
+    if not isinstance(respect_gitignore, bool):
+        raise ScanError("politique d'exclusions Git invalide")
     try:
         if staged:
             return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
@@ -220,6 +230,7 @@ def collect(  # noqa: PLR0913 - explicit scan options
             ci=ci,
             max_file_bytes=max_file_bytes,
             skipped_files=skipped_files,
+            respect_gitignore=respect_gitignore,
         )
     except ToolFailure:
         raise ScanError(_MSG_NOT_A_REPO) from None
@@ -501,6 +512,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
     ci: bool = False,
     max_file_bytes: int | None = None,
     skipped_files: list[str] | None = None,
+    respect_gitignore: bool = True,
 ) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
@@ -536,6 +548,8 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
     pas rendre 0 en silence. Le scan de fichier isolé reste possible en
     bibliothèque (`Scanner`, #22), hors contrat hook/CI.
     """
+    if not isinstance(respect_gitignore, bool):
+        raise ScanError("politique d'exclusions Git invalide")
     deadline = time.monotonic() + MAX_TREE_SECONDS
     access = GitAccess(root)
     if not access.is_repository(timeout=_call_timeout(deadline)):
@@ -571,18 +585,25 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
         allowlist=allowlist,
         max_file_bytes=max_file_bytes,
         skipped_files=skipped_files,
+        respect_gitignore=respect_gitignore,
     )
     skipped_before = len(skipped_files) if skipped_files is not None else 0
     findings = scanner.scan(deadline=deadline)
     skipped_now = len(skipped_files) - skipped_before if skipped_files is not None else 0
-    if ci and scanner.vcs_ignored > 0 and scanner.files_scanned == 0 and skipped_now == 0:
+    if (
+        ci
+        and (scanner.vcs_ignored > 0 or scanner.git_ignored > 0)
+        and scanner.files_scanned == 0
+        and skipped_now == 0
+    ):
         # Aucun contenu n'a été lu : le seul périmètre observé est une base
-        # VCS élaguée. En CI stricte, un code 0 serait indistinguable d'un
-        # dépôt propre pour une automatisation qui ne lit que la sortie.
-        # Le cold start rend explicitement les fichiers trop volumineux dans
-        # un rapport incomplet (code 2) : ce cas n'est pas un arbre VCS seul.
-        logger.debug("refus --ci : arbre réduit à sa base VCS (aucun contenu lu)")
-        raise ScanError(_MSG_VCS_ONLY)
+        # VCS ou des entrées `.gitignore` élaguées. En CI stricte, un code 0
+        # serait indistinguable d'un dépôt propre pour une automatisation qui
+        # ne lit que la sortie. Le cold start rend explicitement les fichiers
+        # trop volumineux dans un rapport incomplet (code 2) : ce cas n'est
+        # pas un arbre réduit à ses seules exclusions.
+        logger.debug("refus --ci : arbre réduit à ses exclusions (aucun contenu lu)")
+        raise ScanError(_MSG_NO_CONTENT_READ)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
     traces = scanner.traces

@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 from support.git_repo import GitRepo
 
+from heimdall.scanner import detect as detect_module
 from heimdall.scanner import gitignore
 from heimdall.scanner.detect import MAX_FILE_BYTES, Scanner
 from heimdall.scanner.errors import ScanError
@@ -393,6 +394,74 @@ def test_git_ignored_is_reset_between_scans(repo: GitRepo) -> None:
     ignored.unlink()
     assert scanner.scan() == []
     assert scanner.git_ignored == 0
+
+
+def test_an_index_change_during_the_scan_is_refused(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un ``git add -f`` concurrent ne produit jamais un 0 silencieux.
+
+    Le premier snapshot ignore ``.env`` ; il est promu suivi **après** ce
+    snapshot, donc le parcours le saute encore. Le second snapshot, pris
+    après le parcours, constate que l'exclusion n'est plus valide et refuse
+    le scan (``ScanError``) au lieu de rendre un verdict périmé.
+    """
+    repo.write(".gitignore", ".env\n")
+    repo.stage(".gitignore")
+    repo.commit_all("base")
+    _secret_file(repo, ".env")
+
+    original = detect_module.collect_git_exclusions
+    calls = 0
+
+    def changing(
+        root: str | os.PathLike[str], *, deadline: float | None = None
+    ) -> GitExclusions | None:
+        nonlocal calls
+        result = original(root, deadline=deadline)
+        if calls == 0:
+            repo.git("add", "-f", ".env")
+        calls += 1
+        return result
+
+    monkeypatch.setattr(detect_module, "collect_git_exclusions", changing)
+    scanner = Scanner(repo.root)
+    with pytest.raises(ScanError):
+        scanner.scan()
+    assert calls == 2
+
+
+def test_a_second_snapshot_failure_is_fail_closed(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Après un skip, un second snapshot impossible refuse le scan.
+
+    Sans ce refus, le scanner ne pourrait pas prouver que l'entrée sautée
+    est encore ignorée : mieux vaut un code 2 qu'un verdict potentiellement
+    périmé.
+    """
+    repo.write(".gitignore", ".env\n")
+    repo.stage(".gitignore")
+    repo.commit_all("base")
+    _secret_file(repo, ".env")
+
+    original = detect_module.collect_git_exclusions
+    calls = 0
+
+    def changing(
+        root: str | os.PathLike[str], *, deadline: float | None = None
+    ) -> GitExclusions | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original(root, deadline=deadline)
+        return None
+
+    monkeypatch.setattr(detect_module, "collect_git_exclusions", changing)
+    scanner = Scanner(repo.root)
+    with pytest.raises(ScanError):
+        scanner.scan()
+    assert calls == 2
 
 
 # --- unités de la couche Git ------------------------------------------------

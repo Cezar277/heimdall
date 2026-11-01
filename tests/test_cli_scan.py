@@ -678,6 +678,84 @@ def test_scan_tree_skips_a_gitignored_untracked_secret(git_repo: GitRepo) -> Non
     assert FAKE_AWS_KEY not in resultat_integral.output
 
 
+def test_collect_tree_propagates_respect_gitignore_to_the_scanner(
+    git_repo: GitRepo,
+) -> None:
+    """Non-régression du câblage CLI -> collect -> TreeScanner (#59).
+
+    Le merge qui a écrasé ``respect_gitignore`` dans ``collect()`` levait un
+    ``TypeError`` sur **chaque** ``heimdall scan``. Ce test appelle le chemin
+    réel ``collect(..., respect_gitignore=False)``, pas seulement ``Scanner``
+    directement, pour que la régression soit impossible à réintroduire.
+    """
+    git_repo.write(".gitignore", ".env\n")
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage(".gitignore", "app.py")
+    git_repo.commit_all("base")
+    git_repo.write(".env", f'AWS = "{FAKE_AWS_KEY}"\n')
+
+    strict = collect(git_repo.root, staged=False, allowlist=Allowlist.empty())
+    assert strict.findings == ()
+    assert strict.git_ignored == 1
+
+    integral = collect(
+        git_repo.root,
+        staged=False,
+        allowlist=Allowlist.empty(),
+        respect_gitignore=False,
+    )
+    assert [finding.file for finding in integral.findings] == [".env"]
+    assert integral.git_ignored == 0
+    assert FAKE_AWS_KEY not in repr(integral)
+
+
+@pytest.mark.parametrize("invalid", ["false", 1, 0, None, object()])
+def test_collect_refuses_an_invalid_respect_gitignore_policy(
+    git_repo: GitRepo, invalid: object
+) -> None:
+    """Une valeur non booléenne est une erreur d'outillage, jamais un skip."""
+    with pytest.raises(ScanError, match="politique d'exclusions Git invalide"):
+        collect(
+            git_repo.root,
+            staged=False,
+            allowlist=Allowlist.empty(),
+            respect_gitignore=invalid,  # type: ignore[arg-type]
+        )
+
+
+def test_collect_ci_refuses_a_tree_reduced_to_gitignored_entries(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """La garde ``--ci`` observe aussi ``git_ignored``, pas seulement le VCS.
+
+    Un scanner qui n'aurait élagué aucune base VCS mais aurait sauté toutes
+    les entrées ``.gitignore`` ne doit jamais rendre un faux « propre » en
+    CI : la condition couvre les deux compteurs, même si ``.git`` est
+    aujourd'hui toujours rencontré en pratique.
+    """
+    git_repo.write("app.py", "x = 1\n")
+
+    class ScannerSansContenu:
+        def __init__(self, root: Path, **kwargs: object) -> None:
+            self.traces: tuple[object, ...] = ()
+            self.vcs_ignored = 0
+            self.git_ignored = 1
+            self.files_scanned = 0
+
+        def scan(self, *, deadline: float | None = None) -> list[object]:
+            assert deadline is not None
+            return []
+
+    monkeypatch.setattr("heimdall.cli.scan.TreeScanner", ScannerSansContenu)
+    with pytest.raises(ScanError, match="scan impossible"):
+        collect(
+            git_repo.root,
+            staged=False,
+            ci=True,
+            allowlist=Allowlist.empty(),
+        )
+
+
 def test_scan_tree_always_scans_a_tracked_file_matching_gitignore(
     git_repo: GitRepo,
 ) -> None:

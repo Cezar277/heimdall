@@ -326,8 +326,8 @@ class Scanner:
         """
         return self._git_ignored
 
-    def _collect_exclusions(self, deadline: float | None) -> None:
-        """Collecte les exclusions Git en re-vérifiant l'identité de la racine.
+    def _snapshot_exclusions(self, deadline: float | None) -> GitExclusions | None:
+        """Prend un snapshot Git en re-vérifiant l'identité de la racine.
 
         Git lit le dépôt par son chemin : un remplacement de la racine entre
         la re-vérification et cet appel pourrait faire calculer les
@@ -335,9 +335,6 @@ class Scanner:
         donc comparée **avant et après** la collecte ; toute divergence lève
         ``ScanError`` (aucun verdict sur un périmètre substitué).
         """
-        self._git_exclusions = None
-        if not self._respect_gitignore or self._single is not None:
-            return
         try:
             before = os.lstat(self._root)
         except OSError:
@@ -353,7 +350,34 @@ class Scanner:
             or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
         ):
             raise ScanError(_SCAN_ERROR)
-        self._git_exclusions = exclusions
+        return exclusions
+
+    def _collect_exclusions(self, deadline: float | None) -> None:
+        """Collecte les exclusions Git avant le parcours."""
+        self._git_exclusions = None
+        if not self._respect_gitignore or self._single is not None:
+            return
+        self._git_exclusions = self._snapshot_exclusions(deadline)
+
+    def _verify_exclusions_unchanged(self, deadline: float | None) -> None:
+        """Refuse un index qui a promu une entrée sautée pendant le parcours.
+
+        Le snapshot initial fige la liste des entrées non suivies et ignorées,
+        mais pas l'index lui-même : un ``git add -f`` concurrent peut rendre
+        suivi un fichier déjà sauté, qui serait alors absent du rapport alors
+        qu'il peut partir dans un commit (faux négatif). Un second snapshot,
+        pris après le parcours, doit donc encore contenir **toutes** les
+        exclusions initiales. Une divergence — ou un second snapshot
+        impossible — lève ``ScanError`` : un verdict sur un état périmé ne
+        vaut ni 0 ni 1. Le contrôle ne coûte rien lorsqu'aucune entrée n'a
+        été sautée (rien n'a été caché).
+        """
+        exclusions = self._git_exclusions
+        if self._git_ignored == 0 or exclusions is None:
+            return
+        current = self._snapshot_exclusions(deadline)
+        if current is None or not exclusions.is_still_excluded_by(current):
+            raise ScanError(_SCAN_ERROR)
 
     def _skip_git_excluded(self, relative: str, *, is_dir: bool) -> bool:
         """Vrai si l'entrée est une exclusion Git et doit être sautée.
@@ -426,6 +450,11 @@ class Scanner:
         une plateforme sans descripteurs de répertoire, le repli par chemin
         conserve les gardes par fichier (``resolve`` + ``is_relative_to`` +
         ``O_NOFOLLOW`` + identité ``dev/ino``).
+
+        Si des entrées ``.gitignore`` ont été sautées, un second snapshot Git
+        est pris **après** le parcours : une entrée devenue suivie entre
+        l'instant initial et la fin du scan lève ``ScanError`` (verdict
+        périmé refusé), au lieu de produire un faux négatif silencieux.
         """
         # Compteurs remis à zéro pour que `vcs_ignored`, `git_ignored` et
         # `files_scanned` décrivent **ce** scan, pas une accumulation d'appels
@@ -444,6 +473,7 @@ class Scanner:
         # Exclusions Git sûres (#59) : uniquement des entrées non suivies et
         # ignorées. Une panne de Git rend `None` et le parcours reste complet.
         self._collect_exclusions(deadline)
+        findings: list[Finding]
         if _DIR_FD_SUPPORTED:
             root_descriptor = self._open_root_dir()
             try:
@@ -466,21 +496,27 @@ class Scanner:
                 # Pas de `list()` sur le périmètre : un dépôt adverse avec un
                 # très grand nombre de fichiers ne doit pas OOM le hook/CI.
                 # Le tri final porte sur les findings, pas sur les chemins.
-                return self._scan_entries(entries, deadline=deadline)
+                findings = self._scan_entries(entries, deadline=deadline)
             finally:
                 self._close_dir(root_descriptor)
-        # Repli documenté pour les plateformes sans `openat`/`scandir(fd)` :
-        # chaque lecture reste confinée et re-vérifiée par `_read_text`.
-        path_entries: Iterable[tuple[str, _FileReader]]
-        if self._single is not None:
-            relative = _validate_relative_path(self._single.name)
-            path_entries = ((relative, partial(self._read_text, self._single)),)
         else:
-            path_entries = (
-                (relative, partial(self._read_text, path))
-                for path, relative in self._iter_files()
-            )
-        return self._scan_entries(path_entries, deadline=deadline)
+            # Repli documenté pour les plateformes sans `openat`/`scandir(fd)` :
+            # chaque lecture reste confinée et re-vérifiée par `_read_text`.
+            path_entries: Iterable[tuple[str, _FileReader]]
+            if self._single is not None:
+                relative = _validate_relative_path(self._single.name)
+                path_entries = ((relative, partial(self._read_text, self._single)),)
+            else:
+                path_entries = (
+                    (relative, partial(self._read_text, path))
+                    for path, relative in self._iter_files()
+                )
+            findings = self._scan_entries(path_entries, deadline=deadline)
+        # Le snapshot initial ne figeait pas l'index : une entrée sautée peut
+        # avoir été promue suivie pendant le parcours. Re-vérifier après coup
+        # ferme cette course avant de rendre un verdict.
+        self._verify_exclusions_unchanged(deadline)
+        return findings
 
     def _scan_entries(
         self,

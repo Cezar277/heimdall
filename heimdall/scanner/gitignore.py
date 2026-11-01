@@ -117,6 +117,20 @@ class GitExclusions:
         """Vrai si ``relative_dir`` (avec ``/`` final) peut être élagué."""
         return relative_dir in self.ignored_dirs
 
+    def is_still_excluded_by(self, current: GitExclusions) -> bool:
+        """Vrai si **toutes** les exclusions initiales sont encore ignorées.
+
+        Le scanner compare le snapshot pris avant le parcours à un second
+        snapshot pris après : une entrée qui n'est plus ignorée (par exemple
+        promue par ``git add -f`` pendant le scan) rend la comparaison fausse.
+        Une entrée nouvellement ignorée ne change pas le verdict : elle n'a
+        pas été sautée.
+        """
+        return (
+            self.ignored_files <= current.ignored_files
+            and self.ignored_dirs <= current.ignored_dirs
+        )
+
 
 def _git_environment(root: Path) -> dict[str, str]:
     """Environnement minimal : aucune redirection de dépôt héritée.
