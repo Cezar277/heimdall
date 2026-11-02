@@ -677,6 +677,32 @@ class SettingsSerializationHygieneTests(unittest.TestCase):
                 self.assertNotIn(secret, dumped.values())
                 self.assertNotIn(secret, serialized)
 
+    def test_app_state_settings_never_serializes_secrets(self) -> None:
+        """`app.state.settings` (`app.py:1601–1603`) ne peut exposer aucun secret.
+
+        Revue LOW : l'interdiction de sérialiser ``app.state.settings`` est
+        vérifiée de bout en bout sur l'objet réellement porté par l'application,
+        et pas seulement sur une instance ``VaultSettings`` isolée.
+        """
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=_PEPPER,
+        )
+        app = create_app(settings)
+        state_settings = app.state.settings
+        self.assertIs(state_settings, settings)
+        dumped = state_settings.model_dump()
+        serialized = state_settings.model_dump_json()
+        rendered = repr(state_settings)
+        self.assertNotIn("master_key", dumped)
+        self.assertNotIn("kek", dumped)
+        self.assertNotIn("api_key_pepper", dumped)
+        for secret in (_MASTER_KEY, _PEPPER):
+            self.assertNotIn(secret, dumped.values())
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn(secret, rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
