@@ -109,8 +109,12 @@ n'est émis (`repr=False`), `hide_input_in_errors` empêche pydantic de la
 réfléter dans un `ValidationError`, et la sérialisation est **structurellement**
 sûre : `master_key`, `kek` et `api_key_pepper` portent `Field(exclude=True)`,
 donc `model_dump()` et `model_dump_json()` ne peuvent jamais les contenir (test
-`test_model_dump_never_contains_master_key_kek_or_pepper`). L'interdiction de
-sérialiser ou journaliser `app.state.settings` reste en vigueur.
+`test_model_dump_never_contains_master_key_kek_or_pepper`). Le porteur
+applicatif `app.state.settings` (`app.py:1601–1603`), seul endroit où les
+settings vivent aussi longtemps que l'application, est vérifié de bout en
+bout — dump, JSON et `repr` — par
+`test_app_state_settings_never_serializes_secrets` : l'interdiction de
+sérialiser ou journaliser `app.state.settings` reste en vigueur ET testée.
 
 Ce qui **est** effacé : le tampon normalisé est un `bytearray` **effaçable**,
 remis à zéro dans un `finally` (`_zeroize_buffer`) après la KDF, y compris si
@@ -189,7 +193,7 @@ utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
   `derive_kek_from_master_key`, `VaultCipher.from_master_key`),
   `heimdall/vault/app.py` (`VaultSettings.master_key`, `VaultSettings.kek_salt`,
   `_resolve_vault_cipher`).
-- Tests : `tests/test_vault_kek_derivation.py` (40 tests), dont le critère
+- Tests : `tests/test_vault_kek_derivation.py` (41 tests), dont le critère
   « Fait quand » (`test_same_master_key_and_same_salt_derive_the_same_kek`),
   l'égalité NFC/NFD (`test_nfc_and_nfd_master_keys_derive_the_same_kek`), le
   verrou « KDF en panne ⇒ démarrage refusé »
@@ -197,7 +201,9 @@ utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
   réelle du store explicite (`test_explicit_store_rejects_cipher_key_equal_to_pepper`,
   `test_explicit_store_path_performs_no_kdf`) et l'effacement best-effort sans
   mutation d'`bytes` (`test_derivation_zeroizes_normalized_buffer_after_success`,
-  `test_zeroize_buffer_never_touches_immutable_bytes`), et l'exclusion des
+  `test_zeroize_buffer_never_touches_immutable_bytes`), l'exclusion des
   secrets de toute sérialisation des settings
-  (`test_model_dump_never_contains_master_key_kek_or_pepper`).
+  (`test_model_dump_never_contains_master_key_kek_or_pepper`) et le verrou de
+  bout en bout sur `app.state.settings`
+  (`test_app_state_settings_never_serializes_secrets`).
 - Fiche SAMM : [`docs/t262-samm.md`](../t262-samm.md).
