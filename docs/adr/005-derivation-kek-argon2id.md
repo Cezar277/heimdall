@@ -107,10 +107,11 @@ et `os.environ` la conservent pendant toute la vie du processus, tandis que
 `VaultCipher` ne garde que la KEK dérivée. Aucun log ni `repr` des settings
 n'est émis (`repr=False`), `hide_input_in_errors` empêche pydantic de la
 réfléter dans un `ValidationError`, et la sérialisation est **structurellement**
-sûre : `master_key`, `kek` et `api_key_pepper` portent `Field(exclude=True)`,
-donc `model_dump()` et `model_dump_json()` ne peuvent jamais les contenir (test
+sûre : `master_key`, `kek`, `kek_salt` et `api_key_pepper` portent
+`Field(exclude=True)`, donc `model_dump()` et `model_dump_json()` ne peuvent
+jamais les contenir (test
 `test_model_dump_never_contains_master_key_kek_or_pepper`). Le porteur
-applicatif `app.state.settings` (`app.py:1601–1603`), seul endroit où les
+applicatif `app.state.settings` (`app.py:1607–1609`), seul endroit où les
 settings vivent aussi longtemps que l'application, est vérifié de bout en
 bout — dump, JSON et `repr` — par
 `test_app_state_settings_never_serializes_secrets` : l'interdiction de
@@ -169,9 +170,11 @@ utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
 - **Backend mémoire** : conserve son comportement de test (KEK éphémère si
   aucune clé n'est fournie) ; si la paire maître/sel est fournie, la KEK est
   dérivée comme en production.
-- **Invariant 5** : la KEK dérivée est comparée en temps constant au pepper
-  d'authentification ; une collision est refusée. La clé maîtresse et le pepper
-  restent deux secrets distincts.
+- **Invariant 5** : la KEK dérivée (brute, base64 URL-safe et standard) est
+  comparée en temps constant au pepper d'authentification, et le pepper est
+  lui aussi décodé lorsqu'il est un base64 de 32 octets : un pepper
+  `b64standard` (`+/` + padding) qui encode la KEK `b64url` (`-_`) est refusé.
+  La clé maîtresse et le pepper restent deux secrets distincts.
 
 ## Conséquences
 
@@ -193,14 +196,20 @@ utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
   `derive_kek_from_master_key`, `VaultCipher.from_master_key`),
   `heimdall/vault/app.py` (`VaultSettings.master_key`, `VaultSettings.kek_salt`,
   `_resolve_vault_cipher`).
-- Tests : `tests/test_vault_kek_derivation.py` (41 tests), dont le critère
+- Tests : `tests/test_vault_kek_derivation.py` (45 tests), dont le critère
   « Fait quand » (`test_same_master_key_and_same_salt_derive_the_same_kek`),
   l'égalité NFC/NFD (`test_nfc_and_nfd_master_keys_derive_the_same_kek`), le
   verrou « KDF en panne ⇒ démarrage refusé »
   (`test_kdf_failure_is_fail_closed_at_startup`), l'invariant 5 sur la KEK
   réelle du store explicite (`test_explicit_store_rejects_cipher_key_equal_to_pepper`,
-  `test_explicit_store_path_performs_no_kdf`) et l'effacement best-effort sans
-  mutation d'`bytes` (`test_derivation_zeroizes_normalized_buffer_after_success`,
+  `test_explicit_store_rejects_standard_base64_pepper`), le refus du pepper
+  sous l'autre alphabet base64
+  (`test_derived_kek_equal_to_standard_base64_pepper_is_rejected`,
+  `test_kek_matches_pepper_detects_standard_base64_alphabet`), le store
+  explicite sans chiffreur
+  (`test_explicit_store_without_cipher_fails_closed`), l'effacement
+  best-effort sans mutation d'`bytes`
+  (`test_derivation_zeroizes_normalized_buffer_after_success`,
   `test_zeroize_buffer_never_touches_immutable_bytes`), l'exclusion des
   secrets de toute sérialisation des settings
   (`test_model_dump_never_contains_master_key_kek_or_pepper`) et le verrou de
