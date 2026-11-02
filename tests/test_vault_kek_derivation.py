@@ -650,5 +650,33 @@ class SecretBufferZeroizationTests(unittest.TestCase):
         self.assertEqual(second, b"meme-entropie" * 8)
 
 
+class SettingsSerializationHygieneTests(unittest.TestCase):
+    """Sérialisation des settings sans secret (revue LOW, mitigation structurelle)."""
+
+    def test_model_dump_never_contains_master_key_kek_or_pepper(self) -> None:
+        """`model_dump`/`model_dump_json` excluent clé maîtresse, KEK et pepper.
+
+        Revue LOW : la mitigation « ne jamais sérialiser `app.state.settings` »
+        est désormais structurelle (`Field(exclude=True)`) — même un appelant qui
+        sérialiserait les settings n'en obtiendrait aucun secret.
+        """
+        with_master = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=_PEPPER,
+        )
+        legacy_kek = generate_encryption_key()
+        with_kek = VaultSettings(kek=legacy_kek, api_key_pepper=_PEPPER)
+        for settings in (with_master, with_kek):
+            dumped = settings.model_dump()
+            serialized = settings.model_dump_json()
+            self.assertNotIn("master_key", dumped)
+            self.assertNotIn("kek", dumped)
+            self.assertNotIn("api_key_pepper", dumped)
+            for secret in (_MASTER_KEY, legacy_kek, _PEPPER):
+                self.assertNotIn(secret, dumped.values())
+                self.assertNotIn(secret, serialized)
+
+
 if __name__ == "__main__":
     unittest.main()

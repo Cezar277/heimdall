@@ -588,7 +588,7 @@ class VaultSettings(BaseSettings):
     )
     api_key_pepper: str | None = Field(
         default=None,
-        repr=False,
+        repr=False, exclude=True,  # jamais dans model_dump()/model_dump_json()
         description=(
             "Pepper serveur distinct de la KEK pour hachage HMAC-SHA256 (ticket #64). "
             "Doit comporter au moins 32 octets (256 bits). "
@@ -610,7 +610,7 @@ class VaultSettings(BaseSettings):
     )
     kek: str | None = Field(
         default=None,
-        repr=False,
+        repr=False, exclude=True,  # jamais dans model_dump()/model_dump_json()
         description=(
             "MODE HISTORIQUE : KEK AES-256 encodée base64 (32 octets), utilisée "
             "directement sans dérivation, distincte du pepper d'authentification. "
@@ -623,7 +623,7 @@ class VaultSettings(BaseSettings):
     )
     master_key: str | None = Field(
         default=None,
-        repr=False,
+        repr=False, exclude=True,  # jamais dans model_dump()/model_dump_json()
         description=(
             "Clé maîtresse du serveur (phrase de passe UTF-8 d'au moins 16 octets), "
             "matière première de la KEK dérivée par Argon2id (ticket #262). "
