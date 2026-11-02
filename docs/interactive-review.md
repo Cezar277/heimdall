@@ -1,0 +1,224 @@
+# Validation humaine T32
+
+## Rendu (#87)
+
+`heimdall.cli.review.Proposal` reçoit un `Finding`, le nom de variable,
+les snapshots `TextChange` avant/après et **toutes les valeurs sensibles
+connues**, y compris dans le contexte. Le producteur T30 fournit ces données
+en mémoire : aucun manifeste contenant des secrets n'est écrit sur disque.
+Les contenus et valeurs sont exclus de `repr`.
+
+`render_diff` utilise `difflib.unified_diff`. Les valeurs connues sont entièrement
+masquées avant le calcul du diff, avec le marqueur **constant** `<MASKED>`
+(aucun oracle de longueur : `len(valeur)` ne fuit ni à l'écran ni dans un
+journal de session). Le masque conservateur MCP ajoute un filet pour les
+autres candidats, lui aussi ramené au marqueur constant : son
+`<REDACTED:type:len=N>` est réécrit par `_net`, donc ni le type ni la
+longueur exacte d'un candidat heuristique ne sont affichés. Les références `os.getenv`, `os.environ` et
+`process.env` restent lisibles. Le diff comprend les fichiers de code,
+`.env.example` et `.gitignore` fournis par le producteur. Le contenu des `.env`
+et de `.git` est refusé. Les contrôles terminal et caractères directionnels
+sont échappés ; aucune séquence ANSI issue d'un fichier n'est exécutée.
+
+Le producteur doit refuser les patches approximatifs et inclure tous les
+changements dans la proposition affichée. Le moteur de remplacement T30
+(#83–#86) n'est pas encore livré sur cette branche : cette interface ne
+génère pas de remplacements et n'ouvre aucun fichier source.
+
+Preuve locale : `python -m pytest tests/test_cli_review.py` (166 tests pour #87–#90).
+
+## Boucle Y/N/E (#88)
+
+`heimdall.cli.review.review_proposal` affiche le diff masqué puis lit une
+réponse. Trois actions seulement, aucune n'est un défaut implicite :
+
+| Réponse | Action | Effet |
+| --- | --- | --- |
+| `Y` (`yes`, `o`, `oui`) | `Choice.VALIDATE` | appelle le backend, puis journalise le résultat réel |
+| `N` (`no`, `non`) | `Choice.IGNORE` | journalise, laisse le secret en place |
+| `E` (`edit`) | `Choice.EDIT` | appelle l'éditeur, journalise, réaffiche le nouveau diff et redemande |
+
+`parse_choice` refuse tout le reste (chaîne vide, Entrée seule, valeur
+inconnue, réponse de plus de 16 caractères) : la boucle réaffiche
+l'avertissement statique et **redemande**, sans jamais deviner. Deux bornes
+évitent une boucle infinie : `MAX_PROMPTS` (16 réponses, invalides comprises)
+et `MAX_EDITS` (8 éditions successives). Les dépasser est une
+`ReviewError`, donc une erreur d'outillage côté CLI (code 2), jamais une
+validation implicite.
+
+`apply` et `edit` sont **injectés** : c'est le backend T30 (#83–#86) qui
+calcule et pose le patch atomique, cette interface ne touche aucun fichier.
+Sans backend, `Y` et `E` sont refusés (`ReviewError`) **avant** toute
+écriture au journal : aucune trace ne prétend qu'une action a eu lieu.
+
+Toute exception du backend est convertie en `ReviewError` **statique**
+(`raise ... from None`) : le message, le chemin ou la valeur portés par
+l'exception T30 ne sortent jamais sur stderr ni dans un journal. Le journal
+est ensuite écrit **après** l'action, avec le champ `applied` qui reflète ce
+qui s'est réellement passé : `true` seulement si `apply` a rendu la main
+sans erreur, `false` pour `N`, `E`, une édition annulée ou un échec. Un
+audit ne prétend donc jamais qu'une tentative a abouti.
+
+Une édition annulée (éditeur fermé sans sauvegarde, `edit` rendant `None`)
+réaffiche le diff et redemande.
+
+Chaque choix est journalisé dans `$XDG_STATE_HOME/heimdall/review-decisions.jsonl`
+(par défaut `~/.local/state/...`), **hors dépôt**, avec un contrat fermé :
+`schema`, `sequence`, `date`, `action`, `applied`, `file`, `line`,
+`snippet_hash`, `previous_hash` et `hash`. Un `applied: true` avec une action
+autre que `Y` est refusé à la construction **et** à la relecture. La chaîne de hachage réutilise les primitives
+durcies de T33 (verrou exclusif, permissions `0600`, append + `fsync`,
+relecture intégrale vérifiée) : une entrée modifiée ou réordonnée fait
+échouer `DecisionJournal.read()`. Le journal ne contient **jamais** la
+valeur du secret : uniquement l'empreinte `snippet_hash` du Finding.
+
+## Mode non interactif (#89)
+
+`is_interactive(ci=..., stream=...)` applique un refus par défaut :
+
+- `ci=True` force le mode non interactif, même si l'appelant demande
+  l'inverse (`review_proposals(ci=True, interactive=True)`) ;
+- `interactive=True` **ne suffit jamais** : il faut aussi un TTY sûr. Un
+  appelant qui force l'interactif sur un stdin pipé
+  (`echo y | heimdall review`) retombe en mode non interactif au lieu d'y
+  voir une validation humaine ;
+- sans TTY sûr (`sys.stdin.isatty()` absent, faux ou en erreur), le mode
+  est non interactif ;
+- toute ambiguïté (flux sans `isatty`, `OSError`, `ValueError`,
+  `RuntimeError` d'un flux exotique) est traitée comme « pas de terminal » ;
+- une lecture clavier impossible (`EOFError`, `OSError`, `ValueError`,
+  `KeyboardInterrupt`) devient une `ReviewError` statique : jamais de
+  traceback, et jamais le code 1 réservé aux secrets avérés.
+
+Dans ce mode, `review_proposal` rend un `ReviewOutcome` sans action
+(`action=None`, `applied=False`) et n'appelle **ni** `ask`, **ni** `apply`,
+**ni** `edit`, **ni** le journal : rapport seul, aucune écriture. C'est
+l'inverse du piège « auto-valider quand personne ne répond ».
+
+`ReviewReport.render()` produit alors le rapport masqué et le décompte
+(`N proposition(s), M appliquée(s), K restante(s)`). Le code de sortie
+attendu pour l'appelant suit le contrat de `scan` : 0 si `remaining == 0`,
+1 si des propositions restent, 2 sur erreur d'outillage.
+
+Preuve opérateur : `heimdall scan --ci` ne modifie rien dans le dépôt
+(`git status` propre, ni `.env`, ni `.env.example`, ni `.gitignore`).
+
+## Tests du flux interactif (#90)
+
+`tests/test_cli_review.py` simule le clavier en injectant `ask` (alternative
+documentée au `CliRunner(input=...)` de Typer) et couvre :
+
+- `Y` : application puis journal `applied: true`, diff masqué dans le prompt ;
+- `N` : backend jamais appelé, secret laissé en place, `applied: false` ;
+- `E` : réaffichage du nouveau diff, puis validation de la proposition éditée ;
+- entrée invalide : redemande, puis épuisement borné (`MAX_PROMPTS`) ;
+- `Y`/`E` sans backend : refus avant journal ;
+- échec du backend `apply`/`edit` (message contenant la valeur et un chemin) :
+  `ReviewError` statique, `__cause__` nulle, journal `applied: false`, aucune
+  valeur écrite ;
+- édition annulée ou édition rendant un objet étranger : refus sans écriture ;
+- mode non interactif : aucun appel à `ask`/`apply`/`edit`/journal ;
+- `ci=True` gagnant sur `interactive=True` ;
+- `interactive=True` sur un stdin pipé : reste non interactif ;
+- détection TTY (absent, faux, en erreur, `RuntimeError`) ;
+- lecture clavier en échec (`OSError`, `KeyboardInterrupt`) : erreur statique ;
+- `ask`/`notify` injectés qui lèvent avec une valeur dans le message : rien
+  sur stderr, `ReviewError` statique, journal vide ou intact ;
+- `isatty` levant `KeyboardInterrupt`/`SystemExit` : non interactif ;
+- `ask` injecté levant `SystemExit("<valeur>")` : `ReviewError` statique,
+  stderr vide, journal vide ;
+- `apply`/`edit` levant `SystemExit`/`KeyboardInterrupt` : statique, stderr
+  vide, journal `applied:false` ;
+- journal injecté levant `OSError` avec valeur et chemin, ou sans `append` :
+  `JournalError` statique, stderr vide ;
+- générateur infini de propositions : borné à `MAX_PROPOSALS + 1` éléments
+  consommés, `ReviewError`, aucune écriture ;
+- producteur `None`/entier/objet, ou générateur qui lève : `ReviewError`
+  statique, pas de `TypeError` fuyant ;
+- chemin de journal avec octet NUL, `HOME` indisponible, argument non-`Path`,
+  journal par défaut cassé : `JournalError` statique ;
+- rendu en `MemoryError`/`KeyboardInterrupt` (boucle et rapport) :
+  `ReviewError` statique, journal vide ;
+- `__getattr__` hostile sur le flux : non interactif, stderr vide ;
+- double faute backend + journal : `ReviewError` statique, `__context__` et
+  `__cause__` nuls, stderr vide ;
+- options invalides avec producteur infini : `ReviewError` sans consommer un
+  seul élément ;
+- `os.fstat` en `MemoryError`/`KeyboardInterrupt` sur `read` et `append` :
+  `JournalError` statique ;
+- `edit` rendant un `finding` déplacé ou des `secrets` réduits : `ReviewError`,
+  journal `e:false` ; ajout de valeurs accepté ;
+- rendu au plafond (`MAX_CHANGES` textes dont un à `MAX_TEXT_CHARS`) : masqué
+  et borné, en ~2 s ;
+- marqueur constant : `<MASKED>` sans chiffre, quelle que soit la longueur ;
+- lecture clavier bornée : `readline(MAX_ANSWER_CHARS + 2)`, EOF et flux
+  absents en erreur statique ;
+- journal relu avec `file`/`line`/`snippet_hash` de types arbitraires :
+  `JournalError` statique ;
+- candidat heuristique hors `secrets` : `<MASKED>` sans `len=` ni type ;
+- `apply` réussi puis journal en panne : `JournalError`, avertissement
+  `UNAPPLIED_TRACE`, journal vide ;
+- volume de session au-delà de `MAX_SESSION_BYTES` : `ReviewError` ;
+- `stream` TTY vérifié avec `sys.stdin` pipé : la lecture porte sur le flux
+  vérifié, jamais sur le pipe ;
+- marqueur `<REDACTED:...>` de type exotique réécrit ; marqueur malformé
+  refusé (`ReviewError`) ;
+- volume compté en octets UTF-8 (`é` = 2 octets) ;
+- `sys.stderr` levant `SystemExit("<valeur>")` : silence, boucle poursuivie ;
+- `render_diff` appelé directement avec `mask_text` en `MemoryError` :
+  `ReviewError` statique ;
+- `notify` levant `KeyboardInterrupt` : interrompu en solo **et** en session ;
+- `notify` levant `SystemExit("<valeur>")` : absorbé en solo **et** en
+  session, rien sur stderr ; `SystemExit` d'un producteur → `ReviewError` ;
+- `XDG_STATE_HOME` relatif ou contenant `..` : `JournalError` statique ;
+- masquage borné : total des valeurs > `MAX_SECRET_BYTES` refusé, 256 valeurs
+  longues acceptées et masquées ;
+- grammaires alignées sur l'invariant 2 (`_`, `A`, `_APP` refusés) ;
+- chemins privés insensibles à la casse (`.Git/config`, `.ENV`, `.Env.local`) ;
+- journal chaîné : falsification détectée, `applied` incohérent refusé,
+  permissions `0600`, aucune valeur ;
+- `scan --ci` : `git status` propre (CliRunner, dépôt jetable).
+
+```sh
+python -m pytest tests/test_cli_review.py -v
+ruff check heimdall/cli/review.py tests/test_cli_review.py
+mypy heimdall tests/test_cli_review.py
+```
+
+## Durcissements après revue de code
+
+| Constat | Correctif |
+| --- | --- |
+| [HIGH] `interactive=True` contournait le garde TTY (auto-validation sur stdin pipé) | `review_proposal` exige `is_interactive(stream=...)` en plus de `interactive=True` ; `review_proposals` combine `ci`, `interactive is False` et TTY |
+| [HIGH] exceptions `apply`/`edit` brutes et journal déjà écrit | `raise ReviewError from None` autour du backend ; journal écrit **après** l'action avec `applied: bool` |
+| [MEDIUM] motif de masquage géant recompilé par ligne, `re.error` fuyante | total borné par `MAX_SECRET_BYTES` dans `Proposal`, motif compilé **une fois** par `render_diff`, `re.error` convertie en `ReviewError` |
+| [MEDIUM] grammaire de variable plus lâche que l'invariant 2 | `[A-Z][A-Z0-9_]{1,63}` pour `_VARIABLE` **et** `_ENV_REFERENCE` |
+| [LOW] garde `.env`/`.git` sensible à la casse | comparaison `lower()` sur tous les segments |
+| [LOW] `_stdin_ask`/`is_interactive` trop étroits | `EOFError`/`OSError`/`ValueError`/`KeyboardInterrupt` → `ReviewError` ; `isatty` en erreur → non interactif |
+| [LOW] exceptions d'un `ask`/`notify` injecté non normalisées | `_ask` convertit toute exception (hors `ReviewError`) en erreur statique ; `_notify` reste best-effort et ne laisse jamais ressortir son exception |
+| [LOW] `is_interactive` laissait passer `BaseException` | `except BaseException` → refus par défaut (non interactif), sans traceback |
+| [LOW] `_ask` laissait passer `SystemExit("<valeur>")`, imprimé sur stderr par l'interpréteur | `_ask` capture `BaseException` → `ReviewError` statique, sans message d'entrée ni code de sortie choisi par l'appelant |
+| Choix `_notify` | `Exception` seul, volontairement : aucune entrée lue, donc `Ctrl-C`/`SystemExit` peuvent interrompre entre deux propositions (documenté) |
+| [LOW] `apply`/`edit` ne capturaient que `Exception` | `BaseException` → journal `applied:false` puis `ReviewError` statique (couvre `SystemExit("<valeur>")`) |
+| [LOW] journal injecté non normalisé | `_journal` réémet `JournalError`/`ReviewError` et convertit tout le reste en `JournalError from None` |
+| [LOW] `review_proposals` matérialisait tout | consommation paresseuse bornée par `MAX_PROPOSALS` (1024), `ReviewError` au-delà, jamais de troncature silencieuse |
+| [LOW] résolution du journal hors contrat (`Path.home()` en `RuntimeError`, `Path` acceptant NUL) | `decision_journal_path`/`DecisionJournal` encadrent la résolution, refusent un chemin non-`Path` ou contenant NUL ; `_resolve_journal` garantit un `JournalError` statique |
+| [LOW] producteur non itérable (`TypeError` brut) | `_bounded_proposals` encadre l'itération et rend une `ReviewError` statique |
+| [LOW] rendu non gardé (`MemoryError`, `KeyboardInterrupt`) | `_render` encadre `render_diff`, `ReviewReport.render` encadre le rapport |
+| [LOW] `getattr` hors `try` dans `is_interactive` | `getattr` déplacé dans le `try` : un `__getattr__` hostile retombe sur le refus par défaut |
+| [LOW] `__context__` backend conservée sur double faute | drapeau + erreur statique levée **hors** du `except` ; `_journal_failure` absorbe la panne du journal, `__context__`/`__cause__` nuls |
+| [LOW] options validées après consommation du producteur | validation `ci`/`interactive` **avant** `_bounded_proposals` |
+| [LOW] `read`/`append` ne capturaient pas `MemoryError`/`KeyboardInterrupt` | `BaseException` capturé, `JournalError` réémis ou converti |
+| [LOW] `edit` pouvait changer le `finding` ou réduire `secrets` | ré-ancrage : `edited.finding == current.finding` et `current.secrets ⊆ edited.secrets` (ajout permis, retrait refusé), sinon `ReviewError` statique |
+| [LOW] marqueur `<MASKED_N>` révélait `len(valeur)` | marqueur **constant** `<MASKED>`, documenté |
+| [LOW] `input()` lisait une réponse non bornée | `sys.stdin.readline(MAX_ANSWER_CHARS + 2)` : un collage volumineux n'est pas matérialisé |
+| [LOW] relecture du journal sans contrôle de types | `_valid_target` : `file` conforme au contrat Finding, `line` entier ≥ 1, `snippet_hash` hex 64, sinon `JournalError` |
+| [LOW] filet MCP `mask_text` révélait `type` + `len` | `_net` ramène `<REDACTED:type:len=N>` au marqueur constant `<MASKED>` |
+| [LOW] patch appliqué sans trace si le journal échoue après `apply` | `_journal_applied` : avertissement statique `UNAPPLIED_TRACE` puis `JournalError` ; atomicité patch+journal non garantie, documentée |
+| [LOW] session matérialisée (1024 × 32 × 100 Ko) | traitement **en flux** (`_review_all`) + borne de volume `MAX_SESSION_BYTES` (64 Mio), `ReviewError` au-delà |
+| [LOW] TTY vérifié sur `stream` mais lecture sur `sys.stdin` | `_stdin_ask(prompt, stream)` lit **le même objet** que celui contrôlé par `is_interactive` |
+| [LOW] `_REDACTION` trop étroit (type hors `[a-z_]`) | motif large `<REDACTED:[^<>]*>` + post-condition fail-closed si un marqueur reste |
+| [LOW] volume compté en caractères | `_proposal_bytes` compte les **octets UTF-8** (jusqu'à 4× plus qu'en caractères) |
+| [LOW] `_stderr_notify` laissait passer `BaseException` | `except BaseException` : un `sys.stderr` exotique ne peut ni imprimer ni choisir le code de sortie |
+| [LOW] `render_diff` publique non gardée (seul `_render` l'était) | `render_diff` **est** le chemin durci ; `_render` supprimé |
+| [LOW] interruption incohérente entre appel solo et session | contrat unifié : `KeyboardInterrupt` est réémis partout, `SystemExit` est absorbé partout (un composant ne choisit ni code de sortie ni message) |

@@ -1,0 +1,14 @@
+{
+  "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+  "python": "3.13.5",
+  "elapsed_seconds": 39.87585519099997,
+  "peak_rss_self_kib": 98348,
+  "peak_rss_child_kib": 98348,
+  "status": "refused",
+  "complete": false,
+  "commits": null,
+  "entries": null,
+  "bytes_read": null,
+  "unique_findings": null,
+  "skipped": null
+}

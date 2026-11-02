@@ -1018,12 +1018,22 @@ def test_read_key_converts_oserror_to_scan_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     key_file = _write_key_file(tmp_path / "state" / "key")
+    real_os = hashing.os
 
-    def failing_fstat(descriptor: int) -> os.stat_result:
-        del descriptor
-        raise OSError("panne simulée")
+    class _OsProxy:
+        """Délègue tout à ``os`` sauf ``fstat``, sans patcher le module global."""
 
-    monkeypatch.setattr(hashing.os, "fstat", failing_fstat)
+        def __getattr__(self, name: str) -> object:
+            return getattr(real_os, name)
+
+        def fstat(self, descriptor: int) -> os.stat_result:
+            del descriptor
+            raise OSError("panne simulée")
+
+    # pytest 9.2+ utilise ``os.fstat`` pour sa capture : un patch global ferait
+    # échouer le runner avant même l'assertion. Le proxy ne touche que le nom
+    # ``os`` importé par ``hashing``.
+    monkeypatch.setattr(hashing, "os", _OsProxy())
     with pytest.raises(ScanError):
         hashing._read_key(key_file)
 

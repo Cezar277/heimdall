@@ -2,9 +2,12 @@
 
 Les sous-commandes réelles arrivent avec leurs tickets :
 ``scan`` (#29 branche le scanner #22),
-``vault`` (#25/#26/#64), ``mcp`` (#27). La validation Y/N/E (#32) et le
-remplacement du secret arrivent plus tard : ``scan`` est aujourd'hui une
-lecture seule, sans dialogue.
+``vault`` (#25/#26/#64), ``mcp`` (#27), ``cold-start`` et ``deep-scan``
+(#107–#110 : entonnoir puis LLM, historique complet, limites, alerte de
+révocation). La boucle Y/N/E (#32) est livrée comme API de
+``heimdall.cli.review`` (rendu masqué, choix humain, journal, mode non
+interactif) ; sa commande CLI et le remplacement du secret arrivent avec
+T30 (#83–#86). ``scan`` reste une lecture seule, sans dialogue.
 
 Codes de sortie (invariant 11) : 0 propre, 1 secrets détectés, 2 erreur
 d'outillage. Une commande non branchée est une panne d'outillage, donc 2 —
@@ -23,6 +26,8 @@ from typing import Final
 import typer
 
 import heimdall
+from heimdall.cli.cold_start import collect_cold_start, render_cold_start
+from heimdall.cli.history import collect_history, render_history
 from heimdall.cli.scan import (
     EXIT_CLEAN,
     EXIT_FINDINGS,
@@ -164,12 +169,15 @@ def scan(  # noqa: PLR0913, PLR0917
             typer.echo(render_text(report))
         if ci:
             # Résumé déterministe sur stderr : le journal CI montre toujours
-            # le verdict, le nombre de findings ignorés et l'empreinte sha256 de config.
+            # le verdict, les findings ignorés, les bases VCS élaguées et
+            # l'empreinte sha256 de config.
             hash_info = f" (config sha256:{report.config_hash})" if report.config_hash else ""
             typer.echo(
                 f"heimdall scan : périmètre {report.scope}, "
                 f"{len(report.findings)} secret(s) détecté(s), "
-                f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}.",
+                f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}, "
+                f"{report.vcs_ignored} base(s) VCS élaguée(s) "
+                "(historique non parcouru).",
                 err=True,
             )
     except (ScanError, ToolFailure):
@@ -186,6 +194,68 @@ def scan(  # noqa: PLR0913, PLR0917
         # best-effort (invariant 8).
         _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
+    raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
+
+
+@app.command("cold-start")
+def cold_start(
+    path: str = typer.Argument(".", help="Racine du dépôt existant à analyser."),
+    ci: bool = typer.Option(False, "--ci", help="Déterministe : aucun appel LLM ni journal."),
+    llm: bool = typer.Option(
+        True, "--llm/--no-llm", help="Qualifie les seuls candidats localement."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Rapport machine sans secret."),
+    max_file_bytes: int = typer.Option(
+        1_048_576,
+        "--max-file-bytes",
+        min=1,
+        max=1_048_576,
+        help="Taille maximale par fichier, en octets.",
+    ),
+) -> None:
+    """Premier scan complet : regex/entropie puis avis du LLM local (#107).
+
+    Hors CI avec LLM, les propositions faux_positif sont journalisées au
+    chemin opérateur par défaut. --ci ou --no-llm désactive ce journal.
+    """
+    try:
+        report = collect_cold_start(Path(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes)
+        typer.echo(render_cold_start(report, json_output=json_output))
+    except Exception:
+        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
+        raise typer.Exit(code=2) from None
+    if report.skipped_files:
+        raise typer.Exit(code=2)
+    raise typer.Exit(code=EXIT_FINDINGS if report.scan.findings else EXIT_CLEAN)
+
+
+@app.command("deep-scan")
+def deep_scan(
+    path: str = typer.Argument(".", help="Racine du dépôt dont l'historique est analysé."),
+    ci: bool = typer.Option(False, "--ci", help="Aucun appel LLM ni journal."),
+    llm: bool = typer.Option(True, "--llm/--no-llm", help="Avis local consultatif."),
+    json_output: bool = typer.Option(False, "--json", help="Rapport historique sans secret."),
+    max_file_bytes: int = typer.Option(
+        1_048_576,
+        "--max-file-bytes",
+        min=1,
+        max=1_048_576,
+        help="Taille maximale par blob, en octets.",
+    ),
+) -> None:
+    """Scanne tous les commits accessibles et signale les secrets à révoquer (#108–#110).
+
+    Hors CI avec LLM, les propositions faux_positif sont journalisées au
+    chemin opérateur par défaut. --ci ou --no-llm désactive ce journal.
+    """
+    try:
+        report = collect_history(Path(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes)
+        typer.echo(render_history(report, json_output=json_output))
+    except Exception:
+        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
+        raise typer.Exit(code=2) from None
+    if not report.complete:
+        raise typer.Exit(code=2)
     raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
 
 
