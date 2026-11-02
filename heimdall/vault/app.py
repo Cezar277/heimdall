@@ -99,6 +99,7 @@ from heimdall.vault import auth as vault_auth
 from heimdall.vault.crypto import (
     MIN_MASTER_KEY_BYTES,
     VaultCipher,
+    _zeroize_buffer,
     constant_time_equal,
     decode_kek_salt,
     derive_kek_from_master_key,
@@ -356,7 +357,12 @@ def _validate_explicit_secret_store_configuration(settings: "VaultSettings") -> 
     ):
         return
     derived_kek = derive_kek_from_master_key(settings.master_key, settings.kek_salt)
-    _reject_kek_equal_to_pepper(derived_kek, settings.api_key_pepper)
+    try:
+        _reject_kek_equal_to_pepper(derived_kek, settings.api_key_pepper)
+    finally:
+        # Cette KEK n'est utilisée par aucun chiffreur sur ce chemin : on
+        # l'efface best-effort au lieu de la laisser dans la mémoire du processus.
+        _zeroize_buffer(derived_kek)
 
 
 # Motifs d'identifiants du contrat (#15) : `project` vient du module

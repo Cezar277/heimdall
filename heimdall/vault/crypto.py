@@ -43,6 +43,7 @@ pas rendre illisibles les blobs existants ; les deux modes sont exclusifs.
 """
 
 import base64
+import ctypes
 import hashlib
 import hmac
 import os
@@ -221,15 +222,35 @@ def decode_kek_salt(salt: str | bytes) -> bytes:
     return decoded
 
 
-def _normalize_master_key(master_key: str | bytes) -> bytes:
-    """Normalise la clé maîtresse en octets sans jamais l'écho dans une erreur.
+def _zeroize_buffer(buffer: bytes | bytearray) -> None:
+    """Efface best-effort un tampon d'octets dérivé (revue LOW #262).
+
+    Python ne garantit ni l'effacement des ``str`` immuables ni celui des copies
+    internes d'Argon2 ; ce nettoyage couvre uniquement les buffers que ce module
+    crée lui-même (buffer normalisé et copie transmise à la KDF). Il réduit la
+    fenêtre d'exposition sans prétendre effacer la clé maîtresse d'origine ni
+    ``os.environ``. ``ctypes`` est utilisé car ``bytes`` est immuable ; l'appel
+    reste local à des objets fraîchement alloués, jamais partagés.
+    """
+    if isinstance(buffer, bytearray):
+        buffer[:] = b"\x00" * len(buffer)
+        return
+    try:
+        ctypes.memset(ctypes.c_char_p(buffer), 0, len(buffer))
+    except (TypeError, ValueError):  # pragma: no cover - plateformes exotiques
+        return
+
+
+def _normalize_master_key(master_key: str | bytes) -> bytearray:
+    """Normalise la clé maîtresse en octets effaçables, sans écho dans une erreur.
 
     Une chaîne est une phrase de passe UTF-8 **canonisée NFC** avant encodage ;
-    des octets sont utilisés bruts (utile aux tests et aux appelants qui
-    détiennent déjà une clé aléatoire). La longueur minimale de 128 bits est une
-    défense en profondeur contre une phrase de passe triviale : Argon2id
-    ralentit l'attaque hors ligne mais ne compense pas une clé maîtresse sans
-    entropie.
+    des octets sont copiés tels quels (utile aux tests et aux appelants qui
+    détiennent déjà une clé aléatoire). Le ``bytearray`` retourné appartient à
+    l'appelant, qui doit l'effacer après usage (``_zeroize_buffer``). La longueur
+    minimale de 128 bits est une défense en profondeur contre une phrase de passe
+    triviale : Argon2id ralentit l'attaque hors ligne mais ne compense pas une
+    clé maîtresse sans entropie.
     """
     if isinstance(master_key, str):
         if not master_key or not master_key.strip():
@@ -239,11 +260,14 @@ def _normalize_master_key(master_key: str | bytes) -> bytes:
         try:
             # Forme canonique NFC (ticket #262) : « é » précomposé et « e » +
             # accent combinant doivent dériver la même KEK (ADR-005).
-            raw = unicodedata.normalize("NFC", master_key).encode("utf-8")
+            raw = bytearray(unicodedata.normalize("NFC", master_key).encode("utf-8"))
         except UnicodeEncodeError:
             raise ValueError("Clé maîtresse invalide : encodage UTF-8 impossible.") from None
     elif isinstance(master_key, (bytes, bytearray)):
-        raw = bytes(master_key)
+        # Copie systématique : effacer le buffer ne doit jamais corrompre
+        # l'objet de l'appelant (bytes(bytearray) crée toujours un nouvel objet,
+        # contrairement à bytes(bytes) qui peut renvoyer le même).
+        raw = bytearray(master_key)
         if not raw.strip():
             raise ValueError("Clé maîtresse invalide : valeur vide ou blanche.")
         if raw != raw.strip():
@@ -270,18 +294,26 @@ def derive_kek_from_master_key(master_key: str | bytes, salt: str | bytes) -> by
     c'est le critère « Fait quand » du ticket — et volontairement lente. Elle
     DOIT être appelée une seule fois au démarrage, puis la KEK retournée est
     conservée en mémoire (``VaultCipher``), jamais recalculée par requête.
+
+    Les octets normalisés et leur copie transmise à Argon2 sont effacés
+    best-effort dans un ``finally``, y compris si la KDF échoue (revue LOW).
     """
     secret = _normalize_master_key(master_key)
     salt_bytes = decode_kek_salt(salt)
-    return argon2.low_level.hash_secret_raw(
-        secret=secret,
-        salt=salt_bytes,
-        time_cost=ARGON2ID_TIME_COST,
-        memory_cost=ARGON2ID_MEMORY_COST_KIB,
-        parallelism=ARGON2ID_PARALLELISM,
-        hash_len=ARGON2ID_HASH_LEN,
-        type=argon2.low_level.Type.ID,
-    )
+    payload = bytes(secret)
+    try:
+        return argon2.low_level.hash_secret_raw(
+            secret=payload,
+            salt=salt_bytes,
+            time_cost=ARGON2ID_TIME_COST,
+            memory_cost=ARGON2ID_MEMORY_COST_KIB,
+            parallelism=ARGON2ID_PARALLELISM,
+            hash_len=ARGON2ID_HASH_LEN,
+            type=argon2.low_level.Type.ID,
+        )
+    finally:
+        _zeroize_buffer(secret)
+        _zeroize_buffer(payload)
 
 
 def decode_encoded_key(encoded: str | bytes) -> bytes:

@@ -564,5 +564,47 @@ class ExplicitSecretStoreInvariantTests(unittest.TestCase):
         self.assertIsNotNone(test_app.state.secret_store)
 
 
+class SecretBufferZeroizationTests(unittest.TestCase):
+    """Effacement best-effort des octets de dérivation (revue LOW #262)."""
+
+    def test_argon2_secret_buffer_is_zeroized_after_derivation(self) -> None:
+        """Le buffer transmis à Argon2 est effacé après un succès."""
+        captured: list[bytes] = []
+
+        def fake_hash_secret_raw(**kwargs: object) -> bytes:
+            secret = kwargs["secret"]
+            assert isinstance(secret, bytes)
+            captured.append(secret)
+            return b"K" * 32
+
+        with patch(
+            "heimdall.vault.crypto.argon2.low_level.hash_secret_raw",
+            side_effect=fake_hash_secret_raw,
+        ):
+            derived = derive_kek_from_master_key(_MASTER_KEY, _SALT_A)
+        self.assertEqual(derived, b"K" * 32)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(bytes(captured[0]), b"\x00" * len(captured[0]))
+
+    def test_argon2_secret_buffer_is_zeroized_on_kdf_failure(self) -> None:
+        """Le buffer est aussi effacé quand la KDF échoue (fail-closed)."""
+        captured: list[bytes] = []
+
+        def failing_hash_secret_raw(**kwargs: object) -> bytes:
+            secret = kwargs["secret"]
+            assert isinstance(secret, bytes)
+            captured.append(secret)
+            raise RuntimeError("KDF indisponible")
+
+        with patch(
+            "heimdall.vault.crypto.argon2.low_level.hash_secret_raw",
+            side_effect=failing_hash_secret_raw,
+        ):
+            with self.assertRaises(RuntimeError):
+                derive_kek_from_master_key(_MASTER_KEY, _SALT_A)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(bytes(captured[0]), b"\x00" * len(captured[0]))
+
+
 if __name__ == "__main__":
     unittest.main()
