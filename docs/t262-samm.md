@@ -6,10 +6,11 @@ enveloppe »`, branche `69-t262-kek-dérivée-avec-argon2id`, tickets voisins
 (chasse aux fuites de clés). Cette fiche fournit les couples module + ligne et
 les permaliens du code testé ; elle ne prétend pas modifier une feuille externe.
 
-Révision du code testé : `eb0d7f4`
-(`fix(vault): refuser le pepper sous alphabet base64 alternatif et durcir le store explicite (#262)`),
-au-dessus du merge de `main` (`987a59a`, PR #168). Cette révision intègre les
-remarques de revue des huit passes (MEDIUM et LOW) : comparaison du pepper à la KEK dérivée
+Révision du code T262 testé : `eb0d7f4`
+(`fix(vault): refuser le pepper sous alphabet base64 alternatif et durcir le store explicite (#262)`) ;
+les fichiers T262 sont inchangés par le merge de `main` (`e0af359`, PR #199,
+merge `5a1d342`). Cette révision intègre les remarques de revue des huit passes
+(MEDIUM et LOW) : comparaison du pepper à la KEK dérivée
 base64, validation `master_key == pepper` dès `VaultSettings`, contrôle
 maître/pepper avant la KDF, `repr=False` sur `kek_salt`, alignement du chemin
 `bytes` de la clé maîtresse sur le refus des espaces de bord, canonisation NFC
@@ -115,21 +116,22 @@ autre sel   : True
 
 ## 5. Résultats locaux
 
-Environnement : Linux, Python 3.14.7, venv local (`.venv`, mêmes versions que
-la CI : `argon2-cffi` 25.1.0, `cryptography` 50.0.2, `pytest` 9.1.1 ; la
-couverture `pytest-cov` est mesurée par la CI).
+Environnement : Linux, Python 3.14.7, venv local (`.venv` synchronisé sur
+`requirements.lock`, mêmes versions que la CI : `argon2-cffi` 25.1.0,
+`cryptography` 50.0.2, `fastapi` 0.162.0, `pytest` 9.2.0 ; la couverture
+`pytest-cov` est mesurée par la CI).
 
 ```sh
 python -m pytest tests/test_vault_kek_derivation.py
 # 45 passed
 
 python -m pytest
-# 2256 passed, 16 skipped, 4512 subtests passed
+# 2632 passed, 16 skipped, 4512 subtests passed
 
 ruff check heimdall tests
 # All checks passed!
 python -m mypy heimdall tests/contracts/fastapi_contract_fixture.py
-# Success: no issues found in 45 source files
+# Success: no issues found in 48 source files
 
 # CI Linux : couverture `--cov-fail-under=85`, `bandit -r heimdall -q`
 # et `python docs/security/check_model.py` (voir le workflow).
