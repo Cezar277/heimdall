@@ -262,6 +262,24 @@ def _resolve_storage_backend(settings: "VaultSettings") -> Literal["memory", "sq
     return "sqlite" if in_production else "memory"
 
 
+def _reject_kek_equal_to_pepper(derived_kek: bytes, pepper: str) -> None:
+    """Refuse une KEK qui réutilise l'entropie du pepper (invariant 5).
+
+    Couvre la KEK brute **et** sa représentation base64 URL-safe : deux
+    encodages de la même entropie ne doivent jamais servir au chiffrement et à
+    l'authentification. Le message reste générique (aucun écho de secret).
+    """
+    pepper_bytes = pepper.encode("utf-8")
+    derived_b64 = base64.urlsafe_b64encode(derived_kek).decode("ascii")
+    if constant_time_equal(derived_kek, pepper_bytes) or kek_matches_pepper(
+        derived_b64, pepper
+    ):
+        raise ValueError(
+            "La KEK dérivée de la clé maîtresse et le pepper d'authentification "
+            "doivent être distincts (invariant 5)."
+        )
+
+
 def _resolve_vault_cipher(
     settings: "VaultSettings",
     backend: Literal["memory", "sqlite"],
@@ -306,18 +324,7 @@ def _resolve_vault_cipher(
             )
         derived_kek = derive_kek_from_master_key(settings.master_key, salt)
         if pepper is not None:
-            pepper_bytes = pepper.encode("utf-8")
-            derived_b64 = base64.urlsafe_b64encode(derived_kek).decode("ascii")
-            # Même sémantique que le mode historique : refuser la KEK brute ET
-            # sa représentation base64, sinon le pepper pourrait réutiliser la
-            # même entropie sous un autre encodage (invariant 5).
-            if constant_time_equal(derived_kek, pepper_bytes) or kek_matches_pepper(
-                derived_b64, pepper
-            ):
-                raise ValueError(
-                    "La KEK dérivée de la clé maîtresse et le pepper d'authentification "
-                    "doivent être distincts (invariant 5)."
-                )
+            _reject_kek_equal_to_pepper(derived_kek, pepper)
         return VaultCipher(derived_kek)
     if backend == "sqlite":
         raise ValueError(
@@ -328,6 +335,28 @@ def _resolve_vault_cipher(
             "persistées."
         )
     return VaultCipher.generate()
+
+
+def _validate_explicit_secret_store_configuration(settings: "VaultSettings") -> None:
+    """Refuse ``KEK dérivée == pepper`` sur le chemin ``secret_store`` explicite.
+
+    Avec un store explicite, ``_resolve_vault_cipher`` n'est pas appelé et la
+    KEK dérivée n'est jamais construite par l'application. Un appelant peut
+    toutefois fournir un store dont le chiffreur a été construit avec cette même
+    KEK et un pepper identique (invariant 5) : la collision est refusée ici, lors
+    du démarrage, au prix d'une dérivation Argon2id unique. Le chemin reste
+    réservé aux tests ; la production HTTP passe toujours par
+    ``_resolve_vault_cipher``. Les contrôles bon marché restent dans
+    ``VaultSettings`` (paire maître/sel, ``master_key != pepper``).
+    """
+    if (
+        settings.master_key is None
+        or settings.kek_salt is None
+        or settings.api_key_pepper is None
+    ):
+        return
+    derived_kek = derive_kek_from_master_key(settings.master_key, settings.kek_salt)
+    _reject_kek_equal_to_pepper(derived_kek, settings.api_key_pepper)
 
 
 # Motifs d'identifiants du contrat (#15) : `project` vient du module
@@ -1507,6 +1536,7 @@ def _configure_secret_store(
             "(HEIMDALL_ENV=production/prod) : utiliser SqliteSecretStore "
             "avec une KEK persistante."
         )
+    _validate_explicit_secret_store_configuration(settings)
     app.state.secret_store = secret_store
     if isinstance(secret_store, SqliteSecretStore):
         # Aligner l'authentification sur la même base que le store explicite.
@@ -1530,11 +1560,12 @@ def create_app(
     - `settings` : Configuration VaultSettings (défaut : get_settings()).
     - `secret_store` : Magasin de secrets explicite (défaut : résolu par
       `settings.storage_backend` — SQLite chiffré en production, mémoire chiffré
-      hors production). **Réservé aux tests** : avec un store explicite,
-      `_resolve_vault_cipher` n'est pas appelée, donc le contrôle « KEK dérivée
-      == pepper » (brut + base64, invariant 5) n'est exécuté que sur le chemin
-      par défaut. Ne jamais appeler `create_app` avec un store explicite en
-      production.
+      hors production). **Réservé aux tests** : la production passe toujours par
+      `_resolve_vault_cipher`. Par défense en profondeur (invariant 5), une
+      collision « KEK dérivée == pepper » (brut + base64) est refusée même sur
+      ce chemin, au prix d'une dérivation Argon2id unique au démarrage lorsque
+      le couple maître/sel et le pepper sont fournis. Ne jamais appeler
+      `create_app` avec un store explicite en production.
     - `api_key_hashes` : Dictionnaire {hash_hmac_hex: project_id} de clés pré-hachées.
       Chaque clé DOIT être une chaîne hexadécimale de 64 caractères (^[0-9a-f]{64}$).
       Les clés brutes sont expressément refusées pour éviter toute confusion de format.

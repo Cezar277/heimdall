@@ -48,6 +48,7 @@ from heimdall.vault.crypto import (
     generate_encryption_key,
     generate_kek_salt,
 )
+from heimdall.vault.store import InMemorySecretStore
 
 # Matériaux synthétiques, jamais des secrets de déploiement.
 _MASTER_KEY = "correct horse battery staple heimdall"  # phrase de passe factice, > 16 octets
@@ -532,6 +533,35 @@ class T262UnicodeAndFailClosedTests(unittest.TestCase):
             with self.assertRaises(MemoryError) as ctx:
                 create_app(settings)
         self.assertIn("KDF", str(ctx.exception))
+
+
+class ExplicitSecretStoreInvariantTests(unittest.TestCase):
+    """Invariant 5 sur le chemin ``create_app(secret_store=...)`` (revue LOW)."""
+
+    def test_explicit_store_rejects_derived_kek_equal_to_pepper(self) -> None:
+        """Une collision dérivée est refusée même avec un store explicite."""
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=_PEPPER,
+        )
+        with patch(
+            "heimdall.vault.app.derive_kek_from_master_key",
+            return_value=_PEPPER.encode("utf-8"),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                create_app(settings, secret_store=InMemorySecretStore())
+        self.assertIn("distincts", str(ctx.exception))
+
+    def test_explicit_store_still_starts_with_distinct_kek(self) -> None:
+        """Pas de faux positif : un couple distinct démarre normalement."""
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=_PEPPER,
+        )
+        test_app = create_app(settings, secret_store=InMemorySecretStore())
+        self.assertIsNotNone(test_app.state.secret_store)
 
 
 if __name__ == "__main__":
