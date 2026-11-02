@@ -4,7 +4,7 @@ Périmètre : ticket #59 « Exclusions de fichiers », sous-ticket de l'épic #2
 Cette fiche fournit les couples **module + ligne**, les tests et les permaliens
 du code livré ; elle ne prétend pas modifier une feuille SAMM externe.
 
-Révision du code et des tests : `cae99ece77a4dbdbec8e0da9a2dee56c624bcbec`
+Révision du code et des tests : `16d83712829c335f096d1f09cb273a4af7f65660b`
 (`fix(scanner): rétablit le câblage --no-gitignore et vérifie l'index (#59)`),
 au-dessus de
 `d8c0eafc9d6adadeda2e5322825c91fc78ce77cd`
@@ -25,10 +25,10 @@ et de la livraison initiale
 `ee8871a6830d82c309d98c49b15c4c36f3cf3640`
 (`feat(scanner): exclusions Git sûres et observables (#59)`).
 
-Les permaliens de cette fiche épinglent `cae99ec…`, la révision qui contient
+Les permaliens de cette fiche épinglent `16d8371…`, la révision qui contient
 le code **et** les tests cités. Le correctif de revue « racine épinglée par
 descripteur » est décrit dans [scanner.md](scanner.md) ; les permaliens
-ci-dessous restent ceux de la révision `cae99ec…`. Après une fusion par
+ci-dessous restent ceux de la révision `16d8371…`. Après une fusion par
 squash, re-pincer la fiche sur le SHA présent dans `main` :
 
 ```sh
