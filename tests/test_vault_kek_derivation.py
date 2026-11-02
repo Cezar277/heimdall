@@ -43,6 +43,7 @@ from heimdall.vault.crypto import (
     ARGON2ID_TIME_COST,
     MIN_MASTER_KEY_BYTES,
     VaultCipher,
+    _zeroize_buffer,
     decode_kek_salt,
     derive_kek_from_master_key,
     generate_encryption_key,
@@ -538,23 +539,25 @@ class T262UnicodeAndFailClosedTests(unittest.TestCase):
 class ExplicitSecretStoreInvariantTests(unittest.TestCase):
     """Invariant 5 sur le chemin ``create_app(secret_store=...)`` (revue LOW)."""
 
-    def test_explicit_store_rejects_derived_kek_equal_to_pepper(self) -> None:
-        """Une collision dérivée est refusée même avec un store explicite."""
+    def test_explicit_store_rejects_cipher_key_equal_to_pepper(self) -> None:
+        """Le chiffreur du store réutilisant l'entropie du pepper est refusé.
+
+        Revue LOW : le contrôle porte sur la KEK **réellement portée** par le
+        store explicite (pas sur la dérivation des settings, qui peut diverger).
+        """
+        kek = generate_encryption_key()
         settings = VaultSettings(
             master_key=_MASTER_KEY,
             kek_salt=_SALT_A,
-            api_key_pepper=_PEPPER,
+            api_key_pepper=kek,
         )
-        with patch(
-            "heimdall.vault.app.derive_kek_from_master_key",
-            return_value=_PEPPER.encode("utf-8"),
-        ):
-            with self.assertRaises(ValueError) as ctx:
-                create_app(settings, secret_store=InMemorySecretStore())
+        store = InMemorySecretStore(cipher=VaultCipher.from_encoded_key(kek))
+        with self.assertRaises(ValueError) as ctx:
+            create_app(settings, secret_store=store)
         self.assertIn("distincts", str(ctx.exception))
 
     def test_explicit_store_still_starts_with_distinct_kek(self) -> None:
-        """Pas de faux positif : un couple distinct démarre normalement."""
+        """Pas de faux positif : un chiffreur distinct du pepper démarre normalement."""
         settings = VaultSettings(
             master_key=_MASTER_KEY,
             kek_salt=_SALT_A,
@@ -563,47 +566,88 @@ class ExplicitSecretStoreInvariantTests(unittest.TestCase):
         test_app = create_app(settings, secret_store=InMemorySecretStore())
         self.assertIsNotNone(test_app.state.secret_store)
 
+    def test_explicit_store_path_performs_no_kdf(self) -> None:
+        """Le contrôle du store explicite ne dérive rien : aucune KDF inutile.
+
+        Revue LOW : la vérification porte sur la KEK réelle du chiffreur, donc
+        aucune dérivation Argon2id n'est lancée sur ce chemin (contrairement à
+        l'ancienne version qui dérivait les settings).
+        """
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=_PEPPER,
+        )
+        with patch(
+            "heimdall.vault.app.derive_kek_from_master_key",
+            side_effect=AssertionError("aucune dérivation attendue sur ce chemin"),
+        ):
+            test_app = create_app(settings, secret_store=InMemorySecretStore())
+        self.assertIsNotNone(test_app.state.secret_store)
+
 
 class SecretBufferZeroizationTests(unittest.TestCase):
-    """Effacement best-effort des octets de dérivation (revue LOW #262)."""
+    """Effacement best-effort du buffer de dérivation (revue LOW #262)."""
 
-    def test_argon2_secret_buffer_is_zeroized_after_derivation(self) -> None:
-        """Le buffer transmis à Argon2 est effacé après un succès."""
-        captured: list[bytes] = []
-
-        def fake_hash_secret_raw(**kwargs: object) -> bytes:
-            secret = kwargs["secret"]
-            assert isinstance(secret, bytes)
-            captured.append(secret)
-            return b"K" * 32
-
-        with patch(
-            "heimdall.vault.crypto.argon2.low_level.hash_secret_raw",
-            side_effect=fake_hash_secret_raw,
+    def test_derivation_zeroizes_normalized_buffer_after_success(self) -> None:
+        """Le `bytearray` normalisé est effacé après une KDF réussie."""
+        secret = bytearray(_MASTER_KEY.encode("utf-8"))
+        with (
+            patch(
+                "heimdall.vault.crypto._normalize_master_key",
+                return_value=secret,
+            ),
+            patch(
+                "heimdall.vault.crypto.argon2.low_level.hash_secret_raw",
+                return_value=b"K" * 32,
+            ) as mocked_kdf,
         ):
             derived = derive_kek_from_master_key(_MASTER_KEY, _SALT_A)
         self.assertEqual(derived, b"K" * 32)
-        self.assertEqual(len(captured), 1)
-        self.assertEqual(bytes(captured[0]), b"\x00" * len(captured[0]))
+        # Seul le `bytearray` que nous possédons est effacé ; la copie
+        # immuable transmise à Argon2 est créée au dernier moment et n'est
+        # jamais mutée (voir `test_zeroize_buffer_never_touches_immutable_bytes`).
+        self.assertEqual(bytes(secret), b"\x00" * len(secret))
+        self.assertEqual(
+            mocked_kdf.call_args.kwargs["secret"], _MASTER_KEY.encode("utf-8")
+        )
 
-    def test_argon2_secret_buffer_is_zeroized_on_kdf_failure(self) -> None:
+    def test_derivation_zeroizes_buffer_on_kdf_failure(self) -> None:
         """Le buffer est aussi effacé quand la KDF échoue (fail-closed)."""
-        captured: list[bytes] = []
-
-        def failing_hash_secret_raw(**kwargs: object) -> bytes:
-            secret = kwargs["secret"]
-            assert isinstance(secret, bytes)
-            captured.append(secret)
-            raise RuntimeError("KDF indisponible")
-
-        with patch(
-            "heimdall.vault.crypto.argon2.low_level.hash_secret_raw",
-            side_effect=failing_hash_secret_raw,
+        secret = bytearray(_MASTER_KEY.encode("utf-8"))
+        with (
+            patch(
+                "heimdall.vault.crypto._normalize_master_key",
+                return_value=secret,
+            ),
+            patch(
+                "heimdall.vault.crypto.argon2.low_level.hash_secret_raw",
+                side_effect=RuntimeError("KDF indisponible"),
+            ),
         ):
             with self.assertRaises(RuntimeError):
                 derive_kek_from_master_key(_MASTER_KEY, _SALT_A)
-        self.assertEqual(len(captured), 1)
-        self.assertEqual(bytes(captured[0]), b"\x00" * len(captured[0]))
+        self.assertEqual(bytes(secret), b"\x00" * len(secret))
+
+    def test_zeroize_buffer_clears_bytearray(self) -> None:
+        """`_zeroize_buffer` remet bien à zéro un tampon effaçable."""
+        buffer = bytearray(b"cle-derivee" * 4)
+        _zeroize_buffer(buffer)
+        self.assertEqual(bytes(buffer), b"\x00" * len(buffer))
+
+    def test_zeroize_buffer_never_touches_immutable_bytes(self) -> None:
+        """`_zeroize_buffer` refuse les `bytes` : aucun objet immuable altéré.
+
+        Revue LOW : muter un `bytes` via `ctypes` serait indéfini sur un objet
+        partagé/interné ; la fonction n'accepte donc que des `bytearray` et
+        laisse les `bytes` intacts (y compris un objet de contenu égal).
+        """
+        first = b"meme-entropie" * 8
+        second = b"meme-entropie" * 8  # contenu égal, objet distinct
+        with self.assertRaises(TypeError):
+            _zeroize_buffer(first)  # type: ignore[arg-type]
+        self.assertEqual(first, second)
+        self.assertEqual(second, b"meme-entropie" * 8)
 
 
 if __name__ == "__main__":

@@ -43,7 +43,6 @@ pas rendre illisibles les blobs existants ; les deux modes sont exclusifs.
 """
 
 import base64
-import ctypes
 import hashlib
 import hmac
 import os
@@ -222,23 +221,18 @@ def decode_kek_salt(salt: str | bytes) -> bytes:
     return decoded
 
 
-def _zeroize_buffer(buffer: bytes | bytearray) -> None:
-    """Efface best-effort un tampon d'octets dérivé (revue LOW #262).
+def _zeroize_buffer(buffer: bytearray) -> None:
+    """Remet à zéro best-effort un tampon ``bytearray`` de dérivation (revue LOW).
 
-    Python ne garantit ni l'effacement des ``str`` immuables ni celui des copies
-    internes d'Argon2 ; ce nettoyage couvre uniquement les buffers que ce module
-    crée lui-même (buffer normalisé et copie transmise à la KDF). Il réduit la
-    fenêtre d'exposition sans prétendre effacer la clé maîtresse d'origine ni
-    ``os.environ``. ``ctypes`` est utilisé car ``bytes`` est immuable ; l'appel
-    reste local à des objets fraîchement alloués, jamais partagés.
+    Seuls les ``bytearray`` passent par ici : un ``bytes`` est immuable en
+    Python et le muter via ``ctypes`` serait un comportement indéfini sur un
+    objet potentiellement partagé ou interné (corruption d'une autre référence,
+    crash ou no-op selon la plateforme) — cette mutation n'est donc **jamais**
+    faite. Ce nettoyage réduit la fenêtre d'exposition des copies que ce module
+    crée lui-même ; il ne prétend ni effacer la clé maîtresse d'origine (``str``,
+    ``os.environ``) ni les copies internes de ``argon2-cffi``.
     """
-    if isinstance(buffer, bytearray):
-        buffer[:] = b"\x00" * len(buffer)
-        return
-    try:
-        ctypes.memset(ctypes.c_char_p(buffer), 0, len(buffer))
-    except (TypeError, ValueError):  # pragma: no cover - plateformes exotiques
-        return
+    buffer[:] = b"\x00" * len(buffer)
 
 
 def _normalize_master_key(master_key: str | bytes) -> bytearray:
@@ -295,15 +289,19 @@ def derive_kek_from_master_key(master_key: str | bytes, salt: str | bytes) -> by
     DOIT être appelée une seule fois au démarrage, puis la KEK retournée est
     conservée en mémoire (``VaultCipher``), jamais recalculée par requête.
 
-    Les octets normalisés et leur copie transmise à Argon2 sont effacés
-    best-effort dans un ``finally``, y compris si la KDF échoue (revue LOW).
+    Les octets normalisés sont effacés best-effort dans un ``finally``, y
+    compris si la KDF échoue (revue LOW). La copie transmise à
+    ``argon2-cffi`` doit être un ``bytes`` (API de la librairie) : elle est
+    créée au dernier moment, pour la durée de l'appel seulement, et n'est pas
+    mutée (voir ``_zeroize_buffer``).
     """
     secret = _normalize_master_key(master_key)
-    salt_bytes = decode_kek_salt(salt)
-    payload = bytes(secret)
     try:
+        salt_bytes = decode_kek_salt(salt)
         return argon2.low_level.hash_secret_raw(
-            secret=payload,
+            # Copie immuable transitoire exigée par `argon2-cffi` (ffi.new) :
+            # le `bytearray` effaçable reste la seule forme durable du secret.
+            secret=bytes(secret),
             salt=salt_bytes,
             time_cost=ARGON2ID_TIME_COST,
             memory_cost=ARGON2ID_MEMORY_COST_KIB,
@@ -313,7 +311,6 @@ def derive_kek_from_master_key(master_key: str | bytes, salt: str | bytes) -> by
         )
     finally:
         _zeroize_buffer(secret)
-        _zeroize_buffer(payload)
 
 
 def decode_encoded_key(encoded: str | bytes) -> bytes:
@@ -427,6 +424,21 @@ class VaultCipher:
         de vie du processus.
         """
         return cls(derive_kek_from_master_key(master_key, salt))
+
+    def key_reuses_pepper(self, pepper: str) -> bool:
+        """Détecte si la KEK de ce chiffreur réutilise l'entropie du pepper.
+
+        Compare la KEK brute, sa représentation base64 URL-safe et la décodée
+        (invariant 5), sans jamais exposer ni la KEK ni ``pepper``. Sert au
+        chemin ``secret_store`` explicite de ``create_app`` : c'est la clé
+        **réellement portée par le chiffreur du store** qui est vérifiée, pas
+        la dérivation que ``settings`` produirait — les deux peuvent diverger
+        (revue LOW).
+        """
+        encoded = base64.urlsafe_b64encode(self._key).decode("ascii")
+        return kek_matches_pepper(encoded, pepper) or constant_time_equal(
+            self._key, pepper.encode("utf-8")
+        )
 
     @staticmethod
     def aad(project: str, env: str, name: str) -> bytes:

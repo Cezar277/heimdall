@@ -99,7 +99,6 @@ from heimdall.vault import auth as vault_auth
 from heimdall.vault.crypto import (
     MIN_MASTER_KEY_BYTES,
     VaultCipher,
-    _zeroize_buffer,
     constant_time_equal,
     decode_kek_salt,
     derive_kek_from_master_key,
@@ -338,31 +337,32 @@ def _resolve_vault_cipher(
     return VaultCipher.generate()
 
 
-def _validate_explicit_secret_store_configuration(settings: "VaultSettings") -> None:
-    """Refuse ``KEK dérivée == pepper`` sur le chemin ``secret_store`` explicite.
+def _validate_explicit_secret_store_configuration(
+    settings: "VaultSettings",
+    secret_store: "InMemorySecretStore | SqliteSecretStore",
+) -> None:
+    """Refuse la réutilisation du pepper par la KEK **réelle** du store explicite.
 
-    Avec un store explicite, ``_resolve_vault_cipher`` n'est pas appelé et la
-    KEK dérivée n'est jamais construite par l'application. Un appelant peut
-    toutefois fournir un store dont le chiffreur a été construit avec cette même
-    KEK et un pepper identique (invariant 5) : la collision est refusée ici, lors
-    du démarrage, au prix d'une dérivation Argon2id unique. Le chemin reste
-    réservé aux tests ; la production HTTP passe toujours par
+    Avec un store explicite, ``_resolve_vault_cipher`` n'est pas appelé : la KEK
+    qui chiffre réellement les secrets est celle portée par le chiffreur du
+    store, pas celle que ``settings`` dériverait (les deux peuvent diverger —
+    revue LOW). Ce contrôle compare donc la KEK du store au pepper (brut +
+    base64), une fois au démarrage, **sans dérivation supplémentaire**. Le
+    chemin reste réservé aux tests ; la production HTTP passe toujours par
     ``_resolve_vault_cipher``. Les contrôles bon marché restent dans
     ``VaultSettings`` (paire maître/sel, ``master_key != pepper``).
     """
-    if (
-        settings.master_key is None
-        or settings.kek_salt is None
-        or settings.api_key_pepper is None
-    ):
+    if settings.api_key_pepper is None:
         return
-    derived_kek = derive_kek_from_master_key(settings.master_key, settings.kek_salt)
-    try:
-        _reject_kek_equal_to_pepper(derived_kek, settings.api_key_pepper)
-    finally:
-        # Cette KEK n'est utilisée par aucun chiffreur sur ce chemin : on
-        # l'efface best-effort au lieu de la laisser dans la mémoire du processus.
-        _zeroize_buffer(derived_kek)
+    # Attribut du même paquet `heimdall.vault` : c'est la clé réellement
+    # utilisée pour chiffrer, jamais la dérivation des settings (inutilisée
+    # sur ce chemin).
+    cipher = secret_store._cipher
+    if cipher.key_reuses_pepper(settings.api_key_pepper):
+        raise ValueError(
+            "La KEK du store et le pepper d'authentification doivent être "
+            "distincts (invariant 5)."
+        )
 
 
 # Motifs d'identifiants du contrat (#15) : `project` vient du module
@@ -1542,7 +1542,7 @@ def _configure_secret_store(
             "(HEIMDALL_ENV=production/prod) : utiliser SqliteSecretStore "
             "avec une KEK persistante."
         )
-    _validate_explicit_secret_store_configuration(settings)
+    _validate_explicit_secret_store_configuration(settings, secret_store)
     app.state.secret_store = secret_store
     if isinstance(secret_store, SqliteSecretStore):
         # Aligner l'authentification sur la même base que le store explicite.
@@ -1567,10 +1567,9 @@ def create_app(
     - `secret_store` : Magasin de secrets explicite (défaut : résolu par
       `settings.storage_backend` — SQLite chiffré en production, mémoire chiffré
       hors production). **Réservé aux tests** : la production passe toujours par
-      `_resolve_vault_cipher`. Par défense en profondeur (invariant 5), une
-      collision « KEK dérivée == pepper » (brut + base64) est refusée même sur
-      ce chemin, au prix d'une dérivation Argon2id unique au démarrage lorsque
-      le couple maître/sel et le pepper sont fournis. Ne jamais appeler
+      `_resolve_vault_cipher`. Par défense en profondeur (invariant 5), la KEK
+      du chiffreur du store explicite est comparée au pepper (brut + base64)
+      une fois au démarrage, sans dérivation supplémentaire. Ne jamais appeler
       `create_app` avec un store explicite en production.
     - `api_key_hashes` : Dictionnaire {hash_hmac_hex: project_id} de clés pré-hachées.
       Chaque clé DOIT être une chaîne hexadécimale de 64 caractères (^[0-9a-f]{64}$).
