@@ -44,10 +44,12 @@ from heimdall.vault.crypto import (
     MIN_MASTER_KEY_BYTES,
     VaultCipher,
     _zeroize_buffer,
+    decode_encoded_key,
     decode_kek_salt,
     derive_kek_from_master_key,
     generate_encryption_key,
     generate_kek_salt,
+    kek_matches_pepper,
 )
 from heimdall.vault.store import InMemorySecretStore
 
@@ -316,6 +318,24 @@ class VaultSettingsMasterKeyTests(unittest.TestCase):
                 _resolve_vault_cipher(settings, "memory")
         self.assertIn("distincts", str(ctx.exception))
 
+    def test_derived_kek_equal_to_standard_base64_pepper_is_rejected(self) -> None:
+        """Même entropie sous l'alphabet base64 standard : refusée (revue MEDIUM)."""
+        derived_kek = b"\xff" * 32
+        pepper = base64.b64encode(derived_kek).decode("ascii")
+        self.assertIn("/", pepper)  # alphabet standard, absent de l'URL-safe
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=pepper,
+        )
+        with patch(
+            "heimdall.vault.app.derive_kek_from_master_key",
+            return_value=derived_kek,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_vault_cipher(settings, "memory")
+        self.assertIn("distincts", str(ctx.exception))
+
     def test_settings_reject_master_key_equal_to_pepper(self) -> None:
         """La validation refuse maître == pepper avant tout store injecté."""
         shared_secret = "shared_master_key_and_pepper_" + "Q" * 8
@@ -494,6 +514,24 @@ class T262ReviewHygieneTests(unittest.TestCase):
         legacy = VaultSettings(kek=kek, api_key_pepper=_PEPPER)
         self.assertNotIn(kek, repr(legacy))
 
+    def test_kek_matches_pepper_detects_standard_base64_alphabet(self) -> None:
+        """Un pepper en base64 standard révèle la même entropie que la KEK.
+
+        Revue MEDIUM : ``b64standard`` (``+/``) et ``b64url`` (``-_``) encodent
+        la même KEK ; la comparaison doit décoder le pepper, pas seulement la KEK.
+        """
+        raw = b"\xff" * 32
+        urlsafe_kek = base64.urlsafe_b64encode(raw).decode("ascii")
+        standard_pepper = base64.b64encode(raw).decode("ascii")
+        self.assertIn("/", standard_pepper)
+        self.assertNotEqual(urlsafe_kek, standard_pepper)
+        self.assertEqual(
+            decode_encoded_key(standard_pepper), decode_encoded_key(urlsafe_kek)
+        )
+        self.assertTrue(kek_matches_pepper(urlsafe_kek, standard_pepper))
+        unrelated = base64.b64encode(b"Z" * 32).decode("ascii")
+        self.assertFalse(kek_matches_pepper(urlsafe_kek, unrelated))
+
 
 class T262UnicodeAndFailClosedTests(unittest.TestCase):
     """Normalisation Unicode de la clé maîtresse et échec KDF fail-closed (revue LOW)."""
@@ -555,6 +593,45 @@ class ExplicitSecretStoreInvariantTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             create_app(settings, secret_store=store)
         self.assertIn("distincts", str(ctx.exception))
+
+    def test_explicit_store_rejects_standard_base64_pepper(self) -> None:
+        """La variante base64 standard est refusée aussi sur le store explicite.
+
+        Revue MEDIUM : le pepper ``b64standard`` (``+/``) révèle la même
+        entropie que la KEK ``b64url`` (``-_``) du chiffreur.
+        """
+        raw = b"\xff" * 32
+        pepper = base64.b64encode(raw).decode("ascii")
+        self.assertIn("/", pepper)
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=pepper,
+        )
+        store = InMemorySecretStore(
+            cipher=VaultCipher.from_encoded_key(
+                base64.urlsafe_b64encode(raw).decode("ascii")
+            )
+        )
+        with self.assertRaises(ValueError) as ctx:
+            create_app(settings, secret_store=store)
+        self.assertIn("distincts", str(ctx.exception))
+
+    def test_explicit_store_without_cipher_fails_closed(self) -> None:
+        """Un store sans chiffreur lève un ``ValueError`` générique, pas un traceback.
+
+        Revue LOW : l'accès à ``_cipher`` passe par ``getattr`` pour rester
+        fail-closed même avec un mock ou un futur store sans attribut.
+        """
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=_PEPPER,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            create_app(settings, secret_store=object())  # type: ignore[arg-type]
+        self.assertIn("Store explicite invalide", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, AttributeError)
 
     def test_explicit_store_still_starts_with_distinct_kek(self) -> None:
         """Pas de faux positif : un chiffreur distinct du pepper démarre normalement."""
@@ -658,7 +735,8 @@ class SettingsSerializationHygieneTests(unittest.TestCase):
 
         Revue LOW : la mitigation « ne jamais sérialiser `app.state.settings` »
         est désormais structurelle (`Field(exclude=True)`) — même un appelant qui
-        sérialiserait les settings n'en obtiendrait aucun secret.
+        sérialiserait les settings n'en obtiendrait aucun secret. Le sel public
+        est également exclu par défense en profondeur.
         """
         with_master = VaultSettings(
             master_key=_MASTER_KEY,
@@ -672,8 +750,9 @@ class SettingsSerializationHygieneTests(unittest.TestCase):
             serialized = settings.model_dump_json()
             self.assertNotIn("master_key", dumped)
             self.assertNotIn("kek", dumped)
+            self.assertNotIn("kek_salt", dumped)
             self.assertNotIn("api_key_pepper", dumped)
-            for secret in (_MASTER_KEY, legacy_kek, _PEPPER):
+            for secret in (_MASTER_KEY, _SALT_A, legacy_kek, _PEPPER):
                 self.assertNotIn(secret, dumped.values())
                 self.assertNotIn(secret, serialized)
 
@@ -697,8 +776,9 @@ class SettingsSerializationHygieneTests(unittest.TestCase):
         rendered = repr(state_settings)
         self.assertNotIn("master_key", dumped)
         self.assertNotIn("kek", dumped)
+        self.assertNotIn("kek_salt", dumped)
         self.assertNotIn("api_key_pepper", dumped)
-        for secret in (_MASTER_KEY, _PEPPER):
+        for secret in (_MASTER_KEY, _SALT_A, _PEPPER):
             self.assertNotIn(secret, dumped.values())
             self.assertNotIn(secret, serialized)
             self.assertNotIn(secret, rendered)

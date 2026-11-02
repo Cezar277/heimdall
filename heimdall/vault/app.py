@@ -265,9 +265,11 @@ def _resolve_storage_backend(settings: "VaultSettings") -> Literal["memory", "sq
 def _reject_kek_equal_to_pepper(derived_kek: bytes, pepper: str) -> None:
     """Refuse une KEK qui réutilise l'entropie du pepper (invariant 5).
 
-    Couvre la KEK brute **et** sa représentation base64 URL-safe : deux
-    encodages de la même entropie ne doivent jamais servir au chiffrement et à
-    l'authentification. Le message reste générique (aucun écho de secret).
+    Couvre la KEK brute **et** ses représentations base64 URL-safe et standard :
+    deux encodages de la même entropie ne doivent jamais servir au chiffrement
+    et à l'authentification, même si un outil opérateur a produit l'autre
+    alphabet (``+/`` au lieu de ``-_``). Le message reste générique (aucun écho
+    de secret).
     """
     pepper_bytes = pepper.encode("utf-8")
     derived_b64 = base64.urlsafe_b64encode(derived_kek).decode("ascii")
@@ -354,10 +356,14 @@ def _validate_explicit_secret_store_configuration(
     """
     if settings.api_key_pepper is None:
         return
-    # Attribut du même paquet `heimdall.vault` : c'est la clé réellement
-    # utilisée pour chiffrer, jamais la dérivation des settings (inutilisée
-    # sur ce chemin).
-    cipher = secret_store._cipher
+    cipher = getattr(secret_store, "_cipher", None)
+    if not isinstance(cipher, VaultCipher):
+        # Fail-closed générique : un store ou mock sans chiffreur ne doit pas
+        # produire un AttributeError technique (revue LOW).
+        raise ValueError(
+            "Store explicite invalide : un chiffreur VaultCipher est requis "
+            "pour vérifier l'invariant 5."
+        )
     if cipher.key_reuses_pepper(settings.api_key_pepper):
         raise ValueError(
             "La KEK du store et le pepper d'authentification doivent être "
@@ -634,7 +640,7 @@ class VaultSettings(BaseSettings):
     )
     kek_salt: str | None = Field(
         default=None,
-        repr=False,
+        repr=False, exclude=True,  # public mais jamais sérialisé par défense
         description=(
             "Sel public Argon2id de 16 octets encodé base64 URL-safe (ticket #262), "
             "persisté à côté de HEIMDALL_VAULT_MASTER_KEY et stable entre les "
