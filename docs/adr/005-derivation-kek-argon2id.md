@@ -104,23 +104,37 @@ recherche des octets de la KEK et de son hexadécimal dans le fichier de base).
 
 La clé maîtresse n'est **pas effacée** après la dérivation : `VaultSettings`
 et `os.environ` la conservent pendant toute la vie du processus, tandis que
-`VaultCipher` ne garde que la KEK dérivée. Aucun log, `repr` ou `model_dump`
-des settings n'est émis, et `hide_input_in_errors` empêche pydantic de la
-refléter dans un `ValidationError`.
+`VaultCipher` ne garde que la KEK dérivée. Aucun log ni `repr` des settings
+n'est émis (`repr=False`), `hide_input_in_errors` empêche pydantic de la
+réfléter dans un `ValidationError`, et la sérialisation est **structurellement**
+sûre : `master_key`, `kek` et `api_key_pepper` portent `Field(exclude=True)`,
+donc `model_dump()` et `model_dump_json()` ne peuvent jamais les contenir (test
+`test_model_dump_never_contains_master_key_kek_or_pepper`). L'interdiction de
+sérialiser ou journaliser `app.state.settings` reste en vigueur.
 
-En revanche, le tampon normalisé est un `bytearray` **effaçable**, remis à zéro
-dans un `finally` (`_zeroize_buffer`) après la KDF, y compris si elle échoue
-(tests `test_derivation_zeroizes_normalized_buffer_after_success` et
-`test_derivation_zeroizes_buffer_on_kdf_failure`). La copie transmise à
-`argon2-cffi` doit être un `bytes` (API de la librairie) : elle est créée au
-dernier moment et **n'est jamais mutée** — muter un `bytes` via `ctypes` serait
-un comportement indéfini sur un objet potentiellement partagé, cette mutation
-est donc exclue. Sur le chemin `secret_store` explicite, la KEK comparée au
-pepper est celle **réellement portée par le chiffreur du store**
-(`VaultCipher.key_reuses_pepper`), sans dérivation supplémentaire. Python ne
-garantit pas une zeroization fiable des chaînes immuables ni des copies
-internes d'Argon2 : cette limite reste assumée et documentée, pas revendiquée
-comme une protection supplémentaire.
+Ce qui **est** effacé : le tampon normalisé est un `bytearray` **effaçable**,
+remis à zéro dans un `finally` (`_zeroize_buffer`) après la KDF, y compris si
+elle échoue (tests `test_derivation_zeroizes_normalized_buffer_after_success`
+et `test_derivation_zeroizes_buffer_on_kdf_failure`). Sur le chemin
+`secret_store` explicite, la KEK comparée au pepper est celle **réellement
+portée par le chiffreur du store** (`VaultCipher.key_reuses_pepper`), sans
+dérivation supplémentaire.
+
+**Risque résiduel accepté** (revue, statu quo — non effaçable en Python) :
+quatre copies survivent au processus et ne sont pas remises à zéro :
+
+1. la copie `bytes` transitoire exigée par `argon2-cffi` (API de la
+   librairie), créée au dernier moment et limitée à la durée de l'appel — la
+   muter via `ctypes` serait un comportement indéfini sur un objet
+   potentiellement partagé, cette mutation est donc exclue ;
+2. les copies internes de la librairie Argon2 (matrice de calcul de la KDF) ;
+3. `settings.master_key` (`str` immuable) ;
+4. l'entrée `HEIMDALL_VAULT_MASTER_KEY` de `os.environ`.
+
+Impact : exposition locale à un dump mémoire du processus seulement — aucune
+fuite ni journal réseau. Ces éléments ne sont pas présentés comme une
+protection supplémentaire : une zeroization complète de la mémoire n'est pas
+garantie par Python et n'est pas revendiquée.
 
 ### 6. Forme canonique NFC de la clé maîtresse
 
@@ -175,7 +189,7 @@ utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
   `derive_kek_from_master_key`, `VaultCipher.from_master_key`),
   `heimdall/vault/app.py` (`VaultSettings.master_key`, `VaultSettings.kek_salt`,
   `_resolve_vault_cipher`).
-- Tests : `tests/test_vault_kek_derivation.py` (39 tests), dont le critère
+- Tests : `tests/test_vault_kek_derivation.py` (40 tests), dont le critère
   « Fait quand » (`test_same_master_key_and_same_salt_derive_the_same_kek`),
   l'égalité NFC/NFD (`test_nfc_and_nfd_master_keys_derive_the_same_kek`), le
   verrou « KDF en panne ⇒ démarrage refusé »
@@ -183,5 +197,7 @@ utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
   réelle du store explicite (`test_explicit_store_rejects_cipher_key_equal_to_pepper`,
   `test_explicit_store_path_performs_no_kdf`) et l'effacement best-effort sans
   mutation d'`bytes` (`test_derivation_zeroizes_normalized_buffer_after_success`,
-  `test_zeroize_buffer_never_touches_immutable_bytes`).
+  `test_zeroize_buffer_never_touches_immutable_bytes`), et l'exclusion des
+  secrets de toute sérialisation des settings
+  (`test_model_dump_never_contains_master_key_kek_or_pepper`).
 - Fiche SAMM : [`docs/t262-samm.md`](../t262-samm.md).
