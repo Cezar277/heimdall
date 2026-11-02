@@ -6,25 +6,26 @@ enveloppe »`, branche `69-t262-kek-dérivée-avec-argon2id`, tickets voisins
 (chasse aux fuites de clés). Cette fiche fournit les couples module + ligne et
 les permaliens du code testé ; elle ne prétend pas modifier une feuille externe.
 
-Révision du code testé : `ce3586f`
-(`fix(vault): effacer best-effort le buffer de dérivation Argon2id (#262)`),
+Révision du code testé : `b71f1f3`
+(`fix(vault): vérifier la KEK réelle du store explicite et effacer sans muter des bytes (#262)`),
 au-dessus du merge de `main` (`987a59a`, PR #168). Cette révision intègre les
 remarques de revue LOW des cinq passes : comparaison du pepper à la KEK dérivée
 base64, validation `master_key == pepper` dès `VaultSettings`, contrôle
 maître/pepper avant la KDF, `repr=False` sur `kek_salt`, alignement du chemin
 `bytes` de la clé maîtresse sur le refus des espaces de bord, canonisation NFC
 de la clé maîtresse (ADR-005 §6), verrou « KDF en panne ⇒ démarrage refusé »
-(fail-closed), contrôle « KEK dérivée == pepper » étendu au chemin
-`secret_store` explicite (une dérivation au démarrage), effacement best-effort
-des buffers de dérivation (succès et échec KDF), durée de vie de la clé
-maîtresse documentée et tests de non-écho étendus. Le fichier d'aide racine
+(fail-closed), contrôle de la KEK **réelle** du chiffreur sur le chemin
+`secret_store` explicite (sans dérivation, via `VaultCipher.key_reuses_pepper`),
+effacement best-effort du seul tampon effaçable sans mutation d'`bytes`
+(succès et échec KDF), durée de vie de la clé maîtresse documentée et tests de
+non-écho étendus. Le fichier d'aide racine
 (`PR_T262.md`) est retiré du livrable ; la fiche SAMM et l'ADR-005 restent les
 artefacts de preuve.
 
 Les permaliens épinglent la révision du code, pas le commit de documentation qui
 archive cette fiche. Le code T262 référencé est inchangé jusqu'à la livraison :
 contrôle effectué avec
-`git diff ce3586f HEAD -- heimdall/vault/crypto.py heimdall/vault/app.py tests/test_vault_kek_derivation.py`
+`git diff b71f1f3 HEAD -- heimdall/vault/crypto.py heimdall/vault/app.py tests/test_vault_kek_derivation.py`
 (sortie vide) ; les commits suivants ne modifient que la documentation.
 
 > **Périmètre du sous-ticket.** Cette livraison dérive la KEK de chiffrement à
@@ -37,16 +38,16 @@ contrôle effectué avec
 
 | Exigence vérifiée | Implémentation (module + ligne) | Test et preuve permanente | Résultat local |
 |---|---|---|---|
-| **Dérivation depuis la clé maîtresse avec `argon2-cffi`** | [heimdall/vault/crypto.py:285–316](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/crypto.py#L285-L316) (`derive_kek_from_master_key` appelle `argon2.low_level.hash_secret_raw`), [heimdall/vault/crypto.py:66–78](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/crypto.py#L66-L78) (paramètres et borne 128 bits), [heimdall/vault/crypto.py:421–429](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/crypto.py#L421-L429) (`VaultCipher.from_master_key`) | [tests/test_vault_kek_derivation.py:66–86](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L66-L86) (déterminisme + interopérabilité de deux chiffreurs) | Réussi |
-| **Type Argon2id réellement utilisé** | [heimdall/vault/crypto.py:305–312](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/crypto.py#L305-L312) (`type=argon2.low_level.Type.ID`) | [tests/test_vault_kek_derivation.py:100–124](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L100-L124) (`mock` sur `hash_secret_raw` : `Type.ID`, `time_cost=3`, `memory_cost=65 536`, `parallelism=4`, `hash_len=32`) | Réussi |
-| **Paramètres au moins OWASP, documentés dans un ADR** | [docs/adr/005-derivation-kek-argon2id.md](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/docs/adr/005-derivation-kek-argon2id.md) (table 64 Mio / 3 / 4 vs minimums 19 Mio / 2 / 1, justification Argon2id vs HKDF), [heimdall/vault/crypto.py:66–75](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/crypto.py#L66-L75) (constantes de format) | [tests/test_vault_kek_derivation.py:107–112](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L107-L112) (valeurs exactes + planchers OWASP) | Réussi |
-| **Sel stocké à côté, public et stable** | [heimdall/vault/crypto.py:184–221](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/crypto.py#L184-L221) (`generate_kek_salt` 16 octets, `decode_kek_salt` base64 strict), [heimdall/vault/app.py:635–644](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/app.py#L635-L644) (`HEIMDALL_VAULT_KEK_SALT`, persisté avec la clé maîtresse), [README.md:67–75](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/README.md#L67-L75) (procédure d'exploitation) | [tests/test_vault_kek_derivation.py:126–137](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L126-L137) (génération via `secrets.token_bytes`, 16 octets, 64 sels distincts), [tests/test_vault_kek_derivation.py:140–158](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L140-L158) (sels invalides refusés) | Réussi |
-| **Paire maître/sel obligatoire et modes exclusifs** | [heimdall/vault/app.py:788–849](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/app.py#L788-L849) (`validate_master_key`, `validate_kek_salt`, `validate_master_key_configuration`) | [tests/test_vault_kek_derivation.py:201–270](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L201-L270) (moitié de paire, KEK + maître, clé trop courte/espaces/non UTF-8, sel invalide) et `test_bytes_master_key_with_surrounding_whitespace_is_rejected` (chemin `bytes` aligné sur le chemin `str`), `test_nfc_and_nfd_master_keys_derive_the_same_kek` et `test_settings_master_key_is_stored_nfc_canonical` (formes NFC/NFD identiques) | Réussi |
-| **Dérivation une seule fois au démarrage, KEK en mémoire** | [heimdall/vault/app.py:284–338](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/app.py#L284-L338) (`_resolve_vault_cipher` construit `VaultCipher` une fois), [heimdall/vault/crypto.py:394–400](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/crypto.py#L394-L400) (KEK gardée dans l'objet) | [tests/test_vault_kek_derivation.py:380–396](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L380-L396) (1 appel à `create_app`, 1 après une requête HTTP), [tests/test_vault_kek_derivation.py:398–434](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L398-L434) (KEK absente du fichier SQLite) | Réussi |
-| **Fait quand : même clé maîtresse + même sel ⇒ même KEK** | [heimdall/vault/crypto.py:285–316](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/crypto.py#L285-L316) (fonction déterministe) | [tests/test_vault_kek_derivation.py:66–75](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L66-L75) (deux appels égaux, 32 octets, différents de la clé et du sel) ; redémarrage réel [tests/test_vault_kek_derivation.py:398–434](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L398-L434) | Réussi |
-| **Aucune régression : mode historique conservé** | [heimdall/vault/app.py:611–623](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/app.py#L611-L623) (`HEIMDALL_VAULT_KEK` directe), [heimdall/vault/app.py:308–309](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/app.py#L308-L309) (priorité au mode direct) | [tests/test_vault_kek_derivation.py:355–363](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L355-L363) (chiffrement/déchiffrement en mode historique), suite Vault existante inchangée | Réussi |
-| **Un sel différent ne permet pas de relire les secrets** | [heimdall/vault/crypto.py:285–316](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/crypto.py#L285-L316) (le sel entre dans Argon2id) | [tests/test_vault_kek_derivation.py:436–469](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L436-L469) (redémarrage avec un autre sel ⇒ 500 générique, aucune fuite de valeur) | Réussi |
-| **Invariant 5 : KEK, clé maîtresse et pepper distincts** | [heimdall/vault/app.py:852–880](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/app.py#L852-L880) (validation de la clé maîtresse et de la KEK historique) et [heimdall/vault/app.py:317–329](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/app.py#L317-L329) (KEK dérivée brute et base64 comparées au pepper, y compris sur le chemin `secret_store` explicite via [heimdall/vault/app.py:341–365](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/heimdall/vault/app.py#L341-L365)) | [tests/test_vault_kek_derivation.py:286–353](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L286-L353) (KEK dérivée = pepper brute et base64 refusées, clé maîtresse = pepper refusée dès la validation puis avant la KDF en défense en profondeur, sel absent refusé) | Réussi |
+| **Dérivation depuis la clé maîtresse avec `argon2-cffi`** | [heimdall/vault/crypto.py:279–313](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L279-L313) (`derive_kek_from_master_key` appelle `argon2.low_level.hash_secret_raw`), [heimdall/vault/crypto.py:65–77](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L65-L77) (paramètres et borne 128 bits), [heimdall/vault/crypto.py:419–426](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L419-L426) (`VaultCipher.from_master_key`) | [tests/test_vault_kek_derivation.py:67–87](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L67-L87) (déterminisme + interopérabilité de deux chiffreurs) | Réussi |
+| **Type Argon2id réellement utilisé** | [heimdall/vault/crypto.py:301–311](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L301-L311) (`type=argon2.low_level.Type.ID`) | [tests/test_vault_kek_derivation.py:101–125](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L101-L125) (`mock` sur `hash_secret_raw` : `Type.ID`, `time_cost=3`, `memory_cost=65 536`, `parallelism=4`, `hash_len=32`) | Réussi |
+| **Paramètres au moins OWASP, documentés dans un ADR** | [docs/adr/005-derivation-kek-argon2id.md](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/docs/adr/005-derivation-kek-argon2id.md) (table 64 Mio / 3 / 4 vs minimums 19 Mio / 2 / 1, justification Argon2id vs HKDF), [heimdall/vault/crypto.py:65–74](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L65-L74) (constantes de format) | [tests/test_vault_kek_derivation.py:108–113](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L108-L113) (valeurs exactes + planchers OWASP) | Réussi |
+| **Sel stocké à côté, public et stable** | [heimdall/vault/crypto.py:183–221](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L183-L221) (`generate_kek_salt` 16 octets, `decode_kek_salt` base64 strict), [heimdall/vault/app.py:635–644](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/app.py#L635-L644) (`HEIMDALL_VAULT_KEK_SALT`, persisté avec la clé maîtresse), [README.md:67–75](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/README.md#L67-L75) (procédure d'exploitation) | [tests/test_vault_kek_derivation.py:127–138](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L127-L138) (génération via `secrets.token_bytes`, 16 octets, 64 sels distincts), [tests/test_vault_kek_derivation.py:141–159](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L141-L159) (sels invalides refusés) | Réussi |
+| **Paire maître/sel obligatoire et modes exclusifs** | [heimdall/vault/app.py:788–849](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/app.py#L788-L849) (`validate_master_key`, `validate_kek_salt`, `validate_master_key_configuration`) | [tests/test_vault_kek_derivation.py:202–271](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L202-L271) (moitié de paire, KEK + maître, clé trop courte/espaces/non UTF-8, sel invalide) et `test_bytes_master_key_with_surrounding_whitespace_is_rejected` (chemin `bytes` aligné sur le chemin `str`), `test_nfc_and_nfd_master_keys_derive_the_same_kek` et `test_settings_master_key_is_stored_nfc_canonical` (formes NFC/NFD identiques) | Réussi |
+| **Dérivation une seule fois au démarrage, KEK en mémoire** | [heimdall/vault/app.py:283–337](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/app.py#L283-L337) (`_resolve_vault_cipher` construit `VaultCipher` une fois), [heimdall/vault/crypto.py:391–400](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L391-L400) (KEK gardée dans l'objet) | [tests/test_vault_kek_derivation.py:381–397](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L381-L397) (1 appel à `create_app`, 1 après une requête HTTP), [tests/test_vault_kek_derivation.py:399–435](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L399-L435) (KEK absente du fichier SQLite) | Réussi |
+| **Fait quand : même clé maîtresse + même sel ⇒ même KEK** | [heimdall/vault/crypto.py:279–313](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L279-L313) (fonction déterministe) | [tests/test_vault_kek_derivation.py:67–76](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L67-L76) (deux appels égaux, 32 octets, différents de la clé et du sel) ; redémarrage réel [tests/test_vault_kek_derivation.py:399–435](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L399-L435) | Réussi |
+| **Aucune régression : mode historique conservé** | [heimdall/vault/app.py:611–623](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/app.py#L611-L623) (`HEIMDALL_VAULT_KEK` directe), [heimdall/vault/app.py:307–308](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/app.py#L307-L308) (priorité au mode direct) | [tests/test_vault_kek_derivation.py:356–364](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L356-L364) (chiffrement/déchiffrement en mode historique), suite Vault existante inchangée | Réussi |
+| **Un sel différent ne permet pas de relire les secrets** | [heimdall/vault/crypto.py:279–313](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L279-L313) (le sel entre dans Argon2id) | [tests/test_vault_kek_derivation.py:437–470](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L437-L470) (redémarrage avec un autre sel ⇒ 500 générique, aucune fuite de valeur) | Réussi |
+| **Invariant 5 : KEK, clé maîtresse et pepper distincts** | [heimdall/vault/app.py:852–880](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/app.py#L852-L880) (validation de la clé maîtresse et de la KEK historique) et [heimdall/vault/app.py:316–328](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/app.py#L316-L328) (KEK dérivée brute et base64 comparées au pepper ; sur le chemin `secret_store` explicite, la KEK réelle du chiffreur via [heimdall/vault/crypto.py:428–441](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L428-L441) `VaultCipher.key_reuses_pepper`, appelé depuis [heimdall/vault/app.py:340–365](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/app.py#L340-L365)) | [tests/test_vault_kek_derivation.py:287–354](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L287-L354) (KEK dérivée = pepper brute et base64 refusées, clé maîtresse = pepper refusée dès la validation puis avant la KDF en défense en profondeur, sel absent refusé, contrôle du store explicite (`test_explicit_store_rejects_cipher_key_equal_to_pepper` et `test_explicit_store_path_performs_no_kdf`)) | Réussi |
 
 ## 2. Checklist du ticket
 
@@ -64,7 +65,7 @@ Sortie locale de la suite dédiée :
 
 ```sh
 .venv/bin/python -m pytest tests/test_vault_kek_derivation.py -v
-# 36 passed
+# 39 passed
 ```
 
 Démonstration hors pytest : deux dérivations du même couple donnent la même
@@ -94,13 +95,13 @@ autre sel   : True
 
 | Menace / exigence | Traitement | Preuve |
 |---|---|---|
-| **Spoofing / Information disclosure** — vol de la base seule | La KEK n'est jamais écrite dans SQLite ; sans elle, les ciphertexts AES-256-GCM restent opaques | `heimdall/vault/app.py:284–338`, test `test_sqlite_secret_survives_a_restart_with_the_same_master_key_and_salt` (recherche des octets de la KEK dans le fichier) |
-| **Information disclosure** — attaque hors ligne par force brute sur une phrase de passe | Argon2id mémoire-dur (64 Mio), 3 itérations, 4 lanes ; sel public unique de 16 octets | `heimdall/vault/crypto.py:66–75` et `:301–316`, ADR-005, test `test_argon2id_parameters_are_owasp_or_better_and_actually_used` |
+| **Spoofing / Information disclosure** — vol de la base seule | La KEK n'est jamais écrite dans SQLite ; sans elle, les ciphertexts AES-256-GCM restent opaques | `heimdall/vault/app.py:283–337`, test `test_sqlite_secret_survives_a_restart_with_the_same_master_key_and_salt` (recherche des octets de la KEK dans le fichier) |
+| **Information disclosure** — attaque hors ligne par force brute sur une phrase de passe | Argon2id mémoire-dur (64 Mio), 3 itérations, 4 lanes ; sel public unique de 16 octets | `heimdall/vault/crypto.py:65–74` et `:301–311`, ADR-005, test `test_argon2id_parameters_are_owasp_or_better_and_actually_used` |
 | **Tampering** — altération de la configuration pour changer la KEK | Paire maître/sel obligatoire, sel validé (base64 strict, 16 octets), modes exclusifs, échec au démarrage | `heimdall/vault/app.py:788–849`, tests `test_settings_require_master_key_and_salt_together` et `test_settings_reject_legacy_kek_and_master_key_together` |
-| **Repudiation / diagnostic** — fuite de secret dans les erreurs | Messages génériques, aucun écho de la clé maîtresse, du sel ou de la KEK ; `hide_input_in_errors` supprime l'`input_value` de pydantic ; `repr` de `VaultSettings` masque la clé maîtresse et le sel | `heimdall/vault/app.py:556–565` et `:782–874`, `tests/test_vault_kek_derivation.py:233–259` et `test_settings_repr_hides_master_key_salt_and_pepper` (aucune clé, sel ou pepper dans `repr`) |
-| **Elevation of privilege** — réutilisation d'une même clé pour chiffrement et authentification | KEK dérivée (brute et base64) et clé maîtresse comparées au pepper en temps constant, refus si collision ; clé maîtresse contrôlée dès la validation et avant la KDF lors de la défense en profondeur | `heimdall/vault/app.py:852–880` et `:298–320`, tests `test_derived_kek_equal_to_pepper_is_rejected`, `test_derived_kek_equal_to_pepper_in_base64_is_rejected`, `test_settings_reject_master_key_equal_to_pepper` et `test_resolver_rejects_master_key_equal_to_pepper_before_kdf`, `test_explicit_store_rejects_derived_kek_equal_to_pepper` et `test_explicit_store_still_starts_with_distinct_kek` |
-| **Denial of service** — dérivation répétée par requête | Dérivation unique à `create_app`, KEK conservée dans `VaultCipher` | `heimdall/vault/app.py:284–338`, test `test_derivation_happens_once_at_startup_not_per_request` |
-| Fail-closed (DoD) | Toute configuration incomplète ou ambiguë lève une erreur au démarrage, jamais un repli silencieux ; une panne de la KDF (`MemoryError`) traverse `create_app` sans repli éphémère ni mode historique | `tests/test_vault_kek_derivation.py` (36 tests), suite Vault existante, `test_kdf_failure_is_fail_closed_at_startup` |
+| **Repudiation / diagnostic** — fuite de secret dans les erreurs | Messages génériques, aucun écho de la clé maîtresse, du sel ou de la KEK ; `hide_input_in_errors` supprime l'`input_value` de pydantic ; `repr` de `VaultSettings` masque la clé maîtresse et le sel | `heimdall/vault/app.py:556–565` et `:782–874`, `tests/test_vault_kek_derivation.py:234–260` et `test_settings_repr_hides_master_key_salt_and_pepper` (aucune clé, sel ou pepper dans `repr`) |
+| **Elevation of privilege** — réutilisation d'une même clé pour chiffrement et authentification | KEK dérivée (brute et base64) et clé maîtresse comparées au pepper en temps constant, refus si collision ; clé maîtresse contrôlée dès la validation et avant la KDF lors de la défense en profondeur | `heimdall/vault/app.py:852–880` et `:316–328`, tests `test_derived_kek_equal_to_pepper_is_rejected`, `test_derived_kek_equal_to_pepper_in_base64_is_rejected`, `test_settings_reject_master_key_equal_to_pepper` et `test_resolver_rejects_master_key_equal_to_pepper_before_kdf`, `test_explicit_store_rejects_cipher_key_equal_to_pepper`, `test_explicit_store_path_performs_no_kdf` et `test_explicit_store_still_starts_with_distinct_kek` |
+| **Denial of service** — dérivation répétée par requête | Dérivation unique à `create_app`, KEK conservée dans `VaultCipher` | `heimdall/vault/app.py:283–337`, test `test_derivation_happens_once_at_startup_not_per_request` |
+| Fail-closed (DoD) | Toute configuration incomplète ou ambiguë lève une erreur au démarrage, jamais un repli silencieux ; une panne de la KDF (`MemoryError`) traverse `create_app` sans repli éphémère ni mode historique | `tests/test_vault_kek_derivation.py` (39 tests), suite Vault existante, `test_kdf_failure_is_fail_closed_at_startup` |
 | Confinement crypto (#17) | `argon2` et `cryptography` restent importés uniquement par `heimdall/vault/crypto.py` | `tests/test_crypto_confinement.py` (garde AST, inchangé) |
 | Non-régression | Mode historique `HEIMDALL_VAULT_KEK` accepté et testé ; les tests Vault/AES-GCM existants passent sans modification | suite complète (§5), `test_legacy_kek_mode_still_works` |
 
@@ -112,10 +113,10 @@ couverture `pytest-cov` est mesurée par la CI).
 
 ```sh
 python -m pytest tests/test_vault_kek_derivation.py
-# 36 passed
+# 39 passed
 
 python -m pytest
-# 2247 passed, 16 skipped, 4512 subtests passed
+# 2250 passed, 16 skipped, 4512 subtests passed
 
 ruff check heimdall tests
 # All checks passed!
@@ -143,19 +144,30 @@ sont requis avant fusion.
   donc accepté pour ne pas rendre les blobs existants illisibles.
 - **Chemin `secret_store` explicite de `create_app`** : réservé aux tests (la
   production HTTP passe toujours par `_resolve_vault_cipher`). Par défense en
-  profondeur, le contrôle « KEK dérivée == pepper » (brut + base64) y est
-  désormais exécuté aussi, via `_validate_explicit_secret_store_configuration` :
-  une dérivation Argon2id unique au démarrage (~90 ms), uniquement si le couple
-  maître/sel et le pepper sont fournis. Risque résiduel clos ; à réexaminer
-  seulement si le pentest demande une mise en cache de la dérivation.
+  profondeur (invariant 5), la KEK **réellement portée** par le chiffreur du
+  store est comparée au pepper (brut + base64) via
+  [heimdall/vault/crypto.py:428–441](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L428-L441)
+  (`VaultCipher.key_reuses_pepper`), appelé depuis
+  [heimdall/vault/app.py:340–365](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/app.py#L340-L365) : une fois
+  au démarrage et **sans dérivation supplémentaire** — le contrôle ne porte plus
+  sur les `settings`, qui peuvent diverger du store réel. Tests :
+  `test_explicit_store_rejects_cipher_key_equal_to_pepper`,
+  `test_explicit_store_path_performs_no_kdf` et
+  `test_explicit_store_still_starts_with_distinct_kek`.
 - **Zeroization mémoire** : Python ne garantit pas l'effacement fiable des
   chaînes ; la KEK dérivée reste en mémoire pour la durée du processus et n'est
-  jamais persistée. Les copies d'octets créées par la dérivation — buffer
-  normalisé (`bytearray`) et copie transmise à Argon2 — sont effacées
-  best-effort dans un `finally` (`_zeroize_buffer`), y compris quand la KDF
-  échoue : [tests/test_vault_kek_derivation.py:570–587](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L570-L587) et
-  [tests/test_vault_kek_derivation.py:589–606](https://github.com/Cezar277/heimdall/blob/ce3586fea5d9a2995a337104448255d5b81424db/tests/test_vault_kek_derivation.py#L589-L606). La clé maîtresse
-  reste dans `VaultSettings`/`os.environ` (chaînes immuables, aucun log ni
+  jamais persistée. Le tampon normalisé est un `bytearray` effaçable, remis à
+  zéro dans un `finally` ([heimdall/vault/crypto.py:224–235](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/heimdall/vault/crypto.py#L224-L235), `_zeroize_buffer`) après la KDF, y compris
+  si elle échoue. La copie transmise à `argon2-cffi` doit être un `bytes` (API de
+  la librairie) : elle est créée au dernier moment et **n'est jamais mutée** —
+  muter un `bytes` via `ctypes` serait un comportement indéfini sur un objet
+  potentiellement partagé, cette mutation est donc exclue. Tests :
+  [tests/test_vault_kek_derivation.py:589–650](https://github.com/Cezar277/heimdall/blob/b71f1f37527515be55bef0d5ac0d9aa73c2dfea4/tests/test_vault_kek_derivation.py#L589-L650)
+  (`test_derivation_zeroizes_normalized_buffer_after_success`,
+  `test_derivation_zeroizes_buffer_on_kdf_failure`,
+  `test_zeroize_buffer_clears_bytearray`,
+  `test_zeroize_buffer_never_touches_immutable_bytes`). La clé maîtresse reste
+  dans `VaultSettings`/`os.environ` (chaînes immuables, aucun log ni
   `model_dump`, `hide_input_in_errors`), limite assumée et documentée dans
   l'ADR-005 §5 ; l'interdiction de sérialiser/journaliser `app.state.settings`
   est maintenue.

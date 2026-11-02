@@ -108,17 +108,19 @@ et `os.environ` la conservent pendant toute la vie du processus, tandis que
 des settings n'est émis, et `hide_input_in_errors` empêche pydantic de la
 refléter dans un `ValidationError`.
 
-En revanche, les copies d'octets que la dérivation crée elle-même sont
-effacées **best-effort** dans un `finally` (`_zeroize_buffer`) : le buffer
-normalisé (`bytearray`) et la copie transmise à Argon2 sont remis à zéro après
-la KDF, y compris si elle échoue (tests
-`test_argon2_secret_buffer_is_zeroized_after_derivation` et
-`test_argon2_secret_buffer_is_zeroized_on_kdf_failure`). Sur le chemin
-`secret_store` explicite, la KEK dérivée uniquement pour le contrôle
-d'invariant est également effacée après vérification. Python ne garantit pas
-une zeroization fiable des chaînes immuables ni des copies internes d'Argon2 :
-cette limite reste assumée et documentée, pas revendiquée comme une protection
-supplémentaire.
+En revanche, le tampon normalisé est un `bytearray` **effaçable**, remis à zéro
+dans un `finally` (`_zeroize_buffer`) après la KDF, y compris si elle échoue
+(tests `test_derivation_zeroizes_normalized_buffer_after_success` et
+`test_derivation_zeroizes_buffer_on_kdf_failure`). La copie transmise à
+`argon2-cffi` doit être un `bytes` (API de la librairie) : elle est créée au
+dernier moment et **n'est jamais mutée** — muter un `bytes` via `ctypes` serait
+un comportement indéfini sur un objet potentiellement partagé, cette mutation
+est donc exclue. Sur le chemin `secret_store` explicite, la KEK comparée au
+pepper est celle **réellement portée par le chiffreur du store**
+(`VaultCipher.key_reuses_pepper`), sans dérivation supplémentaire. Python ne
+garantit pas une zeroization fiable des chaînes immuables ni des copies
+internes d'Argon2 : cette limite reste assumée et documentée, pas revendiquée
+comme une protection supplémentaire.
 
 ### 6. Forme canonique NFC de la clé maîtresse
 
@@ -173,12 +175,13 @@ utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
   `derive_kek_from_master_key`, `VaultCipher.from_master_key`),
   `heimdall/vault/app.py` (`VaultSettings.master_key`, `VaultSettings.kek_salt`,
   `_resolve_vault_cipher`).
-- Tests : `tests/test_vault_kek_derivation.py` (36 tests), dont le critère
+- Tests : `tests/test_vault_kek_derivation.py` (39 tests), dont le critère
   « Fait quand » (`test_same_master_key_and_same_salt_derive_the_same_kek`),
   l'égalité NFC/NFD (`test_nfc_and_nfd_master_keys_derive_the_same_kek`), le
   verrou « KDF en panne ⇒ démarrage refusé »
-  (`test_kdf_failure_is_fail_closed_at_startup`), l'invariant 5 sur le store
-  explicite (`test_explicit_store_rejects_derived_kek_equal_to_pepper`) et
-  l'effacement best-effort du buffer de dérivation
-  (`test_argon2_secret_buffer_is_zeroized_after_derivation`).
+  (`test_kdf_failure_is_fail_closed_at_startup`), l'invariant 5 sur la KEK
+  réelle du store explicite (`test_explicit_store_rejects_cipher_key_equal_to_pepper`,
+  `test_explicit_store_path_performs_no_kdf`) et l'effacement best-effort sans
+  mutation d'`bytes` (`test_derivation_zeroizes_normalized_buffer_after_success`,
+  `test_zeroize_buffer_never_touches_immutable_bytes`).
 - Fiche SAMM : [`docs/t262-samm.md`](../t262-samm.md).
