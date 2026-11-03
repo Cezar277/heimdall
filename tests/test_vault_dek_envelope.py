@@ -423,6 +423,34 @@ class EnvelopeUpdateTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(SecretStoreError):
                     await store.get("demo", "dev", "API_TOKEN")
 
+    async def test_swapped_blobs_in_sqlite_are_rejected(self) -> None:
+        """Un swap valeur ↔ enveloppe directement en base est refusé au déchiffrement."""
+        cipher = VaultCipher(_KEK)
+        with tempfile.TemporaryDirectory(prefix="heimdall-t263-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            store = SqliteSecretStore(db_path, cipher)
+            await store.create("demo", "dev", "API_TOKEN", _PLAINTEXT)
+            with db_session(db_path) as conn:
+                conn.execute(
+                    "UPDATE secrets SET encrypted_value = encrypted_dek, "
+                    "encrypted_dek = encrypted_value "
+                    "WHERE project_id = ? AND env = ? AND name = ?",
+                    ("demo", "dev", "API_TOKEN"),
+                )
+                row = conn.execute(
+                    "SELECT encrypted_value, encrypted_dek FROM secrets "
+                    "WHERE project_id = ? AND env = ? AND name = ?",
+                    ("demo", "dev", "API_TOKEN"),
+                ).fetchone()
+            with self.assertRaises(VaultCipherError):
+                cipher.decrypt_envelope(
+                    row["encrypted_value"],
+                    row["encrypted_dek"],
+                    aad=_aad(),
+                )
+            with self.assertRaises(SecretStoreError):
+                await store.get("demo", "dev", "API_TOKEN")
+
 
 if __name__ == "__main__":
     unittest.main()
