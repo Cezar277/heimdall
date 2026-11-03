@@ -1087,7 +1087,7 @@ def create_secret(  # noqa: PLR0913
     name: str,
     encrypted_value: str,
     *,
-    encrypted_dek: str = "",
+    encrypted_dek: str | None = None,
     status: SecretStatus = "vaulte",
     fingerprint: str = "",
     created_at: str | None = None,
@@ -1096,13 +1096,19 @@ def create_secret(  # noqa: PLR0913
     """Crée un secret chiffré dans la base de données.
 
     `encrypted_dek` est la DEK du secret chiffrée par la KEK (ticket #70).
-    Une valeur vide correspond à une ligne héritée (#25/#62) chiffrée
-    directement par la KEK ; les nouvelles lignes du store la renseignent
-    toujours. Le paramètre `status` est typé `Literal["vaulte", "rote"]` pour
-    une validation applicative avant toute requête SQL, en complément du CHECK
-    SQLite. Lève sqlite3.IntegrityError si la contrainte d'unicité
-    (project_id, env, name) ou la clé étrangère est enfreinte.
+    `None` (défaut) correspond à une ligne héritée (#25/#62) chiffrée
+    directement par la KEK : la colonne SQLite vaut alors NULL, jamais la
+    chaîne vide. Les nouvelles lignes du store la renseignent toujours. Le
+    paramètre `status` est typé `Literal["vaulte", "rote"]` pour une validation
+    applicative avant toute requête SQL, en complément du CHECK SQLite. Lève
+    sqlite3.IntegrityError si la contrainte d'unicité (project_id, env, name)
+    ou la clé étrangère est enfreinte.
     """
+    if encrypted_dek == "":
+        # Une seule représentation du « sans enveloppe » : NULL. Une chaîne
+        # vide explicite est tolérée pour les appelants historiques, mais elle
+        # ne doit jamais être persistée telle quelle.
+        encrypted_dek = None
     if status not in _ALLOWED_STATUSES:
         logger.debug("Statut de secret invalide rejeté applicativement.")
         raise ValueError("Statut de secret invalide.")
@@ -1232,17 +1238,21 @@ def update_secret(  # noqa: PLR0913
     """Met à jour la valeur chiffrée, l'enveloppe de DEK, l'empreinte et le statut.
 
     `encrypted_dek=None` conserve l'enveloppe existante (mise à jour partielle) ;
-    fournir une valeur permet à la rotation de KEK (#71) de réenvelopper la DEK.
-    Le paramètre `status` est typé `Literal["vaulte", "rote"]` pour une validation
-    applicative avant toute requête SQL.
+    une chaîne vide est refusée car elle effacerait l'enveloppe et rendrait le
+    secret illisible ; fournir une valeur permet à la rotation de KEK (#71) de
+    réenvelopper la DEK. Le paramètre `status` est typé
+    `Literal["vaulte", "rote"]` pour une validation applicative avant toute
+    requête SQL.
     """
+    if encrypted_dek == "":
+        raise ValueError("Enveloppe de DEK invalide.")
     if status not in _ALLOWED_STATUSES:
         logger.debug("Statut de secret invalide rejeté applicativement.")
         raise ValueError("Statut de secret invalide.")
     up_ts = updated_at or get_iso_timestamp()
     query = (
         "UPDATE secrets SET "
-        "encrypted_value = ?, encrypted_dek = COALESCE(?, encrypted_dek), "
+        "encrypted_value = ?, encrypted_dek = COALESCE(NULLIF(?, ''), encrypted_dek), "
         "fingerprint = ?, status = ?, updated_at = ? "
         "WHERE project_id = ? AND env = ? AND name = ?"
     )

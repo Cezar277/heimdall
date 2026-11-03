@@ -13,7 +13,13 @@ Ce que cette suite prouve (checklist du ticket) :
 4. **aucune valeur en clair** n'apparaît dans le fichier SQLite brut, et la
    DEK elle-même n'y apparaît pas en clair (elle est enveloppée) ;
 5. un blob de valeur ou de DEK déplacé vers un autre secret échoue (AAD) ;
-6. les lignes héritées (#25/#62, sans ``encrypted_dek``) restent lisibles.
+6. les lignes héritées (#25/#62, sans ``encrypted_dek``) restent lisibles ;
+7. le réenveloppement via ``update_secret`` reste lisible et une chaîne vide
+   ne peut pas effacer une enveloppe existante ;
+8. le défaut de ``create_secret`` est ``NULL`` (jamais ``""``) et les
+   métadonnées/listes n'exposent ni valeur ni enveloppe ;
+9. le swap valeur ↔ enveloppe est refusé et un ``ValueError`` du chemin
+   enveloppe devient une ``SecretStoreError`` générique.
 
 Faux secrets : valeurs synthétiques explicites, jamais de secret réel.
 """
@@ -23,6 +29,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from heimdall.vault.crypto import (
     SecretEnvelope,
@@ -35,9 +42,16 @@ from heimdall.vault.database import (
     create_project,
     create_secret,
     db_session,
+    get_secret_metadata,
     init_db,
+    list_secrets,
+    update_secret,
 )
-from heimdall.vault.store import InMemorySecretStore, SqliteSecretStore
+from heimdall.vault.store import (
+    InMemorySecretStore,
+    SecretStoreError,
+    SqliteSecretStore,
+)
 
 _KEK = b"K" * 32  # KEK synthétique de 32 octets (AES-256)
 _PLAINTEXT = "t263-synthetic-secret-value"
@@ -243,6 +257,171 @@ class SchemaMigrationTests(unittest.TestCase):
                     for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
                 }
             self.assertIn("encrypted_dek", columns)
+
+
+class EnvelopeDatabaseContractTests(unittest.TestCase):
+    """Contrat DB : NULL legacy, métadonnées sans blobs, swap de blobs refusé."""
+
+    def test_create_secret_defaults_to_null_envelope(self) -> None:
+        """Le défaut est NULL, jamais une chaîne vide (une seule représentation)."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-t263-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                create_project(conn, "demo")
+                created = create_secret(
+                    conn,
+                    "demo",
+                    "dev",
+                    "LEGACY_TOKEN",
+                    "legacy-blob",
+                )
+                self.assertIsNone(created["encrypted_dek"])
+                row = conn.execute(
+                    "SELECT encrypted_dek FROM secrets "
+                    "WHERE project_id = ? AND env = ? AND name = ?",
+                    ("demo", "dev", "LEGACY_TOKEN"),
+                ).fetchone()
+                self.assertIsNone(row["encrypted_dek"])
+
+                # Une chaîne vide explicite est normalisée en NULL, pas stockée.
+                create_secret(
+                    conn,
+                    "demo",
+                    "dev",
+                    "EMPTY_TOKEN",
+                    "legacy-blob",
+                    encrypted_dek="",
+                )
+                row = conn.execute(
+                    "SELECT encrypted_dek FROM secrets "
+                    "WHERE project_id = ? AND env = ? AND name = ?",
+                    ("demo", "dev", "EMPTY_TOKEN"),
+                ).fetchone()
+                self.assertIsNone(row["encrypted_dek"])
+
+    def test_metadata_and_list_do_not_expose_envelope(self) -> None:
+        """Les métadonnées et listes ne divulguent ni valeur ni enveloppe de DEK."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-t263-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                create_project(conn, "demo")
+                create_secret(
+                    conn,
+                    "demo",
+                    "dev",
+                    "API_TOKEN",
+                    "encrypted-value",
+                    encrypted_dek="wrapped-dek",
+                )
+                meta = get_secret_metadata(conn, "demo", "dev", "API_TOKEN")
+                self.assertIsNotNone(meta)
+                assert meta is not None
+                self.assertNotIn("encrypted_value", meta)
+                self.assertNotIn("encrypted_dek", meta)
+
+                listed = list_secrets(conn, "demo", env="dev")
+                self.assertEqual(len(listed), 1)
+                self.assertNotIn("encrypted_value", listed[0])
+                self.assertNotIn("encrypted_dek", listed[0])
+
+    def test_swapping_value_and_wrapped_dek_fails_authentication(self) -> None:
+        """Un swap valeur ↔ enveloppe de DEK échoue à l'authentification GCM."""
+        cipher = VaultCipher(_KEK)
+        aad = _aad()
+        envelope = cipher.encrypt_envelope(_PLAINTEXT.encode("utf-8"), aad=aad)
+        with self.assertRaises(VaultCipherError):
+            cipher.decrypt_envelope(
+                envelope.encrypted_dek,
+                envelope.encrypted_value,
+                aad=aad,
+            )
+
+
+class EnvelopeUpdateTests(unittest.IsolatedAsyncioTestCase):
+    """Réenveloppement, garde anti-effacement et mapping d'erreur du store."""
+
+    async def test_update_secret_rewraps_dek_and_remains_readable(self) -> None:
+        """La branche non-NULL de COALESCE réenveloppe la DEK et reste lisible."""
+        cipher = VaultCipher(_KEK)
+        with tempfile.TemporaryDirectory(prefix="heimdall-t263-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            store = SqliteSecretStore(db_path, cipher)
+            await store.create("demo", "dev", "API_TOKEN", _PLAINTEXT)
+            aad = _aad()
+            replacement = cipher.encrypt_envelope(_PLAINTEXT.encode("utf-8"), aad=aad)
+            with db_session(db_path) as conn:
+                self.assertTrue(
+                    update_secret(
+                        conn,
+                        "demo",
+                        "dev",
+                        "API_TOKEN",
+                        replacement.encrypted_value,
+                        encrypted_dek=replacement.encrypted_dek,
+                    )
+                )
+                row = conn.execute(
+                    "SELECT encrypted_value, encrypted_dek FROM secrets "
+                    "WHERE project_id = ? AND env = ? AND name = ?",
+                    ("demo", "dev", "API_TOKEN"),
+                ).fetchone()
+            self.assertEqual(row["encrypted_value"], replacement.encrypted_value)
+            self.assertEqual(row["encrypted_dek"], replacement.encrypted_dek)
+            record = await store.get("demo", "dev", "API_TOKEN")
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record["value"], _PLAINTEXT)
+
+    async def test_update_secret_rejects_empty_dek_without_wiping_envelope(self) -> None:
+        """Une chaîne vide est refusée et ne détruit pas l'enveloppe existante."""
+        cipher = VaultCipher(_KEK)
+        with tempfile.TemporaryDirectory(prefix="heimdall-t263-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            store = SqliteSecretStore(db_path, cipher)
+            await store.create("demo", "dev", "API_TOKEN", _PLAINTEXT)
+            with db_session(db_path) as conn:
+                before = conn.execute(
+                    "SELECT encrypted_dek FROM secrets "
+                    "WHERE project_id = ? AND env = ? AND name = ?",
+                    ("demo", "dev", "API_TOKEN"),
+                ).fetchone()
+                with self.assertRaises(ValueError):
+                    update_secret(
+                        conn,
+                        "demo",
+                        "dev",
+                        "API_TOKEN",
+                        "replacement-value",
+                        encrypted_dek="",
+                    )
+                after = conn.execute(
+                    "SELECT encrypted_value, encrypted_dek FROM secrets "
+                    "WHERE project_id = ? AND env = ? AND name = ?",
+                    ("demo", "dev", "API_TOKEN"),
+                ).fetchone()
+            self.assertEqual(after["encrypted_dek"], before["encrypted_dek"])
+            self.assertNotEqual(after["encrypted_value"], "replacement-value")
+            record = await store.get("demo", "dev", "API_TOKEN")
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record["value"], _PLAINTEXT)
+
+    async def test_value_error_from_envelope_is_mapped_to_store_error(self) -> None:
+        """Un ValueError du chemin enveloppe devient une SecretStoreError générique."""
+        cipher = VaultCipher(_KEK)
+        with tempfile.TemporaryDirectory(prefix="heimdall-t263-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            store = SqliteSecretStore(db_path, cipher)
+            await store.create("demo", "dev", "API_TOKEN", _PLAINTEXT)
+            with patch.object(
+                cipher,
+                "decrypt_envelope",
+                side_effect=ValueError("synthetic"),
+            ):
+                with self.assertRaises(SecretStoreError):
+                    await store.get("demo", "dev", "API_TOKEN")
 
 
 if __name__ == "__main__":

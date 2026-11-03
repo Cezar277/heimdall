@@ -81,7 +81,10 @@ def _decrypt_record(
             # étaient chiffrées directement par la KEK, sans colonne de DEK.
             plaintext = cipher.decrypt(str(record["encrypted_value"]), aad=aad)
         value = plaintext.decode("utf-8")
-    except (VaultCipherError, UnicodeDecodeError, KeyError):
+    except (VaultCipherError, ValueError, UnicodeDecodeError, KeyError):
+        # ``VaultCipherError`` est un ``ValueError`` ; les deux sont listés
+        # explicitement pour que le contrat reste lisible si la hiérarchie
+        # évolue. Aucun message d'erreur ne contient de secret.
         raise SecretStoreError("Donnée chiffrée illisible.") from None
     return {
         "project": str(record.get("project", record.get("project_id", project))),

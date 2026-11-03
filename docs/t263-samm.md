@@ -44,7 +44,7 @@ La suite complète du sous-ticket :
 
 ```sh
 .venv/bin/python -m pytest tests/test_vault_dek_envelope.py -q
-# 9 passed
+# 15 passed
 ```
 
 ## 4. STRIDE et invariants
@@ -66,7 +66,7 @@ Environnement : Linux, Python 3.14.7, venv local.
 
 ```sh
 .venv/bin/python -m pytest tests/test_vault_dek_envelope.py -q
-# 9 passed
+# 15 passed
 .venv/bin/python -m pytest tests/test_vault_crypto.py tests/test_vault_db.py \
   tests/test_vault_app.py tests/test_vault_dek_envelope.py -q
 # 100 % des tests Vault concernés
@@ -91,3 +91,21 @@ Environnement : Linux, Python 3.14.7, venv local.
   AES-GCM ; cette fiche ajoute uniquement la liaison d'identité de l'enveloppe.
 - **Aucun secret réel** : les tests utilisent des canaris synthétiques et une
   KEK `b"K" * 32`.
+
+## 7. Corrections de revue (LOW)
+
+Les trois remarques LOW de la revue de code sont fermées et pinnées par des
+tests dans `tests/test_vault_dek_envelope.py` :
+
+| Remarque | Correctif | Test de non-régression |
+|---|---|---|
+| `update_secret` : une chaîne vide pouvait écraser l'enveloppe | Garde applicative `ValueError` sur `encrypted_dek == ""` + SQL défensif `COALESCE(NULLIF(?, ''), encrypted_dek)` ; `None` conserve l'enveloppe | `EnvelopeUpdateTests.test_update_secret_rejects_empty_dek_without_wiping_envelope` |
+| `create_secret` : défaut `""` incohérent avec la colonne nullable | Défaut `None` ; une chaîne vide explicite est normalisée en `NULL`, jamais persistée | `EnvelopeDatabaseContractTests.test_create_secret_defaults_to_null_envelope` |
+| `_decrypt_record` : `ValueError` non mappée | `ValueError` ajoutée au `except` ; toute corruption du chemin enveloppe reste une `SecretStoreError` générique | `EnvelopeUpdateTests.test_value_error_from_envelope_is_mapped_to_store_error` |
+
+Compléments de couverture ajoutés : réenveloppement non-`NULL` via
+`update_secret` puis relecture par le store
+(`test_update_secret_rewraps_dek_and_remains_readable`), absence de
+`encrypted_value`/`encrypted_dek` dans `get_secret_metadata` et `list_secrets`
+(`test_metadata_and_list_do_not_expose_envelope`), et refus du swap
+`encrypted_value ↔ encrypted_dek` (`test_swapping_value_and_wrapped_dek_fails_authentication`).
