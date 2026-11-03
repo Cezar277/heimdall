@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -139,4 +140,69 @@ test('le préprocessing optimizationLevel 2 reste borné par défaut', () => {
     { optimizationLevel: 2 },
   );
   assert.ok(combined.set.length <= 1000, `globParts=${combined.set.length}`);
+});
+
+test('le shim n\'expose que des helpers bornés (allowlist explicite)', () => {
+  const upstream = require('minimatch-v11');
+
+  // Tout export du shim doit être connu : un `Object.assign` du namespace
+  // amont ferait fuiter un futur helper construisant un Minimatch interne
+  // sans passer par `withDefaults` (donc sans la borne `braceExpandMax`).
+  const allowed = new Set([
+    'minimatch',
+    'Minimatch',
+    'filter',
+    'match',
+    'braceExpand',
+    'defaults',
+    'sep',
+    'GLOBSTAR',
+    'escape',
+    'unescape',
+    'default',
+  ]);
+  for (const key of Object.keys(minimatch)) {
+    assert.ok(allowed.has(key), `export non borné exposé par le shim : ${key}`);
+  }
+
+  // `defaults(def)` renvoie une fonction `minimatch` pré-configurée : la borne
+  // doit survivre à ce chemin, et rester surchargeable explicitement.
+  const bounded = minimatch.defaults({});
+  assert.equal(typeof bounded, 'function');
+  assert.equal(bounded('a', '{a,b}'), true);
+  assert.ok(bounded.braceExpand('{a,b,c,d,e,f,g,h,i,j}'.repeat(10)).length <= 1000);
+
+  const raised = minimatch.defaults({ braceExpandMax: 50 });
+  assert.ok(raised.braceExpand('{a,b,c,d,e,f,g,h,i,j}'.repeat(10)).length <= 50);
+
+  // L'amont, lui, reste à 100 000 : c'est bien le shim qui borne.
+  assert.ok(
+    upstream
+      .braceExpand('{a,b,c,d,e,f,g,h,i,j}'.repeat(10))
+      .length > 1000,
+  );
+});
+
+test('le contenu du shim vendor/ est figé (dépendance `file:` sans hash)', () => {
+  // `npm ci` ne peut pas vérifier l'intégrité d'une dépendance `file:` : ce
+  // test est le hash registre. Il casse volontairement à chaque modification
+  // du shim — mettre à jour les digests dans le même commit que la revue.
+  const expected = {
+    'vendor/minimatch-cjs/index.js':
+      'b81fca8a7f042db2d51fc8aed2b0c07469530311da409a69e642412685583738',
+    'vendor/minimatch-cjs/package.json':
+      '855f40fe431ea1b95db09c4fafce2b4619ddcc317646ab566891249fdcc4c185',
+  };
+
+  for (const [relative, digest] of Object.entries(expected)) {
+    const actual = crypto
+      .createHash('sha256')
+      .update(fs.readFileSync(path.join(ROOT, relative)))
+      .digest('hex');
+    assert.equal(
+      actual,
+      digest,
+      `${relative} a changé : revue explicite requise, puis mettre à jour le sha256 dans tests/js/minimatch-shim.test.js`,
+    );
+  }
 });
