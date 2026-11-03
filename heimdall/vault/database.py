@@ -53,10 +53,11 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
-from heimdall.vault.crypto import VaultCipher, VaultCipherError
+if TYPE_CHECKING:
+    from heimdall.vault.crypto import VaultCipher
 
 logger = logging.getLogger(__name__)
 
@@ -1366,8 +1367,8 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
 
 def rotate_secrets_kek(
     conn: sqlite3.Connection,
-    old_cipher: VaultCipher,
-    new_cipher: VaultCipher,
+    old_cipher: "VaultCipher",
+    new_cipher: "VaultCipher",
     *,
     target_kek_version: int | None = None,
 ) -> int:
@@ -1382,6 +1383,8 @@ def rotate_secrets_kek(
     - Les DEK déchiffrées en mémoire sont effacées (zeroization) dès leur réenveloppement.
     - Échoue fail-closed si un secret hérité (#25/#62) sans enveloppe de DEK est rencontré.
     """
+    from heimdall.vault.crypto import VaultCipher, VaultCipherError
+
     if old_cipher.has_same_key_as(new_cipher):
         raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
     if target_kek_version is not None and target_kek_version < 1:
