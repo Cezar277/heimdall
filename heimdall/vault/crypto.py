@@ -29,6 +29,15 @@ parties ensemble (``nonce || ciphertext || tag``) et l'AAD est l'identifiant du
 secret : un blob copié sur un autre secret échoue à l'authentification. Deux
 chiffrements du même texte donnent donc deux blobs différents — c'est la preuve
 archivée dans ``tests/test_vault_crypto.py``.
+
+CHIFFREMENT PAR ENVELOPPE (ticket #70, sous-ticket T26.3 de #26) : chaque secret
+reçoit sa propre **DEK** aléatoire de 32 octets. La valeur est chiffrée avec
+cette DEK, puis la DEK est chiffrée (« enveloppée ») avec la **KEK**. Les deux
+blobs sont stockés dans la ligne du secret. La KEK ne chiffre donc que des
+clés : si une DEK fuit, un seul secret est exposé. L'AAD de la valeur reste
+l'identité ``(project, env, name)`` ; celui de l'enveloppe de DEK ajoute un
+label de domaine dédié, pour qu'un blob de DEK ne puisse pas être rejoué comme
+une valeur ni déplacé vers un autre secret.
 """
 
 import base64
@@ -36,6 +45,7 @@ import hashlib
 import hmac
 import os
 import secrets
+from typing import NamedTuple
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -49,6 +59,15 @@ _TAG_SIZE_BYTES: int = 16  # étiquette d'authentification GCM, en fin de cipher
 # résistance hors ligne si les empreintes stockées et le pepper fuient.
 _MIN_PEPPER_BYTES: int = 32
 
+# Une DEK fait 256 bits, comme la KEK : l'AES-256-GCM exige une clé de 32 octets.
+_DEK_SIZE_BYTES: int = 32
+
+# Label de domaine stable de l'enveloppe de DEK (ticket #70). L'AAD de la DEK
+# n'est jamais celui de la valeur : un blob de DEK ne peut pas être rejoué comme
+# un ciphertext de valeur, et inversement. Changer ce label rend les enveloppes
+# existantes illisibles ; c'est un format de stockage, pas un secret.
+_DEK_WRAP_AAD_PREFIX: bytes = b"heimdall-vault-dek-wrap-v1\x00"
+
 # Label de domaine stable de la sous-clé d'empreinte (invariant 5 : la KEK de
 # chiffrement n'est jamais réutilisée directement comme clé HMAC). Changer ce
 # label rompt la vérification d'empreintes existantes ; c'est un dérivé
@@ -58,6 +77,31 @@ _FINGERPRINT_HKDF_INFO: bytes = b"heimdall-vault-fingerprint-v1"
 
 class VaultCipherError(ValueError):
     """Erreur de chiffrement/déchiffrement sans détail sensible."""
+
+
+class SecretEnvelope(NamedTuple):
+    """Les deux blobs d'un secret chiffré par enveloppe (ticket #70).
+
+    - ``encrypted_value`` : valeur chiffrée avec la DEK du secret ;
+    - ``encrypted_dek`` : DEK chiffrée avec la KEK du serveur.
+
+    Les deux champs sont des jetons base64 URL-safe autonomes
+    (``nonce || ciphertext || tag``) et sont liés par AAD à l'identité du
+    secret. Aucun des deux ne contient la valeur en clair.
+    """
+
+    encrypted_value: str
+    encrypted_dek: str
+
+
+def generate_dek() -> bytes:
+    """Génère une DEK de 32 octets (256 bits) avec le CSPRNG du système.
+
+    Chaque secret reçoit sa propre DEK (ticket #70). Elle n'est jamais dérivée
+    de l'identifiant, d'un compteur ou de la KEK : deux secrets partagent donc
+    des DEK indépendantes, et la fuite d'une DEK ne compromet qu'un secret.
+    """
+    return secrets.token_bytes(_DEK_SIZE_BYTES)
 
 
 def generate_api_key() -> str:
@@ -203,6 +247,45 @@ def _new_nonce() -> bytes:
     return os.urandom(_NONCE_SIZE_BYTES)
 
 
+def _decode_token(token: str) -> bytes:
+    """Décode un jeton base64 URL-safe en ``nonce || ciphertext || tag``.
+
+    Toute anomalie (type, chaîne vide, alphabet, longueur minimale) devient une
+    ``VaultCipherError`` générique : aucun oracle n'est offert à l'appelant.
+    """
+    if not isinstance(token, str) or not token:
+        raise VaultCipherError("Donnée chiffrée invalide.")
+    try:
+        raw = base64.b64decode(
+            token.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+    except Exception:
+        raise VaultCipherError("Donnée chiffrée invalide.") from None
+    if len(raw) < _NONCE_SIZE_BYTES + _TAG_SIZE_BYTES:
+        raise VaultCipherError("Donnée chiffrée invalide.")
+    return raw
+
+
+def _encrypt_token(aead: AESGCM, plaintext: bytes, aad: bytes) -> str:
+    """Chiffre avec un AEAD déjà construit et encode ``nonce || ciphertext || tag``."""
+    nonce = _new_nonce()
+    ciphertext = aead.encrypt(nonce, plaintext, aad)
+    return base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+
+
+def _decrypt_token(aead: AESGCM, token: str, aad: bytes) -> bytes:
+    """Déchiffre un jeton et traduit ``InvalidTag`` en ``VaultCipherError`` générique."""
+    raw = _decode_token(token)
+    nonce = raw[:_NONCE_SIZE_BYTES]
+    ciphertext = raw[_NONCE_SIZE_BYTES:]
+    try:
+        return aead.decrypt(nonce, ciphertext, aad)
+    except InvalidTag:
+        raise VaultCipherError("Authentification de la donnée chiffrée échouée.") from None
+
+
 class VaultCipher:
     """Chiffrement authentifié AES-256-GCM des valeurs au repos (ticket #25/#26/#67).
 
@@ -217,6 +300,10 @@ class VaultCipher:
     - L'AAD lie le ciphertext au triplet ``(project, env, name)`` : un blob déplacé
       vers une autre identité échoue à l'authentification.
     - Les erreurs de déchiffrement sont génériques (aucun oracle sur la cause).
+    - Le chiffrement par enveloppe (``encrypt_envelope``/``decrypt_envelope``,
+      ticket #70) génère une DEK de 32 octets par secret : la valeur est
+      chiffrée avec la DEK, puis la DEK est chiffrée avec la KEK. Un blob de
+      DEK ne peut être rejoué comme une valeur (label de domaine distinct).
     - L'empreinte d'intégrité (``fingerprint``) utilise une sous-clé HKDF-SHA256
       dédiée et lie la valeur au triplet : la KEK n'est jamais réutilisée comme
       clé HMAC (invariant 5) et deux valeurs égales sous des triplets distincts
@@ -274,9 +361,7 @@ class VaultCipher:
         """
         if not isinstance(plaintext, (bytes, bytearray)):
             raise TypeError("La valeur à chiffrer doit être de type bytes.")
-        nonce = _new_nonce()
-        ciphertext = self._aead.encrypt(nonce, bytes(plaintext), aad)
-        return base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+        return _encrypt_token(self._aead, bytes(plaintext), aad)
 
     def decrypt(self, token: str, *, aad: bytes = b"") -> bytes:
         """Déchiffre un jeton base64 URL-safe ; InvalidTag devient VaultCipherError.
@@ -286,24 +371,95 @@ class VaultCipher:
         celui du chiffrement, sinon l'authentification GCM échoue (blob copié sur
         un autre secret → ``VaultCipherError``).
         """
-        if not isinstance(token, str) or not token:
-            raise VaultCipherError("Donnée chiffrée invalide.")
-        try:
-            raw = base64.b64decode(
-                token.encode("ascii"),
-                altchars=b"-_",
-                validate=True,
+        return _decrypt_token(self._aead, token, aad)
+
+    @staticmethod
+    def encrypt_with_dek(
+        plaintext: bytes,
+        dek: bytes | bytearray,
+        *,
+        aad: bytes = b"",
+    ) -> str:
+        """Chiffre une valeur avec une DEK (AES-256-GCM, ticket #70).
+
+        La DEK est une clé de 32 octets propre au secret ; l'AAD est l'identité
+        du secret, comme pour le chiffrement direct historique. Le jeton retourné
+        suit le même format ``nonce || ciphertext || tag`` que ``encrypt``.
+        """
+        if not isinstance(plaintext, (bytes, bytearray)):
+            raise TypeError("La valeur à chiffrer doit être de type bytes.")
+        if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
+            raise ValueError(
+                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
             )
-        except Exception:
-            raise VaultCipherError("Donnée chiffrée invalide.") from None
-        if len(raw) < _NONCE_SIZE_BYTES + _TAG_SIZE_BYTES:
-            raise VaultCipherError("Donnée chiffrée invalide.")
-        nonce = raw[:_NONCE_SIZE_BYTES]
-        ciphertext = raw[_NONCE_SIZE_BYTES:]
+        return _encrypt_token(AESGCM(bytes(dek)), bytes(plaintext), aad)
+
+    @staticmethod
+    def decrypt_with_dek(
+        token: str,
+        dek: bytes | bytearray,
+        *,
+        aad: bytes = b"",
+    ) -> bytes:
+        """Déchiffre une valeur avec sa DEK ; toute altération lève ``VaultCipherError``."""
+        if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
+            raise ValueError(
+                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
+            )
+        return _decrypt_token(AESGCM(bytes(dek)), token, aad)
+
+    def wrap_dek(self, dek: bytes | bytearray, *, aad: bytes = b"") -> str:
+        """Chiffre une DEK avec la KEK (ticket #70).
+
+        L'AAD de l'enveloppe est préfixé par un label de domaine dédié, puis lié
+        à l'identité du secret : une enveloppe de DEK ne peut être ni rejouée
+        comme une valeur, ni déplacée vers un autre secret.
+        """
+        if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
+            raise ValueError(
+                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
+            )
+        return self.encrypt(bytes(dek), aad=_DEK_WRAP_AAD_PREFIX + bytes(aad))
+
+    def unwrap_dek(self, encrypted_dek: str, *, aad: bytes = b"") -> bytes:
+        """Déchiffre une DEK enveloppée avec la KEK et vérifie sa taille."""
+        dek = self.decrypt(encrypted_dek, aad=_DEK_WRAP_AAD_PREFIX + bytes(aad))
+        if len(dek) != _DEK_SIZE_BYTES:
+            raise VaultCipherError("DEK déchiffrée invalide.")
+        return dek
+
+    def encrypt_envelope(self, plaintext: bytes, *, aad: bytes = b"") -> SecretEnvelope:
+        """Chiffre une valeur par enveloppe : DEK neuve, puis DEK chiffrée par la KEK.
+
+        La DEK est tirée à chaque appel (``generate_dek``) : deux secrets — même
+        avec la même valeur — ont des DEK indépendantes et des blobs distincts.
+        Le buffer de DEK est effacé au mieux après usage (Python ne garantit pas
+        l'absence de copies, mais aucune référence à la DEK n'est conservée).
+        """
+        dek = bytearray(generate_dek())
         try:
-            return self._aead.decrypt(nonce, ciphertext, aad)
-        except InvalidTag:
-            raise VaultCipherError("Authentification de la donnée chiffrée échouée.") from None
+            encrypted_value = self.encrypt_with_dek(plaintext, dek, aad=aad)
+            encrypted_dek = self.wrap_dek(dek, aad=aad)
+        finally:
+            dek[:] = b"\x00" * len(dek)
+        return SecretEnvelope(
+            encrypted_value=encrypted_value,
+            encrypted_dek=encrypted_dek,
+        )
+
+    def decrypt_envelope(
+        self,
+        encrypted_value: str,
+        encrypted_dek: str,
+        *,
+        aad: bytes = b"",
+    ) -> bytes:
+        """Déchiffre une valeur par enveloppe : DEK avec la KEK, puis valeur avec la DEK."""
+        dek = bytearray(self.unwrap_dek(encrypted_dek, aad=aad))
+        try:
+            return self.decrypt_with_dek(encrypted_value, dek, aad=aad)
+        finally:
+            dek[:] = b"\x00" * len(dek)
 
     def fingerprint(self, plaintext: bytes, *, aad: bytes = b"") -> str:
         """Empreinte HMAC-SHA256 non réversible et liée au triplet d'identité.

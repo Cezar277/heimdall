@@ -4,9 +4,10 @@ Ticket #15 · Porteur : C · Relecteur : A · Estimation : 6 h.
 
 Source contract-first : [openapi.yaml](../../openapi.yaml), OpenAPI 3.1.0.
 Le fichier est écrit indépendamment de FastAPI. Le serveur Vault, le chiffrement
-au repos (AES-256-GCM via KEK) et la persistance SQLite sont implémentés dans
-#25/#26/#62 ; la gestion de clés par identifiant (`encrypt_at_rest`/`key_id`) et
-la révocation restent suivies dans leurs tickets dédiés.
+au repos (AES-256-GCM via KEK, enveloppe DEK par secret depuis #70) et la
+persistance SQLite sont implémentés dans #25/#26/#62/#70 ; la gestion de clés
+par identifiant (`encrypt_at_rest`/`key_id`) et la révocation restent suivies
+dans leurs tickets dédiés.
 
 La traçabilité ticket → module → preuve de ce lot est dans
 [vault-traceability.md](./vault-traceability.md) : chaque brique livrée ici
@@ -151,13 +152,22 @@ rejeté en 400 avant toute décision d'autorisation.
 `create()` retourne uniquement les métadonnées ; le plaintext n'est déchiffré
 que par la lecture autorisée et n'est jamais renvoyé au POST.
 
-Chiffrement au repos : le backend SQLite (défaut en production) chiffre chaque
-valeur avec AES-256-GCM et une KEK `HEIMDALL_VAULT_KEK` de 32 octets encodée
-base64, **distincte du pepper** et jamais stockée dans la base. La séparation
-est vérifiée sur l'entropie décodée (KEK brute vs pepper UTF-8) : deux
-représentations d'une même clé sont refusées, pas seulement la copie exacte des
-chaînes (invariant 5). Chaque ciphertext
-est lié par AAD au triplet `(project, env, name)` ; la contrainte SQLite
+Chiffrement au repos : le backend SQLite (défaut en production) applique un
+**chiffrement par enveloppe** (ticket #70). Chaque secret reçoit une DEK
+aléatoire de 32 octets ; la valeur est chiffrée avec la DEK (AES-256-GCM), puis
+la DEK est chiffrée avec la KEK `HEIMDALL_VAULT_KEK` de 32 octets encodée
+base64, **distincte du pepper** et jamais stockée dans la base. Les deux blobs
+sont persistés dans la ligne du secret (`encrypted_value`, `encrypted_dek`) :
+la KEK ne chiffre donc que des clés, et la fuite d'une DEK ne compromet qu'un
+secret. Les lignes antérieures (chiffrées directement par la KEK, sans
+`encrypted_dek`) restent lisibles via un repli explicite ; `init_db` ajoute la
+colonne nullable aux bases existantes. La séparation KEK/pepper est vérifiée
+sur l'entropie décodée (KEK brute vs pepper UTF-8) : deux représentations
+d'une même clé sont refusées, pas seulement la copie exacte des chaînes
+(invariant 5). Chaque ciphertext
+est lié par AAD au triplet `(project, env, name)` ; l'enveloppe de DEK utilise
+en plus un label de domaine dédié, donc un blob de DEK ne peut pas être rejoué
+comme une valeur. La contrainte SQLite
 `UNIQUE(project_id, env, name)` assure l'anti-écrasement entre workers. Le nonce
 AES-GCM de 96 bits est tiré de l'aléatoire du système (`os.urandom`) **à chaque
 chiffrement** (ticket #67) : il n'est ni un compteur ni dérivé de l'heure, donc

@@ -82,9 +82,10 @@ export HEIMDALL_VAULT_SSL_KEYFILE='/chemin/absolu/server.key'
 python -m heimdall.vault.app
 ```
 
-Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une KEK qui ne
-réside jamais dans la base ; `UNIQUE(project_id, env, name)` garantit le 409
-inter-workers et `PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
+Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une DEK propre au
+secret, elle-même chiffrée par une KEK qui ne réside jamais dans la base ;
+`UNIQUE(project_id, env, name)` garantit le 409 inter-workers et
+`PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
 Le backend mémoire, réservé aux tests/développement, chiffre également les
 valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
 Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets
@@ -367,6 +368,15 @@ le nonce AES-GCM de 96 bits est tiré de `os.urandom` **à chaque** chiffrement
 l'authentification. Deux chiffrements du même texte donnent donc deux blobs
 différents — c'est la preuve archivée pour le rapport. Preuves :
 [`docs/t67-samm.md`](docs/t67-samm.md).
+
+Chiffrement par enveloppe (sous-ticket T263 de #26) : chaque secret reçoit une
+DEK aléatoire de 32 octets ; la valeur est chiffrée avec la DEK, puis la DEK
+est chiffrée avec la KEK. Les deux blobs sont stockés dans la même ligne
+(`encrypted_value`, `encrypted_dek`). Une fuite de DEK ne compromet donc qu'un
+secret, et la KEK ne chiffre que des clés. Les lignes héritées, chiffrées
+directement par la KEK avant #70, restent lisibles. Preuves :
+[`docs/t263-samm.md`](docs/t263-samm.md),
+`tests/test_vault_dek_envelope.py`.
 
 Falsification du chiffrement au repos (sous-ticket T68 de #26, via #66
 « Module crypto isolé ») : un seul octet modifié du blob (nonce, ciphertext ou
