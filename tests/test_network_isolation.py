@@ -111,6 +111,25 @@ _GIT_STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
     "--no-textconv",
 )
 _GIT_OBJECT_RE: Final[re.Pattern[str]] = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+#: Enumération `.gitignore` du scanner (#59) : `git -C <racine>` puis ces
+#: options figées. Aucune option d'egress (`--upload-pack`, `--recurse-submodules`)
+#: ne peut s'y glisser sans casser l'égalité exacte ci-dessous.
+_GIT_GITIGNORE_ARGUMENTS: Final[tuple[str, ...]] = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "core.quotepath=false",
+    "ls-files",
+    "-t",
+    "-z",
+    "--cached",
+    "--others",
+    "--ignored",
+    "--exclude-per-directory=.gitignore",
+    "--directory",
+)
 
 
 def _git_argv_ok(argv: Any) -> bool:
@@ -128,6 +147,15 @@ def _git_argv_ok(argv: Any) -> bool:
         return False
     if not isinstance(argv[0], str) or os.path.basename(argv[0]) != "git":
         return False
+    # Le scanner #59 place `-C` avant ses options de configuration : seule la
+    # forme **exacte** ci-dessous est admise, jamais un préfixe.
+    if (
+        len(argv) >= 3
+        and argv[1] == "-C"
+        and isinstance(argv[2], str)
+        and tuple(argv[3:]) == _GIT_GITIGNORE_ARGUMENTS
+    ):
+        return True
     if list(argv[1:4]) != ["-c", "core.fsmonitor=false", "-C"]:
         return False
     if not isinstance(argv[4], str):
@@ -608,6 +636,12 @@ def test_git_allowlist_accepts_only_exact_product_argv(tmp_path: Path) -> None:
         assert _is_local_git_call((argv,), {"stdin": subprocess.DEVNULL})
         assert _is_local_git_spawn([GIT, argv, {}])
 
+    # Enumération `.gitignore` (#59) : forme exacte acceptée…
+    gitignore_argv = [GIT, "-C", root, *_GIT_GITIGNORE_ARGUMENTS]
+    assert _git_argv_ok(gitignore_argv), gitignore_argv
+    assert _is_local_git_call((gitignore_argv,), {"stdin": subprocess.DEVNULL})
+    assert _is_local_git_spawn([GIT, gitignore_argv, {}])
+
     for tail in (
         (
             "diff",
@@ -626,6 +660,13 @@ def test_git_allowlist_accepts_only_exact_product_argv(tmp_path: Path) -> None:
         ("log", "--format=%H"),
     ):
         argv = [GIT, "-c", "core.fsmonitor=false", "-C", root, *tail]
+        assert not _git_argv_ok(argv), argv
+        assert not _is_local_git_call((argv,), {"stdin": subprocess.DEVNULL})
+        assert not _is_local_git_spawn([GIT, argv, {}])
+
+    # … toute dérive (option d'egress, config dangereuse) reste refusée.
+    for extra in (("--recurse-submodules",), ("--upload-pack=evil",)):
+        argv = [GIT, "-C", root, *_GIT_GITIGNORE_ARGUMENTS, *extra]
         assert not _git_argv_ok(argv), argv
         assert not _is_local_git_call((argv,), {"stdin": subprocess.DEVNULL})
         assert not _is_local_git_spawn([GIT, argv, {}])

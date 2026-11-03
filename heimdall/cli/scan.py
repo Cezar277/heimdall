@@ -12,9 +12,10 @@ verdict propre.
 Deux périmètres, un seul verdict :
 
 - ``working-tree`` (par défaut) : l'arbre de travail, en **mode strict** —
-  seules les exclusions *techniques* de #59 restent (binaires, répertoires
-  générés) ; ``vendor/``, ``third_party/``, les lockfiles et les fichiers de
-  contrôle sont parcourus, parce qu'un secret y est un secret ;
+  la base VCS et les entrées **non suivies** qu'un ``.gitignore`` du dépôt
+  déclare ignorées sont écartées ; ``vendor/``, ``third_party/``, les
+  lockfiles et les fichiers de contrôle sont parcourus dès qu'ils sont
+  suivis ou non ignorés, parce qu'un secret y est un secret ;
 - ``staged`` (``--staged``) : les blobs **ajoutés ou modifiés** dans l'index
   git, lus blob par blob, **sans aucune exclusion de chemin**. C'est ce que
   le commit va contenir, donc ce que le hook et la CI doivent juger.
@@ -113,9 +114,10 @@ _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INVALID_SCOPE: Final[str] = "scan impossible : entrée non analysable"
-#: Mode CI strict : un arbre réduit à sa base VCS n'a lu aucun contenu. Le
-#: code 2 évite qu'une automatisation ne confonde « propre » et « non parcouru ».
-_MSG_VCS_ONLY: Final[str] = "scan impossible : entrée non analysable"
+#: Mode CI strict : un arbre réduit à ses exclusions (base VCS ou entrées
+#: `.gitignore`) n'a lu aucun contenu. Le code 2 évite qu'une automatisation
+#: ne confonde « propre » et « non parcouru ».
+_MSG_NO_CONTENT_READ: Final[str] = "scan impossible : entrée non analysable"
 
 #: Journal de diagnostic (niveau debug uniquement) : les causes de refus de
 #: la garde anti auto-attestation y sont distinguées par des libellés
@@ -124,7 +126,7 @@ logger = logging.getLogger("heimdall.cli.scan")
 
 #: Libellés du périmètre, affichés à l'humain.
 _SCOPE_LABELS: Final[dict[Scope, str]] = {
-    SCOPE_TREE: "arbre de travail (mode strict : exclusions techniques seules)",
+    SCOPE_TREE: "arbre de travail (base VCS et entrées .gitignore non suivies écartées)",
     SCOPE_STAGED: "index git (blobs ajoutés ou modifiés, aucune exclusion de chemin)",
 }
 
@@ -157,6 +159,7 @@ class ScanReport:
     traces: tuple[AllowlistTrace, ...] = ()
     config_hash: str | None = None
     vcs_ignored: int = 0
+    git_ignored: int = 0
 
     def __post_init__(self) -> None:
         # Garde runtime pour les appelants non typés : le `Literal` protège
@@ -165,6 +168,8 @@ class ScanReport:
         if not isinstance(self.scope, str) or self.scope not in _SCOPE_LABELS:
             raise ScanError(_MSG_INVALID_SCOPE)
         if type(self.vcs_ignored) is not int or self.vcs_ignored < 0:
+            raise ScanError(_MSG_INVALID_SCOPE)
+        if type(self.git_ignored) is not int or self.git_ignored < 0:
             raise ScanError(_MSG_INVALID_SCOPE)
 
     @property
@@ -182,6 +187,7 @@ def collect(  # noqa: PLR0913 - explicit scan options
     ci: bool = False,
     max_file_bytes: int | None = None,
     skipped_files: list[str] | None = None,
+    respect_gitignore: bool = True,
 ) -> ScanReport:
     """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
@@ -191,6 +197,12 @@ def collect(  # noqa: PLR0913 - explicit scan options
 
     ``max_file_bytes`` et ``skipped_files`` sont réservés au mode arbre.
     Les fournir avec ``staged=True`` lève ``ScanError`` avant tout accès Git.
+
+    ``respect_gitignore`` (défaut ``True``) est la politique d'exclusion du
+    mode arbre : ``False`` restaure un parcours intégral (``--no-gitignore``).
+    Une valeur non booléenne est refusée (``ScanError``) au lieu d'activer ou
+    de désactiver l'exclusion par accident. L'option est sans effet avec
+    ``staged=True`` : ce périmètre ne consulte jamais ``.gitignore``.
 
     **Auto-attestation (CWE-345)** : si ``allowlist`` est fourni (API), la
     garde anti auto-attestation est contournée. Le seul usage légitime dans
@@ -206,6 +218,8 @@ def collect(  # noqa: PLR0913 - explicit scan options
         type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES
     ):
         raise ScanError("limite de fichier invalide")
+    if not isinstance(respect_gitignore, bool):
+        raise ScanError("politique d'exclusions Git invalide")
     try:
         if staged:
             return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
@@ -216,6 +230,7 @@ def collect(  # noqa: PLR0913 - explicit scan options
             ci=ci,
             max_file_bytes=max_file_bytes,
             skipped_files=skipped_files,
+            respect_gitignore=respect_gitignore,
         )
     except ToolFailure:
         raise ScanError(_MSG_NOT_A_REPO) from None
@@ -497,6 +512,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
     ci: bool = False,
     max_file_bytes: int | None = None,
     skipped_files: list[str] | None = None,
+    respect_gitignore: bool = True,
 ) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
@@ -505,13 +521,23 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
     lockfiles et les fichiers de contrôle sont parcourus. Un secret y est un
     secret. Un fichier binaire connu est refusé (``ScanError``, code 2),
     comme en ``--staged`` : aucun contenu n'est sauté en silence.
+
+    ``respect_gitignore`` (défaut ``True``) ajoute une exclusion **sûre** :
+    les entrées non suivies qu'un ``.gitignore`` du dépôt déclare ignorées
+    sont écartées et comptées dans :attr:`ScanReport.git_ignored`. Un
+    fichier **suivi** reste toujours scanné (``git add -f``), donc aucun nom
+    ni motif ne peut cacher un secret qui peut partir dans un commit. Une
+    panne de Git désactive l'exclusion et parcourt tout l'arbre (le scanner
+    lit plus, jamais moins). ``False`` restaure un parcours intégral.
+
     Un arbre vide (seule la base VCS existe) reste un verdict 0 en local : il
     est réellement vide, pas illisible. En revanche, le mode **``--ci``** est
-    strict : dès qu'une base VCS a été élaguée **sans aucun contenu lu**
-    (``vcs_ignored > 0`` et ``files_scanned == 0``), le scan est refusé
-    (``ScanError``, code 2) — une automatisation qui ne lit que le code de
-    sortie ne doit jamais confondre « propre » et « non parcouru ».
-    ``--staged`` reste le périmètre opposable pour le contenu indexé.
+    strict : dès qu'une exclusion a été appliquée **sans aucun contenu lu**
+    (``vcs_ignored > 0`` ou ``git_ignored > 0``, et ``files_scanned == 0``),
+    le scan est refusé (``ScanError``, code 2) — une automatisation qui ne
+    lit que le code de sortie ne doit jamais confondre « propre » et « non
+    parcouru ». ``--staged`` reste le périmètre opposable pour le contenu
+    indexé.
 
     L'allowlist déterministe (#24) écarte les cas évidents (example,
     changeme, dummy, fixtures de test) et produit une trace pour chaque rejet.
@@ -522,6 +548,8 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
     pas rendre 0 en silence. Le scan de fichier isolé reste possible en
     bibliothèque (`Scanner`, #22), hors contrat hook/CI.
     """
+    if not isinstance(respect_gitignore, bool):
+        raise ScanError("politique d'exclusions Git invalide")
     deadline = time.monotonic() + MAX_TREE_SECONDS
     access = GitAccess(root)
     if not access.is_repository(timeout=_call_timeout(deadline)):
@@ -557,18 +585,25 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
         allowlist=allowlist,
         max_file_bytes=max_file_bytes,
         skipped_files=skipped_files,
+        respect_gitignore=respect_gitignore,
     )
     skipped_before = len(skipped_files) if skipped_files is not None else 0
     findings = scanner.scan(deadline=deadline)
     skipped_now = len(skipped_files) - skipped_before if skipped_files is not None else 0
-    if ci and scanner.vcs_ignored > 0 and scanner.files_scanned == 0 and skipped_now == 0:
+    if (
+        ci
+        and (scanner.vcs_ignored > 0 or scanner.git_ignored > 0)
+        and scanner.files_scanned == 0
+        and skipped_now == 0
+    ):
         # Aucun contenu n'a été lu : le seul périmètre observé est une base
-        # VCS élaguée. En CI stricte, un code 0 serait indistinguable d'un
-        # dépôt propre pour une automatisation qui ne lit que la sortie.
-        # Le cold start rend explicitement les fichiers trop volumineux dans
-        # un rapport incomplet (code 2) : ce cas n'est pas un arbre VCS seul.
-        logger.debug("refus --ci : arbre réduit à sa base VCS (aucun contenu lu)")
-        raise ScanError(_MSG_VCS_ONLY)
+        # VCS ou des entrées `.gitignore` élaguées. En CI stricte, un code 0
+        # serait indistinguable d'un dépôt propre pour une automatisation qui
+        # ne lit que la sortie. Le cold start rend explicitement les fichiers
+        # trop volumineux dans un rapport incomplet (code 2) : ce cas n'est
+        # pas un arbre réduit à ses seules exclusions.
+        logger.debug("refus --ci : arbre réduit à ses exclusions (aucun contenu lu)")
+        raise ScanError(_MSG_NO_CONTENT_READ)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
     traces = scanner.traces
@@ -578,6 +613,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
         traces=tuple(traces),
         config_hash=allowlist.sha256,
         vcs_ignored=scanner.vcs_ignored,
+        git_ignored=scanner.git_ignored,
     )
 
 
@@ -741,9 +777,11 @@ def render_json(report: ScanReport) -> str:
 
     Le document contient le périmètre, le nombre de Findings et les Findings
     eux-mêmes (les sept champs du contrat #14), ainsi que le nombre de
-    findings ignorés et les traces de chaque rejet par l'allowlist (#24), et
-    le nombre de bases VCS élaguées (``vcs_ignored``, toujours 0 en
-    ``--staged``). Aucun secret n'est inclus.
+    findings ignorés et les traces de chaque rejet par l'allowlist (#24), le
+    nombre de bases VCS élaguées (``vcs_ignored``, toujours 0 en
+    ``--staged``) et le nombre d'entrées non suivies ignorées par
+    ``.gitignore`` (``git_ignored``, toujours 0 en ``--staged`` et avec
+    ``--no-gitignore``). Aucun secret n'est inclus.
     """
     payload = {
         "schema": JSON_SCHEMA,
@@ -754,6 +792,7 @@ def render_json(report: ScanReport) -> str:
         "traces": [trace.as_dict() for trace in report.traces],
         "config_hash": report.config_hash,
         "vcs_ignored": report.vcs_ignored,
+        "git_ignored": report.git_ignored,
     }
     return json.dumps(
         payload,
@@ -814,6 +853,13 @@ def render_text(report: ScanReport) -> str:
     lines.append(
         f"Base VCS : {report.vcs_ignored} base(s) élaguée(s) "
         "(historique non parcouru)."
+    )
+    # Les exclusions .gitignore sont aussi une politique : un fichier non
+    # suivi et ignoré n'a pas été lu. Le compteur évite de lire un « aucun
+    # secret » comme une couverture de ces entrées.
+    lines.append(
+        f"Gitignore : {report.git_ignored} entrée(s) non suivie(s) et ignorée(s) "
+        "écartée(s) (non analysée(s))."
     )
     lines.append(_CODES_LINE)
     return "\n".join(lines)
