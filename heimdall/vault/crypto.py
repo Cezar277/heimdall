@@ -113,11 +113,12 @@ def constant_time_equal(left: str | bytes, right: str | bytes) -> bool:
 def kek_matches_pepper(kek: str, pepper: str) -> bool:
     """Détecte la réutilisation de clé, y compris sous des encodages différents.
 
-    Trois comparaisons en temps constant : chaîne KEK vs pepper, KEK décodée vs
-    pepper brut, puis KEK décodée vs pepper **décodé**. La dernière couvre un
-    pepper encodé en base64 standard (``+/``, padding) alors que la KEK est
-    encodée URL-safe (``-_``) : même entropie, donc invariant 5 violé même si
-    les chaînes diffèrent (revue MEDIUM).
+    Quatre comparaisons en temps constant : chaîne KEK vs pepper, KEK décodée vs
+    pepper brut, KEK décodée vs pepper **décodé base64**, puis KEK décodée vs
+    pepper **décodé hexadécimal**. Elles couvrent un pepper encodé en base64
+    standard (``+/``, padding) alors que la KEK est URL-safe (``-_``), et un
+    pepper ``KEK.hex()`` : même entropie, donc invariant 5 violé même si les
+    chaînes diffèrent (revues MEDIUM et LOW).
     """
     pepper_bytes = pepper.encode("utf-8")
     kek_bytes = decode_encoded_key(kek)
@@ -128,9 +129,16 @@ def kek_matches_pepper(kek: str, pepper: str) -> bool:
     try:
         pepper_key = decode_encoded_key(pepper)
     except ValueError:
-        # Pepper arbitraire (pas du base64 32 octets) : aucune entropie de KEK.
+        pepper_key = None
+    if pepper_key is not None and constant_time_equal(kek_bytes, pepper_key):
+        return True
+    try:
+        pepper_hex = bytes.fromhex(pepper)
+    except ValueError:
+        # Pepper arbitraire (ni base64 32 octets ni hexadécimal) : aucune
+        # entropie de KEK.
         return False
-    return constant_time_equal(kek_bytes, pepper_key)
+    return constant_time_equal(kek_bytes, pepper_hex)
 
 
 def _normalize_pepper(pepper: str | bytes | None) -> bytes:
@@ -443,12 +451,13 @@ class VaultCipher:
     def key_reuses_pepper(self, pepper: str) -> bool:
         """Détecte si la KEK de ce chiffreur réutilise l'entropie du pepper.
 
-        Compare la KEK brute, ses représentations base64 URL-safe **et
-        standard**, et la version décodée du pepper (invariant 5), sans jamais
-        exposer ni la KEK ni ``pepper``. Sert au chemin ``secret_store``
-        explicite de ``create_app`` : c'est la clé **réellement portée par le
-        chiffreur du store** qui est vérifiée, pas la dérivation que
-        ``settings`` produirait — les deux peuvent diverger (revue LOW).
+        Compare la KEK brute, ses représentations base64 URL-safe et standard,
+        l'encodage hexadécimal et la version décodée du pepper (invariant 5),
+        sans jamais exposer ni la KEK ni ``pepper``. Sert au chemin
+        ``secret_store`` explicite de ``create_app`` : c'est la clé
+        **réellement portée par le chiffreur du store** qui est vérifiée, pas
+        la dérivation que ``settings`` produirait — les deux peuvent diverger
+        (revue LOW).
         """
         encoded = base64.urlsafe_b64encode(self._key).decode("ascii")
         return kek_matches_pepper(encoded, pepper) or constant_time_equal(

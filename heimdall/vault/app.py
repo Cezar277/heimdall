@@ -265,10 +265,10 @@ def _resolve_storage_backend(settings: "VaultSettings") -> Literal["memory", "sq
 def _reject_kek_equal_to_pepper(derived_kek: bytes, pepper: str) -> None:
     """Refuse une KEK qui réutilise l'entropie du pepper (invariant 5).
 
-    Couvre la KEK brute **et** ses représentations base64 URL-safe et standard :
-    deux encodages de la même entropie ne doivent jamais servir au chiffrement
-    et à l'authentification, même si un outil opérateur a produit l'autre
-    alphabet (``+/`` au lieu de ``-_``). Le message reste générique (aucun écho
+    Couvre la KEK brute, ses représentations base64 URL-safe et standard, et
+    l'encodage hexadécimal : deux encodages de la même entropie ne doivent
+    jamais servir au chiffrement et à l'authentification, même si un outil
+    opérateur a produit un autre format. Le message reste générique (aucun écho
     de secret).
     """
     pepper_bytes = pepper.encode("utf-8")

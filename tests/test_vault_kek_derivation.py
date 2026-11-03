@@ -336,6 +336,24 @@ class VaultSettingsMasterKeyTests(unittest.TestCase):
                 _resolve_vault_cipher(settings, "memory")
         self.assertIn("distincts", str(ctx.exception))
 
+    def test_derived_kek_equal_to_hex_pepper_is_rejected(self) -> None:
+        """Le pepper ``KEK.hex()`` révèle la KEK dérivée (revue LOW)."""
+        derived_kek = b"\xab" * 32
+        pepper = derived_kek.hex()
+        self.assertEqual(len(pepper), 64)
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=pepper,
+        )
+        with patch(
+            "heimdall.vault.app.derive_kek_from_master_key",
+            return_value=derived_kek,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_vault_cipher(settings, "memory")
+        self.assertIn("distincts", str(ctx.exception))
+
     def test_settings_reject_master_key_equal_to_pepper(self) -> None:
         """La validation refuse maître == pepper avant tout store injecté."""
         shared_secret = "shared_master_key_and_pepper_" + "Q" * 8
@@ -533,6 +551,22 @@ class T262ReviewHygieneTests(unittest.TestCase):
         self.assertFalse(kek_matches_pepper(urlsafe_kek, unrelated))
 
 
+    def test_kek_matches_pepper_detects_hex_encoding(self) -> None:
+        """Un pepper ``KEK.hex()`` révèle la même entropie que la KEK.
+
+        Revue LOW : la KEK hexadécimale (64 caractères) passe la comparaison de
+        chaînes et le décodage base64 ; il faut la décoder en hexadécimal.
+        """
+        raw = bytes(range(32))
+        urlsafe_kek = base64.urlsafe_b64encode(raw).decode("ascii")
+        hex_pepper = raw.hex()
+        self.assertEqual(len(hex_pepper), 64)
+        self.assertNotEqual(urlsafe_kek, hex_pepper)
+        self.assertTrue(kek_matches_pepper(urlsafe_kek, hex_pepper))
+        self.assertTrue(kek_matches_pepper(urlsafe_kek, hex_pepper.upper()))
+        self.assertFalse(kek_matches_pepper(urlsafe_kek, (b"Z" * 32).hex()))
+
+
 class T262UnicodeAndFailClosedTests(unittest.TestCase):
     """Normalisation Unicode de la clé maîtresse et échec KDF fail-closed (revue LOW)."""
 
@@ -603,6 +637,24 @@ class ExplicitSecretStoreInvariantTests(unittest.TestCase):
         raw = b"\xff" * 32
         pepper = base64.b64encode(raw).decode("ascii")
         self.assertIn("/", pepper)
+        settings = VaultSettings(
+            master_key=_MASTER_KEY,
+            kek_salt=_SALT_A,
+            api_key_pepper=pepper,
+        )
+        store = InMemorySecretStore(
+            cipher=VaultCipher.from_encoded_key(
+                base64.urlsafe_b64encode(raw).decode("ascii")
+            )
+        )
+        with self.assertRaises(ValueError) as ctx:
+            create_app(settings, secret_store=store)
+        self.assertIn("distincts", str(ctx.exception))
+
+    def test_explicit_store_rejects_hex_pepper(self) -> None:
+        """La variante hexadécimale est refusée sur le store explicite (revue LOW)."""
+        raw = b"\xcd" * 32
+        pepper = raw.hex()
         settings = VaultSettings(
             master_key=_MASTER_KEY,
             kek_salt=_SALT_A,
