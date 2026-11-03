@@ -26,6 +26,7 @@ from heimdall.vault.database import (
     create_project,
     create_secret,
     db_session,
+    ensure_project,
     get_secret,
     get_secret_metadata,
     init_db,
@@ -772,3 +773,186 @@ class ValidateKekVersionHelperTests(unittest.TestCase):
         for val in (0, -1, -99, True, False, "1", 1.5, None):
             with self.assertRaises(ValueError):
                 validate_kek_version(val)
+
+
+class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
+    """Tests de la garde de monotonie de reenvelope_secret (#71 LOW 1)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="heimdall-reenv-")
+        self.db_path = Path(self.tmp.name) / "vault.db"
+        init_db(self.db_path)
+        self.old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        self.new_cipher = VaultCipher(_NEW_KEK_BYTES)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_reenvelope_downgrade_refused(self) -> None:
+        """reenvelope_secret refuse de descendre la kek_version (audit-faussable)."""
+        with db_session(self.db_path) as conn:
+            aad = VaultCipher.aad("proj", "dev", "KEY")
+            envelope = self.old_cipher.encrypt_envelope(b"secret", aad=aad)
+            # Créer le projet et le secret à kek_version=3
+            ensure_project(conn, "proj")
+            create_secret(
+                conn,
+                "proj",
+                "dev",
+                "KEY",
+                envelope.encrypted_value,
+                encrypted_dek=envelope.encrypted_dek,
+                kek_version=3,
+            )
+            # Réenvelopper pour kek_version 5 (OK — montée)
+            new_dek = self.old_cipher.rewrap_dek(self.new_cipher, envelope.encrypted_dek, aad=aad)
+            reenvelope_secret(conn, "proj", "dev", "KEY", new_dek, kek_version=5)
+
+            sec = get_secret(conn, "proj", "dev", "KEY")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], 5)
+
+            # Downgrade 5 → 3 : doit être refusé
+            with self.assertRaises(ValueError) as ctx:
+                reenvelope_secret(conn, "proj", "dev", "KEY", new_dek, kek_version=3)
+            self.assertIn("supérieure", str(ctx.exception))
+
+    def test_reenvelope_same_version_refused(self) -> None:
+        """reenvelope_secret refuse une version égale à la version courante."""
+        with db_session(self.db_path) as conn:
+            aad = VaultCipher.aad("proj", "dev", "KEY2")
+            envelope = self.old_cipher.encrypt_envelope(b"val", aad=aad)
+            ensure_project(conn, "proj")
+            create_secret(
+                conn,
+                "proj",
+                "dev",
+                "KEY2",
+                envelope.encrypted_value,
+                encrypted_dek=envelope.encrypted_dek,
+                kek_version=2,
+            )
+            with self.assertRaises(ValueError):
+                reenvelope_secret(
+                    conn, "proj", "dev", "KEY2", envelope.encrypted_dek, kek_version=2
+                )
+
+    def test_reenvelope_nonexistent_row_still_validates_kek_version(self) -> None:
+        """reenvelope_secret sur une ligne inexistante retourne False sans erreur si version OK."""
+        with db_session(self.db_path) as conn:
+            # Pas de ligne : rowcount == 0, retourne False — pas d'exception
+            result = reenvelope_secret(conn, "proj", "dev", "MISSING", "enc_dek", kek_version=1)
+            self.assertFalse(result)
+
+
+class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):
+    """Tests de non-réflexion de contenu corrompu en base (#71 LOW 2 — invariant 8)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="heimdall-corrupt-")
+        self.db_path = Path(self.tmp.name) / "vault.db"
+        init_db(self.db_path)
+        self.old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        self.new_cipher = VaultCipher(_NEW_KEK_BYTES)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _insert_secret_with_corrupt_kek_version(self, corrupt_value: str) -> None:
+        """Insère une ligne avec une kek_version TEXT injectée directement en SQL."""
+        # Insertion directe contournant validate_kek_version pour simuler une corruption.
+        with sqlite3.connect(str(self.db_path)) as conn_raw:
+            conn_raw.row_factory = sqlite3.Row
+            conn_raw.execute("PRAGMA foreign_keys = ON")
+            conn_raw.execute("INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p','2026')")
+            # Désactiver le CHECK SQLite le temps de l'insertion frauduleuse (ne fonctionne que
+            # si le PRAGMA ignore_check_constraints est disponible, sinon ignorer silencieusement).
+            try:
+                conn_raw.execute("PRAGMA ignore_check_constraints = ON")
+            except sqlite3.Error:
+                pass
+            aad = VaultCipher.aad("p", "dev", "BAD")
+            envelope = self.old_cipher.encrypt_envelope(b"val", aad=aad)
+            try:
+                conn_raw.execute(
+                    "INSERT INTO secrets "
+                    "(project_id, env, name, encrypted_value, encrypted_dek, "
+                    "kek_version, status, fingerprint, created_at, updated_at) "
+                    "VALUES (?, 'dev', 'BAD', ?, ?, ?, 'vaulte', 'fp', '2026', '2026')",
+                    ("p", envelope.encrypted_value, envelope.encrypted_dek, corrupt_value),
+                )
+                conn_raw.commit()
+                return  # Insertion réussie (SQLite sans contrainte CHECK appliquée)
+            except sqlite3.IntegrityError:
+                pass  # CHECK actif : on ne peut pas insérer la valeur corrompue, test ignoré
+
+    def test_corrupted_text_kek_version_raises_generic_error(self) -> None:
+        """rotate_secrets_kek lève ValueError générique sans réfléter la valeur TEXT corrompue."""
+        self._insert_secret_with_corrupt_kek_version("<script>alert(1)</script>")
+        try:
+            with db_session(self.db_path) as conn:
+                secret = get_secret(conn, "p", "dev", "BAD")
+        except Exception:
+            self.skipTest(
+                "Insertion de la valeur corrompue refusée par SQLite — test inapplicable."
+            )
+            return
+        if secret is None or secret.get("kek_version") is None:
+            self.skipTest(
+                "Insertion de la valeur corrompue refusée par SQLite — test inapplicable."
+            )
+            return
+
+        with db_session(self.db_path) as conn:
+            with self.assertRaises(ValueError) as ctx:
+                rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
+        err_msg = str(ctx.exception)
+        self.assertNotIn("<script>", err_msg)
+        self.assertIn("illisible", err_msg)
+
+
+class SqliteStoreDetectKekVersionTests(unittest.TestCase):
+    """Tests du comportement fail-closed de _detect_current_kek_version (#71 LOW 3)."""
+
+    def test_detect_kek_version_on_accessible_db(self) -> None:
+        """_detect_current_kek_version retourne MAX(kek_version) sur base accessible."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-detect-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            cipher = VaultCipher(_OLD_KEK_BYTES)
+            store = SqliteSecretStore(db_path, cipher)
+            # Base vide : version initiale = 1
+            self.assertEqual(store.kek_version, 1)
+
+    def test_detect_kek_version_on_nonexistent_path_raises(self) -> None:
+        """SqliteSecretStore: _detect_current_kek_version fail-closed sur base illisible."""
+        # init_db est appelé dans __init__ ; on construit le store normalement puis
+        # on pointe _db_path vers un chemin inexistant pour tester la propagation d'erreur.
+        with tempfile.TemporaryDirectory(prefix="heimdall-detect2-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            cipher = VaultCipher(_OLD_KEK_BYTES)
+            store = SqliteSecretStore(db_path, cipher)
+            self.assertEqual(store.kek_version, 1)
+
+            # Simuler une erreur SQLite lors de _detect_current_kek_version
+            # en appelant la méthode avec un chemin invalide après construction.
+            store._db_path = Path(tmp) / "nonexistent_subdir" / "vault.db"
+            with self.assertRaises(RuntimeError) as ctx:
+                store._detect_current_kek_version()
+            self.assertIn("fail-closed", str(ctx.exception).lower())
+
+    def test_detect_kek_version_reflects_rotated_version(self) -> None:
+        """Un SqliteSecretStore rechargé après rotation détecte correctement MAX(kek_version)."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-detect3-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(_OLD_KEK_BYTES)
+            new_cipher = VaultCipher(_NEW_KEK_BYTES)
+
+            store = SqliteSecretStore(db_path, old_cipher)
+            store._create("proj", "dev", "K1", "val1")
+            # Rotation vers version 7
+            with db_session(db_path) as conn:
+                rotate_secrets_kek(conn, old_cipher, new_cipher, target_kek_version=7)
+
+            # Recréer le store à partir de la même base
+            store2 = SqliteSecretStore(db_path, new_cipher)
+            self.assertEqual(store2.kek_version, 7)

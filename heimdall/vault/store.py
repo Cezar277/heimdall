@@ -39,6 +39,7 @@ from typing import Any
 
 from heimdall.vault.crypto import VaultCipher, VaultCipherError
 from heimdall.vault.database import (
+    DatabaseUnavailableError,
     count_secrets,
     create_secret,
     delete_all_secrets,
@@ -308,18 +309,23 @@ class SqliteSecretStore:
         return self._kek_version
 
     def _detect_current_kek_version(self) -> int:
-        """Détecte la version KEK maximale déjà persistée dans la base (défaut 1)."""
+        """Détecte la version KEK maximale persistée dans la base.
+
+        Lève ``RuntimeError`` fail-closed si la base est illisible : mieux
+        vaut refuser de démarrer que de créer des secrets sous-étiquetés en
+        kek_version=1 alors que la version réelle est supérieure.
+        """
         try:
             with db_session(self._db_path) as conn:
                 row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
                 if row and row[0] is not None:
                     return max(1, int(row[0]))
-        except (sqlite3.Error, OSError) as exc:
-            logger.debug(
-                "Impossible de lire MAX(kek_version) à l'initialisation du store : %s",
-                exc,
-            )
-        return 1
+            return 1
+        except (sqlite3.Error, OSError, DatabaseUnavailableError) as exc:
+            raise RuntimeError(
+                "Impossible de lire la version KEK courante dans la base "
+                "(fail-closed pour éviter une sous-étiquetage silencieux)."
+            ) from exc
 
     @property
     def db_path(self) -> Path | str:

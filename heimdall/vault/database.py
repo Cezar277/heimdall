@@ -1387,10 +1387,32 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
 
     L'ancienne valeur chiffrée (``encrypted_value``) et son empreinte restent
     strictement inchangées en base.
+
+    Garantie de monotonie : ``kek_version`` doit être strictement supérieure
+    à la version actuellement stockée pour la ligne ciblée.  Cela empêche
+    toute régression d'audit d'un appelant externe (la rotation interne
+    ``rotate_secrets_kek`` n'utilise pas cette fonction).
     """
     if not encrypted_dek:
         raise ValueError("Enveloppe de DEK invalide.")
     validate_kek_version(kek_version)
+
+    # Lire la version courante et imposer la monotonie.
+    row = conn.execute(
+        "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
+        (project_id, env, name),
+    ).fetchone()
+    if row is not None:
+        try:
+            current_v = int(row["kek_version"]) if row["kek_version"] is not None else 1
+        except (ValueError, TypeError):
+            current_v = 1
+        if kek_version <= current_v:
+            raise ValueError(
+                f"La nouvelle kek_version ({kek_version}) doit être strictement "
+                f"supérieure à la version courante ({current_v})."
+            )
+
     up_ts = updated_at or get_iso_timestamp()
     query = (
         "UPDATE secrets SET "
@@ -1442,13 +1464,16 @@ def rotate_secrets_kek(
         if not secrets_to_rotate:
             return 0
 
-        current_max = max(
-            (
-                int(r["kek_version"]) if r["kek_version"] is not None else 1
-                for r in secrets_to_rotate
-            ),
-            default=1,
-        )
+        try:
+            current_max = max(
+                (
+                    int(r["kek_version"]) if r["kek_version"] is not None else 1
+                    for r in secrets_to_rotate
+                ),
+                default=1,
+            )
+        except (ValueError, TypeError):
+            raise ValueError("Version de KEK illisible en base.") from None
         if target_kek_version is not None:
             if target_kek_version <= current_max:
                 raise ValueError(
