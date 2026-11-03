@@ -166,7 +166,11 @@ dans la ligne du secret (`encrypted_value`, `encrypted_dek`) : la KEK ne chiffre
 donc que des clés, et la fuite d'une DEK ne compromet qu'un secret. Les lignes
 antérieures (chiffrées directement par la KEK, sans `encrypted_dek`) restent
 lisibles via un repli explicite ; `init_db` ajoute la colonne nullable aux bases
-existantes. La séparation avec le pepper est vérifiée sur l'entropie décodée
+existantes. Tout accès direct au fichier (outil d'administration via
+`db_session`) doit donc exécuter `init_db` ou passer par `SqliteSecretStore` ;
+`get_secret` lève une `RuntimeError` actionnable si la colonne manque, plutôt
+qu'un `OperationalError` brut. La séparation avec le pepper est vérifiée sur
+l'entropie décodée
 (KEK brute vs pepper UTF-8) : deux représentations d'une même clé sont refusées,
 pas seulement la copie exacte des chaînes (invariant 5). Chaque ciphertext est
 lié par AAD au triplet `(project, env, name)` ; l'enveloppe de DEK utilise en

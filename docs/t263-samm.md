@@ -44,7 +44,7 @@ La suite complète du sous-ticket :
 
 ```sh
 .venv/bin/python -m pytest tests/test_vault_dek_envelope.py -q
-# 16 passed
+# 18 passed
 ```
 
 ## 4. STRIDE et invariants
@@ -66,7 +66,7 @@ Environnement : Linux, Python 3.14.7, venv local.
 
 ```sh
 .venv/bin/python -m pytest tests/test_vault_dek_envelope.py -q
-# 16 passed
+# 18 passed
 .venv/bin/python -m pytest tests/test_vault_crypto.py tests/test_vault_db.py \
   tests/test_vault_app.py tests/test_vault_dek_envelope.py -q
 # 100 % des tests Vault concernés
@@ -111,3 +111,16 @@ Compléments de couverture ajoutés : réenveloppement non-`NULL` via
 `encrypted_value ↔ encrypted_dek` en mémoire
 (`test_swapping_value_and_wrapped_dek_fails_authentication`) et directement en
 base SQLite (`test_swapped_blobs_in_sqlite_are_rejected`).
+
+## 8. Deuxième revue (LOW)
+
+| Remarque | Correctif | Test de non-régression |
+|---|---|---|
+| `_decrypt_token` ne traduisait que `InvalidTag` | `(InvalidTag, ValueError)` → `VaultCipherError` générique : aucune exception brute de la primitive ne remonte aux appelants directs | `tests/test_vault_crypto.py::AadBindingTests::test_primitive_value_error_is_translated_to_vault_cipher_error` |
+| `get_secret` sur base pré-#70 non migrée : `OperationalError` brut | `RuntimeError` actionnable indiquant `init_db`/`SqliteSecretStore`, sans mutation de schéma sur lecture ; accès direct documenté dans `get_secret` et `docs/contracts/vault-api.md` | `EnvelopeDatabaseContractTests.test_get_secret_on_unmigrated_schema_raises_actionable_error` |
+
+Compléments : assertion explicite que la KEK synthétique `b"K" * 32` n'apparaît
+pas dans le fichier SQLite brut
+(`test_raw_sqlite_file_contains_no_plaintext_and_no_raw_dek`), et test
+déterministe de la course `PRAGMA` → `ALTER` entre deux `init_db`
+(`SchemaMigrationTests.test_ensure_secret_envelope_column_tolerates_concurrent_alter`).

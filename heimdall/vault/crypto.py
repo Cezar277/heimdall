@@ -459,13 +459,19 @@ def _encrypt_token(aead: AESGCM, plaintext: bytes, aad: bytes) -> str:
 
 
 def _decrypt_token(aead: AESGCM, token: str, aad: bytes) -> bytes:
-    """Déchiffre un jeton et traduit ``InvalidTag`` en ``VaultCipherError`` générique."""
+    """Déchiffre un jeton et traduit toute erreur de primitive en erreur générique.
+
+    ``AESGCM.decrypt`` lève aujourd'hui ``InvalidTag`` sur une altération, mais
+    une future version de ``cryptography`` peut ajouter des ``ValueError`` de
+    validation d'entrée. Les deux sont traduites en ``VaultCipherError`` pour
+    qu'aucun appelant direct de ``VaultCipher`` ne reçoive un oracle brut.
+    """
     raw = _decode_token(token)
     nonce = raw[:_NONCE_SIZE_BYTES]
     ciphertext = raw[_NONCE_SIZE_BYTES:]
     try:
         return aead.decrypt(nonce, ciphertext, aad)
-    except InvalidTag:
+    except (InvalidTag, ValueError):
         raise VaultCipherError("Authentification de la donnée chiffrée échouée.") from None
 
 

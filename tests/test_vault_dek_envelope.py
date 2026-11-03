@@ -19,7 +19,11 @@ Ce que cette suite prouve (checklist du ticket) :
 8. le défaut de ``create_secret`` est ``NULL`` (jamais ``""``) et les
    métadonnées/listes n'exposent ni valeur ni enveloppe ;
 9. le swap valeur ↔ enveloppe est refusé et un ``ValueError`` du chemin
-   enveloppe devient une ``SecretStoreError`` générique.
+   enveloppe devient une ``SecretStoreError`` générique ;
+10. une base pré-#70 non migrée guide vers ``init_db`` au lieu de laisser
+    remonter un ``OperationalError`` SQL brut ;
+11. la course ``PRAGMA`` → ``ALTER`` entre deux ``init_db`` est absorbée ;
+12. la KEK elle-même n'apparaît pas dans le fichier SQLite brut.
 
 Faux secrets : valeurs synthétiques explicites, jamais de secret réel.
 """
@@ -39,9 +43,11 @@ from heimdall.vault.crypto import (
 )
 from heimdall.vault.database import (
     SCHEMA_SQL,
+    _ensure_secret_envelope_column,
     create_project,
     create_secret,
     db_session,
+    get_secret,
     get_secret_metadata,
     init_db,
     list_secrets,
@@ -177,6 +183,7 @@ class SqliteEnvelopeStorageTests(unittest.IsolatedAsyncioTestCase):
                 await store.create("demo", "dev", f"CANARY_{index}", canary)
 
             raw = db_path.read_bytes()
+            self.assertNotIn(_KEK, raw)
             for canary in canaries:
                 self.assertNotIn(canary.encode("utf-8"), raw)
 
@@ -258,6 +265,49 @@ class SchemaMigrationTests(unittest.TestCase):
                 }
             self.assertIn("encrypted_dek", columns)
 
+    def test_ensure_secret_envelope_column_tolerates_concurrent_alter(self) -> None:
+        """La course PRAGMA→ALTER entre deux init_db est absorbée sans erreur."""
+        legacy_schema = SCHEMA_SQL.replace("    encrypted_dek TEXT,\n", "")
+        with tempfile.TemporaryDirectory(prefix="heimdall-t263-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            conn = sqlite3.connect(str(db_path))
+            other = sqlite3.connect(str(db_path))
+            try:
+                conn.executescript(legacy_schema)
+
+                class _RacingConnection:
+                    """Connexion qui simule un autre worker gagnant l'ALTER."""
+
+                    def __init__(
+                        self,
+                        real: sqlite3.Connection,
+                        concurrent: sqlite3.Connection,
+                    ) -> None:
+                        self._real = real
+                        self._concurrent = concurrent
+
+                    def execute(
+                        self,
+                        sql: str,
+                        parameters: tuple[object, ...] = (),
+                    ) -> sqlite3.Cursor:
+                        if sql.startswith("ALTER TABLE secrets ADD COLUMN encrypted_dek"):
+                            self._concurrent.execute(sql)
+                            self._concurrent.commit()
+                        return self._real.execute(sql, parameters)
+
+                _ensure_secret_envelope_column(
+                    _RacingConnection(conn, other)  # type: ignore[arg-type]
+                )
+                columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
+                }
+                self.assertIn("encrypted_dek", columns)
+            finally:
+                conn.close()
+                other.close()
+
 
 class EnvelopeDatabaseContractTests(unittest.TestCase):
     """Contrat DB : NULL legacy, métadonnées sans blobs, swap de blobs refusé."""
@@ -325,6 +375,46 @@ class EnvelopeDatabaseContractTests(unittest.TestCase):
                 self.assertEqual(len(listed), 1)
                 self.assertNotIn("encrypted_value", listed[0])
                 self.assertNotIn("encrypted_dek", listed[0])
+
+    def test_get_secret_on_unmigrated_schema_raises_actionable_error(self) -> None:
+        """Une base pré-#70 non migrée guide vers init_db, sans SQL brut."""
+        legacy_schema = SCHEMA_SQL.replace("    encrypted_dek TEXT,\n", "")
+        self.assertNotIn("encrypted_dek", legacy_schema)
+        with tempfile.TemporaryDirectory(prefix="heimdall-t263-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.executescript(legacy_schema)
+                conn.execute(
+                    "INSERT INTO projects (id, created_at) VALUES (?, ?)",
+                    ("demo", "2026-01-01T00:00:00Z"),
+                )
+                conn.execute(
+                    "INSERT INTO secrets (project_id, env, name, encrypted_value, "
+                    "status, fingerprint, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "demo",
+                        "dev",
+                        "LEGACY_TOKEN",
+                        "legacy-blob",
+                        "vaulte",
+                        "legacy-fingerprint",
+                        "2026-01-01T00:00:00Z",
+                        "2026-01-01T00:00:00Z",
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with db_session(db_path) as conn:
+                with self.assertRaises(RuntimeError) as ctx:
+                    get_secret(conn, "demo", "dev", "LEGACY_TOKEN")
+            message = str(ctx.exception)
+            self.assertIn("init_db", message)
+            self.assertIn("SqliteSecretStore", message)
+            self.assertNotIn("no such column", message)
 
     def test_swapping_value_and_wrapped_dek_fails_authentication(self) -> None:
         """Un swap valeur ↔ enveloppe de DEK échoue à l'authentification GCM."""

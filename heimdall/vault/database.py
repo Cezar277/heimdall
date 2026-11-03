@@ -60,6 +60,11 @@ logger = logging.getLogger(__name__)
 
 SecretStatus = Literal["vaulte", "rote"]
 _ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
+_SCHEMA_MIGRATION_HINT: str = (
+    "Schéma Vault antérieur au ticket #70 : exécuter "
+    "`python -m heimdall.vault.init_db` (ou ouvrir la base via "
+    "`SqliteSecretStore`) avant de lire un secret."
+)
 
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
@@ -1153,13 +1158,25 @@ def get_secret(
     env: str,
     name: str,
 ) -> dict[str, Any] | None:
-    """Récupère un secret complet (y compris valeur chiffrée) par son triplet."""
+    """Récupère un secret complet (y compris valeur chiffrée) par son triplet.
+
+    Tout accès direct à un fichier existant doit avoir exécuté ``init_db`` (ou
+    ouvrir la base via ``SqliteSecretStore``) pour appliquer la migration
+    additive de #70. Sur une base antérieure non migrée, la colonne
+    ``encrypted_dek`` manque : une ``RuntimeError`` actionnable est levée au
+    lieu de laisser remonter un ``OperationalError`` SQL brut.
+    """
     query = (
         "SELECT id, project_id, env, name, encrypted_value, encrypted_dek, status, "
         "fingerprint, created_at, updated_at "
         "FROM secrets WHERE project_id = ? AND env = ? AND name = ?"
     )
-    cursor = conn.execute(query, (project_id, env, name))
+    try:
+        cursor = conn.execute(query, (project_id, env, name))
+    except sqlite3.OperationalError as exc:
+        if "encrypted_dek" not in str(exc):
+            raise
+        raise RuntimeError(_SCHEMA_MIGRATION_HINT) from None
     row = cursor.fetchone()
     if row is None:
         return None

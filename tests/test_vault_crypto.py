@@ -219,6 +219,17 @@ class AadBindingTests(unittest.TestCase):
         self.assertNotIn(_PLAINTEXT.decode(), message)
         self.assertNotIn(_PLAINTEXT.hex(), message)
 
+    def test_primitive_value_error_is_translated_to_vault_cipher_error(self) -> None:
+        """Une ValueError future de la primitive ne fuit pas brute de ``VaultCipher``."""
+        cipher = VaultCipher(_KEY)
+        blob = cipher.encrypt(_PLAINTEXT, aad=_AAD)
+        with patch.object(cipher, "_aead") as aead:
+            aead.decrypt.side_effect = ValueError("synthetic primitive failure")
+            with self.assertRaises(VaultCipherError) as ctx:
+                cipher.decrypt(blob, aad=_AAD)
+        self.assertNotIn(_PLAINTEXT.decode(), str(ctx.exception))
+        self.assertNotIn("synthetic primitive failure", str(ctx.exception))
+
 
 class StoredSecretBindingTests(unittest.IsolatedAsyncioTestCase):
     """Le blob stocké en base est lié à l'identité du secret qu'il protège."""
