@@ -155,25 +155,29 @@ que par la lecture autorisée et n'est jamais renvoyé au POST.
 Chiffrement au repos : le backend SQLite (défaut en production) applique un
 **chiffrement par enveloppe** (ticket #70). Chaque secret reçoit une DEK
 aléatoire de 32 octets ; la valeur est chiffrée avec la DEK (AES-256-GCM), puis
-la DEK est chiffrée avec la KEK `HEIMDALL_VAULT_KEK` de 32 octets encodée
-base64, **distincte du pepper** et jamais stockée dans la base. Les deux blobs
-sont persistés dans la ligne du secret (`encrypted_value`, `encrypted_dek`) :
-la KEK ne chiffre donc que des clés, et la fuite d'une DEK ne compromet qu'un
-secret. Les lignes antérieures (chiffrées directement par la KEK, sans
-`encrypted_dek`) restent lisibles via un repli explicite ; `init_db` ajoute la
-colonne nullable aux bases existantes. La séparation KEK/pepper est vérifiée
-sur l'entropie décodée (KEK brute vs pepper UTF-8) : deux représentations
-d'une même clé sont refusées, pas seulement la copie exacte des chaînes
-(invariant 5). Chaque ciphertext
-est lié par AAD au triplet `(project, env, name)` ; l'enveloppe de DEK utilise
-en plus un label de domaine dédié, donc un blob de DEK ne peut pas être rejoué
+la DEK est chiffrée avec la KEK, **distincte du pepper** et jamais stockée dans
+la base. La KEK est soit fournie directement (`HEIMDALL_VAULT_KEK`, mode
+historique), soit **dérivée une seule fois au démarrage** avec Argon2id depuis
+`HEIMDALL_VAULT_MASTER_KEY` + `HEIMDALL_VAULT_KEK_SALT` (ticket #262, 64 Mio /
+3 itérations / 4 lanes, sel public de 16 octets) ; les deux modes sont exclusifs.
+La dérivation est documentée dans
+[ADR-005](../adr/005-derivation-kek-argon2id.md). Les deux blobs sont persistés
+dans la ligne du secret (`encrypted_value`, `encrypted_dek`) : la KEK ne chiffre
+donc que des clés, et la fuite d'une DEK ne compromet qu'un secret. Les lignes
+antérieures (chiffrées directement par la KEK, sans `encrypted_dek`) restent
+lisibles via un repli explicite ; `init_db` ajoute la colonne nullable aux bases
+existantes. La séparation avec le pepper est vérifiée sur l'entropie décodée
+(KEK brute vs pepper UTF-8) : deux représentations d'une même clé sont refusées,
+pas seulement la copie exacte des chaînes (invariant 5). Chaque ciphertext est
+lié par AAD au triplet `(project, env, name)` ; l'enveloppe de DEK utilise en
+plus un label de domaine dédié, donc un blob de DEK ne peut pas être rejoué
 comme une valeur. La contrainte SQLite
 `UNIQUE(project_id, env, name)` assure l'anti-écrasement entre workers. Le nonce
 AES-GCM de 96 bits est tiré de l'aléatoire du système (`os.urandom`) **à chaque
 chiffrement** (ticket #67) : il n'est ni un compteur ni dérivé de l'heure, donc
 jamais réutilisé avec la même clé, et le blob stocké contient
 `nonce + ciphertext + tag` (l'étiquette GCM de 16 octets est déjà en fin de
-ciphertext). Deux chiffremens de la même valeur donnent donc deux blobs
+ciphertext). Deux chiffrements de la même valeur donnent donc deux blobs
 différents, et un blob copié sur un autre secret échoue à l'authentification
 (AAD différent). Le backend
 mémoire, réservé aux tests/développement, chiffre aussi son dictionnaire avec une

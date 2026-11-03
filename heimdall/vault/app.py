@@ -43,6 +43,13 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
   aucune suite monotone de 8+, aucune ligne de clavier connue. La valeur
   d'un secret est canonisée en NFC avant stockage et le NUL y est interdit ;
   elle n'est jamais journalisée (décision #62).
+- Dérivation de la KEK (ticket #262) : `HEIMDALL_VAULT_MASTER_KEY` +
+  `HEIMDALL_VAULT_KEK_SALT` dérivent la KEK avec Argon2id **une seule fois à
+  la construction de l'application** (64 Mio / 3 itérations / 4 lanes, sel
+  public de 16 octets) ; la KEK reste en mémoire et n'est jamais écrite dans
+  SQLite. Le mode historique `HEIMDALL_VAULT_KEK` (KEK directe) reste accepté
+  pour les données existantes ; les deux modes sont mutuellement exclusifs et
+  toute paire incomplète est refusée au démarrage (fail-closed).
 - Gestion d'erreurs normalisée :
   - RequestValidationError -> 400 contractuel {"code": "bad_request", "message": "Requête invalide"}
     sans écho du corps ni enveloppe 422 de FastAPI.
@@ -60,6 +67,7 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 """
 
 import asyncio
+import base64
 import ipaddress
 import logging
 import os
@@ -89,7 +97,11 @@ from starlette.requests import Request
 
 from heimdall.vault import auth as vault_auth
 from heimdall.vault.crypto import (
+    MIN_MASTER_KEY_BYTES,
     VaultCipher,
+    constant_time_equal,
+    decode_kek_salt,
+    derive_kek_from_master_key,
     generate_api_key,
     generate_api_key_pepper,
     kek_matches_pepper,
@@ -250,20 +262,113 @@ def _resolve_storage_backend(settings: "VaultSettings") -> Literal["memory", "sq
     return "sqlite" if in_production else "memory"
 
 
+def _reject_kek_equal_to_pepper(derived_kek: bytes, pepper: str) -> None:
+    """Refuse une KEK qui réutilise l'entropie du pepper (invariant 5).
+
+    Couvre la KEK brute, ses représentations base64 URL-safe et standard, et
+    l'encodage hexadécimal : deux encodages de la même entropie ne doivent
+    jamais servir au chiffrement et à l'authentification, même si un outil
+    opérateur a produit un autre format. Le message reste générique (aucun écho
+    de secret).
+    """
+    pepper_bytes = pepper.encode("utf-8")
+    derived_b64 = base64.urlsafe_b64encode(derived_kek).decode("ascii")
+    if constant_time_equal(derived_kek, pepper_bytes) or kek_matches_pepper(
+        derived_b64, pepper
+    ):
+        raise ValueError(
+            "La KEK dérivée de la clé maîtresse et le pepper d'authentification "
+            "doivent être distincts (invariant 5)."
+        )
+
+
 def _resolve_vault_cipher(
     settings: "VaultSettings",
     backend: Literal["memory", "sqlite"],
 ) -> VaultCipher:
-    """Construit le chiffreur : KEK explicite obligatoire pour tout backend SQLite."""
+    """Construit le chiffreur une seule fois au démarrage (tickets #25/#262).
+
+    Trois cas, exclusifs par validation de ``VaultSettings`` :
+
+    1. ``HEIMDALL_VAULT_KEK`` fournie directement : mode historique, aucune
+       dérivation. Conservé pour que les blobs existants restent déchiffrables.
+    2. ``HEIMDALL_VAULT_MASTER_KEY`` + ``HEIMDALL_VAULT_KEK_SALT`` : la KEK est
+       dérivée par Argon2id **ici, une seule fois**, puis seule la KEK dérivée
+       reste en mémoire dans ``VaultCipher``.
+    3. Aucune clé : KEK éphémère uniquement pour le backend mémoire (jamais
+       pour SQLite, dont les données doivent survivre au redémarrage).
+
+    La KEK dérivée est comparée au pepper d'authentification (invariant 5) :
+    même si les deux secrets sont fournis séparément, une collision fortuite
+    ou une configuration volontairement fautive est refusée fail-closed.
+
+    La clé maîtresse reste portée par ``VaultSettings`` et l'environnement pour
+    la durée du processus ; la dérivation ne prétend pas l'effacer. Seule la KEK
+    dérivée est conservée par ``VaultCipher`` et utilisée par les routes.
+    """
     if settings.kek is not None:
         return VaultCipher.from_encoded_key(settings.kek)
+    if settings.master_key is not None:
+        salt = settings.kek_salt
+        if salt is None:
+            # VaultSettings garantit la paire ; garde de défense en profondeur.
+            raise ValueError(
+                "HEIMDALL_VAULT_KEK_SALT est obligatoire avec HEIMDALL_VAULT_MASTER_KEY."
+            )
+        pepper = settings.api_key_pepper
+        # Contrôle bon marché AVANT la KDF coûteuse (défense en profondeur).
+        if pepper is not None and constant_time_equal(
+            settings.master_key.encode("utf-8"), pepper.encode("utf-8")
+        ):
+            raise ValueError(
+                "La clé maîtresse et le pepper d'authentification doivent être "
+                "distincts (invariant 5)."
+            )
+        derived_kek = derive_kek_from_master_key(settings.master_key, salt)
+        if pepper is not None:
+            _reject_kek_equal_to_pepper(derived_kek, pepper)
+        return VaultCipher(derived_kek)
     if backend == "sqlite":
         raise ValueError(
-            "HEIMDALL_VAULT_KEK est obligatoire pour le backend SQLite : fournir une "
-            "KEK 256 bits encodée base64, distincte du pepper d'authentification. "
-            "Aucune KEK éphémère n'est générée pour des données persistées."
+            "HEIMDALL_VAULT_KEK (mode historique) ou le couple "
+            "HEIMDALL_VAULT_MASTER_KEY + HEIMDALL_VAULT_KEK_SALT est obligatoire "
+            "pour le backend SQLite : fournir une KEK 256 bits, distincte du pepper "
+            "d'authentification. Aucune KEK éphémère n'est générée pour des données "
+            "persistées."
         )
     return VaultCipher.generate()
+
+
+def _validate_explicit_secret_store_configuration(
+    settings: "VaultSettings",
+    secret_store: "InMemorySecretStore | SqliteSecretStore",
+) -> None:
+    """Refuse la réutilisation du pepper par la KEK **réelle** du store explicite.
+
+    Avec un store explicite, ``_resolve_vault_cipher`` n'est pas appelé : la KEK
+    qui chiffre réellement les secrets est celle portée par le chiffreur du
+    store, pas celle que ``settings`` dériverait (les deux peuvent diverger —
+    revue LOW). Ce contrôle compare donc la KEK du store au pepper (brut +
+    base64), une fois au démarrage, **sans dérivation supplémentaire**. Le
+    chemin reste réservé aux tests ; la production HTTP passe toujours par
+    ``_resolve_vault_cipher``. Les contrôles bon marché restent dans
+    ``VaultSettings`` (paire maître/sel, ``master_key != pepper``).
+    """
+    if settings.api_key_pepper is None:
+        return
+    cipher = getattr(secret_store, "_cipher", None)
+    if not isinstance(cipher, VaultCipher):
+        # Fail-closed générique : un store ou mock sans chiffreur ne doit pas
+        # produire un AttributeError technique (revue LOW).
+        raise ValueError(
+            "Store explicite invalide : un chiffreur VaultCipher est requis "
+            "pour vérifier l'invariant 5."
+        )
+    if cipher.key_reuses_pepper(settings.api_key_pepper):
+        raise ValueError(
+            "La KEK du store et le pepper d'authentification doivent être "
+            "distincts (invariant 5)."
+        )
 
 
 # Motifs d'identifiants du contrat (#15) : `project` vient du module
@@ -458,6 +563,11 @@ class VaultSettings(BaseSettings):
         env_prefix="HEIMDALL_VAULT_",
         case_sensitive=False,
         extra="ignore",
+        # Aucune valeur reçue (KEK, clé maîtresse, pepper) ne doit apparaître
+        # dans un message de ValidationError : le démarrage peut journaliser
+        # l'erreur. Les validateurs ci-dessous produisent déjà des messages
+        # génériques ; ce réglage supprime l'écho ``input_value`` de pydantic.
+        hide_input_in_errors=True,
     )
 
     host: str = Field(
@@ -484,7 +594,7 @@ class VaultSettings(BaseSettings):
     )
     api_key_pepper: str | None = Field(
         default=None,
-        repr=False,
+        repr=False, exclude=True,  # jamais dans model_dump()/model_dump_json()
         description=(
             "Pepper serveur distinct de la KEK pour hachage HMAC-SHA256 (ticket #64). "
             "Doit comporter au moins 32 octets (256 bits). "
@@ -500,17 +610,42 @@ class VaultSettings(BaseSettings):
         description=(
             "Backend de stockage des secrets. Défaut : 'sqlite' en production "
             "(persistant, multi-workers), 'memory' hors production (tests/dev). "
-            "Le backend 'sqlite' exige toujours une KEK via HEIMDALL_VAULT_KEK."
+            "Le backend 'sqlite' exige toujours une KEK via HEIMDALL_VAULT_KEK "
+            "ou le couple HEIMDALL_VAULT_MASTER_KEY + HEIMDALL_VAULT_KEK_SALT."
         ),
     )
     kek: str | None = Field(
         default=None,
-        repr=False,
+        repr=False, exclude=True,  # jamais dans model_dump()/model_dump_json()
         description=(
-            "KEK AES-256 encodée base64 (32 octets), distincte du pepper d'authentification. "
-            "Obligatoire pour le backend 'sqlite' (aucune KEK éphémère pour des données "
-            "persistées) ; jamais stockée en base. Le backend 'memory' génère une KEK "
-            "éphémère interne au processus."
+            "MODE HISTORIQUE : KEK AES-256 encodée base64 (32 octets), utilisée "
+            "directement sans dérivation, distincte du pepper d'authentification. "
+            "Conservée pour ne pas rendre illisibles les blobs existants ; les "
+            "nouveaux déploiements utilisent HEIMDALL_VAULT_MASTER_KEY + "
+            "HEIMDALL_VAULT_KEK_SALT (ticket #262). Mutuellement exclusive avec "
+            "HEIMDALL_VAULT_MASTER_KEY. Jamais stockée en base ; le backend "
+            "'memory' génère une KEK éphémère si aucune clé n'est fournie."
+        ),
+    )
+    master_key: str | None = Field(
+        default=None,
+        repr=False, exclude=True,  # jamais dans model_dump()/model_dump_json()
+        description=(
+            "Clé maîtresse du serveur (phrase de passe UTF-8 d'au moins 16 octets), "
+            "matière première de la KEK dérivée par Argon2id (ticket #262). "
+            "Exige HEIMDALL_VAULT_KEK_SALT et exclut HEIMDALL_VAULT_KEK. "
+            "La dérivation a lieu une seule fois au démarrage ; la clé maîtresse "
+            "n'est jamais stockée en base, journalisée ni retournée au client."
+        ),
+    )
+    kek_salt: str | None = Field(
+        default=None,
+        repr=False, exclude=True,  # public mais jamais sérialisé par défense
+        description=(
+            "Sel public Argon2id de 16 octets encodé base64 URL-safe (ticket #262), "
+            "persisté à côté de HEIMDALL_VAULT_MASTER_KEY et stable entre les "
+            "démarrages. Non secret, mais indispensable : un sel perdu ou modifié "
+            "change la KEK dérivée et rend les secrets existants illisibles."
         ),
     )
     rate_limit_per_key: int = Field(
@@ -654,6 +789,71 @@ class VaultSettings(BaseSettings):
             raise ValueError(str(exc)) from exc
         return value
 
+    @field_validator("master_key")
+    @classmethod
+    def validate_master_key(cls, value: str | None) -> str | None:
+        """Valide la clé maîtresse : phrase de passe UTF-8 d'au moins 128 bits.
+
+        Le seuil de 16 octets est une défense en profondeur : Argon2id ralentit
+        une attaque hors ligne mais ne rend pas une phrase de passe triviale
+        résistante. La valeur n'est jamais écho dans un message d'erreur. La
+        valeur retournée est canonisée NFC (ticket #262) : deux formes Unicode
+        équivalentes (précomposée vs combinée) produisent la même KEK.
+        """
+        if value is None:
+            return None
+        if not value or not value.strip():
+            raise ValueError("La clé maîtresse ne doit pas être vide ou blanche.")
+        if value != value.strip():
+            raise ValueError("La clé maîtresse ne doit pas comporter d'espaces de début ou de fin.")
+        try:
+            # Forme canonique NFC (ticket #262) : cohérente avec la canonisation
+            # NFC des valeurs de secrets (décision #62) et avec la normalisation
+            # appliquée par `_normalize_master_key` (ADR-005).
+            normalized = unicodedata.normalize("NFC", value)
+            raw = normalized.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("La clé maîtresse doit être encodable en UTF-8.") from None
+        if len(raw) < MIN_MASTER_KEY_BYTES:
+            raise ValueError(
+                f"La clé maîtresse doit comporter au moins {MIN_MASTER_KEY_BYTES} "
+                "octets (128 bits)."
+            )
+        return normalized
+
+    @field_validator("kek_salt")
+    @classmethod
+    def validate_kek_salt(cls, value: str | None) -> str | None:
+        """Valide le sel Argon2id : base64 de 16 octets exactement (ticket #262)."""
+        if value is None:
+            return None
+        try:
+            decode_kek_salt(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+    @model_validator(mode="after")
+    def validate_master_key_configuration(self) -> "VaultSettings":
+        """Impose la paire maître/sel et l'exclusivité avec la KEK historique.
+
+        - ``master_key`` sans ``kek_salt`` (ou l'inverse) est refusé : sans sel
+          stable, la KEK dériverait différemment à chaque démarrage.
+        - ``kek`` et ``master_key`` ensemble sont refusés : deux sources de KEK
+          concurrentes rendraient le choix implicite et le débogage dangereux.
+        """
+        if (self.master_key is None) != (self.kek_salt is None):
+            raise ValueError(
+                "HEIMDALL_VAULT_MASTER_KEY et HEIMDALL_VAULT_KEK_SALT doivent être "
+                "fournis ensemble (ticket #262)."
+            )
+        if self.master_key is not None and self.kek is not None:
+            raise ValueError(
+                "HEIMDALL_VAULT_KEK (mode historique) et HEIMDALL_VAULT_MASTER_KEY "
+                "sont mutuellement exclusifs : choisir un seul mode de dérivation."
+            )
+        return self
+
     @model_validator(mode="after")
     def validate_kek_distinct_from_pepper(self) -> "VaultSettings":
         """La KEK de chiffrement et le pepper d'authentification doivent être distincts.
@@ -663,13 +863,26 @@ class VaultSettings(BaseSettings):
         entropie (ex. pepper UTF-8 dont le base64 32 octets est la KEK) sont
         refusées, conformément à l'invariant 5 (jamais la même clé pour le
         chiffrement et le HMAC de vérification).
+
+        Le contrôle de la clé maîtresse est également fait ici, et pas seulement
+        dans ``_resolve_vault_cipher`` : un ``secret_store`` explicite court-
+        circuite la dérivation et ne doit pas laisser passer cette collision.
         """
-        if self.kek is not None and self.api_key_pepper is not None:
-            if kek_matches_pepper(self.kek, self.api_key_pepper):
-                raise ValueError(
-                    "La KEK de chiffrement et le pepper d'authentification doivent "
-                    "être distincts, y compris sous des encodages différents."
-                )
+        pepper = self.api_key_pepper
+        if pepper is None:
+            return self
+        if self.master_key is not None and constant_time_equal(
+            self.master_key.encode("utf-8"), pepper.encode("utf-8")
+        ):
+            raise ValueError(
+                "La clé maîtresse et le pepper d'authentification doivent être "
+                "distincts (invariant 5)."
+            )
+        if self.kek is not None and kek_matches_pepper(self.kek, pepper):
+            raise ValueError(
+                "La KEK de chiffrement et le pepper d'authentification doivent "
+                "être distincts, y compris sous des encodages différents."
+            )
         return self
 
     @field_validator("db_path")
@@ -1335,6 +1548,7 @@ def _configure_secret_store(
             "(HEIMDALL_ENV=production/prod) : utiliser SqliteSecretStore "
             "avec une KEK persistante."
         )
+    _validate_explicit_secret_store_configuration(settings, secret_store)
     app.state.secret_store = secret_store
     if isinstance(secret_store, SqliteSecretStore):
         # Aligner l'authentification sur la même base que le store explicite.
@@ -1358,7 +1572,11 @@ def create_app(
     - `settings` : Configuration VaultSettings (défaut : get_settings()).
     - `secret_store` : Magasin de secrets explicite (défaut : résolu par
       `settings.storage_backend` — SQLite chiffré en production, mémoire chiffré
-      hors production).
+      hors production). **Réservé aux tests** : la production passe toujours par
+      `_resolve_vault_cipher`. Par défense en profondeur (invariant 5), la KEK
+      du chiffreur du store explicite est comparée au pepper (brut + base64)
+      une fois au démarrage, sans dérivation supplémentaire. Ne jamais appeler
+      `create_app` avec un store explicite en production.
     - `api_key_hashes` : Dictionnaire {hash_hmac_hex: project_id} de clés pré-hachées.
       Chaque clé DOIT être une chaîne hexadécimale de 64 caractères (^[0-9a-f]{64}$).
       Les clés brutes sont expressément refusées pour éviter toute confusion de format.
@@ -1386,6 +1604,8 @@ def create_app(
         redoc_url=None,
         openapi_url=openapi_url,
     )
+    # Ne jamais journaliser ni sérialiser ``app.state.settings`` : il porte la
+    # clé maîtresse (durée de vie du processus) et le pepper d'authentification.
     app.state.settings = effective_settings
     resolved_db = _pin_db_path(effective_settings)
     app.state.db_path = resolved_db
