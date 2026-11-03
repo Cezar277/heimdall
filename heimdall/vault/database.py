@@ -1254,12 +1254,15 @@ def update_secret(  # noqa: PLR0913
 ) -> bool:
     """Met à jour la valeur chiffrée, l'enveloppe de DEK, l'empreinte et le statut.
 
-    `encrypted_dek=None` conserve l'enveloppe existante (mise à jour partielle) ;
-    une chaîne vide est refusée car elle effacerait l'enveloppe et rendrait le
-    secret illisible ; fournir une valeur permet à la rotation de KEK (#71) de
-    réenvelopper la DEK. Le paramètre `status` est typé
-    `Literal["vaulte", "rote"]` pour une validation applicative avant toute
-    requête SQL.
+    `encrypted_dek=None` conserve l'enveloppe existante pour une mise à jour
+    partielle qui ne remplace pas la valeur chiffrée. Si `encrypted_value` est
+    chiffrée avec une DEK neuve, les deux blobs doivent provenir du même
+    `VaultCipher.encrypt_envelope` et être fournis ensemble ; sinon la ligne
+    deviendrait illisible (fail-closed). Une chaîne vide est refusée car elle
+    effacerait l'enveloppe. L'atomicité valeur + enveloppe sera portée par la
+    rotation de KEK (#71, méthode `reenvelope()`), hors périmètre de #70. Le
+    paramètre `status` est typé `Literal["vaulte", "rote"]` pour une validation
+    applicative avant toute requête SQL.
     """
     if encrypted_dek == "":
         raise ValueError("Enveloppe de DEK invalide.")

@@ -85,7 +85,12 @@ Environnement : Linux, Python 3.14.7, venv local.
   compatible avec une KEK dérivée : elle ne suppose qu'une clé de 32 octets.
 - **Rotation de la KEK** : ticket #71. `update_secret` accepte déjà une nouvelle
   enveloppe de DEK (`encrypted_dek`), mais aucune route ni commande de rotation
-  n'est ajoutée ici.
+  n'est ajoutée ici. **Suivi #71** : l'écriture de `encrypted_value` et
+  `encrypted_dek` doit être atomique. `update_secret` ne peut pas détecter
+  qu'une valeur a été chiffrée sous une DEK neuve avec `encrypted_dek=None` ;
+  #71 devra fournir `reenvelope()` (ou exiger les deux blobs ensemble) et un
+  test d'atomicité. Ce point est documenté dans la docstring de `update_secret`
+  et n'est pas corrigé dans #70, car aucun appelant production n'existe.
 - **Chasse aux fuites de clés** : ticket #72, hors périmètre.
 - **Falsification du ciphertext** : déjà couverte par #68 pour la primitive
   AES-GCM ; cette fiche ajoute uniquement la liaison d'identité de l'enveloppe.
