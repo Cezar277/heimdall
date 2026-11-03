@@ -430,6 +430,13 @@ avec `--require-hashes`. Il inclut bandit + ruff pour le SAST de la fixture.
 Spectral est figé par `package.json` +
 `package-lock.json` et installé via `npm ci` (intégrité vérifiée).
 
+`minimatch` est forcé en **11.0.4** par un `override` npm vers
+[`vendor/minimatch-compat`](../../vendor/minimatch-compat/README.md) : c'est la
+version corrigée de l'avis `GHSA-g3hv-75wg-m249` (Dependabot #8), alors que
+`@stoplight/spectral-core` épingle encore `^3.1.4`. Le shim ne réécrit pas le
+code : il rétablit seulement l'ancienne forme d'export CJS attendue par
+`spectral-core` et `glob@7`.
+
 [.spectral.yaml](../../.spectral.yaml) active les règles OpenAPI standard.
 Les exemples de valeur sont des placeholders explicites, jamais des clés
 réalistes, même expirées.

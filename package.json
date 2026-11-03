@@ -7,9 +7,13 @@
     "lint": "spectral lint openapi.yaml --fail-severity warn"
   },
   "devDependencies": {
-    "@stoplight/spectral-cli": "6.17.0"
+    "@stoplight/spectral-cli": "6.17.0",
+    "minimatch": "file:vendor/minimatch-compat"
+  },
+  "overrides": {
+    "minimatch": "$minimatch"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

@@ -1,0 +1,11 @@
+{
+  "name": "minimatch",
+  "version": "11.0.4",
+  "private": true,
+  "description": "Shim CJS : ré-expose minimatch 11 (code réel, via l'alias minimatch-upstream) avec l'ancienne forme `module.exports = fn`. Voir README.md.",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {
+    "minimatch-upstream": "npm:minimatch@11.0.4"
+  }
+}
