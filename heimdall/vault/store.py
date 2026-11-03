@@ -45,6 +45,7 @@ from heimdall.vault.database import (
     get_secret,
     init_db,
     rotate_secrets_kek,
+    validate_kek_version,
 )
 from heimdall.vault.database import runtime_db_session as db_session
 
@@ -197,7 +198,26 @@ class InMemorySecretStore:
         active_old = old_cipher or self._cipher
         if active_old.has_same_key_as(new_cipher):
             raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
+        if target_kek_version is not None:
+            validate_kek_version(target_kek_version, label="Numéro de version cible")
+
         async with self._lock:
+            if not self._secrets:
+                return 0
+            current_max = max(
+                (int(r.get("kek_version", 1)) for r in self._secrets.values()),
+                default=1,
+            )
+            if target_kek_version is not None:
+                if target_kek_version <= current_max:
+                    raise ValueError(
+                        f"Le numéro de version cible ({target_kek_version}) doit être "
+                        f"strictement supérieur à la version actuelle ({current_max})."
+                    )
+                new_version = target_kek_version
+            else:
+                new_version = current_max + 1
+
             backup = dict(self._secrets)
             try:
                 count = 0
@@ -209,11 +229,9 @@ class InMemorySecretStore:
                         )
                     aad = VaultCipher.aad(record["project"], record["env"], record["name"])
                     new_dek = active_old.rewrap_dek(new_cipher, enc_dek, aad=aad)
-                    current_v = int(record.get("kek_version", 1))
-                    new_v = target_kek_version if target_kek_version is not None else current_v + 1
                     updated_record = dict(record)
                     updated_record["encrypted_dek"] = new_dek
-                    updated_record["kek_version"] = new_v
+                    updated_record["kek_version"] = new_version
                     self._secrets[key] = updated_record
                     count += 1
                 self._cipher = new_cipher

@@ -35,7 +35,13 @@ from heimdall.cli.vault_client import (
 )
 from heimdall.vault import auth as vault_auth
 from heimdall.vault.crypto import VaultCipher, VaultCipherError
-from heimdall.vault.database import db_session, init_db, resolve_db_path, rotate_secrets_kek
+from heimdall.vault.database import (
+    db_session,
+    init_db,
+    resolve_db_path,
+    rotate_secrets_kek,
+    validate_kek_version,
+)
 
 key_app = typer.Typer(
     name="key",
@@ -192,11 +198,8 @@ def revoke_key(
     typer.echo(f"Clé API {key_id} révoquée : elle n'authentifie plus aucune requête.")
 
 
-def _resolve_cli_cipher(  # noqa: PLR0913
+def _resolve_cli_cipher(
     *,
-    direct: str | None,
-    master: str | None,
-    salt: str | None,
     env_direct: str,
     env_fallback: str | None,
     env_master: str,
@@ -205,12 +208,11 @@ def _resolve_cli_cipher(  # noqa: PLR0913
 ) -> VaultCipher:
     """Résout un chiffreur VaultCipher depuis une clé directe ou une dérivation Argon2id."""
     resolved_direct = (
-        direct
-        or os.environ.get(env_direct)
+        os.environ.get(env_direct)
         or (os.environ.get(env_fallback) if env_fallback else None)
     )
-    resolved_master = master or os.environ.get(env_master)
-    resolved_salt = salt or os.environ.get(env_salt)
+    resolved_master = os.environ.get(env_master)
+    resolved_salt = os.environ.get(env_salt)
 
     if resolved_direct and (resolved_master or resolved_salt):
         raise ValueError(
@@ -228,42 +230,26 @@ def _resolve_cli_cipher(  # noqa: PLR0913
             raise ValueError(f"{label} dérivée invalide.") from None
     if resolved_master or resolved_salt:
         raise ValueError(f"Clé maîtresse ET sel obligatoires pour dériver {label}.")
-    raise ValueError(f"{label} manquante (option CLI ou variable d'environnement requise).")
+    raise ValueError(
+        f"{label} manquante dans l'environnement ({env_direct} ou {env_master}+{env_salt} requis)."
+    )
 
 
-@vault_app.command("rotate-kek")
-def rotate_kek_command(  # noqa: PLR0913, PLR0917
+@vault_app.command(
+    "rotate-kek",
+    help=(
+        "Effectue la rotation transactionnelle de la KEK sur tous les secrets (ticket #71).\n\n"
+        "RÈGLES DE SÉCURITÉ (invariant 9) :\n"
+        "Pour éviter toute fuite dans les arguments de processus ('ps') et l'historique shell,\n"
+        "les clés et phrases de passe sont lues EXCLUSIVEMENT depuis l'environnement :\n"
+        "- KEK directe : $HEIMDALL_VAULT_OLD_KEK (ou $HEIMDALL_VAULT_KEK) et\n"
+        "  $HEIMDALL_VAULT_NEW_KEK\n"
+        "- Dérivation Argon2id : $HEIMDALL_VAULT_OLD_MASTER_KEY + $HEIMDALL_VAULT_OLD_KEK_SALT et\n"
+        "  $HEIMDALL_VAULT_NEW_MASTER_KEY + $HEIMDALL_VAULT_NEW_KEK_SALT"
+    ),
+)
+def rotate_kek_command(
     db_path: Path | None = _DB_PATH_OPTION,
-    old_kek: str | None = typer.Option(
-        None,
-        "--old-kek",
-        help="Ancienne KEK (base64 URL-safe ou standard). Défaut : $HEIMDALL_VAULT_OLD_KEK.",
-    ),
-    new_kek: str | None = typer.Option(
-        None,
-        "--new-kek",
-        help="Nouvelle KEK (base64 URL-safe ou standard). Défaut : $HEIMDALL_VAULT_NEW_KEK.",
-    ),
-    old_master_key: str | None = typer.Option(
-        None,
-        "--old-master-key",
-        help="Ancienne clé maîtresse (Argon2id).",
-    ),
-    old_salt: str | None = typer.Option(
-        None,
-        "--old-salt",
-        help="Sel associé à l'ancienne clé maîtresse.",
-    ),
-    new_master_key: str | None = typer.Option(
-        None,
-        "--new-master-key",
-        help="Nouvelle clé maîtresse (Argon2id).",
-    ),
-    new_salt: str | None = typer.Option(
-        None,
-        "--new-salt",
-        help="Sel associé à la nouvelle clé maîtresse.",
-    ),
     target_version: int | None = typer.Option(
         None,
         "--target-version",
@@ -273,10 +259,13 @@ def rotate_kek_command(  # noqa: PLR0913, PLR0917
     """Effectue la rotation transactionnelle de la KEK sur tous les secrets (ticket #71)."""
     try:
         resolved = _resolve_db_path(db_path)
+        if not resolved.is_file() or resolved.stat().st_size == 0:
+            typer.echo(
+                "Erreur : la base de données Vault est introuvable ou vide. Vérifiez --db-path.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         old_cipher = _resolve_cli_cipher(
-            direct=old_kek,
-            master=old_master_key,
-            salt=old_salt,
             env_direct="HEIMDALL_VAULT_OLD_KEK",
             env_fallback="HEIMDALL_VAULT_KEK",
             env_master="HEIMDALL_VAULT_OLD_MASTER_KEY",
@@ -284,9 +273,6 @@ def rotate_kek_command(  # noqa: PLR0913, PLR0917
             label="l'ancienne KEK",
         )
         new_cipher = _resolve_cli_cipher(
-            direct=new_kek,
-            master=new_master_key,
-            salt=new_salt,
             env_direct="HEIMDALL_VAULT_NEW_KEK",
             env_fallback=None,
             env_master="HEIMDALL_VAULT_NEW_MASTER_KEY",
@@ -295,14 +281,13 @@ def rotate_kek_command(  # noqa: PLR0913, PLR0917
         )
         if old_cipher.has_same_key_as(new_cipher):
             raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
-        if target_version is not None and target_version < 1:
-            raise ValueError("Le numéro de version cible doit être supérieur ou égal à 1.")
+        if target_version is not None:
+            validate_kek_version(target_version, label="Le numéro de version cible")
     except ValueError as exc:
         typer.echo(f"Erreur : {exc}", err=True)
         raise typer.Exit(code=2) from None
 
     try:
-        init_db(resolved)
         with db_session(resolved) as conn:
             count = rotate_secrets_kek(
                 conn,
@@ -313,9 +298,19 @@ def rotate_kek_command(  # noqa: PLR0913, PLR0917
     except VaultCipherError:
         typer.echo("Erreur : échec du déchiffrement avec l'ancienne KEK.", err=True)
         raise typer.Exit(code=1) from None
+    except ValueError as exc:
+        typer.echo(f"Erreur : {exc}", err=True)
+        raise typer.Exit(code=2) from None
     except Exception:
         typer.echo("Erreur : échec de la rotation de la KEK.", err=True)
         raise typer.Exit(code=1) from None
+
+    if count == 0:
+        typer.echo(
+            "Erreur : aucun secret trouvé dans la base — vérifiez --db-path.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
     typer.echo(f"Rotation de la KEK réussie : {count} secret(s) réenveloppé(s).")
 

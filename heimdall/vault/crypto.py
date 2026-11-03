@@ -656,7 +656,9 @@ class VaultCipher:
         """Déchiffre une DEK avec cette KEK et la rechiffre avec ``new_cipher`` (#71).
 
         La DEK transitoire est conservée dans un ``bytearray`` effacé dès la fin
-        de l'opération (zeroization). L'AAD est préservé.
+        de l'opération. L'effacement mémoire est best-effort (CPython ne garantit
+        pas l'absence de copies d'objets bytes immuables transitoires créés lors
+        du déchiffrement). L'AAD est préservé.
         """
         if not isinstance(new_cipher, VaultCipher):
             raise TypeError("new_cipher doit être une instance de VaultCipher.")

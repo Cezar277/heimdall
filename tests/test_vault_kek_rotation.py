@@ -31,6 +31,8 @@ from heimdall.vault.database import (
     init_db,
     reenvelope_secret,
     rotate_secrets_kek,
+    update_secret,
+    validate_kek_version,
 )
 from heimdall.vault.store import InMemorySecretStore, SecretStoreError, SqliteSecretStore
 
@@ -210,8 +212,23 @@ class DatabaseRotationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 rotate_secrets_kek(conn, self.old_cipher, same_cipher)
 
-    def test_rotation_with_explicit_target_version(self) -> None:
-        """Permet de spécifier une version cible explicite."""
+    def test_rotation_rejects_target_version_downgrade(self) -> None:
+        """Refuse un numéro de version cible <= à la version actuelle (anti-downgrade)."""
+        store = SqliteSecretStore(self.db_path, self.old_cipher)
+        store._create("proj", "dev", "TOKEN", "val")
+
+        with db_session(self.db_path) as conn:
+            # kek_version actuelle est 1 -> target=1 refusé
+            with self.assertRaises(ValueError) as ctx1:
+                rotate_secrets_kek(conn, self.old_cipher, self.new_cipher, target_kek_version=1)
+            self.assertIn("doit être strictement supérieur", str(ctx1.exception))
+
+            # target=0 refusé
+            with self.assertRaises(ValueError):
+                rotate_secrets_kek(conn, self.old_cipher, self.new_cipher, target_kek_version=0)
+
+    def test_rotation_with_explicit_valid_target_version(self) -> None:
+        """Permet de spécifier une version cible strictement supérieure."""
         store = SqliteSecretStore(self.db_path, self.old_cipher)
         store._create("proj", "dev", "TOKEN", "val")
 
@@ -225,7 +242,6 @@ class DatabaseRotationTests(unittest.TestCase):
         """Un secret hérité sans enveloppe de DEK bloque la rotation."""
         with db_session(self.db_path) as conn:
             create_project(conn, "proj")
-            # Insertion directe d'une ligne héritée sans DEK
             create_secret(
                 conn,
                 "proj",
@@ -239,6 +255,38 @@ class DatabaseRotationTests(unittest.TestCase):
             with self.assertRaises(VaultCipherError):
                 rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
 
+    def test_rotation_on_empty_db_returns_zero(self) -> None:
+        """La rotation sur une base sans aucun secret renvoie 0."""
+        with db_session(self.db_path) as conn:
+            count = rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
+            self.assertEqual(count, 0)
+
+    def test_create_secret_validates_kek_version(self) -> None:
+        """create_secret refuse les versions de KEK < 1 ou de type invalide."""
+        with db_session(self.db_path) as conn:
+            create_project(conn, "proj_val")
+            for invalid_v in (0, -1, -5, True, False, "1"):
+                with self.assertRaises(ValueError):
+                    create_secret(
+                        conn,
+                        "proj_val",
+                        "dev",
+                        f"K_{invalid_v}",
+                        "val",
+                        kek_version=invalid_v,  # type: ignore[arg-type]
+                    )
+
+    def test_update_and_reenvelope_validate_kek_version(self) -> None:
+        """update_secret et reenvelope_secret refusent kek_version < 1."""
+        store = SqliteSecretStore(self.db_path, self.old_cipher)
+        store._create("proj", "dev", "SEC_UPD", "val")
+
+        with db_session(self.db_path) as conn:
+            with self.assertRaises(ValueError):
+                update_secret(conn, "proj", "dev", "SEC_UPD", "new_val", kek_version=0)
+            with self.assertRaises(ValueError):
+                reenvelope_secret(conn, "proj", "dev", "SEC_UPD", "new_dek", kek_version=0)
+
     def test_reenvelope_secret_direct(self) -> None:
         """reenvelope_secret met à jour l'enveloppe et la version sans toucher à la valeur."""
         store = SqliteSecretStore(self.db_path, self.old_cipher)
@@ -249,7 +297,6 @@ class DatabaseRotationTests(unittest.TestCase):
             assert sec_before is not None
             val_before = sec_before["encrypted_value"]
 
-            # Réenveloppement unitaire
             aad = VaultCipher.aad("proj", "dev", "SECRET_SINGLE")
             new_dek = self.old_cipher.rewrap_dek(
                 self.new_cipher, sec_before["encrypted_dek"], aad=aad
@@ -264,6 +311,31 @@ class DatabaseRotationTests(unittest.TestCase):
             self.assertEqual(sec_after["encrypted_value"], val_before)
             self.assertEqual(sec_after["encrypted_dek"], new_dek)
             self.assertEqual(sec_after["kek_version"], 3)
+
+    def test_rotation_under_lock_contention_fails_closed(self) -> None:
+        """En cas de contention sur BEGIN IMMEDIATE, la rotation échoue proprement sans fuite."""
+        store = SqliteSecretStore(self.db_path, self.old_cipher)
+        store._create("proj", "dev", "CONCURRENT_SEC", "val")
+
+        # Ouvrir la connexion pour la rotation et réduire le busy_timeout
+        with db_session(self.db_path) as conn_rotating:
+            conn_rotating.execute("PRAGMA busy_timeout = 10")
+
+            # Ouvrir une seconde connexion qui prend un verrou exclusif
+            conn_locking = sqlite3.connect(str(self.db_path), timeout=0.01)
+            conn_locking.execute("BEGIN EXCLUSIVE")
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    rotate_secrets_kek(conn_rotating, self.old_cipher, self.new_cipher)
+            finally:
+                conn_locking.rollback()
+                conn_locking.close()
+
+        # Vérifier que le secret est resté intact
+        with db_session(self.db_path) as conn_check:
+            sec = get_secret(conn_check, "proj", "dev", "CONCURRENT_SEC")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], 1)
 
 
 class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
@@ -306,6 +378,21 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         r1 = await store.get("demo", "dev", "KEY1")
         assert r1 is not None
         self.assertEqual(r1["value"], "val1")
+
+    async def test_in_memory_store_rotate_kek_rejects_downgrade_and_invalid_version(self) -> None:
+        """InMemorySecretStore.rotate_kek refuse le downgrade et les versions invalides."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = InMemorySecretStore(cipher=old_cipher)
+
+        await store.create("demo", "dev", "KEY1", "val1")
+
+        with self.assertRaises(ValueError):
+            await store.rotate_kek(new_cipher, target_kek_version=0)
+
+        with self.assertRaises(ValueError) as ctx:
+            await store.rotate_kek(new_cipher, target_kek_version=1)
+        self.assertIn("doit être strictement supérieur", str(ctx.exception))
 
 
 class SchemaMigrationTests(unittest.TestCase):
@@ -405,20 +492,27 @@ class VaultRotateCliTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_cli_rotate_nominal_options(self) -> None:
-        """Rotation nominale via options CLI directes."""
+    def test_cli_help_does_not_accept_secret_options_on_argv(self) -> None:
+        """Preuve invariant 9 : aucune option --old-kek ni --new-kek n'existe en argument."""
+        res = self.runner.invoke(cli_app, ["vault", "rotate-kek", "--help"])
+        self.assertEqual(res.exit_code, 0)
+        output_lower = res.output.lower()
+        self.assertNotIn("--old-kek", output_lower)
+        self.assertNotIn("--new-kek", output_lower)
+        self.assertNotIn("--old-master-key", output_lower)
+        self.assertNotIn("--new-master-key", output_lower)
+        self.assertIn("règles de sécurité (invariant 9)", output_lower)
+
+    def test_cli_rotate_nominal_via_env_vars(self) -> None:
+        """Rotation nominale via variables d'environnement."""
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
         res = self.runner.invoke(
             cli_app,
-            [
-                "vault",
-                "rotate-kek",
-                "--db-path",
-                str(self.db_path),
-                "--old-kek",
-                _OLD_KEK_B64,
-                "--new-kek",
-                _NEW_KEK_B64,
-            ],
+            ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+            env=env,
         )
         self.assertEqual(res.exit_code, 0)
         self.assertIn("Rotation de la KEK réussie : 1 secret(s) réenveloppé(s)", res.output)
@@ -430,22 +524,8 @@ class VaultRotateCliTests(unittest.TestCase):
         assert rec is not None
         self.assertEqual(rec["value"], "super_secret_value")
 
-    def test_cli_rotate_via_env_vars(self) -> None:
-        """Rotation via variables d'environnement."""
-        env = {
-            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
-            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
-        }
-        res = self.runner.invoke(
-            cli_app,
-            ["vault", "rotate-kek", "--db-path", str(self.db_path)],
-            env=env,
-        )
-        self.assertEqual(res.exit_code, 0)
-        self.assertIn("Rotation de la KEK réussie", res.output)
-
-    def test_cli_rotate_with_argon2id_derivation(self) -> None:
-        """Rotation avec dérivation de KEK via clé maîtresse Argon2id."""
+    def test_cli_rotate_with_argon2id_derivation_env_vars(self) -> None:
+        """Rotation via Argon2id avec clés et sels passés par l'environnement."""
         old_salt = generate_kek_salt()
         new_salt = generate_kek_salt()
         old_cipher = VaultCipher.from_master_key("old_master_passphrase_32_chars_ok!", old_salt)
@@ -456,22 +536,16 @@ class VaultRotateCliTests(unittest.TestCase):
         store = SqliteSecretStore(db_path, old_cipher)
         store._create("demo", "prod", "TOKEN", "val_argon2")
 
+        env = {
+            "HEIMDALL_VAULT_OLD_MASTER_KEY": "old_master_passphrase_32_chars_ok!",
+            "HEIMDALL_VAULT_OLD_KEK_SALT": old_salt,
+            "HEIMDALL_VAULT_NEW_MASTER_KEY": "new_master_passphrase_32_chars_ok!",
+            "HEIMDALL_VAULT_NEW_KEK_SALT": new_salt,
+        }
         res = self.runner.invoke(
             cli_app,
-            [
-                "vault",
-                "rotate-kek",
-                "--db-path",
-                str(db_path),
-                "--old-master-key",
-                "old_master_passphrase_32_chars_ok!",
-                "--old-salt",
-                old_salt,
-                "--new-master-key",
-                "new_master_passphrase_32_chars_ok!",
-                "--new-salt",
-                new_salt,
-            ],
+            ["vault", "rotate-kek", "--db-path", str(db_path)],
+            env=env,
         )
         self.assertEqual(res.exit_code, 0)
 
@@ -483,63 +557,85 @@ class VaultRotateCliTests(unittest.TestCase):
 
     def test_cli_rotate_rejects_identical_keys(self) -> None:
         """Code 2 si l'ancienne et la nouvelle KEK sont identiques."""
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _OLD_KEK_B64,
+        }
         res = self.runner.invoke(
             cli_app,
-            [
-                "vault",
-                "rotate-kek",
-                "--db-path",
-                str(self.db_path),
-                "--old-kek",
-                _OLD_KEK_B64,
-                "--new-kek",
-                _OLD_KEK_B64,
-            ],
+            ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+            env=env,
         )
         self.assertEqual(res.exit_code, 2)
         self.assertIn("Erreur : L'ancienne et la nouvelle KEK doivent être distinctes", res.output)
 
-    def test_cli_rotate_rejects_missing_keys(self) -> None:
-        """Code 2 si aucune clé n'est fournie."""
+    def test_cli_rotate_rejects_missing_keys_without_echoing(self) -> None:
+        """Code 2 si aucune clé n'est fournie dans l'environnement."""
         res = self.runner.invoke(
             cli_app,
             ["vault", "rotate-kek", "--db-path", str(self.db_path)],
             env={"HEIMDALL_VAULT_OLD_KEK": "", "HEIMDALL_VAULT_KEK": ""},
         )
         self.assertEqual(res.exit_code, 2)
+        self.assertIn("Erreur : l'ancienne KEK manquante", res.output)
 
-    def test_cli_rotate_rejects_invalid_base64(self) -> None:
-        """Code 2 si l'encodage base64 est invalide."""
+    def test_cli_rotate_rejects_nonexistent_or_empty_database(self) -> None:
+        """Code 2 si la base de données est inexistante ou vide sans la créer implicitement."""
+        fake_db = Path(self.tmp.name) / "does_not_exist.db"
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
         res = self.runner.invoke(
             cli_app,
-            [
-                "vault",
-                "rotate-kek",
-                "--db-path",
-                str(self.db_path),
-                "--old-kek",
-                "not-valid-base64!!!",
-                "--new-kek",
-                _NEW_KEK_B64,
-            ],
+            ["vault", "rotate-kek", "--db-path", str(fake_db)],
+            env=env,
         )
         self.assertEqual(res.exit_code, 2)
+        self.assertIn("Erreur : la base de données Vault est introuvable ou vide", res.output)
+        self.assertFalse(fake_db.exists(), "La commande ne doit pas créer une fausse base vide")
+
+    def test_cli_rotate_on_database_with_zero_secrets_exits_one(self) -> None:
+        """Code 1 si la base existe mais ne contient aucun secret (fail-closed)."""
+        empty_db = Path(self.tmp.name) / "empty_vault.db"
+        init_db(empty_db)
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(empty_db)],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 1)
+        self.assertIn("Erreur : aucun secret trouvé dans la base", res.output)
+
+    def test_cli_rotate_rejects_target_version_downgrade(self) -> None:
+        """Code 2 si --target-version tente un downgrade."""
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(self.db_path), "--target-version", "1"],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 2)
+        self.assertIn("Erreur : Le numéro de version cible (1) doit être", res.output)
 
     def test_cli_rotate_wrong_old_key_exits_one(self) -> None:
         """Code 1 si l'ancienne KEK fournie ne parvient pas à déchiffrer les DEK."""
         wrong_old_kek = base64.urlsafe_b64encode(b"W" * 32).decode("ascii")
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": wrong_old_kek,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
         res = self.runner.invoke(
             cli_app,
-            [
-                "vault",
-                "rotate-kek",
-                "--db-path",
-                str(self.db_path),
-                "--old-kek",
-                wrong_old_kek,
-                "--new-kek",
-                _NEW_KEK_B64,
-            ],
+            ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+            env=env,
         )
         self.assertEqual(res.exit_code, 1)
         self.assertIn("échec du déchiffrement avec l'ancienne KEK", res.output)
@@ -547,36 +643,41 @@ class VaultRotateCliTests(unittest.TestCase):
     def test_cli_aliases_work(self) -> None:
         """Les alias `rotate` et `kek-rotate` exécutent la même commande."""
         # Premier alias : rotation de OLD vers NEW
+        env1 = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
         res1 = self.runner.invoke(
             cli_app,
-            [
-                "vault",
-                "rotate",
-                "--db-path",
-                str(self.db_path),
-                "--old-kek",
-                _OLD_KEK_B64,
-                "--new-kek",
-                _NEW_KEK_B64,
-            ],
+            ["vault", "rotate", "--db-path", str(self.db_path)],
+            env=env1,
         )
         self.assertEqual(res1.exit_code, 0)
         self.assertIn("Rotation de la KEK réussie", res1.output)
 
         # Deuxième alias : rotation subséquente de NEW vers une troisième KEK
         third_kek_b64 = base64.urlsafe_b64encode(b"3" * 32).decode("ascii")
+        env2 = {
+            "HEIMDALL_VAULT_OLD_KEK": _NEW_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": third_kek_b64,
+        }
         res2 = self.runner.invoke(
             cli_app,
-            [
-                "vault",
-                "kek-rotate",
-                "--db-path",
-                str(self.db_path),
-                "--old-kek",
-                _NEW_KEK_B64,
-                "--new-kek",
-                third_kek_b64,
-            ],
+            ["vault", "kek-rotate", "--db-path", str(self.db_path)],
+            env=env2,
         )
         self.assertEqual(res2.exit_code, 0)
         self.assertIn("Rotation de la KEK réussie", res2.output)
+
+
+class ValidateKekVersionHelperTests(unittest.TestCase):
+    """Tests unitaires de validate_kek_version."""
+
+    def test_validate_kek_version_nominal(self) -> None:
+        self.assertEqual(validate_kek_version(1), 1)
+        self.assertEqual(validate_kek_version(42), 42)
+
+    def test_validate_kek_version_rejects_invalid_types_and_values(self) -> None:
+        for val in (0, -1, -99, True, False, "1", 1.5, None):
+            with self.assertRaises(ValueError):
+                validate_kek_version(val)
