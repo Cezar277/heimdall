@@ -65,6 +65,9 @@ jobs:
         # (intégrité vérifiée) au lieu d'un `npx` sans vérification.
         # Node 22 ou >=24 requis par spectral-cli 6.17.0 ; .npmrc active
         # engine-strict pour échouer tôt sur une version incompatible.
+        # Garde-temps : un registre npm accroché ne doit pas immobiliser le
+        # runner self-hosted (défaut 360 min).
+        timeout-minutes: 5
         run: |
           node --version
           npm --version
