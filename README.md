@@ -89,14 +89,15 @@ export HEIMDALL_VAULT_SSL_KEYFILE='/chemin/absolu/server.key'
 python -m heimdall.vault.app
 ```
 
-Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une KEK qui ne
-réside jamais dans la base. La KEK est **dérivée une seule fois au démarrage**
-avec Argon2id (64 Mio, 3 itérations, 4 lanes, sel public de 16 octets) depuis
-`HEIMDALL_VAULT_MASTER_KEY` + `HEIMDALL_VAULT_KEK_SALT`, puis conservée en
-mémoire ; les requêtes ne recalculent jamais la KDF. Le mode historique
-`HEIMDALL_VAULT_KEK` (KEK 32 octets directe) reste accepté pour les données
-existantes, mais les deux modes sont exclusifs. Détails et justification du
-choix Argon2id vs HKDF : [ADR-005](docs/adr/005-derivation-kek-argon2id.md).
+Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une DEK propre au
+secret, elle-même chiffrée par une KEK qui ne réside jamais dans la base. La KEK
+est **dérivée une seule fois au démarrage** avec Argon2id (64 Mio, 3 itérations,
+4 lanes, sel public de 16 octets) depuis `HEIMDALL_VAULT_MASTER_KEY` +
+`HEIMDALL_VAULT_KEK_SALT`, puis conservée en mémoire ; les requêtes ne
+recalculent jamais la KDF. Le mode historique `HEIMDALL_VAULT_KEK` (KEK 32
+octets directe) reste accepté pour les données existantes, mais les deux modes
+sont exclusifs. Détails et justification du choix Argon2id vs HKDF :
+[ADR-005](docs/adr/005-derivation-kek-argon2id.md).
 `UNIQUE(project_id, env, name)` garantit le 409 inter-workers et
 `PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
 Le backend mémoire, réservé aux tests/développement, chiffre également les
@@ -382,6 +383,15 @@ le nonce AES-GCM de 96 bits est tiré de `os.urandom` **à chaque** chiffrement
 l'authentification. Deux chiffrements du même texte donnent donc deux blobs
 différents — c'est la preuve archivée pour le rapport. Preuves :
 [`docs/t67-samm.md`](docs/t67-samm.md).
+
+Chiffrement par enveloppe (sous-ticket T263 de #26) : chaque secret reçoit une
+DEK aléatoire de 32 octets ; la valeur est chiffrée avec la DEK, puis la DEK
+est chiffrée avec la KEK. Les deux blobs sont stockés dans la même ligne
+(`encrypted_value`, `encrypted_dek`). Une fuite de DEK ne compromet donc qu'un
+secret, et la KEK ne chiffre que des clés. Les lignes héritées, chiffrées
+directement par la KEK avant #70, restent lisibles. Preuves :
+[`docs/t263-samm.md`](docs/t263-samm.md),
+`tests/test_vault_dek_envelope.py`.
 
 Falsification du chiffrement au repos (sous-ticket T68 de #26, via #66
 « Module crypto isolé ») : un seul octet modifié du blob (nonce, ciphertext ou

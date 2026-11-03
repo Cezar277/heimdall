@@ -219,6 +219,17 @@ class AadBindingTests(unittest.TestCase):
         self.assertNotIn(_PLAINTEXT.decode(), message)
         self.assertNotIn(_PLAINTEXT.hex(), message)
 
+    def test_primitive_value_error_is_translated_to_vault_cipher_error(self) -> None:
+        """Une ValueError future de la primitive ne fuit pas brute de ``VaultCipher``."""
+        cipher = VaultCipher(_KEY)
+        blob = cipher.encrypt(_PLAINTEXT, aad=_AAD)
+        with patch.object(cipher, "_aead") as aead:
+            aead.decrypt.side_effect = ValueError("synthetic primitive failure")
+            with self.assertRaises(VaultCipherError) as ctx:
+                cipher.decrypt(blob, aad=_AAD)
+        self.assertNotIn(_PLAINTEXT.decode(), str(ctx.exception))
+        self.assertNotIn("synthetic primitive failure", str(ctx.exception))
+
 
 class StoredSecretBindingTests(unittest.IsolatedAsyncioTestCase):
     """Le blob stocké en base est lié à l'identité du secret qu'il protège."""
@@ -239,23 +250,36 @@ class StoredSecretBindingTests(unittest.IsolatedAsyncioTestCase):
 
             with db_session(db_path) as conn:
                 rows = conn.execute(
-                    "SELECT name, encrypted_value FROM secrets ORDER BY name"
+                    "SELECT name, encrypted_value, encrypted_dek FROM secrets ORDER BY name"
                 ).fetchall()
-            blobs = {row["name"]: row["encrypted_value"] for row in rows}
+            blobs = {
+                row["name"]: (row["encrypted_value"], row["encrypted_dek"])
+                for row in rows
+            }
             self.assertEqual(sorted(blobs), ["SECRET_ONE", "SECRET_TWO"])
-            # Même valeur, deux secrets : deux blobs (nonce différent).
-            self.assertNotEqual(blobs["SECRET_ONE"], blobs["SECRET_TWO"])
+            # Même valeur, deux secrets : deux valeurs chiffrées et deux DEK
+            # enveloppées distinctes (nonce et DEK tirés à chaque création).
+            self.assertNotEqual(blobs["SECRET_ONE"][0], blobs["SECRET_TWO"][0])
+            self.assertNotEqual(blobs["SECRET_ONE"][1], blobs["SECRET_TWO"][1])
 
-            # Chaque blob ne se déchiffre que sous l'identité de son secret.
-            for name, blob in blobs.items():
+            # Chaque enveloppe ne se déchiffre que sous l'identité de son secret.
+            for name, (encrypted_value, encrypted_dek) in blobs.items():
                 with self.subTest(name=name):
                     self.assertEqual(
-                        cipher.decrypt(blob, aad=VaultCipher.aad("demo", "dev", name)),
+                        cipher.decrypt_envelope(
+                            encrypted_value,
+                            encrypted_dek,
+                            aad=VaultCipher.aad("demo", "dev", name),
+                        ),
                         _PLAINTEXT,
                     )
                     other = "SECRET_TWO" if name == "SECRET_ONE" else "SECRET_ONE"
                     with self.assertRaises(VaultCipherError):
-                        cipher.decrypt(blob, aad=VaultCipher.aad("demo", "dev", other))
+                        cipher.decrypt_envelope(
+                            encrypted_value,
+                            encrypted_dek,
+                            aad=VaultCipher.aad("demo", "dev", other),
+                        )
 
             # La valeur en clair n'est jamais écrite dans le fichier SQLite.
             self.assertNotIn(_PLAINTEXT.decode(), db_path.read_bytes().decode("latin-1"))
