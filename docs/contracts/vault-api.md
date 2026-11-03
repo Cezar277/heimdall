@@ -152,18 +152,23 @@ rejeté en 400 avant toute décision d'autorisation.
 que par la lecture autorisée et n'est jamais renvoyé au POST.
 
 Chiffrement au repos : le backend SQLite (défaut en production) chiffre chaque
-valeur avec AES-256-GCM et une KEK `HEIMDALL_VAULT_KEK` de 32 octets encodée
-base64, **distincte du pepper** et jamais stockée dans la base. La séparation
-est vérifiée sur l'entropie décodée (KEK brute vs pepper UTF-8) : deux
-représentations d'une même clé sont refusées, pas seulement la copie exacte des
-chaînes (invariant 5). Chaque ciphertext
+valeur avec AES-256-GCM et une KEK de 32 octets, **distincte du pepper** et
+jamais stockée dans la base. La KEK est soit fournie directement
+(`HEIMDALL_VAULT_KEK`, mode historique), soit **dérivée une seule fois au
+démarrage** avec Argon2id depuis `HEIMDALL_VAULT_MASTER_KEY` +
+`HEIMDALL_VAULT_KEK_SALT` (ticket #262, 64 Mio / 3 itérations / 4 lanes, sel
+public de 16 octets) ; les deux modes sont exclusifs. La dérivation est
+documentée dans [ADR-005](../adr/005-derivation-kek-argon2id.md). La séparation
+avec le pepper est vérifiée sur l'entropie décodée (KEK brute vs pepper UTF-8) :
+deux représentations d'une même clé sont refusées, pas seulement la copie exacte
+des chaînes (invariant 5). Chaque ciphertext
 est lié par AAD au triplet `(project, env, name)` ; la contrainte SQLite
 `UNIQUE(project_id, env, name)` assure l'anti-écrasement entre workers. Le nonce
 AES-GCM de 96 bits est tiré de l'aléatoire du système (`os.urandom`) **à chaque
 chiffrement** (ticket #67) : il n'est ni un compteur ni dérivé de l'heure, donc
 jamais réutilisé avec la même clé, et le blob stocké contient
 `nonce + ciphertext + tag` (l'étiquette GCM de 16 octets est déjà en fin de
-ciphertext). Deux chiffremens de la même valeur donnent donc deux blobs
+ciphertext). Deux chiffrements de la même valeur donnent donc deux blobs
 différents, et un blob copié sur un autre secret échoue à l'authentification
 (AAD différent). Le backend
 mémoire, réservé aux tests/développement, chiffre aussi son dictionnaire avec une
