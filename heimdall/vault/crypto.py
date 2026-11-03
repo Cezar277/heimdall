@@ -714,8 +714,14 @@ class VaultCipher:
         l'AAD ``(project, env, name)`` au message : deux valeurs identiques
         stockées sous des triplets distincts produisent des empreintes
         distinctes, donc non corrélables depuis la seule base. Déterministe pour
-        un même ``(KEK, aad, valeur)`` ; auxiliaire, recalculable après une
-        rotation de KEK.
+        un même ``(KEK, aad, valeur)``.
+
+        Note d'architecture (#71) : cette empreinte est un auxiliaire pré-rotation
+        calculé lors de l'insertion initiale. Lors d'une rotation de KEK par
+        enveloppe (#71), seules les DEK sont réenveloppées ; les valeurs ne sont
+        jamais déchiffrées en mémoire, préservant le secret absolu des données.
+        L'empreinte reste donc volontairement inchangée et ne doit pas servir de
+        contrôle d'intégrité post-rotation.
         """
         message = bytes(aad) + b"\x00" + bytes(plaintext)
         return hmac.new(self._fingerprint_key, message, hashlib.sha256).hexdigest()

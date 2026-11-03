@@ -325,8 +325,13 @@ class DatabaseRotationTests(unittest.TestCase):
             conn_locking = sqlite3.connect(str(self.db_path), timeout=0.01)
             conn_locking.execute("BEGIN EXCLUSIVE")
             try:
-                with self.assertRaises(sqlite3.OperationalError):
+                with self.assertRaises(sqlite3.OperationalError) as ctx:
                     rotate_secrets_kek(conn_rotating, self.old_cipher, self.new_cipher)
+                err_msg = str(ctx.exception)
+                self.assertNotIn("kek", err_msg.lower())
+                self.assertNotIn("dek", err_msg.lower())
+                self.assertNotIn(_OLD_KEK_BYTES.hex(), err_msg)
+                self.assertNotIn(_NEW_KEK_BYTES.hex(), err_msg)
             finally:
                 conn_locking.rollback()
                 conn_locking.close()
@@ -393,6 +398,92 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError) as ctx:
             await store.rotate_kek(new_cipher, target_kek_version=1)
         self.assertIn("doit être strictement supérieur", str(ctx.exception))
+
+    async def test_sqlite_store_create_after_rotate_has_target_kek_version(self) -> None:
+        """Un secret créé après rotation SQLite hérite de la nouvelle kek_version."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-store-postrot-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(_OLD_KEK_BYTES)
+            new_cipher = VaultCipher(_NEW_KEK_BYTES)
+            store = SqliteSecretStore(db_path, old_cipher)
+
+            await store.create("proj", "dev", "PRE_ROT", "val_pre")
+            with db_session(db_path) as conn:
+                sec_pre = get_secret(conn, "proj", "dev", "PRE_ROT")
+                assert sec_pre is not None
+                self.assertEqual(sec_pre["kek_version"], 1)
+
+            # Rotation vers version 42
+            count = await store.rotate_kek(new_cipher, target_kek_version=42)
+            self.assertEqual(count, 1)
+            self.assertEqual(store.kek_version, 42)
+
+            # Création post-rotation
+            await store.create("proj", "dev", "POST_ROT", "val_post")
+
+            with db_session(db_path) as conn:
+                sec_post = get_secret(conn, "proj", "dev", "POST_ROT")
+                assert sec_post is not None
+                self.assertEqual(sec_post["kek_version"], 42)
+
+            # Les deux secrets se lisent avec le store mis à jour
+            r_pre = await store.get("proj", "dev", "PRE_ROT")
+            r_post = await store.get("proj", "dev", "POST_ROT")
+            assert r_pre is not None and r_post is not None
+            self.assertEqual(r_pre["value"], "val_pre")
+            self.assertEqual(r_post["value"], "val_post")
+
+    async def test_in_memory_store_create_after_rotate_has_target_kek_version(self) -> None:
+        """Un secret créé après rotation mémoire hérite de la nouvelle kek_version."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = InMemorySecretStore(cipher=old_cipher)
+
+        await store.create("proj", "dev", "PRE_ROT", "val_pre")
+        self.assertEqual(store._secrets[("proj", "dev", "PRE_ROT")]["kek_version"], 1)
+
+        count = await store.rotate_kek(new_cipher, target_kek_version=15)
+        self.assertEqual(count, 1)
+        self.assertEqual(store.kek_version, 15)
+
+        await store.create("proj", "dev", "POST_ROT", "val_post")
+        self.assertEqual(store._secrets[("proj", "dev", "POST_ROT")]["kek_version"], 15)
+
+        r_pre = await store.get("proj", "dev", "PRE_ROT")
+        r_post = await store.get("proj", "dev", "POST_ROT")
+        assert r_pre is not None and r_post is not None
+        self.assertEqual(r_pre["value"], "val_pre")
+        self.assertEqual(r_post["value"], "val_post")
+
+    async def test_sqlite_store_rotate_empty_does_not_swap_cipher(self) -> None:
+        """La rotation sur un SqliteSecretStore vide retourne 0 sans modifier son cipher."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-store-empty-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(_OLD_KEK_BYTES)
+            new_cipher = VaultCipher(_NEW_KEK_BYTES)
+            store = SqliteSecretStore(db_path, old_cipher)
+
+            count = await store.rotate_kek(new_cipher)
+            self.assertEqual(count, 0)
+            self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+            self.assertEqual(store.kek_version, 1)
+
+            # Un secret créé après cette tentative vide reste chiffrable sous l'ancienne clé
+            await store.create("proj", "dev", "POST_EMPTY", "val")
+            r = await store.get("proj", "dev", "POST_EMPTY")
+            assert r is not None
+            self.assertEqual(r["value"], "val")
+
+    async def test_in_memory_store_rotate_empty_does_not_swap_cipher(self) -> None:
+        """La rotation sur un InMemorySecretStore vide retourne 0 sans modifier son cipher."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = InMemorySecretStore(cipher=old_cipher)
+
+        count = await store.rotate_kek(new_cipher)
+        self.assertEqual(count, 0)
+        self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+        self.assertEqual(store.kek_version, 1)
 
 
 class SchemaMigrationTests(unittest.TestCase):

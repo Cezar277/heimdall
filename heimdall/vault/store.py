@@ -31,6 +31,7 @@ destructive n'est nécessaire.
 """
 
 import asyncio
+import logging
 import sqlite3
 import unicodedata
 from pathlib import Path
@@ -48,6 +49,8 @@ from heimdall.vault.database import (
     validate_kek_version,
 )
 from heimdall.vault.database import runtime_db_session as db_session
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_SECRETS: int = 10_000
 _DEFAULT_MAX_SECRETS_PER_PROJECT: int = 1_000
@@ -135,6 +138,12 @@ class InMemorySecretStore:
         self._max_secrets = max_secrets
         self._max_secrets_per_project = max_secrets_per_project
         self._cipher = cipher if cipher is not None else VaultCipher.generate()
+        self._kek_version: int = 1
+
+    @property
+    def kek_version(self) -> int:
+        """Numéro de version courant de la KEK gérée par ce store."""
+        return self._kek_version
 
     async def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
         async with self._lock:
@@ -170,6 +179,7 @@ class InMemorySecretStore:
                 "status": "vaulte",
                 "encrypted_value": envelope.encrypted_value,
                 "encrypted_dek": envelope.encrypted_dek,
+                "kek_version": self._kek_version,
             }
             self._secrets[key] = record
             self._project_counts[project] = project_count + 1
@@ -235,6 +245,7 @@ class InMemorySecretStore:
                     self._secrets[key] = updated_record
                     count += 1
                 self._cipher = new_cipher
+                self._kek_version = new_version
                 return count
             except Exception:
                 self._secrets = backup
@@ -289,6 +300,26 @@ class SqliteSecretStore:
         self._max_secrets = max_secrets
         self._max_secrets_per_project = max_secrets_per_project
         init_db(db_path)
+        self._kek_version: int = self._detect_current_kek_version()
+
+    @property
+    def kek_version(self) -> int:
+        """Numéro de version courant de la KEK gérée par ce store."""
+        return self._kek_version
+
+    def _detect_current_kek_version(self) -> int:
+        """Détecte la version KEK maximale déjà persistée dans la base (défaut 1)."""
+        try:
+            with db_session(self._db_path) as conn:
+                row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
+                if row and row[0] is not None:
+                    return max(1, int(row[0]))
+        except (sqlite3.Error, OSError) as exc:
+            logger.debug(
+                "Impossible de lire MAX(kek_version) à l'initialisation du store : %s",
+                exc,
+            )
+        return 1
 
     @property
     def db_path(self) -> Path | str:
@@ -342,6 +373,7 @@ class SqliteSecretStore:
                     name,
                     envelope.encrypted_value,
                     encrypted_dek=envelope.encrypted_dek,
+                    kek_version=self._kek_version,
                     fingerprint=fingerprint,
                 )
             except sqlite3.IntegrityError:
@@ -390,5 +422,16 @@ class SqliteSecretStore:
                 new_cipher,
                 target_kek_version=target_kek_version,
             )
+            if count == 0:
+                # Store vide : aucun secret réenveloppé, self._cipher et self._kek_version
+                # restent inchangés (aligné sur InMemorySecretStore).
+                return 0
+            row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
+            if row and row[0] is not None:
+                self._kek_version = int(row[0])
+            elif target_kek_version is not None:
+                self._kek_version = target_kek_version
+            else:
+                self._kek_version += 1
         self._cipher = new_cipher
         return count

@@ -1420,6 +1420,8 @@ def rotate_secrets_kek(
       ne sont JAMAIS rechiffrées ni modifiées.
     - La colonne ``kek_version`` est strictement monotone (target_kek_version > max courant).
     - Les DEK déchiffrées en mémoire sont effacées (zeroization) dès leur réenveloppement.
+    - L'empreinte auxiliaire (fingerprint) reste strictement inchangée car les
+      valeurs ne sont jamais déchiffrées en mémoire lors de la rotation.
     - Échoue fail-closed si un secret hérité (#25/#62) sans enveloppe de DEK est rencontré.
     """
     from heimdall.vault.crypto import VaultCipher, VaultCipherError  # noqa: PLC0415
