@@ -183,13 +183,56 @@ test('le shim n\'expose que des helpers bornés (allowlist explicite)', () => {
   );
 });
 
+test('defaults() borne aussi ses sous-helpers', () => {
+  const pattern = '**/../a/b/'.repeat(200) + 'x';
+  const braces = '{a,b,c,d,e,f,g,h,i,j}'.repeat(10);
+  const bounded = minimatch.defaults({});
+
+  assert.equal(typeof bounded, 'function');
+  assert.equal(bounded('a', '{a,b}'), true);
+  assert.ok(bounded.braceExpand(braces).length <= 1000);
+  assert.equal(
+    new bounded.Minimatch(pattern, { optimizationLevel: 2 }).set.length,
+    1000,
+  );
+  assert.equal(typeof bounded.filter('*.yaml'), 'function');
+  assert.deepEqual(bounded.match(['a', 'z'], '{a,b}'), ['a']);
+  // defaults() imbriqué : la borne doit survivre à chaque étage.
+  const nested = bounded.defaults({});
+  assert.ok(nested.braceExpand(braces).length <= 1000);
+  assert.ok(
+    new nested.Minimatch(pattern, { optimizationLevel: 2 }).set.length <= 1000,
+  );
+});
+
+test('braceExpandMax: undefined explicite ne désactive pas la borne', () => {
+  const braces = '{a,b,c,d,e,f,g,h,i,j}'.repeat(10);
+  const pattern = '**/../a/b/'.repeat(200) + 'x';
+
+  assert.ok(minimatch.braceExpand(braces, { braceExpandMax: undefined }).length <= 1000);
+  assert.ok(
+    minimatch.braceExpand(braces, { braceExpandMax: null }).length <= 1000,
+  );
+  assert.equal(
+    new minimatch.Minimatch(pattern, {
+      optimizationLevel: 2,
+      braceExpandMax: undefined,
+    }).set.length,
+    1000,
+  );
+  // Un appelant peut toujours relever explicitement la borne.
+  assert.ok(
+    minimatch.braceExpand(braces, { braceExpandMax: 5000 }).length > 1000,
+  );
+});
+
 test('le contenu du shim vendor/ est figé (dépendance `file:` sans hash)', () => {
   // `npm ci` ne peut pas vérifier l'intégrité d'une dépendance `file:` : ce
   // test est le hash registre. Il casse volontairement à chaque modification
   // du shim — mettre à jour les digests dans le même commit que la revue.
   const expected = {
     'vendor/minimatch-cjs/index.js':
-      'b81fca8a7f042db2d51fc8aed2b0c07469530311da409a69e642412685583738',
+      'cee833bcc6c2b44f02fe1c42cd5c4c037988dd60d11676aee3a5cfb88e674c08',
     'vendor/minimatch-cjs/package.json':
       '855f40fe431ea1b95db09c4fafce2b4619ddcc317646ab566891249fdcc4c185',
   };

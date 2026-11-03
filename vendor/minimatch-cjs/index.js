@@ -39,10 +39,21 @@ const {
   unescape,
 } = upstream;
 
-const DEFAULT_OPTIONS = Object.freeze({ braceExpandMax: 1000 });
+const DEFAULT_BRACE_EXPAND_MAX = 1000;
 
+// `{ braceExpandMax: undefined }` (ou `null`) ne doit PAS désactiver la borne :
+// on coalesce explicitement au lieu de laisser l'amont retomber sur 100_000.
 function withDefaults(options) {
-  return { ...DEFAULT_OPTIONS, ...options };
+  const { braceExpandMax, ...rest } = options ?? {};
+  return { ...rest, braceExpandMax: braceExpandMax ?? DEFAULT_BRACE_EXPAND_MAX };
+}
+
+// Pour les helpers déjà liés à un `def` (retour de `defaults()`), il ne faut
+// PAS réinjecter 1000 : on retire seulement les valeurs nulles pour laisser
+// le `def` garder la main (ex. `defaults({ braceExpandMax: 50 })`).
+function coalesceOptions(options) {
+  const { braceExpandMax, ...rest } = options ?? {};
+  return braceExpandMax == null ? rest : { ...rest, braceExpandMax };
 }
 
 function shim(source, pattern, options) {
@@ -62,11 +73,33 @@ shim.match = (list, pattern, options) =>
 shim.braceExpand = (pattern, options) =>
   braceExpand(pattern, withDefaults(options));
 // `defaults(def)` renvoie une fonction `minimatch` pré-configurée (et non un
-// objet d'options) : on lui passe donc la borne, puis on rétablit la forme
-// d'export attendue par les appelants (`default` / `minimatch`).
+// objet d'options). Ses sous-helpers restent fermés sur les défauts amont : on
+// les ré-enveloppe un par un pour qu'eux aussi passent par `withDefaults`.
 shim.defaults = (options) => {
   const bound = defaults(withDefaults(options));
-  return Object.assign(bound, { default: bound, minimatch: bound });
+  const {
+    Minimatch: BoundMinimatch,
+    filter: boundFilter,
+    match: boundMatch,
+    braceExpand: boundBraceExpand,
+  } = bound;
+
+  bound.Minimatch = class extends BoundMinimatch {
+    constructor(pattern, opts) {
+      super(pattern, coalesceOptions(opts));
+    }
+  };
+  bound.filter = (pattern, opts) => boundFilter(pattern, coalesceOptions(opts));
+  bound.match = (list, pattern, opts) =>
+    boundMatch(list, pattern, coalesceOptions(opts));
+  bound.braceExpand = (pattern, opts) =>
+    boundBraceExpand(pattern, coalesceOptions(opts));
+  bound.defaults = (opts) =>
+    shim.defaults({ ...(options ?? {}), ...coalesceOptions(opts) });
+  bound.minimatch = bound;
+  bound.default = bound;
+
+  return bound;
 };
 // Constantes et helpers purs : ils ne construisent aucun `Minimatch`.
 shim.sep = sep;
