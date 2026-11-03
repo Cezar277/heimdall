@@ -126,7 +126,7 @@ portée par le chiffreur du store** (`VaultCipher.key_reuses_pepper`), sans
 dérivation supplémentaire.
 
 **Risque résiduel accepté** (revue, statu quo — non effaçable en Python) :
-quatre copies survivent au processus et ne sont pas remises à zéro :
+cinq copies survivent au processus et ne sont pas remises à zéro :
 
 1. la copie `bytes` transitoire exigée par `argon2-cffi` (API de la
    librairie), créée au dernier moment et limitée à la durée de l'appel — la
@@ -134,7 +134,10 @@ quatre copies survivent au processus et ne sont pas remises à zéro :
    potentiellement partagé, cette mutation est donc exclue ;
 2. les copies internes de la librairie Argon2 (matrice de calcul de la KDF) ;
 3. `settings.master_key` (`str` immuable) ;
-4. l'entrée `HEIMDALL_VAULT_MASTER_KEY` de `os.environ`.
+4. l'entrée `HEIMDALL_VAULT_MASTER_KEY` de `os.environ` ;
+5. les copies transitoires produites par le décodage base64/hexadécimal de la
+   KEK et du pepper lors du contrôle de l'invariant 5 (comparaison en temps
+   constant, sans persistance).
 
 Impact : exposition locale à un dump mémoire du processus seulement — aucune
 fuite ni journal réseau. Ces éléments ne sont pas présentés comme une
@@ -171,10 +174,10 @@ utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
   aucune clé n'est fournie) ; si la paire maître/sel est fournie, la KEK est
   dérivée comme en production.
 - **Invariant 5** : la KEK dérivée (brute, base64 URL-safe et standard) est
-  comparée en temps constant au pepper d'authentification, et le pepper est
-  lui aussi décodé lorsqu'il est un base64 de 32 octets : un pepper
-  `b64standard` (`+/` + padding) qui encode la KEK `b64url` (`-_`) est refusé.
-  La clé maîtresse et le pepper restent deux secrets distincts.
+  comparée en temps constant au pepper d'authentification ; le pepper est
+  décodé en base64 (deux alphabets) puis en hexadécimal : un `b64standard`
+  (`+/` + padding) ou un `KEK.hex()` qui encode la KEK `b64url` (`-_`) est
+  refusé. La clé maîtresse et le pepper restent deux secrets distincts.
 
 ## Conséquences
 
@@ -196,17 +199,19 @@ utilisés tels quels (appellants qui détiennent déjà une clé aléatoire).
   `derive_kek_from_master_key`, `VaultCipher.from_master_key`),
   `heimdall/vault/app.py` (`VaultSettings.master_key`, `VaultSettings.kek_salt`,
   `_resolve_vault_cipher`).
-- Tests : `tests/test_vault_kek_derivation.py` (45 tests), dont le critère
+- Tests : `tests/test_vault_kek_derivation.py` (48 tests), dont le critère
   « Fait quand » (`test_same_master_key_and_same_salt_derive_the_same_kek`),
   l'égalité NFC/NFD (`test_nfc_and_nfd_master_keys_derive_the_same_kek`), le
   verrou « KDF en panne ⇒ démarrage refusé »
   (`test_kdf_failure_is_fail_closed_at_startup`), l'invariant 5 sur la KEK
   réelle du store explicite (`test_explicit_store_rejects_cipher_key_equal_to_pepper`,
-  `test_explicit_store_rejects_standard_base64_pepper`), le refus du pepper
-  sous l'autre alphabet base64
-  (`test_derived_kek_equal_to_standard_base64_pepper_is_rejected`,
-  `test_kek_matches_pepper_detects_standard_base64_alphabet`), le store
-  explicite sans chiffreur
+  `test_explicit_store_rejects_standard_base64_pepper`,
+  `test_explicit_store_rejects_hex_pepper`), le refus du pepper sous l'autre
+  alphabet base64 (`test_derived_kek_equal_to_standard_base64_pepper_is_rejected`,
+  `test_kek_matches_pepper_detects_standard_base64_alphabet`) et sous
+  l'encodage hexadécimal (`test_derived_kek_equal_to_hex_pepper_is_rejected`,
+  `test_kek_matches_pepper_detects_hex_encoding`), le store explicite sans
+  chiffreur
   (`test_explicit_store_without_cipher_fails_closed`), l'effacement
   best-effort sans mutation d'`bytes`
   (`test_derivation_zeroizes_normalized_buffer_after_success`,
