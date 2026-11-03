@@ -646,6 +646,32 @@ class VaultCipher:
             raise VaultCipherError("DEK déchiffrée invalide.")
         return dek
 
+    def rewrap_dek(
+        self,
+        new_cipher: "VaultCipher",
+        encrypted_dek: str,
+        *,
+        aad: bytes = b"",
+    ) -> str:
+        """Déchiffre une DEK avec cette KEK et la rechiffre avec ``new_cipher`` (#71).
+
+        La DEK transitoire est conservée dans un ``bytearray`` effacé dès la fin
+        de l'opération (zeroization). L'AAD est préservé.
+        """
+        if not isinstance(new_cipher, VaultCipher):
+            raise TypeError("new_cipher doit être une instance de VaultCipher.")
+        dek = bytearray(self.unwrap_dek(encrypted_dek, aad=aad))
+        try:
+            return new_cipher.wrap_dek(dek, aad=aad)
+        finally:
+            dek[:] = b"\x00" * len(dek)
+
+    def has_same_key_as(self, other: object) -> bool:
+        """Indique si deux chiffreurs utilisent la même KEK sous-jacente."""
+        if not isinstance(other, VaultCipher):
+            return False
+        return constant_time_equal(self._key, other._key)
+
     def encrypt_envelope(self, plaintext: bytes, *, aad: bytes = b"") -> SecretEnvelope:
         """Chiffre une valeur par enveloppe : DEK neuve, puis DEK chiffrée par la KEK.
 

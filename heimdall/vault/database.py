@@ -56,6 +56,8 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from heimdall.vault.crypto import VaultCipher, VaultCipherError
+
 logger = logging.getLogger(__name__)
 
 SecretStatus = Literal["vaulte", "rote"]
@@ -110,6 +112,8 @@ CREATE TABLE IF NOT EXISTS secrets (
     -- DEK chiffrée par la KEK (ticket #70) ; NULL = ligne héritée (#25/#62)
     -- chiffrée directement par la KEK. Les nouvelles lignes renseignent les deux.
     encrypted_dek TEXT,
+    -- Version de la KEK ayant enveloppé la DEK (ticket #71).
+    kek_version INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'vaulte',
     fingerprint TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -710,6 +714,7 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
         "name",
         "encrypted_value",
         "encrypted_dek",
+        "kek_version",
         "status",
         "fingerprint",
         "created_at",
@@ -912,14 +917,37 @@ def _ensure_secret_envelope_column(conn: sqlite3.Connection) -> None:
             raise
 
 
+def _ensure_secret_kek_version_column(conn: sqlite3.Connection) -> None:
+    """Ajoute `secrets.kek_version` aux bases créées avant le ticket #71.
+
+    La migration est idempotente et purement additive : la valeur par défaut
+    est 1 pour toutes les lignes existantes.
+    """
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
+    }
+    if "kek_version" in columns:
+        return
+    try:
+        conn.execute(
+            "ALTER TABLE secrets ADD COLUMN kek_version INTEGER NOT NULL DEFAULT 1"
+        )
+    except sqlite3.OperationalError:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
+        }
+        if "kek_version" not in columns:
+            raise
+
+
 def init_db(db_path: Path | str | None = None) -> None:
     """Initialise à froid la base de données SQLite en créant le schéma complet.
 
     Exécute le script DDL créant `projects`, `api_keys`, `secrets` et leurs index,
-    applique la migration additive de la colonne d'enveloppe `encrypted_dek`
-    (ticket #70), puis vérifie la conformité et l'intégrité du schéma via
-    `_verify_schema()`. Réutilise `get_connection()` pour garantir les mêmes
-    gardes de sécurité (symlink, umask, permissions, journal_mode=DELETE).
+    applique les migrations additives des colonnes d'enveloppe `encrypted_dek` (#70)
+    et de version `kek_version` (#71), puis vérifie la conformité et l'intégrité
+    du schéma via `_verify_schema()`. Réutilise `get_connection()` pour garantir
+    les mêmes gardes de sécurité (symlink, umask, permissions, journal_mode=DELETE).
     Lève RuntimeError si le schéma résultant est incomplet ou dégradé.
     """
     conn = get_connection(db_path)
@@ -927,6 +955,7 @@ def init_db(db_path: Path | str | None = None) -> None:
         with conn:
             conn.executescript(SCHEMA_SQL)
             _ensure_secret_envelope_column(conn)
+            _ensure_secret_kek_version_column(conn)
             _verify_schema(conn)
     finally:
         conn.close()
@@ -1093,6 +1122,7 @@ def create_secret(  # noqa: PLR0913
     encrypted_value: str,
     *,
     encrypted_dek: str | None = None,
+    kek_version: int = 1,
     status: SecretStatus = "vaulte",
     fingerprint: str = "",
     created_at: str | None = None,
@@ -1101,6 +1131,7 @@ def create_secret(  # noqa: PLR0913
     """Crée un secret chiffré dans la base de données.
 
     `encrypted_dek` est la DEK du secret chiffrée par la KEK (ticket #70).
+    `kek_version` est la version de la KEK ayant enveloppé la DEK (ticket #71).
     `None` (défaut) correspond à une ligne héritée (#25/#62) chiffrée
     directement par la KEK : la colonne SQLite vaut alors NULL, jamais la
     chaîne vide. Les nouvelles lignes du store la renseignent toujours. Le
@@ -1121,9 +1152,9 @@ def create_secret(  # noqa: PLR0913
     up_ts = updated_at or ts
     query = (
         "INSERT INTO secrets ("
-        "project_id, env, name, encrypted_value, encrypted_dek, status, fingerprint, "
+        "project_id, env, name, encrypted_value, encrypted_dek, kek_version, status, fingerprint, "
         "created_at, updated_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     conn.execute(
         query,
@@ -1133,6 +1164,7 @@ def create_secret(  # noqa: PLR0913
             name,
             encrypted_value,
             encrypted_dek,
+            kek_version,
             status,
             fingerprint,
             ts,
@@ -1145,6 +1177,7 @@ def create_secret(  # noqa: PLR0913
         "name": name,
         "encrypted_value": encrypted_value,
         "encrypted_dek": encrypted_dek,
+        "kek_version": kek_version,
         "status": status,
         "fingerprint": fingerprint,
         "created_at": ts,
@@ -1162,19 +1195,19 @@ def get_secret(
 
     Tout accès direct à un fichier existant doit avoir exécuté ``init_db`` (ou
     ouvrir la base via ``SqliteSecretStore``) pour appliquer la migration
-    additive de #70. Sur une base antérieure non migrée, la colonne
-    ``encrypted_dek`` manque : une ``RuntimeError`` actionnable est levée au
-    lieu de laisser remonter un ``OperationalError`` SQL brut.
+    additive de #70/#71. Sur une base antérieure non migrée, la colonne
+    ``encrypted_dek`` ou ``kek_version`` manque : une ``RuntimeError`` actionnable
+    est levée au lieu de laisser remonter un ``OperationalError`` SQL brut.
     """
     query = (
-        "SELECT id, project_id, env, name, encrypted_value, encrypted_dek, status, "
+        "SELECT id, project_id, env, name, encrypted_value, encrypted_dek, kek_version, status, "
         "fingerprint, created_at, updated_at "
         "FROM secrets WHERE project_id = ? AND env = ? AND name = ?"
     )
     try:
         cursor = conn.execute(query, (project_id, env, name))
     except sqlite3.OperationalError as exc:
-        if "encrypted_dek" not in str(exc):
+        if "encrypted_dek" not in str(exc) and "kek_version" not in str(exc):
             raise
         raise RuntimeError(_SCHEMA_MIGRATION_HINT) from None
     row = cursor.fetchone()
@@ -1191,7 +1224,8 @@ def get_secret_metadata(
 ) -> dict[str, Any] | None:
     """Récupère les métadonnées d'un secret sans exposer la valeur chiffrée."""
     query = (
-        "SELECT id, project_id, env, name, status, fingerprint, created_at, updated_at "
+        "SELECT id, project_id, env, name, kek_version, status, fingerprint, "
+        "created_at, updated_at "
         "FROM secrets WHERE project_id = ? AND env = ? AND name = ?"
     )
     cursor = conn.execute(query, (project_id, env, name))
@@ -1209,13 +1243,15 @@ def list_secrets(
     """Liste les métadonnées des secrets d'un projet, filtrés optionnellement par environnement."""
     if env is not None:
         query = (
-            "SELECT id, project_id, env, name, status, fingerprint, created_at, updated_at "
+            "SELECT id, project_id, env, name, kek_version, status, fingerprint, "
+            "created_at, updated_at "
             "FROM secrets WHERE project_id = ? AND env = ? ORDER BY name ASC"
         )
         cursor = conn.execute(query, (project_id, env))
     else:
         query = (
-            "SELECT id, project_id, env, name, status, fingerprint, created_at, updated_at "
+            "SELECT id, project_id, env, name, kek_version, status, fingerprint, "
+            "created_at, updated_at "
             "FROM secrets WHERE project_id = ? ORDER BY env ASC, name ASC"
         )
         cursor = conn.execute(query, (project_id,))
@@ -1248,24 +1284,27 @@ def update_secret(  # noqa: PLR0913
     encrypted_value: str,
     *,
     encrypted_dek: str | None = None,
+    kek_version: int | None = None,
     fingerprint: str = "",
     status: SecretStatus = "vaulte",
     updated_at: str | None = None,
 ) -> bool:
-    """Met à jour la valeur chiffrée, l'enveloppe de DEK, l'empreinte et le statut.
+    """Met à jour la valeur chiffrée, l'enveloppe de DEK, la version KEK, l'empreinte et le statut.
 
     `encrypted_dek=None` conserve l'enveloppe existante pour une mise à jour
     partielle qui ne remplace pas la valeur chiffrée. Si `encrypted_value` est
     chiffrée avec une DEK neuve, les deux blobs doivent provenir du même
     `VaultCipher.encrypt_envelope` et être fournis ensemble ; sinon la ligne
     deviendrait illisible (fail-closed). Une chaîne vide est refusée car elle
-    effacerait l'enveloppe. L'atomicité valeur + enveloppe sera portée par la
-    rotation de KEK (#71, méthode `reenvelope()`), hors périmètre de #70. Le
+    effacerait l'enveloppe. Pour une rotation de KEK sans toucher à la valeur,
+    utiliser `reenvelope_secret()` ou `rotate_secrets_kek()` (ticket #71). Le
     paramètre `status` est typé `Literal["vaulte", "rote"]` pour une validation
     applicative avant toute requête SQL.
     """
     if encrypted_dek == "":
         raise ValueError("Enveloppe de DEK invalide.")
+    if kek_version is not None and kek_version < 1:
+        raise ValueError("Numéro de version de KEK invalide.")
     if status not in _ALLOWED_STATUSES:
         logger.debug("Statut de secret invalide rejeté applicativement.")
         raise ValueError("Statut de secret invalide.")
@@ -1273,6 +1312,7 @@ def update_secret(  # noqa: PLR0913
     query = (
         "UPDATE secrets SET "
         "encrypted_value = ?, encrypted_dek = COALESCE(NULLIF(?, ''), encrypted_dek), "
+        "kek_version = COALESCE(?, kek_version), "
         "fingerprint = ?, status = ?, updated_at = ? "
         "WHERE project_id = ? AND env = ? AND name = ?"
     )
@@ -1281,6 +1321,7 @@ def update_secret(  # noqa: PLR0913
         (
             encrypted_value,
             encrypted_dek,
+            kek_version,
             fingerprint,
             status,
             up_ts,
@@ -1290,6 +1331,99 @@ def update_secret(  # noqa: PLR0913
         ),
     )
     return cursor.rowcount > 0
+
+
+def reenvelope_secret(  # noqa: PLR0913, PLR0917
+    conn: sqlite3.Connection,
+    project_id: str,
+    env: str,
+    name: str,
+    encrypted_dek: str,
+    kek_version: int,
+    updated_at: str | None = None,
+) -> bool:
+    """Met à jour l'enveloppe de DEK et la version de KEK sans toucher à la valeur chiffrée (#71).
+
+    L'ancienne valeur chiffrée (``encrypted_value``) et son empreinte restent
+    strictement inchangées en base.
+    """
+    if not encrypted_dek:
+        raise ValueError("Enveloppe de DEK invalide.")
+    if kek_version < 1:
+        raise ValueError("Numéro de version de KEK invalide.")
+    up_ts = updated_at or get_iso_timestamp()
+    query = (
+        "UPDATE secrets SET "
+        "encrypted_dek = ?, kek_version = ?, updated_at = ? "
+        "WHERE project_id = ? AND env = ? AND name = ?"
+    )
+    cursor = conn.execute(
+        query,
+        (encrypted_dek, kek_version, up_ts, project_id, env, name),
+    )
+    return cursor.rowcount > 0
+
+
+def rotate_secrets_kek(
+    conn: sqlite3.Connection,
+    old_cipher: VaultCipher,
+    new_cipher: VaultCipher,
+    *,
+    target_kek_version: int | None = None,
+) -> int:
+    """Effectue la rotation transactionnelle de la KEK sur l'ensemble des secrets (#71).
+
+    Règles de sécurité :
+    - Exécution strictement transactionnelle : tout réussit ou tout est annulé
+      (rollback automatique en cas d'erreur).
+    - Seules les DEK sont rechiffrées : les valeurs chiffrées (``encrypted_value``)
+      ne sont JAMAIS rechiffrées ni modifiées.
+    - La colonne ``kek_version`` est incrémentée ou fixée à ``target_kek_version``.
+    - Les DEK déchiffrées en mémoire sont effacées (zeroization) dès leur réenveloppement.
+    - Échoue fail-closed si un secret hérité (#25/#62) sans enveloppe de DEK est rencontré.
+    """
+    if old_cipher.has_same_key_as(new_cipher):
+        raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
+    if target_kek_version is not None and target_kek_version < 1:
+        raise ValueError("Numéro de version de KEK invalide.")
+
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            "SELECT id, project_id, env, name, encrypted_value, encrypted_dek, kek_version "
+            "FROM secrets ORDER BY id ASC"
+        )
+        secrets_to_rotate = cursor.fetchall()
+
+        rotated_count = 0
+        now_ts = get_iso_timestamp()
+
+        for row in secrets_to_rotate:
+            sec_id = row["id"]
+            project_id = str(row["project_id"])
+            env = str(row["env"])
+            name = str(row["name"])
+            enc_dek = row["encrypted_dek"]
+            current_v = int(row["kek_version"]) if row["kek_version"] is not None else 1
+
+            if not enc_dek:
+                raise VaultCipherError(
+                    "Rotation impossible : un secret hérité sans enveloppe de DEK est présent."
+                )
+
+            aad = VaultCipher.aad(project_id, env, name)
+            new_wrapped_dek = old_cipher.rewrap_dek(new_cipher, str(enc_dek), aad=aad)
+            new_version = target_kek_version if target_kek_version is not None else current_v + 1
+
+            conn.execute(
+                "UPDATE secrets SET encrypted_dek = ?, kek_version = ?, updated_at = ? "
+                "WHERE id = ?",
+                (new_wrapped_dek, new_version, now_ts, sec_id),
+            )
+            rotated_count += 1
+
+    return rotated_count
 
 
 def delete_secret(

@@ -34,7 +34,8 @@ from heimdall.cli.vault_client import (
     vault_run,
 )
 from heimdall.vault import auth as vault_auth
-from heimdall.vault.database import init_db, resolve_db_path
+from heimdall.vault.crypto import VaultCipher, VaultCipherError
+from heimdall.vault.database import db_session, init_db, resolve_db_path, rotate_secrets_kek
 
 key_app = typer.Typer(
     name="key",
@@ -191,4 +192,136 @@ def revoke_key(
     typer.echo(f"Clé API {key_id} révoquée : elle n'authentifie plus aucune requête.")
 
 
-__all__ = ["key_app", "vault_app"]
+def _resolve_cli_cipher(  # noqa: PLR0913
+    *,
+    direct: str | None,
+    master: str | None,
+    salt: str | None,
+    env_direct: str,
+    env_fallback: str | None,
+    env_master: str,
+    env_salt: str,
+    label: str,
+) -> VaultCipher:
+    """Résout un chiffreur VaultCipher depuis une clé directe ou une dérivation Argon2id."""
+    resolved_direct = (
+        direct
+        or os.environ.get(env_direct)
+        or (os.environ.get(env_fallback) if env_fallback else None)
+    )
+    resolved_master = master or os.environ.get(env_master)
+    resolved_salt = salt or os.environ.get(env_salt)
+
+    if resolved_direct and (resolved_master or resolved_salt):
+        raise ValueError(
+            f"Fournir une KEK directe OU une clé maîtresse avec sel pour {label}, pas les deux."
+        )
+    if resolved_direct:
+        try:
+            return VaultCipher.from_encoded_key(resolved_direct)
+        except Exception:
+            raise ValueError(f"{label} directe invalide (base64 attendu).") from None
+    if resolved_master and resolved_salt:
+        try:
+            return VaultCipher.from_master_key(resolved_master, resolved_salt)
+        except Exception:
+            raise ValueError(f"{label} dérivée invalide.") from None
+    if resolved_master or resolved_salt:
+        raise ValueError(f"Clé maîtresse ET sel obligatoires pour dériver {label}.")
+    raise ValueError(f"{label} manquante (option CLI ou variable d'environnement requise).")
+
+
+@vault_app.command("rotate-kek")
+def rotate_kek_command(  # noqa: PLR0913, PLR0917
+    db_path: Path | None = _DB_PATH_OPTION,
+    old_kek: str | None = typer.Option(
+        None,
+        "--old-kek",
+        help="Ancienne KEK (base64 URL-safe ou standard). Défaut : $HEIMDALL_VAULT_OLD_KEK.",
+    ),
+    new_kek: str | None = typer.Option(
+        None,
+        "--new-kek",
+        help="Nouvelle KEK (base64 URL-safe ou standard). Défaut : $HEIMDALL_VAULT_NEW_KEK.",
+    ),
+    old_master_key: str | None = typer.Option(
+        None,
+        "--old-master-key",
+        help="Ancienne clé maîtresse (Argon2id).",
+    ),
+    old_salt: str | None = typer.Option(
+        None,
+        "--old-salt",
+        help="Sel associé à l'ancienne clé maîtresse.",
+    ),
+    new_master_key: str | None = typer.Option(
+        None,
+        "--new-master-key",
+        help="Nouvelle clé maîtresse (Argon2id).",
+    ),
+    new_salt: str | None = typer.Option(
+        None,
+        "--new-salt",
+        help="Sel associé à la nouvelle clé maîtresse.",
+    ),
+    target_version: int | None = typer.Option(
+        None,
+        "--target-version",
+        help="Version de KEK cible explicite (kek_version).",
+    ),
+) -> None:
+    """Effectue la rotation transactionnelle de la KEK sur tous les secrets (ticket #71)."""
+    try:
+        resolved = _resolve_db_path(db_path)
+        old_cipher = _resolve_cli_cipher(
+            direct=old_kek,
+            master=old_master_key,
+            salt=old_salt,
+            env_direct="HEIMDALL_VAULT_OLD_KEK",
+            env_fallback="HEIMDALL_VAULT_KEK",
+            env_master="HEIMDALL_VAULT_OLD_MASTER_KEY",
+            env_salt="HEIMDALL_VAULT_OLD_KEK_SALT",
+            label="l'ancienne KEK",
+        )
+        new_cipher = _resolve_cli_cipher(
+            direct=new_kek,
+            master=new_master_key,
+            salt=new_salt,
+            env_direct="HEIMDALL_VAULT_NEW_KEK",
+            env_fallback=None,
+            env_master="HEIMDALL_VAULT_NEW_MASTER_KEY",
+            env_salt="HEIMDALL_VAULT_NEW_KEK_SALT",
+            label="la nouvelle KEK",
+        )
+        if old_cipher.has_same_key_as(new_cipher):
+            raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
+        if target_version is not None and target_version < 1:
+            raise ValueError("Le numéro de version cible doit être supérieur ou égal à 1.")
+    except ValueError as exc:
+        typer.echo(f"Erreur : {exc}", err=True)
+        raise typer.Exit(code=2) from None
+
+    try:
+        init_db(resolved)
+        with db_session(resolved) as conn:
+            count = rotate_secrets_kek(
+                conn,
+                old_cipher,
+                new_cipher,
+                target_kek_version=target_version,
+            )
+    except VaultCipherError:
+        typer.echo("Erreur : échec du déchiffrement avec l'ancienne KEK.", err=True)
+        raise typer.Exit(code=1) from None
+    except Exception:
+        typer.echo("Erreur : échec de la rotation de la KEK.", err=True)
+        raise typer.Exit(code=1) from None
+
+    typer.echo(f"Rotation de la KEK réussie : {count} secret(s) réenveloppé(s).")
+
+
+vault_app.command("kek-rotate", hidden=True)(rotate_kek_command)
+vault_app.command("rotate", hidden=True)(rotate_kek_command)
+
+
+__all__ = ["key_app", "rotate_kek_command", "vault_app"]

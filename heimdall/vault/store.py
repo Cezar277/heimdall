@@ -44,6 +44,7 @@ from heimdall.vault.database import (
     ensure_project,
     get_secret,
     init_db,
+    rotate_secrets_kek,
 )
 from heimdall.vault.database import runtime_db_session as db_session
 
@@ -127,7 +128,7 @@ class InMemorySecretStore:
         *,
         cipher: VaultCipher | None = None,
     ) -> None:
-        self._secrets: dict[tuple[str, str, str], dict[str, str]] = {}
+        self._secrets: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._project_counts: dict[str, int] = {}
         self._lock = asyncio.Lock()
         self._max_secrets = max_secrets
@@ -184,6 +185,42 @@ class InMemorySecretStore:
         async with self._lock:
             self._secrets.clear()
             self._project_counts.clear()
+
+    async def rotate_kek(
+        self,
+        new_cipher: VaultCipher,
+        *,
+        old_cipher: VaultCipher | None = None,
+        target_kek_version: int | None = None,
+    ) -> int:
+        """Effectue la rotation atomique de la KEK en mémoire (ticket #71)."""
+        active_old = old_cipher or self._cipher
+        if active_old.has_same_key_as(new_cipher):
+            raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
+        async with self._lock:
+            backup = dict(self._secrets)
+            try:
+                count = 0
+                for key, record in list(self._secrets.items()):
+                    enc_dek = record.get("encrypted_dek")
+                    if not enc_dek:
+                        raise VaultCipherError(
+                            "Rotation impossible : un secret sans enveloppe de DEK est présent."
+                        )
+                    aad = VaultCipher.aad(record["project"], record["env"], record["name"])
+                    new_dek = active_old.rewrap_dek(new_cipher, enc_dek, aad=aad)
+                    current_v = int(record.get("kek_version", 1))
+                    new_v = target_kek_version if target_kek_version is not None else current_v + 1
+                    updated_record = dict(record)
+                    updated_record["encrypted_dek"] = new_dek
+                    updated_record["kek_version"] = new_v
+                    self._secrets[key] = updated_record
+                    count += 1
+                self._cipher = new_cipher
+                return count
+            except Exception:
+                self._secrets = backup
+                raise
 
 
 class SqliteSecretStore:
@@ -304,3 +341,36 @@ class SqliteSecretStore:
     def _clear(self) -> None:
         with db_session(self._db_path) as conn:
             delete_all_secrets(conn)
+
+    async def rotate_kek(
+        self,
+        new_cipher: VaultCipher,
+        *,
+        old_cipher: VaultCipher | None = None,
+        target_kek_version: int | None = None,
+    ) -> int:
+        """Effectue la rotation transactionnelle de la KEK dans SQLite (ticket #71)."""
+        return await asyncio.to_thread(
+            self._rotate_kek,
+            new_cipher,
+            old_cipher=old_cipher,
+            target_kek_version=target_kek_version,
+        )
+
+    def _rotate_kek(
+        self,
+        new_cipher: VaultCipher,
+        *,
+        old_cipher: VaultCipher | None = None,
+        target_kek_version: int | None = None,
+    ) -> int:
+        active_old = old_cipher or self._cipher
+        with db_session(self._db_path) as conn:
+            count = rotate_secrets_kek(
+                conn,
+                active_old,
+                new_cipher,
+                target_kek_version=target_kek_version,
+            )
+        self._cipher = new_cipher
+        return count
