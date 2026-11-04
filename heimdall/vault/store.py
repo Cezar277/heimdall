@@ -454,6 +454,12 @@ class SqliteSecretStore:
                         raise ValueError
                     self._kek_version = int(val)
                 except (ValueError, TypeError):
+                    self._cipher = new_cipher
+                    self._kek_version = (
+                        target_kek_version
+                        if target_kek_version is not None
+                        else self._kek_version + 1
+                    )
                     raise RuntimeError("Version de KEK illisible en base.") from None
             elif target_kek_version is not None:
                 self._kek_version = target_kek_version

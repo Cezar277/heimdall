@@ -748,34 +748,27 @@ class VaultRotateCliTests(unittest.TestCase):
         self.assertEqual(res.exit_code, 1)
         self.assertIn("échec du déchiffrement avec l'ancienne KEK", res.output)
 
-    def test_cli_aliases_work(self) -> None:
-        """Les alias `rotate` et `kek-rotate` exécutent la même commande."""
-        # Premier alias : rotation de OLD vers NEW
-        env1 = {
+    def test_cli_alias_kek_rotate_works_and_rotate_removed(self) -> None:
+        """L'alias `kek-rotate` fonctionne et l'alias trop générique `rotate` est supprimé."""
+        # L'alias générique 'rotate' n'existe plus pour éviter toute ambiguïté (LOW 3)
+        res_generic = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate", "--db-path", str(self.db_path)],
+        )
+        self.assertNotEqual(res_generic.exit_code, 0)
+
+        # L'alias spécifique 'kek-rotate' fonctionne nominalement
+        env = {
             "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
             "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
         }
-        res1 = self.runner.invoke(
-            cli_app,
-            ["vault", "rotate", "--db-path", str(self.db_path)],
-            env=env1,
-        )
-        self.assertEqual(res1.exit_code, 0)
-        self.assertIn("Rotation de la KEK réussie", res1.output)
-
-        # Deuxième alias : rotation subséquente de NEW vers une troisième KEK
-        third_kek_b64 = base64.urlsafe_b64encode(b"3" * 32).decode("ascii")
-        env2 = {
-            "HEIMDALL_VAULT_OLD_KEK": _NEW_KEK_B64,
-            "HEIMDALL_VAULT_NEW_KEK": third_kek_b64,
-        }
-        res2 = self.runner.invoke(
+        res = self.runner.invoke(
             cli_app,
             ["vault", "kek-rotate", "--db-path", str(self.db_path)],
-            env=env2,
+            env=env,
         )
-        self.assertEqual(res2.exit_code, 0)
-        self.assertIn("Rotation de la KEK réussie", res2.output)
+        self.assertEqual(res.exit_code, 0)
+        self.assertIn("Rotation de la KEK réussie", res.output)
 
     def test_cli_rotate_empty_old_kek_env_var_fails_closed_without_fallback(self) -> None:
         """CLI avec HEIMDALL_VAULT_OLD_KEK='' sort en code 2 sans utiliser le fallback."""
@@ -1092,7 +1085,7 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
     def test_sqlite_store_rotate_kek_corrupted_max_version_preserves_cipher_and_raises(
         self,
     ) -> None:
-        """SqliteSecretStore._rotate_kek sur MAX illisible lève RuntimeError et garde _cipher."""
+        """SqliteSecretStore._rotate_kek sur MAX illisible : RuntimeError sans désync _cipher."""
         with tempfile.TemporaryDirectory(prefix="heimdall-store-corrupt-") as tmp:
             db_path = Path(tmp) / "vault.db"
             init_db(db_path)
@@ -1114,11 +1107,15 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
                         store._rotate_kek(new_cipher)
                     self.assertNotIn(corrupt_val, str(ctx1.exception))
                     self.assertIn("illisible", str(ctx1.exception).lower())
-                    self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+                    # Pas de désynchronisation DoS : _cipher est swappé et kek_version mise à jour
+                    self.assertTrue(store._cipher.has_same_key_as(new_cipher))
+                    self.assertEqual(store.kek_version, 2)
 
                     # Cas 2 : REAL non entier
                     mock_conn.execute.return_value.fetchone.return_value = (2.5,)
+                    new_cipher2 = VaultCipher(b"2" * 32)
                     with self.assertRaises(RuntimeError) as ctx2:
-                        store._rotate_kek(new_cipher)
+                        store._rotate_kek(new_cipher2)
                     self.assertIn("illisible", str(ctx2.exception).lower())
-                    self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+                    self.assertTrue(store._cipher.has_same_key_as(new_cipher2))
+                    self.assertEqual(store.kek_version, 3)

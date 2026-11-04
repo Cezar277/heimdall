@@ -332,7 +332,6 @@ def rotate_kek_command(
 
 
 vault_app.command("kek-rotate", hidden=True)(rotate_kek_command)
-vault_app.command("rotate", hidden=True)(rotate_kek_command)
 
 
 __all__ = ["key_app", "rotate_kek_command", "vault_app"]
