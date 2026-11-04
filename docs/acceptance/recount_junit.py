@@ -16,11 +16,11 @@ def main():
     junit_path = expected.get("junit_path")
     if not isinstance(junit_path, str) or not junit_path.strip():
         raise ValueError("junit_path must be a non-empty relative path")
+    if Path(junit_path).is_absolute():
+        raise ValueError("junit_path must be a relative path")
     source = (root / junit_path).resolve()
     if not source.is_relative_to(root):
         raise ValueError("junit_path outside acceptance directory")
-    if Path(junit_path).is_absolute():
-        raise ValueError("junit_path must be a relative path")
     expected_sha = expected.get("junit_sha256", "")
     if (
         not isinstance(expected_sha, str)
@@ -31,8 +31,20 @@ def main():
     for key, value_type in (
         ("by_module", dict), ("pytest_counts", dict), ("subtests_passed", int), ("groups", list)
     ):
-        if not isinstance(expected.get(key), value_type):
+        if type(expected.get(key)) is not value_type:
             raise ValueError(f"Missing or invalid results.json field: {key}")
+    for index, group in enumerate(expected["groups"]):
+        if not isinstance(group, dict):
+            raise ValueError(f"Group {index} must be an object")
+        for key in ("id", "status"):
+            if not isinstance(group.get(key), str) or not group.get(key):
+                raise ValueError(f"Missing or invalid group {index} field: {key}")
+        for key in ("selectors", "modules"):
+            values = group.get(key)
+            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                raise ValueError(f"Missing or invalid group {index} field: {key}")
+        if not isinstance(group.get("counts"), dict):
+            raise ValueError(f"Missing or invalid group {index} field: counts")
     if hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:
         raise ValueError("JUnit SHA-256 mismatch")
     by_module = collections.defaultdict(collections.Counter)
@@ -59,7 +71,12 @@ def main():
         total.update(counts)
     if total != expected["pytest_counts"]:
         raise ValueError("Total counts mismatch")
-    suite_tests = sum(int(suite.attrib["tests"]) for suite in tree.iter("testsuite"))
+    suite_tests = 0
+    for index, suite in enumerate(tree.iter("testsuite")):
+        tests = suite.attrib.get("tests")
+        if tests is None or not tests.isascii() or not tests.isdecimal():
+            raise ValueError(f"Missing or invalid testsuite {index} attribute: tests ({tests!r})")
+        suite_tests += int(tests)
     if suite_tests - sum(total.values()) != expected["subtests_passed"]:
         raise ValueError("Subtest counts mismatch")
     seen = []

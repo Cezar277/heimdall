@@ -65,6 +65,27 @@ documentaire ni par l'intégration des évolutions ultérieures de `main`.
   symbolique sortant refusés ; métadonnées invalides refusées ; archive valide
   toujours recalculable. Aucun changement des verdicts ni des conditions AC-24.
 
+### Rejeu versionné des cas invalides
+
+Le [harnais stdlib](acceptance/test_recount_junit.py) remplace la vérification
+sur copies temporaires non archivées. Depuis la racine du dépôt, sous POSIX
+(pour créer le lien symbolique sortant), lancer :
+
+```sh
+python3 docs/acceptance/recount_junit.py
+python3 docs/acceptance/test_recount_junit.py
+```
+
+Les 24 cas de métadonnées et chemins invalides sont rejoués en sous-tests,
+avec une garde qui fait échouer le test si le XML est lu avant leur rejet.
+Le harnais vérifie aussi les champs de groupe absents ou mal typés,
+`testsuite.tests` absent ou invalide, les `classname` atypiques, le refus d'une
+empreinte incorrecte avant parsing et le succès de l'archive valide. Toutes les
+mutations se font dans un répertoire temporaire, sans modifier les pièces versées.
+Les sorties sont archivées dans [le journal](acceptance/recount-junit.log).
+Le vérificateur contrôle les chemins absolus avant la jointure et signale les
+champs de suite et de groupe invalides par un `ValueError` contextualisé.
+
 ## Conditions avant fusion
 
 - **CI distante** : exiger `CI (/ci)` vert sur le commit de merge correspondant

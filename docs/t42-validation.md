@@ -107,6 +107,10 @@ séparément cette différence ; il ne compte pas les sous-tests deux fois.
 La [sortie du vérificateur après correction de revue](acceptance/recount-junit.log)
 est archivée avec son code de sortie. Elle valide uniquement les pièces versées ;
 les conditions de fusion AC-24 restent ouvertes.
+Le [harnais de contrôle du vérificateur](acceptance/test_recount_junit.py) se
+rejoue sous POSIX avec `python3 docs/acceptance/test_recount_junit.py` depuis la
+racine. Il génère ses copies temporaires et couvre notamment les 24 cas de
+métadonnées et chemins invalides ; les commandes et sorties sont dans le journal.
 
 Résultat du rejeu de revue : **2 211 passed, 16 skipped, 7 warnings,
 4 480 subtests passed**, couverture **91,29 %**, durée **262,76 s**.
