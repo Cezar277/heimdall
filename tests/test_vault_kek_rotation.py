@@ -863,6 +863,33 @@ class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
                     conn, "proj", "dev", "KEY2", envelope.encrypted_dek, kek_version=2
                 )
 
+    def test_update_secret_downgrade_refused(self) -> None:
+        """update_secret refuse de descendre la kek_version (audit faussable)."""
+        with db_session(self.db_path) as conn:
+            aad = VaultCipher.aad("proj", "dev", "KEY_UPD")
+            envelope = self.old_cipher.encrypt_envelope(b"secret", aad=aad)
+            ensure_project(conn, "proj")
+            create_secret(
+                conn,
+                "proj",
+                "dev",
+                "KEY_UPD",
+                envelope.encrypted_value,
+                encrypted_dek=envelope.encrypted_dek,
+                kek_version=5,
+            )
+            # Downgrade 5 -> 1 refusé
+            with self.assertRaises(ValueError) as ctx:
+                update_secret(
+                    conn,
+                    "proj",
+                    "dev",
+                    "KEY_UPD",
+                    "new_val",
+                    kek_version=1,
+                )
+            self.assertIn("inférieure", str(ctx.exception))
+
     def test_reenvelope_nonexistent_row_still_validates_kek_version(self) -> None:
         """reenvelope_secret sur une ligne inexistante retourne False sans erreur si version OK."""
         with db_session(self.db_path) as conn:
@@ -1084,11 +1111,11 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
             self.assertNotIn(corrupt_val, err_msg)
             self.assertIn("Impossible de lire la version KEK courante", err_msg)
 
-    def test_sqlite_store_rotate_kek_corrupted_max_version_preserves_cipher_and_raises(
+    def test_sqlite_store_rotate_kek_nominal_uses_returned_new_version_without_second_select(
         self,
     ) -> None:
-        """SqliteSecretStore._rotate_kek sur MAX illisible : RuntimeError sans désync _cipher."""
-        with tempfile.TemporaryDirectory(prefix="heimdall-store-corrupt-") as tmp:
+        """SqliteSecretStore._rotate_kek nominal utilise new_version sans 2e SELECT."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-store-rot-no-select-") as tmp:
             db_path = Path(tmp) / "vault.db"
             init_db(db_path)
             old_cipher = VaultCipher(_OLD_KEK_BYTES)
@@ -1096,34 +1123,19 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
             store = SqliteSecretStore(db_path, old_cipher)
             store._create("p", "dev", "K1", "val1")
 
-            corrupt_val = "<corrupted-text-version-max>"
-            with unittest.mock.patch("heimdall.vault.store.db_session") as mock_session:
-                mock_conn = unittest.mock.MagicMock()
-                mock_session.return_value.__enter__.return_value = mock_conn
-                # Cas 1 : TEXT corrompu. rotate_secrets_kek renvoie new_version=5.
-                # Même si store._kek_version locale est 1, on prouve qu'elle est mise
-                # à jour avec new_version=5 (et non store._kek_version + 1 = 2).
+            mock_conn = unittest.mock.MagicMock()
+            with unittest.mock.patch("heimdall.vault.store.db_session") as mock_db_session:
+                mock_db_session.return_value.__enter__.return_value = mock_conn
                 with unittest.mock.patch(
-                    "heimdall.vault.store.rotate_secrets_kek", return_value=(1, 5)
+                    "heimdall.vault.store.rotate_secrets_kek",
+                    return_value=(1, 42),
                 ):
-                    mock_conn.execute.return_value.fetchone.return_value = (corrupt_val,)
-                    with self.assertRaises(RuntimeError) as ctx1:
-                        store._rotate_kek(new_cipher)
-                    self.assertNotIn(corrupt_val, str(ctx1.exception))
-                    self.assertIn("illisible", str(ctx1.exception).lower())
-                    # Pas de désynchronisation DoS : _cipher est swappé et kek_version mise à jour
-                    self.assertTrue(store._cipher.has_same_key_as(new_cipher))
-                    self.assertEqual(store.kek_version, 5)
+                    count = store._rotate_kek(new_cipher)
 
-                # Cas 2 : REAL non entier. rotate_secrets_kek renvoie new_version=8.
-                mock_conn.execute.return_value.fetchone.return_value = (2.5,)
-                new_cipher2 = VaultCipher(b"2" * 32)
-                with unittest.mock.patch(
-                    "heimdall.vault.store.rotate_secrets_kek", return_value=(1, 8)
-                ):
-                    with self.assertRaises(RuntimeError) as ctx2:
-                        store._rotate_kek(new_cipher2)
-                    self.assertNotIn("2.5", str(ctx2.exception))
-                    self.assertIn("illisible", str(ctx2.exception).lower())
-                    self.assertTrue(store._cipher.has_same_key_as(new_cipher2))
-                    self.assertEqual(store.kek_version, 8)
+            self.assertEqual(count, 1)
+            # Vérifier que store.kek_version vaut exactement la new_version retournée
+            self.assertEqual(store.kek_version, 42)
+            # Vérifier que _cipher a pivoté
+            self.assertTrue(store._cipher.has_same_key_as(new_cipher))
+            # Vérifier qu'AUCUNE 2e requête SELECT n'a été exécutée
+            mock_conn.execute.assert_not_called()

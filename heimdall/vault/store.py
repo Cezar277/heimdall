@@ -446,18 +446,6 @@ class SqliteSecretStore:
                 # Store vide : aucun secret réenveloppé, self._cipher et self._kek_version
                 # restent inchangés (aligné sur InMemorySecretStore).
                 return 0
-            row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
-            if row and row[0] is not None:
-                try:
-                    val = row[0]
-                    if isinstance(val, float) and not val.is_integer():
-                        raise ValueError
-                    self._kek_version = int(val)
-                except (ValueError, TypeError):
-                    self._cipher = new_cipher
-                    self._kek_version = new_version
-                    raise RuntimeError("Version de KEK illisible en base.") from None
-            else:
-                self._kek_version = new_version
         self._cipher = new_cipher
+        self._kek_version = new_version
         return count

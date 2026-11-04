@@ -1341,37 +1341,65 @@ def update_secret(  # noqa: PLR0913
     utiliser `reenvelope_secret()` ou `rotate_secrets_kek()` (ticket #71). Le
     paramètre `status` est typé `Literal["vaulte", "rote"]` pour une validation
     applicative avant toute requête SQL.
+
+    Garantie de monotonie : si ``kek_version`` est fournie, elle ne peut pas être
+    inférieure à la version actuellement stockée pour la ligne ciblée (anti-downgrade).
     """
     if encrypted_dek == "":
         raise ValueError("Enveloppe de DEK invalide.")
-    if kek_version is not None:
-        validate_kek_version(kek_version)
     if status not in _ALLOWED_STATUSES:
         logger.debug("Statut de secret invalide rejeté applicativement.")
         raise ValueError("Statut de secret invalide.")
-    up_ts = updated_at or get_iso_timestamp()
-    query = (
-        "UPDATE secrets SET "
-        "encrypted_value = ?, encrypted_dek = COALESCE(NULLIF(?, ''), encrypted_dek), "
-        "kek_version = COALESCE(?, kek_version), "
-        "fingerprint = ?, status = ?, updated_at = ? "
-        "WHERE project_id = ? AND env = ? AND name = ?"
-    )
-    cursor = conn.execute(
-        query,
-        (
-            encrypted_value,
-            encrypted_dek,
-            kek_version,
-            fingerprint,
-            status,
-            up_ts,
-            project_id,
-            env,
-            name,
-        ),
-    )
-    return cursor.rowcount > 0
+
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+
+        if kek_version is not None:
+            validate_kek_version(kek_version)
+            row = conn.execute(
+                "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
+                (project_id, env, name),
+            ).fetchone()
+            if row is not None:
+                try:
+                    current_v = (
+                        int(row["kek_version"]) if row["kek_version"] is not None else 1
+                    )
+                except (ValueError, TypeError):
+                    raise ValueError("Version de KEK illisible en base.") from None
+                if kek_version < current_v:
+                    raise ValueError(
+                        f"La nouvelle kek_version ({kek_version}) ne peut pas être "
+                        f"inférieure à la version courante ({current_v})."
+                    )
+
+        up_ts = updated_at or get_iso_timestamp()
+        query = (
+            "UPDATE secrets SET "
+            "encrypted_value = ?, encrypted_dek = COALESCE(NULLIF(?, ''), encrypted_dek), "
+            "kek_version = COALESCE(?, kek_version), "
+            "fingerprint = ?, status = ?, updated_at = ? "
+            "WHERE project_id = ? AND env = ? AND name = ? AND "
+            "(? IS NULL OR kek_version IS NULL OR kek_version <= ?)"
+        )
+        cursor = conn.execute(
+            query,
+            (
+                encrypted_value,
+                encrypted_dek,
+                kek_version,
+                fingerprint,
+                status,
+                up_ts,
+                project_id,
+                env,
+                name,
+                kek_version,
+                kek_version,
+            ),
+        )
+        return cursor.rowcount > 0
 
 
 def reenvelope_secret(  # noqa: PLR0913, PLR0917
