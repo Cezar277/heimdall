@@ -198,6 +198,15 @@ def revoke_key(
     typer.echo(f"Clé API {key_id} révoquée : elle n'authentifie plus aucune requête.")
 
 
+def _read_env_secret(var_name: str, label: str) -> str | None:
+    val = os.environ.get(var_name)
+    if val is not None and not val:
+        raise ValueError(
+            f"{label} manquante ou vide dans l'environnement ({var_name} ne peut pas être vide)."
+        )
+    return val
+
+
 def _resolve_cli_cipher(
     *,
     env_direct: str,
@@ -207,12 +216,19 @@ def _resolve_cli_cipher(
     label: str,
 ) -> VaultCipher:
     """Résout un chiffreur VaultCipher depuis une clé directe ou une dérivation Argon2id."""
-    resolved_direct = (
-        os.environ.get(env_direct)
-        or (os.environ.get(env_fallback) if env_fallback else None)
-    )
-    resolved_master = os.environ.get(env_master)
-    resolved_salt = os.environ.get(env_salt)
+    resolved_direct = _read_env_secret(env_direct, label)
+    if resolved_direct is None and env_fallback and env_fallback in os.environ:
+        resolved_direct = _read_env_secret(env_fallback, label)
+
+    raw_master = os.environ.get(env_master)
+    if raw_master is not None and not raw_master:
+        raise ValueError(f"La clé maîtresse pour {label} dans {env_master} ne peut pas être vide.")
+    resolved_master = raw_master
+
+    raw_salt = os.environ.get(env_salt)
+    if raw_salt is not None and not raw_salt:
+        raise ValueError(f"Le sel pour {label} dans {env_salt} ne peut pas être vide.")
+    resolved_salt = raw_salt
 
     if resolved_direct and (resolved_master or resolved_salt):
         raise ValueError(

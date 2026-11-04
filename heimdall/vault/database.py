@@ -1406,7 +1406,7 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
         try:
             current_v = int(row["kek_version"]) if row["kek_version"] is not None else 1
         except (ValueError, TypeError):
-            current_v = 1
+            raise ValueError("Version de KEK illisible en base.") from None
         if kek_version <= current_v:
             raise ValueError(
                 f"La nouvelle kek_version ({kek_version}) doit être strictement "
@@ -1457,7 +1457,7 @@ def rotate_secrets_kek(
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute(
-            "SELECT id, project_id, env, name, encrypted_value, encrypted_dek, kek_version "
+            "SELECT id, project_id, env, name, encrypted_dek, kek_version "
             "FROM secrets ORDER BY id ASC"
         )
         secrets_to_rotate = cursor.fetchall()

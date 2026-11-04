@@ -486,6 +486,20 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(store._cipher.has_same_key_as(old_cipher))
         self.assertEqual(store.kek_version, 1)
 
+    async def test_in_memory_rotate_kek_corrupted_version_raises_generic_error(self) -> None:
+        """InMemorySecretStore.rotate_kek : erreur générique sans reflet si version corrompue."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = InMemorySecretStore(cipher=old_cipher)
+        await store.create("demo", "dev", "KEY1", "val1")
+        corrupt_val = "<corrupt-kek-version-in-mem>"
+        store._secrets[("demo", "dev", "KEY1")]["kek_version"] = corrupt_val
+        with self.assertRaises(ValueError) as ctx:
+            await store.rotate_kek(new_cipher)
+        err_msg = str(ctx.exception)
+        self.assertNotIn(corrupt_val, err_msg)
+        self.assertEqual(str(ctx.exception), "Version de KEK illisible.")
+
 
 class SchemaMigrationTests(unittest.TestCase):
     """Vérifie la migration additive du schéma existant vers kek_version."""
@@ -761,6 +775,21 @@ class VaultRotateCliTests(unittest.TestCase):
         self.assertEqual(res2.exit_code, 0)
         self.assertIn("Rotation de la KEK réussie", res2.output)
 
+    def test_cli_rotate_empty_old_kek_env_var_fails_closed_without_fallback(self) -> None:
+        """CLI avec HEIMDALL_VAULT_OLD_KEK='' sort en code 2 sans utiliser le fallback."""
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": "",
+            "HEIMDALL_VAULT_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 2)
+        self.assertIn("ne peut pas être vide", res.output)
+
 
 class ValidateKekVersionHelperTests(unittest.TestCase):
     """Tests unitaires de validate_kek_version."""
@@ -910,6 +939,30 @@ class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):
         self.assertNotIn("<script>", err_msg)
         self.assertIn("illisible", err_msg)
 
+    def test_reenvelope_secret_corrupted_version_raises_generic_error(self) -> None:
+        """reenvelope_secret sur ligne avec kek_version corrompue lève ValueError générique."""
+        self._insert_secret_with_corrupt_kek_version("<script>alert('reenvelope')</script>")
+        try:
+            with db_session(self.db_path) as conn:
+                secret = get_secret(conn, "p", "dev", "BAD")
+        except Exception:
+            self.skipTest(
+                "Insertion de la valeur corrompue refusée par SQLite — test inapplicable."
+            )
+            return
+        if secret is None or secret.get("kek_version") is None:
+            self.skipTest(
+                "Insertion de la valeur corrompue refusée par SQLite — test inapplicable."
+            )
+            return
+
+        with db_session(self.db_path) as conn:
+            with self.assertRaises(ValueError) as ctx:
+                reenvelope_secret(conn, "p", "dev", "BAD", "new_dek", kek_version=2)
+        err_msg = str(ctx.exception)
+        self.assertNotIn("<script>", err_msg)
+        self.assertEqual(str(ctx.exception), "Version de KEK illisible en base.")
+
 
 class SqliteStoreDetectKekVersionTests(unittest.TestCase):
     """Tests du comportement fail-closed de _detect_current_kek_version (#71 LOW 3)."""
@@ -956,3 +1009,30 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
             # Recréer le store à partir de la même base
             store2 = SqliteSecretStore(db_path, new_cipher)
             self.assertEqual(store2.kek_version, 7)
+
+    def test_detect_kek_version_corrupted_text_raises_runtime_error_no_reflection(self) -> None:
+        """SqliteSecretStore: _detect_current_kek_version fail-closed sans reflet sur TEXT."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-detect-corrupt-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            corrupt_val = "<injected-corrupted-version>"
+            with sqlite3.connect(str(db_path)) as conn_raw:
+                conn_raw.execute(
+                    "INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p','2026')"
+                )
+                conn_raw.execute(
+                    "INSERT INTO secrets "
+                    "(project_id, env, name, encrypted_value, encrypted_dek, "
+                    "kek_version, status, fingerprint, created_at, updated_at) "
+                    "VALUES ('p', 'dev', 'CORRUPT', 'enc_val', 'enc_dek', ?, 'vaulte', 'fp', "
+                    "'2026', '2026')",
+                    (corrupt_val,),
+                )
+                conn_raw.commit()
+
+            cipher = VaultCipher(_OLD_KEK_BYTES)
+            with self.assertRaises(RuntimeError) as ctx:
+                SqliteSecretStore(db_path, cipher)
+            err_msg = str(ctx.exception)
+            self.assertNotIn(corrupt_val, err_msg)
+            self.assertIn("Impossible de lire la version KEK courante", err_msg)

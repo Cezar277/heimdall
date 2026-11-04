@@ -215,10 +215,18 @@ class InMemorySecretStore:
         async with self._lock:
             if not self._secrets:
                 return 0
-            current_max = max(
-                (int(r.get("kek_version", 1)) for r in self._secrets.values()),
-                default=1,
-            )
+            try:
+                current_max = max(
+                    (
+                        int(r["kek_version"])
+                        if r.get("kek_version") is not None
+                        else 1
+                        for r in self._secrets.values()
+                    ),
+                    default=1,
+                )
+            except (ValueError, TypeError):
+                raise ValueError("Version de KEK illisible.") from None
             if target_kek_version is not None:
                 if target_kek_version <= current_max:
                     raise ValueError(
@@ -319,7 +327,13 @@ class SqliteSecretStore:
             with db_session(self._db_path) as conn:
                 row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
                 if row and row[0] is not None:
-                    return max(1, int(row[0]))
+                    try:
+                        return max(1, int(row[0]))
+                    except (ValueError, TypeError):
+                        raise RuntimeError(
+                            "Impossible de lire la version KEK courante dans la base "
+                            "(version corrompue ou invalide)."
+                        ) from None
             return 1
         except (sqlite3.Error, OSError, DatabaseUnavailableError) as exc:
             raise RuntimeError(
