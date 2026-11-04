@@ -4,9 +4,10 @@ Ticket #15 · Porteur : C · Relecteur : A · Estimation : 6 h.
 
 Source contract-first : [openapi.yaml](../../openapi.yaml), OpenAPI 3.1.0.
 Le fichier est écrit indépendamment de FastAPI. Le serveur Vault, le chiffrement
-au repos (AES-256-GCM via KEK) et la persistance SQLite sont implémentés dans
-#25/#26/#62 ; la gestion de clés par identifiant (`encrypt_at_rest`/`key_id`) et
-la révocation restent suivies dans leurs tickets dédiés.
+au repos (AES-256-GCM via KEK, enveloppe DEK par secret depuis #70) et la
+persistance SQLite sont implémentés dans #25/#26/#62/#70 ; la gestion de clés
+par identifiant (`encrypt_at_rest`/`key_id`) et la révocation restent suivies
+dans leurs tickets dédiés.
 
 La traçabilité ticket → module → preuve de ce lot est dans
 [vault-traceability.md](./vault-traceability.md) : chaque brique livrée ici
@@ -151,18 +152,30 @@ rejeté en 400 avant toute décision d'autorisation.
 `create()` retourne uniquement les métadonnées ; le plaintext n'est déchiffré
 que par la lecture autorisée et n'est jamais renvoyé au POST.
 
-Chiffrement au repos : le backend SQLite (défaut en production) chiffre chaque
-valeur avec AES-256-GCM et une KEK de 32 octets, **distincte du pepper** et
-jamais stockée dans la base. La KEK est soit fournie directement
-(`HEIMDALL_VAULT_KEK`, mode historique), soit **dérivée une seule fois au
-démarrage** avec Argon2id depuis `HEIMDALL_VAULT_MASTER_KEY` +
-`HEIMDALL_VAULT_KEK_SALT` (ticket #262, 64 Mio / 3 itérations / 4 lanes, sel
-public de 16 octets) ; les deux modes sont exclusifs. La dérivation est
-documentée dans [ADR-005](../adr/005-derivation-kek-argon2id.md). La séparation
-avec le pepper est vérifiée sur l'entropie décodée (KEK brute vs pepper UTF-8) :
-deux représentations d'une même clé sont refusées, pas seulement la copie exacte
-des chaînes (invariant 5). Chaque ciphertext
-est lié par AAD au triplet `(project, env, name)` ; la contrainte SQLite
+Chiffrement au repos : le backend SQLite (défaut en production) applique un
+**chiffrement par enveloppe** (ticket #70). Chaque secret reçoit une DEK
+aléatoire de 32 octets ; la valeur est chiffrée avec la DEK (AES-256-GCM), puis
+la DEK est chiffrée avec la KEK, **distincte du pepper** et jamais stockée dans
+la base. La KEK est soit fournie directement (`HEIMDALL_VAULT_KEK`, mode
+historique), soit **dérivée une seule fois au démarrage** avec Argon2id depuis
+`HEIMDALL_VAULT_MASTER_KEY` + `HEIMDALL_VAULT_KEK_SALT` (ticket #262, 64 Mio /
+3 itérations / 4 lanes, sel public de 16 octets) ; les deux modes sont exclusifs.
+La dérivation est documentée dans
+[ADR-005](../adr/005-derivation-kek-argon2id.md). Les deux blobs sont persistés
+dans la ligne du secret (`encrypted_value`, `encrypted_dek`) : la KEK ne chiffre
+donc que des clés, et la fuite d'une DEK ne compromet qu'un secret. Les lignes
+antérieures (chiffrées directement par la KEK, sans `encrypted_dek`) restent
+lisibles via un repli explicite ; `init_db` ajoute la colonne nullable aux bases
+existantes. Tout accès direct au fichier (outil d'administration via
+`db_session`) doit donc exécuter `init_db` ou passer par `SqliteSecretStore` ;
+`get_secret` lève une `RuntimeError` actionnable si la colonne manque, plutôt
+qu'un `OperationalError` brut. La séparation avec le pepper est vérifiée sur
+l'entropie décodée
+(KEK brute vs pepper UTF-8) : deux représentations d'une même clé sont refusées,
+pas seulement la copie exacte des chaînes (invariant 5). Chaque ciphertext est
+lié par AAD au triplet `(project, env, name)` ; l'enveloppe de DEK utilise en
+plus un label de domaine dédié, donc un blob de DEK ne peut pas être rejoué
+comme une valeur. La contrainte SQLite
 `UNIQUE(project_id, env, name)` assure l'anti-écrasement entre workers. Le nonce
 AES-GCM de 96 bits est tiré de l'aléatoire du système (`os.urandom`) **à chaque
 chiffrement** (ticket #67) : il n'est ni un compteur ni dérivé de l'heure, donc
@@ -396,7 +409,7 @@ pas être utilisées pour contourner les codes ci-dessus.
 
 ## Vérifier le contrat
 
-Depuis la racine du dépôt, Python 3.10 ou supérieur, Node.js et npm/npx :
+Depuis la racine du dépôt, Python 3.10 ou supérieur, Node.js 22 ou 24+ (requis par Spectral 6.17.0) et npm/npx :
 
 Windows / PowerShell :
 
@@ -407,6 +420,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m bandit tests/contracts/fastapi_contract_fixture.py
 .venv/Scripts/python.exe -m ruff check --select S tests/contracts/fastapi_contract_fixture.py
 npm ci --no-audit --no-fund
+npm run test:js
 ./node_modules/.bin/spectral lint openapi.yaml --fail-severity warn
 git diff --check
 ```
@@ -420,9 +434,13 @@ python3 -m venv .venv
 .venv/bin/bandit tests/contracts/fastapi_contract_fixture.py
 .venv/bin/ruff check --select S tests/contracts/fastapi_contract_fixture.py
 npm ci --no-audit --no-fund
+npm run test:js
 ./node_modules/.bin/spectral lint openapi.yaml --fail-severity warn
 git diff --check
 ```
+
+`npm ci` applique `engine-strict=true` (`.npmrc`) : une version de Node non
+supportée échoue immédiatement.
 
 `tests/contracts/requirements.txt` est compilé avec hashes SHA-256
 (`requirements.in` + `pip-compile --generate-hashes`, LOW-4) et installé

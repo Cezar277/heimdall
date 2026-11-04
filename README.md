@@ -89,14 +89,15 @@ export HEIMDALL_VAULT_SSL_KEYFILE='/chemin/absolu/server.key'
 python -m heimdall.vault.app
 ```
 
-Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une KEK qui ne
-réside jamais dans la base. La KEK est **dérivée une seule fois au démarrage**
-avec Argon2id (64 Mio, 3 itérations, 4 lanes, sel public de 16 octets) depuis
-`HEIMDALL_VAULT_MASTER_KEY` + `HEIMDALL_VAULT_KEK_SALT`, puis conservée en
-mémoire ; les requêtes ne recalculent jamais la KDF. Le mode historique
-`HEIMDALL_VAULT_KEK` (KEK 32 octets directe) reste accepté pour les données
-existantes, mais les deux modes sont exclusifs. Détails et justification du
-choix Argon2id vs HKDF : [ADR-005](docs/adr/005-derivation-kek-argon2id.md).
+Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une DEK propre au
+secret, elle-même chiffrée par une KEK qui ne réside jamais dans la base. La KEK
+est **dérivée une seule fois au démarrage** avec Argon2id (64 Mio, 3 itérations,
+4 lanes, sel public de 16 octets) depuis `HEIMDALL_VAULT_MASTER_KEY` +
+`HEIMDALL_VAULT_KEK_SALT`, puis conservée en mémoire ; les requêtes ne
+recalculent jamais la KDF. Le mode historique `HEIMDALL_VAULT_KEK` (KEK 32
+octets directe) reste accepté pour les données existantes, mais les deux modes
+sont exclusifs. Détails et justification du choix Argon2id vs HKDF :
+[ADR-005](docs/adr/005-derivation-kek-argon2id.md).
 `UNIQUE(project_id, env, name)` garantit le 409 inter-workers et
 `PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
 Le backend mémoire, réservé aux tests/développement, chiffre également les
@@ -324,6 +325,27 @@ prouve l'absence de connexion sur ce chemin opérationnel.
   sélectionnable après le premier run qui le publie (une approbation ou un
   `/ci`). Pas de force-push. Ne pas exiger `Vault contract` : ses filtres de
   chemins le laisseraient « en attente » sur les PR sans fichiers de contrat.
+- **Merge réservé au mainteneur** : ruleset `Merge réservé au mainteneur`
+  (cible `~DEFAULT_BRANCH`) avec la seule règle *Restrict updates* et
+  `Cezar277` comme unique acteur de contournement. Conséquence : **seul le
+  mainteneur peut mettre à jour `main`**, donc seul il peut merger — un auteur
+  de PR ne peut plus merger la sienne, même après approbation, et le bouton
+  *Merge* reste bloqué pour tous les autres collaborateurs. Le contournement
+  étant limité à ce ruleset, `Protection Main` (PR + approbation + checks)
+  continue de s'appliquer au mainteneur. Recréation (idempotente, à rejouer si
+  le ruleset est supprimé) :
+
+  ```bash
+  gh api -X POST repos/Cezar277/heimdall/rulesets --input - <<'JSON'
+  {"name":"Merge réservé au mainteneur","target":"branch","enforcement":"active",
+   "conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},
+   "rules":[{"type":"update"}],
+   "bypass_actors":[{"actor_id":82095388,"actor_type":"User","bypass_mode":"always"}]}
+  JSON
+  ```
+
+  Rappel : ce ruleset ne remplace pas la revue humaine — il empêche seulement
+  l'auteur de merger sa propre PR.
 - **Actions** (Settings > Actions > General) : garder l'approbation requise
   pour les workflows déclenchés depuis un fork (« Require approval for all
   outside collaborators »). **Exigence bloquante** — le runner `self-hosted`
@@ -382,6 +404,15 @@ le nonce AES-GCM de 96 bits est tiré de `os.urandom` **à chaque** chiffrement
 l'authentification. Deux chiffrements du même texte donnent donc deux blobs
 différents — c'est la preuve archivée pour le rapport. Preuves :
 [`docs/t67-samm.md`](docs/t67-samm.md).
+
+Chiffrement par enveloppe (sous-ticket T263 de #26) : chaque secret reçoit une
+DEK aléatoire de 32 octets ; la valeur est chiffrée avec la DEK, puis la DEK
+est chiffrée avec la KEK. Les deux blobs sont stockés dans la même ligne
+(`encrypted_value`, `encrypted_dek`). Une fuite de DEK ne compromet donc qu'un
+secret, et la KEK ne chiffre que des clés. Les lignes héritées, chiffrées
+directement par la KEK avant #70, restent lisibles. Preuves :
+[`docs/t263-samm.md`](docs/t263-samm.md),
+`tests/test_vault_dek_envelope.py`.
 
 Falsification du chiffrement au repos (sous-ticket T68 de #26, via #66
 « Module crypto isolé ») : un seul octet modifié du blob (nonce, ciphertext ou
