@@ -1444,7 +1444,7 @@ def rotate_secrets_kek(
     new_cipher: "VaultCipher",
     *,
     target_kek_version: int | None = None,
-) -> int:
+) -> tuple[int, int]:
     """Effectue la rotation transactionnelle de la KEK sur l'ensemble des secrets (#71).
 
     Règles de sécurité :
@@ -1457,6 +1457,9 @@ def rotate_secrets_kek(
     - L'empreinte auxiliaire (fingerprint) reste strictement inchangée car les
       valeurs ne sont jamais déchiffrées en mémoire lors de la rotation.
     - Échoue fail-closed si un secret hérité (#25/#62) sans enveloppe de DEK est rencontré.
+
+    Returns:
+        tuple[int, int]: Un tuple (nombre_de_secrets_reenveloppes, nouvelle_version_kek).
     """
     from heimdall.vault.crypto import VaultCipher, VaultCipherError  # noqa: PLC0415
 
@@ -1474,7 +1477,7 @@ def rotate_secrets_kek(
         )
         secrets_to_rotate = cursor.fetchall()
         if not secrets_to_rotate:
-            return 0
+            return 0, target_kek_version or 1
 
         try:
             current_max = max(
@@ -1528,7 +1531,7 @@ def rotate_secrets_kek(
             new_version,
         )
 
-    return rotated_count
+    return rotated_count, new_version
 
 
 def delete_secret(

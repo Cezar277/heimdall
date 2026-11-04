@@ -436,7 +436,7 @@ class SqliteSecretStore:
     ) -> int:
         active_old = old_cipher or self._cipher
         with db_session(self._db_path) as conn:
-            count = rotate_secrets_kek(
+            count, new_version = rotate_secrets_kek(
                 conn,
                 active_old,
                 new_cipher,
@@ -455,15 +455,9 @@ class SqliteSecretStore:
                     self._kek_version = int(val)
                 except (ValueError, TypeError):
                     self._cipher = new_cipher
-                    self._kek_version = (
-                        target_kek_version
-                        if target_kek_version is not None
-                        else self._kek_version + 1
-                    )
+                    self._kek_version = new_version
                     raise RuntimeError("Version de KEK illisible en base.") from None
-            elif target_kek_version is not None:
-                self._kek_version = target_kek_version
             else:
-                self._kek_version += 1
+                self._kek_version = new_version
         self._cipher = new_cipher
         return count

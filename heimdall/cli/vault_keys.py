@@ -305,7 +305,7 @@ def rotate_kek_command(
 
     try:
         with db_session(resolved) as conn:
-            count = rotate_secrets_kek(
+            count, _ = rotate_secrets_kek(
                 conn,
                 old_cipher,
                 new_cipher,
