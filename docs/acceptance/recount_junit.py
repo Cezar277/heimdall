@@ -11,8 +11,29 @@ import xml.etree.ElementTree as ET
 def main():
     root = Path(__file__).resolve().parent
     expected = json.loads((root / "results.json").read_text(encoding="utf-8"))
-    source = root / expected["junit_path"]
-    if hashlib.sha256(source.read_bytes()).hexdigest() != expected["junit_sha256"]:
+    if not isinstance(expected, dict):
+        raise ValueError("results.json must contain an object")
+    junit_path = expected.get("junit_path")
+    if not isinstance(junit_path, str) or not junit_path.strip():
+        raise ValueError("junit_path must be a non-empty relative path")
+    source = (root / junit_path).resolve()
+    if not source.is_relative_to(root):
+        raise ValueError("junit_path outside acceptance directory")
+    if Path(junit_path).is_absolute():
+        raise ValueError("junit_path must be a relative path")
+    expected_sha = expected.get("junit_sha256", "")
+    if (
+        not isinstance(expected_sha, str)
+        or len(expected_sha) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha)
+    ):
+        raise ValueError("junit_sha256 must be a lowercase SHA-256 hex digest")
+    for key, value_type in (
+        ("by_module", dict), ("pytest_counts", dict), ("subtests_passed", int), ("groups", list)
+    ):
+        if not isinstance(expected.get(key), value_type):
+            raise ValueError(f"Missing or invalid results.json field: {key}")
+    if hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:
         raise ValueError("JUnit SHA-256 mismatch")
     by_module = collections.defaultdict(collections.Counter)
     tree = ET.parse(source)

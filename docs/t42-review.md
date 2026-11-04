@@ -50,6 +50,21 @@ Le bilan de l'instantané du 25 octobre reste **17 Pass, 2 Fail, 2 Partiel,
 Ollama et KEK/DEK de cet instantané ne sont pas requalifiées par cette revue
 documentaire ni par l'intégration des évolutions ultérieures de `main`.
 
+## Complément de revue — cohérence et confinement du vérificateur
+
+- `junit_note` est aligné sur `junit_replay.redaction` : les paramètres sont
+  remplacés par des identifiants synthétiques conservés, le hostname est retiré,
+  les chemins et adresses mémoire sont anonymisés.
+- Le chemin JUnit doit être relatif et rester dans `docs/acceptance/` après
+  résolution, y compris pour un lien symbolique. Le refus précède la lecture
+  du XML et le calcul de son empreinte.
+- Un document JSON qui n'est pas un objet, un chemin ou une empreinte absent
+  ou invalide, ainsi que les principaux champs de comptage absents ou de type
+  incorrect, produisent un `ValueError` explicite.
+- Validation ciblée sur copies temporaires : chemins parent, absolu et lien
+  symbolique sortant refusés ; métadonnées invalides refusées ; archive valide
+  toujours recalculable. Aucun changement des verdicts ni des conditions AC-24.
+
 ## Conditions avant fusion
 
 - **CI distante** : exiger `CI (/ci)` vert sur le commit de merge correspondant

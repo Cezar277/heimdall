@@ -2,3 +2,5 @@ Validation locale : 2026-11-04 (Debian/WSL)
 Commande : python3 docs/acceptance/recount_junit.py
 OK: 2211 passed, 16 skipped; 46 modules, 19 groups; SHA-256 verified
 Exit code: 0
+Validation ciblee sur copies temporaires :
+OK: 24 invalid metadata/path cases rejected before XML read (including outgoing symlink)

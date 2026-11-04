@@ -564,7 +564,7 @@
   "subtests_passed": 4480,
   "warnings": 7,
   "duration_seconds": 251.17,
-  "junit_note": "XML expurgé du rejeu de revue versionné ; comptes par module comparés au relevé initial. Paramètres des noms de tests et hostname retirés, chemins anonymisés. Le hash historique seul ne permet pas de reconstruire le XML initial.",
+  "junit_note": "XML expurgé du rejeu de revue versionné ; comptes par module comparés au relevé initial. Paramètres des noms de tests remplacés par des identifiants synthétiques case-XXXX conservés, hostname retiré, chemins et adresses mémoire anonymisés. Le hash historique seul ne permet pas de reconstruire le XML initial.",
   "acceptance_cases": [
     {
       "id": "AC-01",
