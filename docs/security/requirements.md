@@ -287,20 +287,126 @@ Tests complémentaires (même fichiers) : corpus d'obfuscations exigé
   symlinké est refusé au lieu d'être suivi ; une signature binaire ne suffit
   pas à faire ignorer un fichier dont le contenu est majoritairement textuel
   (le refus est alors explicite) ; un secret coupé par un retour à la ligne
-  est recherché dans une fenêtre multi-ligne bornée à 4 Kio ; la clé HMAC
+  est recherché dans une fenêtre multi-ligne bornée à 4 Kio, sur deux lignes
+  contiguës uniquement, les lignes vides intercalées (`\n\n`) sont hors
+  périmètre (limite documentée tickets #23/#24) ; la clé HMAC
   locale est durcie (fichier `0600`, propriétaire vérifié, parent `0700`,
   parent symlink refusé, `..` refusé) et son indisponibilité lève `ScanError`
   au lieu d'une clé éphémère.
-  Preuves : `tests/test_scanner_detect.py`,
-  `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean` et
-  la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
+  Durcissement post-2ᵉ relecture : **aucun nom de fichier n'exclut un fichier
+  du scan** — une extension binaire, un lockfile ou un répertoire de tiers ne
+  peuvent plus cacher un secret (le contenu décide : lu et scanné s'il est
+  textuel). Un contenu du périmètre qui ne peut pas être analysé (binaire
+  connu, lien symbolique, fichier illisible, trop gros ou modifié pendant la
+  lecture) lève `ScanError` : aucun `[]` ne peut masquer une lecture
+  partielle. Seules la base VCS (`.git/`, `.hg/`, `.svn/`) **et les entrées
+  non suivies qu'un `.gitignore` du dépôt déclare ignorées** sont élaguées
+  par politique. Un fichier **suivi** reste toujours analysé, même si un
+  motif le matche (`git add -f`) ou s'il vit dans un répertoire ignoré :
+  aucune exclusion ne peut cacher un secret qui peut partir dans un commit.
+  Les fichiers suivis sont retirés des exclusions et un répertoire ignoré
+  contenant un fichier suivi n'est jamais élagué. Un second snapshot Git,
+  pris après le parcours, refuse (code 2) toute entrée sautée qui ne serait
+  plus ignorée : un `git add -f` concurrent ne peut pas produire un faux
+  négatif silencieux. Les exclusions globales de la machine
+  (`.git/info/exclude`, `core.excludesFile`, `~/.config/git/ignore`) ne sont
+  **pas** honorées : le verdict reste déterministe. Une panne de Git (binaire
+  absent, dépôt invalide) désactive l'exclusion et parcourt tout l'arbre. Le compteur
+  `heimdall.scanner.detect.Scanner.vcs_ignored` expose les bases VCS
+  écartées et `heimdall.scanner.detect.Scanner.git_ignored` les entrées
+  `.gitignore` écartées ; les deux sont propagés par la CLI dans
+  `ScanReport.vcs_ignored` / `ScanReport.git_ignored`, le JSON
+  (`vcs_ignored` / `git_ignored`) et le résumé `--ci`. Le mode arbre ne
+  prétend donc jamais couvrir l'historique : `--staged` couvre le contenu
+  indexé (ce que le commit va contenir), pas les commits déjà écrits, et
+  n'applique aucune exclusion `.gitignore`. Un binaire connu du périmètre est
+  refusé (code 2) dans les deux périmètres : il n'est jamais sauté
+  silencieusement ; une entrée non suivie et ignorée est écartée avant
+  lecture et comptée. Un arbre vide (seule la base VCS existe, ou toutes les
+  entrées sont ignorées) reste un verdict 0 assumé **en bibliothèque et en
+  local**, avec `files_scanned == 0` et `vcs_ignored`/`git_ignored`
+  observables ; en mode `--ci`, il est refusé (code 2) car aucun contenu n'a
+  été lu : une automatisation qui ne lit que le code de sortie ne peut pas
+  confondre « propre » et « non parcouru ». Un test fige que `--staged`
+  couvre le contenu indexé. Dès qu'un fichier de contenu est analysé,
+  l'élagage reste une politique comptée et un dépôt réellement propre sort
+  en 0.
+  Durcissement post-3ᵉ relecture : **aucun verdict propre partiel**. Les
+  compteurs ne sont plus jetés par `scan()`/`find_candidates()` : un fichier
+  du périmètre qui n'a pas pu être analysé lève `ScanError` au lieu de rendre
+  une liste vide ; un fichier tronqué entre le `stat` et l'`open` (même
+  inode) est refusé ; une racine contenant un octet NUL est refusée par
+  `ScanError` et non par une `ValueError` nue ; en mode fichier unique, la
+  racine parente est re-vérifiée par `lstat` avant lecture (aucun lien suivi).
+  Avant le walk, la racine **et tous ses ancêtres** sont re-`lstat`és, et
+  l'identité `(st_dev, st_ino)` de la racine parcourue doit être celle figée à
+  la construction : un ancêtre symlinké ou un répertoire substitué au même
+  chemin est refusé, jamais lu à la place du périmètre. La racine est ensuite
+  **ouverte** en `O_NOFOLLOW|O_DIRECTORY` et le parcours/lecture sont ancrés
+  sur des descripteurs de répertoire (`openat`/`scandir(fd)`) : la fenêtre
+  résiduelle entre la re-vérification et le walk ne peut plus détourner le
+  périmètre. Le repli par chemin des plateformes sans descripteurs conserve
+  les gardes par fichier (`resolve` + `is_relative_to`, `O_NOFOLLOW`,
+  identité `dev/ino`, taille et `mtime_ns` avant/après).
+  Durcissement post-5ᵉ relecture : un fichier régulier nommé `.git` (gitlink
+  de worktree ou de sous-module, `gitdir: …`) n'est **pas** confondu avec le
+  répertoire `.git/` : seul un segment **parent** classe un chemin hors
+  périmètre, et le fichier `.git` est lu par contenu.
+  Preuves : `tests/test_scanner_detect.py`
+  (`test_the_vcs_database_is_not_walked`,
+  `test_a_vcs_database_with_a_secret_returns_an_empty_list`,
+  `test_the_vcs_skip_is_counted_and_never_claimed_complete`,
+  `test_vcs_ignored_is_reset_between_scans`,
+  `test_files_scanned_describes_the_current_scan`,
+  `test_gitlink_file_and_vcs_directory_scan_matrix`,
+  `test_the_rotating_bounds_are_frozen_at_scan_level`,
+  `test_the_deprecated_binary_helper_is_not_exported`,
+  `test_a_gitlink_file_is_not_mistaken_for_the_vcs_database`,
+  `test_a_real_binary_is_fail_closed`,
+  `test_symlinks_are_fail_closed`,
+  `test_a_broken_file_in_the_strict_perimeter_is_fail_closed`,
+  `test_a_single_file_parent_replaced_by_a_symlink_before_reading_is_fail_closed`,
+  `test_an_ancestor_of_the_root_replaced_by_a_symlink_is_fail_closed`,
+  `test_the_root_replaced_by_another_directory_is_fail_closed`,
+  `test_a_root_swapped_between_recheck_and_open_is_fail_closed`,
+  `test_a_root_swapped_after_open_cannot_redirect_the_traversal`,
+  `test_gitlink_file_is_scanned_vs_vcs_directory_matrix`,
+  `test_scanner_does_not_consult_the_deprecated_binary_helper`),
+  `tests/security/test_scanner_bypass.py::test_incomplete_scan_never_clean`
+  et la mesure T21 (`tests/test_trap_acceptance.py`, `core` précision/rappel 1,00).
+  Preuves #59 (exclusions Git sûres) : `tests/test_scanner_gitignore.py`
+  (`test_an_ignored_env_file_is_not_scanned`,
+  `test_an_ignored_vendor_directory_is_not_scanned`,
+  `test_an_ignored_node_modules_directory_is_not_scanned`,
+  `test_an_ignored_lockfile_is_not_scanned`,
+  `test_an_ignored_binary_is_not_scanned`,
+  `test_an_ignored_oversized_file_is_not_scanned`,
+  `test_a_tracked_file_matching_gitignore_is_always_scanned`,
+  `test_a_tracked_file_inside_an_ignored_directory_is_always_scanned`,
+  `test_git_info_exclude_is_not_honored`,
+  `test_global_git_excludes_are_not_honored`,
+  `test_git_unavailable_falls_back_to_a_full_scan`,
+  `test_respect_gitignore_false_restores_the_full_scan`,
+  `test_single_file_mode_ignores_gitignore`,
+  `test_git_ignored_is_reset_between_scans`), et les preuves CLI
+  `tests/test_cli_scan.py::test_scan_tree_skips_a_gitignored_untracked_secret`,
+  `::test_scan_tree_always_scans_a_tracked_file_matching_gitignore`,
+  `::test_scan_tree_ignored_binary_is_skipped_without_code_two`,
+  `::test_scan_ci_refuses_a_tree_with_only_gitignored_content`,
+  `::test_scan_staged_scans_a_gitignored_secret`.
   Depuis #29, le contrat 0/1/2 est **exécuté** : `tests/test_cli_scan.py`
   prouve dépôt propre => 0, secret avéré => 1, racine absente => 2, index en
-  conflit => 2, blob trop gros => 2, et **aucune écriture** pendant un scan.
+  conflit => 2, blob trop gros => 2, blob binaire connu => 2, et **aucune
+  écriture** pendant un scan ; `test_scan_tree_reports_the_vcs_skip_in_json_and_ci`
+  prouve que `vcs_ignored` reste observable en bibliothèque, en JSON et en
+  `--ci`.
   Le mode `--staged` analyse les blobs ajoutés ou modifiés de l'index **sans
-  aucune exclusion de chemin** (`vendor/`, lockfiles compris) : c'est la
-  correction du point HIGH relevé à la revue de #165, où la politique #59
-  laissait passer un secret posé dans `vendor/evil.py`.
+  aucune exclusion de chemin** (`vendor/`, lockfiles compris) ; le mode arbre
+  de travail écarte la base VCS et les **entrées non suivies ignorées** par
+  un `.gitignore` du dépôt, et refuse (2) tout fichier du périmètre non
+  analysable. C'est la correction du point HIGH relevé à la revue de #165, où
+  une exclusion **par le nom** (politique initiale de #59) laissait passer un
+  secret posé dans `vendor/evil.py`, sans jamais le signaler.
   Limites connues documentées par T21 : base64, concaténation et flux de
   variables ne sont pas décodés ; leur traitement relève de #23/#24 et ne
   produit jamais un verdict propre sans les contrôles CI de #29/#19.

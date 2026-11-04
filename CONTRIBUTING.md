@@ -58,16 +58,20 @@ Règles: résumé de 72 caractères maximum, une seule idée par commit, jamais 
 - Un relecteur d'un autre domaine, au minimum 1 approbation.
 - Délai cible: 48 h ouvrées. Au-delà, relance dans le ticket.
 - Le relecteur vérifie: la Definition of Done (voir `docs/DEFINITION_OF_DONE.md`), l'impact sécurité, la lisibilité, les tests.
-- Le porteur ne merge pas une PR qui n'a pas été approuvée.
+- Le porteur ne merge **jamais** sa propre PR, même approuvée et CI verte : seul le mainteneur (`Cezar277`) merge (règle GitHub `Merge réservé au mainteneur`). Le bouton *Merge* est bloqué pour tous les autres collaborateurs.
 - Une remarque bloquante se résout par une discussion dans la PR, pas par un contournement.
 
 ## 7. Protection de `main`
 
-Dans Settings > Branches, la règle sur `main` impose:
+Dans Settings > Rules, les règles sur `main` imposent:
 - une PR avant merge,
 - au moins 1 approbation,
 - les status checks requis (une fois la CI en place),
-- pas de force-push.
+- pas de force-push,
+- **le merge réservé au mainteneur** : ruleset `Merge réservé au mainteneur`
+  (règle *Restrict updates*, `Cezar277` seul acteur de contournement). Un
+  auteur de PR ne peut donc pas merger la sienne : il demande le merge au
+  mainteneur, qui reste soumis à `Protection Main` (PR + approbation + checks).
 
 La CI lourde (`.github/workflows/ci.yml`, #20) ne se déclenche **pas** à chaque
 push : elle démarre quand un collaborateur de confiance commente **`/ci`** (en

@@ -1,9 +1,9 @@
 """Erreurs du scanner déterministe (#53, #22).
 
-Un scan incomplet ne produit jamais un verdict propre : toute erreur de
-lecture, de confinement ou de décodage remonte en ``ScanError``. Les messages
-sont statiques et ne reflètent jamais une entrée (invariant 8) : ni chemin, ni
-extrait de fichier, ni valeur candidate.
+Le rapport de scan est **non implémenté** : ``scan()`` ne distingue pas propre
+et partiel. Toute erreur de lecture, de confinement ou de décodage remonte en
+``ScanError``. Les messages sont statiques et ne reflètent jamais une entrée
+(invariant 8) : ni chemin, ni extrait de fichier, ni valeur candidate.
 
 ``InvalidFinding`` et ``InvalidTarget`` dérivent aussi de ``ValueError`` : un
 appelant qui traite les erreurs de contrat comme des valeurs invalides

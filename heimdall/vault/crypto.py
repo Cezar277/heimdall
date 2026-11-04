@@ -29,6 +29,26 @@ parties ensemble (``nonce || ciphertext || tag``) et l'AAD est l'identifiant du
 secret : un blob copié sur un autre secret échoue à l'authentification. Deux
 chiffrements du même texte donnent donc deux blobs différents — c'est la preuve
 archivée dans ``tests/test_vault_crypto.py``.
+
+CHIFFREMENT PAR ENVELOPPE (ticket #70, sous-ticket T26.3 de #26) : chaque secret
+reçoit sa propre **DEK** aléatoire de 32 octets. La valeur est chiffrée avec
+cette DEK, puis la DEK est chiffrée (« enveloppée ») avec la **KEK**. Les deux
+blobs sont stockés dans la ligne du secret. La KEK ne chiffre donc que des
+clés : si une DEK fuit, un seul secret est exposé. L'AAD de la valeur reste
+l'identité ``(project, env, name)`` ; celui de l'enveloppe de DEK ajoute un
+label de domaine dédié, pour qu'un blob de DEK ne puisse pas être rejoué comme
+une valeur ni déplacé vers un autre secret.
+
+DÉRIVATION DE LA KEK (ticket #262, sous-ticket de #26 « Clé maîtresse et
+chiffrement par enveloppe ») : la KEK qui chiffre les secrets est dérivée de la
+clé maîtresse du serveur avec **Argon2id** (``argon2.low_level.hash_secret_raw``,
+``Type.ID``), sel public de 16 octets persisté à côté de la clé maîtresse.
+Paramètres OWASP (64 Mio, 3 itérations, 4 lanes) : voir
+``docs/adr/005-derivation-kek-argon2id.md``. La dérivation est volontairement
+lente et n'a lieu **qu'une fois au démarrage** ; la KEK dérivée reste en mémoire
+dans ``VaultCipher`` et n'est jamais écrite en base. Le mode historique
+``HEIMDALL_VAULT_KEK`` (KEK 32 octets fournie directement) reste accepté pour ne
+pas rendre illisibles les blobs existants ; les deux modes sont exclusifs.
 """
 
 import base64
@@ -36,7 +56,10 @@ import hashlib
 import hmac
 import os
 import secrets
+import unicodedata
+from typing import NamedTuple
 
+import argon2.low_level
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -49,6 +72,29 @@ _TAG_SIZE_BYTES: int = 16  # étiquette d'authentification GCM, en fin de cipher
 # résistance hors ligne si les empreintes stockées et le pepper fuient.
 _MIN_PEPPER_BYTES: int = 32
 
+# Une DEK fait 256 bits, comme la KEK : l'AES-256-GCM exige une clé de 32 octets.
+_DEK_SIZE_BYTES: int = 32
+
+# Label de domaine stable de l'enveloppe de DEK (ticket #70). L'AAD de la DEK
+# n'est jamais celui de la valeur : un blob de DEK ne peut pas être rejoué comme
+# un ciphertext de valeur, et inversement. Changer ce label rend les enveloppes
+# existantes illisibles ; c'est un format de stockage, pas un secret.
+_DEK_WRAP_AAD_PREFIX: bytes = b"heimdall-vault-dek-wrap-v1\x00"
+
+# Paramètres Argon2id de dérivation de la KEK (ticket #262, ADR-005) :
+# 64 Mio de mémoire, 3 itérations, 4 lanes. Ils dépassent les minimums OWASP
+# (19 Mio / 2 / 1) tout en restant supportables au démarrage. Changer ces
+# valeurs change la KEK produite pour un même couple (clé maîtresse, sel) :
+# les traiter comme un format de stockage, jamais comme un réglage jetable.
+ARGON2ID_TIME_COST: int = 3
+ARGON2ID_MEMORY_COST_KIB: int = 64 * 1024  # 64 Mio
+ARGON2ID_PARALLELISM: int = 4
+ARGON2ID_HASH_LEN: int = _KEY_SIZE_BYTES  # 32 octets, clé AES-256
+ARGON2ID_SALT_BYTES: int = 16  # 128 bits, sel public stocké à côté de la clé maîtresse
+# Une clé maîtresse plus courte que 128 bits n'apporte pas la marge nécessaire
+# face à une attaque hors ligne : refus fail-closed en amont d'Argon2id.
+MIN_MASTER_KEY_BYTES: int = 16
+
 # Label de domaine stable de la sous-clé d'empreinte (invariant 5 : la KEK de
 # chiffrement n'est jamais réutilisée directement comme clé HMAC). Changer ce
 # label rompt la vérification d'empreintes existantes ; c'est un dérivé
@@ -58,6 +104,31 @@ _FINGERPRINT_HKDF_INFO: bytes = b"heimdall-vault-fingerprint-v1"
 
 class VaultCipherError(ValueError):
     """Erreur de chiffrement/déchiffrement sans détail sensible."""
+
+
+class SecretEnvelope(NamedTuple):
+    """Les deux blobs d'un secret chiffré par enveloppe (ticket #70).
+
+    - ``encrypted_value`` : valeur chiffrée avec la DEK du secret ;
+    - ``encrypted_dek`` : DEK chiffrée avec la KEK du serveur.
+
+    Les deux champs sont des jetons base64 URL-safe autonomes
+    (``nonce || ciphertext || tag``) et sont liés par AAD à l'identité du
+    secret. Aucun des deux ne contient la valeur en clair.
+    """
+
+    encrypted_value: str
+    encrypted_dek: str
+
+
+def generate_dek() -> bytes:
+    """Génère une DEK de 32 octets (256 bits) avec le CSPRNG du système.
+
+    Chaque secret reçoit sa propre DEK (ticket #70). Elle n'est jamais dérivée
+    de l'identifiant, d'un compteur ou de la KEK : deux secrets partagent donc
+    des DEK indépendantes, et la fuite d'une DEK ne compromet qu'un secret.
+    """
+    return secrets.token_bytes(_DEK_SIZE_BYTES)
 
 
 def generate_api_key() -> str:
@@ -84,11 +155,34 @@ def constant_time_equal(left: str | bytes, right: str | bytes) -> bool:
 
 
 def kek_matches_pepper(kek: str, pepper: str) -> bool:
-    """Détecte la réutilisation de clé, y compris sous des encodages différents."""
+    """Détecte la réutilisation de clé, y compris sous des encodages différents.
+
+    Quatre comparaisons en temps constant : chaîne KEK vs pepper, KEK décodée vs
+    pepper brut, KEK décodée vs pepper **décodé base64**, puis KEK décodée vs
+    pepper **décodé hexadécimal**. Elles couvrent un pepper encodé en base64
+    standard (``+/``, padding) alors que la KEK est URL-safe (``-_``), et un
+    pepper ``KEK.hex()`` : même entropie, donc invariant 5 violé même si les
+    chaînes diffèrent (revues MEDIUM et LOW).
+    """
     pepper_bytes = pepper.encode("utf-8")
+    kek_bytes = decode_encoded_key(kek)
     encoded_match = constant_time_equal(kek.encode("utf-8"), pepper_bytes)
-    decoded_match = constant_time_equal(decode_encoded_key(kek), pepper_bytes)
-    return encoded_match or decoded_match
+    decoded_match = constant_time_equal(kek_bytes, pepper_bytes)
+    if encoded_match or decoded_match:
+        return True
+    try:
+        pepper_key = decode_encoded_key(pepper)
+    except ValueError:
+        pepper_key = None
+    if pepper_key is not None and constant_time_equal(kek_bytes, pepper_key):
+        return True
+    try:
+        pepper_hex = bytes.fromhex(pepper)
+    except ValueError:
+        # Pepper arbitraire (ni base64 32 octets ni hexadécimal) : aucune
+        # entropie de KEK.
+        return False
+    return constant_time_equal(kek_bytes, pepper_hex)
 
 
 def _normalize_pepper(pepper: str | bytes | None) -> bytes:
@@ -153,6 +247,139 @@ def generate_encryption_key() -> str:
     return base64.urlsafe_b64encode(secrets.token_bytes(_KEY_SIZE_BYTES)).decode("ascii")
 
 
+def generate_kek_salt() -> str:
+    """Génère un sel public Argon2id de 16 octets encodé base64 URL-safe (ticket #262).
+
+    Le sel n'est **pas** un secret : il doit être persisté à côté de la clé
+    maîtresse et rester stable entre les démarrages. Seul, il ne permet pas de
+    retrouver la KEK ; perdu ou modifié, il rend en revanche les secrets
+    existants illisibles (la KEK dérivée change).
+    """
+    return base64.urlsafe_b64encode(secrets.token_bytes(ARGON2ID_SALT_BYTES)).decode("ascii")
+
+
+def decode_kek_salt(salt: str | bytes) -> bytes:
+    """Décode et valide un sel Argon2id de 16 octets exactement (ticket #262).
+
+    Une chaîne est interprétée comme du base64 URL-safe ou standard (avec ou
+    sans padding, validation stricte). Des octets sont pris tels quels : les
+    tests et les appels internes peuvent fournir le sel brut. Toute autre
+    longueur est refusée : le sel est public, mais une erreur de configuration
+    doit échouer franchement plutôt que dériver silencieusement une autre KEK.
+    """
+    if isinstance(salt, str):
+        if not salt or salt != salt.strip():
+            raise ValueError("Sel KEK invalide : valeur vide ou entourée d'espaces.")
+        try:
+            raw = salt.encode("ascii")
+        except UnicodeEncodeError:
+            raise ValueError("Sel KEK invalide : encodage non ASCII.") from None
+        try:
+            padding = b"=" * (-len(raw) % 4)
+            decoded = base64.b64decode(raw + padding, altchars=b"-_", validate=True)
+        except Exception:
+            raise ValueError("Sel KEK invalide : encodage base64 incorrect.") from None
+    elif isinstance(salt, (bytes, bytearray)):
+        decoded = bytes(salt)
+    else:
+        raise ValueError("Sel KEK invalide : chaîne base64 ou octets attendus.")
+    if len(decoded) != ARGON2ID_SALT_BYTES:
+        raise ValueError(f"Sel KEK invalide : {ARGON2ID_SALT_BYTES} octets décodés requis.")
+    return decoded
+
+
+def _zeroize_buffer(buffer: bytearray) -> None:
+    """Remet à zéro best-effort un tampon ``bytearray`` de dérivation (revue LOW).
+
+    Seuls les ``bytearray`` passent par ici : un ``bytes`` est immuable en
+    Python et le muter via ``ctypes`` serait un comportement indéfini sur un
+    objet potentiellement partagé ou interné (corruption d'une autre référence,
+    crash ou no-op selon la plateforme) — cette mutation n'est donc **jamais**
+    faite. Ce nettoyage réduit la fenêtre d'exposition des copies que ce module
+    crée lui-même ; il ne prétend ni effacer la clé maîtresse d'origine (``str``,
+    ``os.environ``) ni les copies internes de ``argon2-cffi``.
+    """
+    buffer[:] = b"\x00" * len(buffer)
+
+
+def _normalize_master_key(master_key: str | bytes) -> bytearray:
+    """Normalise la clé maîtresse en octets effaçables, sans écho dans une erreur.
+
+    Une chaîne est une phrase de passe UTF-8 **canonisée NFC** avant encodage ;
+    des octets sont copiés tels quels (utile aux tests et aux appelants qui
+    détiennent déjà une clé aléatoire). Le ``bytearray`` retourné appartient à
+    l'appelant, qui doit l'effacer après usage (``_zeroize_buffer``). La longueur
+    minimale de 128 bits est une défense en profondeur contre une phrase de passe
+    triviale : Argon2id ralentit l'attaque hors ligne mais ne compense pas une
+    clé maîtresse sans entropie.
+    """
+    if isinstance(master_key, str):
+        if not master_key or not master_key.strip():
+            raise ValueError("Clé maîtresse invalide : valeur vide ou blanche.")
+        if master_key != master_key.strip():
+            raise ValueError("Clé maîtresse invalide : espaces de début ou de fin interdits.")
+        try:
+            # Forme canonique NFC (ticket #262) : « é » précomposé et « e » +
+            # accent combinant doivent dériver la même KEK (ADR-005).
+            raw = bytearray(unicodedata.normalize("NFC", master_key).encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ValueError("Clé maîtresse invalide : encodage UTF-8 impossible.") from None
+    elif isinstance(master_key, (bytes, bytearray)):
+        # Copie systématique : effacer le buffer ne doit jamais corrompre
+        # l'objet de l'appelant (bytes(bytearray) crée toujours un nouvel objet,
+        # contrairement à bytes(bytes) qui peut renvoyer le même).
+        raw = bytearray(master_key)
+        if not raw.strip():
+            raise ValueError("Clé maîtresse invalide : valeur vide ou blanche.")
+        if raw != raw.strip():
+            raise ValueError("Clé maîtresse invalide : espaces de début ou de fin interdits.")
+    else:
+        raise ValueError("Clé maîtresse invalide : chaîne ou octets attendus.")
+    if len(raw) < MIN_MASTER_KEY_BYTES:
+        raise ValueError(
+            f"Clé maîtresse invalide : au moins {MIN_MASTER_KEY_BYTES} octets "
+            "(128 bits) sont requis."
+        )
+    return raw
+
+
+def derive_kek_from_master_key(master_key: str | bytes, salt: str | bytes) -> bytes:
+    """Dérive la KEK 256 bits avec Argon2id (ticket #262, ADR-005).
+
+    ``argon2.low_level.hash_secret_raw`` est utilisée en ``Type.ID`` (Argon2id),
+    avec 64 Mio de mémoire, 3 itérations et 4 lanes. Ces paramètres sont figés
+    dans le module (voir ``ARGON2ID_*``) et documentés dans l'ADR : ils font
+    partie du format de la KEK, pas d'un réglage d'exécution.
+
+    La fonction est déterministe pour un même couple (clé maîtresse, sel) —
+    c'est le critère « Fait quand » du ticket — et volontairement lente. Elle
+    DOIT être appelée une seule fois au démarrage, puis la KEK retournée est
+    conservée en mémoire (``VaultCipher``), jamais recalculée par requête.
+
+    Les octets normalisés sont effacés best-effort dans un ``finally``, y
+    compris si la KDF échoue (revue LOW). La copie transmise à
+    ``argon2-cffi`` doit être un ``bytes`` (API de la librairie) : elle est
+    créée au dernier moment, pour la durée de l'appel seulement, et n'est pas
+    mutée (voir ``_zeroize_buffer``).
+    """
+    secret = _normalize_master_key(master_key)
+    try:
+        salt_bytes = decode_kek_salt(salt)
+        return argon2.low_level.hash_secret_raw(
+            # Copie immuable transitoire exigée par `argon2-cffi` (ffi.new) :
+            # le `bytearray` effaçable reste la seule forme durable du secret.
+            secret=bytes(secret),
+            salt=salt_bytes,
+            time_cost=ARGON2ID_TIME_COST,
+            memory_cost=ARGON2ID_MEMORY_COST_KIB,
+            parallelism=ARGON2ID_PARALLELISM,
+            hash_len=ARGON2ID_HASH_LEN,
+            type=argon2.low_level.Type.ID,
+        )
+    finally:
+        _zeroize_buffer(secret)
+
+
 def decode_encoded_key(encoded: str | bytes) -> bytes:
     """Décode une KEK base64 URL-safe (ou standard) de 32 octets en octets bruts.
 
@@ -203,11 +430,59 @@ def _new_nonce() -> bytes:
     return os.urandom(_NONCE_SIZE_BYTES)
 
 
-class VaultCipher:
-    """Chiffrement authentifié AES-256-GCM des valeurs au repos (ticket #25/#26/#67).
+def _decode_token(token: str) -> bytes:
+    """Décode un jeton base64 URL-safe en ``nonce || ciphertext || tag``.
 
-    - La KEK est fournie par l'exploitant (``HEIMDALL_VAULT_KEK``), jamais stockée
-      dans la base SQLite : la compromission de la base seule ne révèle rien.
+    Toute anomalie (type, chaîne vide, alphabet, longueur minimale) devient une
+    ``VaultCipherError`` générique : aucun oracle n'est offert à l'appelant.
+    """
+    if not isinstance(token, str) or not token:
+        raise VaultCipherError("Donnée chiffrée invalide.")
+    try:
+        raw = base64.b64decode(
+            token.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+    except Exception:
+        raise VaultCipherError("Donnée chiffrée invalide.") from None
+    if len(raw) < _NONCE_SIZE_BYTES + _TAG_SIZE_BYTES:
+        raise VaultCipherError("Donnée chiffrée invalide.")
+    return raw
+
+
+def _encrypt_token(aead: AESGCM, plaintext: bytes, aad: bytes) -> str:
+    """Chiffre avec un AEAD déjà construit et encode ``nonce || ciphertext || tag``."""
+    nonce = _new_nonce()
+    ciphertext = aead.encrypt(nonce, plaintext, aad)
+    return base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+
+
+def _decrypt_token(aead: AESGCM, token: str, aad: bytes) -> bytes:
+    """Déchiffre un jeton et traduit toute erreur de primitive en erreur générique.
+
+    ``AESGCM.decrypt`` lève aujourd'hui ``InvalidTag`` sur une altération, mais
+    une future version de ``cryptography`` peut ajouter des ``ValueError`` de
+    validation d'entrée. Les deux sont traduites en ``VaultCipherError`` pour
+    qu'aucun appelant direct de ``VaultCipher`` ne reçoive un oracle brut.
+    """
+    raw = _decode_token(token)
+    nonce = raw[:_NONCE_SIZE_BYTES]
+    ciphertext = raw[_NONCE_SIZE_BYTES:]
+    try:
+        return aead.decrypt(nonce, ciphertext, aad)
+    except (InvalidTag, ValueError):
+        raise VaultCipherError("Authentification de la donnée chiffrée échouée.") from None
+
+
+class VaultCipher:
+    """Chiffrement authentifié AES-256-GCM des valeurs au repos (ticket #25/#26/#67/#262).
+
+    - La KEK est fournie par l'exploitant soit directement
+      (``HEIMDALL_VAULT_KEK``, mode historique), soit dérivée au démarrage de la
+      clé maîtresse avec Argon2id (``HEIMDALL_VAULT_MASTER_KEY`` +
+      ``HEIMDALL_VAULT_KEK_SALT``, ticket #262). Elle n'est jamais stockée dans
+      la base SQLite : la compromission de la base seule ne révèle rien.
     - Chaque chiffrement tire un **nonce neuf de 96 bits** depuis l'aléatoire du
       système (``os.urandom``, ticket #67) : deux chiffremens du même texte
       donnent deux blobs différents, et un nonce n'est jamais réutilisé avec la
@@ -217,6 +492,10 @@ class VaultCipher:
     - L'AAD lie le ciphertext au triplet ``(project, env, name)`` : un blob déplacé
       vers une autre identité échoue à l'authentification.
     - Les erreurs de déchiffrement sont génériques (aucun oracle sur la cause).
+    - Le chiffrement par enveloppe (``encrypt_envelope``/``decrypt_envelope``,
+      ticket #70) génère une DEK de 32 octets par secret : la valeur est
+      chiffrée avec la DEK, puis la DEK est chiffrée avec la KEK. Un blob de
+      DEK ne peut être rejoué comme une valeur (label de domaine distinct).
     - L'empreinte d'intégrité (``fingerprint``) utilise une sous-clé HKDF-SHA256
       dédiée et lie la valeur au triplet : la KEK n'est jamais réutilisée comme
       clé HMAC (invariant 5) et deux valeurs égales sous des triplets distincts
@@ -252,6 +531,32 @@ class VaultCipher:
         """Décode une KEK base64 URL-safe (ou standard) de 32 octets."""
         return cls(decode_encoded_key(encoded))
 
+    @classmethod
+    def from_master_key(cls, master_key: str | bytes, salt: str | bytes) -> "VaultCipher":
+        """Dérive la KEK avec Argon2id puis construit le chiffreur (ticket #262).
+
+        À appeler **une seule fois au démarrage** : la dérivation est coûteuse
+        (64 Mio, 3 itérations) et la KEK obtenue reste en mémoire pour la durée
+        de vie du processus.
+        """
+        return cls(derive_kek_from_master_key(master_key, salt))
+
+    def key_reuses_pepper(self, pepper: str) -> bool:
+        """Détecte si la KEK de ce chiffreur réutilise l'entropie du pepper.
+
+        Compare la KEK brute, ses représentations base64 URL-safe et standard,
+        l'encodage hexadécimal et la version décodée du pepper (invariant 5),
+        sans jamais exposer ni la KEK ni ``pepper``. Sert au chemin
+        ``secret_store`` explicite de ``create_app`` : c'est la clé
+        **réellement portée par le chiffreur du store** qui est vérifiée, pas
+        la dérivation que ``settings`` produirait — les deux peuvent diverger
+        (revue LOW).
+        """
+        encoded = base64.urlsafe_b64encode(self._key).decode("ascii")
+        return kek_matches_pepper(encoded, pepper) or constant_time_equal(
+            self._key, pepper.encode("utf-8")
+        )
+
     @staticmethod
     def aad(project: str, env: str, name: str) -> bytes:
         """Contexte authentifié liant un ciphertext à son triplet d'identité.
@@ -274,9 +579,7 @@ class VaultCipher:
         """
         if not isinstance(plaintext, (bytes, bytearray)):
             raise TypeError("La valeur à chiffrer doit être de type bytes.")
-        nonce = _new_nonce()
-        ciphertext = self._aead.encrypt(nonce, bytes(plaintext), aad)
-        return base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+        return _encrypt_token(self._aead, bytes(plaintext), aad)
 
     def decrypt(self, token: str, *, aad: bytes = b"") -> bytes:
         """Déchiffre un jeton base64 URL-safe ; InvalidTag devient VaultCipherError.
@@ -286,24 +589,95 @@ class VaultCipher:
         celui du chiffrement, sinon l'authentification GCM échoue (blob copié sur
         un autre secret → ``VaultCipherError``).
         """
-        if not isinstance(token, str) or not token:
-            raise VaultCipherError("Donnée chiffrée invalide.")
-        try:
-            raw = base64.b64decode(
-                token.encode("ascii"),
-                altchars=b"-_",
-                validate=True,
+        return _decrypt_token(self._aead, token, aad)
+
+    @staticmethod
+    def encrypt_with_dek(
+        plaintext: bytes,
+        dek: bytes | bytearray,
+        *,
+        aad: bytes = b"",
+    ) -> str:
+        """Chiffre une valeur avec une DEK (AES-256-GCM, ticket #70).
+
+        La DEK est une clé de 32 octets propre au secret ; l'AAD est l'identité
+        du secret, comme pour le chiffrement direct historique. Le jeton retourné
+        suit le même format ``nonce || ciphertext || tag`` que ``encrypt``.
+        """
+        if not isinstance(plaintext, (bytes, bytearray)):
+            raise TypeError("La valeur à chiffrer doit être de type bytes.")
+        if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
+            raise ValueError(
+                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
             )
-        except Exception:
-            raise VaultCipherError("Donnée chiffrée invalide.") from None
-        if len(raw) < _NONCE_SIZE_BYTES + _TAG_SIZE_BYTES:
-            raise VaultCipherError("Donnée chiffrée invalide.")
-        nonce = raw[:_NONCE_SIZE_BYTES]
-        ciphertext = raw[_NONCE_SIZE_BYTES:]
+        return _encrypt_token(AESGCM(bytes(dek)), bytes(plaintext), aad)
+
+    @staticmethod
+    def decrypt_with_dek(
+        token: str,
+        dek: bytes | bytearray,
+        *,
+        aad: bytes = b"",
+    ) -> bytes:
+        """Déchiffre une valeur avec sa DEK ; toute altération lève ``VaultCipherError``."""
+        if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
+            raise ValueError(
+                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
+            )
+        return _decrypt_token(AESGCM(bytes(dek)), token, aad)
+
+    def wrap_dek(self, dek: bytes | bytearray, *, aad: bytes = b"") -> str:
+        """Chiffre une DEK avec la KEK (ticket #70).
+
+        L'AAD de l'enveloppe est préfixé par un label de domaine dédié, puis lié
+        à l'identité du secret : une enveloppe de DEK ne peut être ni rejouée
+        comme une valeur, ni déplacée vers un autre secret.
+        """
+        if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
+            raise ValueError(
+                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
+            )
+        return self.encrypt(bytes(dek), aad=_DEK_WRAP_AAD_PREFIX + bytes(aad))
+
+    def unwrap_dek(self, encrypted_dek: str, *, aad: bytes = b"") -> bytes:
+        """Déchiffre une DEK enveloppée avec la KEK et vérifie sa taille."""
+        dek = self.decrypt(encrypted_dek, aad=_DEK_WRAP_AAD_PREFIX + bytes(aad))
+        if len(dek) != _DEK_SIZE_BYTES:
+            raise VaultCipherError("DEK déchiffrée invalide.")
+        return dek
+
+    def encrypt_envelope(self, plaintext: bytes, *, aad: bytes = b"") -> SecretEnvelope:
+        """Chiffre une valeur par enveloppe : DEK neuve, puis DEK chiffrée par la KEK.
+
+        La DEK est tirée à chaque appel (``generate_dek``) : deux secrets — même
+        avec la même valeur — ont des DEK indépendantes et des blobs distincts.
+        Le buffer de DEK est effacé au mieux après usage (Python ne garantit pas
+        l'absence de copies, mais aucune référence à la DEK n'est conservée).
+        """
+        dek = bytearray(generate_dek())
         try:
-            return self._aead.decrypt(nonce, ciphertext, aad)
-        except InvalidTag:
-            raise VaultCipherError("Authentification de la donnée chiffrée échouée.") from None
+            encrypted_value = self.encrypt_with_dek(plaintext, dek, aad=aad)
+            encrypted_dek = self.wrap_dek(dek, aad=aad)
+        finally:
+            dek[:] = b"\x00" * len(dek)
+        return SecretEnvelope(
+            encrypted_value=encrypted_value,
+            encrypted_dek=encrypted_dek,
+        )
+
+    def decrypt_envelope(
+        self,
+        encrypted_value: str,
+        encrypted_dek: str,
+        *,
+        aad: bytes = b"",
+    ) -> bytes:
+        """Déchiffre une valeur par enveloppe : DEK avec la KEK, puis valeur avec la DEK."""
+        dek = bytearray(self.unwrap_dek(encrypted_dek, aad=aad))
+        try:
+            return self.decrypt_with_dek(encrypted_value, dek, aad=aad)
+        finally:
+            dek[:] = b"\x00" * len(dek)
 
     def fingerprint(self, plaintext: bytes, *, aad: bytes = b"") -> str:
         """Empreinte HMAC-SHA256 non réversible et liée au triplet d'identité.

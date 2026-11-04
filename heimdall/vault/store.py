@@ -20,6 +20,14 @@ interne : les valeurs ne sont déchiffrées qu'au moment de la réponse autoris�
 lecture autorisée ``get`` déchiffre la valeur. Les valeurs stockées sont
 canonicalisées en Unicode NFC (décision #62) : deux écritures visuellement
 identiques d'un même secret ne peuvent pas diverger en base.
+
+Chiffrement par enveloppe (ticket #70) : chaque nouveau secret reçoit une DEK
+aléatoire de 32 octets. La valeur est chiffrée avec la DEK, puis la DEK est
+chiffrée avec la KEK ; les deux blobs sont stockés dans la même ligne
+(``encrypted_value`` et ``encrypted_dek``). La lecture déchiffre d'abord la DEK
+avec la KEK, puis la valeur avec la DEK. Les lignes héritées de #25/#62, sans
+``encrypted_dek``, restent lisibles via le repli KEK direct : aucune migration
+destructive n'est nécessaire.
 """
 
 import asyncio
@@ -58,14 +66,25 @@ def _decrypt_record(
     env: str,
     name: str,
 ) -> dict[str, str]:
-    """Déchiffre un enregistrement et retourne une copie défensive en clair."""
+    """Déchiffre un enregistrement (enveloppe #70 ou ligne héritée) en clair."""
+    aad = VaultCipher.aad(project, env, name)
     try:
-        plaintext = cipher.decrypt(
-            str(record["encrypted_value"]),
-            aad=VaultCipher.aad(project, env, name),
-        )
+        encrypted_dek = str(record.get("encrypted_dek") or "")
+        if encrypted_dek:
+            plaintext = cipher.decrypt_envelope(
+                str(record["encrypted_value"]),
+                encrypted_dek,
+                aad=aad,
+            )
+        else:
+            # Compatibilité #25/#62 : les lignes antérieures au ticket #70
+            # étaient chiffrées directement par la KEK, sans colonne de DEK.
+            plaintext = cipher.decrypt(str(record["encrypted_value"]), aad=aad)
         value = plaintext.decode("utf-8")
-    except (VaultCipherError, UnicodeDecodeError, KeyError):
+    except (VaultCipherError, ValueError, UnicodeDecodeError, KeyError):
+        # ``VaultCipherError`` est un ``ValueError`` ; les deux sont listés
+        # explicitement pour que le contrat reste lisible si la hiérarchie
+        # évolue. Aucun message d'erreur ne contient de secret.
         raise SecretStoreError("Donnée chiffrée illisible.") from None
     return {
         "project": str(record.get("project", record.get("project_id", project))),
@@ -141,12 +160,14 @@ class InMemorySecretStore:
                 raise QuotaExceededError(
                     f"Quota maximal de secrets atteint pour le projet '{project}'"
                 )
+            envelope = self._cipher.encrypt_envelope(value.encode("utf-8"), aad=aad)
             record = {
                 "project": project,
                 "env": env,
                 "name": name,
                 "status": "vaulte",
-                "encrypted_value": self._cipher.encrypt(value.encode("utf-8"), aad=aad),
+                "encrypted_value": envelope.encrypted_value,
+                "encrypted_dek": envelope.encrypted_dek,
             }
             self._secrets[key] = record
             self._project_counts[project] = project_count + 1
@@ -256,7 +277,7 @@ class SqliteSecretStore:
                     f"Quota maximal de secrets atteint pour le projet '{project}'"
                 )
             ensure_project(conn, project)
-            encrypted_value = self._cipher.encrypt(value.encode("utf-8"), aad=aad)
+            envelope = self._cipher.encrypt_envelope(value.encode("utf-8"), aad=aad)
             fingerprint = self._cipher.fingerprint(value.encode("utf-8"), aad=aad)
             try:
                 create_secret(
@@ -264,7 +285,8 @@ class SqliteSecretStore:
                     project,
                     env,
                     name,
-                    encrypted_value,
+                    envelope.encrypted_value,
+                    encrypted_dek=envelope.encrypted_dek,
                     fingerprint=fingerprint,
                 )
             except sqlite3.IntegrityError:

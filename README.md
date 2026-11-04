@@ -35,6 +35,8 @@ heimdall --version
 heimdall scan             # scan de l'arbre de travail (mode strict, #29)
 heimdall scan --staged    # blobs ajoutés ou modifiés dans l'index git (#29)
 heimdall scan --ci        # mode CI headless : le code de sortie est le verdict
+heimdall cold-start . --ci # premier scan déterministe du dépôt existant
+heimdall deep-scan . --ci  # historique complet accessible, alerte de révocation
 heimdall scan --json      # rapport JSON sur stdout (contrat heimdall.scan.v1)
 heimdall mcp --root .     # serveur MCP stdio (outils en lecture seule, #27)
 ```
@@ -65,10 +67,17 @@ Le serveur Vault démarre sur la boucle locale (`127.0.0.1:8443` par défaut) vi
 python -m heimdall.vault.init_db
 
 # Variables minimales d'un déploiement réel (aucune valeur publique par défaut) :
-# KEK : python -c "from heimdall.vault.crypto import generate_encryption_key; print(generate_encryption_key())"
+# KEK (recommandé, ticket #262) : dérivée au démarrage par Argon2id depuis cette
+# clé maîtresse (phrase de passe >= 16 octets) et ce sel public de 16 octets.
+# Générer le sel UNE fois puis le conserver avec la clé maîtresse :
+#   python -c "from heimdall.vault.crypto import generate_kek_salt; print(generate_kek_salt())"
 export HEIMDALL_ENV=production
 export HEIMDALL_VAULT_API_KEY_PEPPER='<pepper aléatoire persistant, distinct de la KEK>'
-export HEIMDALL_VAULT_KEK='<KEK AES-256 base64, 32 octets, distincte du pepper>'
+export HEIMDALL_VAULT_MASTER_KEY='<phrase de passe longue et unique>'
+export HEIMDALL_VAULT_KEK_SALT='<sel base64 URL-safe de 16 octets, persisté>'
+# Mode historique (compatibilité uniquement) : KEK 32 octets utilisée SANS
+# dérivation. Mutuellement exclusif avec HEIMDALL_VAULT_MASTER_KEY.
+# export HEIMDALL_VAULT_KEK='<KEK AES-256 base64, 32 octets, distincte du pepper>'
 # TLS obligatoire en production : certificat avec SAN IP 127.0.0.1 + clé privée.
 export HEIMDALL_VAULT_SSL_CERTFILE='/chemin/absolu/server.crt'
 export HEIMDALL_VAULT_SSL_KEYFILE='/chemin/absolu/server.key'
@@ -80,9 +89,17 @@ export HEIMDALL_VAULT_SSL_KEYFILE='/chemin/absolu/server.key'
 python -m heimdall.vault.app
 ```
 
-Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une KEK qui ne
-réside jamais dans la base ; `UNIQUE(project_id, env, name)` garantit le 409
-inter-workers et `PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
+Le backend SQLite chiffre chaque valeur avec AES-256-GCM et une DEK propre au
+secret, elle-même chiffrée par une KEK qui ne réside jamais dans la base. La KEK
+est **dérivée une seule fois au démarrage** avec Argon2id (64 Mio, 3 itérations,
+4 lanes, sel public de 16 octets) depuis `HEIMDALL_VAULT_MASTER_KEY` +
+`HEIMDALL_VAULT_KEK_SALT`, puis conservée en mémoire ; les requêtes ne
+recalculent jamais la KDF. Le mode historique `HEIMDALL_VAULT_KEK` (KEK 32
+octets directe) reste accepté pour les données existantes, mais les deux modes
+sont exclusifs. Détails et justification du choix Argon2id vs HKDF :
+[ADR-005](docs/adr/005-derivation-kek-argon2id.md).
+`UNIQUE(project_id, env, name)` garantit le 409 inter-workers et
+`PRAGMA foreign_keys=ON` protège l'intégrité référentielle.
 Le backend mémoire, réservé aux tests/développement, chiffre également les
 valeurs dans son dictionnaire mais reste strictement mono-processus (workers=1).
 Le pepper (`HEIMDALL_VAULT_API_KEY_PEPPER`) doit comporter au moins 32 octets
@@ -193,7 +210,9 @@ heimdall/            paquet unique (#17)
   scanner/           détection déterministe regex + entropie (#22, contrat #14)
     interface.py     cible (diff indexé ou fichier) + scan(cible) -> list[Finding] (#53)
     finding.py       sortie Finding conforme au schéma #14 par construction (#53)
-    exclusions.py    politique d'exclusions déterministes (#22 / #59)
+    exclusions.py    périmètre et politique de contenu (#22 / #59)
+    gitignore.py     exclusions Git sûres : non suivies + ignorées (#59)
+    detect.py        parcours confiné d'une racine + rapport de scan (#22 / #59)
   mcp/               serveur MCP stdio, 4 outils lecture seule (#27, contrat #16)
     prompts/         prompt système versionné du trieur (qualify_v1, #80)
   llm/               client Ollama local, sortie JSON contrainte (#80, T28.2), candidat fail-closed (#81)
@@ -306,6 +325,27 @@ prouve l'absence de connexion sur ce chemin opérationnel.
   sélectionnable après le premier run qui le publie (une approbation ou un
   `/ci`). Pas de force-push. Ne pas exiger `Vault contract` : ses filtres de
   chemins le laisseraient « en attente » sur les PR sans fichiers de contrat.
+- **Merge réservé au mainteneur** : ruleset `Merge réservé au mainteneur`
+  (cible `~DEFAULT_BRANCH`) avec la seule règle *Restrict updates* et
+  `Cezar277` comme unique acteur de contournement. Conséquence : **seul le
+  mainteneur peut mettre à jour `main`**, donc seul il peut merger — un auteur
+  de PR ne peut plus merger la sienne, même après approbation, et le bouton
+  *Merge* reste bloqué pour tous les autres collaborateurs. Le contournement
+  étant limité à ce ruleset, `Protection Main` (PR + approbation + checks)
+  continue de s'appliquer au mainteneur. Recréation (idempotente, à rejouer si
+  le ruleset est supprimé) :
+
+  ```bash
+  gh api -X POST repos/Cezar277/heimdall/rulesets --input - <<'JSON'
+  {"name":"Merge réservé au mainteneur","target":"branch","enforcement":"active",
+   "conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},
+   "rules":[{"type":"update"}],
+   "bypass_actors":[{"actor_id":82095388,"actor_type":"User","bypass_mode":"always"}]}
+  JSON
+  ```
+
+  Rappel : ce ruleset ne remplace pas la revue humaine — il empêche seulement
+  l'auteur de merger sa propre PR.
 - **Actions** (Settings > Actions > General) : garder l'approbation requise
   pour les workflows déclenchés depuis un fork (« Require approval for all
   outside collaborators »). **Exigence bloquante** — le runner `self-hosted`
@@ -369,6 +409,15 @@ le nonce AES-GCM de 96 bits est tiré de `os.urandom` **à chaque** chiffrement
 l'authentification. Deux chiffrements du même texte donnent donc deux blobs
 différents — c'est la preuve archivée pour le rapport. Preuves :
 [`docs/t67-samm.md`](docs/t67-samm.md).
+
+Chiffrement par enveloppe (sous-ticket T263 de #26) : chaque secret reçoit une
+DEK aléatoire de 32 octets ; la valeur est chiffrée avec la DEK, puis la DEK
+est chiffrée avec la KEK. Les deux blobs sont stockés dans la même ligne
+(`encrypted_value`, `encrypted_dek`). Une fuite de DEK ne compromet donc qu'un
+secret, et la KEK ne chiffre que des clés. Les lignes héritées, chiffrées
+directement par la KEK avant #70, restent lisibles. Preuves :
+[`docs/t263-samm.md`](docs/t263-samm.md),
+`tests/test_vault_dek_envelope.py`.
 
 Falsification du chiffrement au repos (sous-ticket T68 de #26, via #66
 « Module crypto isolé ») : un seul octet modifié du blob (nonce, ciphertext ou
