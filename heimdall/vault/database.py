@@ -1397,12 +1397,18 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
         raise ValueError("Enveloppe de DEK invalide.")
     validate_kek_version(kek_version)
 
-    # Lire la version courante et imposer la monotonie.
-    row = conn.execute(
-        "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
-        (project_id, env, name),
-    ).fetchone()
-    if row is not None:
+    with conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+
+        # Lire la version courante et imposer la monotonie.
+        row = conn.execute(
+            "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
+            (project_id, env, name),
+        ).fetchone()
+        if row is None:
+            return False
+
         try:
             current_v = int(row["kek_version"]) if row["kek_version"] is not None else 1
         except (ValueError, TypeError):
@@ -1413,17 +1419,23 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
                 f"supérieure à la version courante ({current_v})."
             )
 
-    up_ts = updated_at or get_iso_timestamp()
-    query = (
-        "UPDATE secrets SET "
-        "encrypted_dek = ?, kek_version = ?, updated_at = ? "
-        "WHERE project_id = ? AND env = ? AND name = ?"
-    )
-    cursor = conn.execute(
-        query,
-        (encrypted_dek, kek_version, up_ts, project_id, env, name),
-    )
-    return cursor.rowcount > 0
+        up_ts = updated_at or get_iso_timestamp()
+        query = (
+            "UPDATE secrets SET "
+            "encrypted_dek = ?, kek_version = ?, updated_at = ? "
+            "WHERE project_id = ? AND env = ? AND name = ? AND "
+            "(kek_version IS NULL OR kek_version < ?)"
+        )
+        cursor = conn.execute(
+            query,
+            (encrypted_dek, kek_version, up_ts, project_id, env, name, kek_version),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError(
+                f"Concurrence détectée : la ligne ({project_id}/{env}/{name}) a été modifiée "
+                f"et sa kek_version n'est plus inférieure à {kek_version}."
+            )
+        return True
 
 
 def rotate_secrets_kek(

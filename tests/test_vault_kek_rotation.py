@@ -10,7 +10,9 @@ import base64
 import sqlite3
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
+from typing import Any
 
 from typer.testing import CliRunner
 
@@ -873,6 +875,56 @@ class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
             result = reenvelope_secret(conn, "proj", "dev", "MISSING", "enc_dek", kek_version=1)
             self.assertFalse(result)
 
+    def test_reenvelope_secret_intercalated_concurrent_update_refuses_downgrade(self) -> None:
+        """reenvelope_secret intercalé (version passée de 1 à 3) refuse le downgrade 3->2."""
+        with db_session(self.db_path) as conn:
+            aad = VaultCipher.aad("proj", "dev", "INTERCAL")
+            envelope = self.old_cipher.encrypt_envelope(b"val", aad=aad)
+            ensure_project(conn, "proj")
+            create_secret(
+                conn,
+                "proj",
+                "dev",
+                "INTERCAL",
+                envelope.encrypted_value,
+                encrypted_dek=envelope.encrypted_dek,
+                kek_version=1,
+            )
+            new_dek = self.old_cipher.rewrap_dek(self.new_cipher, envelope.encrypted_dek, aad=aad)
+
+            class _InterceptingConn:
+                def __init__(self, target: sqlite3.Connection) -> None:
+                    self._target = target
+
+                def execute(
+                    self, sql: str, parameters: Any = ()
+                ) -> sqlite3.Cursor:
+                    # Simuler un bump concurrent à 3 intercalé juste avant l'UPDATE atomique
+                    if "UPDATE secrets SET encrypted_dek" in sql:
+                        self._target.execute(
+                            "UPDATE secrets SET kek_version = 3 "
+                            "WHERE project_id = 'proj' AND env = 'dev' AND name = 'INTERCAL'"
+                        )
+                    return self._target.execute(sql, parameters)
+
+                def __enter__(self) -> _InterceptingConn:
+                    return self
+
+                def __exit__(self, *args: object) -> object:
+                    return False
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self._target, name)
+
+            proxy_conn: Any = _InterceptingConn(conn)
+            with self.assertRaises(ValueError) as ctx:
+                reenvelope_secret(proxy_conn, "proj", "dev", "INTERCAL", new_dek, kek_version=2)
+            self.assertIn("Concurrence détectée", str(ctx.exception))
+
+            sec = get_secret(conn, "proj", "dev", "INTERCAL")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], 3)
+
 
 class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):
     """Tests de non-réflexion de contenu corrompu en base (#71 LOW 2 — invariant 8)."""
@@ -1036,3 +1088,37 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
             err_msg = str(ctx.exception)
             self.assertNotIn(corrupt_val, err_msg)
             self.assertIn("Impossible de lire la version KEK courante", err_msg)
+
+    def test_sqlite_store_rotate_kek_corrupted_max_version_preserves_cipher_and_raises(
+        self,
+    ) -> None:
+        """SqliteSecretStore._rotate_kek sur MAX illisible lève RuntimeError et garde _cipher."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-store-corrupt-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            old_cipher = VaultCipher(_OLD_KEK_BYTES)
+            new_cipher = VaultCipher(_NEW_KEK_BYTES)
+            store = SqliteSecretStore(db_path, old_cipher)
+            store._create("p", "dev", "K1", "val1")
+
+            corrupt_val = "<corrupted-text-version-max>"
+            with unittest.mock.patch("heimdall.vault.store.db_session") as mock_session:
+                mock_conn = unittest.mock.MagicMock()
+                mock_session.return_value.__enter__.return_value = mock_conn
+                with unittest.mock.patch(
+                    "heimdall.vault.store.rotate_secrets_kek", return_value=1
+                ):
+                    # Cas 1 : TEXT corrompu
+                    mock_conn.execute.return_value.fetchone.return_value = (corrupt_val,)
+                    with self.assertRaises(RuntimeError) as ctx1:
+                        store._rotate_kek(new_cipher)
+                    self.assertNotIn(corrupt_val, str(ctx1.exception))
+                    self.assertIn("illisible", str(ctx1.exception).lower())
+                    self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+
+                    # Cas 2 : REAL non entier
+                    mock_conn.execute.return_value.fetchone.return_value = (2.5,)
+                    with self.assertRaises(RuntimeError) as ctx2:
+                        store._rotate_kek(new_cipher)
+                    self.assertIn("illisible", str(ctx2.exception).lower())
+                    self.assertTrue(store._cipher.has_same_key_as(old_cipher))

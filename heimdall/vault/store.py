@@ -448,7 +448,13 @@ class SqliteSecretStore:
                 return 0
             row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
             if row and row[0] is not None:
-                self._kek_version = int(row[0])
+                try:
+                    val = row[0]
+                    if isinstance(val, float) and not val.is_integer():
+                        raise ValueError
+                    self._kek_version = int(val)
+                except (ValueError, TypeError):
+                    raise RuntimeError("Version de KEK illisible en base.") from None
             elif target_kek_version is not None:
                 self._kek_version = target_kek_version
             else:
