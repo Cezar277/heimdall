@@ -1,0 +1,2 @@
+# Keep the archived JUnit bytes stable for SHA-256 verification on every OS.
+/docs/acceptance/junit.xml text eol=lf

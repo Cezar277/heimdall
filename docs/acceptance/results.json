@@ -8,7 +8,7 @@
   },
   "coverage_percent": 91.29,
   "pytest_command": "python -m pytest --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85 --junitxml=/tmp/heimdall-t42-pytest.xml",
-  "junit_sha256": "6d31ce427e626ab173e6cffc7b551efd0f3d7a2873d0d1c583b66653545f478c",
+  "junit_sha256": "c021dbc113a53f02b498c1541266a06cc6d0bb3dd8394685adbcfa38d03ebaed",
   "groups": [
     {
       "id": "AC-01",
@@ -745,7 +745,7 @@
     "summary": "2211 passed, 16 skipped, 7 warnings, 4480 subtests passed in 262.76s (0:04:22)",
     "tmpdir": "/tmp/heimdall-t42-review",
     "command": "TMPDIR=/tmp/heimdall-t42-review python -m pytest --cov=heimdall --cov-branch --cov-report=term-missing --cov-fail-under=85 --junitxml=<raw-output.xml>",
-    "redaction": "hostname et paramètres des noms de tests retirés ; chemins de compte et adresses mémoire anonymisés ; verdicts inchangés."
+    "redaction": "hostname retiré ; paramètres des noms de tests remplacés par des identifiants synthétiques case-XXXX conservés dans le XML, y compris les 15 cas d'injection ignorés ; chemins de compte et adresses mémoire anonymisés ; verdicts inchangés."
   },
   "initial_skipped_cases": [
     {

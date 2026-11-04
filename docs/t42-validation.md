@@ -53,8 +53,13 @@ par module sont comparés à ceux du relevé initial avant publication.
 Le SHA-256 de ce XML figure dans `results.json` ; le hash de l'ancien XML
 temporaire est conservé comme provenance historique, sans prétendre le reconstruire.
 Les chemins locaux sont remplacés par des chemins génériques dans les pièces
-publiées ; le nom d'hôte et les valeurs de paramètres des noms de tests sont
-retirés du XML. Les verdicts et comptes ne sont pas modifiés par cette expurgation.
+publiées ; le nom d'hôte est retiré du XML et les valeurs de paramètres des
+noms de tests sont remplacées par des identifiants synthétiques `case-XXXX`
+conservés dans le XML, y compris pour les 15 cas d'injection ignorés.
+Les adresses mémoire sont anonymisées.
+Les verdicts et comptes ne sont pas modifiés par cette expurgation.
+Le XML est versionné avec des fins de ligne LF, imposées par `.gitattributes`,
+afin que son SHA-256 reste identique après un clone Windows ou POSIX.
 
 ## Reproduire
 
@@ -98,6 +103,10 @@ Dans ce XML pytest, l'attribut `testsuite.tests=6707` inclut les 4 480
 sous-tests : il correspond à 2 211 réussites + 16 skips + 4 480 sous-tests.
 Le vérificateur ventile les 2 227 éléments `testcase` par module et vérifie
 séparément cette différence ; il ne compte pas les sous-tests deux fois.
+
+La [sortie du vérificateur après correction de revue](acceptance/recount-junit.log)
+est archivée avec son code de sortie. Elle valide uniquement les pièces versées ;
+les conditions de fusion AC-24 restent ouvertes.
 
 Résultat du rejeu de revue : **2 211 passed, 16 skipped, 7 warnings,
 4 480 subtests passed**, couverture **91,29 %**, durée **262,76 s**.

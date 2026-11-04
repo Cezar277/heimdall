@@ -17,8 +17,13 @@ def main():
     by_module = collections.defaultdict(collections.Counter)
     tree = ET.parse(source)
     for case in tree.iter("testcase"):
-        parts = case.attrib["classname"].split(".")
-        index = next(i for i, part in enumerate(parts) if part.startswith("test_"))
+        classname = case.attrib.get("classname", "")
+        parts = classname.split(".")
+        index = next((i for i, part in enumerate(parts) if part.startswith("test_")), None)
+        if index is None:
+            raise ValueError(
+                f"Unexpected classname {classname!r} for testcase {case.attrib.get('name', '<unnamed>')!r}"
+            )
         module = "/".join(parts[: index + 1]) + ".py"
         status = "passed"
         for tag, verdict in (("failure", "failed"), ("error", "error"), ("skipped", "skipped")):
