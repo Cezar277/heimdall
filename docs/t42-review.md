@@ -1,8 +1,9 @@
 # T42 — traitement de la revue documentaire
 
 Revue initiale du 25 octobre 2026 : **APPROVE WITH COMMENTS**.
-La revue complémentaire **DEMANDER DES MODIFICATIONS** est traitée ci-dessous ;
-aucune nouvelle approbation indépendante n'est revendiquée.
+La revue complémentaire **DEMANDER DES MODIFICATIONS** a été suivie d'une
+nouvelle revue **APPROVE WITH COMMENTS**, transmise le 4 novembre 2026 et
+consignée ci-dessous. Ce verdict ne constitue pas une attestation de revue D.
 PR : [#190](https://github.com/Cezar277/heimdall/pull/190), **Closes #42**.
 Les corrections concernent la provenance et la confidentialité des preuves ;
 elles ne modifient aucun module runtime ni aucun seuil d'acceptation.
@@ -32,6 +33,22 @@ elles ne modifient aucun module runtime ni aucun seuil d'acceptation.
   `classname` absent et atypique ont aussi été vérifiés sur des copies temporaires.
   Les comptes et verdicts produit restent inchangés ; cette preuve locale ne
   satisfait pas les conditions AC-24.
+
+## Nouvelle revue — APPROVE WITH COMMENTS
+
+La revue transmise confirme la correction de l'empreinte JUnit, la sortie verte
+du vérificateur, la description de l'expurgation et le diagnostic contextualisé.
+Elle ne demande aucun changement technique supplémentaire ni test runtime.
+
+| Remarque | Traitement |
+| --- | --- |
+| MEDIUM — AC-24 toujours Non exécuté | Condition avant fusion maintenue : liens vers `CI (/ci)` vert sur le SHA de merge correspondant au dernier SHA de branche, revue D et attestation du cycle de vie du runner jetable à archiver dans la PR. La validation locale ne satisfait pas cette condition. |
+| LOW — XML JUnit volumineux | Pièce conservée pour permettre le recalcul indépendant de la ventilation SAMM : 2 227 éléments `testcase`, dont 16 skips (1 Ollama et 15 injections). Aucune réduction ni suppression demandée. |
+
+Le bilan de l'instantané du 25 octobre reste **17 Pass, 2 Fail, 2 Partiel,
+4 Non exécuté**, et l'acceptation du MVP reste **non acquise**. Les réserves
+Ollama et KEK/DEK de cet instantané ne sont pas requalifiées par cette revue
+documentaire ni par l'intégration des évolutions ultérieures de `main`.
 
 ## Conditions avant fusion
 
