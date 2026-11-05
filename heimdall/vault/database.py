@@ -1363,12 +1363,12 @@ def update_secret(  # noqa: PLR0913
             ).fetchone()
             if row is None:
                 return False
-            try:
-                current_v = (
-                    int(row["kek_version"]) if row["kek_version"] is not None else 1
-                )
-            except (ValueError, TypeError):
-                raise ValueError("Version de KEK illisible en base.") from None
+            raw_v = row["kek_version"]
+            if raw_v is not None and (
+                not isinstance(raw_v, int) or isinstance(raw_v, bool) or raw_v < 1
+            ):
+                raise ValueError("Version de KEK illisible en base.")
+            current_v = raw_v if raw_v is not None else 1
             if kek_version < current_v:
                 raise ValueError(
                     f"La nouvelle kek_version ({kek_version}) ne peut pas être "
@@ -1401,10 +1401,7 @@ def update_secret(  # noqa: PLR0913
             ),
         )
         if kek_version is not None and cursor.rowcount == 0:
-            raise ValueError(
-                f"Concurrence détectée : la ligne ({project_id}/{env}/{name}) a été modifiée "
-                f"et sa kek_version n'est plus inférieure ou égale à {kek_version}."
-            )
+            raise ValueError("Concurrence détectée sur kek_version.")
         return cursor.rowcount > 0
 
 
@@ -1443,10 +1440,12 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
         if row is None:
             return False
 
-        try:
-            current_v = int(row["kek_version"]) if row["kek_version"] is not None else 1
-        except (ValueError, TypeError):
-            raise ValueError("Version de KEK illisible en base.") from None
+        raw_v = row["kek_version"]
+        if raw_v is not None and (
+            not isinstance(raw_v, int) or isinstance(raw_v, bool) or raw_v < 1
+        ):
+            raise ValueError("Version de KEK illisible en base.")
+        current_v = raw_v if raw_v is not None else 1
         if kek_version <= current_v:
             raise ValueError(
                 f"La nouvelle kek_version ({kek_version}) doit être strictement "
@@ -1465,10 +1464,7 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
             (encrypted_dek, kek_version, up_ts, project_id, env, name, kek_version),
         )
         if cursor.rowcount == 0:
-            raise ValueError(
-                f"Concurrence détectée : la ligne ({project_id}/{env}/{name}) a été modifiée "
-                f"et sa kek_version n'est plus inférieure à {kek_version}."
-            )
+            raise ValueError("Concurrence détectée sur kek_version.")
         return True
 
 
@@ -1518,16 +1514,20 @@ def rotate_secrets_kek(
             # qu'une version non persistée est active (#71 LOW 2).
             return 0, 1
 
-        try:
-            current_max = max(
-                (
-                    int(r["kek_version"]) if r["kek_version"] is not None else 1
-                    for r in secrets_to_rotate
-                ),
-                default=1,
-            )
-        except (ValueError, TypeError):
-            raise ValueError("Version de KEK illisible en base.") from None
+        for r in secrets_to_rotate:
+            v = r["kek_version"]
+            if v is not None and (
+                not isinstance(v, int) or isinstance(v, bool) or v < 1
+            ):
+                raise ValueError("Version de KEK illisible en base.")
+
+        current_max = max(
+            (
+                r["kek_version"] if r["kek_version"] is not None else 1
+                for r in secrets_to_rotate
+            ),
+            default=1,
+        )
         if target_kek_version is not None:
             if target_kek_version <= current_max:
                 raise ValueError(

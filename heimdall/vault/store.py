@@ -31,6 +31,7 @@ destructive n'est nécessaire.
 """
 
 import asyncio
+import copy
 import logging
 import sqlite3
 import unicodedata
@@ -215,18 +216,22 @@ class InMemorySecretStore:
         async with self._lock:
             if not self._secrets:
                 return 0
-            try:
-                current_max = max(
-                    (
-                        int(r["kek_version"])
-                        if r.get("kek_version") is not None
-                        else 1
-                        for r in self._secrets.values()
-                    ),
-                    default=1,
-                )
-            except (ValueError, TypeError):
-                raise ValueError("Version de KEK illisible.") from None
+            for r in self._secrets.values():
+                v = r.get("kek_version")
+                if v is not None and (
+                    not isinstance(v, int) or isinstance(v, bool) or v < 1
+                ):
+                    raise ValueError("Version de KEK illisible.")
+
+            current_max = max(
+                (
+                    r["kek_version"]
+                    if r.get("kek_version") is not None
+                    else 1
+                    for r in self._secrets.values()
+                ),
+                default=1,
+            )
             if target_kek_version is not None:
                 if target_kek_version <= current_max:
                     raise ValueError(
@@ -237,7 +242,9 @@ class InMemorySecretStore:
             else:
                 new_version = current_max + 1
 
-            backup = dict(self._secrets)
+            # Invariant d'atomicité : backup profond pour garantir que self._secrets
+            # est restauré intact même en cas de mutation in-place (#71 LOW 4).
+            backup = copy.deepcopy(self._secrets)
             try:
                 count = 0
                 for key, record in list(self._secrets.items()):
@@ -327,13 +334,17 @@ class SqliteSecretStore:
             with db_session(self._db_path) as conn:
                 row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
                 if row and row[0] is not None:
-                    try:
-                        return max(1, int(row[0]))
-                    except (ValueError, TypeError):
+                    raw_val = row[0]
+                    if (
+                        not isinstance(raw_val, int)
+                        or isinstance(raw_val, bool)
+                        or raw_val < 1
+                    ):
                         raise RuntimeError(
                             "Impossible de lire la version KEK courante dans la base "
                             "(version corrompue ou invalide)."
-                        ) from None
+                        )
+                    return raw_val
             return 1
         except (sqlite3.Error, OSError, DatabaseUnavailableError) as exc:
             raise RuntimeError(

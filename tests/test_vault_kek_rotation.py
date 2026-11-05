@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import sqlite3
 import tempfile
 import unittest
@@ -593,6 +594,39 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.kek_version, 1)
         self.assertEqual(store._secrets, initial_secrets)
 
+    async def test_in_memory_rotate_kek_backup_resists_inplace_mutation_on_error(self) -> None:
+        """InMemorySecretStore: deepcopy protège contre les mutations in-place (#71 LOW 4)."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = InMemorySecretStore(cipher=old_cipher)
+        await store.create("demo", "dev", "KEY1", "val1")
+        await store.create("demo", "dev", "KEY2", "val2")
+
+        initial_secrets = copy.deepcopy(store._secrets)
+        call_count = 0
+        orig_rewrap = old_cipher.rewrap_dek
+
+        def mock_rewrap_with_inplace_tamper(*args: Any, **kwargs: Any) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                # Simuler une mutation in-place accidentelle dans un record du store
+                store._secrets[("demo", "dev", "KEY1")]["encrypted_dek"] = "MUTATED_IN_PLACE"
+                raise RuntimeError("Simulation d'erreur pendant rotation")
+            return orig_rewrap(*args, **kwargs)
+
+        with unittest.mock.patch.object(
+            old_cipher, "rewrap_dek", side_effect=mock_rewrap_with_inplace_tamper
+        ):
+            with self.assertRaises(RuntimeError):
+                await store.rotate_kek(new_cipher)
+
+        self.assertEqual(store._secrets, initial_secrets)
+        self.assertNotEqual(
+            store._secrets[("demo", "dev", "KEY1")]["encrypted_dek"],
+            "MUTATED_IN_PLACE",
+        )
+
 
 class SchemaMigrationTests(unittest.TestCase):
     """Vérifie la migration additive du schéma existant vers kek_version."""
@@ -1030,7 +1064,11 @@ class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
             proxy_conn: Any = _InterceptingConn(conn)
             with self.assertRaises(ValueError) as ctx:
                 reenvelope_secret(proxy_conn, "proj", "dev", "INTERCAL", new_dek, kek_version=2)
-            self.assertIn("Concurrence détectée", str(ctx.exception))
+            self.assertEqual(str(ctx.exception), "Concurrence détectée sur kek_version.")
+            # Invariant 8 : aucun identifiant ni version dans l'exception (#71 LOW 3)
+            self.assertNotIn("proj", str(ctx.exception))
+            self.assertNotIn("dev", str(ctx.exception))
+            self.assertNotIn("INTERCAL", str(ctx.exception))
 
             sec = get_secret(conn, "proj", "dev", "INTERCAL")
             assert sec is not None
@@ -1087,7 +1125,11 @@ class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
                     "new_encrypted_val",
                     kek_version=2,
                 )
-            self.assertIn("Concurrence détectée", str(ctx.exception))
+            self.assertEqual(str(ctx.exception), "Concurrence détectée sur kek_version.")
+            # Invariant 8 : aucun identifiant ni version dans l'exception (#71 LOW 3)
+            self.assertNotIn("proj", str(ctx.exception))
+            self.assertNotIn("dev", str(ctx.exception))
+            self.assertNotIn("INTERCAL_UPD", str(ctx.exception))
 
             sec = get_secret(conn, "proj", "dev", "INTERCAL_UPD")
             assert sec is not None
@@ -1197,6 +1239,37 @@ class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):
         self.assertNotIn("<script>", err_msg)
         self.assertEqual(str(ctx.exception), "Version de KEK illisible en base.")
 
+    def test_corrupted_real_kek_version_raises_generic_error(self) -> None:
+        """rotate_secrets_kek lève ValueError sur kek_version REAL (1.5) sans reflet (#71 LOW 2)."""
+        with sqlite3.connect(str(self.db_path)) as conn_raw:
+            conn_raw.execute("INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p', '2026')")
+            aad = VaultCipher.aad("p", "dev", "BAD_REAL")
+            envelope = self.old_cipher.encrypt_envelope(b"val", aad=aad)
+            conn_raw.execute(
+                "INSERT INTO secrets "
+                "(project_id, env, name, encrypted_value, encrypted_dek, "
+                "kek_version, status, fingerprint, created_at, updated_at) "
+                "VALUES ('p', 'dev', 'BAD_REAL', ?, ?, 1.5, 'vaulte', 'fp', '2026', '2026')",
+                (envelope.encrypted_value, envelope.encrypted_dek),
+            )
+            conn_raw.commit()
+
+        with db_session(self.db_path) as conn:
+            with self.assertRaises(ValueError) as ctx:
+                rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
+            self.assertEqual(str(ctx.exception), "Version de KEK illisible en base.")
+            self.assertNotIn("1.5", str(ctx.exception))
+
+            with self.assertRaises(ValueError) as ctx_up:
+                update_secret(conn, "p", "dev", "BAD_REAL", "new_val", kek_version=2)
+            self.assertEqual(str(ctx_up.exception), "Version de KEK illisible en base.")
+            self.assertNotIn("1.5", str(ctx_up.exception))
+
+            with self.assertRaises(ValueError) as ctx_re:
+                reenvelope_secret(conn, "p", "dev", "BAD_REAL", "new_dek", kek_version=2)
+            self.assertEqual(str(ctx_re.exception), "Version de KEK illisible en base.")
+            self.assertNotIn("1.5", str(ctx_re.exception))
+
 
 class SqliteStoreDetectKekVersionTests(unittest.TestCase):
     """Tests du comportement fail-closed de _detect_current_kek_version (#71 LOW 3)."""
@@ -1269,6 +1342,31 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
                 SqliteSecretStore(db_path, cipher)
             err_msg = str(ctx.exception)
             self.assertNotIn(corrupt_val, err_msg)
+            self.assertIn("Impossible de lire la version KEK courante", err_msg)
+
+    def test_detect_kek_version_corrupted_real_raises_runtime_error_no_reflection(self) -> None:
+        """SqliteSecretStore: _detect_current_kek_version fail-closed sur REAL (1.5) (#71 LOW 2)."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-detect-real-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            with sqlite3.connect(str(db_path)) as conn_raw:
+                conn_raw.execute(
+                    "INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p', '2026')"
+                )
+                conn_raw.execute(
+                    "INSERT INTO secrets "
+                    "(project_id, env, name, encrypted_value, encrypted_dek, "
+                    "kek_version, status, fingerprint, created_at, updated_at) "
+                    "VALUES ('p', 'dev', 'REAL_VER', 'enc_val', 'enc_dek', 1.5, 'vaulte', 'fp', "
+                    "'2026', '2026')"
+                )
+                conn_raw.commit()
+
+            cipher = VaultCipher(_OLD_KEK_BYTES)
+            with self.assertRaises(RuntimeError) as ctx:
+                SqliteSecretStore(db_path, cipher)
+            err_msg = str(ctx.exception)
+            self.assertNotIn("1.5", err_msg)
             self.assertIn("Impossible de lire la version KEK courante", err_msg)
 
     def test_sqlite_store_rotate_kek_nominal_uses_returned_new_version_without_second_select(
