@@ -1618,11 +1618,18 @@ def rotate_secrets_kek(
             aad = VaultCipher.aad(project_id, env, name)
             new_wrapped_dek = old_cipher.rewrap_dek(new_cipher, str(enc_dek), aad=aad)
 
-            conn.execute(
+            # Garde anti-downgrade : la ligne doit encore être à une version
+            # strictement inférieure à la cible. BEGIN IMMEDIATE sérialise les
+            # rotations inter-processus, mais l'écriture conditionnelle prouve
+            # l'absence d'écrasement (v3 -> v2) même si la ligne a bougé depuis
+            # la lecture — même contrat que update_secret/reenvelope_secret.
+            cursor = conn.execute(
                 "UPDATE secrets SET encrypted_dek = ?, kek_version = ?, updated_at = ? "
-                "WHERE id = ?",
-                (new_wrapped_dek, new_version, now_ts, sec_id),
+                "WHERE id = ? AND kek_version < ?",
+                (new_wrapped_dek, new_version, now_ts, sec_id, new_version),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("Concurrence détectée sur kek_version.")
             rotated_count += 1
 
         logger.info(

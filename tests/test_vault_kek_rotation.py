@@ -318,6 +318,104 @@ class DatabaseRotationTests(unittest.TestCase):
             self.assertEqual(rec["kek_version"], MAX_KEK_VERSION)
             self.assertIsInstance(rec["kek_version"], int)
 
+    def test_rotate_secrets_kek_update_is_version_guarded_no_downgrade(self) -> None:
+        """L'UPDATE de rotation est conditionné : aucun écrasement v3 -> v2 (#71 §3).
+
+        `BEGIN IMMEDIATE` sérialise les rotations inter-processus ; la clause
+        `WHERE kek_version < ?` prouve en plus que la ligne relue n'est jamais
+        rétrogradée si elle a bougé depuis la lecture.
+        """
+        store = SqliteSecretStore(self.db_path, self.old_cipher)
+        store._create("proj", "dev", "GUARDED", "valeur_initiale")
+
+        with db_session(self.db_path) as conn:
+
+            class _InterceptingConn:
+                def __init__(self, target: sqlite3.Connection) -> None:
+                    self._target = target
+
+                def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+                    if "UPDATE secrets SET" in sql:
+                        # Bump « concurrent » intercalé : la ligne est portée à 3
+                        # juste avant l'écriture de la rotation (qui vise la 2).
+                        self._target.execute(
+                            "UPDATE secrets SET kek_version = 3 "
+                            "WHERE project_id = 'proj' AND env = 'dev' AND name = 'GUARDED'"
+                        )
+                    return self._target.execute(sql, parameters)
+
+                def __enter__(self) -> _InterceptingConn:
+                    return self
+
+                def __exit__(self, *args: object) -> object:
+                    return False
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self._target, name)
+
+            proxy_conn: Any = _InterceptingConn(conn)
+            with self.assertRaises(ValueError) as ctx:
+                rotate_secrets_kek(proxy_conn, self.old_cipher, self.new_cipher)
+            self.assertEqual(str(ctx.exception), "Concurrence détectée sur kek_version.")
+            # Invariant 8 : aucun identifiant dans le message.
+            self.assertNotIn("GUARDED", str(ctx.exception))
+
+            # Aucun écrasement : ni rétrogradation vers 2, ni réenveloppement.
+            sec = get_secret(conn, "proj", "dev", "GUARDED")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], 1)
+            self.assertNotEqual(sec["kek_version"], 2)
+
+    def test_concurrent_double_rotation_serializes_without_downgrade(self) -> None:
+        """Deux rotations concurrentes : sérialisées, version uniforme, pas de mélange (#71 §3)."""
+        store = SqliteSecretStore(self.db_path, self.old_cipher)
+        store._create("proj", "dev", "CONC_1", "valeur_1")
+        store._create("proj", "dev", "CONC_2", "valeur_2")
+        third_cipher = VaultCipher(b"T" * 32)
+
+        barrier = threading.Barrier(2, timeout=10)
+        results: dict[str, Any] = {}
+
+        def rotate(name: str, old: VaultCipher, new: VaultCipher) -> None:
+            try:
+                with db_session(self.db_path) as conn:
+                    barrier.wait()
+                    results[name] = rotate_secrets_kek(conn, old, new)
+            except (sqlite3.OperationalError, VaultCipherError) as exc:
+                # Verrou occupé (échec fail-closed) ou DEK déjà réenveloppées par
+                # l'autre rotation : la tentative est annulée, jamais partiellement
+                # appliquée.
+                results[name] = type(exc).__name__
+
+        t1 = threading.Thread(target=rotate, args=("a", self.old_cipher, self.new_cipher))
+        t2 = threading.Thread(target=rotate, args=("b", self.old_cipher, self.new_cipher))
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        # Une seule rotation s'applique (l'autre échoue fail-closed), version 2.
+        applied = [v for v in results.values() if isinstance(v, tuple)]
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(applied[0], (2, 2))
+        with db_session(self.db_path) as conn:
+            versions = [
+                row[0]
+                for row in conn.execute("SELECT DISTINCT kek_version FROM secrets ORDER BY 1")
+            ]
+        self.assertEqual(versions, [2], "aucune ligne mélangée ni rétrogradée")
+
+        # Rotation suivante sérialisée : passage strictement monotone à 3.
+        with db_session(self.db_path) as conn:
+            count, new_v = rotate_secrets_kek(conn, self.new_cipher, third_cipher)
+        self.assertEqual((count, new_v), (2, 3))
+        with db_session(self.db_path) as conn:
+            versions = [
+                row[0]
+                for row in conn.execute("SELECT DISTINCT kek_version FROM secrets ORDER BY 1")
+            ]
+        self.assertEqual(versions, [3])
+
     def test_create_secret_validates_kek_version(self) -> None:
         """create_secret refuse les versions de KEK < 1 ou de type invalide."""
         with db_session(self.db_path) as conn:
@@ -608,6 +706,40 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(store._cipher.has_same_key_as(old_cipher))
         self.assertEqual(store._secrets[("demo", "dev", "KEY1")]["kek_version"], 2**100)
 
+    async def test_in_memory_rotate_kek_restores_cipher_and_version_on_interrupt(self) -> None:
+        """Interruption entre les deux affectations de sortie : couple restauré (#71 LOW)."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+
+        class _InterruptingVersionStore(InMemorySecretStore):
+            @property
+            def _kek_version(self) -> int:
+                value: int = self.__dict__["_kek_version"]
+                return value
+
+            @_kek_version.setter
+            def _kek_version(self, value: int) -> None:
+                if getattr(self, "_interrupt_version_set", False):
+                    raise KeyboardInterrupt("interruption simulée entre les affectations")
+                self.__dict__["_kek_version"] = value
+
+        store = _InterruptingVersionStore(cipher=old_cipher)
+        await store.create("demo", "dev", "KEY1", "val1")
+        store._interrupt_version_set = True  # type: ignore[attr-defined]
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                await store.rotate_kek(new_cipher)
+        finally:
+            store._interrupt_version_set = False  # type: ignore[attr-defined]
+
+        # Couple restauré : ni cipher neuf avec d'anciennes DEK, ni version haussée.
+        self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+        self.assertEqual(store.kek_version, 1)
+        # Le store reste lisible avec l'ancienne KEK (pas d'indisponibilité).
+        rec = await store.get("demo", "dev", "KEY1")
+        assert rec is not None
+        self.assertEqual(rec["value"], "val1")
+
     async def test_in_memory_rotate_kek_atomicity_on_keyboard_interrupt(self) -> None:
         """InMemorySecretStore.rotate_kek restaure l'état sur KeyboardInterrupt (#71 LOW 3)."""
         old_cipher = VaultCipher(_OLD_KEK_BYTES)
@@ -782,6 +914,46 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
                 sec2 = get_secret(conn, "proj", "dev", "KEY2")
                 assert sec2 is not None
                 self.assertEqual(sec2["kek_version"], 5)
+
+    async def test_sqlite_store_read_after_crash_window_fails_closed_with_stale_cipher(
+        self,
+    ) -> None:
+        """Commit DB fait, swap mémoire jamais fait : lecture fail-closed (#71 §3)."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-store-crash-read-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(_OLD_KEK_BYTES)
+            new_cipher = VaultCipher(_NEW_KEK_BYTES)
+            store = SqliteSecretStore(db_path, old_cipher)
+
+            await store.create("proj", "dev", "KEY1", "val1")
+
+            # Fenêtre de crash : la rotation est COMMITée en base alors que ce
+            # store n'a jamais rechargé ni son cipher ni sa version en mémoire.
+            with db_session(db_path) as conn:
+                count, new_v = rotate_secrets_kek(conn, old_cipher, new_cipher)
+                self.assertEqual((count, new_v), (1, 2))
+
+            # État mémoire inchangé (jamais de swap) : version toujours 1.
+            self.assertEqual(store.kek_version, 1)
+
+            # Relecture avec l'ancien cipher : échec fail-closed, sans reflet.
+            with self.assertRaises(SecretStoreError) as ctx:
+                await store.get("proj", "dev", "KEY1")
+            err_msg = str(ctx.exception)
+            self.assertIn("illisible", err_msg)
+            self.assertNotIn("val1", err_msg)
+
+            # Écriture également refusée : pas de secret sous-étiqueté en v1.
+            with self.assertRaises(RuntimeError) as ctx_create:
+                await store.create("proj", "dev", "KEY2", "val2")
+            self.assertIn("rotation de KEK externe", str(ctx_create.exception))
+
+            # Le store redémarré avec la nouvelle KEK prend le relais.
+            restarted = SqliteSecretStore(db_path, new_cipher)
+            self.assertEqual(restarted.kek_version, 2)
+            rec = await restarted.get("proj", "dev", "KEY1")
+            assert rec is not None
+            self.assertEqual(rec["value"], "val1")
 
 
 class SchemaMigrationTests(unittest.TestCase):

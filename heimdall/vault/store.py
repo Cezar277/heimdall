@@ -247,6 +247,10 @@ class InMemorySecretStore:
             # Invariant d'atomicité : backup profond pour garantir que self._secrets
             # est restauré intact même en cas de mutation in-place (#71 LOW 4).
             backup = copy.deepcopy(self._secrets)
+            # État cipher/version précédent : une interruption entre les deux
+            # affectations de sortie laisserait un cipher neuf avec des DEK
+            # anciennes (store illisible) — on restaure le couple complet (#71 LOW).
+            prev_cipher, prev_version = self._cipher, self._kek_version
             try:
                 count = 0
                 for key, record in list(self._secrets.items()):
@@ -262,11 +266,11 @@ class InMemorySecretStore:
                     updated_record["kek_version"] = new_version
                     self._secrets[key] = updated_record
                     count += 1
-                self._cipher = new_cipher
-                self._kek_version = new_version
+                self._cipher, self._kek_version = new_cipher, new_version
                 return count
             except BaseException:
                 self._secrets = backup
+                self._cipher, self._kek_version = prev_cipher, prev_version
                 raise
 
 
@@ -355,7 +359,11 @@ class SqliteSecretStore:
             with db_session(self._db_path) as conn:
                 max_v = _read_max_kek_version(conn)
                 return max_v if max_v is not None else 1
-        except (sqlite3.Error, OSError, DatabaseUnavailableError) as exc:
+        except (sqlite3.Error, OSError, DatabaseUnavailableError, RuntimeError) as exc:
+            # ``RuntimeError`` couvre le fail-closed de ``_read_max_kek_version``
+            # (REAL/TEXT/bool/>MAX) : re-wrap générique sans reflet, quel que soit
+            # le chemin d'erreur, pour que le contrat « exception unique » tienne
+            # même si un nouveau garde-fou lève un ``RuntimeError`` non générique.
             raise RuntimeError(
                 "Impossible de lire la version KEK courante dans la base "
                 "(fail-closed pour éviter une sous-étiquetage silencieux)."

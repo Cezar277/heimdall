@@ -499,9 +499,13 @@ class VaultCipher:
     - L'empreinte d'intégrité (``fingerprint``) utilise une sous-clé HKDF-SHA256
       dédiée et lie la valeur au triplet : la KEK n'est jamais réutilisée comme
       clé HMAC (invariant 5) et deux valeurs égales sous des triplets distincts
-      ne sont pas corrélables par un lecteur de la seule base. L'empreinte est
-      auxiliaire : une rotation de KEK la rend obsolète (recalcul après
-      déchiffrement), jamais une perte de secret.
+      ne sont pas corrélables par un lecteur de la seule base. Empreinte
+      **auxiliaire pré-rotation** (#71) : la rotation de KEK par enveloppe ne
+      touche jamais aux valeurs, elle reste donc volontairement inchangée et
+      **n'est jamais vérifiée en lecture** — elle ne doit pas servir de contrôle
+      d'intégrité post-rotation (c'est le déchiffrement GCM, lui, qui détecte
+      toute altération). Recalculer cette empreinte supposerait de déchiffrer la
+      valeur, ce que la rotation interdit explicitement.
     """
 
     def __init__(self, key: bytes) -> None:
