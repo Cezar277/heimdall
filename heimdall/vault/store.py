@@ -268,6 +268,24 @@ class InMemorySecretStore:
                 raise
 
 
+def _read_max_kek_version(conn: sqlite3.Connection) -> int | None:
+    """Lit la version KEK maximale dans la base avec validation stricte du type."""
+    row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
+    if row and row[0] is not None:
+        raw_val = row[0]
+        if (
+            not isinstance(raw_val, int)
+            or isinstance(raw_val, bool)
+            or raw_val < 1
+        ):
+            raise RuntimeError(
+                "Impossible de lire la version KEK courante dans la base "
+                "(version corrompue ou invalide)."
+            )
+        return raw_val
+    return None
+
+
 class SqliteSecretStore:
     """Stockage SQLite chiffré, partagé entre workers (tickets #26/#62).
 
@@ -332,20 +350,8 @@ class SqliteSecretStore:
         """
         try:
             with db_session(self._db_path) as conn:
-                row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
-                if row and row[0] is not None:
-                    raw_val = row[0]
-                    if (
-                        not isinstance(raw_val, int)
-                        or isinstance(raw_val, bool)
-                        or raw_val < 1
-                    ):
-                        raise RuntimeError(
-                            "Impossible de lire la version KEK courante dans la base "
-                            "(version corrompue ou invalide)."
-                        )
-                    return raw_val
-            return 1
+                max_v = _read_max_kek_version(conn)
+                return max_v if max_v is not None else 1
         except (sqlite3.Error, OSError, DatabaseUnavailableError) as exc:
             raise RuntimeError(
                 "Impossible de lire la version KEK courante dans la base "
@@ -384,6 +390,16 @@ class SqliteSecretStore:
             # quota et l'insertion forment une seule transaction atomique,
             # même entre workers partageant le fichier SQLite.
             conn.execute("BEGIN IMMEDIATE")
+            # Vérification de non-obsolescence de la KEK (ticket #71 MEDIUM) :
+            # si une rotation externe (ex. via CLI) a incrémenté la version en base
+            # au-delà de celle chargée en mémoire par ce worker, refuser fail-closed
+            # pour ne pas chiffrer un nouveau secret avec une ancienne KEK compromise.
+            db_max = _read_max_kek_version(conn)
+            if db_max is not None and db_max > self._kek_version:
+                raise RuntimeError(
+                    "La base de données a subi une rotation de KEK externe. "
+                    "Redémarrage du worker requis."
+                )
             # Un doublon reste un 409 même si la capacité est saturée.
             if get_secret(conn, project, env, name) is not None:
                 raise KeyError("Secret déjà existant")
@@ -445,6 +461,14 @@ class SqliteSecretStore:
         old_cipher: VaultCipher | None = None,
         target_kek_version: int | None = None,
     ) -> int:
+        """Exécute la rotation transactionnelle de la KEK dans SQLite (ticket #71).
+
+        La transaction SQLite garantit l'atomicité sur disque. Les attributs en
+        mémoire (self._cipher, self._kek_version) sont mis à jour immédiatement après
+        le commit réussi. En cas de crash ou redémarrage du processus entre le
+        commit DB et l'affectation en mémoire, l'initialisation du nouveau store
+        relit automatiquement la version KEK maximale via _detect_current_kek_version.
+        """
         active_old = old_cipher or self._cipher
         with db_session(self._db_path) as conn:
             count, new_version = rotate_secrets_kek(

@@ -627,6 +627,73 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
             "MUTATED_IN_PLACE",
         )
 
+    async def test_sqlite_store_create_rejects_stale_cipher_after_external_rotation(
+        self,
+    ) -> None:
+        """SqliteSecretStore.create lève RuntimeError si rotation externe (#71 MEDIUM)."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-store-stale-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(_OLD_KEK_BYTES)
+            new_cipher = VaultCipher(_NEW_KEK_BYTES)
+            store = SqliteSecretStore(db_path, old_cipher)
+
+            await store.create("proj", "dev", "KEY1", "val1")
+
+            # Rotation externe effectuée directement en base
+            with db_session(db_path) as conn:
+                rotate_secrets_kek(conn, old_cipher, new_cipher)
+
+            # store utilise encore old_cipher (self._kek_version == 1, alors que DB max == 2)
+            with self.assertRaises(RuntimeError) as ctx:
+                await store.create("proj", "dev", "KEY2", "val2")
+
+            err_msg = str(ctx.exception)
+            self.assertIn("rotation de KEK externe", err_msg)
+            self.assertIn("Redémarrage du worker requis", err_msg)
+
+            # Vérifier que KEY2 n'a pas été inséré avec l'ancien cipher
+            with db_session(db_path) as conn:
+                self.assertIsNone(get_secret(conn, "proj", "dev", "KEY2"))
+
+            # Un store fraîchement initialisé avec new_cipher prend le relais
+            store_restarted = SqliteSecretStore(db_path, new_cipher)
+            self.assertEqual(store_restarted.kek_version, 2)
+            await store_restarted.create("proj", "dev", "KEY2", "val2")
+            r1 = await store_restarted.get("proj", "dev", "KEY1")
+            r2 = await store_restarted.get("proj", "dev", "KEY2")
+            assert r1 is not None and r2 is not None
+            self.assertEqual(r1["value"], "val1")
+            self.assertEqual(r2["value"], "val2")
+
+    async def test_sqlite_store_reinit_after_simulated_crash_reloads_version(self) -> None:
+        """SqliteSecretStore rechargé après crash relit MAX(kek_version) en DB (#71 LOW 3)."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-store-crash-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(_OLD_KEK_BYTES)
+            new_cipher = VaultCipher(_NEW_KEK_BYTES)
+            store = SqliteSecretStore(db_path, old_cipher)
+
+            await store.create("proj", "dev", "KEY1", "val1")
+
+            # Rotation atomique en DB vers version 5
+            with db_session(db_path) as conn:
+                count, new_v = rotate_secrets_kek(
+                    conn, old_cipher, new_cipher, target_kek_version=5
+                )
+                self.assertEqual(count, 1)
+                self.assertEqual(new_v, 5)
+
+            # Simulation d'un arrêt de processus / crash : nouveau store instancié
+            store_after_crash = SqliteSecretStore(db_path, new_cipher)
+            self.assertEqual(store_after_crash.kek_version, 5)
+
+            # Nouveau secret étiqueté version 5
+            await store_after_crash.create("proj", "dev", "KEY2", "val2")
+            with db_session(db_path) as conn:
+                sec2 = get_secret(conn, "proj", "dev", "KEY2")
+                assert sec2 is not None
+                self.assertEqual(sec2["kek_version"], 5)
+
 
 class SchemaMigrationTests(unittest.TestCase):
     """Vérifie la migration additive du schéma existant vers kek_version."""
@@ -909,6 +976,30 @@ class VaultRotateCliTests(unittest.TestCase):
         )
         self.assertEqual(res.exit_code, 2)
         self.assertIn("ne peut pas être vide", res.output)
+
+    def test_cli_rotate_corrupted_kek_version_exits_one(self) -> None:
+        """Code 1 (opérationnel) et message générique si kek_version corrompue (#71 LOW 2)."""
+        corrupted_val = 1.5
+        with sqlite3.connect(str(self.db_path)) as conn_raw:
+            conn_raw.execute(
+                "UPDATE secrets SET kek_version = ? WHERE name = 'API_KEY'",
+                (corrupted_val,),
+            )
+            conn_raw.commit()
+
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 1)
+        self.assertIn("Erreur : base de données corrompue ou invalide", res.output)
+        self.assertNotIn(str(corrupted_val), res.output)
+        self.assertNotIn("1.5", res.output)
 
 
 class ValidateKekVersionHelperTests(unittest.TestCase):

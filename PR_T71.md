@@ -34,22 +34,27 @@ d'identifiants (`project`, `env`, `name`) dans le message d'erreur (invariant 8)
 Atomicité préservée en mémoire sur `BaseException` (`KeyboardInterrupt`, `asyncio.CancelledError`, `SystemExit`)
 avec snapshot profond `copy.deepcopy(self._secrets)`. Détection fail-closed de la version courante
 `_detect_current_kek_version` refusant strictement tout type non-entier (REAL `1.5`, TEXT, bool).
+Vérification fail-closed de non-obsolescence sous `BEGIN IMMEDIATE` dans `SqliteSecretStore.create` si une
+rotation externe (ex. CLI) a incrémenté `kek_version` en base au-delà de la version en mémoire du store :
+levée de `RuntimeError` générique et refus de chiffrer avec l'ancienne KEK compromise. La rotation hors-ligne
+exige le redémarrage de tous les processus Vault pour charger le nouveau chiffreur.
 
 **6. Commande CLI durcie (`heimdall vault rotate-kek`, `heimdall/cli/vault_keys.py`)** — variables
 d'environnement uniquement (`HEIMDALL_VAULT_OLD_KEK`, `HEIMDALL_VAULT_NEW_KEK`, ou dérivation Argon2id via
 `HEIMDALL_VAULT_*_MASTER_KEY` / `*_SALT`), aucune option secrète en `argv` (invariant 9). Refus fail-closed
 si base absente/vide (code 2), si variable vide (code 2), ou si les deux clés sont identiques (code 2).
-Messages d'erreur génériques sans fuite (code 1). Alias spécifique `kek-rotate` supporté, alias trop
-générique `rotate` supprimé.
+Distinction stricte des codes d'erreur : exit 1 pour erreur opérationnelle ou anomalie d'intégrité DB
+(`illisible`/`Concurrence`, message générique sans reflet), exit 2 pour erreur d'usage / arguments.
+Alias spécifique `kek-rotate` supporté, alias trop générique `rotate` supprimé.
 
-**7. Suite de tests et documentation** — 60 tests automatisés dans `tests/test_vault_kek_rotation.py`,
+**7. Suite de tests et documentation** — 63 tests automatisés dans `tests/test_vault_kek_rotation.py`,
 fiche de preuves SAMM complète `docs/t264-samm.md` et mise à jour de `docs/contracts/vault-traceability.md`.
 
 ## Comment tester
 
 ```sh
 .venv/bin/python -m pytest tests/test_vault_kek_rotation.py -v
-# 60 passed in 2.15s
+# 63 passed in 1.95s
 ```
 
 Vérification que les valeurs chiffrées ne changent pas et qu'aucun clair n'est présent dans SQLite :

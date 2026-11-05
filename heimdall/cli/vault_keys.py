@@ -315,6 +315,10 @@ def rotate_kek_command(
         typer.echo("Erreur : échec du déchiffrement avec l'ancienne KEK.", err=True)
         raise typer.Exit(code=1) from None
     except ValueError as exc:
+        msg = str(exc)
+        if "illisible" in msg or "Concurrence" in msg:
+            typer.echo("Erreur : base de données corrompue ou invalide.", err=True)
+            raise typer.Exit(code=1) from None
         typer.echo(f"Erreur : {exc}", err=True)
         raise typer.Exit(code=2) from None
     except Exception:
