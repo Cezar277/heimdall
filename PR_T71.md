@@ -24,10 +24,14 @@ bloc `finally`. Les valeurs chiffrées (`encrypted_value`) et leurs empreintes (
 fail-closed sur non-entiers (REAL `1.5`, TEXT) levant une exception générique sans reflet. Retourne `(0, 1)`
 sans écriture ni persistance si la base est vide, ignorant toute `target_kek_version` non persistée.
 
-**4. Monotonie et intégrité (`reenvelope_secret`, `update_secret`)** — mise à jour atomique conditionnelle
-(`UPDATE ... WHERE kek_version < ?` ou `<= ?`). Si une course concurrente est détectée, levée d'une
-exception générique fail-closed `ValueError("Concurrence détectée sur kek_version.")` sans reflet
-d'identifiants (`project`, `env`, `name`) dans le message d'erreur (invariant 8).
+**4. Monotonie et intégrité (`reenvelope_secret`, `update_secret`, `_write_transaction`)** — mise à jour
+atomique conditionnelle (`UPDATE ... WHERE kek_version < ?` ou `<= ?`). Si une course concurrente est détectée,
+levée d'une exception générique fail-closed `ValueError("Concurrence détectée sur kek_version.")` sans reflet
+d'identifiants (`project`, `env`, `name`) dans le message d'erreur (invariant 8). Les trois helpers d'écriture
+(`update_secret`, `reenvelope_secret`, `rotate_secrets_kek`) n'ouvrent une transaction `BEGIN IMMEDIATE` que
+si aucune n'est déjà active (`_write_transaction`) : plus de `with conn:` imbriqué qui commiterait
+prématurément la transaction de l'appelant — un échec ultérieur dans la même `db_session` annule désormais
+l'intégralité des écritures.
 
 **5. Stores `SqliteSecretStore` et `InMemorySecretStore` (`heimdall/vault/store.py`)** — suivi de
 `kek_version` post-rotation : les secrets créés après rotation héritent de la nouvelle version.
@@ -48,16 +52,18 @@ d'environnement uniquement (`HEIMDALL_VAULT_OLD_KEK`, `HEIMDALL_VAULT_NEW_KEK`, 
 si base absente/vide (code 2), si variable vide (code 2), ou si les deux clés sont identiques (code 2).
 Distinction stricte des codes d'erreur : exit 1 pour erreur opérationnelle ou anomalie d'intégrité DB
 (`illisible`/`Concurrence`, message générique sans reflet), exit 2 pour erreur d'usage / arguments.
-Alias spécifique `kek-rotate` supporté, alias trop générique `rotate` supprimé.
+Alias spécifique `kek-rotate` supporté, alias trop générique `rotate` supprimé. Le pré-contrôle
+d'existence utilise `os.lstat` (jamais `stat`) : un `--db-path` symlink est refusé en code 2 sans être suivi
+et sans reflet du chemin, avant la garde d'ouverture sécurisée de `db_session` (invariant 8).
 
-**7. Suite de tests et documentation** — 64 tests automatisés dans `tests/test_vault_kek_rotation.py`,
+**7. Suite de tests et documentation** — 68 tests automatisés dans `tests/test_vault_kek_rotation.py`,
 fiche de preuves SAMM complète `docs/t264-samm.md` et mise à jour de `docs/contracts/vault-traceability.md`.
 
 ## Comment tester
 
 ```sh
 .venv/bin/python -m pytest tests/test_vault_kek_rotation.py -v
-# 64 passed
+# 68 passed
 ```
 
 Vérification que les valeurs chiffrées ne changent pas et qu'aucun clair n'est présent dans SQLite :
@@ -87,7 +93,7 @@ PY
 
 ## Tests
 
-- [x] Tests unitaires et d'intégration ajoutés (64 tests)
+- [x] Tests unitaires et d'intégration ajoutés (68 tests)
 - [x] Tests verts en local (`pytest tests/test_vault_kek_rotation.py`)
 - [x] Suite complète Vault et confinement crypto verte
 - [x] Linter ruff conforme (`ruff check heimdall tests/test_vault_kek_rotation.py`)

@@ -677,6 +677,31 @@ def db_session(db_path: Path | str | None = None) -> Generator[sqlite3.Connectio
         conn.close()
 
 
+@contextmanager
+def _write_transaction(conn: sqlite3.Connection) -> Generator[None, None, None]:
+    """Exécute un bloc d'écriture sans imbriquer la transaction de l'appelant (#71 LOW).
+
+    ``update_secret``, ``reenvelope_secret`` et ``rotate_secrets_kek`` sont
+    appelés depuis un ``with db_session(...)`` déjà transactionnel. Un
+    ``with conn:`` imbriqué commiterait prématurément la transaction de
+    l'appelant (atomicité multi-écritures rompue, état partiel persisté si une
+    écriture ultérieure échoue). On ne possède donc la transaction que si
+    aucune n'est déjà ouverte : sinon le bloc reste dans celle de l'appelant,
+    qui garde l'exclusivité du commit ou du rollback.
+    """
+    if conn.in_transaction:
+        yield
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
 class DatabaseUnavailableError(Exception):
     """Stockage indisponible (contention ou panne), sans détail sensible."""
 
@@ -1351,9 +1376,7 @@ def update_secret(  # noqa: PLR0913
         logger.debug("Statut de secret invalide rejeté applicativement.")
         raise ValueError("Statut de secret invalide.")
 
-    with conn:
-        if not conn.in_transaction:
-            conn.execute("BEGIN IMMEDIATE")
+    with _write_transaction(conn):
 
         if kek_version is not None:
             validate_kek_version(kek_version)
@@ -1428,9 +1451,7 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
         raise ValueError("Enveloppe de DEK invalide.")
     validate_kek_version(kek_version)
 
-    with conn:
-        if not conn.in_transaction:
-            conn.execute("BEGIN IMMEDIATE")
+    with _write_transaction(conn):
 
         # Lire la version courante et imposer la monotonie.
         row = conn.execute(
@@ -1500,9 +1521,7 @@ def rotate_secrets_kek(
     if target_kek_version is not None:
         validate_kek_version(target_kek_version, label="Numéro de version cible")
 
-    with conn:
-        if not conn.in_transaction:
-            conn.execute("BEGIN IMMEDIATE")
+    with _write_transaction(conn):
         cursor = conn.execute(
             "SELECT id, project_id, env, name, encrypted_dek, kek_version "
             "FROM secrets ORDER BY id ASC"

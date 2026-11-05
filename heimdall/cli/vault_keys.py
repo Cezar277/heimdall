@@ -23,6 +23,7 @@ Codes de sortie (convention de la CLI) : 0 (succès), 1 (échec opérationnel),
 """
 
 import os
+import stat
 from pathlib import Path
 
 import typer
@@ -95,6 +96,26 @@ def _resolve_db_path(db_path: Path | None) -> Path:
             "Chemin absolu requis (un chemin relatif dépend du répertoire courant)."
         )
     return resolved
+
+
+def _assert_regular_non_empty_db_file(path: Path) -> None:
+    """Refuse une base absente, vide, non régulière ou un lien symbolique.
+
+    Le test s'appuie sur ``lstat`` (jamais ``stat``) : un lien symbolique est
+    refusé sans être suivi, avant même la garde d'ouverture sécurisée de
+    ``db_session``. Le message reste générique et ne reflète jamais le chemin
+    (invariant 8).
+    """
+    try:
+        file_stat = os.lstat(path)
+    except OSError:
+        raise ValueError(
+            "la base de données Vault est introuvable ou vide. Vérifiez --db-path."
+        ) from None
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size == 0:
+        raise ValueError(
+            "la base de données Vault est introuvable ou vide. Vérifiez --db-path."
+        )
 
 
 def _explicit_pepper() -> str:
@@ -275,12 +296,9 @@ def rotate_kek_command(
     """Effectue la rotation transactionnelle de la KEK sur tous les secrets (ticket #71)."""
     try:
         resolved = _resolve_db_path(db_path)
-        if not resolved.is_file() or resolved.stat().st_size == 0:
-            typer.echo(
-                "Erreur : la base de données Vault est introuvable ou vide. Vérifiez --db-path.",
-                err=True,
-            )
-            raise typer.Exit(code=2)
+        # Pré-contrôle sans suivi de lien symbolique (lstat), avant la garde
+        # d'ouverture sécurisée de db_session (invariant 8, fail-closed).
+        _assert_regular_non_empty_db_file(resolved)
         old_cipher = _resolve_cli_cipher(
             env_direct="HEIMDALL_VAULT_OLD_KEK",
             env_fallback="HEIMDALL_VAULT_KEK",

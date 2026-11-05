@@ -929,6 +929,39 @@ class VaultRotateCliTests(unittest.TestCase):
         self.assertIn("Erreur : la base de données Vault est introuvable ou vide", res.output)
         self.assertFalse(fake_db.exists(), "La commande ne doit pas créer une fausse base vide")
 
+    def test_cli_rotate_rejects_symlink_db_path_without_following(self) -> None:
+        """Un --db-path symlink est refusé sans être suivi (fail-closed, invariant 8).
+
+        La cible est une vraie base Vault : si le pré-contrôle suivait le lien,
+        la rotation réussirait (exit 0). On vérifie donc qu'aucun secret n'a été
+        lu/réenveloppé et que ni le lien ni sa cible ne sont modifiés.
+        """
+        target_db = Path(self.tmp.name) / "symlink_target.db"
+        init_db(target_db)
+        target_store = SqliteSecretStore(target_db, self.old_cipher)
+        target_store._create("demo", "dev", "TARGET_SECRET", "target_value")
+
+        link = Path(self.tmp.name) / "vault_link.db"
+        link.symlink_to(target_db)
+
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(link)],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 2)
+        self.assertIn("Erreur : la base de données Vault est introuvable ou vide", res.output)
+        self.assertNotIn(str(target_db), res.output)
+        self.assertTrue(link.is_symlink(), "Le lien symbolique ne doit pas être remplacé")
+        with db_session(target_db) as conn:
+            sec = get_secret(conn, "demo", "dev", "TARGET_SECRET")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], 1)
+
     def test_cli_rotate_on_database_with_zero_secrets_exits_one(self) -> None:
         """Code 1 si la base existe mais ne contient aucun secret (fail-closed)."""
         empty_db = Path(self.tmp.name) / "empty_vault.db"
@@ -1522,3 +1555,77 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
             self.assertTrue(store._cipher.has_same_key_as(new_cipher))
             # Vérifier qu'AUCUNE 2e requête SELECT n'a été exécutée
             mock_conn.execute.assert_not_called()
+
+
+class NestedTransactionIsolationTests(unittest.TestCase):
+    """LOW revue : aucun helper d'écriture ne commite la transaction de l'appelant."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="heimdall-nested-tx-")
+        self.db_path = Path(self.tmp.name) / "vault.db"
+        init_db(self.db_path)
+        self.old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        self.new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = SqliteSecretStore(self.db_path, self.old_cipher)
+        store._create("proj", "dev", "API_KEY", "valeur_initiale")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _snapshot(self) -> dict[str, Any]:
+        with db_session(self.db_path) as conn:
+            record = get_secret(conn, "proj", "dev", "API_KEY")
+        assert record is not None
+        return record
+
+    def _run_then_fail(self, write: Any) -> None:
+        """Écriture antérieure + helper + échec dans la même session SQLite."""
+        with self.assertRaises(RuntimeError):
+            with db_session(self.db_path) as conn:
+                # Écriture antérieure : la transaction de l'appelant est ouverte.
+                ensure_project(conn, "caller_tx_marker")
+                write(conn)
+                raise RuntimeError("échec ultérieur simulé")
+
+    def _assert_fully_rolled_back(self, before: dict[str, Any]) -> None:
+        after = self._snapshot()
+        self.assertEqual(after["encrypted_value"], before["encrypted_value"])
+        self.assertEqual(after["encrypted_dek"], before["encrypted_dek"])
+        self.assertEqual(after["fingerprint"], before["fingerprint"])
+        self.assertEqual(after["kek_version"], before["kek_version"])
+        with db_session(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM projects WHERE id = 'caller_tx_marker'"
+            ).fetchone()
+        assert row is not None
+        self.assertEqual(row[0], 0, "L'écriture antérieure de l'appelant doit être annulée")
+
+    def test_update_secret_does_not_commit_caller_transaction(self) -> None:
+        before = self._snapshot()
+        self._run_then_fail(
+            lambda conn: update_secret(
+                conn,
+                "proj",
+                "dev",
+                "API_KEY",
+                "valeur_rechiffree",
+                encrypted_dek="enveloppe_v2",
+                kek_version=2,
+                fingerprint="empreinte_v2",
+            )
+        )
+        self._assert_fully_rolled_back(before)
+
+    def test_reenvelope_secret_does_not_commit_caller_transaction(self) -> None:
+        before = self._snapshot()
+        self._run_then_fail(
+            lambda conn: reenvelope_secret(conn, "proj", "dev", "API_KEY", "enveloppe_v2", 2)
+        )
+        self._assert_fully_rolled_back(before)
+
+    def test_rotate_secrets_kek_does_not_commit_caller_transaction(self) -> None:
+        before = self._snapshot()
+        self._run_then_fail(
+            lambda conn: rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
+        )
+        self._assert_fully_rolled_back(before)
