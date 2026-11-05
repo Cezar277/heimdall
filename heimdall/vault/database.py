@@ -61,6 +61,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Connexions ouvertes par `db_session` : leur transaction appartient à l'appelant.
+_SESSION_CONNECTIONS: set[int] = set()
+
 SecretStatus = Literal["vaulte", "rote"]
 _ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
 _SCHEMA_MIGRATION_HINT: str = (
@@ -70,12 +73,19 @@ _SCHEMA_MIGRATION_HINT: str = (
 )
 
 
+# SQLite stocke les INTEGER sur 64 bits signés : au-delà, le moteur bascule en
+# REAL et `kek_version` sortirait du contrat (audit faussé, lectures incohérentes).
+MAX_KEK_VERSION: int = 2**63 - 1
+
+
 def validate_kek_version(version: Any, *, label: str = "Numéro de version de KEK") -> int:
-    """Valide qu'un numéro de version de KEK est un entier strictement positif (>= 1)."""
+    """Valide qu'un numéro de version de KEK est un entier dans [1, 2**63-1]."""
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"{label} invalide : entier attendu.")
     if version < 1:
         raise ValueError(f"{label} invalide : valeur >= 1 requise.")
+    if version > MAX_KEK_VERSION:
+        raise ValueError(f"{label} invalide : valeur <= {MAX_KEK_VERSION} requise.")
     return version
 
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
@@ -670,36 +680,57 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
 def db_session(db_path: Path | str | None = None) -> Generator[sqlite3.Connection, None, None]:
     """Gestionnaire de contexte pour transaction SQLite sûre (commit/rollback et fermeture)."""
     conn = get_connection(db_path)
+    # sqlite3.Connection n'est pas faiblement référençable : on identifie la
+    # portée transactionnelle par id() et on retire l'entrée avant la fermeture.
+    _SESSION_CONNECTIONS.add(id(conn))
     try:
         with conn:
             yield conn
     finally:
+        _SESSION_CONNECTIONS.discard(id(conn))
         conn.close()
 
 
 @contextmanager
 def _write_transaction(conn: sqlite3.Connection) -> Generator[None, None, None]:
-    """Exécute un bloc d'écriture sans imbriquer la transaction de l'appelant (#71 LOW).
+    """Exécute un bloc d'écriture sans briser l'atomicité de l'appelant (#71 LOW).
 
-    ``update_secret``, ``reenvelope_secret`` et ``rotate_secrets_kek`` sont
-    appelés depuis un ``with db_session(...)`` déjà transactionnel. Un
-    ``with conn:`` imbriqué commiterait prématurément la transaction de
-    l'appelant (atomicité multi-écritures rompue, état partiel persisté si une
-    écriture ultérieure échoue). On ne possède donc la transaction que si
-    aucune n'est déjà ouverte : sinon le bloc reste dans celle de l'appelant,
-    qui garde l'exclusivité du commit ou du rollback.
+    Les helpers ``update_secret``, ``reenvelope_secret`` et
+    ``rotate_secrets_kek`` sont appelés depuis un ``with db_session(...)`` déjà
+    transactionnel. Un ``with conn:`` imbriqué commiterait prématurément la
+    transaction de l'appelant : on utilise donc un ``SAVEPOINT`` lorsque la
+    connexion appartient à une session ``db_session`` (ou qu'une transaction
+    est déjà ouverte). Le savepoint permet d'annuler uniquement les écritures
+    du helper en cas d'erreur, sans commiter le reste : ``db_session`` garde
+    l'exclusivité du commit/rollback, y compris pour plusieurs helpers chaînés
+    dans la même session. Hors session (appel direct), le helper possède la
+    transaction et la valide ou l'annule à sa sortie.
     """
-    if conn.in_transaction:
-        yield
+    in_session = id(conn) in _SESSION_CONNECTIONS
+    if not in_session and not conn.in_transaction:
+        # Appel direct : le helper possède une transaction exclusive complète.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
         return
-    conn.execute("BEGIN IMMEDIATE")
+
+    if in_session and not conn.in_transaction:
+        # Ouvre la transaction de session (verrou d'écriture) avant le savepoint.
+        conn.execute("BEGIN IMMEDIATE")
+    conn.execute("SAVEPOINT heimdall_write")
     try:
         yield
     except BaseException:
-        conn.rollback()
+        conn.execute("ROLLBACK TO SAVEPOINT heimdall_write")
+        conn.execute("RELEASE SAVEPOINT heimdall_write")
         raise
     else:
-        conn.commit()
+        conn.execute("RELEASE SAVEPOINT heimdall_write")
 
 
 class DatabaseUnavailableError(Exception):

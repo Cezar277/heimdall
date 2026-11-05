@@ -27,6 +27,7 @@ from heimdall.vault.crypto import (
 )
 from heimdall.vault.database import (
     _SCHEMA_MIGRATION_HINT,
+    MAX_KEK_VERSION,
     create_project,
     create_secret,
     db_session,
@@ -992,6 +993,38 @@ class VaultRotateCliTests(unittest.TestCase):
         self.assertEqual(res.exit_code, 2)
         self.assertIn("Erreur : Le numéro de version cible (1) doit être", res.output)
 
+    def test_cli_rotate_rejects_target_version_above_sqlite_integer_range(self) -> None:
+        """Code 2 si --target-version dépasse INTEGER 64 bits signé (LOW revue).
+
+        Sans borne haute, SQLite stockerait un REAL/TEXT hors contrat dans
+        `kek_version` (audit faussé, lectures incohérentes).
+        """
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            [
+                "vault",
+                "rotate-kek",
+                "--db-path",
+                str(self.db_path),
+                "--target-version",
+                "99999999999999999999",
+            ],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 2)
+        self.assertIn("valeur <= 9223372036854775807 requise", res.output)
+        self.assertNotIn("99999999999999999999", res.output)
+        # Aucune écriture : la version persistée reste inchangée.
+        with db_session(self.db_path) as conn:
+            sec = get_secret(conn, "demo", "dev", "API_KEY")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], 1)
+            self.assertIsInstance(sec["kek_version"], int)
+
     def test_cli_rotate_wrong_old_key_exits_one(self) -> None:
         """Code 1 si l'ancienne KEK fournie ne parvient pas à déchiffrer les DEK."""
         wrong_old_kek = base64.urlsafe_b64encode(b"W" * 32).decode("ascii")
@@ -1080,6 +1113,16 @@ class ValidateKekVersionHelperTests(unittest.TestCase):
         for val in (0, -1, -99, True, False, "1", 1.5, None):
             with self.assertRaises(ValueError):
                 validate_kek_version(val)
+
+    def test_validate_kek_version_bounds_sqlite_signed_integer(self) -> None:
+        """Borne haute = INTEGER signé 64 bits de SQLite (LOW revue)."""
+        self.assertEqual(validate_kek_version(MAX_KEK_VERSION), MAX_KEK_VERSION)
+        for val in (MAX_KEK_VERSION + 1, 2**63, 99999999999999999999):
+            with self.assertRaises(ValueError) as ctx:
+                validate_kek_version(val)
+            # Aucun reflet de la valeur refusée (invariant 8).
+            self.assertNotIn(str(val), str(ctx.exception))
+            self.assertIn("valeur <= 9223372036854775807 requise", str(ctx.exception))
 
 
 class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
@@ -1230,7 +1273,10 @@ class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
 
             sec = get_secret(conn, "proj", "dev", "INTERCAL")
             assert sec is not None
-            self.assertEqual(sec["kek_version"], 3)
+            # Le bump simulé partage le savepoint du helper : l'échec annule
+            # aussi cette écriture (un vrai concurrent utiliserait une autre
+            # connexion et ne serait pas concerné par ce rollback local).
+            self.assertEqual(sec["kek_version"], 1)
 
     def test_update_secret_intercalated_concurrent_update_refuses_downgrade(self) -> None:
         """update_secret(..., kek_version=2) après montée 1->3 refuse l'écriture (#71 LOW 1)."""
@@ -1291,7 +1337,9 @@ class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
 
             sec = get_secret(conn, "proj", "dev", "INTERCAL_UPD")
             assert sec is not None
-            self.assertEqual(sec["kek_version"], 3)
+            # Le bump simulé partage le savepoint du helper et est annulé avec
+            # son échec : aucune écriture partielle ne subsiste.
+            self.assertEqual(sec["kek_version"], 1)
             self.assertEqual(sec["encrypted_value"], envelope.encrypted_value)
 
     def test_update_secret_missing_row_with_kek_version_returns_false(self) -> None:
@@ -1628,4 +1676,25 @@ class NestedTransactionIsolationTests(unittest.TestCase):
         self._run_then_fail(
             lambda conn: rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
         )
+        self._assert_fully_rolled_back(before)
+
+    def test_two_helpers_chained_in_same_session_roll_back_together(self) -> None:
+        """Deux helpers chaînés : aucun commit partiel si le second échoue (LOW revue)."""
+        before = self._snapshot()
+        with self.assertRaises(RuntimeError):
+            with db_session(self.db_path) as conn:
+                # Premier helper : ne doit pas commiter avant la fin de la session.
+                update_secret(
+                    conn,
+                    "proj",
+                    "dev",
+                    "API_KEY",
+                    "valeur_v2",
+                    encrypted_dek="enveloppe_v2",
+                    kek_version=2,
+                    fingerprint="empreinte_v2",
+                )
+                # Second helper, puis échec : les deux écritures doivent être annulées.
+                reenvelope_secret(conn, "proj", "dev", "API_KEY", "enveloppe_v3", 3)
+                raise RuntimeError("échec après deux helpers")
         self._assert_fully_rolled_back(before)
