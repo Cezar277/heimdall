@@ -388,6 +388,40 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r1["value"], "secret1")
             self.assertEqual(r2["value"], "secret2")
 
+    async def test_sqlite_store_rotate_kek_persists_returned_new_version_without_drift(
+        self,
+    ) -> None:
+        """`_rotate_kek` aligne `store.kek_version` sur la `new_version` retournée.
+
+        Verrouille la revue LOW : la version mémorisée par le store doit être
+        exactement celle persistée par `rotate_secrets_kek` (aucun SELECT
+        supplémentaire, aucune dérive future entre la mémoire du worker et la base).
+        """
+        with tempfile.TemporaryDirectory(prefix="heimdall-store-rot-sync-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(_OLD_KEK_BYTES)
+            new_cipher = VaultCipher(_NEW_KEK_BYTES)
+            store = SqliteSecretStore(db_path, old_cipher)
+
+            await store.create("demo", "dev", "KEY1", "secret1")
+            await store.create("demo", "dev", "KEY2", "secret2")
+
+            count = await store.rotate_kek(new_cipher, target_kek_version=7)
+            self.assertEqual(count, 2)
+            # store.kek_version == new_version retournée par rotate_secrets_kek.
+            self.assertEqual(store.kek_version, 7)
+            # ... et identique à la version persistée en base (pas de dérive).
+            with db_session(db_path) as conn:
+                row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
+            self.assertEqual(row is not None and row[0], store.kek_version)
+
+            # Le secret créé ensuite hérite de cette même version (pas de dérive future).
+            await store.create("demo", "dev", "KEY3", "secret3")
+            with db_session(db_path) as conn:
+                sec = get_secret(conn, "demo", "dev", "KEY3")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], store.kek_version)
+
     async def test_in_memory_store_rotate_kek(self) -> None:
         """InMemorySecretStore.rotate_kek pivote la KEK en mémoire de façon atomique."""
         old_cipher = VaultCipher(_OLD_KEK_BYTES)
