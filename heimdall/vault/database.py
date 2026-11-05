@@ -1361,18 +1361,19 @@ def update_secret(  # noqa: PLR0913
                 "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
                 (project_id, env, name),
             ).fetchone()
-            if row is not None:
-                try:
-                    current_v = (
-                        int(row["kek_version"]) if row["kek_version"] is not None else 1
-                    )
-                except (ValueError, TypeError):
-                    raise ValueError("Version de KEK illisible en base.") from None
-                if kek_version < current_v:
-                    raise ValueError(
-                        f"La nouvelle kek_version ({kek_version}) ne peut pas être "
-                        f"inférieure à la version courante ({current_v})."
-                    )
+            if row is None:
+                return False
+            try:
+                current_v = (
+                    int(row["kek_version"]) if row["kek_version"] is not None else 1
+                )
+            except (ValueError, TypeError):
+                raise ValueError("Version de KEK illisible en base.") from None
+            if kek_version < current_v:
+                raise ValueError(
+                    f"La nouvelle kek_version ({kek_version}) ne peut pas être "
+                    f"inférieure à la version courante ({current_v})."
+                )
 
         up_ts = updated_at or get_iso_timestamp()
         query = (
@@ -1399,6 +1400,11 @@ def update_secret(  # noqa: PLR0913
                 kek_version,
             ),
         )
+        if kek_version is not None and cursor.rowcount == 0:
+            raise ValueError(
+                f"Concurrence détectée : la ligne ({project_id}/{env}/{name}) a été modifiée "
+                f"et sa kek_version n'est plus inférieure ou égale à {kek_version}."
+            )
         return cursor.rowcount > 0
 
 
@@ -1485,6 +1491,8 @@ def rotate_secrets_kek(
     - L'empreinte auxiliaire (fingerprint) reste strictement inchangée car les
       valeurs ne sont jamais déchiffrées en mémoire lors de la rotation.
     - Échoue fail-closed si un secret hérité (#25/#62) sans enveloppe de DEK est rencontré.
+    - Si la base est vide (aucun secret), retourne (0, 1) sans modifier la base,
+      target_kek_version étant ignorée car aucune version n'est persistée (#71 LOW 2).
 
     Returns:
         tuple[int, int]: Un tuple (nombre_de_secrets_reenveloppes, nouvelle_version_kek).
@@ -1505,7 +1513,10 @@ def rotate_secrets_kek(
         )
         secrets_to_rotate = cursor.fetchall()
         if not secrets_to_rotate:
-            return 0, target_kek_version or 1
+            # Base vide : aucun secret réenveloppé, aucune version n'est persistée.
+            # target_kek_version est ignorée pour ne pas faire croire à l'appelant
+            # qu'une version non persistée est active (#71 LOW 2).
+            return 0, 1
 
         try:
             current_max = max(

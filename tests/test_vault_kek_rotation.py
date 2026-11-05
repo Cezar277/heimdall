@@ -6,6 +6,7 @@ Sous-ticket T264 : Rotation de la KEK sans rechiffrer les valeurs.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import sqlite3
 import tempfile
@@ -266,6 +267,19 @@ class DatabaseRotationTests(unittest.TestCase):
             self.assertEqual(count, 0)
             self.assertEqual(new_ver, 1)
 
+    def test_rotation_on_empty_db_with_target_version_returns_one_and_writes_nothing(self) -> None:
+        """rotate_secrets_kek sur base vide avec target_kek_version=42 → (0, 1) (#71 LOW 2)."""
+        with db_session(self.db_path) as conn:
+            count, new_ver = rotate_secrets_kek(
+                conn, self.old_cipher, self.new_cipher, target_kek_version=42
+            )
+            self.assertEqual(count, 0)
+            self.assertEqual(new_ver, 1)
+
+            # Vérifier que rien n'est écrit dans la table secrets
+            total = conn.execute("SELECT COUNT(*) FROM secrets").fetchone()[0]
+            self.assertEqual(total, 0)
+
     def test_create_secret_validates_kek_version(self) -> None:
         """create_secret refuse les versions de KEK < 1 ou de type invalide."""
         with db_session(self.db_path) as conn:
@@ -503,6 +517,81 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         err_msg = str(ctx.exception)
         self.assertNotIn(corrupt_val, err_msg)
         self.assertEqual(str(ctx.exception), "Version de KEK illisible.")
+
+    async def test_in_memory_rotate_kek_atomicity_on_keyboard_interrupt(self) -> None:
+        """InMemorySecretStore.rotate_kek restaure l'état sur KeyboardInterrupt (#71 LOW 3)."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = InMemorySecretStore(cipher=old_cipher)
+        await store.create("demo", "dev", "KEY1", "val1")
+        await store.create("demo", "dev", "KEY2", "val2")
+
+        initial_secrets = {k: dict(v) for k, v in store._secrets.items()}
+        call_count = 0
+        orig_rewrap = old_cipher.rewrap_dek
+
+        def mock_rewrap(*args: Any, **kwargs: Any) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise KeyboardInterrupt
+            return orig_rewrap(*args, **kwargs)
+
+        with unittest.mock.patch.object(old_cipher, "rewrap_dek", side_effect=mock_rewrap):
+            with self.assertRaises(KeyboardInterrupt):
+                await store.rotate_kek(new_cipher)
+
+        self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+        self.assertEqual(store.kek_version, 1)
+        self.assertEqual(store._secrets, initial_secrets)
+
+    async def test_in_memory_rotate_kek_atomicity_on_cancelled_error(self) -> None:
+        """InMemorySecretStore.rotate_kek restaure l'état sur CancelledError (#71 LOW 3)."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = InMemorySecretStore(cipher=old_cipher)
+        await store.create("demo", "dev", "KEY1", "val1")
+        await store.create("demo", "dev", "KEY2", "val2")
+
+        initial_secrets = {k: dict(v) for k, v in store._secrets.items()}
+        call_count = 0
+        orig_rewrap = old_cipher.rewrap_dek
+
+        def mock_rewrap(*args: Any, **kwargs: Any) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise asyncio.CancelledError
+            return orig_rewrap(*args, **kwargs)
+
+        with unittest.mock.patch.object(old_cipher, "rewrap_dek", side_effect=mock_rewrap):
+            with self.assertRaises(asyncio.CancelledError):
+                await store.rotate_kek(new_cipher)
+
+        self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+        self.assertEqual(store.kek_version, 1)
+        self.assertEqual(store._secrets, initial_secrets)
+
+    async def test_in_memory_rotate_kek_task_cancellation_restores_state(self) -> None:
+        """Annulation d'une tâche asyncio pendant rotate_kek restaure l'état (#71 LOW 3)."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = InMemorySecretStore(cipher=old_cipher)
+        await store.create("demo", "dev", "KEY1", "val1")
+        await store.create("demo", "dev", "KEY2", "val2")
+
+        initial_secrets = {k: dict(v) for k, v in store._secrets.items()}
+
+        def mock_rewrap_cancel(*args: Any, **kwargs: Any) -> str:
+            raise asyncio.CancelledError
+
+        with unittest.mock.patch.object(old_cipher, "rewrap_dek", side_effect=mock_rewrap_cancel):
+            with self.assertRaises(asyncio.CancelledError):
+                await store.rotate_kek(new_cipher)
+
+        self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+        self.assertEqual(store.kek_version, 1)
+        self.assertEqual(store._secrets, initial_secrets)
 
 
 class SchemaMigrationTests(unittest.TestCase):
@@ -946,6 +1035,77 @@ class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
             sec = get_secret(conn, "proj", "dev", "INTERCAL")
             assert sec is not None
             self.assertEqual(sec["kek_version"], 3)
+
+    def test_update_secret_intercalated_concurrent_update_refuses_downgrade(self) -> None:
+        """update_secret(..., kek_version=2) après montée 1->3 refuse l'écriture (#71 LOW 1)."""
+        with db_session(self.db_path) as conn:
+            aad = VaultCipher.aad("proj", "dev", "INTERCAL_UPD")
+            envelope = self.old_cipher.encrypt_envelope(b"val_init", aad=aad)
+            ensure_project(conn, "proj")
+            create_secret(
+                conn,
+                "proj",
+                "dev",
+                "INTERCAL_UPD",
+                envelope.encrypted_value,
+                encrypted_dek=envelope.encrypted_dek,
+                kek_version=1,
+            )
+
+            class _InterceptingConn:
+                def __init__(self, target: sqlite3.Connection) -> None:
+                    self._target = target
+
+                def execute(
+                    self, sql: str, parameters: Any = ()
+                ) -> sqlite3.Cursor:
+                    # Simuler un bump concurrent à 3 intercalé juste avant l'UPDATE atomique
+                    if "UPDATE secrets SET" in sql:
+                        self._target.execute(
+                            "UPDATE secrets SET kek_version = 3 "
+                            "WHERE project_id = 'proj' AND env = 'dev' AND name = 'INTERCAL_UPD'"
+                        )
+                    return self._target.execute(sql, parameters)
+
+                def __enter__(self) -> _InterceptingConn:
+                    return self
+
+                def __exit__(self, *args: object) -> object:
+                    return False
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self._target, name)
+
+            proxy_conn: Any = _InterceptingConn(conn)
+            # update_secret avec kek_version=2 lève ValueError et ne retourne pas False
+            with self.assertRaises(ValueError) as ctx:
+                update_secret(
+                    proxy_conn,
+                    "proj",
+                    "dev",
+                    "INTERCAL_UPD",
+                    "new_encrypted_val",
+                    kek_version=2,
+                )
+            self.assertIn("Concurrence détectée", str(ctx.exception))
+
+            sec = get_secret(conn, "proj", "dev", "INTERCAL_UPD")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], 3)
+            self.assertEqual(sec["encrypted_value"], envelope.encrypted_value)
+
+    def test_update_secret_missing_row_with_kek_version_returns_false(self) -> None:
+        """update_secret sur ligne absente avec kek_version retourne False (#71 LOW 1)."""
+        with db_session(self.db_path) as conn:
+            res = update_secret(
+                conn,
+                "proj",
+                "dev",
+                "DOES_NOT_EXIST",
+                "enc_val",
+                kek_version=2,
+            )
+            self.assertFalse(res)
 
 
 class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):

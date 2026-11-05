@@ -256,7 +256,7 @@ class InMemorySecretStore:
                 self._cipher = new_cipher
                 self._kek_version = new_version
                 return count
-            except Exception:
+            except BaseException:
                 self._secrets = backup
                 raise
 
