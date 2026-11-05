@@ -12,7 +12,9 @@ colonne `kek_version INTEGER NOT NULL DEFAULT 1 CHECK (kek_version >= 1)` sur la
 Migration idempotente et purement additive `_ensure_secret_kek_version_column` pour les bases pré-#71
 sans perte de données. Helper applicatif strict `validate_kek_version` bornant la version à
 l'intervalle `[1, 2**63-1]` (INTEGER signé 64 bits de SQLite) et interdisant les types
-invalides (bool, str, float/REAL, entiers < 1).
+invalides (bool, str, float/REAL, entiers < 1). La borne s'applique aussi à l'auto-incrément de
+rotation (`validate_kek_version(current_max + 1)`) : au sommet de l'intervalle, la rotation échoue
+`ValueError` (code 2 en CLI) au lieu de persister un REAL hors contrat.
 
 **2. Réenveloppement exclusif des DEK (`heimdall/vault/crypto.py`, `heimdall/vault/database.py`)** —
 méthode `VaultCipher.rewrap_dek(new_cipher, encrypted_dek, aad)` déchiffrant la DEK avec l'ancienne KEK
@@ -22,7 +24,8 @@ bloc `finally`. Les valeurs chiffrées (`encrypted_value`) et leurs empreintes (
 
 **3. Rotation transactionnelle atomique (`rotate_secrets_kek`)** — rotation globale sous verrou
 `BEGIN IMMEDIATE` : rollback intégral si une DEK échoue (ou secret hérité sans DEK). Détection de version
-fail-closed sur non-entiers (REAL `1.5`, TEXT) levant une exception générique sans reflet. Retourne `(0, 1)`
+fail-closed sur non-entiers (REAL `1.5`, TEXT) et sur valeurs hors INTEGER 64 bits levant une exception
+générique sans reflet. Retourne `(0, 1)`
 sans écriture ni persistance si la base est vide, ignorant toute `target_kek_version` non persistée.
 
 **4. Monotonie et intégrité (`reenvelope_secret`, `update_secret`, `_write_transaction`)** — mise à jour
@@ -33,13 +36,17 @@ d'identifiants (`project`, `env`, `name`) dans le message d'erreur (invariant 8)
 si aucune n'est déjà active (`_write_transaction`) : plus de `with conn:` imbriqué qui commiterait
 prématurément la transaction de l'appelant. Dans une `db_session`, chaque helper s'exécute sous `SAVEPOINT`
 (réversible localement, sans commit) : un échec ultérieur dans la même session annule l'intégralité des
-écritures, y compris plusieurs helpers chaînés.
+écritures, y compris plusieurs helpers chaînés. La portée de session est portée par un attribut de la
+connexion elle-même (`_SessionConnection._heimdall_session`, posé par `db_session`), sans registre global
+d'`id()` : aucune classification croisée possible entre sessions concurrentes.
 
 **5. Stores `SqliteSecretStore` et `InMemorySecretStore` (`heimdall/vault/store.py`)** — suivi de
 `kek_version` post-rotation : les secrets créés après rotation héritent de la nouvelle version.
 Atomicité préservée en mémoire sur `BaseException` (`KeyboardInterrupt`, `asyncio.CancelledError`, `SystemExit`)
 avec snapshot profond `copy.deepcopy(self._secrets)`. Détection fail-closed de la version courante
-`_detect_current_kek_version` refusant strictement tout type non-entier (REAL `1.5`, TEXT, bool).
+`_detect_current_kek_version` / `_read_max_kek_version` refusant strictement tout type non-entier
+(REAL `1.5`, TEXT, bool) et toute valeur `> MAX_KEK_VERSION` (défense en profondeur, y compris pour le
+backend mémoire où une mutation directe à `2**100` est possible).
 Vérification fail-closed de non-obsolescence sous `BEGIN IMMEDIATE` dans `SqliteSecretStore.create` si une
 rotation externe (ex. CLI) a incrémenté `kek_version` en base au-delà de la version en mémoire du store :
 levée de `RuntimeError` générique et refus de chiffrer avec l'ancienne KEK compromise. La rotation hors-ligne
@@ -58,14 +65,14 @@ Alias spécifique `kek-rotate` supporté, alias trop générique `rotate` suppri
 d'existence utilise `os.lstat` (jamais `stat`) : un `--db-path` symlink est refusé en code 2 sans être suivi
 et sans reflet du chemin, avant la garde d'ouverture sécurisée de `db_session` (invariant 8).
 
-**7. Suite de tests et documentation** — 71 tests automatisés dans `tests/test_vault_kek_rotation.py`,
+**7. Suite de tests et documentation** — 76 tests automatisés dans `tests/test_vault_kek_rotation.py`,
 fiche de preuves SAMM complète `docs/t264-samm.md` et mise à jour de `docs/contracts/vault-traceability.md`.
 
 ## Comment tester
 
 ```sh
 .venv/bin/python -m pytest tests/test_vault_kek_rotation.py -v
-# 71 passed
+# 76 passed
 ```
 
 Vérification que les valeurs chiffrées ne changent pas et qu'aucun clair n'est présent dans SQLite :
@@ -95,7 +102,7 @@ PY
 
 ## Tests
 
-- [x] Tests unitaires et d'intégration ajoutés (71 tests)
+- [x] Tests unitaires et d'intégration ajoutés (76 tests)
 - [x] Tests verts en local (`pytest tests/test_vault_kek_rotation.py`)
 - [x] Suite complète Vault et confinement crypto verte
 - [x] Linter ruff conforme (`ruff check heimdall tests/test_vault_kek_rotation.py`)

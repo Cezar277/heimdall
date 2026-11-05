@@ -61,8 +61,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Connexions ouvertes par `db_session` : leur transaction appartient à l'appelant.
-_SESSION_CONNECTIONS: set[int] = set()
+
+class _SessionConnection(sqlite3.Connection):
+    """Connexion SQLite portant l'indicateur de session `db_session`.
+
+    `sqlite3.Connection` n'est ni extensible ni faiblement référençable : le
+    `factory` de `connect()` permet de porter l'attribut `_heimdall_session`
+    directement sur l'objet, sans registre global d'`id()` (impossible de
+    reclasser une connexion périmée après un recyclage d'`id` après GC).
+    """
+
+    _heimdall_session: bool = False
 
 SecretStatus = Literal["vaulte", "rote"]
 _ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
@@ -593,7 +602,9 @@ def _connect_pinned_fd(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]
                 "Permissions de la base SQLite insuffisantes : attendu 0o600, "
                 f"obtenu {oct(applied_mode)}"
             )
-        conn = sqlite3.connect(f"/dev/fd/{fd}", timeout=SQLITE_TIMEOUT_SECONDS)
+        conn = sqlite3.connect(
+            f"/dev/fd/{fd}", timeout=SQLITE_TIMEOUT_SECONDS, factory=_SessionConnection
+        )
         opened_identity = (fd_stat.st_dev, fd_stat.st_ino)
     except BaseException:
         os.close(fd)
@@ -625,7 +636,7 @@ def _connect_by_path(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]:
     _assert_not_symlink(path)
     _apply_secure_permissions(path)
     pre_open_stat = _stat_no_follow(path)
-    conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SECONDS)
+    conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SECONDS, factory=_SessionConnection)
     return conn, (pre_open_stat.st_dev, pre_open_stat.st_ino)
 
 
@@ -669,7 +680,7 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     if isinstance(resolved, Path):
         conn = _open_db_file(resolved)
     else:
-        conn = sqlite3.connect(resolved, timeout=SQLITE_TIMEOUT_SECONDS)
+        conn = sqlite3.connect(resolved, timeout=SQLITE_TIMEOUT_SECONDS, factory=_SessionConnection)
 
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -680,14 +691,13 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
 def db_session(db_path: Path | str | None = None) -> Generator[sqlite3.Connection, None, None]:
     """Gestionnaire de contexte pour transaction SQLite sûre (commit/rollback et fermeture)."""
     conn = get_connection(db_path)
-    # sqlite3.Connection n'est pas faiblement référençable : on identifie la
-    # portée transactionnelle par id() et on retire l'entrée avant la fermeture.
-    _SESSION_CONNECTIONS.add(id(conn))
+    # Marque la connexion : sa transaction appartient à l'appelant (LOW revue).
+    if isinstance(conn, _SessionConnection):
+        conn._heimdall_session = True
     try:
         with conn:
             yield conn
     finally:
-        _SESSION_CONNECTIONS.discard(id(conn))
         conn.close()
 
 
@@ -706,7 +716,7 @@ def _write_transaction(conn: sqlite3.Connection) -> Generator[None, None, None]:
     dans la même session. Hors session (appel direct), le helper possède la
     transaction et la valide ou l'annule à sa sortie.
     """
-    in_session = id(conn) in _SESSION_CONNECTIONS
+    in_session = getattr(conn, "_heimdall_session", False)
     if not in_session and not conn.in_transaction:
         # Appel direct : le helper possède une transaction exclusive complète.
         conn.execute("BEGIN IMMEDIATE")
@@ -1567,7 +1577,7 @@ def rotate_secrets_kek(
         for r in secrets_to_rotate:
             v = r["kek_version"]
             if v is not None and (
-                not isinstance(v, int) or isinstance(v, bool) or v < 1
+                not isinstance(v, int) or isinstance(v, bool) or v < 1 or v > MAX_KEK_VERSION
             ):
                 raise ValueError("Version de KEK illisible en base.")
 
@@ -1586,7 +1596,9 @@ def rotate_secrets_kek(
                 )
             new_version = target_kek_version
         else:
-            new_version = current_max + 1
+            # Fail-closed : l'auto-incrément ne doit jamais dépasser l'INTEGER
+            # signé 64 bits de SQLite (sinon bascule en REAL, audit faussé).
+            new_version = validate_kek_version(current_max + 1)
 
         rotated_count = 0
         now_ts = get_iso_timestamp()

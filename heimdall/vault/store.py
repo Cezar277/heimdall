@@ -40,6 +40,7 @@ from typing import Any
 
 from heimdall.vault.crypto import VaultCipher, VaultCipherError
 from heimdall.vault.database import (
+    MAX_KEK_VERSION,
     DatabaseUnavailableError,
     count_secrets,
     create_secret,
@@ -219,7 +220,7 @@ class InMemorySecretStore:
             for r in self._secrets.values():
                 v = r.get("kek_version")
                 if v is not None and (
-                    not isinstance(v, int) or isinstance(v, bool) or v < 1
+                    not isinstance(v, int) or isinstance(v, bool) or v < 1 or v > MAX_KEK_VERSION
                 ):
                     raise ValueError("Version de KEK illisible.")
 
@@ -240,7 +241,8 @@ class InMemorySecretStore:
                     )
                 new_version = target_kek_version
             else:
-                new_version = current_max + 1
+                # Fail-closed : l'auto-incrément reste borné à l'INTEGER 64 bits.
+                new_version = validate_kek_version(current_max + 1)
 
             # Invariant d'atomicité : backup profond pour garantir que self._secrets
             # est restauré intact même en cas de mutation in-place (#71 LOW 4).
@@ -277,6 +279,7 @@ def _read_max_kek_version(conn: sqlite3.Connection) -> int | None:
             not isinstance(raw_val, int)
             or isinstance(raw_val, bool)
             or raw_val < 1
+            or raw_val > MAX_KEK_VERSION
         ):
             raise RuntimeError(
                 "Impossible de lire la version KEK courante dans la base "

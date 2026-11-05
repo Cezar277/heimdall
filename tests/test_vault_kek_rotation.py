@@ -11,6 +11,7 @@ import base64
 import copy
 import sqlite3
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -40,7 +41,12 @@ from heimdall.vault.database import (
     update_secret,
     validate_kek_version,
 )
-from heimdall.vault.store import InMemorySecretStore, SecretStoreError, SqliteSecretStore
+from heimdall.vault.store import (
+    InMemorySecretStore,
+    SecretStoreError,
+    SqliteSecretStore,
+    _read_max_kek_version,
+)
 
 _OLD_KEK_BYTES = b"O" * 32
 _NEW_KEK_BYTES = b"N" * 32
@@ -281,6 +287,36 @@ class DatabaseRotationTests(unittest.TestCase):
             # Vérifier que rien n'est écrit dans la table secrets
             total = conn.execute("SELECT COUNT(*) FROM secrets").fetchone()[0]
             self.assertEqual(total, 0)
+
+    def test_rotation_refuses_auto_increment_beyond_sqlite_integer_max(self) -> None:
+        """Auto-incrément borné : rotate avec MAX(kek_version)=2**63-1 → ValueError (#71 LOW 1)."""
+        with db_session(self.db_path) as conn:
+            ensure_project(conn, "proj")
+            aad = VaultCipher.aad("proj", "dev", "AT_MAX")
+            envelope = self.old_cipher.encrypt_envelope(b"val_at_max", aad=aad)
+            create_secret(
+                conn,
+                "proj",
+                "dev",
+                "AT_MAX",
+                envelope.encrypted_value,
+                encrypted_dek=envelope.encrypted_dek,
+                kek_version=MAX_KEK_VERSION,
+            )
+
+        with self.assertRaises(ValueError) as ctx:
+            with db_session(self.db_path) as conn:
+                rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
+        self.assertIn("9223372036854775807", str(ctx.exception))
+        # Aucun reflet de l'auto-incrément débordant (invariant 8).
+        self.assertNotIn("9223372036854775808", str(ctx.exception))
+
+        # Rien persisté : la version reste un INTEGER à sa valeur d'origine.
+        with db_session(self.db_path) as conn:
+            rec = get_secret(conn, "proj", "dev", "AT_MAX")
+            assert rec is not None
+            self.assertEqual(rec["kek_version"], MAX_KEK_VERSION)
+            self.assertIsInstance(rec["kek_version"], int)
 
     def test_create_secret_validates_kek_version(self) -> None:
         """create_secret refuse les versions de KEK < 1 ou de type invalide."""
@@ -553,6 +589,24 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         err_msg = str(ctx.exception)
         self.assertNotIn(corrupt_val, err_msg)
         self.assertEqual(str(ctx.exception), "Version de KEK illisible.")
+
+    async def test_in_memory_rotate_kek_rejects_oversized_version_without_reflection(self) -> None:
+        """Version mémoire > INTEGER 64 bits refusée sans reflet (#71 LOW 2)."""
+        old_cipher = VaultCipher(_OLD_KEK_BYTES)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES)
+        store = InMemorySecretStore(cipher=old_cipher)
+        await store.create("demo", "dev", "KEY1", "val1")
+        store._secrets[("demo", "dev", "KEY1")]["kek_version"] = 2**100
+        with self.assertRaises(ValueError) as ctx:
+            await store.rotate_kek(new_cipher)
+        err_msg = str(ctx.exception)
+        self.assertEqual(err_msg, "Version de KEK illisible.")
+        # Aucun reflet de la valeur débordante (invariant 8).
+        self.assertNotIn("1267650600228229401496703205376", err_msg)
+        self.assertNotIn("1e+30", err_msg)
+        # Échec fail-closed : ni swap de clé, ni réenveloppement.
+        self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+        self.assertEqual(store._secrets[("demo", "dev", "KEY1")]["kek_version"], 2**100)
 
     async def test_in_memory_rotate_kek_atomicity_on_keyboard_interrupt(self) -> None:
         """InMemorySecretStore.rotate_kek restaure l'état sur KeyboardInterrupt (#71 LOW 3)."""
@@ -1023,6 +1077,34 @@ class VaultRotateCliTests(unittest.TestCase):
             sec = get_secret(conn, "demo", "dev", "API_KEY")
             assert sec is not None
             self.assertEqual(sec["kek_version"], 1)
+            self.assertIsInstance(sec["kek_version"], int)
+
+    def test_cli_rotate_rejects_auto_increment_overflow_at_max(self) -> None:
+        """Code 2 si l'auto-incrément atteint l'INTEGER 64 bits (LOW revue)."""
+        with sqlite3.connect(str(self.db_path)) as conn_raw:
+            conn_raw.execute(
+                "UPDATE secrets SET kek_version = ? WHERE name = 'API_KEY'",
+                (MAX_KEK_VERSION,),
+            )
+            conn_raw.commit()
+
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 2)
+        self.assertIn("9223372036854775807", res.output)
+        self.assertNotIn("9223372036854775808", res.output)
+        # Aucune écriture : la version persistée reste en INTEGER à MAX.
+        with db_session(self.db_path) as conn:
+            sec = get_secret(conn, "demo", "dev", "API_KEY")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], MAX_KEK_VERSION)
             self.assertIsInstance(sec["kek_version"], int)
 
     def test_cli_rotate_wrong_old_key_exits_one(self) -> None:
@@ -1575,6 +1657,54 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
             self.assertNotIn("1.5", err_msg)
             self.assertIn("Impossible de lire la version KEK courante", err_msg)
 
+    def test_detect_kek_version_oversized_real_raises_generic_error_no_reflection(self) -> None:
+        """_read_max_kek_version refuse un MAX hors INTEGER 64 bits (REAL) sans reflet (#71 LOW 2).
+
+        SQLite ne peut stocker une valeur > 2**63-1 que sous forme de REAL :
+        le garde-fou `> MAX_KEK_VERSION` ferme la porte en profondeur.
+        """
+        oversized = float(2**100)
+        with tempfile.TemporaryDirectory(prefix="heimdall-detect-oversized-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            with sqlite3.connect(str(db_path)) as conn_raw:
+                conn_raw.execute(
+                    "INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p', '2026')"
+                )
+                conn_raw.execute(
+                    "INSERT INTO secrets "
+                    "(project_id, env, name, encrypted_value, encrypted_dek, "
+                    "kek_version, status, fingerprint, created_at, updated_at) "
+                    "VALUES ('p', 'dev', 'OVERSIZE', 'enc_val', 'enc_dek', ?, 'vaulte', 'fp', "
+                    "'2026', '2026')",
+                    (oversized,),
+                )
+                conn_raw.commit()
+
+            cipher = VaultCipher(_OLD_KEK_BYTES)
+            with self.assertRaises(RuntimeError) as ctx:
+                SqliteSecretStore(db_path, cipher)
+            err_msg = str(ctx.exception)
+            self.assertIn("Impossible de lire la version KEK courante", err_msg)
+            # Aucun reflet de la valeur débordante (invariant 8).
+            self.assertNotIn("1.2676506002282294e+30", err_msg)
+            self.assertNotIn("1e+30", err_msg)
+
+        # Garde explicite `> MAX_KEK_VERSION` : un entier hors bornes (cas
+        # mémoire / mock, impossible à obtenir via SQLite) est aussi refusé.
+        class _OversizedConn:
+            def execute(self, _sql: str) -> Any:
+                return self
+
+            def fetchone(self) -> Any:
+                return (2**100,)
+
+        with self.assertRaises(RuntimeError) as ctx_direct:
+            _read_max_kek_version(_OversizedConn())  # type: ignore[arg-type]
+        direct_msg = str(ctx_direct.exception)
+        self.assertIn("Impossible de lire la version KEK courante", direct_msg)
+        self.assertNotIn("1267650600228229401496703205376", direct_msg)
+
     def test_sqlite_store_rotate_kek_nominal_uses_returned_new_version_without_second_select(
         self,
     ) -> None:
@@ -1698,3 +1828,76 @@ class NestedTransactionIsolationTests(unittest.TestCase):
                 reenvelope_secret(conn, "proj", "dev", "API_KEY", "enveloppe_v3", 3)
                 raise RuntimeError("échec après deux helpers")
         self._assert_fully_rolled_back(before)
+
+    def test_concurrent_sessions_do_not_cross_commit(self) -> None:
+        """Deux sessions concurrentes : portées transactionnelles indépendantes (#71 LOW 3).
+
+        Le marquage de session porte sur l'objet connexion (attribut
+        `_heimdall_session`), pas sur un registre global d'`id()` : aucune
+        classification croisée possible entre deux sessions de threads.
+        """
+        paths: list[Path] = []
+        for idx in (1, 2):
+            path = Path(self.tmp.name) / f"concurrent_{idx}.db"
+            init_db(path)
+            SqliteSecretStore(path, self.old_cipher)._create(
+                "proj", "dev", f"K{idx}", f"valeur_{idx}"
+            )
+            paths.append(path)
+
+        barrier = threading.Barrier(2, timeout=10)
+        outcomes: dict[str, str] = {}
+
+        def failing() -> None:
+            try:
+                with db_session(paths[0]) as conn:
+                    barrier.wait()
+                    update_secret(
+                        conn,
+                        "proj",
+                        "dev",
+                        "K1",
+                        "valeur_modifiee",
+                        encrypted_dek="enveloppe_v2",
+                        kek_version=2,
+                        fingerprint="empreinte_v2",
+                    )
+                    raise RuntimeError("échec simulé")
+            except RuntimeError:
+                outcomes["failing"] = "rolled_back"
+            else:  # pragma: no cover - garde
+                outcomes["failing"] = "committed"
+
+        def succeeding() -> None:
+            with db_session(paths[1]) as conn:
+                barrier.wait()
+                update_secret(
+                    conn,
+                    "proj",
+                    "dev",
+                    "K2",
+                    "valeur_modifiee",
+                    encrypted_dek="enveloppe_v2",
+                    kek_version=2,
+                    fingerprint="empreinte_v2",
+                )
+            outcomes["succeeding"] = "committed"
+
+        t1 = threading.Thread(target=failing)
+        t2 = threading.Thread(target=succeeding)
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+        self.assertEqual(
+            outcomes, {"failing": "rolled_back", "succeeding": "committed"}
+        )
+
+        # Aucun commit croisé : chaque base ne reflète que sa propre session.
+        with db_session(paths[0]) as conn:
+            rec1 = get_secret(conn, "proj", "dev", "K1")
+        with db_session(paths[1]) as conn:
+            rec2 = get_secret(conn, "proj", "dev", "K2")
+        assert rec1 is not None and rec2 is not None
+        self.assertEqual(rec1["kek_version"], 1)
+        self.assertEqual(rec2["kek_version"], 2)
