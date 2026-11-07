@@ -10,7 +10,7 @@ les `repr()`.
 ## 1. Exigences du ticket et preuves
 
 > **Permaliens** : les liens ci-dessous sont épinglés à la révision du code
-> [`f3fde8d`](https://github.com/Cezar277/heimdall/commit/f3fde8d306c9b9a9559d7fad2bf4544297f6e46c),
+> [`d2f6997`](https://github.com/Cezar277/heimdall/commit/d2f6997e47a5e0fe56c568236b8ec01a81b6bec7),
 > qui contient le test de chasse et le `__repr__` expurgé du registre. Cette
 > fiche est le commit suivant : elle ne modifie que de la documentation. Les
 > permaliens épinglent la révision du code, pas le commit de documentation.
@@ -62,11 +62,12 @@ chiffrés (`encrypted_value`). Les noms de classes d'exception (`ValueError`,
 les faux positifs. `encrypted_dek` reste marqué sensible par défense en
 profondeur. Un test négatif
 (`test_static_logging_guard_detects_known_violations`) prouve que la garde
-détecte les dix-sept formes testées : argument direct, `extra=`, alias `log`,
+détecte les dix-huit formes testées : argument direct, `extra=`, alias `log`,
 `getLogger(...).info`, `registry._pepper`, `settings.master_key`, `cipher._key`,
 `settings.model_dump()["master_key"]`, `key` nu, `cipher.key`, `print(...)`,
-`raise ValueError(f"…{secret_value}…")`, et les objets porteurs loggés entiers
-(`settings`, `cipher`, `registry`, `client`, `issued`).
+`raise ValueError(f"…{secret_value}…")`, `raise … from secret_exc` (cause
+inspectée), et les objets porteurs loggés entiers (`settings`, `cipher`,
+`registry`, `client`, `issued`).
 
 ## 4. Résultats locaux
 
