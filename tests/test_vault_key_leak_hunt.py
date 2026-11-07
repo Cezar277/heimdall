@@ -89,6 +89,40 @@ _SENSITIVE_ATTRIBUTES = frozenset(
 _SENSITIVE_OBJECTS = frozenset({"settings", "cipher", "registry", "client", "issued"})
 _SENSITIVE_CALLS = frozenset({"locals", "globals", "vars", "dir"})
 _SENSITIVE_METHODS = frozenset({"model_dump", "model_dump_json"})
+_SAFE_ATTRIBUTES = frozenset(
+    {
+        "db_path",
+        "key_id",
+        "key_hash",
+        "project_id",
+        "created_at",
+        "name",
+        "path",
+        "status",
+        "storage_backend",
+        "host",
+        "port",
+        "enable_docs",
+        "require_auth",
+        "rate_limit_per_key",
+        "rate_limit_per_peer",
+        "rate_limit_global",
+        "rate_limit_window_seconds",
+        "ssl_certfile",
+        "ssl_keyfile",
+        "ssl_ca_file",
+        "min_tls_version",
+        "max_request_body_bytes",
+        "max_secrets",
+        "max_secrets_per_project",
+        "_base_url",
+        "_timeout",
+        "_ca_cert",
+        "_transport",
+        "_client",
+        "_db_path",
+    }
+)
 
 
 def _is_sensitive_name(name: str) -> bool:
@@ -138,7 +172,9 @@ def _sensitive_reference(value: ast.AST) -> str | None:  # noqa: PLR0911, PLR091
             return attr
         if attr in _SENSITIVE_METHODS:
             return f"{attr}()"
-        return None
+        if attr in _SAFE_ATTRIBUTES:
+            return None
+        return _sensitive_reference(value.value)
     if isinstance(value, ast.Call):
         func = value.func
         if isinstance(func, ast.Name) and func.id in _SENSITIVE_CALLS:
@@ -169,7 +205,12 @@ def _sensitive_reference(value: ast.AST) -> str | None:  # noqa: PLR0911, PLR091
         name = _sensitive_reference(value.value)
         if name is not None:
             return name
-        return _sensitive_reference(value.slice)
+        slice_node = value.slice
+        if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+            return slice_node.value if _is_sensitive_name(slice_node.value) else None
+        if isinstance(slice_node, ast.Name):
+            return slice_node.id if _is_sensitive_name(slice_node.id) else None
+        return _sensitive_reference(slice_node)
     for child in ast.iter_child_nodes(value):
         name = _sensitive_reference(child)
         if name is not None:
@@ -470,11 +511,15 @@ class VaultKeyLeakHuntTests(unittest.TestCase):
                 "logger.info(issued.key_id)\n"
                 "typer.echo(f'Identifiant : {issued.key_id}')\n"
                 "logger.info(secret_value.hex())\n"
-                "logger.info(data[secret_value])\n",
+                "logger.info(data[secret_value])\n"
+                "logger.info(registry.active_hashes)\n"
+                "logger.info(d['master_key'])\n"
+                "logger.info(settings.host)\n"
+                "logger.info(client._base_url)\n",
                 encoding="utf-8",
             )
             violations = _static_logging_violations([path])
-        self.assertEqual(len(violations), 25)
+        self.assertEqual(len(violations), 27)
 
 
 if __name__ == "__main__":
