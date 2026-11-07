@@ -61,6 +61,7 @@ _SENSITIVE_MARKERS = (
 _ALLOWED_NAMES = frozenset(
     {"encrypted_value", "kek_version", "max_kek_version", "new_version", "current_max"}
 )
+_SENSITIVE_ATTRIBUTES = frozenset({"_key"})
 
 
 def _is_sensitive_name(name: str) -> bool:
@@ -104,10 +105,35 @@ def _static_logging_violations(paths: list[Path]) -> list[str]:
             values = list(node.args) + [keyword.value for keyword in node.keywords]
             for value in values:
                 for child in ast.walk(value):
+                    name: str | None = None
                     if isinstance(child, ast.Name) and _is_sensitive_name(child.id):
+                        name = child.id
+                    elif isinstance(child, ast.Attribute) and (
+                        child.attr.lower() in _SENSITIVE_ATTRIBUTES
+                        or _is_sensitive_name(child.attr)
+                    ):
+                        name = child.attr
+                    elif (
+                        isinstance(child, ast.Subscript)
+                        and isinstance(child.value, ast.Call)
+                        and isinstance(child.value.func, ast.Attribute)
+                        and child.value.func.attr == "model_dump"
+                    ):
+                        slice_node = child.slice
+                        if (
+                            isinstance(slice_node, ast.Constant)
+                            and isinstance(slice_node.value, str)
+                            and _is_sensitive_name(slice_node.value)
+                        ):
+                            name = slice_node.value
+                        elif isinstance(slice_node, ast.Name) and _is_sensitive_name(
+                            slice_node.id
+                        ):
+                            name = slice_node.id
+                    if name is not None:
                         violations.append(
                             f"{path.name}:{node.lineno}: "
-                            f"logger.{node.func.attr} référence {child.id!r}"
+                            f"logger.{node.func.attr} référence {name!r}"
                         )
     return violations
 
@@ -316,11 +342,15 @@ class VaultKeyLeakHuntTests(unittest.TestCase):
                 "logger.info(secret_value)\n"
                 "logger.info('x', extra={'secret': secret_value})\n"
                 "log.info(secret_value)\n"
-                "logging.getLogger('x').info(secret_value)\n",
+                "logging.getLogger('x').info(secret_value)\n"
+                "logger.info(registry._pepper)\n"
+                "logger.info(settings.master_key)\n"
+                "logger.info(cipher._key)\n"
+                "logger.info(settings.model_dump()['master_key'])\n",
                 encoding="utf-8",
             )
             violations = _static_logging_violations([path])
-        self.assertEqual(len(violations), 4)
+        self.assertEqual(len(violations), 8)
 
 
 if __name__ == "__main__":
