@@ -42,6 +42,7 @@ from heimdall.vault.crypto import VaultCipher, VaultCipherError
 from heimdall.vault.database import (
     MAX_KEK_VERSION,
     DatabaseUnavailableError,
+    KekVersionError,
     count_secrets,
     create_secret,
     delete_all_secrets,
@@ -222,7 +223,7 @@ class InMemorySecretStore:
                 if v is not None and (
                     not isinstance(v, int) or isinstance(v, bool) or v < 1 or v > MAX_KEK_VERSION
                 ):
-                    raise ValueError("Version de KEK illisible.")
+                    raise KekVersionError("Version de KEK illisible.")
 
             current_max = max(
                 (
@@ -492,6 +493,15 @@ class SqliteSecretStore:
                 # Store vide : aucun secret réenveloppé, self._cipher et self._kek_version
                 # restent inchangés (aligné sur InMemorySecretStore).
                 return 0
-        self._cipher = new_cipher
-        self._kek_version = new_version
+        # Swap atomique du couple (cipher, version) : une interruption entre
+        # les deux affectations ne doit pas laisser un cipher neuf étiqueté
+        # avec l'ancienne version (mislabeling d'audit). Le commit DB est déjà
+        # acquis ; en cas d'interruption, le store reste sur l'ancien couple et
+        # un create ultérieur échouera fail-closed sur la version DB supérieure.
+        prev_cipher, prev_version = self._cipher, self._kek_version
+        try:
+            self._cipher, self._kek_version = new_cipher, new_version
+        except BaseException:
+            self._cipher, self._kek_version = prev_cipher, prev_version
+            raise
         return count

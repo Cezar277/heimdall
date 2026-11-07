@@ -687,7 +687,7 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         await store.create("demo", "dev", "KEY1", "val1")
         corrupt_val = "<corrupt-kek-version-in-mem>"
         store._secrets[("demo", "dev", "KEY1")]["kek_version"] = corrupt_val
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(KekVersionError) as ctx:
             await store.rotate_kek(new_cipher)
         err_msg = str(ctx.exception)
         self.assertNotIn(corrupt_val, err_msg)
@@ -700,7 +700,7 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         store = InMemorySecretStore(cipher=old_cipher)
         await store.create("demo", "dev", "KEY1", "val1")
         store._secrets[("demo", "dev", "KEY1")]["kek_version"] = 2**100
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(KekVersionError) as ctx:
             await store.rotate_kek(new_cipher)
         err_msg = str(ctx.exception)
         self.assertEqual(err_msg, "Version de KEK illisible.")
@@ -744,6 +744,51 @@ class StoreRotationMethodTests(unittest.IsolatedAsyncioTestCase):
         rec = await store.get("demo", "dev", "KEY1")
         assert rec is not None
         self.assertEqual(rec["value"], "val1")
+
+    async def test_sqlite_store_rotate_kek_restores_cipher_and_version_on_interrupt(
+        self,
+    ) -> None:
+        """SqliteSecretStore restaure le couple (cipher, version) si le swap est interrompu."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-store-interrupt-") as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(_OLD_KEK_BYTES)
+            new_cipher = VaultCipher(_NEW_KEK_BYTES)
+
+            class _InterruptingVersionStore(SqliteSecretStore):
+                @property
+                def _kek_version(self) -> int:
+                    value: int = self.__dict__["_kek_version"]
+                    return value
+
+                @_kek_version.setter
+                def _kek_version(self, value: int) -> None:
+                    if getattr(self, "_interrupt_version_set", False):
+                        raise KeyboardInterrupt("interruption simulée entre les affectations")
+                    self.__dict__["_kek_version"] = value
+
+            store = _InterruptingVersionStore(db_path, old_cipher)
+            await store.create("demo", "dev", "KEY1", "val1")
+            store._interrupt_version_set = True  # type: ignore[attr-defined]
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    await store.rotate_kek(new_cipher)
+            finally:
+                store._interrupt_version_set = False  # type: ignore[attr-defined]
+
+            # Couple restauré : pas de cipher neuf étiqueté avec l'ancienne version.
+            self.assertTrue(store._cipher.has_same_key_as(old_cipher))
+            self.assertEqual(store.kek_version, 1)
+            with db_session(db_path) as conn:
+                sec = get_secret(conn, "demo", "dev", "KEY1")
+                assert sec is not None
+                self.assertEqual(sec["kek_version"], 2)
+
+            # Le store ne peut plus lire (DEK en base sous la nouvelle KEK) et
+            # refuse de créer un secret sous l'ancienne KEK (fail-closed).
+            with self.assertRaises(SecretStoreError):
+                await store.get("demo", "dev", "KEY1")
+            with self.assertRaises(RuntimeError):
+                await store.create("demo", "dev", "POST_INTERRUPT", "val")
 
     async def test_in_memory_rotate_kek_atomicity_on_keyboard_interrupt(self) -> None:
         """InMemorySecretStore.rotate_kek restaure l'état sur KeyboardInterrupt (#71 LOW 3)."""
