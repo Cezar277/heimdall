@@ -97,6 +97,14 @@ def validate_kek_version(version: Any, *, label: str = "Numéro de version de KE
         raise ValueError(f"{label} invalide : valeur <= {MAX_KEK_VERSION} requise.")
     return version
 
+
+class KekVersionError(ValueError):
+    """Version de KEK illisible ou hors contrat dans la base (intégrité)."""
+
+
+class KekConcurrencyError(ValueError):
+    """Écriture conditionnelle sur ``kek_version`` perdante (concurrence)."""
+
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
 _SECURE_DIR_MODE: int = 0o700
@@ -1431,7 +1439,7 @@ def update_secret(  # noqa: PLR0913
             if raw_v is not None and (
                 not isinstance(raw_v, int) or isinstance(raw_v, bool) or raw_v < 1
             ):
-                raise ValueError("Version de KEK illisible en base.")
+                raise KekVersionError("Version de KEK illisible en base.")
             current_v = raw_v if raw_v is not None else 1
             if kek_version < current_v:
                 raise ValueError(
@@ -1465,7 +1473,7 @@ def update_secret(  # noqa: PLR0913
             ),
         )
         if kek_version is not None and cursor.rowcount == 0:
-            raise ValueError("Concurrence détectée sur kek_version.")
+            raise KekConcurrencyError("Concurrence détectée sur kek_version.")
         return cursor.rowcount > 0
 
 
@@ -1506,7 +1514,7 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
         if raw_v is not None and (
             not isinstance(raw_v, int) or isinstance(raw_v, bool) or raw_v < 1
         ):
-            raise ValueError("Version de KEK illisible en base.")
+            raise KekVersionError("Version de KEK illisible en base.")
         current_v = raw_v if raw_v is not None else 1
         if kek_version <= current_v:
             raise ValueError(
@@ -1526,7 +1534,7 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
             (encrypted_dek, kek_version, up_ts, project_id, env, name, kek_version),
         )
         if cursor.rowcount == 0:
-            raise ValueError("Concurrence détectée sur kek_version.")
+            raise KekConcurrencyError("Concurrence détectée sur kek_version.")
         return True
 
 
@@ -1579,7 +1587,7 @@ def rotate_secrets_kek(
             if v is not None and (
                 not isinstance(v, int) or isinstance(v, bool) or v < 1 or v > MAX_KEK_VERSION
             ):
-                raise ValueError("Version de KEK illisible en base.")
+                raise KekVersionError("Version de KEK illisible en base.")
 
         current_max = max(
             (
@@ -1629,7 +1637,7 @@ def rotate_secrets_kek(
                 (new_wrapped_dek, new_version, now_ts, sec_id, new_version),
             )
             if cursor.rowcount != 1:
-                raise ValueError("Concurrence détectée sur kek_version.")
+                raise KekConcurrencyError("Concurrence détectée sur kek_version.")
             rotated_count += 1
 
         logger.info(

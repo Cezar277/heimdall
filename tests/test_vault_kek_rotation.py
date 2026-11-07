@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -29,6 +32,8 @@ from heimdall.vault.crypto import (
 from heimdall.vault.database import (
     _SCHEMA_MIGRATION_HINT,
     MAX_KEK_VERSION,
+    KekConcurrencyError,
+    KekVersionError,
     create_project,
     create_secret,
     db_session,
@@ -354,7 +359,7 @@ class DatabaseRotationTests(unittest.TestCase):
                     return getattr(self._target, name)
 
             proxy_conn: Any = _InterceptingConn(conn)
-            with self.assertRaises(ValueError) as ctx:
+            with self.assertRaises(KekConcurrencyError) as ctx:
                 rotate_secrets_kek(proxy_conn, self.old_cipher, self.new_cipher)
             self.assertEqual(str(ctx.exception), "Concurrence détectée sur kek_version.")
             # Invariant 8 : aucun identifiant dans le message.
@@ -1355,6 +1360,77 @@ class VaultRotateCliTests(unittest.TestCase):
         self.assertNotIn(str(corrupted_val), res.output)
         self.assertNotIn("1.5", res.output)
 
+    def test_cli_rotate_concurrency_error_exits_one_without_reflection(self) -> None:
+        """KekConcurrencyError est classée exit 1 par type, sans matching de libellé."""
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        with unittest.mock.patch(
+            "heimdall.cli.vault_keys.rotate_secrets_kek",
+            side_effect=KekConcurrencyError("Concurrence détectée sur kek_version."),
+        ):
+            res = self.runner.invoke(
+                cli_app,
+                ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+                env=env,
+            )
+        self.assertEqual(res.exit_code, 1)
+        self.assertIn("Erreur : base de données corrompue ou invalide", res.output)
+        self.assertNotIn("Concurrence", res.output)
+
+    def test_cli_rotate_two_concurrent_processes_one_fails_closed(self) -> None:
+        """Deux CLI rotate-kek simultanées : une réussit, l'autre échoue exit 1."""
+        env = os.environ.copy()
+        env["HEIMDALL_VAULT_OLD_KEK"] = _OLD_KEK_B64
+        env["HEIMDALL_VAULT_NEW_KEK"] = _NEW_KEK_B64
+        command = [
+            sys.executable,
+            "-c",
+            "from heimdall.cli.main import main; main()",
+            "vault",
+            "rotate-kek",
+            "--db-path",
+            str(self.db_path),
+        ]
+        processes = [
+            subprocess.Popen(  # noqa: S603 — commande statique, env de test contrôlé
+                command,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        results: list[tuple[int, str, str]] = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=60)
+            results.append((process.returncode, stdout, stderr))
+
+        self.assertEqual(sorted(code for code, _, _ in results), [0, 1])
+        loser_output = "".join(
+            stdout + stderr for code, stdout, stderr in results if code != 0
+        )
+        self.assertNotIn(_OLD_KEK_B64, loser_output)
+        self.assertNotIn(_NEW_KEK_B64, loser_output)
+        self.assertNotIn("super_secret_value", loser_output)
+
+        with db_session(self.db_path) as conn:
+            secret = get_secret(conn, "demo", "dev", "API_KEY")
+            assert secret is not None
+            self.assertEqual(secret["kek_version"], 2)
+
+        rotated = SqliteSecretStore(self.db_path, VaultCipher(_NEW_KEK_BYTES))._get(
+            "demo", "dev", "API_KEY"
+        )
+        assert rotated is not None
+        self.assertEqual(rotated["value"], "super_secret_value")
+        with self.assertRaises(SecretStoreError):
+            SqliteSecretStore(self.db_path, self.old_cipher)._get(
+                "demo", "dev", "API_KEY"
+            )
+
 
 class ValidateKekVersionHelperTests(unittest.TestCase):
     """Tests unitaires de validate_kek_version."""
@@ -1517,7 +1593,7 @@ class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
                     return getattr(self._target, name)
 
             proxy_conn: Any = _InterceptingConn(conn)
-            with self.assertRaises(ValueError) as ctx:
+            with self.assertRaises(KekConcurrencyError) as ctx:
                 reenvelope_secret(proxy_conn, "proj", "dev", "INTERCAL", new_dek, kek_version=2)
             self.assertEqual(str(ctx.exception), "Concurrence détectée sur kek_version.")
             # Invariant 8 : aucun identifiant ni version dans l'exception (#71 LOW 3)
@@ -1573,8 +1649,8 @@ class ReenvelopeSecretMonotonicityTests(unittest.TestCase):
                     return getattr(self._target, name)
 
             proxy_conn: Any = _InterceptingConn(conn)
-            # update_secret avec kek_version=2 lève ValueError et ne retourne pas False
-            with self.assertRaises(ValueError) as ctx:
+            # update_secret avec kek_version=2 lève KekConcurrencyError et ne retourne pas False
+            with self.assertRaises(KekConcurrencyError) as ctx:
                 update_secret(
                     proxy_conn,
                     "proj",
@@ -1669,7 +1745,7 @@ class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):
             return
 
         with db_session(self.db_path) as conn:
-            with self.assertRaises(ValueError) as ctx:
+            with self.assertRaises(KekVersionError) as ctx:
                 rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
         err_msg = str(ctx.exception)
         self.assertNotIn("<script>", err_msg)
@@ -1693,7 +1769,7 @@ class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):
             return
 
         with db_session(self.db_path) as conn:
-            with self.assertRaises(ValueError) as ctx:
+            with self.assertRaises(KekVersionError) as ctx:
                 reenvelope_secret(conn, "p", "dev", "BAD", "new_dek", kek_version=2)
         err_msg = str(ctx.exception)
         self.assertNotIn("<script>", err_msg)
@@ -1715,17 +1791,17 @@ class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):
             conn_raw.commit()
 
         with db_session(self.db_path) as conn:
-            with self.assertRaises(ValueError) as ctx:
+            with self.assertRaises(KekVersionError) as ctx:
                 rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
             self.assertEqual(str(ctx.exception), "Version de KEK illisible en base.")
             self.assertNotIn("1.5", str(ctx.exception))
 
-            with self.assertRaises(ValueError) as ctx_up:
+            with self.assertRaises(KekVersionError) as ctx_up:
                 update_secret(conn, "p", "dev", "BAD_REAL", "new_val", kek_version=2)
             self.assertEqual(str(ctx_up.exception), "Version de KEK illisible en base.")
             self.assertNotIn("1.5", str(ctx_up.exception))
 
-            with self.assertRaises(ValueError) as ctx_re:
+            with self.assertRaises(KekVersionError) as ctx_re:
                 reenvelope_secret(conn, "p", "dev", "BAD_REAL", "new_dek", kek_version=2)
             self.assertEqual(str(ctx_re.exception), "Version de KEK illisible en base.")
             self.assertNotIn("1.5", str(ctx_re.exception))

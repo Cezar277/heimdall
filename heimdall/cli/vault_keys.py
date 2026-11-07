@@ -37,6 +37,8 @@ from heimdall.cli.vault_client import (
 from heimdall.vault import auth as vault_auth
 from heimdall.vault.crypto import VaultCipher, VaultCipherError
 from heimdall.vault.database import (
+    KekConcurrencyError,
+    KekVersionError,
     db_session,
     init_db,
     resolve_db_path,
@@ -332,11 +334,10 @@ def rotate_kek_command(
     except VaultCipherError:
         typer.echo("Erreur : échec du déchiffrement avec l'ancienne KEK.", err=True)
         raise typer.Exit(code=1) from None
+    except (KekVersionError, KekConcurrencyError):
+        typer.echo("Erreur : base de données corrompue ou invalide.", err=True)
+        raise typer.Exit(code=1) from None
     except ValueError as exc:
-        msg = str(exc)
-        if "illisible" in msg or "Concurrence" in msg:
-            typer.echo("Erreur : base de données corrompue ou invalide.", err=True)
-            raise typer.Exit(code=1) from None
         typer.echo(f"Erreur : {exc}", err=True)
         raise typer.Exit(code=2) from None
     except Exception:
