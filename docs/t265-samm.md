@@ -10,7 +10,7 @@ les `repr()`.
 ## 1. Exigences du ticket et preuves
 
 > **Permaliens** : les liens ci-dessous sont épinglés à la révision du code
-> [`c7537e2`](https://github.com/Cezar277/heimdall/commit/c7537e2bf3ac176dec3126a66526f8dfe583034a),
+> [`7360627`](https://github.com/Cezar277/heimdall/commit/73606274af9b0cd2c9d058b88c764eed0d6a48ce),
 > qui contient le test de chasse et le `__repr__` expurgé du registre. Cette
 > fiche est le commit suivant : elle ne modifie que de la documentation. Les
 > permaliens épinglent la révision du code, pas le commit de documentation.
@@ -40,7 +40,8 @@ sous `assertLogs("heimdall", level="DEBUG")` :
 
 À la sortie, le test vérifie l'absence de la clé maîtresse, du sel, du pepper,
 de la valeur du secret, de la clé API, de la clé brute émise par la CLI et de
-la KEK dans l'intégralité des enregistrements de logs.
+la KEK (y compris la KEK dérivée en hexadécimal) dans l'intégralité des
+enregistrements de logs.
 
 ## 3. Garde statique
 
@@ -67,14 +68,15 @@ profondeur. Le seul `echo` autorisé est l'affichage volontaire de la clé brute
 par `vault key create` (`typer.echo(issued.raw_key)`), explicitement allowlisté.
 Un test négatif
 (`test_static_logging_guard_detects_known_violations`) prouve que la garde
-détecte les vingt-trois formes testées : argument direct, `extra=`, alias `log`,
+détecte les vingt-cinq formes testées : argument direct, `extra=`, alias `log`,
 `getLogger(...).info`, `registry._pepper`, `settings.master_key`, `cipher._key`,
 `settings.model_dump()["master_key"]`, `key` nu, `cipher.key`, `print(...)`,
 `raise ValueError(f"…{secret_value}…")`, `raise … from secret_exc` (cause
 inspectée), les objets porteurs loggés entiers (`settings`, `cipher`,
 `registry`, `client`, `issued`), `locals()`, `typer.echo(secret_value)`,
-`settings.model_dump()`, `settings.model_dump_json()` et `settings.__dict__`.
-Les formes sûres (`typer.echo(issued.raw_key)`, `settings.db_path`,
+`settings.model_dump()`, `settings.model_dump_json()`, `settings.__dict__`,
+`secret_value.hex()` (receveur d'appel) et `data[secret_value]` (indice de
+subscript). Les formes sûres (`typer.echo(issued.raw_key)`, `settings.db_path`,
 `issued.key_id`, `typer.echo(f"…{issued.key_id}…")`) ne sont pas signalées.
 
 ## 4. Résultats locaux
