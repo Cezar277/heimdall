@@ -83,8 +83,12 @@ _ALLOWED_NAMES = frozenset(
         "env_salt",
     }
 )
-_SENSITIVE_ATTRIBUTES = frozenset({"_key"})
+_SENSITIVE_ATTRIBUTES = frozenset(
+    {"_key", "_pepper", "_api_key", "_entries", "_active", "__dict__"}
+)
 _SENSITIVE_OBJECTS = frozenset({"settings", "cipher", "registry", "client", "issued"})
+_SENSITIVE_CALLS = frozenset({"locals", "globals", "vars", "dir"})
+_SENSITIVE_METHODS = frozenset({"model_dump", "model_dump_json"})
 
 
 def _is_sensitive_name(name: str) -> bool:
@@ -113,48 +117,71 @@ def _is_logging_call(node: ast.Call) -> bool:
     return False
 
 
-def _sensitive_reference(value: ast.AST) -> str | None:
-    """Retourne le premier nom/attribut sensible trouvé dans une expression."""
-    for child in ast.walk(value):
-        if isinstance(child, ast.Name) and child.id in _SENSITIVE_OBJECTS:
-            return child.id
+def _sensitive_reference(value: ast.AST) -> str | None:  # noqa: PLR0911, PLR0912
+    """Retourne le premier nom/attribut/appel sensible trouvé dans une expression.
+
+    Gère les accès attributs (``settings.master_key``, ``cipher._key``), les
+    subscripts ``model_dump()``, les objets porteurs loggés entiers et les
+    introspections ``locals()``/``globals()``/``vars()``/``dir()``.
+    """
+    if isinstance(value, ast.Name):
+        if value.id in _SENSITIVE_OBJECTS:
+            return value.id
+        if value.id.endswith(("Error", "Exception")) or value.id.isupper():
+            return None
+        return value.id if _is_sensitive_name(value.id) else None
+    if isinstance(value, ast.Attribute):
+        attr = value.attr
+        if attr in _SENSITIVE_OBJECTS or attr.lower() in _SENSITIVE_ATTRIBUTES:
+            return attr
+        if not attr.isupper() and _is_sensitive_name(attr):
+            return attr
+        if attr in _SENSITIVE_METHODS:
+            return f"{attr}()"
+        return None
+    if isinstance(value, ast.Call):
+        func = value.func
+        if isinstance(func, ast.Name) and func.id in _SENSITIVE_CALLS:
+            return f"{func.id}()"
+        if isinstance(func, ast.Attribute) and func.attr in _SENSITIVE_METHODS:
+            return f"{func.attr}()"
+        for child in list(value.args) + [keyword.value for keyword in value.keywords]:
+            name = _sensitive_reference(child)
+            if name is not None:
+                return name
+        return None
+    if isinstance(value, ast.Subscript):
         if (
-            isinstance(child, ast.Name)
-            and not child.id.endswith(("Error", "Exception"))
-            and not child.id.isupper()
-            and _is_sensitive_name(child.id)
+            isinstance(value.value, ast.Call)
+            and isinstance(value.value.func, ast.Attribute)
+            and value.value.func.attr in _SENSITIVE_METHODS
         ):
-            return child.id
-        if (
-            isinstance(child, ast.Attribute)
-            and not child.attr.isupper()
-            and (
-                child.attr in _SENSITIVE_OBJECTS
-                or child.attr.lower() in _SENSITIVE_ATTRIBUTES
-                or _is_sensitive_name(child.attr)
-            )
-        ):
-            return child.attr
-        if (
-            isinstance(child, ast.Subscript)
-            and isinstance(child.value, ast.Call)
-            and isinstance(child.value.func, ast.Attribute)
-            and child.value.func.attr == "model_dump"
-        ):
-            slice_node = child.slice
-            if (
-                isinstance(slice_node, ast.Constant)
-                and isinstance(slice_node.value, str)
-                and _is_sensitive_name(slice_node.value)
-            ):
-                return slice_node.value
-            if isinstance(slice_node, ast.Name) and _is_sensitive_name(slice_node.id):
-                return slice_node.id
+            slice_node = value.slice
+            if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+                return slice_node.value if _is_sensitive_name(slice_node.value) else None
+            if isinstance(slice_node, ast.Name):
+                return slice_node.id if _is_sensitive_name(slice_node.id) else None
+            return None
+        return _sensitive_reference(value.value)
+    for child in ast.iter_child_nodes(value):
+        name = _sensitive_reference(child)
+        if name is not None:
+            return name
     return None
 
 
-def _static_logging_violations(paths: list[Path]) -> list[str]:
-    """Inspecte logs, ``print`` et ``raise`` : args, keywords, attributs, subscripts.
+def _is_allowed_echo(value: ast.AST) -> bool:
+    """Seul ``typer.echo(issued.raw_key)`` est autorisé (affichage unique CLI)."""
+    return (
+        isinstance(value, ast.Attribute)
+        and value.attr == "raw_key"
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "issued"
+    )
+
+
+def _static_logging_violations(paths: list[Path]) -> list[str]:  # noqa: PLR0912
+    """Inspecte logs, ``print``, ``echo`` et ``raise`` : args, keywords, attributs.
 
     Les blobs chiffrés ``encrypted_value`` restent autorisés (ciphertext, pas de
     clair) ; ``encrypted_dek`` est marqué sensible par défense en profondeur.
@@ -172,10 +199,14 @@ def _static_logging_violations(paths: list[Path]) -> list[str]:
                     isinstance(node.func, ast.Attribute) and node.func.attr == "print"
                 ):
                     label = "print"
+                elif isinstance(node.func, ast.Attribute) and node.func.attr == "echo":
+                    label = "echo"
                 else:
                     continue
                 values = list(node.args) + [keyword.value for keyword in node.keywords]
                 for value in values:
+                    if label == "echo" and _is_allowed_echo(value):
+                        continue
                     name = _sensitive_reference(value)
                     if name is not None:
                         violations.append(
@@ -192,7 +223,6 @@ def _static_logging_violations(paths: list[Path]) -> list[str]:
                         f"{path.name}:{node.lineno}: raise référence {name!r}"
                     )
     return violations
-
 
 
 class VaultKeyLeakHuntTests(unittest.TestCase):
@@ -412,11 +442,20 @@ class VaultKeyLeakHuntTests(unittest.TestCase):
                 "logger.info(registry)\n"
                 "logger.info(client)\n"
                 "logger.info(issued)\n"
-                "raise ValueError('x') from secret_exc\n",
+                "raise ValueError('x') from secret_exc\n"
+                "logger.info(locals())\n"
+                "typer.echo(secret_value)\n"
+                "logger.info(settings.model_dump())\n"
+                "logger.info(settings.model_dump_json())\n"
+                "logger.info(settings.__dict__)\n"
+                "typer.echo(issued.raw_key)\n"
+                "logger.info(settings.db_path)\n"
+                "logger.info(issued.key_id)\n"
+                "typer.echo(f'Identifiant : {issued.key_id}')\n",
                 encoding="utf-8",
             )
             violations = _static_logging_violations([path])
-        self.assertEqual(len(violations), 18)
+        self.assertEqual(len(violations), 23)
 
 
 if __name__ == "__main__":
