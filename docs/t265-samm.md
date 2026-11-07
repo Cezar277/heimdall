@@ -10,7 +10,7 @@ les `repr()`.
 ## 1. Exigences du ticket et preuves
 
 > **Permaliens** : les liens ci-dessous sont épinglés à la révision du code
-> [`d2f6997`](https://github.com/Cezar277/heimdall/commit/d2f6997e47a5e0fe56c568236b8ec01a81b6bec7),
+> [`c7537e2`](https://github.com/Cezar277/heimdall/commit/c7537e2bf3ac176dec3126a66526f8dfe583034a),
 > qui contient le test de chasse et le `__repr__` expurgé du registre. Cette
 > fiche est le commit suivant : elle ne modifie que de la documentation. Les
 > permaliens épinglent la révision du code, pas le commit de documentation.
@@ -46,12 +46,15 @@ la KEK dans l'intégralité des enregistrements de logs.
 
 `test_static_logging_calls_do_not_reference_sensitive_names` parse l'AST de
 `heimdall/vault/*.py` et `heimdall/cli/vault_keys.py` et refuse tout appel de
-log (`logger.*`, `log.*`, `logging.*`, `getLogger(...).*`), `print(...)` et
-`raise ...` qui référence une variable sensible dans ses arguments **ou ses
-keywords** (`extra=`, `exc_info=`, etc.), y compris via un **accès attribut**
+log (`logger.*`, `log.*`, `logging.*`, `getLogger(...).*`), `print(...)`,
+`echo` (`typer.echo`/`click.echo`) et `raise ...` qui référence une variable
+sensible dans ses arguments **ou ses keywords** (`extra=`, `exc_info=`, etc.),
+y compris via un **accès attribut**
 (`registry._pepper`, `settings.master_key`, `cipher._key`, `cipher.key`) ou un
-**subscript `model_dump()`** (`settings.model_dump()["master_key"]`). La
-détection est conservatrice par sous-chaîne (`secret`, `plaintext`, `password`,
+**subscript `model_dump()`** (`settings.model_dump()["master_key"]`), les
+**introspections** (`locals()`, `globals()`, `vars()`, `dir()`) ou l'appel
+`model_dump()`/`model_dump_json()` entier. La détection est conservatrice par
+sous-chaîne (`secret`, `plaintext`, `password`,
 `private_key`, `master_key`, `master`, `api_key`, `raw_key`, `pepper`, `kek`,
 `dek`, `salt`, `seed`, `token`, `value`, `key`), les objets porteurs (`settings`,
 `cipher`, `registry`, `client`, `issued`), avec une allowlist pour les
@@ -60,14 +63,19 @@ métadonnées et constantes publiques (`kek_version`, `new_version`,
 chiffrés (`encrypted_value`). Les noms de classes d'exception (`ValueError`,
 `VaultCipherError`, …) et les constantes `UPPER_CASE` sont ignorés pour éviter
 les faux positifs. `encrypted_dek` reste marqué sensible par défense en
-profondeur. Un test négatif
+profondeur. Le seul `echo` autorisé est l'affichage volontaire de la clé brute
+par `vault key create` (`typer.echo(issued.raw_key)`), explicitement allowlisté.
+Un test négatif
 (`test_static_logging_guard_detects_known_violations`) prouve que la garde
-détecte les dix-huit formes testées : argument direct, `extra=`, alias `log`,
+détecte les vingt-trois formes testées : argument direct, `extra=`, alias `log`,
 `getLogger(...).info`, `registry._pepper`, `settings.master_key`, `cipher._key`,
 `settings.model_dump()["master_key"]`, `key` nu, `cipher.key`, `print(...)`,
 `raise ValueError(f"…{secret_value}…")`, `raise … from secret_exc` (cause
-inspectée), et les objets porteurs loggés entiers (`settings`, `cipher`,
-`registry`, `client`, `issued`).
+inspectée), les objets porteurs loggés entiers (`settings`, `cipher`,
+`registry`, `client`, `issued`), `locals()`, `typer.echo(secret_value)`,
+`settings.model_dump()`, `settings.model_dump_json()` et `settings.__dict__`.
+Les formes sûres (`typer.echo(issued.raw_key)`, `settings.db_path`,
+`issued.key_id`, `typer.echo(f"…{issued.key_id}…")`) ne sont pas signalées.
 
 ## 4. Résultats locaux
 
