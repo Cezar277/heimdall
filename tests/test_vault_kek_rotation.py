@@ -17,6 +17,7 @@ import tempfile
 import threading
 import unittest
 import unittest.mock
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -1308,7 +1309,7 @@ class VaultRotateCliTests(unittest.TestCase):
 
     def test_cli_rotate_rejects_auto_increment_overflow_at_max(self) -> None:
         """Code 1 (limite système) si l'auto-incrément atteint l'INTEGER 64 bits."""
-        with sqlite3.connect(str(self.db_path)) as conn_raw:
+        with closing(sqlite3.connect(str(self.db_path))) as conn_raw:
             conn_raw.execute(
                 "UPDATE secrets SET kek_version = ? WHERE name = 'API_KEY'",
                 (MAX_KEK_VERSION,),
@@ -1390,7 +1391,7 @@ class VaultRotateCliTests(unittest.TestCase):
     def test_cli_rotate_corrupted_kek_version_exits_one(self) -> None:
         """Code 1 (opérationnel) et message générique si kek_version corrompue (#71 LOW 2)."""
         corrupted_val = 1.5
-        with sqlite3.connect(str(self.db_path)) as conn_raw:
+        with closing(sqlite3.connect(str(self.db_path))) as conn_raw:
             conn_raw.execute(
                 "UPDATE secrets SET kek_version = ? WHERE name = 'API_KEY'",
                 (corrupted_val,),
@@ -1753,7 +1754,7 @@ class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):
     def _insert_secret_with_corrupt_kek_version(self, corrupt_value: str) -> None:
         """Insère une ligne avec une kek_version TEXT injectée directement en SQL."""
         # Insertion directe contournant validate_kek_version pour simuler une corruption.
-        with sqlite3.connect(str(self.db_path)) as conn_raw:
+        with closing(sqlite3.connect(str(self.db_path))) as conn_raw:
             conn_raw.row_factory = sqlite3.Row
             conn_raw.execute("PRAGMA foreign_keys = ON")
             conn_raw.execute("INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p','2026')")
@@ -1828,7 +1829,7 @@ class RotateSecretsKekCorruptedVersionTests(unittest.TestCase):
 
     def test_corrupted_real_kek_version_raises_generic_error(self) -> None:
         """rotate_secrets_kek lève ValueError sur kek_version REAL (1.5) sans reflet (#71 LOW 2)."""
-        with sqlite3.connect(str(self.db_path)) as conn_raw:
+        with closing(sqlite3.connect(str(self.db_path))) as conn_raw:
             conn_raw.execute("INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p', '2026')")
             aad = VaultCipher.aad("p", "dev", "BAD_REAL")
             envelope = self.old_cipher.encrypt_envelope(b"val", aad=aad)
@@ -1910,7 +1911,7 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
             db_path = Path(tmp) / "vault.db"
             init_db(db_path)
             corrupt_val = "<injected-corrupted-version>"
-            with sqlite3.connect(str(db_path)) as conn_raw:
+            with closing(sqlite3.connect(str(db_path))) as conn_raw:
                 conn_raw.execute(
                     "INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p','2026')"
                 )
@@ -1936,7 +1937,7 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="heimdall-detect-real-") as tmp:
             db_path = Path(tmp) / "vault.db"
             init_db(db_path)
-            with sqlite3.connect(str(db_path)) as conn_raw:
+            with closing(sqlite3.connect(str(db_path))) as conn_raw:
                 conn_raw.execute(
                     "INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p', '2026')"
                 )
@@ -1966,7 +1967,7 @@ class SqliteStoreDetectKekVersionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="heimdall-detect-oversized-") as tmp:
             db_path = Path(tmp) / "vault.db"
             init_db(db_path)
-            with sqlite3.connect(str(db_path)) as conn_raw:
+            with closing(sqlite3.connect(str(db_path))) as conn_raw:
                 conn_raw.execute(
                     "INSERT OR IGNORE INTO projects (id, created_at) VALUES ('p', '2026')"
                 )
