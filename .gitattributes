@@ -1,0 +1,7 @@
+# Keep the archived JUnit bytes stable for SHA-256 verification on every OS.
+/docs/acceptance/junit.xml text eol=lf
+
+# Le test `tests/js/minimatch-shim.test.js` fige le sha256 des octets bruts de
+# `vendor/minimatch-cjs/` : un checkout CRLF (Windows, core.autocrlf=true)
+# casserait l'empreinte alors que la CI est Linux. On fige LF pour ce dossier.
+vendor/minimatch-cjs/* text eol=lf

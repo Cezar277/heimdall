@@ -1,0 +1,19 @@
+Validation locale : 2026-11-04 (Debian/WSL)
+Commande : python3 docs/acceptance/recount_junit.py
+OK: 2211 passed, 16 skipped; 46 modules, 19 groups; SHA-256 verified
+Exit code: 0
+
+Commande : python3 docs/acceptance/test_recount_junit.py
+test_24_invalid_metadata_and_paths_before_xml_read (__main__.RecountChecks.test_24_invalid_metadata_and_paths_before_xml_read) ... ok
+test_hash_mismatch_before_xml_parse (__main__.RecountChecks.test_hash_mismatch_before_xml_parse) ... ok
+test_invalid_classname (__main__.RecountChecks.test_invalid_classname) ... ok
+test_invalid_group_fields (__main__.RecountChecks.test_invalid_group_fields) ... ok
+test_invalid_group_object (__main__.RecountChecks.test_invalid_group_object) ... ok
+test_invalid_suite_tests (__main__.RecountChecks.test_invalid_suite_tests) ... ok
+test_valid_archive (__main__.RecountChecks.test_valid_archive) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.170s
+
+OK
+Exit code: 0

@@ -1,0 +1,11 @@
+# Le shim vendor/minimatch-cjs est consommé via une dépendance `file:` :
+# npm ci ne vérifie pas son contenu par un hash registre. Toute modification
+# exige donc une revue explicite.
+# La règle « Require review from Code Owners » est portée par le ruleset
+# GitHub `Protection Main` (`require_code_owner_review: true`), pas par
+# Settings > Branches (la protection classique n'est pas utilisée ici).
+# Le mainteneur ne pouvant pas approuver sa propre PR, d'autres code owners
+# sont listés pour que la règle reste satisfiable.
+# Gardes fonctionnelles complémentaires : tests/js/minimatch-shim.test.js
+# (allowlist des exports + sha256 du shim).
+/vendor/ @Cezar277 @erwan-blanchet @estelle-bsr @NW03

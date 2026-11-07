@@ -211,6 +211,7 @@ heimdall/            paquet unique (#17)
     interface.py     cible (diff indexé ou fichier) + scan(cible) -> list[Finding] (#53)
     finding.py       sortie Finding conforme au schéma #14 par construction (#53)
     exclusions.py    périmètre et politique de contenu (#22 / #59)
+    gitignore.py     exclusions Git sûres : non suivies + ignorées (#59)
     detect.py        parcours confiné d'une racine + rapport de scan (#22 / #59)
   mcp/               serveur MCP stdio, 4 outils lecture seule (#27, contrat #16)
     prompts/         prompt système versionné du trieur (qualify_v1, #80)
@@ -324,6 +325,27 @@ prouve l'absence de connexion sur ce chemin opérationnel.
   sélectionnable après le premier run qui le publie (une approbation ou un
   `/ci`). Pas de force-push. Ne pas exiger `Vault contract` : ses filtres de
   chemins le laisseraient « en attente » sur les PR sans fichiers de contrat.
+- **Merge réservé au mainteneur** : ruleset `Merge réservé au mainteneur`
+  (cible `~DEFAULT_BRANCH`) avec la seule règle *Restrict updates* et
+  `Cezar277` comme unique acteur de contournement. Conséquence : **seul le
+  mainteneur peut mettre à jour `main`**, donc seul il peut merger — un auteur
+  de PR ne peut plus merger la sienne, même après approbation, et le bouton
+  *Merge* reste bloqué pour tous les autres collaborateurs. Le contournement
+  étant limité à ce ruleset, `Protection Main` (PR + approbation + checks)
+  continue de s'appliquer au mainteneur. Recréation (idempotente, à rejouer si
+  le ruleset est supprimé) :
+
+  ```bash
+  gh api -X POST repos/Cezar277/heimdall/rulesets --input - <<'JSON'
+  {"name":"Merge réservé au mainteneur","target":"branch","enforcement":"active",
+   "conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},
+   "rules":[{"type":"update"}],
+   "bypass_actors":[{"actor_id":82095388,"actor_type":"User","bypass_mode":"always"}]}
+  JSON
+  ```
+
+  Rappel : ce ruleset ne remplace pas la revue humaine — il empêche seulement
+  l'auteur de merger sa propre PR.
 - **Actions** (Settings > Actions > General) : garder l'approbation requise
   pour les workflows déclenchés depuis un fork (« Require approval for all
   outside collaborators »). **Exigence bloquante** — le runner `self-hosted`
@@ -340,6 +362,11 @@ prouve l'absence de connexion sur ce chemin opérationnel.
   ré-approuver) pour re-signaler le check. À n'activer que si nécessaire.
 
 ## Vérifier
+
+Consolidation T42 : [SAMM v1 et preuves datées](docs/samm-v1.md),
+[matrice d'acceptation fonctionnelle et de sécurité](docs/Functional_and_security_Acceptance_Testing_Case.md)
+et [résultats d'exécution](docs/t42-validation.md). Les résultats distinguent
+les tests de régression réussis des critères produit encore non satisfaits.
 
 Corpus d'acceptation T21 : [34 cas synthétiques et mesure précision/rappel](tests/fixtures/trap_repo/README.md).
 Exécuter `python -m pytest tests/test_trap_acceptance.py -s -rx` ; la CLI
