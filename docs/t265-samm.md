@@ -10,7 +10,7 @@ les `repr()`.
 ## 1. Exigences du ticket et preuves
 
 > **Permaliens** : les liens ci-dessous sont épinglés à la révision du code
-> [`16a609f`](https://github.com/Cezar277/heimdall/commit/16a609f7e6f6bf72dbed7498449182ffee5190ba),
+> [`64c7379`](https://github.com/Cezar277/heimdall/commit/64c7379429bd47c2c64c7e59f00e956e4fd70cc7),
 > qui contient le test de chasse et le `__repr__` expurgé du registre. Cette
 > fiche est le commit suivant : elle ne modifie que de la documentation. Les
 > permaliens épinglent la révision du code, pas le commit de documentation.
@@ -48,15 +48,18 @@ la KEK dans l'intégralité des enregistrements de logs.
 `heimdall/vault/*.py` et `heimdall/cli/vault_keys.py` et refuse tout appel de
 log (`logger.*`, `log.*`, `logging.*`, `getLogger(...).*`) qui référence une
 variable sensible dans ses arguments **ou ses keywords** (`extra=`, `exc_info=`,
-etc.). La détection est conservatrice par sous-chaîne (`secret`, `plaintext`,
-`password`, `private_key`, `master_key`, `master`, `api_key`, `raw_key`,
-`pepper`, `kek`, `dek`, `salt`, `seed`, `token`, `value`), avec une allowlist
-pour les métadonnées (`kek_version`, `new_version`, `current_max`) et les blobs
-chiffrés (`encrypted_value`). `encrypted_dek` reste marqué sensible par défense
-en profondeur. Un test négatif
+etc.), y compris via un **accès attribut** (`registry._pepper`,
+`settings.master_key`, `cipher._key`) ou un **subscript `model_dump()`**
+(`settings.model_dump()["master_key"]`). La détection est conservatrice par
+sous-chaîne (`secret`, `plaintext`, `password`, `private_key`, `master_key`,
+`master`, `api_key`, `raw_key`, `pepper`, `kek`, `dek`, `salt`, `seed`, `token`,
+`value`), avec une allowlist pour les métadonnées (`kek_version`, `new_version`,
+`current_max`) et les blobs chiffrés (`encrypted_value`). `encrypted_dek` reste
+marqué sensible par défense en profondeur. Un test négatif
 (`test_static_logging_guard_detects_known_violations`) prouve que la garde
-détecte bien les quatre formes : argument direct, `extra=`, alias `log` et
-`getLogger(...).info`.
+détecte les huit formes testées : argument direct, `extra=`, alias `log`,
+`getLogger(...).info`, `registry._pepper`, `settings.master_key`, `cipher._key`
+et `settings.model_dump()["master_key"]`.
 
 ## 4. Résultats locaux
 
