@@ -4,7 +4,7 @@ Périmètre : ticket #60 « Tests unitaires et mesure sur le jeu piège », sous
 
 Cette PR est **strictement documentaire** : elle n'ajoute ni ne modifie aucun test. Les tests cités ci-dessous pré-existent sur `main` et ont été livrés par les PR #54 (registre de signatures) et #21 (corpus piège, mesure et acceptation) ; ils sont référencés ici comme preuve, pas comme livraison du ticket #60.
 
-Révision du code testé : `981e404ae844cace1f470549501d81018c94e809` (tête de `main`, merge PR #190, incluant #59 — PR #202). Les couples module + ligne ci-dessous sont vérifiés à cette révision ; pour un lien permanent, utiliser `blob/981e404ae844cace1f470549501d81018c94e809/<chemin>#L<début>-L<fin>`.
+Révision du code testé : `981e404ae844cace1f470549501d81018c94e809` (tête de `main`, merge PR #190). Les couples module + ligne ci-dessous sont vérifiés à cette révision ; pour un lien permanent, utiliser `blob/981e404ae844cace1f470549501d81018c94e809/<chemin>#L<début>-L<fin>`.
 
 ## 1. Exigences vérifiées
 
