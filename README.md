@@ -363,6 +363,11 @@ prouve l'absence de connexion sur ce chemin opérationnel.
 
 ## Vérifier
 
+Consolidation T42 : [SAMM v1 et preuves datées](docs/samm-v1.md),
+[matrice d'acceptation fonctionnelle et de sécurité](docs/Functional_and_security_Acceptance_Testing_Case.md)
+et [résultats d'exécution](docs/t42-validation.md). Les résultats distinguent
+les tests de régression réussis des critères produit encore non satisfaits.
+
 Corpus d'acceptation T21 : [34 cas synthétiques et mesure précision/rappel](tests/fixtures/trap_repo/README.md).
 Exécuter `python -m pytest tests/test_trap_acceptance.py -s -rx` ; la CLI
 `heimdall scan` (#29) est branchée sur ce scanner — voir
