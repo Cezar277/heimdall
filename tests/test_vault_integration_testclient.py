@@ -44,6 +44,7 @@ Preuves SAMM : module + ligne (voir `docs/t255-samm.md`).
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -289,7 +290,7 @@ class VaultNominalFlowTests(VaultIntegrationTestCase):
         raw_database = self.db_path.read_bytes()
         self.assertNotIn(_TEST_VALUE.encode("utf-8"), raw_database)
         # La ligne existe bien et n'est pas vide : le secret est stocké, chiffré.
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection:
             rows = connection.execute(
                 "SELECT encrypted_value, status FROM secrets WHERE project_id = ? AND name = ?",
                 (_PROJECT, _NAME),
@@ -356,7 +357,7 @@ class VaultInvalidApiKeyTests(VaultIntegrationTestCase):
         response = self._create_secret(generate_api_key())
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json(), _UNAUTHORIZED_BODY)
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection:
             count = connection.execute("SELECT COUNT(*) FROM secrets").fetchone()[0]
         self.assertEqual(count, 0)
 
@@ -408,7 +409,7 @@ class VaultCrossProjectAccessTests(VaultIntegrationTestCase):
         )
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json(), _FORBIDDEN_BODY)
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection:
             count = connection.execute("SELECT COUNT(*) FROM secrets").fetchone()[0]
         self.assertEqual(count, 0)
 
