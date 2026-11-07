@@ -10,7 +10,7 @@ les `repr()`.
 ## 1. Exigences du ticket et preuves
 
 > **Permaliens** : les liens ci-dessous sont épinglés à la révision du code
-> [`64c7379`](https://github.com/Cezar277/heimdall/commit/64c7379429bd47c2c64c7e59f00e956e4fd70cc7),
+> [`13a58bb`](https://github.com/Cezar277/heimdall/commit/13a58bb662d301d543e1e7cbd02ac166f19623a1),
 > qui contient le test de chasse et le `__repr__` expurgé du registre. Cette
 > fiche est le commit suivant : elle ne modifie que de la documentation. Les
 > permaliens épinglent la révision du code, pas le commit de documentation.
@@ -46,20 +46,25 @@ la KEK dans l'intégralité des enregistrements de logs.
 
 `test_static_logging_calls_do_not_reference_sensitive_names` parse l'AST de
 `heimdall/vault/*.py` et `heimdall/cli/vault_keys.py` et refuse tout appel de
-log (`logger.*`, `log.*`, `logging.*`, `getLogger(...).*`) qui référence une
-variable sensible dans ses arguments **ou ses keywords** (`extra=`, `exc_info=`,
-etc.), y compris via un **accès attribut** (`registry._pepper`,
-`settings.master_key`, `cipher._key`) ou un **subscript `model_dump()`**
-(`settings.model_dump()["master_key"]`). La détection est conservatrice par
-sous-chaîne (`secret`, `plaintext`, `password`, `private_key`, `master_key`,
-`master`, `api_key`, `raw_key`, `pepper`, `kek`, `dek`, `salt`, `seed`, `token`,
-`value`), avec une allowlist pour les métadonnées (`kek_version`, `new_version`,
-`current_max`) et les blobs chiffrés (`encrypted_value`). `encrypted_dek` reste
-marqué sensible par défense en profondeur. Un test négatif
+log (`logger.*`, `log.*`, `logging.*`, `getLogger(...).*`), `print(...)` et
+`raise ...` qui référence une variable sensible dans ses arguments **ou ses
+keywords** (`extra=`, `exc_info=`, etc.), y compris via un **accès attribut**
+(`registry._pepper`, `settings.master_key`, `cipher._key`, `cipher.key`) ou un
+**subscript `model_dump()`** (`settings.model_dump()["master_key"]`). La
+détection est conservatrice par sous-chaîne (`secret`, `plaintext`, `password`,
+`private_key`, `master_key`, `master`, `api_key`, `raw_key`, `pepper`, `kek`,
+`dek`, `salt`, `seed`, `token`, `value`, `key`), avec une allowlist pour les
+métadonnées et constantes publiques (`kek_version`, `new_version`,
+`current_max`, `key_id`, `key_hash`, `env_master`, `env_salt`, …) et les blobs
+chiffrés (`encrypted_value`). Les noms de classes d'exception (`ValueError`,
+`VaultCipherError`, …) et les constantes `UPPER_CASE` sont ignorés pour éviter
+les faux positifs. `encrypted_dek` reste marqué sensible par défense en
+profondeur. Un test négatif
 (`test_static_logging_guard_detects_known_violations`) prouve que la garde
-détecte les huit formes testées : argument direct, `extra=`, alias `log`,
-`getLogger(...).info`, `registry._pepper`, `settings.master_key`, `cipher._key`
-et `settings.model_dump()["master_key"]`.
+détecte les douze formes testées : argument direct, `extra=`, alias `log`,
+`getLogger(...).info`, `registry._pepper`, `settings.master_key`, `cipher._key`,
+`settings.model_dump()["master_key"]`, `key` nu, `cipher.key`, `print(...)` et
+`raise ValueError(f"…{secret_value}…")`.
 
 ## 4. Résultats locaux
 
