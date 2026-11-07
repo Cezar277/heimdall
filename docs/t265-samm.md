@@ -10,7 +10,7 @@ les `repr()`.
 ## 1. Exigences du ticket et preuves
 
 > **Permaliens** : les liens ci-dessous sont épinglés à la révision du code
-> [`7360627`](https://github.com/Cezar277/heimdall/commit/73606274af9b0cd2c9d058b88c764eed0d6a48ce),
+> [`cd0d505`](https://github.com/Cezar277/heimdall/commit/cd0d50519b038aa3175348f25f83604bdc409fff),
 > qui contient le test de chasse et le `__repr__` expurgé du registre. Cette
 > fiche est le commit suivant : elle ne modifie que de la documentation. Les
 > permaliens épinglent la révision du code, pas le commit de documentation.
@@ -68,16 +68,19 @@ profondeur. Le seul `echo` autorisé est l'affichage volontaire de la clé brute
 par `vault key create` (`typer.echo(issued.raw_key)`), explicitement allowlisté.
 Un test négatif
 (`test_static_logging_guard_detects_known_violations`) prouve que la garde
-détecte les vingt-cinq formes testées : argument direct, `extra=`, alias `log`,
+détecte les vingt-sept formes testées : argument direct, `extra=`, alias `log`,
 `getLogger(...).info`, `registry._pepper`, `settings.master_key`, `cipher._key`,
 `settings.model_dump()["master_key"]`, `key` nu, `cipher.key`, `print(...)`,
 `raise ValueError(f"…{secret_value}…")`, `raise … from secret_exc` (cause
 inspectée), les objets porteurs loggés entiers (`settings`, `cipher`,
 `registry`, `client`, `issued`), `locals()`, `typer.echo(secret_value)`,
 `settings.model_dump()`, `settings.model_dump_json()`, `settings.__dict__`,
-`secret_value.hex()` (receveur d'appel) et `data[secret_value]` (indice de
-subscript). Les formes sûres (`typer.echo(issued.raw_key)`, `settings.db_path`,
-`issued.key_id`, `typer.echo(f"…{issued.key_id}…")`) ne sont pas signalées.
+`secret_value.hex()` (receveur d'appel), `data[secret_value]` (indice de
+subscript), `registry.active_hashes` (base d'attribut) et `d["master_key"]`
+(indice littéral). Les formes sûres (`typer.echo(issued.raw_key)`,
+`settings.db_path`, `settings.host`, `client._base_url`, `issued.key_id`,
+`typer.echo(f"…{issued.key_id}…")`) sont explicitement allowlistées par
+`_SAFE_ATTRIBUTES` et ne sont pas signalées.
 
 ## 4. Résultats locaux
 
@@ -107,3 +110,11 @@ Environnement : Linux, Python 3.13, venv du dépôt.
 - La clé brute émise par `heimdall vault key create` est volontairement affichée
   **une seule fois sur stdout** ; elle n'est ni journalisée ni persistée en
   clair (seul son HMAC est en base).
+- La garde statique est **lexicale** (noms, attributs, appels) : ce n'est pas une
+  analyse de taint. Un alias (`x = secret_value; logger.info(x)`) ou une valeur
+  construite dynamiquement peut passer ; la preuve de référence reste le test
+  runtime qui grep les canaris. La garde est un filet anti-faute-de-frappe.
+- `ApiKeyEntry.key_hash` est un HMAC-SHA256 non réversible sans le pepper ; ce
+  n'est pas une clé brute. Le code actuel ne le journalise pas ;
+  `repr(list_entries())` l'expose mais le test vérifie l'absence de `raw_key`.
+  À traiter en suivi si la fuite du pepper entre dans le modèle de menace.
