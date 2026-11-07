@@ -181,8 +181,12 @@ def _static_logging_violations(paths: list[Path]) -> list[str]:
                         violations.append(
                             f"{path.name}:{node.lineno}: {label} référence {name!r}"
                         )
-            elif isinstance(node, ast.Raise) and node.exc is not None:
-                name = _sensitive_reference(node.exc)
+            elif isinstance(node, ast.Raise) and (
+                node.exc is not None or node.cause is not None
+            ):
+                name = _sensitive_reference(node.exc) if node.exc is not None else None
+                if name is None and node.cause is not None:
+                    name = _sensitive_reference(node.cause)
                 if name is not None:
                     violations.append(
                         f"{path.name}:{node.lineno}: raise référence {name!r}"
@@ -407,11 +411,12 @@ class VaultKeyLeakHuntTests(unittest.TestCase):
                 "logger.info(cipher)\n"
                 "logger.info(registry)\n"
                 "logger.info(client)\n"
-                "logger.info(issued)\n",
+                "logger.info(issued)\n"
+                "raise ValueError('x') from secret_exc\n",
                 encoding="utf-8",
             )
             violations = _static_logging_violations([path])
-        self.assertEqual(len(violations), 17)
+        self.assertEqual(len(violations), 18)
 
 
 if __name__ == "__main__":
