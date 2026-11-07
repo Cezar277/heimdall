@@ -1,5 +1,43 @@
 # Vault API v1 — contrat OpenAPI
 
+## Gestion de capacité et pagination (#158)
+
+`GET /api/v1/secrets?project=demo&limit=50&offset=0` retourne
+`{"items": [...], "next_offset": 50}`. La clé doit appartenir au projet demandé.
+Chaque élément contient exclusivement `project`, `env`, `name`, `status` :
+aucune valeur, empreinte, DEK ou donnée chiffrée n'est chargée pour le listage.
+`limit` vaut 50 par défaut et accepte 1 à 100 ; `offset` vaut 0 par défaut et
+accepte 0 à 1 000 000. Les paramètres invalides retournent 400.
+L'ordre est lexicographique ASCII par `env`, puis `name`. `next_offset` vaut
+`null` sur la dernière page, y compris une page vide. La pagination par offset
+ne garantit pas un instantané entre requêtes si des créations/suppressions
+concurrentes modifient la collection.
+
+`DELETE /api/v1/secrets/{project}/{env}/{name}` vérifie l'accès au projet avant
+toute recherche, supprime sans déchiffrer et retourne **204 sans corps** avec
+`Cache-Control: no-store`, comme le listage. Une ressource absente (ou déjà
+supprimée) retourne 404 ; une clé absente/invalide retourne 401 et une clé
+d'un autre projet retourne 403, que le secret existe ou non.
+La suppression libère les quotas global et par projet, également entre workers
+SQLite. Un doublon reste 409, même lorsque le quota est atteint.
+
+Le **429 de capacité** de POST conserve `Retry-After: 60` pour le contrat ;
+attendre ne libère pas de capacité. Lister puis supprimer un secret permet de
+recréer avec **201**. Le **429 de débit** est transitoire : son `Retry-After`
+indique le temps restant de la fenêtre du limiteur (1 à 3600 secondes).
+DELETE et le listage sont soumis à ce même limiteur de débit.
+
+Preuves : `tests/test_vault_capacity.py` (deux backends, quota libéré,
+pagination bornée, canari absent, autorisation avant stockage et visibilité
+inter-workers) ; `tests/contracts/test_vault_openapi.py` (contrat indépendant)
+et `tests/test_vault_integration_testclient.py` (schéma runtime).
+
+| Garantie | Implémentation | Preuve automatisée |
+| --- | --- | --- |
+| Autorisation avant accès au stockage | `heimdall/vault/app.py:1384`, `heimdall/vault/app.py:1412` | `tests/test_vault_capacity.py:130` |
+| Libération atomique des quotas | `heimdall/vault/store.py:200`, `heimdall/vault/store.py:478` | `tests/test_vault_capacity.py:58`, `tests/test_vault_capacity.py:144` |
+| Pagination bornée et absence de valeur | `heimdall/vault/database.py:1376`, `heimdall/vault/app.py:1384` | `tests/test_vault_capacity.py:75`, `tests/test_vault_capacity.py:115` |
+
 Ticket #15 · Porteur : C · Relecteur : A · Estimation : 6 h.
 
 Source contract-first : [openapi.yaml](../../openapi.yaml), OpenAPI 3.1.0.

@@ -74,12 +74,13 @@ import os
 import re
 import unicodedata
 from functools import lru_cache
+from http import HTTPStatus
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, Literal
 
 import uvicorn
-from fastapi import Depends, FastAPI, Response
+from fastapi import Depends, FastAPI, Query, Response
 from fastapi import Path as FastApiPath
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -456,6 +457,14 @@ class SecretRead(SecretMetadata):
     value: SecretValue
 
 
+class SecretPage(BaseModel):
+    """Page de métadonnées publiques, sans valeur ni empreinte de secret."""
+
+    model_config = ConfigDict(extra="forbid")
+    items: list[SecretMetadata] = Field(max_length=100)
+    next_offset: int | None = Field(ge=0)
+
+
 _MAX_RETRY_AFTER_SECONDS: int = 3600
 
 _RETRY_AFTER_HEADER = {
@@ -553,6 +562,17 @@ _SECRETS_STATE_RESPONSES: dict[int | str, dict[str, Any]] = {
         "description": "Métadonnées courantes, sans la valeur (état seul).",
         "headers": _NO_STORE_HEADER,
     },
+}
+
+
+_SECRETS_LIST_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **{key: value for key, value in _SECRETS_GET_RESPONSES.items() if key != HTTPStatus.NOT_FOUND},
+    200: {"model": SecretPage, "headers": _NO_STORE_HEADER, "description": "Page de métadonnées"},
+}
+
+_SECRETS_DELETE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **{key: value for key, value in _SECRETS_GET_RESPONSES.items() if key != HTTPStatus.OK},
+    204: {"headers": _NO_STORE_HEADER, "description": "Secret supprimé, capacité libérée"},
 }
 
 
@@ -1353,6 +1373,52 @@ def _register_routes(app: FastAPI) -> None:
         """Santé minimale : répond 200 {'status': 'ok'} sans métadonnées sensibles."""
         return {"status": "ok"}
 
+    @app.get(
+        "/api/v1/secrets",
+        response_model=SecretPage,
+        responses=_SECRETS_LIST_RESPONSES,
+        tags=["Secrets"],
+        summary="Lister les métadonnées des secrets d'un projet",
+        operation_id="listSecrets",
+    )
+    async def list_secrets(
+        project: Annotated[ProjectId, Query()],
+        response: Response,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+        authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
+    ) -> SecretPage:
+        vault_auth.ensure_project_access(
+            authenticated_project, project, require_auth=app.state.settings.require_auth
+        )
+        response.headers["Cache-Control"] = "no-store"
+        store: InMemorySecretStore | SqliteSecretStore = app.state.secret_store
+        records = await store.list_page(project, limit + 1, offset)
+        return SecretPage(
+            items=[SecretMetadata.model_validate(record) for record in records[:limit]],
+            next_offset=offset + limit if len(records) > limit else None,
+        )
+
+    @app.delete(
+        "/api/v1/secrets/{project}/{env}/{name}",
+        status_code=204,
+        response_class=Response,
+        responses=_SECRETS_DELETE_RESPONSES,
+        tags=["Secrets"],
+        summary="Supprimer un secret et libérer sa capacité",
+        operation_id="deleteSecret",
+        dependencies=[Depends(vault_auth.require_project_access())],
+    )
+    async def delete_secret(
+        project: Annotated[ProjectId, FastApiPath()],
+        env: Annotated[EnvironmentId, FastApiPath()],
+        name: Annotated[SecretName, FastApiPath()],
+    ) -> Response:
+        store: InMemorySecretStore | SqliteSecretStore = app.state.secret_store
+        if not await store.delete(project, env, name):
+            raise StarletteHTTPException(status_code=404, detail="Ressource introuvable")
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
     @app.post(
         "/api/v1/secrets",
         response_model=SecretMetadata,
@@ -1396,10 +1462,8 @@ def _register_routes(app: FastAPI) -> None:
             # DÉBIT (rate-limit, lot #63), lui transitoire.
             # Le contrat OpenAPI impose `Retry-After` sur TOUT 429, donc
             # l'en-tête est présent même ici ; en revanche ce 429 n'est PAS
-            # transitoire : sans route DELETE dans le contrat #63, un retry
-            # (même après le délai annoncé) sera refusé tant que la capacité
-            # reste pleine. Le retry est donc INUTILE jusqu'à libération d'un
-            # emplacement (route DELETE + quotas par projet, TODO(#156)).
+            # transitoire : un retry sera refusé tant que la capacité reste
+            # pleine. Libérer un emplacement via DELETE (#158) avant de recréer.
             raise StarletteHTTPException(
                 status_code=429,
                 detail="Trop de requêtes",
@@ -1774,6 +1838,7 @@ __all__ = [
     "RateLimitedError",
     "SecretCreate",
     "SecretMetadata",
+    "SecretPage",
     "SecretRead",
     "Settings",
     "UnauthorizedError",

@@ -1373,6 +1373,18 @@ def list_secrets(
     return [dict(row) for row in cursor.fetchall()]
 
 
+def list_secret_page(
+    conn: sqlite3.Connection, project_id: str, limit: int, offset: int
+) -> list[dict[str, str]]:
+    """Lit une page de métadonnées publiques, sans charger les blobs chiffrés."""
+    rows = conn.execute(
+        "SELECT project_id AS project, env, name, status FROM secrets "
+        "WHERE project_id = ? ORDER BY env ASC, name ASC LIMIT ? OFFSET ?",
+        (project_id, limit, offset),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def count_secrets(conn: sqlite3.Connection, project_id: str | None = None) -> int:
     """Compte les secrets (globalement ou pour un projet), sans exposer de valeur."""
     if project_id is None:
