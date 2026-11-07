@@ -290,7 +290,7 @@ def _read_max_kek_version(conn: sqlite3.Connection) -> int | None:
             or raw_val < 1
             or raw_val > MAX_KEK_VERSION
         ):
-            raise RuntimeError(
+            raise KekVersionError(
                 "Impossible de lire la version KEK courante dans la base "
                 "(version corrompue ou invalide)."
             )
@@ -364,11 +364,10 @@ class SqliteSecretStore:
             with db_session(self._db_path) as conn:
                 max_v = _read_max_kek_version(conn)
                 return max_v if max_v is not None else 1
-        except (sqlite3.Error, OSError, DatabaseUnavailableError, RuntimeError) as exc:
-            # ``RuntimeError`` couvre le fail-closed de ``_read_max_kek_version``
+        except (sqlite3.Error, OSError, DatabaseUnavailableError, KekVersionError) as exc:
+            # ``KekVersionError`` couvre le fail-closed de ``_read_max_kek_version``
             # (REAL/TEXT/bool/>MAX) : re-wrap générique sans reflet, quel que soit
-            # le chemin d'erreur, pour que le contrat « exception unique » tienne
-            # même si un nouveau garde-fou lève un ``RuntimeError`` non générique.
+            # le chemin d'erreur, pour que le contrat « exception unique » tienne.
             raise RuntimeError(
                 "Impossible de lire la version KEK courante dans la base "
                 "(fail-closed pour éviter une sous-étiquetage silencieux)."

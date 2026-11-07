@@ -1437,7 +1437,10 @@ def update_secret(  # noqa: PLR0913
             return False
         raw_v = row["kek_version"]
         if raw_v is not None and (
-            not isinstance(raw_v, int) or isinstance(raw_v, bool) or raw_v < 1
+            not isinstance(raw_v, int)
+            or isinstance(raw_v, bool)
+            or raw_v < 1
+            or raw_v > MAX_KEK_VERSION
         ):
             raise KekVersionError("Version de KEK illisible en base.")
         current_v = raw_v if raw_v is not None else 1
@@ -1513,7 +1516,10 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
 
         raw_v = row["kek_version"]
         if raw_v is not None and (
-            not isinstance(raw_v, int) or isinstance(raw_v, bool) or raw_v < 1
+            not isinstance(raw_v, int)
+            or isinstance(raw_v, bool)
+            or raw_v < 1
+            or raw_v > MAX_KEK_VERSION
         ):
             raise KekVersionError("Version de KEK illisible en base.")
         current_v = raw_v if raw_v is not None else 1
