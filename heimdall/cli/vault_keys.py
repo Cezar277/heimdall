@@ -23,6 +23,7 @@ Codes de sortie (convention de la CLI) : 0 (succès), 1 (échec opérationnel),
 """
 
 import os
+import stat
 from pathlib import Path
 
 import typer
@@ -34,7 +35,16 @@ from heimdall.cli.vault_client import (
     vault_run,
 )
 from heimdall.vault import auth as vault_auth
-from heimdall.vault.database import init_db, resolve_db_path
+from heimdall.vault.crypto import VaultCipher, VaultCipherError
+from heimdall.vault.database import (
+    KekConcurrencyError,
+    KekVersionError,
+    db_session,
+    init_db,
+    resolve_db_path,
+    rotate_secrets_kek,
+    validate_kek_version,
+)
 
 key_app = typer.Typer(
     name="key",
@@ -88,6 +98,26 @@ def _resolve_db_path(db_path: Path | None) -> Path:
             "Chemin absolu requis (un chemin relatif dépend du répertoire courant)."
         )
     return resolved
+
+
+def _assert_regular_non_empty_db_file(path: Path) -> None:
+    """Refuse une base absente, vide, non régulière ou un lien symbolique.
+
+    Le test s'appuie sur ``lstat`` (jamais ``stat``) : un lien symbolique est
+    refusé sans être suivi, avant même la garde d'ouverture sécurisée de
+    ``db_session``. Le message reste générique et ne reflète jamais le chemin
+    (invariant 8).
+    """
+    try:
+        file_stat = os.lstat(path)
+    except OSError:
+        raise ValueError(
+            "la base de données Vault est introuvable ou vide. Vérifiez --db-path."
+        ) from None
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size == 0:
+        raise ValueError(
+            "la base de données Vault est introuvable ou vide. Vérifiez --db-path."
+        )
 
 
 def _explicit_pepper() -> str:
@@ -191,4 +221,140 @@ def revoke_key(
     typer.echo(f"Clé API {key_id} révoquée : elle n'authentifie plus aucune requête.")
 
 
-__all__ = ["key_app", "vault_app"]
+def _read_env_secret(var_name: str, label: str) -> str | None:
+    val = os.environ.get(var_name)
+    if val is not None and not val:
+        raise ValueError(
+            f"{label} manquante ou vide dans l'environnement ({var_name} ne peut pas être vide)."
+        )
+    return val
+
+
+def _resolve_cli_cipher(
+    *,
+    env_direct: str,
+    env_fallback: str | None,
+    env_master: str,
+    env_salt: str,
+    label: str,
+) -> VaultCipher:
+    """Résout un chiffreur VaultCipher depuis une clé directe ou une dérivation Argon2id."""
+    resolved_direct = _read_env_secret(env_direct, label)
+    if resolved_direct is None and env_fallback and env_fallback in os.environ:
+        resolved_direct = _read_env_secret(env_fallback, label)
+
+    raw_master = os.environ.get(env_master)
+    if raw_master is not None and not raw_master:
+        raise ValueError(f"La clé maîtresse pour {label} dans {env_master} ne peut pas être vide.")
+    resolved_master = raw_master
+
+    raw_salt = os.environ.get(env_salt)
+    if raw_salt is not None and not raw_salt:
+        raise ValueError(f"Le sel pour {label} dans {env_salt} ne peut pas être vide.")
+    resolved_salt = raw_salt
+
+    if resolved_direct and (resolved_master or resolved_salt):
+        raise ValueError(
+            f"Fournir une KEK directe OU une clé maîtresse avec sel pour {label}, pas les deux."
+        )
+    if resolved_direct:
+        try:
+            return VaultCipher.from_encoded_key(resolved_direct)
+        except Exception:
+            raise ValueError(f"{label} directe invalide (base64 attendu).") from None
+    if resolved_master and resolved_salt:
+        try:
+            return VaultCipher.from_master_key(resolved_master, resolved_salt)
+        except Exception:
+            raise ValueError(f"{label} dérivée invalide.") from None
+    if resolved_master or resolved_salt:
+        raise ValueError(f"Clé maîtresse ET sel obligatoires pour dériver {label}.")
+    raise ValueError(
+        f"{label} manquante dans l'environnement ({env_direct} ou {env_master}+{env_salt} requis)."
+    )
+
+
+@vault_app.command(
+    "rotate-kek",
+    help=(
+        "Effectue la rotation transactionnelle de la KEK sur tous les secrets (ticket #71).\n\n"
+        "RÈGLES DE SÉCURITÉ (invariant 9) :\n"
+        "Pour éviter toute fuite dans les arguments de processus ('ps') et l'historique shell,\n"
+        "les clés et phrases de passe sont lues EXCLUSIVEMENT depuis l'environnement :\n"
+        "- KEK directe : $HEIMDALL_VAULT_OLD_KEK (ou $HEIMDALL_VAULT_KEK) et\n"
+        "  $HEIMDALL_VAULT_NEW_KEK\n"
+        "- Dérivation Argon2id : $HEIMDALL_VAULT_OLD_MASTER_KEY + $HEIMDALL_VAULT_OLD_KEK_SALT et\n"
+        "  $HEIMDALL_VAULT_NEW_MASTER_KEY + $HEIMDALL_VAULT_NEW_KEK_SALT"
+    ),
+)
+def rotate_kek_command(
+    db_path: Path | None = _DB_PATH_OPTION,
+    target_version: int | None = typer.Option(
+        None,
+        "--target-version",
+        help="Version de KEK cible explicite (kek_version).",
+    ),
+) -> None:
+    """Effectue la rotation transactionnelle de la KEK sur tous les secrets (ticket #71)."""
+    try:
+        resolved = _resolve_db_path(db_path)
+        # Pré-contrôle sans suivi de lien symbolique (lstat), avant la garde
+        # d'ouverture sécurisée de db_session (invariant 8, fail-closed).
+        _assert_regular_non_empty_db_file(resolved)
+        old_cipher = _resolve_cli_cipher(
+            env_direct="HEIMDALL_VAULT_OLD_KEK",
+            env_fallback="HEIMDALL_VAULT_KEK",
+            env_master="HEIMDALL_VAULT_OLD_MASTER_KEY",
+            env_salt="HEIMDALL_VAULT_OLD_KEK_SALT",
+            label="l'ancienne KEK",
+        )
+        new_cipher = _resolve_cli_cipher(
+            env_direct="HEIMDALL_VAULT_NEW_KEK",
+            env_fallback=None,
+            env_master="HEIMDALL_VAULT_NEW_MASTER_KEY",
+            env_salt="HEIMDALL_VAULT_NEW_KEK_SALT",
+            label="la nouvelle KEK",
+        )
+        if old_cipher.has_same_key_as(new_cipher):
+            raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
+        if target_version is not None:
+            validate_kek_version(target_version, label="Le numéro de version cible")
+    except ValueError as exc:
+        typer.echo(f"Erreur : {exc}", err=True)
+        raise typer.Exit(code=2) from None
+
+    try:
+        with db_session(resolved) as conn:
+            count, _ = rotate_secrets_kek(
+                conn,
+                old_cipher,
+                new_cipher,
+                target_kek_version=target_version,
+            )
+    except VaultCipherError:
+        typer.echo("Erreur : échec du déchiffrement avec l'ancienne KEK.", err=True)
+        raise typer.Exit(code=1) from None
+    except (KekVersionError, KekConcurrencyError):
+        typer.echo("Erreur : base de données corrompue ou invalide.", err=True)
+        raise typer.Exit(code=1) from None
+    except ValueError as exc:
+        typer.echo(f"Erreur : {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    except Exception:
+        typer.echo("Erreur : échec de la rotation de la KEK.", err=True)
+        raise typer.Exit(code=1) from None
+
+    if count == 0:
+        typer.echo(
+            "Erreur : aucun secret trouvé dans la base — vérifiez --db-path.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Rotation de la KEK réussie : {count} secret(s) réenveloppé(s).")
+
+
+vault_app.command("kek-rotate", hidden=True)(rotate_kek_command)
+
+
+__all__ = ["key_app", "rotate_kek_command", "vault_app"]

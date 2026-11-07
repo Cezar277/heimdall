@@ -499,9 +499,13 @@ class VaultCipher:
     - L'empreinte d'intégrité (``fingerprint``) utilise une sous-clé HKDF-SHA256
       dédiée et lie la valeur au triplet : la KEK n'est jamais réutilisée comme
       clé HMAC (invariant 5) et deux valeurs égales sous des triplets distincts
-      ne sont pas corrélables par un lecteur de la seule base. L'empreinte est
-      auxiliaire : une rotation de KEK la rend obsolète (recalcul après
-      déchiffrement), jamais une perte de secret.
+      ne sont pas corrélables par un lecteur de la seule base. Empreinte
+      **auxiliaire pré-rotation** (#71) : la rotation de KEK par enveloppe ne
+      touche jamais aux valeurs, elle reste donc volontairement inchangée et
+      **n'est jamais vérifiée en lecture** — elle ne doit pas servir de contrôle
+      d'intégrité post-rotation (c'est le déchiffrement GCM, lui, qui détecte
+      toute altération). Recalculer cette empreinte supposerait de déchiffrer la
+      valeur, ce que la rotation interdit explicitement.
     """
 
     def __init__(self, key: bytes) -> None:
@@ -646,6 +650,34 @@ class VaultCipher:
             raise VaultCipherError("DEK déchiffrée invalide.")
         return dek
 
+    def rewrap_dek(
+        self,
+        new_cipher: "VaultCipher",
+        encrypted_dek: str,
+        *,
+        aad: bytes = b"",
+    ) -> str:
+        """Déchiffre une DEK avec cette KEK et la rechiffre avec ``new_cipher`` (#71).
+
+        La DEK transitoire est conservée dans un ``bytearray`` effacé dès la fin
+        de l'opération. L'effacement mémoire est best-effort (CPython ne garantit
+        pas l'absence de copies d'objets bytes immuables transitoires créés lors
+        du déchiffrement). L'AAD est préservé.
+        """
+        if not isinstance(new_cipher, VaultCipher):
+            raise TypeError("new_cipher doit être une instance de VaultCipher.")
+        dek = bytearray(self.unwrap_dek(encrypted_dek, aad=aad))
+        try:
+            return new_cipher.wrap_dek(dek, aad=aad)
+        finally:
+            dek[:] = b"\x00" * len(dek)
+
+    def has_same_key_as(self, other: object) -> bool:
+        """Indique si deux chiffreurs utilisent la même KEK sous-jacente."""
+        if not isinstance(other, VaultCipher):
+            return False
+        return constant_time_equal(self._key, other._key)
+
     def encrypt_envelope(self, plaintext: bytes, *, aad: bytes = b"") -> SecretEnvelope:
         """Chiffre une valeur par enveloppe : DEK neuve, puis DEK chiffrée par la KEK.
 
@@ -686,8 +718,14 @@ class VaultCipher:
         l'AAD ``(project, env, name)`` au message : deux valeurs identiques
         stockées sous des triplets distincts produisent des empreintes
         distinctes, donc non corrélables depuis la seule base. Déterministe pour
-        un même ``(KEK, aad, valeur)`` ; auxiliaire, recalculable après une
-        rotation de KEK.
+        un même ``(KEK, aad, valeur)``.
+
+        Note d'architecture (#71) : cette empreinte est un auxiliaire pré-rotation
+        calculé lors de l'insertion initiale. Lors d'une rotation de KEK par
+        enveloppe (#71), seules les DEK sont réenveloppées ; les valeurs ne sont
+        jamais déchiffrées en mémoire, préservant le secret absolu des données.
+        L'empreinte reste donc volontairement inchangée et ne doit pas servir de
+        contrôle d'intégrité post-rotation.
         """
         message = bytes(aad) + b"\x00" + bytes(plaintext)
         return hmac.new(self._fingerprint_key, message, hashlib.sha256).hexdigest()

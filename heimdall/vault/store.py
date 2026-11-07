@@ -31,6 +31,8 @@ destructive n'est nécessaire.
 """
 
 import asyncio
+import copy
+import logging
 import sqlite3
 import unicodedata
 from pathlib import Path
@@ -38,14 +40,21 @@ from typing import Any
 
 from heimdall.vault.crypto import VaultCipher, VaultCipherError
 from heimdall.vault.database import (
+    MAX_KEK_VERSION,
+    DatabaseUnavailableError,
+    KekVersionError,
     count_secrets,
     create_secret,
     delete_all_secrets,
     ensure_project,
     get_secret,
     init_db,
+    rotate_secrets_kek,
+    validate_kek_version,
 )
 from heimdall.vault.database import runtime_db_session as db_session
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_SECRETS: int = 10_000
 _DEFAULT_MAX_SECRETS_PER_PROJECT: int = 1_000
@@ -127,12 +136,18 @@ class InMemorySecretStore:
         *,
         cipher: VaultCipher | None = None,
     ) -> None:
-        self._secrets: dict[tuple[str, str, str], dict[str, str]] = {}
+        self._secrets: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._project_counts: dict[str, int] = {}
         self._lock = asyncio.Lock()
         self._max_secrets = max_secrets
         self._max_secrets_per_project = max_secrets_per_project
         self._cipher = cipher if cipher is not None else VaultCipher.generate()
+        self._kek_version: int = 1
+
+    @property
+    def kek_version(self) -> int:
+        """Numéro de version courant de la KEK gérée par ce store."""
+        return self._kek_version
 
     async def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
         async with self._lock:
@@ -168,6 +183,7 @@ class InMemorySecretStore:
                 "status": "vaulte",
                 "encrypted_value": envelope.encrypted_value,
                 "encrypted_dek": envelope.encrypted_dek,
+                "kek_version": self._kek_version,
             }
             self._secrets[key] = record
             self._project_counts[project] = project_count + 1
@@ -184,6 +200,102 @@ class InMemorySecretStore:
         async with self._lock:
             self._secrets.clear()
             self._project_counts.clear()
+
+    async def rotate_kek(
+        self,
+        new_cipher: VaultCipher,
+        *,
+        old_cipher: VaultCipher | None = None,
+        target_kek_version: int | None = None,
+    ) -> int:
+        """Effectue la rotation atomique de la KEK en mémoire (ticket #71)."""
+        active_old = old_cipher or self._cipher
+        if active_old.has_same_key_as(new_cipher):
+            raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
+        if target_kek_version is not None:
+            validate_kek_version(target_kek_version, label="Numéro de version cible")
+
+        async with self._lock:
+            if not self._secrets:
+                return 0
+            for r in self._secrets.values():
+                v = r.get("kek_version")
+                if v is not None and (
+                    not isinstance(v, int) or isinstance(v, bool) or v < 1 or v > MAX_KEK_VERSION
+                ):
+                    raise KekVersionError("Version de KEK illisible.")
+
+            current_max = max(
+                (
+                    r["kek_version"]
+                    if r.get("kek_version") is not None
+                    else 1
+                    for r in self._secrets.values()
+                ),
+                default=1,
+            )
+            if target_kek_version is not None:
+                if target_kek_version <= current_max:
+                    raise ValueError(
+                        "Le numéro de version cible doit être strictement supérieur "
+                    "à la version actuelle."
+                    )
+                new_version = target_kek_version
+            else:
+                # Fail-closed : l'auto-incrément reste borné à l'INTEGER 64 bits.
+                # Limite système, pas une erreur d'usage : KekVersionError => exit 1.
+                try:
+                    new_version = validate_kek_version(current_max + 1)
+                except ValueError:
+                    raise KekVersionError("Version de KEK maximale atteinte en base.") from None
+
+            # Invariant d'atomicité : backup profond pour garantir que self._secrets
+            # est restauré intact même en cas de mutation in-place (#71 LOW 4).
+            backup = copy.deepcopy(self._secrets)
+            # État cipher/version précédent : une interruption entre les deux
+            # affectations de sortie laisserait un cipher neuf avec des DEK
+            # anciennes (store illisible) — on restaure le couple complet (#71 LOW).
+            prev_cipher, prev_version = self._cipher, self._kek_version
+            try:
+                count = 0
+                for key, record in list(self._secrets.items()):
+                    enc_dek = record.get("encrypted_dek")
+                    if not enc_dek:
+                        raise VaultCipherError(
+                            "Rotation impossible : un secret sans enveloppe de DEK est présent."
+                        )
+                    aad = VaultCipher.aad(record["project"], record["env"], record["name"])
+                    new_dek = active_old.rewrap_dek(new_cipher, enc_dek, aad=aad)
+                    updated_record = dict(record)
+                    updated_record["encrypted_dek"] = new_dek
+                    updated_record["kek_version"] = new_version
+                    self._secrets[key] = updated_record
+                    count += 1
+                self._cipher, self._kek_version = new_cipher, new_version
+                return count
+            except BaseException:
+                self._secrets = backup
+                self._cipher, self._kek_version = prev_cipher, prev_version
+                raise
+
+
+def _read_max_kek_version(conn: sqlite3.Connection) -> int | None:
+    """Lit la version KEK maximale dans la base avec validation stricte du type."""
+    row = conn.execute("SELECT MAX(kek_version) FROM secrets").fetchone()
+    if row and row[0] is not None:
+        raw_val = row[0]
+        if (
+            not isinstance(raw_val, int)
+            or isinstance(raw_val, bool)
+            or raw_val < 1
+            or raw_val > MAX_KEK_VERSION
+        ):
+            raise KekVersionError(
+                "Impossible de lire la version KEK courante dans la base "
+                "(version corrompue ou invalide)."
+            )
+        return raw_val
+    return None
 
 
 class SqliteSecretStore:
@@ -234,6 +346,32 @@ class SqliteSecretStore:
         self._max_secrets = max_secrets
         self._max_secrets_per_project = max_secrets_per_project
         init_db(db_path)
+        self._kek_version: int = self._detect_current_kek_version()
+
+    @property
+    def kek_version(self) -> int:
+        """Numéro de version courant de la KEK gérée par ce store."""
+        return self._kek_version
+
+    def _detect_current_kek_version(self) -> int:
+        """Détecte la version KEK maximale persistée dans la base.
+
+        Lève ``RuntimeError`` fail-closed si la base est illisible : mieux
+        vaut refuser de démarrer que de créer des secrets sous-étiquetés en
+        kek_version=1 alors que la version réelle est supérieure.
+        """
+        try:
+            with db_session(self._db_path) as conn:
+                max_v = _read_max_kek_version(conn)
+                return max_v if max_v is not None else 1
+        except (sqlite3.Error, OSError, DatabaseUnavailableError, KekVersionError) as exc:
+            # ``KekVersionError`` couvre le fail-closed de ``_read_max_kek_version``
+            # (REAL/TEXT/bool/>MAX) : re-wrap générique sans reflet, quel que soit
+            # le chemin d'erreur, pour que le contrat « exception unique » tienne.
+            raise RuntimeError(
+                "Impossible de lire la version KEK courante dans la base "
+                "(fail-closed pour éviter une sous-étiquetage silencieux)."
+            ) from exc
 
     @property
     def db_path(self) -> Path | str:
@@ -267,6 +405,16 @@ class SqliteSecretStore:
             # quota et l'insertion forment une seule transaction atomique,
             # même entre workers partageant le fichier SQLite.
             conn.execute("BEGIN IMMEDIATE")
+            # Vérification de non-obsolescence de la KEK (ticket #71 MEDIUM) :
+            # si une rotation externe (ex. via CLI) a incrémenté la version en base
+            # au-delà de celle chargée en mémoire par ce worker, refuser fail-closed
+            # pour ne pas chiffrer un nouveau secret avec une ancienne KEK compromise.
+            db_max = _read_max_kek_version(conn)
+            if db_max is not None and db_max > self._kek_version:
+                raise RuntimeError(
+                    "La base de données a subi une rotation de KEK externe. "
+                    "Redémarrage du worker requis."
+                )
             # Un doublon reste un 409 même si la capacité est saturée.
             if get_secret(conn, project, env, name) is not None:
                 raise KeyError("Secret déjà existant")
@@ -287,6 +435,7 @@ class SqliteSecretStore:
                     name,
                     envelope.encrypted_value,
                     encrypted_dek=envelope.encrypted_dek,
+                    kek_version=self._kek_version,
                     fingerprint=fingerprint,
                 )
             except sqlite3.IntegrityError:
@@ -304,3 +453,58 @@ class SqliteSecretStore:
     def _clear(self) -> None:
         with db_session(self._db_path) as conn:
             delete_all_secrets(conn)
+
+    async def rotate_kek(
+        self,
+        new_cipher: VaultCipher,
+        *,
+        old_cipher: VaultCipher | None = None,
+        target_kek_version: int | None = None,
+    ) -> int:
+        """Effectue la rotation transactionnelle de la KEK dans SQLite (ticket #71)."""
+        return await asyncio.to_thread(
+            self._rotate_kek,
+            new_cipher,
+            old_cipher=old_cipher,
+            target_kek_version=target_kek_version,
+        )
+
+    def _rotate_kek(
+        self,
+        new_cipher: VaultCipher,
+        *,
+        old_cipher: VaultCipher | None = None,
+        target_kek_version: int | None = None,
+    ) -> int:
+        """Exécute la rotation transactionnelle de la KEK dans SQLite (ticket #71).
+
+        La transaction SQLite garantit l'atomicité sur disque. Les attributs en
+        mémoire (self._cipher, self._kek_version) sont mis à jour immédiatement après
+        le commit réussi. En cas de crash ou redémarrage du processus entre le
+        commit DB et l'affectation en mémoire, l'initialisation du nouveau store
+        relit automatiquement la version KEK maximale via _detect_current_kek_version.
+        """
+        active_old = old_cipher or self._cipher
+        with db_session(self._db_path) as conn:
+            count, new_version = rotate_secrets_kek(
+                conn,
+                active_old,
+                new_cipher,
+                target_kek_version=target_kek_version,
+            )
+            if count == 0:
+                # Store vide : aucun secret réenveloppé, self._cipher et self._kek_version
+                # restent inchangés (aligné sur InMemorySecretStore).
+                return 0
+        # Swap atomique du couple (cipher, version) : une interruption entre
+        # les deux affectations ne doit pas laisser un cipher neuf étiqueté
+        # avec l'ancienne version (mislabeling d'audit). Le commit DB est déjà
+        # acquis ; en cas d'interruption, le store reste sur l'ancien couple et
+        # un create ultérieur échouera fail-closed sur la version DB supérieure.
+        prev_cipher, prev_version = self._cipher, self._kek_version
+        try:
+            self._cipher, self._kek_version = new_cipher, new_version
+        except BaseException:
+            self._cipher, self._kek_version = prev_cipher, prev_version
+            raise
+        return count

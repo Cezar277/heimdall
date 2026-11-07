@@ -53,10 +53,25 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
+if TYPE_CHECKING:
+    from heimdall.vault.crypto import VaultCipher
+
 logger = logging.getLogger(__name__)
+
+
+class _SessionConnection(sqlite3.Connection):
+    """Connexion SQLite portant l'indicateur de session `db_session`.
+
+    `sqlite3.Connection` n'est ni extensible ni faiblement référençable : le
+    `factory` de `connect()` permet de porter l'attribut `_heimdall_session`
+    directement sur l'objet, sans registre global d'`id()` (impossible de
+    reclasser une connexion périmée après un recyclage d'`id` après GC).
+    """
+
+    _heimdall_session: bool = False
 
 SecretStatus = Literal["vaulte", "rote"]
 _ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
@@ -65,6 +80,30 @@ _SCHEMA_MIGRATION_HINT: str = (
     "`python -m heimdall.vault.init_db` (ou ouvrir la base via "
     "`SqliteSecretStore`) avant de lire un secret."
 )
+
+
+# SQLite stocke les INTEGER sur 64 bits signés : au-delà, le moteur bascule en
+# REAL et `kek_version` sortirait du contrat (audit faussé, lectures incohérentes).
+MAX_KEK_VERSION: int = 2**63 - 1
+
+
+def validate_kek_version(version: Any, *, label: str = "Numéro de version de KEK") -> int:
+    """Valide qu'un numéro de version de KEK est un entier dans [1, 2**63-1]."""
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError(f"{label} invalide : entier attendu.")
+    if version < 1:
+        raise ValueError(f"{label} invalide : valeur >= 1 requise.")
+    if version > MAX_KEK_VERSION:
+        raise ValueError(f"{label} invalide : valeur <= {MAX_KEK_VERSION} requise.")
+    return version
+
+
+class KekVersionError(RuntimeError):
+    """Version de KEK illisible ou hors contrat dans la base (intégrité)."""
+
+
+class KekConcurrencyError(RuntimeError):
+    """Écriture conditionnelle sur ``kek_version`` perdante (concurrence)."""
 
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
@@ -110,13 +149,16 @@ CREATE TABLE IF NOT EXISTS secrets (
     -- DEK chiffrée par la KEK (ticket #70) ; NULL = ligne héritée (#25/#62)
     -- chiffrée directement par la KEK. Les nouvelles lignes renseignent les deux.
     encrypted_dek TEXT,
+    -- Version de la KEK ayant enveloppé la DEK (ticket #71).
+    kek_version INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'vaulte',
     fingerprint TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
     CONSTRAINT uq_secrets_project_env_name UNIQUE (project_id, env, name),
-    CONSTRAINT chk_secrets_status CHECK (status IN ('vaulte', 'rote'))
+    CONSTRAINT chk_secrets_status CHECK (status IN ('vaulte', 'rote')),
+    CONSTRAINT chk_secrets_kek_version CHECK (kek_version >= 1)
 );
 
 CREATE INDEX IF NOT EXISTS idx_secrets_project_env_name ON secrets(project_id, env, name);
@@ -568,7 +610,9 @@ def _connect_pinned_fd(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]
                 "Permissions de la base SQLite insuffisantes : attendu 0o600, "
                 f"obtenu {oct(applied_mode)}"
             )
-        conn = sqlite3.connect(f"/dev/fd/{fd}", timeout=SQLITE_TIMEOUT_SECONDS)
+        conn = sqlite3.connect(
+            f"/dev/fd/{fd}", timeout=SQLITE_TIMEOUT_SECONDS, factory=_SessionConnection
+        )
         opened_identity = (fd_stat.st_dev, fd_stat.st_ino)
     except BaseException:
         os.close(fd)
@@ -600,7 +644,7 @@ def _connect_by_path(path: Path) -> tuple[sqlite3.Connection, tuple[int, int]]:
     _assert_not_symlink(path)
     _apply_secure_permissions(path)
     pre_open_stat = _stat_no_follow(path)
-    conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SECONDS)
+    conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SECONDS, factory=_SessionConnection)
     return conn, (pre_open_stat.st_dev, pre_open_stat.st_ino)
 
 
@@ -644,7 +688,7 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     if isinstance(resolved, Path):
         conn = _open_db_file(resolved)
     else:
-        conn = sqlite3.connect(resolved, timeout=SQLITE_TIMEOUT_SECONDS)
+        conn = sqlite3.connect(resolved, timeout=SQLITE_TIMEOUT_SECONDS, factory=_SessionConnection)
 
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -655,11 +699,56 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
 def db_session(db_path: Path | str | None = None) -> Generator[sqlite3.Connection, None, None]:
     """Gestionnaire de contexte pour transaction SQLite sûre (commit/rollback et fermeture)."""
     conn = get_connection(db_path)
+    # Marque la connexion : sa transaction appartient à l'appelant (LOW revue).
+    if isinstance(conn, _SessionConnection):
+        conn._heimdall_session = True
     try:
         with conn:
             yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def _write_transaction(conn: sqlite3.Connection) -> Generator[None, None, None]:
+    """Exécute un bloc d'écriture sans briser l'atomicité de l'appelant (#71 LOW).
+
+    Les helpers ``update_secret``, ``reenvelope_secret`` et
+    ``rotate_secrets_kek`` sont appelés depuis un ``with db_session(...)`` déjà
+    transactionnel. Un ``with conn:`` imbriqué commiterait prématurément la
+    transaction de l'appelant : on utilise donc un ``SAVEPOINT`` lorsque la
+    connexion appartient à une session ``db_session`` (ou qu'une transaction
+    est déjà ouverte). Le savepoint permet d'annuler uniquement les écritures
+    du helper en cas d'erreur, sans commiter le reste : ``db_session`` garde
+    l'exclusivité du commit/rollback, y compris pour plusieurs helpers chaînés
+    dans la même session. Hors session (appel direct), le helper possède la
+    transaction et la valide ou l'annule à sa sortie.
+    """
+    in_session = getattr(conn, "_heimdall_session", False)
+    if not in_session and not conn.in_transaction:
+        # Appel direct : le helper possède une transaction exclusive complète.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        return
+
+    if in_session and not conn.in_transaction:
+        # Ouvre la transaction de session (verrou d'écriture) avant le savepoint.
+        conn.execute("BEGIN IMMEDIATE")
+    conn.execute("SAVEPOINT heimdall_write")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT heimdall_write")
+        conn.execute("RELEASE SAVEPOINT heimdall_write")
+        raise
+    else:
+        conn.execute("RELEASE SAVEPOINT heimdall_write")
 
 
 class DatabaseUnavailableError(Exception):
@@ -710,6 +799,7 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
         "name",
         "encrypted_value",
         "encrypted_dek",
+        "kek_version",
         "status",
         "fingerprint",
         "created_at",
@@ -823,6 +913,34 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
                 "Schéma de base de données non conforme : contrainte CHECK de statut inopérante."
             )
 
+        # Test comportemental du CHECK sur kek_version (ticket #71)
+        chk_kek_enforced = False
+        try:
+            conn.execute(
+                "INSERT INTO secrets ("
+                "project_id, env, name, encrypted_value, kek_version, status, fingerprint, "
+                "created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    probe_proj,
+                    "dev",
+                    f"PROBE_KEK_V_{uuid4().hex}",
+                    "val",
+                    0,
+                    "vaulte",
+                    "fp",
+                    "2026-01-01",
+                    "2026-01-01",
+                ),
+            )
+        except sqlite3.IntegrityError:
+            chk_kek_enforced = True
+        if not chk_kek_enforced:
+            raise RuntimeError(
+                "Schéma de base de données non conforme : "
+                "contrainte CHECK de kek_version inopérante."
+            )
+
         # Test comportemental de la contrainte UNIQUE(project_id, env, name)
         try:
             conn.execute(
@@ -912,14 +1030,38 @@ def _ensure_secret_envelope_column(conn: sqlite3.Connection) -> None:
             raise
 
 
+def _ensure_secret_kek_version_column(conn: sqlite3.Connection) -> None:
+    """Ajoute `secrets.kek_version` aux bases créées avant le ticket #71.
+
+    La migration est idempotente et purement additive : la valeur par défaut
+    est 1 pour toutes les lignes existantes.
+    """
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
+    }
+    if "kek_version" in columns:
+        return
+    try:
+        conn.execute(
+            "ALTER TABLE secrets ADD COLUMN kek_version INTEGER NOT NULL DEFAULT 1 "
+            "CHECK (kek_version >= 1)"
+        )
+    except sqlite3.OperationalError:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
+        }
+        if "kek_version" not in columns:
+            raise
+
+
 def init_db(db_path: Path | str | None = None) -> None:
     """Initialise à froid la base de données SQLite en créant le schéma complet.
 
     Exécute le script DDL créant `projects`, `api_keys`, `secrets` et leurs index,
-    applique la migration additive de la colonne d'enveloppe `encrypted_dek`
-    (ticket #70), puis vérifie la conformité et l'intégrité du schéma via
-    `_verify_schema()`. Réutilise `get_connection()` pour garantir les mêmes
-    gardes de sécurité (symlink, umask, permissions, journal_mode=DELETE).
+    applique les migrations additives des colonnes d'enveloppe `encrypted_dek` (#70)
+    et de version `kek_version` (#71), puis vérifie la conformité et l'intégrité
+    du schéma via `_verify_schema()`. Réutilise `get_connection()` pour garantir
+    les mêmes gardes de sécurité (symlink, umask, permissions, journal_mode=DELETE).
     Lève RuntimeError si le schéma résultant est incomplet ou dégradé.
     """
     conn = get_connection(db_path)
@@ -927,6 +1069,7 @@ def init_db(db_path: Path | str | None = None) -> None:
         with conn:
             conn.executescript(SCHEMA_SQL)
             _ensure_secret_envelope_column(conn)
+            _ensure_secret_kek_version_column(conn)
             _verify_schema(conn)
     finally:
         conn.close()
@@ -1093,6 +1236,7 @@ def create_secret(  # noqa: PLR0913
     encrypted_value: str,
     *,
     encrypted_dek: str | None = None,
+    kek_version: int = 1,
     status: SecretStatus = "vaulte",
     fingerprint: str = "",
     created_at: str | None = None,
@@ -1101,6 +1245,7 @@ def create_secret(  # noqa: PLR0913
     """Crée un secret chiffré dans la base de données.
 
     `encrypted_dek` est la DEK du secret chiffrée par la KEK (ticket #70).
+    `kek_version` est la version de la KEK ayant enveloppé la DEK (ticket #71).
     `None` (défaut) correspond à une ligne héritée (#25/#62) chiffrée
     directement par la KEK : la colonne SQLite vaut alors NULL, jamais la
     chaîne vide. Les nouvelles lignes du store la renseignent toujours. Le
@@ -1109,6 +1254,7 @@ def create_secret(  # noqa: PLR0913
     sqlite3.IntegrityError si la contrainte d'unicité (project_id, env, name)
     ou la clé étrangère est enfreinte.
     """
+    validate_kek_version(kek_version)
     if encrypted_dek == "":
         # Une seule représentation du « sans enveloppe » : NULL. Une chaîne
         # vide explicite est tolérée pour les appelants historiques, mais elle
@@ -1121,9 +1267,9 @@ def create_secret(  # noqa: PLR0913
     up_ts = updated_at or ts
     query = (
         "INSERT INTO secrets ("
-        "project_id, env, name, encrypted_value, encrypted_dek, status, fingerprint, "
+        "project_id, env, name, encrypted_value, encrypted_dek, kek_version, status, fingerprint, "
         "created_at, updated_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     conn.execute(
         query,
@@ -1133,6 +1279,7 @@ def create_secret(  # noqa: PLR0913
             name,
             encrypted_value,
             encrypted_dek,
+            kek_version,
             status,
             fingerprint,
             ts,
@@ -1145,6 +1292,7 @@ def create_secret(  # noqa: PLR0913
         "name": name,
         "encrypted_value": encrypted_value,
         "encrypted_dek": encrypted_dek,
+        "kek_version": kek_version,
         "status": status,
         "fingerprint": fingerprint,
         "created_at": ts,
@@ -1162,19 +1310,19 @@ def get_secret(
 
     Tout accès direct à un fichier existant doit avoir exécuté ``init_db`` (ou
     ouvrir la base via ``SqliteSecretStore``) pour appliquer la migration
-    additive de #70. Sur une base antérieure non migrée, la colonne
-    ``encrypted_dek`` manque : une ``RuntimeError`` actionnable est levée au
-    lieu de laisser remonter un ``OperationalError`` SQL brut.
+    additive de #70/#71. Sur une base antérieure non migrée, la colonne
+    ``encrypted_dek`` ou ``kek_version`` manque : une ``RuntimeError`` actionnable
+    est levée au lieu de laisser remonter un ``OperationalError`` SQL brut.
     """
     query = (
-        "SELECT id, project_id, env, name, encrypted_value, encrypted_dek, status, "
+        "SELECT id, project_id, env, name, encrypted_value, encrypted_dek, kek_version, status, "
         "fingerprint, created_at, updated_at "
         "FROM secrets WHERE project_id = ? AND env = ? AND name = ?"
     )
     try:
         cursor = conn.execute(query, (project_id, env, name))
     except sqlite3.OperationalError as exc:
-        if "encrypted_dek" not in str(exc):
+        if "encrypted_dek" not in str(exc) and "kek_version" not in str(exc):
             raise
         raise RuntimeError(_SCHEMA_MIGRATION_HINT) from None
     row = cursor.fetchone()
@@ -1191,7 +1339,8 @@ def get_secret_metadata(
 ) -> dict[str, Any] | None:
     """Récupère les métadonnées d'un secret sans exposer la valeur chiffrée."""
     query = (
-        "SELECT id, project_id, env, name, status, fingerprint, created_at, updated_at "
+        "SELECT id, project_id, env, name, kek_version, status, fingerprint, "
+        "created_at, updated_at "
         "FROM secrets WHERE project_id = ? AND env = ? AND name = ?"
     )
     cursor = conn.execute(query, (project_id, env, name))
@@ -1209,13 +1358,15 @@ def list_secrets(
     """Liste les métadonnées des secrets d'un projet, filtrés optionnellement par environnement."""
     if env is not None:
         query = (
-            "SELECT id, project_id, env, name, status, fingerprint, created_at, updated_at "
+            "SELECT id, project_id, env, name, kek_version, status, fingerprint, "
+            "created_at, updated_at "
             "FROM secrets WHERE project_id = ? AND env = ? ORDER BY name ASC"
         )
         cursor = conn.execute(query, (project_id, env))
     else:
         query = (
-            "SELECT id, project_id, env, name, status, fingerprint, created_at, updated_at "
+            "SELECT id, project_id, env, name, kek_version, status, fingerprint, "
+            "created_at, updated_at "
             "FROM secrets WHERE project_id = ? ORDER BY env ASC, name ASC"
         )
         cursor = conn.execute(query, (project_id,))
@@ -1248,48 +1399,265 @@ def update_secret(  # noqa: PLR0913
     encrypted_value: str,
     *,
     encrypted_dek: str | None = None,
+    kek_version: int | None = None,
     fingerprint: str = "",
     status: SecretStatus = "vaulte",
     updated_at: str | None = None,
 ) -> bool:
-    """Met à jour la valeur chiffrée, l'enveloppe de DEK, l'empreinte et le statut.
+    """Met à jour la valeur chiffrée, l'enveloppe de DEK, la version KEK, l'empreinte et le statut.
 
     `encrypted_dek=None` conserve l'enveloppe existante pour une mise à jour
     partielle qui ne remplace pas la valeur chiffrée. Si `encrypted_value` est
     chiffrée avec une DEK neuve, les deux blobs doivent provenir du même
     `VaultCipher.encrypt_envelope` et être fournis ensemble ; sinon la ligne
     deviendrait illisible (fail-closed). Une chaîne vide est refusée car elle
-    effacerait l'enveloppe. L'atomicité valeur + enveloppe sera portée par la
-    rotation de KEK (#71, méthode `reenvelope()`), hors périmètre de #70. Le
+    effacerait l'enveloppe. Pour une rotation de KEK sans toucher à la valeur,
+    utiliser `reenvelope_secret()` ou `rotate_secrets_kek()` (ticket #71). Le
     paramètre `status` est typé `Literal["vaulte", "rote"]` pour une validation
     applicative avant toute requête SQL.
+
+    Garantie de monotonie : si ``kek_version`` est fournie, elle ne peut pas être
+    inférieure à la version actuellement stockée pour la ligne ciblée (anti-downgrade).
     """
     if encrypted_dek == "":
         raise ValueError("Enveloppe de DEK invalide.")
     if status not in _ALLOWED_STATUSES:
         logger.debug("Statut de secret invalide rejeté applicativement.")
         raise ValueError("Statut de secret invalide.")
-    up_ts = updated_at or get_iso_timestamp()
-    query = (
-        "UPDATE secrets SET "
-        "encrypted_value = ?, encrypted_dek = COALESCE(NULLIF(?, ''), encrypted_dek), "
-        "fingerprint = ?, status = ?, updated_at = ? "
-        "WHERE project_id = ? AND env = ? AND name = ?"
-    )
-    cursor = conn.execute(
-        query,
-        (
-            encrypted_value,
-            encrypted_dek,
-            fingerprint,
-            status,
-            up_ts,
-            project_id,
-            env,
-            name,
-        ),
-    )
-    return cursor.rowcount > 0
+
+    with _write_transaction(conn):
+
+        if kek_version is not None:
+            validate_kek_version(kek_version)
+        row = conn.execute(
+            "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
+            (project_id, env, name),
+        ).fetchone()
+        if row is None:
+            return False
+        raw_v = row["kek_version"]
+        if raw_v is not None and (
+            not isinstance(raw_v, int)
+            or isinstance(raw_v, bool)
+            or raw_v < 1
+            or raw_v > MAX_KEK_VERSION
+        ):
+            raise KekVersionError("Version de KEK illisible en base.")
+        current_v = raw_v if raw_v is not None else 1
+        if kek_version is not None and kek_version < current_v:
+            raise ValueError(
+                "La nouvelle kek_version ne peut pas être inférieure à la version courante."
+            )
+
+        up_ts = updated_at or get_iso_timestamp()
+        query = (
+            "UPDATE secrets SET "
+            "encrypted_value = ?, encrypted_dek = COALESCE(NULLIF(?, ''), encrypted_dek), "
+            "kek_version = COALESCE(?, kek_version), "
+            "fingerprint = ?, status = ?, updated_at = ? "
+            "WHERE project_id = ? AND env = ? AND name = ? AND "
+            "COALESCE(kek_version, 1) = ? AND "
+            "(? IS NULL OR kek_version IS NULL OR kek_version <= ?)"
+        )
+        cursor = conn.execute(
+            query,
+            (
+                encrypted_value,
+                encrypted_dek,
+                kek_version,
+                fingerprint,
+                status,
+                up_ts,
+                project_id,
+                env,
+                name,
+                current_v,
+                kek_version,
+                kek_version,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise KekConcurrencyError("Concurrence détectée sur kek_version.")
+        return True
+
+
+def reenvelope_secret(  # noqa: PLR0913, PLR0917
+    conn: sqlite3.Connection,
+    project_id: str,
+    env: str,
+    name: str,
+    encrypted_dek: str,
+    kek_version: int,
+    updated_at: str | None = None,
+) -> bool:
+    """Met à jour l'enveloppe de DEK et la version de KEK sans toucher à la valeur chiffrée (#71).
+
+    L'ancienne valeur chiffrée (``encrypted_value``) et son empreinte restent
+    strictement inchangées en base.
+
+    Garantie de monotonie : ``kek_version`` doit être strictement supérieure
+    à la version actuellement stockée pour la ligne ciblée.  Cela empêche
+    toute régression d'audit d'un appelant externe (la rotation interne
+    ``rotate_secrets_kek`` n'utilise pas cette fonction).
+    """
+    if not encrypted_dek:
+        raise ValueError("Enveloppe de DEK invalide.")
+    validate_kek_version(kek_version)
+
+    with _write_transaction(conn):
+
+        # Lire la version courante et imposer la monotonie.
+        row = conn.execute(
+            "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
+            (project_id, env, name),
+        ).fetchone()
+        if row is None:
+            return False
+
+        raw_v = row["kek_version"]
+        if raw_v is not None and (
+            not isinstance(raw_v, int)
+            or isinstance(raw_v, bool)
+            or raw_v < 1
+            or raw_v > MAX_KEK_VERSION
+        ):
+            raise KekVersionError("Version de KEK illisible en base.")
+        current_v = raw_v if raw_v is not None else 1
+        if kek_version <= current_v:
+            raise ValueError(
+                "La nouvelle kek_version doit être strictement supérieure à la version courante."
+            )
+
+        up_ts = updated_at or get_iso_timestamp()
+        query = (
+            "UPDATE secrets SET "
+            "encrypted_dek = ?, kek_version = ?, updated_at = ? "
+            "WHERE project_id = ? AND env = ? AND name = ? AND "
+            "(kek_version IS NULL OR kek_version < ?)"
+        )
+        cursor = conn.execute(
+            query,
+            (encrypted_dek, kek_version, up_ts, project_id, env, name, kek_version),
+        )
+        if cursor.rowcount == 0:
+            raise KekConcurrencyError("Concurrence détectée sur kek_version.")
+        return True
+
+
+def rotate_secrets_kek(
+    conn: sqlite3.Connection,
+    old_cipher: "VaultCipher",
+    new_cipher: "VaultCipher",
+    *,
+    target_kek_version: int | None = None,
+) -> tuple[int, int]:
+    """Effectue la rotation transactionnelle de la KEK sur l'ensemble des secrets (#71).
+
+    Règles de sécurité :
+    - Exécution strictement transactionnelle : tout réussit ou tout est annulé
+      (rollback automatique en cas d'erreur).
+    - Seules les DEK sont rechiffrées : les valeurs chiffrées (``encrypted_value``)
+      ne sont JAMAIS rechiffrées ni modifiées.
+    - La colonne ``kek_version`` est strictement monotone (target_kek_version > max courant).
+    - Les DEK déchiffrées en mémoire sont effacées (zeroization) dès leur réenveloppement.
+    - L'empreinte auxiliaire (fingerprint) reste strictement inchangée car les
+      valeurs ne sont jamais déchiffrées en mémoire lors de la rotation.
+    - Échoue fail-closed si un secret hérité (#25/#62) sans enveloppe de DEK est rencontré.
+    - Si la base est vide (aucun secret), retourne (0, 1) sans modifier la base,
+      target_kek_version étant ignorée car aucune version n'est persistée (#71 LOW 2).
+
+    Returns:
+        tuple[int, int]: Un tuple (nombre_de_secrets_reenveloppes, nouvelle_version_kek).
+    """
+    from heimdall.vault.crypto import VaultCipher, VaultCipherError  # noqa: PLC0415
+
+    if old_cipher.has_same_key_as(new_cipher):
+        raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
+    if target_kek_version is not None:
+        validate_kek_version(target_kek_version, label="Numéro de version cible")
+
+    with _write_transaction(conn):
+        cursor = conn.execute(
+            "SELECT id, project_id, env, name, encrypted_dek, kek_version "
+            "FROM secrets ORDER BY id ASC"
+        )
+        secrets_to_rotate = cursor.fetchall()
+        if not secrets_to_rotate:
+            # Base vide : aucun secret réenveloppé, aucune version n'est persistée.
+            # target_kek_version est ignorée pour ne pas faire croire à l'appelant
+            # qu'une version non persistée est active (#71 LOW 2).
+            return 0, 1
+
+        for r in secrets_to_rotate:
+            v = r["kek_version"]
+            if v is not None and (
+                not isinstance(v, int) or isinstance(v, bool) or v < 1 or v > MAX_KEK_VERSION
+            ):
+                raise KekVersionError("Version de KEK illisible en base.")
+
+        current_max = max(
+            (
+                r["kek_version"] if r["kek_version"] is not None else 1
+                for r in secrets_to_rotate
+            ),
+            default=1,
+        )
+        if target_kek_version is not None:
+            if target_kek_version <= current_max:
+                raise ValueError(
+                    "Le numéro de version cible doit être strictement supérieur "
+                    "à la version actuelle."
+                )
+            new_version = target_kek_version
+        else:
+            # Fail-closed : l'auto-incrément ne doit jamais dépasser l'INTEGER
+            # signé 64 bits de SQLite (sinon bascule en REAL, audit faussé).
+            # Limite système, pas une erreur d'usage : KekVersionError => exit 1.
+            try:
+                new_version = validate_kek_version(current_max + 1)
+            except ValueError:
+                raise KekVersionError("Version de KEK maximale atteinte en base.") from None
+
+        rotated_count = 0
+        now_ts = get_iso_timestamp()
+
+        for row in secrets_to_rotate:
+            sec_id = row["id"]
+            project_id = str(row["project_id"])
+            env = str(row["env"])
+            name = str(row["name"])
+            enc_dek = row["encrypted_dek"]
+
+            if not enc_dek:
+                raise VaultCipherError(
+                    "Rotation impossible : un secret hérité sans enveloppe de DEK est présent."
+                )
+
+            aad = VaultCipher.aad(project_id, env, name)
+            new_wrapped_dek = old_cipher.rewrap_dek(new_cipher, str(enc_dek), aad=aad)
+
+            # Garde anti-downgrade : la ligne doit encore être à une version
+            # strictement inférieure à la cible. BEGIN IMMEDIATE sérialise les
+            # rotations inter-processus, mais l'écriture conditionnelle prouve
+            # l'absence d'écrasement (v3 -> v2) même si la ligne a bougé depuis
+            # la lecture — même contrat que update_secret/reenvelope_secret.
+            cursor = conn.execute(
+                "UPDATE secrets SET encrypted_dek = ?, kek_version = ?, updated_at = ? "
+                "WHERE id = ? AND kek_version < ?",
+                (new_wrapped_dek, new_version, now_ts, sec_id, new_version),
+            )
+            if cursor.rowcount != 1:
+                raise KekConcurrencyError("Concurrence détectée sur kek_version.")
+            rotated_count += 1
+
+        logger.info(
+            "Rotation de KEK réussie : %d secret(s) réenveloppé(s) (version %d -> %d).",
+            rotated_count,
+            current_max,
+            new_version,
+        )
+
+    return rotated_count, new_version
 
 
 def delete_secret(
