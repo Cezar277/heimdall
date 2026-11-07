@@ -143,8 +143,12 @@ def _sensitive_reference(value: ast.AST) -> str | None:  # noqa: PLR0911, PLR091
         func = value.func
         if isinstance(func, ast.Name) and func.id in _SENSITIVE_CALLS:
             return f"{func.id}()"
-        if isinstance(func, ast.Attribute) and func.attr in _SENSITIVE_METHODS:
-            return f"{func.attr}()"
+        if isinstance(func, ast.Attribute):
+            name = _sensitive_reference(func.value)
+            if name is not None:
+                return name
+            if func.attr in _SENSITIVE_METHODS:
+                return f"{func.attr}()"
         for child in list(value.args) + [keyword.value for keyword in value.keywords]:
             name = _sensitive_reference(child)
             if name is not None:
@@ -162,7 +166,10 @@ def _sensitive_reference(value: ast.AST) -> str | None:  # noqa: PLR0911, PLR091
             if isinstance(slice_node, ast.Name):
                 return slice_node.id if _is_sensitive_name(slice_node.id) else None
             return None
-        return _sensitive_reference(value.value)
+        name = _sensitive_reference(value.value)
+        if name is not None:
+            return name
+        return _sensitive_reference(value.slice)
     for child in ast.iter_child_nodes(value):
         name = _sensitive_reference(child)
         if name is not None:
@@ -406,7 +413,17 @@ class VaultKeyLeakHuntTests(unittest.TestCase):
         log_text = "\n".join(captured.output)
         self._assert_no_canaries(
             log_text,
-            [_MASTER_KEY, self.salt, _PEPPER, _SECRET_VALUE, self.api_key, raw_key, self.kek],
+            [
+                _MASTER_KEY,
+                self.salt,
+                _PEPPER,
+                _SECRET_VALUE,
+                self.api_key,
+                raw_key,
+                self.kek,
+                old_cipher._key.hex(),
+                new_cipher._key.hex(),
+            ],
         )
         self.assertNotIn(raw_key, log_text)
 
@@ -451,11 +468,13 @@ class VaultKeyLeakHuntTests(unittest.TestCase):
                 "typer.echo(issued.raw_key)\n"
                 "logger.info(settings.db_path)\n"
                 "logger.info(issued.key_id)\n"
-                "typer.echo(f'Identifiant : {issued.key_id}')\n",
+                "typer.echo(f'Identifiant : {issued.key_id}')\n"
+                "logger.info(secret_value.hex())\n"
+                "logger.info(data[secret_value])\n",
                 encoding="utf-8",
             )
             violations = _static_logging_violations([path])
-        self.assertEqual(len(violations), 23)
+        self.assertEqual(len(violations), 25)
 
 
 if __name__ == "__main__":
