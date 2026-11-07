@@ -39,7 +39,7 @@ dependencies = [
 dev = [
   "pytest==9.2.0",
   "ruff==0.17.3",
-  "mypy==2.4.0",
+  "mypy==2.4.1",
   "bandit==1.9.4",
   "setuptools==84.2.1",     # backend de build, installé depuis le lock en CI
   "pytest-cov==7.1.0",      # couverture + seuil CI (#20), aligné sur tests/security
