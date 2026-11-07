@@ -457,12 +457,15 @@ class SecretRead(SecretMetadata):
     value: SecretValue
 
 
+_MAX_SECRET_OFFSET = 1_000_000
+
+
 class SecretPage(BaseModel):
     """Page de métadonnées publiques, sans valeur ni empreinte de secret."""
 
     model_config = ConfigDict(extra="forbid")
     items: list[SecretMetadata] = Field(max_length=100)
-    next_offset: int | None = Field(ge=0)
+    next_offset: int | None = Field(ge=0, le=_MAX_SECRET_OFFSET)
 
 
 _MAX_RETRY_AFTER_SECONDS: int = 3600
@@ -1385,7 +1388,7 @@ def _register_routes(app: FastAPI) -> None:
         project: Annotated[ProjectId, Query()],
         response: Response,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
-        offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+        offset: Annotated[int, Query(ge=0, le=_MAX_SECRET_OFFSET)] = 0,
         authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretPage:
         vault_auth.ensure_project_access(
@@ -1396,7 +1399,11 @@ def _register_routes(app: FastAPI) -> None:
         records = await store.list_page(project, limit + 1, offset)
         return SecretPage(
             items=[SecretMetadata.model_validate(record) for record in records[:limit]],
-            next_offset=offset + limit if len(records) > limit else None,
+            next_offset=(
+                offset + limit
+                if len(records) > limit and offset + limit <= _MAX_SECRET_OFFSET
+                else None
+            ),
         )
 
     @app.delete(

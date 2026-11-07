@@ -44,7 +44,7 @@ class SecretRead(SecretMetadata):
 
 class SecretPage(StrictModel):
     items: list[SecretMetadata] = Field(max_length=100)
-    next_offset: int | None = Field(ge=0)
+    next_offset: int | None = Field(ge=0, le=1_000_000)
 
 
 class BadRequestError(StrictModel):

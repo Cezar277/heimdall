@@ -10,7 +10,10 @@ aucune valeur, empreinte, DEK ou donnée chiffrée n'est chargée pour le listag
 accepte 0 à 1 000 000. Les paramètres invalides retournent 400.
 L'ordre est lexicographique ASCII par `env`, puis `name`. `next_offset` vaut
 `null` sur la dernière page, y compris une page vide. La pagination par offset
-ne garantit pas un instantané entre requêtes si des créations/suppressions
+renvoie également `null` si l'offset suivant dépasserait 1 000 000 : tout
+`next_offset` non nul est réutilisable avec le même `limit`, sans erreur 400.
+Ce plafond arrête la navigation même s'il reste des métadonnées au-delà.
+La pagination par offset ne garantit pas un instantané entre requêtes si des créations/suppressions
 concurrentes modifient la collection.
 
 `DELETE /api/v1/secrets/{project}/{env}/{name}` vérifie l'accès au projet avant
@@ -34,9 +37,9 @@ et `tests/test_vault_integration_testclient.py` (schéma runtime).
 
 | Garantie | Implémentation | Preuve automatisée |
 | --- | --- | --- |
-| Autorisation avant accès au stockage | `heimdall/vault/app.py:1384`, `heimdall/vault/app.py:1412` | `tests/test_vault_capacity.py:130` |
-| Libération atomique des quotas | `heimdall/vault/store.py:200`, `heimdall/vault/store.py:478` | `tests/test_vault_capacity.py:58`, `tests/test_vault_capacity.py:144` |
-| Pagination bornée et absence de valeur | `heimdall/vault/database.py:1376`, `heimdall/vault/app.py:1384` | `tests/test_vault_capacity.py:75`, `tests/test_vault_capacity.py:115` |
+| Autorisation avant accès au stockage | `heimdall/vault/app.py:1387`, `heimdall/vault/app.py:1419` | `tests/test_vault_capacity.py:131` |
+| Libération atomique des quotas | `heimdall/vault/store.py:200`, `heimdall/vault/store.py:480` | `tests/test_vault_capacity.py:59`, `tests/test_vault_capacity.py:145` |
+| Pagination bornée et absence de valeur | `heimdall/vault/database.py:1376`, `heimdall/vault/app.py:1387` | `tests/test_vault_capacity.py:76`, `tests/test_vault_capacity.py:116` |
 
 Ticket #15 · Porteur : C · Relecteur : A · Estimation : 6 h.
 

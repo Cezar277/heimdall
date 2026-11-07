@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -175,3 +176,55 @@ def test_unavailable_storage_is_generic_503(vault: TestClient, operation: str) -
     assert response.status_code == 503
     assert 1 <= int(response.headers["Retry-After"]) <= 3600
     assert _CANARY not in response.text
+
+
+@pytest.mark.parametrize(
+    "offset, expected_next", [(999900, 1000000), (999901, None), (1000000, None)]
+)
+def test_next_offset_remains_reusable(
+    vault: TestClient, offset: int, expected_next: int | None
+) -> None:
+    # Simuler les pages lointaines sans créer un million de secrets.
+    records = [{"project": "demo", "env": "dev", "name": "DEMO_A", "status": "vaulte"}] * 101
+    with patch.object(vault.app.state.secret_store, "list_page", return_value=records) as listing:
+        response = vault.get(
+            _COLLECTION, params={"project": "demo", "limit": 100, "offset": offset}
+        )
+        assert response.status_code == 200
+        assert len(response.json()["items"]) == 100
+        assert response.json()["next_offset"] == expected_next
+        listing.assert_awaited_once_with("demo", 101, offset)
+        if expected_next is not None:
+            following = vault.get(
+                _COLLECTION, params={"project": "demo", "limit": 100, "offset": expected_next}
+            )
+            assert following.status_code == 200
+            assert following.json()["next_offset"] is None
+
+
+@pytest.mark.parametrize("count", [None, 0, -1, 1, 2])
+@pytest.mark.parametrize("vault", ["memory"], indirect=True)
+def test_delete_tolerates_desynchronized_memory_counter(
+    vault: TestClient, count: int | None
+) -> None:
+    store = vault.app.state.secret_store
+    assert isinstance(store, InMemorySecretStore)
+    _create(vault)
+    if count is None:
+        store._project_counts.pop("demo")
+    else:
+        store._project_counts["demo"] = count
+    deleted = vault.delete(_RESOURCE)
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+    assert vault.delete(_RESOURCE).status_code == 404
+    assert store._project_counts.get("demo", 0) == (1 if count == 2 else 0)
+
+
+def test_concurrent_double_delete_returns_204_and_404(vault: TestClient) -> None:
+    _create(vault)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(vault.delete, [_RESOURCE, _RESOURCE]))
+    assert sorted(response.status_code for response in responses) == [204, 404]
+    for response in responses:
+        assert _CANARY not in response.text

@@ -202,9 +202,11 @@ class InMemorySecretStore:
         async with self._lock:
             if self._secrets.pop((project, env, name), None) is None:
                 return False
-            self._project_counts[project] -= 1
-            if self._project_counts[project] == 0:
-                del self._project_counts[project]
+            count = self._project_counts.get(project, 0)
+            if count <= 1:
+                self._project_counts.pop(project, None)
+            else:
+                self._project_counts[project] = count - 1
             return True
 
     async def list_page(self, project: str, limit: int, offset: int) -> list[dict[str, str]]:

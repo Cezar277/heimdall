@@ -29,6 +29,9 @@ paths:
         ou donnée chiffrée. Ordre stable par env puis name, lexicographique ASCII.
         Une page vide retourne items vide et next_offset null. Les pages ne
         constituent pas un snapshot si des écritures concurrentes ont lieu.
+        Tout next_offset non null est réutilisable comme offset avec le même
+        limit. Si la page suivante dépasserait l'offset maximal de 1000000,
+        next_offset vaut null même s'il reste des métadonnées au-delà.
       parameters:
         - name: project
           in: query
@@ -439,6 +442,7 @@ components:
           anyOf:
             - type: integer
               minimum: 0
+              maximum: 1000000
             - type: 'null'
     InternalError:
       type: object
