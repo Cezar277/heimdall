@@ -2,7 +2,9 @@
 
 Périmètre : ticket #60 « Tests unitaires et mesure sur le jeu piège », sous-ticket de l'épic #22 « Scanner : regex de signatures et exclusions ». Cette fiche fournit les couples **module + ligne**, les tests et les permaliens du code livré ; elle ne prétend pas modifier une feuille externe.
 
-Révision du code testé : `4515e1b02ee4d056a1d0237076d889202e332241` (HEAD de la branche `60-t224-tests-unitaires-et-mesure-sur-le-jeu-piège`, au-dessus de la livraison #59 — PR #202, exclusions Git sûres).
+Cette PR est **strictement documentaire** : elle n'ajoute ni ne modifie aucun test. Les tests cités ci-dessous pré-existent sur `main` et ont été livrés par les PR #54 (registre de signatures) et #21 (corpus piège, mesure et acceptation) ; ils sont référencés ici comme preuve, pas comme livraison du ticket #60.
+
+Révision du code testé : `981e404ae844cace1f470549501d81018c94e809` (tête de `main`, merge PR #190, incluant #59 — PR #202). Les couples module + ligne ci-dessous sont vérifiés à cette révision ; pour un lien permanent, utiliser `blob/981e404ae844cace1f470549501d81018c94e809/<chemin>#L<début>-L<fin>`.
 
 ## 1. Exigences vérifiées
 
