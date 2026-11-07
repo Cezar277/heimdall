@@ -84,6 +84,7 @@ _ALLOWED_NAMES = frozenset(
     }
 )
 _SENSITIVE_ATTRIBUTES = frozenset({"_key"})
+_SENSITIVE_OBJECTS = frozenset({"settings", "cipher", "registry", "client", "issued"})
 
 
 def _is_sensitive_name(name: str) -> bool:
@@ -115,6 +116,8 @@ def _is_logging_call(node: ast.Call) -> bool:
 def _sensitive_reference(value: ast.AST) -> str | None:
     """Retourne le premier nom/attribut sensible trouvé dans une expression."""
     for child in ast.walk(value):
+        if isinstance(child, ast.Name) and child.id in _SENSITIVE_OBJECTS:
+            return child.id
         if (
             isinstance(child, ast.Name)
             and not child.id.endswith(("Error", "Exception"))
@@ -126,7 +129,8 @@ def _sensitive_reference(value: ast.AST) -> str | None:
             isinstance(child, ast.Attribute)
             and not child.attr.isupper()
             and (
-                child.attr.lower() in _SENSITIVE_ATTRIBUTES
+                child.attr in _SENSITIVE_OBJECTS
+                or child.attr.lower() in _SENSITIVE_ATTRIBUTES
                 or _is_sensitive_name(child.attr)
             )
         ):
@@ -398,11 +402,16 @@ class VaultKeyLeakHuntTests(unittest.TestCase):
                 "logger.info(key)\n"
                 "logger.info(cipher.key)\n"
                 "print(secret_value)\n"
-                "raise ValueError(f'bad {secret_value}')\n",
+                "raise ValueError(f'bad {secret_value}')\n"
+                "logger.info(settings)\n"
+                "logger.info(cipher)\n"
+                "logger.info(registry)\n"
+                "logger.info(client)\n"
+                "logger.info(issued)\n",
                 encoding="utf-8",
             )
             violations = _static_logging_violations([path])
-        self.assertEqual(len(violations), 12)
+        self.assertEqual(len(violations), 17)
 
 
 if __name__ == "__main__":
