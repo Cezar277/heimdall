@@ -98,11 +98,11 @@ def validate_kek_version(version: Any, *, label: str = "Numéro de version de KE
     return version
 
 
-class KekVersionError(ValueError):
+class KekVersionError(RuntimeError):
     """Version de KEK illisible ou hors contrat dans la base (intégrité)."""
 
 
-class KekConcurrencyError(ValueError):
+class KekConcurrencyError(RuntimeError):
     """Écriture conditionnelle sur ``kek_version`` perdante (concurrence)."""
 
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
@@ -1443,8 +1443,7 @@ def update_secret(  # noqa: PLR0913
             current_v = raw_v if raw_v is not None else 1
             if kek_version < current_v:
                 raise ValueError(
-                    f"La nouvelle kek_version ({kek_version}) ne peut pas être "
-                    f"inférieure à la version courante ({current_v})."
+                    "La nouvelle kek_version ne peut pas être inférieure à la version courante."
                 )
 
         up_ts = updated_at or get_iso_timestamp()
@@ -1518,8 +1517,7 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
         current_v = raw_v if raw_v is not None else 1
         if kek_version <= current_v:
             raise ValueError(
-                f"La nouvelle kek_version ({kek_version}) doit être strictement "
-                f"supérieure à la version courante ({current_v})."
+                "La nouvelle kek_version doit être strictement supérieure à la version courante."
             )
 
         up_ts = updated_at or get_iso_timestamp()
@@ -1599,8 +1597,8 @@ def rotate_secrets_kek(
         if target_kek_version is not None:
             if target_kek_version <= current_max:
                 raise ValueError(
-                    f"Le numéro de version cible ({target_kek_version}) doit être "
-                    f"strictement supérieur à la version actuelle ({current_max})."
+                    "Le numéro de version cible doit être strictement supérieur "
+                    "à la version actuelle."
                 )
             new_version = target_kek_version
         else:

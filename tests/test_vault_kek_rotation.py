@@ -1267,7 +1267,11 @@ class VaultRotateCliTests(unittest.TestCase):
             env=env,
         )
         self.assertEqual(res.exit_code, 2)
-        self.assertIn("Erreur : Le numéro de version cible (1) doit être", res.output)
+        self.assertIn(
+            "Erreur : Le numéro de version cible doit être strictement supérieur",
+            res.output,
+        )
+        self.assertNotIn("(1)", res.output)
 
     def test_cli_rotate_rejects_target_version_above_sqlite_integer_range(self) -> None:
         """Code 2 si --target-version dépasse INTEGER 64 bits signé (LOW revue).

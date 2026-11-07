@@ -237,8 +237,8 @@ class InMemorySecretStore:
             if target_kek_version is not None:
                 if target_kek_version <= current_max:
                     raise ValueError(
-                        f"Le numéro de version cible ({target_kek_version}) doit être "
-                        f"strictement supérieur à la version actuelle ({current_max})."
+                        "Le numéro de version cible doit être strictement supérieur "
+                    "à la version actuelle."
                     )
                 new_version = target_kek_version
             else:
