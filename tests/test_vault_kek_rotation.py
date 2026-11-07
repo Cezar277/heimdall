@@ -294,7 +294,7 @@ class DatabaseRotationTests(unittest.TestCase):
             self.assertEqual(total, 0)
 
     def test_rotation_refuses_auto_increment_beyond_sqlite_integer_max(self) -> None:
-        """Auto-incrément borné : rotate avec MAX(kek_version)=2**63-1 → ValueError (#71 LOW 1)."""
+        """Auto-incrément borné : MAX(kek_version)=2**63-1 → KekVersionError (#71 LOW 1)."""
         with db_session(self.db_path) as conn:
             ensure_project(conn, "proj")
             aad = VaultCipher.aad("proj", "dev", "AT_MAX")
@@ -309,11 +309,12 @@ class DatabaseRotationTests(unittest.TestCase):
                 kek_version=MAX_KEK_VERSION,
             )
 
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(KekVersionError) as ctx:
             with db_session(self.db_path) as conn:
                 rotate_secrets_kek(conn, self.old_cipher, self.new_cipher)
-        self.assertIn("9223372036854775807", str(ctx.exception))
-        # Aucun reflet de l'auto-incrément débordant (invariant 8).
+        self.assertEqual(str(ctx.exception), "Version de KEK maximale atteinte en base.")
+        # Aucun reflet de la borne ni de l'auto-incrément débordant (invariant 8).
+        self.assertNotIn("9223372036854775807", str(ctx.exception))
         self.assertNotIn("9223372036854775808", str(ctx.exception))
 
         # Rien persisté : la version reste un INTEGER à sa valeur d'origine.
@@ -1306,7 +1307,7 @@ class VaultRotateCliTests(unittest.TestCase):
             self.assertIsInstance(sec["kek_version"], int)
 
     def test_cli_rotate_rejects_auto_increment_overflow_at_max(self) -> None:
-        """Code 2 si l'auto-incrément atteint l'INTEGER 64 bits (LOW revue)."""
+        """Code 1 (limite système) si l'auto-incrément atteint l'INTEGER 64 bits."""
         with sqlite3.connect(str(self.db_path)) as conn_raw:
             conn_raw.execute(
                 "UPDATE secrets SET kek_version = ? WHERE name = 'API_KEY'",
@@ -1323,8 +1324,9 @@ class VaultRotateCliTests(unittest.TestCase):
             ["vault", "rotate-kek", "--db-path", str(self.db_path)],
             env=env,
         )
-        self.assertEqual(res.exit_code, 2)
-        self.assertIn("9223372036854775807", res.output)
+        self.assertEqual(res.exit_code, 1)
+        self.assertIn("Erreur : base de données corrompue ou invalide", res.output)
+        self.assertNotIn("9223372036854775807", res.output)
         self.assertNotIn("9223372036854775808", res.output)
         # Aucune écriture : la version persistée reste en INTEGER à MAX.
         with db_session(self.db_path) as conn:
@@ -2090,6 +2092,40 @@ class NestedTransactionIsolationTests(unittest.TestCase):
             )
         )
         self._assert_fully_rolled_back(before)
+
+    def test_update_secret_without_kek_version_refuses_concurrent_rotation(self) -> None:
+        """update_secret sans kek_version refuse un bump concurrent (garde optimiste)."""
+        with db_session(self.db_path) as conn:
+
+            class _InterceptingConn:
+                def __init__(self, target: sqlite3.Connection) -> None:
+                    self._target = target
+
+                def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+                    if "UPDATE secrets SET" in sql:
+                        self._target.execute(
+                            "UPDATE secrets SET kek_version = 2 "
+                            "WHERE project_id = 'proj' AND env = 'dev' AND name = 'API_KEY'"
+                        )
+                    return self._target.execute(sql, parameters)
+
+                def __enter__(self) -> _InterceptingConn:
+                    return self
+
+                def __exit__(self, *args: object) -> object:
+                    return False
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self._target, name)
+
+            proxy_conn: Any = _InterceptingConn(conn)
+            with self.assertRaises(KekConcurrencyError):
+                update_secret(proxy_conn, "proj", "dev", "API_KEY", "valeur_rechiffree")
+
+            # Le savepoint annule aussi le bump simulé : version inchangée.
+            sec = get_secret(conn, "proj", "dev", "API_KEY")
+            assert sec is not None
+            self.assertEqual(sec["kek_version"], 1)
 
     def test_reenvelope_secret_does_not_commit_caller_transaction(self) -> None:
         before = self._snapshot()

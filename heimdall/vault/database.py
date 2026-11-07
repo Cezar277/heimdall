@@ -1429,22 +1429,22 @@ def update_secret(  # noqa: PLR0913
 
         if kek_version is not None:
             validate_kek_version(kek_version)
-            row = conn.execute(
-                "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
-                (project_id, env, name),
-            ).fetchone()
-            if row is None:
-                return False
-            raw_v = row["kek_version"]
-            if raw_v is not None and (
-                not isinstance(raw_v, int) or isinstance(raw_v, bool) or raw_v < 1
-            ):
-                raise KekVersionError("Version de KEK illisible en base.")
-            current_v = raw_v if raw_v is not None else 1
-            if kek_version < current_v:
-                raise ValueError(
-                    "La nouvelle kek_version ne peut pas être inférieure à la version courante."
-                )
+        row = conn.execute(
+            "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
+            (project_id, env, name),
+        ).fetchone()
+        if row is None:
+            return False
+        raw_v = row["kek_version"]
+        if raw_v is not None and (
+            not isinstance(raw_v, int) or isinstance(raw_v, bool) or raw_v < 1
+        ):
+            raise KekVersionError("Version de KEK illisible en base.")
+        current_v = raw_v if raw_v is not None else 1
+        if kek_version is not None and kek_version < current_v:
+            raise ValueError(
+                "La nouvelle kek_version ne peut pas être inférieure à la version courante."
+            )
 
         up_ts = updated_at or get_iso_timestamp()
         query = (
@@ -1453,6 +1453,7 @@ def update_secret(  # noqa: PLR0913
             "kek_version = COALESCE(?, kek_version), "
             "fingerprint = ?, status = ?, updated_at = ? "
             "WHERE project_id = ? AND env = ? AND name = ? AND "
+            "COALESCE(kek_version, 1) = ? AND "
             "(? IS NULL OR kek_version IS NULL OR kek_version <= ?)"
         )
         cursor = conn.execute(
@@ -1467,13 +1468,14 @@ def update_secret(  # noqa: PLR0913
                 project_id,
                 env,
                 name,
+                current_v,
                 kek_version,
                 kek_version,
             ),
         )
-        if kek_version is not None and cursor.rowcount == 0:
+        if cursor.rowcount == 0:
             raise KekConcurrencyError("Concurrence détectée sur kek_version.")
-        return cursor.rowcount > 0
+        return True
 
 
 def reenvelope_secret(  # noqa: PLR0913, PLR0917
@@ -1604,7 +1606,11 @@ def rotate_secrets_kek(
         else:
             # Fail-closed : l'auto-incrément ne doit jamais dépasser l'INTEGER
             # signé 64 bits de SQLite (sinon bascule en REAL, audit faussé).
-            new_version = validate_kek_version(current_max + 1)
+            # Limite système, pas une erreur d'usage : KekVersionError => exit 1.
+            try:
+                new_version = validate_kek_version(current_max + 1)
+            except ValueError:
+                raise KekVersionError("Version de KEK maximale atteinte en base.") from None
 
         rotated_count = 0
         now_ts = get_iso_timestamp()

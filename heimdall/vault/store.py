@@ -243,7 +243,11 @@ class InMemorySecretStore:
                 new_version = target_kek_version
             else:
                 # Fail-closed : l'auto-incrément reste borné à l'INTEGER 64 bits.
-                new_version = validate_kek_version(current_max + 1)
+                # Limite système, pas une erreur d'usage : KekVersionError => exit 1.
+                try:
+                    new_version = validate_kek_version(current_max + 1)
+                except ValueError:
+                    raise KekVersionError("Version de KEK maximale atteinte en base.") from None
 
             # Invariant d'atomicité : backup profond pour garantir que self._secrets
             # est restauré intact même en cas de mutation in-place (#71 LOW 4).
