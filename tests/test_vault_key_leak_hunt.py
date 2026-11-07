@@ -36,6 +36,82 @@ _MASTER_KEY = "leak-hunt-master-key-0123456789abcdef"  # noqa: S105
 _PEPPER = "leak-hunt-pepper-0123456789abcdef0123456789abcdef"  # noqa: S105
 _SECRET_VALUE = "CANARY_SECRET_VALUE_LEAK_HUNT_0123456789"  # noqa: S105
 
+_LOGGING_METHODS = frozenset(
+    {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
+)
+_LOGGER_NAMES = frozenset({"logger", "log", "LOG", "logging"})
+_SENSITIVE_MARKERS = (
+    "value",
+    "plaintext",
+    "secret",
+    "password",
+    "passphrase",
+    "private_key",
+    "master_key",
+    "master",
+    "api_key",
+    "raw_key",
+    "pepper",
+    "kek",
+    "dek",
+    "salt",
+    "seed",
+    "token",
+)
+_ALLOWED_NAMES = frozenset(
+    {"encrypted_value", "kek_version", "max_kek_version", "new_version", "current_max"}
+)
+
+
+def _is_sensitive_name(name: str) -> bool:
+    """Détection conservatrice par sous-chaîne, avec allowlist des métadonnées."""
+    normalized = name.lower()
+    if normalized in _ALLOWED_NAMES:
+        return False
+    return any(marker in normalized for marker in _SENSITIVE_MARKERS)
+
+
+def _is_logging_call(node: ast.Call) -> bool:
+    """Reconnaît logger.*, log.*, logging.* et getLogger(...).*."""
+    if not isinstance(node.func, ast.Attribute) or node.func.attr not in _LOGGING_METHODS:
+        return False
+    base = node.func.value
+    if isinstance(base, ast.Name):
+        return base.id in _LOGGER_NAMES
+    if isinstance(base, ast.Attribute):
+        return base.attr in _LOGGER_NAMES
+    if isinstance(base, ast.Call):
+        func = base.func
+        if isinstance(func, ast.Name) and func.id == "getLogger":
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == "getLogger":
+            return True
+    return False
+
+
+def _static_logging_violations(paths: list[Path]) -> list[str]:
+    """Inspecte args et keywords des appels de log, y compris les alias.
+
+    Les blobs chiffrés ``encrypted_value`` restent autorisés (ciphertext, pas de
+    clair) ; ``encrypted_dek`` est marqué sensible par défense en profondeur.
+    """
+    violations: list[str] = []
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not _is_logging_call(node):
+                continue
+            values = list(node.args) + [keyword.value for keyword in node.keywords]
+            for value in values:
+                for child in ast.walk(value):
+                    if isinstance(child, ast.Name) and _is_sensitive_name(child.id):
+                        violations.append(
+                            f"{path.name}:{node.lineno}: "
+                            f"logger.{node.func.attr} référence {child.id!r}"
+                        )
+    return violations
+
+
 
 class VaultKeyLeakHuntTests(unittest.TestCase):
     """Vérifie logs, exceptions et repr() sur les objets porteurs de clés."""
@@ -224,40 +300,27 @@ class VaultKeyLeakHuntTests(unittest.TestCase):
 
     def test_static_logging_calls_do_not_reference_sensitive_names(self) -> None:
         """Garde statique : aucun logger.* ne référence une variable de secret."""
-        sensitive = {
-            "value",
-            "plaintext",
-            "secret",
-            "secret_value",
-            "master_key",
-            "kek",
-            "api_key",
-            "raw_key",
-            "pepper",
-            "password",
-            "token",
-        }
-        violations: list[str] = []
         paths = list((REPO_ROOT / "heimdall" / "vault").glob("*.py"))
         paths.append(REPO_ROOT / "heimdall" / "cli" / "vault_keys.py")
-        for path in paths:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if not (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "logger"
-                ):
-                    continue
-                for arg in node.args:
-                    for child in ast.walk(arg):
-                        if isinstance(child, ast.Name) and child.id.lower() in sensitive:
-                            violations.append(
-                                f"{path.relative_to(REPO_ROOT)}:{node.lineno}: "
-                                f"logger.{node.func.attr} référence {child.id!r}"
-                            )
-        self.assertEqual(violations, [])
+        self.assertEqual(_static_logging_violations(paths), [])
+
+    def test_static_logging_guard_detects_known_violations(self) -> None:
+        """La garde détecte args, keywords, alias et getLogger(...).*."""
+        with tempfile.TemporaryDirectory(prefix="heimdall-log-guard-") as tmp:
+            path = Path(tmp) / "bad_logging.py"
+            path.write_text(
+                "import logging\n"
+                "logger = logging.getLogger(__name__)\n"
+                "log = logging.getLogger('alias')\n"
+                "secret_value = 'x'\n"
+                "logger.info(secret_value)\n"
+                "logger.info('x', extra={'secret': secret_value})\n"
+                "log.info(secret_value)\n"
+                "logging.getLogger('x').info(secret_value)\n",
+                encoding="utf-8",
+            )
+            violations = _static_logging_violations([path])
+        self.assertEqual(len(violations), 4)
 
 
 if __name__ == "__main__":
