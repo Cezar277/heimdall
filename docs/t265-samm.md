@@ -10,7 +10,7 @@ les `repr()`.
 ## 1. Exigences du ticket et preuves
 
 > **Permaliens** : les liens ci-dessous sont épinglés à la révision du code
-> [`ad0e53b`](https://github.com/Cezar277/heimdall/commit/ad0e53bcd749e64c17f41044e8ee21dd3f87e06e),
+> [`16a609f`](https://github.com/Cezar277/heimdall/commit/16a609f7e6f6bf72dbed7498449182ffee5190ba),
 > qui contient le test de chasse et le `__repr__` expurgé du registre. Cette
 > fiche est le commit suivant : elle ne modifie que de la documentation. Les
 > permaliens épinglent la révision du code, pas le commit de documentation.
@@ -21,7 +21,7 @@ les `repr()`.
 | **Vérifier les exceptions** : pas d'écho de clé/valeur dans les messages | `VaultSettings` : `hide_input_in_errors=True` (`app.py:570`) + validateurs génériques (`app.py:595-650`) ; `VaultCipher` : erreurs génériques (`crypto.py:383-412`) ; handlers FastAPI génériques 400/500 (`app.py:1285-1338`) | `tests/test_vault_key_leak_hunt.py::VaultKeyLeakHuntTests::test_settings_validation_errors_do_not_echo_secret_inputs`, `::test_cipher_repr_and_errors_redact_keys`, `::test_client_repr_and_errors_redact_api_key`, `::test_runtime_logs_do_not_contain_master_key_or_secret_values` (réponses 400/401) | Réussi — messages génériques, aucune valeur réfléchie |
 | **Vérifier les `repr()`** des objets porteurs de clés | `VaultCipher.__repr__` (`crypto.py:525-526`), `VaultClient.__repr__`/`__str__` (`client.py:854-858`), `IssuedApiKey.__repr__` (`auth.py:440-445`), `ApiKeyRegistry.__repr__` (`auth.py:491-496`), `VaultSettings` champs `repr=False, exclude=True` (`app.py:595-650`) | `tests/test_vault_key_leak_hunt.py::VaultKeyLeakHuntTests::test_settings_repr_and_serialization_redact_secrets`, `::test_cipher_repr_and_errors_redact_keys`, `::test_client_repr_and_errors_redact_api_key`, `::test_issued_key_and_registry_repr_redact_raw_key` ; tests existants `tests/test_vault_kek_derivation.py:521`, `:785`, `tests/test_vault_client.py:82`, `tests/test_vault_auth.py:69` | Réussi — `repr`, `model_dump` et `model_dump_json` expurgés |
 | **Test qui grep les logs pour la clé maîtresse** | Canaris uniques `_MASTER_KEY`, `_PEPPER`, `_SECRET_VALUE` + clés générées à l'exécution | `tests/test_vault_key_leak_hunt.py::VaultKeyLeakHuntTests::test_runtime_logs_do_not_contain_master_key_or_secret_values` | Réussi — 0 occurrence dans les logs capturés |
-| **Aucune clé dans les logs** (Fait quand) | Voir ci-dessus | `pytest tests/test_vault_key_leak_hunt.py -q` → **7 passed** | Réussi |
+| **Aucune clé dans les logs** (Fait quand) | Voir ci-dessus | `pytest tests/test_vault_key_leak_hunt.py -q` → **8 passed** | Réussi |
 
 ## 2. Scénarios couverts par le test runtime
 
@@ -45,11 +45,18 @@ la KEK dans l'intégralité des enregistrements de logs.
 ## 3. Garde statique
 
 `test_static_logging_calls_do_not_reference_sensitive_names` parse l'AST de
-`heimdall/vault/*.py` et `heimdall/cli/vault_keys.py` et refuse tout appel
-`logger.*` qui référence une variable dont le nom est sensible (`value`,
-`plaintext`, `secret`, `secret_value`, `master_key`, `kek`, `api_key`,
-`raw_key`, `pepper`, `password`, `token`). Cette garde complète le test runtime :
-elle bloque une régression future même si le scénario n'est pas exécuté.
+`heimdall/vault/*.py` et `heimdall/cli/vault_keys.py` et refuse tout appel de
+log (`logger.*`, `log.*`, `logging.*`, `getLogger(...).*`) qui référence une
+variable sensible dans ses arguments **ou ses keywords** (`extra=`, `exc_info=`,
+etc.). La détection est conservatrice par sous-chaîne (`secret`, `plaintext`,
+`password`, `private_key`, `master_key`, `master`, `api_key`, `raw_key`,
+`pepper`, `kek`, `dek`, `salt`, `seed`, `token`, `value`), avec une allowlist
+pour les métadonnées (`kek_version`, `new_version`, `current_max`) et les blobs
+chiffrés (`encrypted_value`). `encrypted_dek` reste marqué sensible par défense
+en profondeur. Un test négatif
+(`test_static_logging_guard_detects_known_violations`) prouve que la garde
+détecte bien les quatre formes : argument direct, `extra=`, alias `log` et
+`getLogger(...).info`.
 
 ## 4. Résultats locaux
 
@@ -57,7 +64,7 @@ Environnement : Linux, Python 3.13, venv du dépôt.
 
 ```sh
 .venv/bin/python -m pytest tests/test_vault_key_leak_hunt.py -q
-# 7 passed
+# 8 passed
 
 .venv/bin/python -m pytest tests/test_vault_auth.py tests/test_vault_client.py \
   tests/test_vault_kek_derivation.py tests/test_vault_key_leak_hunt.py -q
