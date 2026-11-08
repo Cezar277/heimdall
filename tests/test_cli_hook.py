@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import stat
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -251,6 +252,39 @@ def test_install_refuses_an_interpreter_inside_the_repository(
 
     assert result.exit_code == 2
     assert not _hook(git_repo).exists()
+
+
+def test_uninstall_works_when_the_interpreter_moved_inside_the_repository(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _run("hook", "install", str(git_repo.root)).exit_code == 0
+    venv_bin = git_repo.root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module.sys, "executable", str(python))
+
+    result = _run("hook", "uninstall", str(git_repo.root))
+
+    assert result.exit_code == 0
+    assert not _hook(git_repo).exists()
+
+
+def test_install_force_creates_missing_hooks_parents_privately(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    custom = tmp_path / "outside-a" / "b" / "hooks"
+    git_repo.git("config", "core.hooksPath", str(custom))
+    previous = os.umask(0o002)
+    try:
+        result = _run("hook", "install", str(git_repo.root), "--force")
+    finally:
+        os.umask(previous)
+
+    assert result.exit_code == 0
+    assert (custom / "pre-commit").is_file()
+    for parent in (tmp_path / "outside-a", tmp_path / "outside-a" / "b"):
+        assert stat.S_IMODE(parent.stat().st_mode) == 0o700
 
 
 def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:

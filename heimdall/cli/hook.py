@@ -477,12 +477,20 @@ def _ensure_hooks_directory(path: Path) -> None:
     Un dossier accessible en écriture au groupe ou aux autres est refusé :
     un autre utilisateur pourrait y remplacer le hook, que Git exécuterait
     ensuite avec les droits du développeur. Un umask 0002 rend `.git/hooks`
-    groupe-inscriptible : l'opérateur doit alors faire `chmod g-w`.
+    groupe-inscriptible : l'opérateur doit alors faire `chmod g-w`. Les
+    parents manquants (``--force`` vers un chemin absolu) sont créés en 0700 :
+    ``mkdir(parents=True)`` les créerait selon l'umask.
     """
     try:
         if path.exists() and not path.is_dir():
             raise HookError
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        missing: list[Path] = []
+        current = path
+        while not os.path.lexists(current):
+            missing.append(current)
+            current = current.parent
+        for directory in reversed(missing):
+            directory.mkdir(mode=0o700)
         metadata = os.stat(path)
     except OSError:
         raise HookError from None
@@ -619,7 +627,6 @@ def _check_legacy_restorable(path: Path) -> None:
 def uninstall_hook(root: Path, *, force: bool = False) -> UninstallOutcome:
     """Retire le hook Heimdall et restaure le hook précédent s'il existe."""
     access = _open_repository(root)
-    _ensure_interpreter_outside_repository(access)
     hooks_directory = _git_path(access, "hooks")
     _validate_hooks_directory(access, hooks_directory)
     if not force and not _inside_allowed_roots(access, hooks_directory):
