@@ -136,8 +136,9 @@ moteur de remédiation interactif reste le ticket #30/#32.
 - Le hook est local et mono-utilisateur ; la CI déterministe reste la seule
   barrière opposable pour une branche partagée.
 - Si l'interpréteur Python est un venv **dans le dépôt**, le dépôt peut le
-  modifier après l'installation ; pour une garantie forte, utiliser un
-  interpréteur hors du dépôt. Le script console sous la racine est refusé.
+  modifier après l'installation : `hook install` affiche un avertissement
+  explicite. Pour une garantie forte, utiliser un interpréteur hors du
+  dépôt. Le script console sous la racine est refusé.
 
 ## Preuves
 
@@ -163,8 +164,8 @@ moteur de remédiation interactif reste le ticket #30/#32.
 - chaînage du legacy par chemin relatif au hook, prouvé après déplacement
   du dépôt ;
 - console script sous la racine (même lien vers l'extérieur) refusé
-  (repli `-m`) et commit depuis un sous-dossier toujours bloqué par le scan
-  de la racine ;
+  (repli `-m`), avertissement si l'interpréteur Python est dans le dépôt, et
+  commit depuis un sous-dossier toujours bloqué par le scan de la racine ;
 - chemins assertés figés : un échange `a` → lien vers `b` entre l'assert et
   la ré-indexation est refusé sans stager `b` ;
 - anti-récursion `HEIMDALL_IN_HOOK=1`.

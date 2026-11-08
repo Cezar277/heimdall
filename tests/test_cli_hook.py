@@ -187,6 +187,21 @@ def test_launcher_refuses_a_console_symlink_under_the_repository(
     assert str(console) not in launcher
 
 
+def test_install_warns_when_the_interpreter_is_inside_the_repository(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv_bin = git_repo.root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module.sys, "executable", str(python))
+
+    result = _run("hook", "install", str(git_repo.root))
+
+    assert result.exit_code == 0
+    assert "interpréteur Python dans le dépôt" in result.stderr
+
+
 def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:
     result = _run("hook", "install", str(git_repo.root))
 

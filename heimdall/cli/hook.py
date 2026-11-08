@@ -317,6 +317,24 @@ def _launcher(root: Path) -> str:
     return f"{shlex.quote(python)} -I -m heimdall.cli.main"
 
 
+def interpreter_inside_repository(root: Path) -> bool:
+    """True si l'interpréteur Python d'installation est sous la racine du dépôt.
+
+    Un venv local est exécuté à chaque commit : le dépôt peut le modifier
+    après l'installation. L'appelant affiche un avertissement ; la garantie
+    forte exige un interpréteur hors du dépôt.
+    """
+    access = _open_repository(root)
+    python = Path(_interpreter())
+    try:
+        repository_root = access.root
+        return python.is_relative_to(repository_root) or python.resolve().is_relative_to(
+            repository_root
+        )
+    except (OSError, RuntimeError):
+        raise HookError from None
+
+
 def _read_regular(path: Path, limit: int) -> bytes:
     """Lit un fichier régulier sans suivre un lien, avec borne stricte."""
     try:
@@ -977,6 +995,12 @@ def hook_install(
     """Installe le hook pre-commit dans le dépôt indiqué."""
     try:
         outcome = install_hook(Path(path), force=force)
+        if interpreter_inside_repository(Path(path)):
+            typer.echo(
+                "hook pre-commit : avertissement : interpréteur Python dans le dépôt "
+                "(garantie forte = interpréteur hors du dépôt)",
+                err=True,
+            )
     except OutsideRepositoryError:
         typer.echo("hook pre-commit : hooksPath hors du dépôt (utiliser --force)", err=True)
         raise typer.Exit(code=2) from None
