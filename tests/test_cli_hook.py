@@ -287,6 +287,42 @@ def test_install_force_creates_missing_hooks_parents_privately(
         assert stat.S_IMODE(parent.stat().st_mode) == 0o700
 
 
+def test_install_on_python_310_without_console_leaves_a_foreign_hook_in_place(
+    git_repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = "#!/bin/sh\necho FOREIGN\n"
+    hook = _write_foreign_hook(git_repo, original)
+    venv_bin = tmp_path / "outside-venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module.sys, "executable", str(python))
+    monkeypatch.setattr(hook_module.sys, "version_info", (3, 10, 0))
+
+    with pytest.raises(HookError):
+        hook_module.install_hook(git_repo.root)
+
+    assert hook.read_text(encoding="utf-8") == original
+    assert not _legacy(git_repo).exists()
+
+
+def test_reads_and_index_writes_refuse_without_o_nofollow(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git_repo.write("app.py", "old\n")
+    git_repo.stage("app.py")
+    git_repo.commit_all("base")
+    git_repo.write("app.py", "new\n")
+    monkeypatch.delattr(os, "O_NOFOLLOW")
+
+    with pytest.raises(HookError):
+        hook_module._read_regular(git_repo.root / "app.py", 1024)
+    with pytest.raises(HookError):
+        hook_module._restage_paths(git_repo.root, ["app.py"])
+
+    assert not (git_repo.root / ".git" / "index.lock").exists()
+
+
 def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:
     result = _run("hook", "install", str(git_repo.root))
 

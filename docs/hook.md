@@ -145,6 +145,10 @@ moteur de remédiation interactif reste le ticket #30/#32.
   à l'installation (code 2). Le script console sous la racine est également
   refusé. Sur Python 3.10, un console script hors dépôt est obligatoire
   (pas de `-P`) ; sur 3.11+, le repli `-P`/`PYTHONSAFEPATH` est sûr.
+- Les garanties anti-lien (`O_NOFOLLOW`) ne sont disponibles que sur les
+  plateformes qui l'exposent. Ailleurs (Windows), les lectures et écritures
+  d'index sensibles refusent en code 2 au lieu de suivre un lien : la
+  remédiation (`apply_and_restage`) n'y est pas disponible.
 
 ## Preuves
 

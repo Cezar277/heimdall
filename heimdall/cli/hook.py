@@ -331,10 +331,18 @@ def _launcher(root: Path) -> str:
     return fallback
 
 
+def _nofollow() -> int:
+    """Drapeau ``O_NOFOLLOW`` exigé : sans lui, refus plutôt que suivi de lien."""
+    flag: int | None = getattr(os, "O_NOFOLLOW", None)
+    if flag is None:
+        raise HookError
+    return flag
+
+
 def _read_regular(path: Path, limit: int) -> bytes:
     """Lit un fichier régulier sans suivre un lien, avec borne stricte."""
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(path, os.O_RDONLY | _nofollow())
     except OSError:
         raise HookError from None
     try:
@@ -583,12 +591,15 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
     _verify_root(access)
     hook_path = hooks_directory / HOOK_NAME
     legacy_path = hooks_directory / (HOOK_NAME + LEGACY_SUFFIX)
+    # Le lanceur est résolu avant tout déplacement : un refus (3.10 sans
+    # console, interpréteur piégé) ne doit pas laisser le hook étranger renommé.
+    launcher = _launcher(access.root)
     try:
         ours, moved_legacy = _prepare_existing_hook(hook_path, legacy_path)
         previous = _read_regular(hook_path, MAX_HOOK_BYTES) if ours else None
-        legacy_for_chain = legacy_path if _is_chainable(legacy_path) else None
-        script = _hook_script(_launcher(access.root), legacy_for_chain)
         try:
+            legacy_for_chain = legacy_path if _is_chainable(legacy_path) else None
+            script = _hook_script(launcher, legacy_for_chain)
             _atomic_write(hook_path, script)
             _verify_root(access)
         except BaseException:
@@ -733,7 +744,7 @@ def _read_regular_bounded(path: Path) -> tuple[bytes, os.stat_result]:
     silencieusement le mode indexé ni faire lire au-delà de la borne.
     """
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(path, os.O_RDONLY | _nofollow())
     except OSError:
         raise HookError from None
     try:
@@ -886,9 +897,7 @@ def _create_locked_index_copy(index_path: Path, lock_path: Path) -> None:
     source_descriptor = -1
     try:
         try:
-            source_descriptor = os.open(
-                index_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            )
+            source_descriptor = os.open(index_path, os.O_RDONLY | _nofollow())
         except OSError:
             raise HookError from None
         metadata = os.fstat(source_descriptor)
@@ -920,7 +929,7 @@ def _create_locked_index_copy(index_path: Path, lock_path: Path) -> None:
 def _replace_index_atomically(lock_path: Path, index_path: Path) -> None:
     """Remplace l'index par le verrou après contrôle d'identité régulière."""
     try:
-        descriptor = os.open(lock_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(lock_path, os.O_RDONLY | _nofollow())
     except OSError:
         raise HookError from None
     try:
