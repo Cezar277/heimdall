@@ -108,6 +108,7 @@ from heimdall.vault.crypto import (
     kek_matches_pepper,
 )
 from heimdall.vault.database import (
+    _MAX_SECRET_PAGE_OFFSET,
     DEFAULT_DB_PATH,
     DatabaseUnavailableError,
     _assert_not_symlink,
@@ -457,7 +458,7 @@ class SecretRead(SecretMetadata):
     value: SecretValue
 
 
-_MAX_SECRET_OFFSET = 1_000_000
+_MAX_SECRET_OFFSET = _MAX_SECRET_PAGE_OFFSET
 
 
 class SecretPage(BaseModel):

@@ -115,7 +115,7 @@ def test_invalid_pagination_is_400(vault: TestClient, params: dict[str, str | in
 
 @pytest.mark.parametrize(
     "limit, offset",
-    [(0, 0), (-1, 0), (102, 0), (1, -1), (101, -1)],
+    [(0, 0), (-1, 0), (102, 0), (1, -1), (101, -1), (1, 1_000_001)],
 )
 def test_store_rejects_out_of_bounds_pagination(vault: TestClient, limit: int, offset: int) -> None:
     store = vault.app.state.secret_store
@@ -123,9 +123,10 @@ def test_store_rejects_out_of_bounds_pagination(vault: TestClient, limit: int, o
         asyncio.run(store.list_page("demo", limit, offset))
 
 
-def test_store_accepts_internal_limit_plus_one(vault: TestClient) -> None:
+def test_store_accepts_pagination_boundaries(vault: TestClient) -> None:
     store = vault.app.state.secret_store
     assert asyncio.run(store.list_page("demo", 101, 0)) == []
+    assert asyncio.run(store.list_page("demo", 1, 1_000_000)) == []
 
 
 def test_memory_list_page_caches_order_and_invalidates() -> None:

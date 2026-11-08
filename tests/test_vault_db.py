@@ -713,11 +713,12 @@ class VaultDatabaseTests(unittest.TestCase):
         init_db(self.db_path)
         with db_session(self.db_path) as conn:
             create_project(conn, "proj_page")
-            for limit, offset in ((0, 0), (-1, 0), (102, 0), (1, -1)):
+            for limit, offset in ((0, 0), (-1, 0), (102, 0), (1, -1), (1, 1_000_001)):
                 with self.subTest(limit=limit, offset=offset):
                     with self.assertRaisesRegex(ValueError, "pagination hors bornes"):
                         list_secret_page(conn, "proj_page", limit, offset)
             self.assertEqual(list_secret_page(conn, "proj_page", 101, 0), [])
+            self.assertEqual(list_secret_page(conn, "proj_page", 1, 1_000_000), [])
 
     def test_oversized_identifiers_pin_absence_of_db_level_length_validation(self) -> None:
         """Comportement pinné : la couche DB ne valide pas la longueur (ressort de l'API future).

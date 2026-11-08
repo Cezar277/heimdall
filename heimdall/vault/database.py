@@ -1374,6 +1374,7 @@ def list_secrets(
 
 
 _MAX_SECRET_PAGE_LIMIT = 101
+_MAX_SECRET_PAGE_OFFSET = 1_000_000
 
 
 def validate_secret_page_bounds(limit: int, offset: int) -> None:
@@ -1386,7 +1387,12 @@ def validate_secret_page_bounds(limit: int, offset: int) -> None:
     signifie « illimité » et un ``OFFSET`` négatif a une sémantique
     surprenante.
     """
-    if limit < 1 or limit > _MAX_SECRET_PAGE_LIMIT or offset < 0:
+    if (
+        limit < 1
+        or limit > _MAX_SECRET_PAGE_LIMIT
+        or offset < 0
+        or offset > _MAX_SECRET_PAGE_OFFSET
+    ):
         raise ValueError("pagination hors bornes")
 
 
