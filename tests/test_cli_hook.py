@@ -18,12 +18,14 @@ from heimdall.cli.hook import (
     HOOK_MARKER,
     HookError,
     UnstagedChangesError,
+    _verify_root,
     apply_and_restage,
     install_hook,
     restage_paths,
     uninstall_hook,
 )
 from heimdall.cli.main import app
+from heimdall.mcp.gitdiff import GitAccess
 
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 TEST_HMAC_KEY = "00" * 32
@@ -222,18 +224,99 @@ def test_uninstall_leaves_a_foreign_hook_untouched(git_repo: GitRepo) -> None:
     assert hook.read_text(encoding="utf-8") == "foreign\n"
 
 
+def test_uninstall_restores_a_symlinked_legacy_hook(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    target = tmp_path / "legacy-target"
+    target.write_text("#!/bin/sh\necho LEGACY\n", encoding="utf-8")
+    target.chmod(0o755)
+    hook = _hook(git_repo)
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.symlink_to(target)
+
+    assert _run("hook", "install", str(git_repo.root)).exit_code == 0
+    assert _legacy(git_repo).is_symlink()
+    assert _run("hook", "uninstall", str(git_repo.root)).exit_code == 0
+
+    assert hook.is_symlink()
+    assert os.readlink(hook) == str(target)
+
+
 @pytest.mark.parametrize("absolute", [False, True])
 def test_install_respects_core_hooks_path(
     git_repo: GitRepo, tmp_path: Path, absolute: bool
 ) -> None:
     custom = tmp_path / "custom-hooks" if absolute else git_repo.root / "custom-hooks"
     git_repo.git("config", "core.hooksPath", str(custom) if absolute else "custom-hooks")
+    arguments = ("hook", "install", str(git_repo.root))
+    if absolute:
+        arguments = (*arguments, "--force")
 
-    result = _run("hook", "install", str(git_repo.root))
+    result = _run(*arguments)
 
     assert result.exit_code == 0
     assert (custom / "pre-commit").is_file()
     assert not (git_repo.root / ".git" / "hooks" / "pre-commit").exists()
+
+
+def test_install_refuses_an_absolute_hooks_path_outside_the_repository(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    custom = tmp_path / "outside-hooks"
+    git_repo.git("config", "core.hooksPath", str(custom))
+
+    result = _run("hook", "install", str(git_repo.root))
+
+    assert result.exit_code == 2
+    assert "--force" in result.stderr
+    assert not (custom / "pre-commit").exists()
+
+
+def test_install_accepts_an_absolute_hooks_path_outside_with_force(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    custom = tmp_path / "outside-hooks"
+    git_repo.git("config", "core.hooksPath", str(custom))
+
+    result = _run("hook", "install", str(git_repo.root), "--force")
+
+    assert result.exit_code == 0
+    assert (custom / "pre-commit").is_file()
+
+
+def test_uninstall_requires_force_for_an_absolute_hooks_path_outside(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    custom = tmp_path / "outside-hooks"
+    git_repo.git("config", "core.hooksPath", str(custom))
+    assert _run("hook", "install", str(git_repo.root), "--force").exit_code == 0
+
+    refused = _run("hook", "uninstall", str(git_repo.root))
+    assert refused.exit_code == 2
+    assert (custom / "pre-commit").is_file()
+
+    forced = _run("hook", "uninstall", str(git_repo.root), "--force")
+    assert forced.exit_code == 0
+    assert not (custom / "pre-commit").exists()
+
+
+def test_install_refuses_an_absolute_symlink_to_outside_without_force(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    target = tmp_path / "target-hooks"
+    target.mkdir()
+    link = tmp_path / "linked-hooks"
+    link.symlink_to(target)
+    git_repo.git("config", "core.hooksPath", str(link))
+
+    result = _run("hook", "install", str(git_repo.root))
+
+    assert result.exit_code == 2
+    assert not (target / "pre-commit").exists()
+
+    forced = _run("hook", "install", str(git_repo.root), "--force")
+    assert forced.exit_code == 0
+    assert (target / "pre-commit").is_file()
 
 
 def test_install_refuses_a_world_writable_hooks_directory(
@@ -311,6 +394,31 @@ def test_hook_blocks_a_staged_secret(git_repo: GitRepo) -> None:
     git_repo.stage("app.py")
     clean = _commit(git_repo, "clean")
     assert clean.returncode == 0, clean.stderr
+
+
+def test_heimdall_in_hook_is_a_documented_bypass(git_repo: GitRepo) -> None:
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.stage("app.py")
+    git_repo.commit_all("base")
+    git_repo.write("app.py", f'AWS = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage("app.py")
+    assert _run("hook", "install", str(git_repo.root)).exit_code == 0
+    environment = dict(os.environ)
+    environment[HEIMDALL_IN_HOOK_ENV] = "1"
+    assert GIT is not None
+
+    completed = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+        [GIT, "-C", str(git_repo.root), "commit", "-m", "bypass"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "scan ignoré" in completed.stderr
+    assert FAKE_AWS_KEY in git_repo.git_output("show", "HEAD:app.py")
 
 
 def test_hook_scans_only_the_index(git_repo: GitRepo) -> None:
@@ -420,7 +528,17 @@ def test_apply_and_restage_refuses_a_deleted_tracked_file(git_repo: GitRepo) -> 
 
 @pytest.mark.parametrize(
     "path",
-    ["../evil", "/etc/passwd", ".git/config", ".env", "a\\b", "a:b", "dir/"],
+    [
+        "../evil",
+        "/etc/passwd",
+        ".git/config",
+        ".env",
+        "a\\b",
+        "a:b",
+        "dir/",
+        "-q",
+        "--cacheinfo",
+    ],
 )
 def test_restage_rejects_unsafe_paths(git_repo: GitRepo, path: str) -> None:
     with pytest.raises(HookError):
@@ -480,6 +598,16 @@ def test_restage_does_not_run_filters_or_hooks(git_repo: GitRepo, tmp_path: Path
     assert git_repo.git_output("show", ":app.py") == "new\n"
 
 
+def test_verify_root_detects_a_replaced_root(git_repo: GitRepo) -> None:
+    access = GitAccess(git_repo.root)
+    moved = git_repo.root.with_name("moved")
+    git_repo.root.rename(moved)
+    git_repo.root.mkdir()
+
+    with pytest.raises(HookError):
+        _verify_root(access)
+
+
 def test_hook_skips_when_already_inside_a_hook(git_repo: GitRepo) -> None:
     git_repo.write("app.py", f'AWS = "{FAKE_AWS_KEY}"\n')
     git_repo.stage("app.py")
@@ -498,6 +626,7 @@ def test_hook_skips_when_already_inside_a_hook(git_repo: GitRepo) -> None:
     )
 
     assert completed.returncode == 0
+    assert "scan ignoré" in completed.stderr
     assert FAKE_AWS_KEY not in completed.stdout + completed.stderr
 
 

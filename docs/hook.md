@@ -7,22 +7,26 @@ Statut : livré. Le hook local est une **aide** : il reste contournable par
 ## Utilisation
 
 ```sh
-heimdall hook install [CHEMIN]    # installe ou met à jour le hook
-heimdall hook uninstall [CHEMIN]  # retire le hook et restaure le précédent
+heimdall hook install [CHEMIN] [--force]    # installe ou met à jour le hook
+heimdall hook uninstall [CHEMIN] [--force]  # retire le hook et restaure le précédent
 ```
 
 `CHEMIN` est la racine du dépôt Git (`.` par défaut). Les commandes échouent
 en code 2 si la racine n'est pas un dépôt, si le hook existant ne peut pas
 être conservé, ou si l'écriture échoue. Les messages sont statiques : aucun
-chemin ni contenu n'est reflété.
+chemin ni contenu n'est reflété. `--force` est requis pour un
+`core.hooksPath` absolu qui sort du dépôt **et** du répertoire Git commun
+(worktrees liés).
 
 ## Ce que fait le hook installé
 
 Le script généré exécute, dans cet ordre :
 
 1. le hook précédent s'il a été conservé et s'il est exécutable ;
-2. `python -m heimdall.cli.main scan --staged .` avec l'interpréteur absolu
-   qui a installé Heimdall.
+2. `heimdall scan --staged .` avec le script console absolu (ou, à défaut,
+   `python -I -m heimdall.cli.main`) qui a installé Heimdall. `-I` isole
+   l'interpréteur du `PYTHONPATH` et du dépôt : un `heimdall/` local ne peut
+   pas détourner l'import.
 
 Le hook précédent passe **avant** Heimdall : s'il modifie l'index, le scan
 juge l'état final qui sera réellement commité. Un code de sortie non nul du
@@ -39,7 +43,11 @@ seront pas commitées (#106).
 ## Hooks existants, `core.hooksPath` et worktrees
 
 Le dossier de hooks est celui rendu par `git rev-parse --git-path hooks` :
-il respecte `core.hooksPath` et les worktrees liés.
+il respecte `core.hooksPath` et les worktrees liés. Le chemin est **résolu**
+(liens symboliques suivis) avant contrôle. Un `core.hooksPath` relatif doit
+rester dans le dépôt ; un absolu doit rester dans le dépôt ou dans le
+répertoire Git commun, sinon `--force` est exigé. Sans `--force`, la commande
+refuse en code 2 avant toute écriture.
 
 - hook absent : Heimdall écrit `pre-commit` ;
 - hook Heimdall déjà présent : mise à jour idempotente ;
@@ -57,9 +65,14 @@ déplacé comme sauvegarde et n'est pas chaîné.
 ## Anti-récursion
 
 Le script pose `HEIMDALL_IN_HOOK=1` avant d'exécuter le hook précédent et le
-scan. Si la variable vaut déjà `1`, il sort immédiatement en `0`. Un hook
-hérité qui relancerait Heimdall, ou une future remédiation qui ré-indexe,
-ne déclenche donc pas de boucle (#105).
+scan. Si la variable vaut déjà `1`, il affiche un avertissement sur stderr
+puis sort immédiatement en `0`. Un hook hérité qui relancerait Heimdall, ou
+une future remédiation qui ré-indexe, ne déclenche donc pas de boucle (#105).
+
+Poser `HEIMDALL_IN_HOOK=1` dans l'environnement **contourne le hook** :
+c'est équivalent à `git commit --no-verify`. L'avertissement rend le
+contournement visible, mais ne le bloque pas. La CI `--ci` reste la barrière
+(REQ-SEC-08).
 
 ## Ré-indexation après remédiation
 
@@ -85,19 +98,30 @@ réelle, confinement à la racine, refus des liens sortants). Les chemins
 Le hook installé se contente de scanner et bloquer : le branchement du
 moteur de remédiation interactif reste le ticket #30/#32.
 
+## Limites
+
+- `git commit --no-verify` contourne le hook.
+- `HEIMDALL_IN_HOOK=1` contourne le hook (avertissement sur stderr) ; c'est
+  le mécanisme d'anti-récursion, pas une garantie de sécurité.
+- Le hook est local et mono-utilisateur ; la CI déterministe reste la seule
+  barrière opposable pour une branche partagée.
+
 ## Preuves
 
 `tests/test_cli_hook.py` couvre notamment :
 
 - installation, mise à jour idempotente, désinstallation et restauration ;
 - hook existant conservé et chaîné, refus d'écraser une sauvegarde ;
-- `core.hooksPath` relatif/absolu et worktree lié ;
+- `core.hooksPath` relatif/absolu, `--force` hors dépôt, symlink résolu et
+  worktree lié ;
 - blocage d'un secret indexé, ignore d'un secret non indexé ;
+- contournement documenté `HEIMDALL_IN_HOOK=1` sur un vrai `git commit` ;
 - commit partiel avec deux hunks : l'index reste exactement celui préparé,
   le second hunk reste intact dans le dossier de travail ;
 - refus des modifications non indexées avant remédiation ;
 - ré-indexation sans exécuter les filtres `clean` ni le hook
   `post-index-change` ;
+- chemins commençant par `-` refusés, restauration d'un legacy symlink ;
 - anti-récursion `HEIMDALL_IN_HOOK=1`.
 
 ```sh

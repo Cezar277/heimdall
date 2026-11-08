@@ -93,6 +93,13 @@ class UnstagedChangesError(HookError):
         )
 
 
+class OutsideRepositoryError(HookError):
+    """``core.hooksPath`` sort du dépôt et du répertoire Git commun."""
+
+    def __init__(self) -> None:
+        super().__init__("hooksPath hors du dépôt : utiliser --force")
+
+
 class InstallOutcome(str, Enum):
     """Résultat d'une installation, pour un message CLI statique."""
 
@@ -188,15 +195,42 @@ def _git_path(access: GitAccess, name: str) -> Path:
         path = Path(raw.decode("utf-8"))
     except UnicodeDecodeError:
         raise HookError from None
-    if path.is_absolute():
-        return Path(os.path.abspath(path))
     try:
-        resolved = (access.root / path).resolve()
+        resolved = path.resolve() if path.is_absolute() else (access.root / path).resolve()
     except (OSError, RuntimeError):
         raise HookError from None
-    if not resolved.is_relative_to(access.root):
+    if not path.is_absolute() and not resolved.is_relative_to(access.root):
         raise HookError
     return resolved
+
+
+def _git_common_dir(access: GitAccess) -> Path:
+    """Répertoire Git commun (``.git`` partagé par les worktrees liés)."""
+    try:
+        completed = access.execute(("rev-parse", "--git-common-dir"))
+    except ToolFailure:
+        raise HookError from None
+    if completed.returncode != 0:
+        raise HookError
+    raw = completed.stdout[:-1] if completed.stdout.endswith(b"\n") else completed.stdout
+    if not raw or b"\x00" in raw or b"\n" in raw or b"\r" in raw:
+        raise HookError
+    try:
+        path = Path(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise HookError from None
+    if not path.is_absolute():
+        path = access.root / path
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        raise HookError from None
+
+
+def _inside_allowed_roots(access: GitAccess, path: Path) -> bool:
+    """Vrai si ``path`` est dans le worktree ou dans le Git commun."""
+    common = _git_common_dir(access)
+    return path.is_relative_to(access.root) or path.is_relative_to(common)
 
 
 def _interpreter() -> str:
@@ -285,6 +319,7 @@ def _hook_script(launcher: str, legacy: Path | None) -> bytes:
         HOOK_MARKER,
         "# Généré par `heimdall hook install` : ne pas éditer à la main.",
         'if [ "${HEIMDALL_IN_HOOK:-}" = "1" ]; then',
+        '    echo "heimdall: hook déjà en cours (HEIMDALL_IN_HOOK=1), scan ignoré" >&2',
         "    exit 0",
         "fi",
         "HEIMDALL_IN_HOOK=1",
@@ -416,15 +451,18 @@ def _prepare_existing_hook(hook_path: Path, legacy_path: Path) -> tuple[bool, bo
     return False, True
 
 
-def install_hook(root: Path) -> InstallOutcome:
+def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
     """Installe (ou met à jour) le hook ``pre-commit`` du dépôt ``root``.
 
     Un hook existant est conservé : renommé en ``pre-commit.heimdall-legacy``
     puis chaîné s'il est exécutable. Si une sauvegarde existe déjà, un nouveau
-    hook étranger est refusé au lieu d'être écrasé.
+    hook étranger est refusé au lieu d'être écrasé. Un ``hooksPath`` absolu
+    hors du dépôt et du répertoire Git commun exige ``force=True``.
     """
     access = _open_repository(root)
     hooks_directory = _git_path(access, "hooks")
+    if not force and not _inside_allowed_roots(access, hooks_directory):
+        raise OutsideRepositoryError
     _verify_root(access)
     _ensure_hooks_directory(hooks_directory)
     hook_path = hooks_directory / HOOK_NAME
@@ -452,10 +490,12 @@ def install_hook(root: Path) -> InstallOutcome:
     return InstallOutcome.INSTALLED
 
 
-def uninstall_hook(root: Path) -> UninstallOutcome:
+def uninstall_hook(root: Path, *, force: bool = False) -> UninstallOutcome:
     """Retire le hook Heimdall et restaure le hook précédent s'il existe."""
     access = _open_repository(root)
     hooks_directory = _git_path(access, "hooks")
+    if not force and not _inside_allowed_roots(access, hooks_directory):
+        raise OutsideRepositoryError
     _verify_root(access)
     hook_path = hooks_directory / HOOK_NAME
     legacy_path = hooks_directory / (HOOK_NAME + LEGACY_SUFFIX)
@@ -497,6 +537,10 @@ def _confined_paths(root: Path, paths: Iterable[str]) -> list[ConfinedPath]:
         if item.relative in seen:
             continue
         seen.add(item.relative)
+        if item.relative.startswith("-"):
+            # Contrat explicite : un chemin ne doit jamais ressembler à une
+            # option, même si l'arité de ``--cacheinfo`` le protège aujourd'hui.
+            raise HookError
         parts = [part.lower() for part in item.relative.split("/")]
         if ".git" in parts:
             raise HookError
@@ -574,6 +618,7 @@ def assert_no_unstaged_changes(root: Path, paths: Iterable[str]) -> list[Confine
     """
     access = _open_repository(root)
     repository_root = access.root
+    _verify_root(access)
     confined = _confined_paths(repository_root, paths)
     for item in confined:
         try:
@@ -602,6 +647,7 @@ def assert_no_unstaged_changes(root: Path, paths: Iterable[str]) -> list[Confine
             raise UnstagedChangesError
         if completed.returncode != 0:
             raise HookError
+    _verify_root(access)
     return confined
 
 
@@ -615,6 +661,7 @@ def restage_paths(root: Path, paths: Iterable[str]) -> int:
     """
     access = _open_repository(root)
     repository_root = access.root
+    _verify_root(access)
     confined = _confined_paths(repository_root, paths)
     entries: list[tuple[str, str, str]] = []
     for item in confined:
@@ -628,6 +675,7 @@ def restage_paths(root: Path, paths: Iterable[str]) -> int:
     completed = _run_git(repository_root, arguments)
     if completed.returncode != 0:
         raise HookError
+    _verify_root(access)
     return len(entries)
 
 
@@ -677,10 +725,20 @@ hook_app = typer.Typer(
 
 
 @hook_app.command("install")
-def hook_install(path: str = typer.Argument(".", help="Racine du dépôt Git.")) -> None:
+def hook_install(
+    path: str = typer.Argument(".", help="Racine du dépôt Git."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Autoriser un hooksPath absolu hors du dépôt et du Git commun.",
+    ),
+) -> None:
     """Installe le hook pre-commit dans le dépôt indiqué."""
     try:
-        outcome = install_hook(Path(path))
+        outcome = install_hook(Path(path), force=force)
+    except OutsideRepositoryError:
+        typer.echo("hook pre-commit : hooksPath hors du dépôt (utiliser --force)", err=True)
+        raise typer.Exit(code=2) from None
     except HookError:
         typer.echo("hook pre-commit : installation impossible", err=True)
         raise typer.Exit(code=2) from None
@@ -689,10 +747,20 @@ def hook_install(path: str = typer.Argument(".", help="Racine du dépôt Git."))
 
 
 @hook_app.command("uninstall")
-def hook_uninstall(path: str = typer.Argument(".", help="Racine du dépôt Git.")) -> None:
+def hook_uninstall(
+    path: str = typer.Argument(".", help="Racine du dépôt Git."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Autoriser un hooksPath absolu hors du dépôt et du Git commun.",
+    ),
+) -> None:
     """Retire le hook pre-commit et restaure le hook précédent."""
     try:
-        outcome = uninstall_hook(Path(path))
+        outcome = uninstall_hook(Path(path), force=force)
+    except OutsideRepositoryError:
+        typer.echo("hook pre-commit : hooksPath hors du dépôt (utiliser --force)", err=True)
+        raise typer.Exit(code=2) from None
     except HookError:
         typer.echo("hook pre-commit : désinstallation impossible", err=True)
         raise typer.Exit(code=2) from None
