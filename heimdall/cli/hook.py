@@ -306,7 +306,10 @@ def _launcher(root: Path) -> str:
     # Python : on garde le module isolé, qui fonctionne partout.
     if os.name != "nt" and console.is_file() and os.access(console, os.X_OK):
         try:
-            if console.resolve().is_relative_to(root.resolve()):
+            repository_root = root.resolve()
+            if console.is_relative_to(repository_root) or console.resolve().is_relative_to(
+                repository_root
+            ):
                 return f"{shlex.quote(python)} -I -m heimdall.cli.main"
         except (OSError, RuntimeError):
             raise HookError from None
@@ -840,7 +843,12 @@ def _create_locked_index_copy(index_path: Path, lock_path: Path) -> None:
                 os.close(descriptor)
 
 
-def _restage_paths(root: Path, paths: Iterable[str]) -> int:
+def _restage_paths(
+    root: Path,
+    paths: Iterable[str],
+    *,
+    expected: Sequence[ConfinedPath] | None = None,
+) -> int:
     """Ré-indexe le contenu exact de fichiers remédiés, sans filtre ni hook.
 
     Fonction **interne** : l'appelant public est :func:`apply_and_restage`,
@@ -853,6 +861,11 @@ def _restage_paths(root: Path, paths: Iterable[str]) -> int:
     repository_root = access.root
     _verify_root(access)
     confined = _confined_paths(repository_root, paths)
+    if expected is not None:
+        frozen = {item.relative: item.absolute for item in expected}
+        for item in confined:
+            if frozen.get(item.relative) != item.absolute:
+                raise HookError
     entries: list[tuple[str, str, str]] = []
     for item in confined:
         data, metadata = _read_regular_bounded(item.absolute)
@@ -920,7 +933,11 @@ def apply_and_restage(
     os.environ[HEIMDALL_IN_HOOK_ENV] = "1"
     try:
         apply()
-        return _restage_paths(root, [item.relative for item in confined])
+        return _restage_paths(
+            root,
+            [item.relative for item in confined],
+            expected=confined,
+        )
     finally:
         if previous is None:
             os.environ.pop(HEIMDALL_IN_HOOK_ENV, None)

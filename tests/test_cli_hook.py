@@ -167,6 +167,26 @@ def test_launcher_refuses_a_console_script_inside_the_repository(
     assert str(console) not in launcher
 
 
+def test_launcher_refuses_a_console_symlink_under_the_repository(
+    git_repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv_bin = git_repo.root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.write_text("", encoding="utf-8")
+    outside = tmp_path / "outside-heimdall"
+    outside.write_text("", encoding="utf-8")
+    outside.chmod(0o755)
+    console = venv_bin / "heimdall"
+    console.symlink_to(outside)
+    monkeypatch.setattr(hook_module.sys, "executable", str(python))
+
+    launcher = _launcher(git_repo.root)
+
+    assert "-I -m heimdall.cli.main" in launcher
+    assert str(console) not in launcher
+
+
 def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:
     result = _run("hook", "install", str(git_repo.root))
 
@@ -731,6 +751,23 @@ def test_apply_and_restage_restores_state_when_apply_fails(git_repo: GitRepo) ->
 
     assert git_repo.git_output("show", ":app.py") == before
     assert HEIMDALL_IN_HOOK_ENV not in os.environ
+
+
+def test_apply_and_restage_freezes_the_asserted_paths(git_repo: GitRepo) -> None:
+    git_repo.write("a", "a\n")
+    git_repo.write("b", "b\n")
+    git_repo.stage("a", "b")
+    git_repo.commit_all("base")
+    before = git_repo.git_output("show", ":a")
+
+    def apply() -> None:
+        (git_repo.root / "a").unlink()
+        (git_repo.root / "a").symlink_to(git_repo.root / "b")
+
+    with pytest.raises(HookError):
+        apply_and_restage(git_repo.root, ["a"], apply)
+
+    assert git_repo.git_output("show", ":a") == before
 
 
 @pytest.mark.parametrize(

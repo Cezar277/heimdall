@@ -29,8 +29,10 @@ isole l'interpréteur du `PYTHONPATH` et du dépôt : un `heimdall/` local ne
 peut pas détourner l'import. Git lance les hooks avec `cwd` = racine ; si le
 script est invoqué depuis un sous-dossier, `$PWD` n'est pas une racine de
 dépôt et le scan échoue en code 2 (fail-closed), jamais un périmètre partiel.
-Un console script situé sous la racine (venv dans le dépôt) est refusé et
-remplacé par le module isolé.
+Un console script situé sous la racine, même s'il pointe par lien vers
+l'extérieur (venv dans le dépôt), est refusé et remplacé par le module isolé.
+L'interpréteur Python lui-même reste celui de l'installation : pour une
+garantie forte, installer Heimdall avec un interpréteur **hors du dépôt**.
 
 Le hook précédent est localisé **relativement au script** (`dirname "$0"`) :
 déplacer le dépôt ne casse pas le chaînage. Il passe **avant** Heimdall :
@@ -93,7 +95,10 @@ fournie pour le moteur de remédiation (#30/#32) :
    automatique est refusée (`UnstagedChangesError`) : un `git add` après
    coup indexerait des lignes que le développeur n'a pas choisies ;
 2. `apply()` applique le patch ;
-3. `_restage_paths` (interne) ré-indexe le contenu exact des seuls fichiers cibles.
+3. `_restage_paths` (interne) ré-indexe le contenu exact des seuls fichiers
+   cibles. Les `ConfinedPath` assertés sont figés et repassés : si un chemin
+   a été échangé contre un lien vers un autre fichier entre 1 et 3, la
+   ré-indexation refuse (`HookError`) au lieu de stager la cible.
 
 La ré-indexation n'exécute **ni filtre `clean` ni hook Git** du dépôt :
 le contenu est lu par Heimdall (`O_NOFOLLOW`, taille bornée), haché par
@@ -130,6 +135,9 @@ moteur de remédiation interactif reste le ticket #30/#32.
   le mécanisme d'anti-récursion, pas une garantie de sécurité.
 - Le hook est local et mono-utilisateur ; la CI déterministe reste la seule
   barrière opposable pour une branche partagée.
+- Si l'interpréteur Python est un venv **dans le dépôt**, le dépôt peut le
+  modifier après l'installation ; pour une garantie forte, utiliser un
+  interpréteur hors du dépôt. Le script console sous la racine est refusé.
 
 ## Preuves
 
@@ -154,8 +162,11 @@ moteur de remédiation interactif reste le ticket #30/#32.
 - détection « notre hook » ancrée au préambule, pas à une sous-chaîne ;
 - chaînage du legacy par chemin relatif au hook, prouvé après déplacement
   du dépôt ;
-- console script sous la racine refusé (repli `-m`) et commit depuis un
-  sous-dossier toujours bloqué par le scan de la racine ;
+- console script sous la racine (même lien vers l'extérieur) refusé
+  (repli `-m`) et commit depuis un sous-dossier toujours bloqué par le scan
+  de la racine ;
+- chemins assertés figés : un échange `a` → lien vers `b` entre l'assert et
+  la ré-indexation est refusé sans stager `b` ;
 - anti-récursion `HEIMDALL_IN_HOOK=1`.
 
 ```sh
