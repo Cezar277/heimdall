@@ -28,6 +28,7 @@ import typer
 import heimdall
 from heimdall.cli.cold_start import collect_cold_start, render_cold_start
 from heimdall.cli.history import collect_history, render_history
+from heimdall.cli.hook import hook_app
 from heimdall.cli.scan import (
     EXIT_CLEAN,
     EXIT_FINDINGS,
@@ -56,6 +57,8 @@ app = typer.Typer(
 )
 # Administration du Vault (clés API de projet, ticket #64) et client (ticket #35).
 app.add_typer(vault_app, name="vault")
+# Hook Git pre-commit (tickets #36, #103-#106).
+app.add_typer(hook_app, name="hook")
 
 # Exécution avec injection en mémoire (ticket #101). Voie canonique :
 # `heimdall run`. L'alias `heimdall vault run` (vault_keys.py) partage le
@@ -317,3 +320,7 @@ def mcp(
 def main() -> None:
     """Entrée console ``heimdall`` (voir ``[project.scripts]``)."""
     app()
+
+
+if __name__ == "__main__":
+    main()

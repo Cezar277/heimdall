@@ -479,6 +479,10 @@ class GitAccess:
                 raise ToolFailure("INTERNAL") from None
         return resolved
 
+    def index_path(self, *, timeout: float = GIT_TIMEOUT_SECONDS) -> Path:
+        """Chemin réel et vérifié de l'index (refus des liens/non-réguliers)."""
+        return self._checked_index_path(timeout=timeout)
+
     def index_entry(
         self,
         relative_path: str,
