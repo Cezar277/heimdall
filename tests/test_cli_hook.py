@@ -635,6 +635,8 @@ def test_apply_and_restage_restores_state_when_apply_fails(git_repo: GitRepo) ->
         ".env.d/f",
         ".env.example/foo",
         "a/.env.example/f",
+        ".ENV.EXAMPLE",
+        ".Env.Example/foo",
         "a\\b",
         "a:b",
         "dir/",

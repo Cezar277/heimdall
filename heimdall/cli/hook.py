@@ -596,15 +596,17 @@ def _confined_paths(root: Path, paths: Iterable[str]) -> list[ConfinedPath]:
             # Contrat explicite : un chemin ne doit jamais ressembler à une
             # option, même si l'arité de ``--cacheinfo`` le protège aujourd'hui.
             raise HookError
-        parts = [part.lower() for part in item.relative.split("/")]
+        raw_parts = item.relative.split("/")
+        parts = [part.lower() for part in raw_parts]
         if ".git" in parts:
             raise HookError
         for index, part in enumerate(parts):
             if not part.startswith(".env"):
                 continue
-            # Seul le fichier exact ``.env.example`` en dernier composant est
-            # autorisé ; un répertoire ``.env.example/`` reste refusé.
-            if index == len(parts) - 1 and part == ".env.example":
+            # Seul le fichier exact ``.env.example`` (casse incluse) en dernier
+            # composant est autorisé ; un répertoire ``.env.example/`` reste
+            # refusé.
+            if index == len(raw_parts) - 1 and raw_parts[index] == ".env.example":
                 continue
             raise HookError
         confined.append(item)

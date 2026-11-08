@@ -101,8 +101,9 @@ un argv figé, `core.fsmonitor=false` et `core.hooksPath=os.devnull` ; les
 chemins passent par la garde unique `heimdall.mcp.paths.confine` (résolution
 réelle, confinement à la racine, refus des liens sortants). Les chemins
 contenant un composant `.git` ou `.env*` sont refusés, quel que soit leur
-niveau ; seul le **fichier** exact `.env.example` (dernier composant) est
-accepté, un répertoire `.env.example/` est refusé.
+niveau ; seul le **fichier** exact `.env.example` (dernier composant,
+**casse incluse**) est accepté, un répertoire `.env.example/` ou un nom
+`.ENV.EXAMPLE` est refusé.
 
 Le hook installé se contente de scanner et bloquer : le branchement du
 moteur de remédiation interactif reste le ticket #30/#32.
