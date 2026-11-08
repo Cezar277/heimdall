@@ -339,6 +339,8 @@ def test_install_force_refuses_a_group_writable_existing_parent(
 
     assert result.exit_code == 2
     assert not custom.exists()
+    shared.chmod(0o755)
+    assert _run("hook", "install", str(git_repo.root), "--force").exit_code == 0
 
 
 def test_atomic_write_refuses_a_temporary_swapped_for_a_symlink(
