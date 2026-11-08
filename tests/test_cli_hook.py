@@ -379,6 +379,34 @@ def test_uninstall_refuses_a_directory_as_hook(git_repo: GitRepo) -> None:
     assert hook.is_dir()
 
 
+def test_uninstall_refuses_a_directory_legacy_without_overwriting(
+    git_repo: GitRepo,
+) -> None:
+    assert _run("hook", "install", str(git_repo.root)).exit_code == 0
+    legacy = _legacy(git_repo)
+    legacy.mkdir()
+
+    result = _run("hook", "uninstall", str(git_repo.root))
+
+    assert result.exit_code == 2
+    assert _hook(git_repo).is_file()
+    assert legacy.is_dir()
+
+
+def test_uninstall_refuses_a_directory_legacy_when_hook_is_absent(
+    git_repo: GitRepo,
+) -> None:
+    legacy = _legacy(git_repo)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.mkdir()
+
+    result = _run("hook", "uninstall", str(git_repo.root))
+
+    assert result.exit_code == 2
+    assert not _hook(git_repo).exists()
+    assert legacy.is_dir()
+
+
 def test_install_uses_the_worktree_hooks_path(git_repo: GitRepo, tmp_path: Path) -> None:
     git_repo.write("app.py", "x = 1\n")
     git_repo.stage("app.py")
@@ -587,6 +615,8 @@ def test_apply_and_restage_restores_state_when_apply_fails(git_repo: GitRepo) ->
         ".env",
         "a/.env/b",
         ".env.d/f",
+        ".env.example/foo",
+        "a/.env.example/f",
         "a\\b",
         "a:b",
         "dir/",

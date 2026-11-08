@@ -511,6 +511,16 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
     return InstallOutcome.INSTALLED
 
 
+def _check_legacy_restorable(path: Path) -> None:
+    """Refuse de restaurer autre chose qu'un fichier régulier ou un lien."""
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        raise HookError from None
+    if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+        raise HookError
+
+
 def uninstall_hook(root: Path, *, force: bool = False) -> UninstallOutcome:
     """Retire le hook Heimdall et restaure le hook précédent s'il existe."""
     access = _open_repository(root)
@@ -529,12 +539,14 @@ def uninstall_hook(root: Path, *, force: bool = False) -> UninstallOutcome:
             if not stat.S_ISREG(metadata.st_mode) or not _is_ours(hook_path):
                 outcome = UninstallOutcome.NOT_INSTALLED
             elif os.path.lexists(legacy_path):
+                _check_legacy_restorable(legacy_path)
                 os.replace(legacy_path, hook_path)
                 outcome = UninstallOutcome.RESTORED
             else:
                 os.unlink(hook_path)
                 outcome = UninstallOutcome.REMOVED
         elif os.path.lexists(legacy_path):
+            _check_legacy_restorable(legacy_path)
             os.replace(legacy_path, hook_path)
             outcome = UninstallOutcome.RESTORED
         else:
@@ -570,7 +582,13 @@ def _confined_paths(root: Path, paths: Iterable[str]) -> list[ConfinedPath]:
         parts = [part.lower() for part in item.relative.split("/")]
         if ".git" in parts:
             raise HookError
-        if any(part.startswith(".env") and part != ".env.example" for part in parts):
+        for index, part in enumerate(parts):
+            if not part.startswith(".env"):
+                continue
+            # Seul le fichier exact ``.env.example`` en dernier composant est
+            # autorisé ; un répertoire ``.env.example/`` reste refusé.
+            if index == len(parts) - 1 and part == ".env.example":
+                continue
             raise HookError
         confined.append(item)
     if not confined:
