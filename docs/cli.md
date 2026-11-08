@@ -3,6 +3,10 @@
 Le journal des propositions de rejet du LLM se consulte avec
 `heimdall rejections [--details]` ; voir [T33](llm-rejections.md).
 
+Le hook Git `pre-commit` s'installe avec `heimdall hook install` et se retire
+avec `heimdall hook uninstall` ; il exécute `heimdall scan --staged` sur
+l'index uniquement. Voir [hook.md](hook.md) (T36, #103-#106).
+
 Le premier lancement sur un dépôt existant dispose de deux commandes
 associées, décrites dans [cold-start.md](cold-start.md) (T38, #107–#110) :
 `heimdall cold-start` (entonnoir regex/entropie puis avis LLM sur les seuls
