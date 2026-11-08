@@ -28,8 +28,9 @@ Le script généré exécute, dans cet ordre :
    l'interpréteur du `PYTHONPATH` et du dépôt : un `heimdall/` local ne peut
    pas détourner l'import.
 
-Le hook précédent passe **avant** Heimdall : s'il modifie l'index, le scan
-juge l'état final qui sera réellement commité. Un code de sortie non nul du
+Le hook précédent est localisé **relativement au script** (`dirname "$0"`) :
+déplacer le dépôt ne casse pas le chaînage. Il passe **avant** Heimdall :
+s'il modifie l'index, le scan juge l'état final qui sera réellement commité. Un code de sortie non nul du
 hook précédent bloque le commit sans lancer Heimdall. Le code de sortie de
 Heimdall est propagé : `0` (propre), `1` (secrets détectés), `2` (erreur
 d'outillage) bloquent le commit pour `1` et `2`.
@@ -93,10 +94,11 @@ fournie pour le moteur de remédiation (#30/#32) :
 La ré-indexation n'exécute **ni filtre `clean` ni hook Git** du dépôt :
 le contenu est lu par Heimdall (`O_NOFOLLOW`, taille bornée), haché par
 `git hash-object -w --no-filters --stdin`, puis écrit dans un **index
-temporaire** par `git update-index --add --cacheinfo`. L'index réel est
-remplacé atomiquement (`os.replace`) sous le verrou Git `index.lock`, après
-vérification des entrées (`git ls-files -s -z`) : une panne médiane ne laisse
-pas l'index partiellement modifié. Les commandes git internes utilisent
+temporaire** par `git update-index --add --cacheinfo`. Le verrou Git
+`index.lock` est pris **avant** la copie de l'index, puis l'index réel est
+remplacé atomiquement (`os.replace`) après vérification des entrées
+(`git ls-files -s -z`) : ni panne médiane ni `git add` concurrent ne laisse
+l'index partiellement modifié ou n'écrase une mise à jour concurrente. Les commandes git internes utilisent
 un argv figé, `core.fsmonitor=false` et `core.hooksPath=os.devnull` ; les
 chemins passent par la garde unique `heimdall.mcp.paths.confine` (résolution
 réelle, confinement à la racine, refus des liens sortants). Les chemins
@@ -130,11 +132,14 @@ moteur de remédiation interactif reste le ticket #30/#32.
   le second hunk reste intact dans le dossier de travail ;
 - refus des modifications non indexées avant remédiation ;
 - ré-indexation sans exécuter les filtres `clean` ni le hook
-  `post-index-change`, avec index temporaire et échec `update-index` sans
-  modification de l'index réel ;
+  `post-index-change`, avec verrou `index.lock` pris avant copie, échec
+  `update-index` sans modification de l'index réel et refus si le verrou
+  est déjà pris ;
 - chemins commençant par `-` refusés, `.env.example/` répertoire refusé,
   restauration d'un legacy symlink ou refus d'un legacy répertoire ;
 - détection « notre hook » ancrée au préambule, pas à une sous-chaîne ;
+- chaînage du legacy par chemin relatif au hook, prouvé après déplacement
+  du dépôt ;
 - anti-récursion `HEIMDALL_IN_HOOK=1`.
 
 ```sh

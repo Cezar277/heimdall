@@ -146,7 +146,8 @@ def test_install_preserves_and_chains_an_existing_hook(git_repo: GitRepo) -> Non
     assert legacy.read_text(encoding="utf-8") == original
     content = hook.read_text(encoding="utf-8")
     assert HOOK_MARKER in content
-    assert str(legacy) in content
+    assert "pre-commit.heimdall-legacy" in content
+    assert 'hook_dir=$(dirname "$0")' in content
 
     completed = subprocess.run(  # noqa: S603 - hook local généré
         [str(hook)],
@@ -156,6 +157,28 @@ def test_install_preserves_and_chains_an_existing_hook(git_repo: GitRepo) -> Non
         timeout=120,
         check=False,
     )
+    assert completed.returncode == 0
+    assert "LEGACY_RAN" in completed.stdout
+
+
+def test_chained_legacy_survives_repository_move(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    original = "#!/bin/sh\necho LEGACY_RAN\n"
+    _write_foreign_hook(git_repo, original)
+    assert _run("hook", "install", str(git_repo.root)).exit_code == 0
+    moved = tmp_path / "moved-repo"
+    git_repo.root.rename(moved)
+
+    completed = subprocess.run(  # noqa: S603 - hook local généré
+        [str(moved / ".git" / "hooks" / "pre-commit")],
+        cwd=moved,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
     assert completed.returncode == 0
     assert "LEGACY_RAN" in completed.stdout
 
@@ -723,6 +746,22 @@ def test_restage_discards_the_temporary_index_on_failure(
         hook_module._restage_paths(git_repo.root, ["app.py"])
 
     assert git_repo.git_output("show", ":app.py") == before
+
+
+def test_restage_refuses_when_the_index_lock_exists(git_repo: GitRepo) -> None:
+    git_repo.write("app.py", "old\n")
+    git_repo.stage("app.py")
+    git_repo.commit_all("base")
+    before = git_repo.git_output("show", ":app.py")
+    git_repo.write("app.py", "new\n")
+    lock = git_repo.root / ".git" / "index.lock"
+    lock.write_text("", encoding="utf-8")
+
+    with pytest.raises(HookError):
+        hook_module._restage_paths(git_repo.root, ["app.py"])
+
+    assert git_repo.git_output("show", ":app.py") == before
+    assert lock.exists()
 
 
 def test_verify_root_detects_a_replaced_root(git_repo: GitRepo) -> None:

@@ -354,11 +354,13 @@ def _hook_script(launcher: str, legacy: Path | None) -> bytes:
         "export HEIMDALL_IN_HOOK",
     ]
     if legacy is not None:
-        quoted = shlex.quote(str(legacy))
+        legacy_name = shlex.quote(legacy.name)
         lines.extend(
             [
-                f"if [ -x {quoted} ]; then",
-                f'    {quoted} "$@"',
+                'hook_dir=$(dirname "$0")',
+                f'legacy="$hook_dir"/{legacy_name}',
+                'if [ -x "$legacy" ]; then',
+                '    "$legacy" "$@"',
                 "    status=$?",
                 '    if [ "$status" -ne 0 ]; then',
                 '        exit "$status"',
@@ -753,10 +755,10 @@ def _restage_paths(root: Path, paths: Iterable[str]) -> int:
     """Ré-indexe le contenu exact de fichiers remédiés, sans filtre ni hook.
 
     Fonction **interne** : l'appelant public est :func:`apply_and_restage`,
-    qui vérifie d'abord l'absence de modifications non indexées. L'index est
-    mis à jour dans un fichier temporaire puis remplacé atomiquement sous le
-    verrou Git ``index.lock`` : une panne médiane ne laisse pas l'index réel
-    partiellement modifié.
+    qui vérifie d'abord l'absence de modifications non indexées. Le verrou
+    Git ``index.lock`` est pris **avant** la copie, l'index est mis à jour
+    dedans puis remplacé atomiquement : ni panne médiane ni ``git add``
+    concurrent ne laisse l'index réel partiellement modifié.
     """
     access = _open_repository(root)
     repository_root = access.root
@@ -773,16 +775,19 @@ def _restage_paths(root: Path, paths: Iterable[str]) -> int:
     except ToolFailure:
         raise HookError from None
     lock_path = index_path.with_name(index_path.name + ".lock")
-    temporary: str | None = None
-    lock_descriptor = -1
+    lock_created = False
     try:
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=".heimdall-index-", dir=index_path.parent
+        # Protocole Git natif : prendre ``index.lock`` AVANT de copier, pour
+        # qu'un ``git add`` concurrent ne puisse pas se terminer puis être
+        # écrasé silencieusement par notre ``os.replace``.
+        lock_descriptor = os.open(
+            lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
         )
-        os.close(descriptor)
-        shutil.copyfile(index_path, temporary)
-        os.chmod(temporary, 0o600)
-        extra_env = {"GIT_INDEX_FILE": temporary}
+        lock_created = True
+        os.close(lock_descriptor)
+        shutil.copyfile(index_path, lock_path)
+        os.chmod(lock_path, 0o600)
+        extra_env = {"GIT_INDEX_FILE": str(lock_path)}
         arguments = ["update-index", "--add"]
         for mode, digest, relative in entries:
             arguments.extend(["--cacheinfo", mode, digest, relative])
@@ -790,22 +795,14 @@ def _restage_paths(root: Path, paths: Iterable[str]) -> int:
         if completed.returncode != 0:
             raise HookError
         _verify_index_entries(repository_root, entries, extra_env=extra_env)
-        lock_descriptor = os.open(
-            lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-        )
-        os.replace(temporary, index_path)
-        temporary = None
+        os.replace(lock_path, index_path)
+        lock_created = False
     except OSError:
         raise HookError from None
     finally:
-        if lock_descriptor >= 0:
-            with contextlib.suppress(OSError):
-                os.close(lock_descriptor)
+        if lock_created:
             with contextlib.suppress(OSError):
                 os.unlink(lock_path)
-        if temporary is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(temporary)
     _verify_root(access)
     return len(entries)
 
