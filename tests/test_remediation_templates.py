@@ -283,6 +283,8 @@ def test_python_refuses_shadowed_os(source: str) -> None:
         'os.environ["APP_KEY"] = value\n',
         'os.environ.get("APP_KEY")\n',
         'os.getenv("APP_KEY")\n',
+        'KEY = getattr(os, "APP_KEY")\n',
+        'KEY = operator.getitem(os.environ, "APP_KEY")\n',
     ],
 )
 def test_python_refuses_environment_key_auto_targeting(source: str) -> None:
@@ -369,6 +371,7 @@ def test_javascript_regex_with_quotes_does_not_hide_the_real_string() -> None:
         (f"const KEY = `{SECRET}`;\n", ManualReason.AMBIGUOUS_STRING),
         (f'const KEY = "{SECRET}" + suffix;\n', ManualReason.AMBIGUOUS_CONCATENATION),
         (f'const KEY = suffix + "{SECRET}";\n', ManualReason.AMBIGUOUS_CONCATENATION),
+        (f'const x = "{SECRET}" "other";\n', ManualReason.AMBIGUOUS_CONCATENATION),
         (f'const x = {{"{SECRET}": 1}};\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'const x = {{"{SECRET}"() {{}}}};\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'class X {{ "{SECRET}"() {{}} }}\n', ManualReason.AMBIGUOUS_CONTEXT),
@@ -423,6 +426,9 @@ def test_javascript_refuses_shadowed_process(source: str) -> None:
         'process.env["APP_KEY"];\n',
         "process.env['APP_KEY'];\n",
         'process.env.get("APP_KEY");\n',
+        'x = process["env"]["APP_KEY"];\n',
+        'KEY = Reflect.get(process.env, "APP_KEY");\n',
+        'KEY = operator.getitem(process.env, "APP_KEY");\n',
     ],
 )
 def test_javascript_refuses_environment_key_auto_targeting(source: str) -> None:

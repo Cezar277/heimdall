@@ -404,6 +404,13 @@ def _is_os_environ(node: ast.AST) -> bool:
     )
 
 
+def _is_os_module(node: ast.AST) -> bool:
+    """Vrai pour ``os`` ou ``os.environ`` : l'objet qui porte les clés."""
+    if isinstance(node, ast.Name):
+        return node.id == "os"
+    return _is_os_environ(node)
+
+
 def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     """Vrai si le littéral sert de **nom** de variable d'environnement.
 
@@ -416,15 +423,29 @@ def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> 
     while parent is not None:
         if isinstance(parent, ast.Subscript) and _is_os_environ(parent.value):
             return True
-        if isinstance(parent, ast.Call) and isinstance(parent.func, ast.Attribute):
+        if isinstance(parent, ast.Call):
             function = parent.func
-            if _is_os_environ(function.value):
-                return True
-            if (
-                isinstance(function.value, ast.Name)
-                and function.value.id == "os"
-                and function.attr == "getenv"
+            if isinstance(function, ast.Attribute):
+                if _is_os_environ(function.value):
+                    return True
+                if (
+                    isinstance(function.value, ast.Name)
+                    and function.value.id == "os"
+                    and function.attr == "getenv"
+                ):
+                    return True
+                if function.attr == "getitem" and len(parent.args) > 1 and parent.args[1] is node:
+                    # ``operator.getitem(os.environ, "NOM")`` : la clé lue
+                    # deviendrait la valeur lue.
+                    return True
+            elif (
+                isinstance(function, ast.Name)
+                and function.id == "getattr"
+                and parent.args
+                and _is_os_module(parent.args[0])
             ):
+                # ``getattr(os, "NOM")`` / ``getattr(os.environ, "NOM")`` : la
+                # clé lue deviendrait la valeur lue.
                 return True
         child = parent
         parent = parents.get(child)
@@ -1056,10 +1077,9 @@ _JS_FUNCTION_KEYWORD_LOOKBACK: Final[int] = 2
 _JS_ELLIPSIS_LOOKBACK: Final[int] = 3
 #: Nombre maximal de jetons d'opérateur avant le ``=`` d'une affectation.
 _JS_ASSIGNMENT_LOOKBACK: Final[int] = 3
-#: Recul nécessaire pour reconnaître ``process.env[...]`` avant l'indice.
-_JS_PROCESS_ENV_LOOKBACK: Final[int] = 4
-#: Recul nécessaire pour reconnaître ``process.env.get(...)`` avant l'argument.
-_JS_PROCESS_ENV_METHOD_LOOKBACK: Final[int] = 6
+#: Fenêtre de contexte glissant pour détecter un accès ``process.env`` autour
+#: du littéral scruté (indice, getter, objet d'un appel).
+_JS_ENV_ACCESS_LOOKBACK: Final[int] = 12
 
 #: Mots-clés dont la parenthèse suivante n'est **pas** une liste de paramètres.
 _JS_NON_BINDING_PAREN_KEYWORDS: Final[frozenset[str]] = frozenset(
@@ -1358,34 +1378,62 @@ def _javascript_process_shadowed(source: str, tokens: list[_JsToken]) -> bool:
 
 
 def _js_process_env_key(tokens: list[_JsToken], position: int) -> bool:
-    """Vrai si le littéral est une clé lue dans ``process.env`` (auto-ciblage)."""
-    if (
-        position >= _JS_PROCESS_ENV_LOOKBACK
-        and tokens[position - 1].kind == "punct"
-        and tokens[position - 1].value == "["
-        and tokens[position - 2].kind == "ident"
-        and tokens[position - 2].value == "env"
-        and tokens[position - 3].kind == "punct"
-        and tokens[position - 3].value == "."
-        and tokens[position - 4].kind == "ident"
-        and tokens[position - 4].value == "process"
-    ):
-        return True
-    # ``process.env.get("NOM")`` : la valeur deviendrait le nom de la variable.
-    return (
-        position >= _JS_PROCESS_ENV_METHOD_LOOKBACK
-        and tokens[position - 1].kind == "punct"
-        and tokens[position - 1].value == "("
-        and tokens[position - 2].kind == "ident"
-        and tokens[position - 3].kind == "punct"
-        and tokens[position - 3].value == "."
-        and tokens[position - 4].kind == "ident"
-        and tokens[position - 4].value == "env"
-        and tokens[position - 5].kind == "punct"
-        and tokens[position - 5].value == "."
-        and tokens[position - 6].kind == "ident"
-        and tokens[position - 6].value == "process"
-    )
+    """Vrai si le littéral est une clé lue dans ``process.env`` (auto-ciblage).
+
+    Couvre les formes ``process.env["NOM"]``, ``process["env"]["NOM"]``,
+    ``process.env.get("NOM")``, ``process["env"].get("NOM")`` et les clés
+    d'appel ``Reflect.get(process.env, "NOM")`` : dans chacune, la clé du
+    littéral deviendrait la valeur lue, et le patch ``process.env.<VARIABLE>``
+    la transformerait en récursion sur la table de secrets.
+    """
+    if position < 1 or tokens[position - 1].kind != "punct" or tokens[position - 1].value is None:
+        # Litéral sans contexte d'indice ni d'appel : pas de clé dynamique.
+        return False
+    if tokens[position - 1].value not in {"[", "(", ",", ")"}:
+        # Litéral en position d'expression simple (``const k = "SECRET"``) :
+        # seuls un indice, un appel ou un argument peut être une clé dynamique.
+        return False
+    end = position - 1
+    start = max(0, position - _JS_ENV_ACCESS_LOOKBACK)
+    return _js_env_access_present(tokens, start, end)
+
+
+def _js_env_access_present(tokens: list[_JsToken], start: int, end: int) -> bool:
+    """Vrai si la plage ``[start, end)`` contient un accès ``process.env``.
+
+    Détecte les lectures par membre (``process.env``, ``process.env.FOO``) et
+    par indice (``process["env"]``), y compris comme récepteur d'un getter.
+    L'analyse est une fenêtre glissante : le doute profite au refus, jamais au
+    patch.
+    """
+    for index in range(start, max(start, end)):
+        token = tokens[index]
+        is_env_name = token.kind in {"ident", "string"} and token.value == "env"
+        if (
+            is_env_name
+            and index - 2 >= start
+            and tokens[index - 1].kind == "punct"
+            and tokens[index - 1].value == "."
+            and tokens[index - 2].kind == "ident"
+            and tokens[index - 2].value == "process"
+        ):
+            # Membre : ``process.env`` ou un sous-récepteur déjà env-rooted.
+            return True
+        if (
+            is_env_name
+            and index - 1 > start
+            and tokens[index - 1].kind == "punct"
+            and tokens[index - 1].value == "["
+            and index + 1 < len(tokens)
+            and tokens[index + 1].kind == "punct"
+            and tokens[index + 1].value == "]"
+            and index - 2 >= start
+            and tokens[index - 2].kind == "ident"
+            and tokens[index - 2].value == "process"
+        ):
+            # Indice : ``process["env"]`` — le sous-clé est ``env``.
+            return True
+    return False
 
 
 def _js_standalone_string(tokens: list[_JsToken], position: int) -> bool:
@@ -1453,6 +1501,14 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
     previous = tokens[position - 1] if position > 0 else None
     following = tokens[position + 1] if position + 1 < len(tokens) else None
+    if (previous is not None and previous.kind == "string") or (
+        following is not None and following.kind == "string"
+    ):
+        # Concaténation implicite : ``"SECRET" "other"`` n'est pas du JS valide,
+        # mais le tokenizer le réduit à deux jetons ``string`` contigus. Sans
+        # cette garde, le patch produirait ``process.env.APP_KEY "other"`` sur
+        # une entrée déjà invalide, sans revalidation possible côté tokenizer.
+        return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONCATENATION)
     if (previous is not None and previous.kind == "punct" and previous.value == "+") or (
         following is not None and following.kind == "punct" and following.value == "+"
     ):

@@ -94,9 +94,9 @@ expression et une raison stable (`ManualReason`) :
 | Valeur présente mais pas dans un littéral simple exact | `NO_SIMPLE_LITERAL` |
 | Plusieurs littéraux identiques sur la ligne | `MULTIPLE_LITERALS` |
 | F-string ou template literal | `AMBIGUOUS_STRING` |
-| Concaténation explicite ou implicite | `AMBIGUOUS_CONCATENATION` |
+| Concaténation explicite (`+`/`-`) ou implicite (chaîne adjacente, non reconnue par le tokenizer JS) | `AMBIGUOUS_CONCATENATION` |
 | Docstring, annotation, `match`, clé/méthode d'objet, import statique | `AMBIGUOUS_CONTEXT` |
-| Clé déjà assainie lue via `os.environ[...]`/`os.getenv(...)` ou `process.env[...]`/`process.env.get(...)` | `AMBIGUOUS_CONTEXT` |
+| Clé déjà assainie lue via `os.environ[...]`/`os.getenv(...)`, `getattr(os, ...)`/`operator.getitem(os.environ, ...)` ou `process.env[...]`/`process.env.get(...)`, `process["env"][...]`/`Reflect.get(process.env, ...)` | `AMBIGUOUS_CONTEXT` |
 | Directive prologue JavaScript (`"use strict"`) | `AMBIGUOUS_CONTEXT` |
 | Nom `os` masqué côté Python ou `process` masqué côté JavaScript | `SHADOWED_MODULE` |
 
@@ -128,7 +128,12 @@ une chaîne JavaScript ordinaire.
   (`_JsToken.value`) est également masquée. Un journal de session n'y verra
   pas le secret.
 - **Patch vérifié** : après substitution et ajout éventuel de l'import, le
-  texte Python final doit reparser ; sinon aucun patch n'est rendu.
+  texte Python final doit reparser ; sinon aucun patch n'est rendu. Côté
+  JavaScript, aucun patch n'est rendu sur un contexte ambigu (concaténation
+  implicite, clé dynamique, directive prologue, `os`/`process` masqué…) : la
+  substitution n'est appliquée qu'à un littéral dont le contexte lexical est
+  sûr, et le tokenizer ne fait pas de reparsing JS (hors bibliothèque standard
+  du projet).
 
 La denylist sémantique (`PATH`, `LD_PRELOAD`, `PYTHONPATH`…) et le
 dédoublonnage `_2`/`_3` restent dans #84. L'écriture atomique et la

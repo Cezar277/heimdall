@@ -37,7 +37,7 @@ dépôt, aucune connexion réseau utilisée.
 
 | Contrôle | Résultat |
 | --- | --- |
-| `pytest tests/test_remediation_templates.py` | 140 passed |
+| `pytest tests/test_remediation_templates.py` | 146 passed |
 | `pytest tests/test_remediation_templates.py --cov=heimdall.remediation --cov-branch --cov-fail-under=70` | couverture du module 79,51 % (seuil critique 70 %) |
 | `pytest --cov=heimdall --cov-branch --cov-fail-under=85` | 2960 passed, 15 skipped, 4512 sous-tests ; couverture globale 90,25 % |
 | `ruff check heimdall tests scripts` | succès |
@@ -60,7 +60,12 @@ relecture croisée et la CI distante restent à réaliser ; aucun merge sur
   peut apparaître dans une traceback.
 - `_environment_key_context` et `_js_process_env_key` refusent le
   re-ciblage d'une clé déjà assainie (`os.environ[...]`, `os.getenv(...)`,
-  `process.env[...]`, `process.env.get(...)`).
+  `getattr(os, ...)`, `operator.getitem(os.environ, ...)`,
+  `process.env[...]`, `process.env.get(...)`, `process["env"][...]`,
+  `Reflect.get(process.env, ...)`).
+- `_javascript_replacement` refuse la concaténation implicite (`"SECRET"
+  "other"`, non reconnue par le tokenizer JS) avec `AMBIGUOUS_CONCATENATION`,
+  pour ne plus rendre de patch sur entrée déjà invalide.
 - `_js_standalone_string` refuse une directive prologue (`"use strict"`) pour
   ne pas perdre sa sémantique.
 
