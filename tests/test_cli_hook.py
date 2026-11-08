@@ -346,6 +346,39 @@ def test_install_refuses_a_relative_hooks_path_that_escapes_the_repository(
     assert not (outside / "pre-commit").exists()
 
 
+@pytest.mark.parametrize("hooks_path", [".", ".git"])
+def test_install_refuses_a_hooks_directory_that_is_the_repo_or_common_dir(
+    git_repo: GitRepo, hooks_path: str
+) -> None:
+    git_repo.git("config", "core.hooksPath", hooks_path)
+
+    result = _run("hook", "install", str(git_repo.root))
+
+    assert result.exit_code == 2
+    assert not (git_repo.root / "pre-commit").exists()
+    assert not (git_repo.root / ".git" / "pre-commit").exists()
+
+
+def test_install_refuses_a_directory_as_hook(git_repo: GitRepo) -> None:
+    hook = _hook(git_repo)
+    hook.mkdir(parents=True)
+
+    result = _run("hook", "install", str(git_repo.root))
+
+    assert result.exit_code == 2
+    assert hook.is_dir()
+
+
+def test_uninstall_refuses_a_directory_as_hook(git_repo: GitRepo) -> None:
+    hook = _hook(git_repo)
+    hook.mkdir(parents=True)
+
+    result = _run("hook", "uninstall", str(git_repo.root))
+
+    assert result.exit_code == 2
+    assert hook.is_dir()
+
+
 def test_install_uses_the_worktree_hooks_path(git_repo: GitRepo, tmp_path: Path) -> None:
     git_repo.write("app.py", "x = 1\n")
     git_repo.stage("app.py")
@@ -527,6 +560,24 @@ def test_apply_and_restage_refuses_a_deleted_tracked_file(git_repo: GitRepo) -> 
     assert git_repo.git_output("show", ":app.py") == "old\n"
 
 
+def test_apply_and_restage_restores_state_when_apply_fails(git_repo: GitRepo) -> None:
+    git_repo.write("app.py", "old\n")
+    git_repo.stage("app.py")
+    git_repo.commit_all("base")
+    before = git_repo.git_output("show", ":app.py")
+
+    def apply() -> None:
+        assert os.environ.get(HEIMDALL_IN_HOOK_ENV) == "1"
+        git_repo.write("app.py", "partial\n")
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        apply_and_restage(git_repo.root, ["app.py"], apply)
+
+    assert git_repo.git_output("show", ":app.py") == before
+    assert HEIMDALL_IN_HOOK_ENV not in os.environ
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -534,6 +585,8 @@ def test_apply_and_restage_refuses_a_deleted_tracked_file(git_repo: GitRepo) -> 
         "/etc/passwd",
         ".git/config",
         ".env",
+        "a/.env/b",
+        ".env.d/f",
         "a\\b",
         "a:b",
         "dir/",

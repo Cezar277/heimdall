@@ -233,6 +233,17 @@ def _inside_allowed_roots(access: GitAccess, path: Path) -> bool:
     return path.is_relative_to(access.root) or path.is_relative_to(common)
 
 
+def _validate_hooks_directory(access: GitAccess, path: Path) -> None:
+    """Refuse un dossier de hooks confondu avec la racine ou le Git commun.
+
+    Écrire ``pre-commit`` directement à la racine du dépôt (ou dans ``.git``)
+    changerait l'identité du dossier racine et exposerait un fichier de hook
+    au suivi Git. Le dossier doit être un sous-dossier dédié.
+    """
+    if path == access.root or path == _git_common_dir(access):
+        raise HookError
+
+
 def _interpreter() -> str:
     """Interpréteur absolu utilisé par le hook, sans dépendre du PATH."""
     python = os.path.abspath(sys.executable)
@@ -461,10 +472,19 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
     """
     access = _open_repository(root)
     hooks_directory = _git_path(access, "hooks")
+    _validate_hooks_directory(access, hooks_directory)
     if not force and not _inside_allowed_roots(access, hooks_directory):
         raise OutsideRepositoryError
     _verify_root(access)
     _ensure_hooks_directory(hooks_directory)
+    # Le mkdir peut avoir changé le ctime de la racine : on rouvre pour
+    # comparer la suite des écritures à l'identité courante, pas à l'ancienne.
+    access = _open_repository(root)
+    hooks_directory = _git_path(access, "hooks")
+    _validate_hooks_directory(access, hooks_directory)
+    if not force and not _inside_allowed_roots(access, hooks_directory):
+        raise OutsideRepositoryError
+    _verify_root(access)
     hook_path = hooks_directory / HOOK_NAME
     legacy_path = hooks_directory / (HOOK_NAME + LEGACY_SUFFIX)
     try:
@@ -473,6 +493,7 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
         script = _hook_script(_launcher(), legacy_for_chain)
         try:
             _atomic_write(hook_path, script)
+            _verify_root(access)
         except BaseException:
             if moved_legacy:
                 with contextlib.suppress(OSError):
@@ -494,6 +515,7 @@ def uninstall_hook(root: Path, *, force: bool = False) -> UninstallOutcome:
     """Retire le hook Heimdall et restaure le hook précédent s'il existe."""
     access = _open_repository(root)
     hooks_directory = _git_path(access, "hooks")
+    _validate_hooks_directory(access, hooks_directory)
     if not force and not _inside_allowed_roots(access, hooks_directory):
         raise OutsideRepositoryError
     _verify_root(access)
@@ -505,18 +527,22 @@ def uninstall_hook(root: Path, *, force: bool = False) -> UninstallOutcome:
             if stat.S_ISDIR(metadata.st_mode):
                 raise HookError
             if not stat.S_ISREG(metadata.st_mode) or not _is_ours(hook_path):
-                return UninstallOutcome.NOT_INSTALLED
-            if os.path.lexists(legacy_path):
+                outcome = UninstallOutcome.NOT_INSTALLED
+            elif os.path.lexists(legacy_path):
                 os.replace(legacy_path, hook_path)
-                return UninstallOutcome.RESTORED
-            os.unlink(hook_path)
-            return UninstallOutcome.REMOVED
-        if os.path.lexists(legacy_path):
+                outcome = UninstallOutcome.RESTORED
+            else:
+                os.unlink(hook_path)
+                outcome = UninstallOutcome.REMOVED
+        elif os.path.lexists(legacy_path):
             os.replace(legacy_path, hook_path)
-            return UninstallOutcome.RESTORED
-        return UninstallOutcome.NOT_INSTALLED
+            outcome = UninstallOutcome.RESTORED
+        else:
+            outcome = UninstallOutcome.NOT_INSTALLED
     except OSError:
         raise HookError from None
+    _verify_root(access)
+    return outcome
 
 
 def _confined_paths(root: Path, paths: Iterable[str]) -> list[ConfinedPath]:
@@ -544,7 +570,7 @@ def _confined_paths(root: Path, paths: Iterable[str]) -> list[ConfinedPath]:
         parts = [part.lower() for part in item.relative.split("/")]
         if ".git" in parts:
             raise HookError
-        if parts[-1].startswith(".env") and parts[-1] != ".env.example":
+        if any(part.startswith(".env") and part != ".env.example" for part in parts):
             raise HookError
         confined.append(item)
     if not confined:

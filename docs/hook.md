@@ -59,8 +59,9 @@ refuse en code 2 avant toute écriture.
   existe ; un hook étranger non géré n'est jamais touché.
 
 Le hook est écrit atomiquement (fichier temporaire, `fsync`, `os.replace`)
-avec le mode `0700`. Le dossier de hooks ne doit être inscriptible ni par le
-groupe ni par les autres : un umask `0002` rend `.git/hooks` groupe-inscriptible
+avec le mode `0700`. Le dossier de hooks doit être un sous-dossier dédié,
+distinct de la racine du dépôt et de `.git` ; il ne doit être inscriptible ni
+par le groupe ni par les autres : un umask `0002` rend `.git/hooks` groupe-inscriptible
 et l'installation refuse alors en code 2 ; faire `chmod g-w .git/hooks` (ou
 utiliser un `core.hooksPath` dédié en `0700`). Un lien symbolique de hook
 n'est jamais suivi : il est déplacé comme sauvegarde et n'est pas chaîné.
@@ -96,7 +97,8 @@ le contenu est lu par Heimdall (`O_NOFOLLOW`, taille bornée), haché par
 un argv figé, `core.fsmonitor=false` et `core.hooksPath=os.devnull` ; les
 chemins passent par la garde unique `heimdall.mcp.paths.confine` (résolution
 réelle, confinement à la racine, refus des liens sortants). Les chemins
-`.git/**` et `.env*` (sauf `.env.example`) sont refusés.
+contenant un composant `.git` ou `.env*` (sauf `.env.example`) sont refusés,
+quel que soit leur niveau.
 
 Le hook installé se contente de scanner et bloquer : le branchement du
 moteur de remédiation interactif reste le ticket #30/#32.
