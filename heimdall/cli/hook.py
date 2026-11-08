@@ -627,6 +627,8 @@ def uninstall_hook(root: Path, *, force: bool = False) -> UninstallOutcome:
     _verify_root(access)
     hook_path = hooks_directory / HOOK_NAME
     legacy_path = hooks_directory / (HOOK_NAME + LEGACY_SUFFIX)
+    managed: bytes | None = None
+    legacy_moved = False
     try:
         if os.path.lexists(hook_path):
             metadata = os.lstat(hook_path)
@@ -634,23 +636,45 @@ def uninstall_hook(root: Path, *, force: bool = False) -> UninstallOutcome:
                 raise HookError
             if not stat.S_ISREG(metadata.st_mode) or not _is_ours(hook_path):
                 outcome = UninstallOutcome.NOT_INSTALLED
-            elif os.path.lexists(legacy_path):
-                _check_legacy_restorable(legacy_path)
-                os.replace(legacy_path, hook_path)
-                outcome = UninstallOutcome.RESTORED
             else:
-                os.unlink(hook_path)
-                outcome = UninstallOutcome.REMOVED
+                managed = _read_regular(hook_path, MAX_HOOK_BYTES)
+                if os.path.lexists(legacy_path):
+                    _check_legacy_restorable(legacy_path)
+                    os.replace(legacy_path, hook_path)
+                    legacy_moved = True
+                    outcome = UninstallOutcome.RESTORED
+                else:
+                    os.unlink(hook_path)
+                    outcome = UninstallOutcome.REMOVED
         elif os.path.lexists(legacy_path):
             _check_legacy_restorable(legacy_path)
             os.replace(legacy_path, hook_path)
+            legacy_moved = True
             outcome = UninstallOutcome.RESTORED
         else:
             outcome = UninstallOutcome.NOT_INSTALLED
+        _verify_root(access)
     except OSError:
         raise HookError from None
-    _verify_root(access)
+    except BaseException:
+        _rollback_uninstall(hook_path, legacy_path, managed, legacy_moved)
+        raise
     return outcome
+
+
+def _rollback_uninstall(
+    hook_path: Path,
+    legacy_path: Path,
+    managed: bytes | None,
+    legacy_moved: bool,
+) -> None:
+    """Remet le dépôt dans l'état d'avant un ``uninstall`` échoué."""
+    if legacy_moved:
+        with contextlib.suppress(OSError):
+            os.replace(hook_path, legacy_path)
+    if managed is not None:
+        with contextlib.suppress(HookError):
+            _atomic_write(hook_path, managed)
 
 
 def _confined_paths(root: Path, paths: Iterable[str]) -> list[ConfinedPath]:

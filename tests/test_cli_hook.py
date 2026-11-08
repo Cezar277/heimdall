@@ -302,6 +302,40 @@ def test_install_rolls_back_if_root_check_fails_after_write(
         assert not _hook(git_repo).exists()
 
 
+@pytest.mark.parametrize("state", ["managed_with_legacy", "managed_alone", "legacy_alone"])
+def test_uninstall_rolls_back_if_root_check_fails_after_replace(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    legacy_text = "#!/bin/sh\necho LEGACY\n"
+    if state == "legacy_alone":
+        _legacy(git_repo).write_text(legacy_text, encoding="utf-8")
+        _legacy(git_repo).chmod(0o755)
+    else:
+        if state == "managed_with_legacy":
+            _write_foreign_hook(git_repo, legacy_text)
+        assert _run("hook", "install", str(git_repo.root)).exit_code == 0
+    before_hook = _hook(git_repo).read_bytes() if _hook(git_repo).exists() else None
+    before_legacy = _legacy(git_repo).read_bytes() if _legacy(git_repo).exists() else None
+    calls = [0]
+    real_verify = hook_module._verify_root
+
+    def failing_verify(access):
+        calls[0] += 1
+        if calls[0] >= 2:
+            raise HookError
+        real_verify(access)
+
+    monkeypatch.setattr(hook_module, "_verify_root", failing_verify)
+
+    with pytest.raises(HookError):
+        hook_module.uninstall_hook(git_repo.root)
+
+    after_hook = _hook(git_repo).read_bytes() if _hook(git_repo).exists() else None
+    after_legacy = _legacy(git_repo).read_bytes() if _legacy(git_repo).exists() else None
+    assert after_hook == before_hook
+    assert after_legacy == before_legacy
+
+
 def test_install_is_idempotent(git_repo: GitRepo) -> None:
     assert _run("hook", "install", str(git_repo.root)).exit_code == 0
     first = _hook(git_repo).read_bytes()
