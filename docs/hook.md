@@ -31,8 +31,9 @@ script est invoqué depuis un sous-dossier, `$PWD` n'est pas une racine de
 dépôt et le scan échoue en code 2 (fail-closed), jamais un périmètre partiel.
 Un console script situé sous la racine, même s'il pointe par lien vers
 l'extérieur (venv dans le dépôt), est refusé et remplacé par le module isolé.
-L'interpréteur Python lui-même reste celui de l'installation : pour une
-garantie forte, installer Heimdall avec un interpréteur **hors du dépôt**.
+L'interpréteur Python doit lui aussi être **hors du dépôt** : `hook install`
+refuse en code 2 si `sys.executable` est sous la racine, pour qu'un dépôt
+piégé ne puisse pas remplacer l'interpréteur exécuté à chaque commit.
 
 Le hook précédent est localisé **relativement au script** (`dirname "$0"`) :
 déplacer le dépôt ne casse pas le chaînage. Il passe **avant** Heimdall :
@@ -98,7 +99,9 @@ fournie pour le moteur de remédiation (#30/#32) :
 3. `_restage_paths` (interne) ré-indexe le contenu exact des seuls fichiers
    cibles. Les `ConfinedPath` assertés sont figés et repassés : si un chemin
    a été échangé contre un lien vers un autre fichier entre 1 et 3, la
-   ré-indexation refuse (`HookError`) au lieu de stager la cible.
+   ré-indexation refuse (`HookError`) au lieu de stager la cible. Seuls les
+   fichiers **déjà suivis** sont acceptés : un chemin non suivi ou absent
+   est refusé (pas de `git add` implicite de lignes non revues).
 
 La ré-indexation n'exécute **ni filtre `clean` ni hook Git** du dépôt :
 le contenu est lu par Heimdall (`O_NOFOLLOW`, taille bornée), haché par
@@ -135,10 +138,9 @@ moteur de remédiation interactif reste le ticket #30/#32.
   le mécanisme d'anti-récursion, pas une garantie de sécurité.
 - Le hook est local et mono-utilisateur ; la CI déterministe reste la seule
   barrière opposable pour une branche partagée.
-- Si l'interpréteur Python est un venv **dans le dépôt**, le dépôt peut le
-  modifier après l'installation : `hook install` affiche un avertissement
-  explicite. Pour une garantie forte, utiliser un interpréteur hors du
-  dépôt. Le script console sous la racine est refusé.
+- L'interpréteur Python doit être hors du dépôt : un venv local est refusé
+  à l'installation (code 2). Le script console sous la racine est également
+  refusé.
 
 ## Preuves
 
@@ -164,10 +166,12 @@ moteur de remédiation interactif reste le ticket #30/#32.
 - chaînage du legacy par chemin relatif au hook, prouvé après déplacement
   du dépôt ;
 - console script sous la racine (même lien vers l'extérieur) refusé
-  (repli `-m`), avertissement si l'interpréteur Python est dans le dépôt, et
-  commit depuis un sous-dossier toujours bloqué par le scan de la racine ;
+  (repli `-m`), interpréteur Python sous la racine refusé à l'installation,
+  et commit depuis un sous-dossier toujours bloqué par le scan de la racine ;
 - chemins assertés figés : un échange `a` → lien vers `b` entre l'assert et
   la ré-indexation est refusé sans stager `b` ;
+- fichiers non suivis ou absents refusés par l'assert (pas de `git add`
+  implicite) ;
 - anti-récursion `HEIMDALL_IN_HOOK=1`.
 
 ```sh

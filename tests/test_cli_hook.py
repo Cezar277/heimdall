@@ -187,7 +187,7 @@ def test_launcher_refuses_a_console_symlink_under_the_repository(
     assert str(console) not in launcher
 
 
-def test_install_warns_when_the_interpreter_is_inside_the_repository(
+def test_install_refuses_an_interpreter_inside_the_repository(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     venv_bin = git_repo.root / ".venv" / "bin"
@@ -198,8 +198,8 @@ def test_install_warns_when_the_interpreter_is_inside_the_repository(
 
     result = _run("hook", "install", str(git_repo.root))
 
-    assert result.exit_code == 0
-    assert "interpréteur Python dans le dépôt" in result.stderr
+    assert result.exit_code == 2
+    assert not _hook(git_repo).exists()
 
 
 def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:
@@ -783,6 +783,26 @@ def test_apply_and_restage_freezes_the_asserted_paths(git_repo: GitRepo) -> None
         apply_and_restage(git_repo.root, ["a"], apply)
 
     assert git_repo.git_output("show", ":a") == before
+
+
+def test_apply_and_restage_refuses_an_untracked_file(git_repo: GitRepo) -> None:
+    git_repo.write("untracked.txt", "x\n")
+    called: list[bool] = []
+
+    with pytest.raises(HookError):
+        apply_and_restage(git_repo.root, ["untracked.txt"], lambda: called.append(True))
+
+    assert called == []
+    assert not (git_repo.root / ".git" / "index.lock").exists()
+
+
+def test_apply_and_restage_refuses_an_absent_file(git_repo: GitRepo) -> None:
+    called: list[bool] = []
+
+    with pytest.raises(HookError):
+        apply_and_restage(git_repo.root, ["absent.txt"], lambda: called.append(True))
+
+    assert called == []
 
 
 @pytest.mark.parametrize(
