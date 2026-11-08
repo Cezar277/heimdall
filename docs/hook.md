@@ -59,8 +59,11 @@ refuse en code 2 avant toute écriture.
   existe ; un hook étranger non géré n'est jamais touché.
 
 Le hook est écrit atomiquement (fichier temporaire, `fsync`, `os.replace`)
-avec le mode `0700`. Un lien symbolique de hook n'est jamais suivi : il est
-déplacé comme sauvegarde et n'est pas chaîné.
+avec le mode `0700`. Le dossier de hooks ne doit être inscriptible ni par le
+groupe ni par les autres : un umask `0002` rend `.git/hooks` groupe-inscriptible
+et l'installation refuse alors en code 2 ; faire `chmod g-w .git/hooks` (ou
+utiliser un `core.hooksPath` dédié en `0700`). Un lien symbolique de hook
+n'est jamais suivi : il est déplacé comme sauvegarde et n'est pas chaîné.
 
 ## Anti-récursion
 

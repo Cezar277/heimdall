@@ -387,10 +387,10 @@ def _atomic_write(path: Path, content: bytes) -> None:
 def _ensure_hooks_directory(path: Path) -> None:
     """Crée le dossier de hooks si nécessaire, sans écraser un fichier.
 
-    Un dossier world-writable est refusé : un autre utilisateur pourrait y
-    remplacer le hook, que Git exécuterait ensuite avec les droits du
-    développeur. L'écriture de groupe reste acceptée (umask 0002 et groupes
-    privés utilisateur sont courants), le hook lui-même étant en 0700.
+    Un dossier accessible en écriture au groupe ou aux autres est refusé :
+    un autre utilisateur pourrait y remplacer le hook, que Git exécuterait
+    ensuite avec les droits du développeur. Un umask 0002 rend `.git/hooks`
+    groupe-inscriptible : l'opérateur doit alors faire `chmod g-w`.
     """
     try:
         if path.exists() and not path.is_dir():
@@ -399,7 +399,7 @@ def _ensure_hooks_directory(path: Path) -> None:
         metadata = os.stat(path)
     except OSError:
         raise HookError from None
-    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & 0o002:
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & 0o022:
         raise HookError
 
 

@@ -319,12 +319,13 @@ def test_install_refuses_an_absolute_symlink_to_outside_without_force(
     assert (target / "pre-commit").is_file()
 
 
-def test_install_refuses_a_world_writable_hooks_directory(
-    git_repo: GitRepo, tmp_path: Path
+@pytest.mark.parametrize("mode", [0o770, 0o777])
+def test_install_refuses_a_group_or_world_writable_hooks_directory(
+    git_repo: GitRepo, tmp_path: Path, mode: int
 ) -> None:
     custom = tmp_path / "hooks"
     custom.mkdir()
-    custom.chmod(0o777)
+    custom.chmod(mode)
     git_repo.git("config", "core.hooksPath", str(custom))
 
     result = _run("hook", "install", str(git_repo.root))
