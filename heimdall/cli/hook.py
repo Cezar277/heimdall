@@ -290,19 +290,26 @@ def _interpreter() -> str:
     return python
 
 
-def _launcher() -> str:
+def _launcher(root: Path) -> str:
     """Commande absolue du hook, déjà quotée pour ``/bin/sh``.
 
-    Le script console ``heimdall`` est préféré : son ``sys.path[0]`` est le
-    dossier ``bin`` de l'environnement, pas la racine du dépôt. À défaut,
-    ``python -I -m`` isole aussi l'interpréteur du dépôt (pas de ``heimdall``
-    local importable, pas de ``PYTHONPATH``).
+    Le script console ``heimdall`` est préféré s'il est **hors du dépôt** :
+    son ``sys.path[0]`` est le dossier ``bin`` de l'environnement, pas la
+    racine du dépôt. Un console script sous la racine (venv dans le dépôt)
+    est refusé et remplacé par ``python -I -m``, qui isole aussi
+    l'interpréteur (pas de ``heimdall`` local importable, pas de
+    ``PYTHONPATH``).
     """
     python = _interpreter()
     console = Path(python).with_name("heimdall")
     # Sous Windows, ``heimdall.exe`` est un lanceur natif, pas un script
     # Python : on garde le module isolé, qui fonctionne partout.
     if os.name != "nt" and console.is_file() and os.access(console, os.X_OK):
+        try:
+            if console.resolve().is_relative_to(root.resolve()):
+                return f"{shlex.quote(python)} -I -m heimdall.cli.main"
+        except (OSError, RuntimeError):
+            raise HookError from None
         return f"{shlex.quote(python)} -I {shlex.quote(str(console))}"
     return f"{shlex.quote(python)} -I -m heimdall.cli.main"
 
@@ -402,7 +409,7 @@ def _hook_script(launcher: str, legacy: Path | None) -> bytes:
     lines.extend(
         [
             "unset PYTHONPATH PYTHONHOME",
-            f"exec {launcher} scan --staged .",
+            f'exec {launcher} scan --staged "$PWD"',
         ]
     )
     return ("\n".join(lines) + "\n").encode("utf-8")
@@ -540,7 +547,7 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
     try:
         ours, moved_legacy = _prepare_existing_hook(hook_path, legacy_path)
         legacy_for_chain = legacy_path if _is_chainable(legacy_path) else None
-        script = _hook_script(_launcher(), legacy_for_chain)
+        script = _hook_script(_launcher(access.root), legacy_for_chain)
         try:
             _atomic_write(hook_path, script)
             _verify_root(access)
@@ -801,8 +808,19 @@ def _create_locked_index_copy(index_path: Path, lock_path: Path) -> None:
         )
     except OSError:
         raise HookError from None
+    source_descriptor = -1
     try:
-        with open(index_path, "rb") as source:
+        try:
+            source_descriptor = os.open(
+                index_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+        except OSError:
+            raise HookError from None
+        metadata = os.fstat(source_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HookError
+        with os.fdopen(source_descriptor, "rb", closefd=True) as source:
+            source_descriptor = -1
             with os.fdopen(descriptor, "wb", closefd=True) as target:
                 descriptor = -1
                 shutil.copyfileobj(source, target)
@@ -814,6 +832,9 @@ def _create_locked_index_copy(index_path: Path, lock_path: Path) -> None:
             os.unlink(lock_path)
         raise
     finally:
+        if source_descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(source_descriptor)
         if descriptor >= 0:
             with contextlib.suppress(OSError):
                 os.close(descriptor)

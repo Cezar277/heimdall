@@ -19,7 +19,9 @@ from heimdall.cli.hook import (
     HOOK_MARKER,
     HookError,
     UnstagedChangesError,
+    _create_locked_index_copy,
     _git_binary,
+    _launcher,
     _restage_paths,
     _verify_root,
     apply_and_restage,
@@ -147,6 +149,24 @@ def test_run_git_rejects_a_relative_index_file(git_repo: GitRepo) -> None:
         )
 
 
+def test_launcher_refuses_a_console_script_inside_the_repository(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv_bin = git_repo.root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.write_text("", encoding="utf-8")
+    console = venv_bin / "heimdall"
+    console.write_text("", encoding="utf-8")
+    console.chmod(0o755)
+    monkeypatch.setattr(hook_module.sys, "executable", str(python))
+
+    launcher = _launcher(git_repo.root)
+
+    assert "-I -m heimdall.cli.main" in launcher
+    assert str(console) not in launcher
+
+
 def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:
     result = _run("hook", "install", str(git_repo.root))
 
@@ -159,6 +179,7 @@ def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:
     assert HEIMDALL_IN_HOOK_ENV in content
     assert "unset PYTHONPATH PYTHONHOME" in content
     assert "scan --staged" in content
+    assert '"$PWD"' in content
     console = Path(sys.executable).with_name("heimdall")
     if os.name != "nt" and console.is_file():
         assert str(console) in content
@@ -541,6 +562,29 @@ def test_hook_blocks_a_staged_secret(git_repo: GitRepo) -> None:
     assert clean.returncode == 0, clean.stderr
 
 
+def test_hook_blocks_a_secret_from_a_subdirectory_commit(
+    git_repo: GitRepo,
+) -> None:
+    git_repo.write("sub/base.py", "x = 1\n")
+    git_repo.stage("sub/base.py")
+    git_repo.commit_all("base")
+    git_repo.write("app.py", f'AWS = "{FAKE_AWS_KEY}"\n')
+    git_repo.stage("app.py")
+    assert _run("hook", "install", str(git_repo.root)).exit_code == 0
+    assert GIT is not None
+
+    completed = subprocess.run(  # noqa: S603 - argv figé, aucun shell
+        [GIT, "-C", str(git_repo.root / "sub"), "commit", "-m", "sub"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert FAKE_AWS_KEY not in completed.stdout + completed.stderr
+
+
 def test_heimdall_in_hook_is_a_documented_bypass(git_repo: GitRepo) -> None:
     git_repo.write("app.py", "x = 1\n")
     git_repo.stage("app.py")
@@ -823,6 +867,22 @@ def test_restage_refuses_a_symlink_index_lock(
 
     assert target.read_text(encoding="utf-8") == "do not touch"
     assert lock.is_symlink()
+
+
+def test_locked_index_copy_refuses_a_symlink_source(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "real-index"
+    target.write_text("do not read", encoding="utf-8")
+    source = tmp_path / "index-link"
+    source.symlink_to(target)
+    lock = tmp_path / "index.lock"
+
+    with pytest.raises(HookError):
+        _create_locked_index_copy(source, lock)
+
+    assert target.read_text(encoding="utf-8") == "do not read"
+    assert not lock.exists()
 
 
 def test_verify_root_detects_a_replaced_root(git_repo: GitRepo) -> None:

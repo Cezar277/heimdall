@@ -23,10 +23,14 @@ chemin ni contenu n'est reflété. `--force` est requis pour un
 Le script généré exécute, dans cet ordre :
 
 1. le hook précédent s'il a été conservé et s'il est exécutable ;
-2. `heimdall scan --staged .` avec le script console absolu (ou, à défaut,
-   `python -I -m heimdall.cli.main`) qui a installé Heimdall. `-I` isole
-   l'interpréteur du `PYTHONPATH` et du dépôt : un `heimdall/` local ne peut
-   pas détourner l'import.
+2. `heimdall scan --staged "$PWD"` avec le script console absolu (ou, à
+defaut, `python -I -m heimdall.cli.main`) qui a installé Heimdall. `-I`
+isole l'interpréteur du `PYTHONPATH` et du dépôt : un `heimdall/` local ne
+peut pas détourner l'import. Git lance les hooks avec `cwd` = racine ; si le
+script est invoqué depuis un sous-dossier, `$PWD` n'est pas une racine de
+dépôt et le scan échoue en code 2 (fail-closed), jamais un périmètre partiel.
+Un console script situé sous la racine (venv dans le dépôt) est refusé et
+remplacé par le module isolé.
 
 Le hook précédent est localisé **relativement au script** (`dirname "$0"`) :
 déplacer le dépôt ne casse pas le chaînage. Il passe **avant** Heimdall :
@@ -95,10 +99,11 @@ La ré-indexation n'exécute **ni filtre `clean` ni hook Git** du dépôt :
 le contenu est lu par Heimdall (`O_NOFOLLOW`, taille bornée), haché par
 `git hash-object -w --no-filters --stdin`, puis écrit dans un **index
 temporaire** par `git update-index --add --cacheinfo`. Le verrou Git
-`index.lock` est pris **avant** la copie de l'index ; la copie passe par le
-descripteur du verrou (jamais par une réouverture du nom, donc pas de suivi
-de lien), puis l'index réel est remplacé atomiquement (`os.replace`) après
-vérification des entrées (`git ls-files -s -z`) : ni panne médiane ni `git add` concurrent ne laisse
+`index.lock` est pris **avant** la copie de l'index ; la source est ouverte
+avec `O_NOFOLLOW` et la copie passe par le descripteur du verrou (jamais par
+une réouverture du nom, donc pas de suivi de lien), puis l'index réel est
+remplacé atomiquement (`os.replace`) après vérification des entrées
+(`git ls-files -s -z`) : ni panne médiane ni `git add` concurrent ne laisse
 l'index partiellement modifié ou n'écrase une mise à jour concurrente. Les commandes git internes utilisent
 un argv figé, `core.fsmonitor=false` et `core.hooksPath=os.devnull` ; les
 chemins passent par la garde unique `heimdall.mcp.paths.confine` (résolution
@@ -140,14 +145,17 @@ moteur de remédiation interactif reste le ticket #30/#32.
   le second hunk reste intact dans le dossier de travail ;
 - refus des modifications non indexées avant remédiation ;
 - ré-indexation sans exécuter les filtres `clean` ni le hook
-  `post-index-change`, avec verrou `index.lock` pris avant copie, copie via
-  descripteur, échec `update-index` sans modification de l'index réel et
-  refus si le verrou est déjà pris ou remplacé par un symlink ;
+  `post-index-change`, avec verrou `index.lock` pris avant copie, source
+  ouverte en `O_NOFOLLOW`, copie via descripteur, échec `update-index` sans
+  modification de l'index réel et refus si le verrou est déjà pris ou
+  remplacé par un symlink ;
 - chemins commençant par `-` refusés, `.env.example/` répertoire refusé,
   restauration d'un legacy symlink ou refus d'un legacy répertoire ;
 - détection « notre hook » ancrée au préambule, pas à une sous-chaîne ;
 - chaînage du legacy par chemin relatif au hook, prouvé après déplacement
   du dépôt ;
+- console script sous la racine refusé (repli `-m`) et commit depuis un
+  sous-dossier toujours bloqué par le scan de la racine ;
 - anti-récursion `HEIMDALL_IN_HOOK=1`.
 
 ```sh
