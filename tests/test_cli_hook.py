@@ -161,10 +161,13 @@ def test_launcher_refuses_a_console_script_inside_the_repository(
     console.chmod(0o755)
     monkeypatch.setattr(hook_module.sys, "executable", str(python))
 
-    launcher = _launcher(git_repo.root)
-
-    assert "-I -m heimdall.cli.main" in launcher
-    assert str(console) not in launcher
+    if sys.version_info >= (3, 11):
+        launcher = _launcher(git_repo.root)
+        assert "-I -P -m heimdall.cli.main" in launcher
+        assert str(console) not in launcher
+    else:
+        with pytest.raises(HookError):
+            _launcher(git_repo.root)
 
 
 def test_launcher_refuses_a_console_symlink_under_the_repository(
@@ -181,10 +184,42 @@ def test_launcher_refuses_a_console_symlink_under_the_repository(
     console.symlink_to(outside)
     monkeypatch.setattr(hook_module.sys, "executable", str(python))
 
+    if sys.version_info >= (3, 11):
+        launcher = _launcher(git_repo.root)
+        assert "-I -P -m heimdall.cli.main" in launcher
+        assert str(console) not in launcher
+    else:
+        with pytest.raises(HookError):
+            _launcher(git_repo.root)
+
+
+def test_launcher_requires_a_console_on_python_310(
+    git_repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv_bin = tmp_path / "outside-venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module.sys, "executable", str(python))
+    monkeypatch.setattr(hook_module.sys, "version_info", (3, 10, 0))
+
+    with pytest.raises(HookError):
+        _launcher(git_repo.root)
+
+
+def test_launcher_uses_safe_path_on_python_311(
+    git_repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv_bin = tmp_path / "outside-venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module.sys, "executable", str(python))
+    monkeypatch.setattr(hook_module.sys, "version_info", (3, 11, 0))
+
     launcher = _launcher(git_repo.root)
 
-    assert "-I -m heimdall.cli.main" in launcher
-    assert str(console) not in launcher
+    assert "-I -P -m heimdall.cli.main" in launcher
 
 
 def test_install_refuses_an_interpreter_inside_the_repository(
@@ -215,12 +250,40 @@ def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:
     assert "unset PYTHONPATH PYTHONHOME" in content
     assert "scan --staged" in content
     assert '"$PWD"' in content
+    assert "PYTHONSAFEPATH=1" in content
     console = Path(sys.executable).with_name("heimdall")
     if os.name != "nt" and console.is_file():
         assert str(console) in content
     else:
         assert os.path.abspath(sys.executable) in content
         assert "-I -m heimdall.cli.main" in content
+
+
+@pytest.mark.parametrize("preinstalled", [False, True])
+def test_install_rolls_back_if_root_check_fails_after_write(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, preinstalled: bool
+) -> None:
+    if preinstalled:
+        hook_module.install_hook(git_repo.root)
+    before = _hook(git_repo).read_bytes() if preinstalled else None
+    calls = [0]
+    real_verify = hook_module._verify_root
+
+    def failing_verify(access):
+        calls[0] += 1
+        if calls[0] >= 3:
+            raise HookError
+        real_verify(access)
+
+    monkeypatch.setattr(hook_module, "_verify_root", failing_verify)
+
+    with pytest.raises(HookError):
+        hook_module.install_hook(git_repo.root)
+
+    if preinstalled:
+        assert _hook(git_repo).read_bytes() == before
+    else:
+        assert not _hook(git_repo).exists()
 
 
 def test_install_is_idempotent(git_repo: GitRepo) -> None:
@@ -939,6 +1002,34 @@ def test_restage_refuses_a_symlink_index_lock(
 
     assert target.read_text(encoding="utf-8") == "do not touch"
     assert lock.is_symlink()
+
+
+def test_restage_refuses_a_lock_swapped_for_a_symlink_before_replace(
+    git_repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git_repo.write("app.py", "old\n")
+    git_repo.stage("app.py")
+    git_repo.commit_all("base")
+    before = git_repo.git_output("show", ":app.py")
+    git_repo.write("app.py", "new\n")
+    target = tmp_path / "target"
+    target.write_text("do not touch", encoding="utf-8")
+    lock = git_repo.root / ".git" / "index.lock"
+    real_verify = hook_module._verify_index_entries
+
+    def swap_then_verify(*args, **kwargs):
+        real_verify(*args, **kwargs)
+        lock.unlink()
+        lock.symlink_to(target)
+
+    monkeypatch.setattr(hook_module, "_verify_index_entries", swap_then_verify)
+
+    with pytest.raises(HookError):
+        hook_module._restage_paths(git_repo.root, ["app.py"])
+
+    assert target.read_text(encoding="utf-8") == "do not touch"
+    assert git_repo.git_output("show", ":app.py") == before
+    assert not os.path.lexists(lock)
 
 
 def test_locked_index_copy_refuses_a_symlink_source(

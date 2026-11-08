@@ -23,17 +23,19 @@ chemin ni contenu n'est reflété. `--force` est requis pour un
 Le script généré exécute, dans cet ordre :
 
 1. le hook précédent s'il a été conservé et s'il est exécutable ;
-2. `heimdall scan --staged "$PWD"` avec le script console absolu (ou, à
-defaut, `python -I -m heimdall.cli.main`) qui a installé Heimdall. `-I`
-isole l'interpréteur du `PYTHONPATH` et du dépôt : un `heimdall/` local ne
-peut pas détourner l'import. Git lance les hooks avec `cwd` = racine ; si le
-script est invoqué depuis un sous-dossier, `$PWD` n'est pas une racine de
-dépôt et le scan échoue en code 2 (fail-closed), jamais un périmètre partiel.
-Un console script situé sous la racine, même s'il pointe par lien vers
-l'extérieur (venv dans le dépôt), est refusé et remplacé par le module isolé.
-L'interpréteur Python doit lui aussi être **hors du dépôt** : `hook install`
-refuse en code 2 si `sys.executable` est sous la racine, pour qu'un dépôt
-piégé ne puisse pas remplacer l'interpréteur exécuté à chaque commit.
+2. `heimdall scan --staged "$PWD"` avec le script console absolu ou, à
+defaut, `python -I -P -m heimdall.cli.main` (Python ≥ 3.11). `PYTHONSAFEPATH=1`
+est exporté et `-P` empêche le préfixe du cwd : un `heimdall/` local ne peut
+pas détourner l'import. Sur Python 3.10, `-P` n'existe pas : le script
+console **hors du dépôt** est alors obligatoire, sinon `hook install` refuse
+en code 2. Git lance les hooks avec `cwd` = racine ; si le script est invoqué
+depuis un sous-dossier, `$PWD` n'est pas une racine de dépôt et le scan
+échoue en code 2 (fail-closed), jamais un périmètre partiel. Un console
+script situé sous la racine, même s'il pointe par lien vers l'extérieur (venv
+dans le dépôt), est refusé. L'interpréteur Python doit lui aussi être **hors
+du dépôt** : `hook install` refuse en code 2 si `sys.executable` est sous la
+racine, pour qu'un dépôt piégé ne puisse pas remplacer l'interpréteur exécuté
+à chaque commit.
 
 Le hook précédent est localisé **relativement au script** (`dirname "$0"`) :
 déplacer le dépôt ne casse pas le chaînage. Il passe **avant** Heimdall :
@@ -140,7 +142,8 @@ moteur de remédiation interactif reste le ticket #30/#32.
   barrière opposable pour une branche partagée.
 - L'interpréteur Python doit être hors du dépôt : un venv local est refusé
   à l'installation (code 2). Le script console sous la racine est également
-  refusé.
+  refusé. Sur Python 3.10, un console script hors dépôt est obligatoire
+  (pas de `-P`) ; sur 3.11+, le repli `-P`/`PYTHONSAFEPATH` est sûr.
 
 ## Preuves
 
@@ -165,9 +168,10 @@ moteur de remédiation interactif reste le ticket #30/#32.
 - détection « notre hook » ancrée au préambule, pas à une sous-chaîne ;
 - chaînage du legacy par chemin relatif au hook, prouvé après déplacement
   du dépôt ;
-- console script sous la racine (même lien vers l'extérieur) refusé
-  (repli `-m`), interpréteur Python sous la racine refusé à l'installation,
-  et commit depuis un sous-dossier toujours bloqué par le scan de la racine ;
+- console script sous la racine (même lien vers l'extérieur) refusé,
+  interpréteur Python sous la racine refusé à l'installation, repli `-P`
+  uniquement sur 3.11+ (refus sur 3.10 sans console), et commit depuis un
+  sous-dossier toujours bloqué par le scan de la racine ;
 - chemins assertés figés : un échange `a` → lien vers `b` entre l'assert et
   la ré-indexation est refusé sans stager `b` ;
 - fichiers non suivis ou absents refusés par l'assert (pas de `git add`

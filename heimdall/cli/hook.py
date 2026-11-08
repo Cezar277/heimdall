@@ -302,6 +302,11 @@ def _launcher(root: Path) -> str:
     """
     python = _interpreter()
     console = Path(python).with_name("heimdall")
+    fallback = f"{shlex.quote(python)} -I -m heimdall.cli.main"
+    if sys.version_info >= (3, 11):
+        # ``-P`` n'existe qu'à partir de 3.11 ; sur 3.10, ``-I -m`` préfixe
+        # encore le cwd et un paquet ``heimdall/`` du dépôt serait importé.
+        fallback = f"{shlex.quote(python)} -I -P -m heimdall.cli.main"
     # Sous Windows, ``heimdall.exe`` est un lanceur natif, pas un script
     # Python : on garde le module isolé, qui fonctionne partout.
     if os.name != "nt" and console.is_file() and os.access(console, os.X_OK):
@@ -310,11 +315,15 @@ def _launcher(root: Path) -> str:
             if console.is_relative_to(repository_root) or console.resolve().is_relative_to(
                 repository_root
             ):
-                return f"{shlex.quote(python)} -I -m heimdall.cli.main"
+                if sys.version_info < (3, 11):
+                    raise HookError
+                return fallback
         except (OSError, RuntimeError):
             raise HookError from None
         return f"{shlex.quote(python)} -I {shlex.quote(str(console))}"
-    return f"{shlex.quote(python)} -I -m heimdall.cli.main"
+    if sys.version_info < (3, 11):
+        raise HookError
+    return fallback
 
 
 def _read_regular(path: Path, limit: int) -> bytes:
@@ -412,6 +421,8 @@ def _hook_script(launcher: str, legacy: Path | None) -> bytes:
     lines.extend(
         [
             "unset PYTHONPATH PYTHONHOME",
+            "PYTHONSAFEPATH=1",
+            "export PYTHONSAFEPATH",
             f'exec {launcher} scan --staged "$PWD"',
         ]
     )
@@ -495,6 +506,16 @@ def _verify_root(access: GitAccess) -> None:
         raise HookError
 
 
+def _ensure_interpreter_outside_repository(access: GitAccess) -> None:
+    """Refuse un interpréteur Python situé sous la racine du dépôt."""
+    python = Path(_interpreter())
+    try:
+        if python.is_relative_to(access.root) or python.resolve().is_relative_to(access.root):
+            raise HookError
+    except (OSError, RuntimeError):
+        raise HookError from None
+
+
 def _prepare_existing_hook(hook_path: Path, legacy_path: Path) -> tuple[bool, bool]:
     """Classe le hook existant et le sauvegarde si nécessaire.
 
@@ -531,12 +552,7 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
     hors du dépôt et du répertoire Git commun exige ``force=True``.
     """
     access = _open_repository(root)
-    python = Path(_interpreter())
-    try:
-        if python.is_relative_to(access.root) or python.resolve().is_relative_to(access.root):
-            raise HookError
-    except (OSError, RuntimeError):
-        raise HookError from None
+    _ensure_interpreter_outside_repository(access)
     hooks_directory = _git_path(access, "hooks")
     _validate_hooks_directory(access, hooks_directory)
     if not force and not _inside_allowed_roots(access, hooks_directory):
@@ -546,12 +562,7 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
     # Le mkdir peut avoir changé le ctime de la racine : on rouvre pour
     # comparer la suite des écritures à l'identité courante, pas à l'ancienne.
     access = _open_repository(root)
-    python = Path(_interpreter())
-    try:
-        if python.is_relative_to(access.root) or python.resolve().is_relative_to(access.root):
-            raise HookError
-    except (OSError, RuntimeError):
-        raise HookError from None
+    _ensure_interpreter_outside_repository(access)
     hooks_directory = _git_path(access, "hooks")
     _validate_hooks_directory(access, hooks_directory)
     if not force and not _inside_allowed_roots(access, hooks_directory):
@@ -561,6 +572,7 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
     legacy_path = hooks_directory / (HOOK_NAME + LEGACY_SUFFIX)
     try:
         ours, moved_legacy = _prepare_existing_hook(hook_path, legacy_path)
+        previous = _read_regular(hook_path, MAX_HOOK_BYTES) if ours else None
         legacy_for_chain = legacy_path if _is_chainable(legacy_path) else None
         script = _hook_script(_launcher(access.root), legacy_for_chain)
         try:
@@ -570,6 +582,12 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
             if moved_legacy:
                 with contextlib.suppress(OSError):
                     os.replace(legacy_path, hook_path)
+            elif previous is not None:
+                with contextlib.suppress(HookError):
+                    _atomic_write(hook_path, previous)
+            else:
+                with contextlib.suppress(OSError):
+                    os.unlink(hook_path)
             raise
     except OSError:
         raise HookError from None
@@ -596,12 +614,7 @@ def _check_legacy_restorable(path: Path) -> None:
 def uninstall_hook(root: Path, *, force: bool = False) -> UninstallOutcome:
     """Retire le hook Heimdall et restaure le hook précédent s'il existe."""
     access = _open_repository(root)
-    python = Path(_interpreter())
-    try:
-        if python.is_relative_to(access.root) or python.resolve().is_relative_to(access.root):
-            raise HookError
-    except (OSError, RuntimeError):
-        raise HookError from None
+    _ensure_interpreter_outside_repository(access)
     hooks_directory = _git_path(access, "hooks")
     _validate_hooks_directory(access, hooks_directory)
     if not force and not _inside_allowed_roots(access, hooks_directory):
@@ -852,7 +865,9 @@ def _create_locked_index_copy(index_path: Path, lock_path: Path) -> None:
                 shutil.copyfileobj(source, target)
                 target.flush()
                 os.fsync(target.fileno())
-        os.chmod(lock_path, 0o600)
+                fchmod = getattr(os, "fchmod", None)
+                if fchmod is not None:
+                    fchmod(target.fileno(), 0o600)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(lock_path)
@@ -864,6 +879,25 @@ def _create_locked_index_copy(index_path: Path, lock_path: Path) -> None:
         if descriptor >= 0:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+
+
+def _replace_index_atomically(lock_path: Path, index_path: Path) -> None:
+    """Remplace l'index par le verrou après contrôle d'identité régulière."""
+    try:
+        descriptor = os.open(lock_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise HookError from None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HookError
+        current = os.lstat(lock_path)
+        if (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino):
+            raise HookError
+        os.replace(lock_path, index_path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
 
 
 def _restage_paths(
@@ -925,9 +959,7 @@ def _restage_paths(
             extra_env=extra_env,
             allowed_index_file=lock_path,
         )
-        if not stat.S_ISREG(os.lstat(lock_path).st_mode):
-            raise HookError
-        os.replace(lock_path, index_path)
+        _replace_index_atomically(lock_path, index_path)
         lock_created = False
     except OSError:
         raise HookError from None
