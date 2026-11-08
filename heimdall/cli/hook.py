@@ -454,7 +454,16 @@ def _atomic_write(path: Path, content: bytes) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(temporary, 0o700)
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                fchmod(stream.fileno(), 0o700)
+            written = os.fstat(stream.fileno())
+        current = os.lstat(temporary)
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
+            written.st_dev,
+            written.st_ino,
+        ):
+            raise HookError
         os.replace(temporary, path)
         temporary = None
         try:
@@ -479,7 +488,7 @@ def _atomic_write(path: Path, content: bytes) -> None:
                 os.unlink(temporary)
 
 
-def _ensure_hooks_directory(path: Path) -> None:
+def _ensure_hooks_directory(path: Path, *, outside: bool) -> None:
     """Crée le dossier de hooks si nécessaire, sans écraser un fichier.
 
     Un dossier accessible en écriture au groupe ou aux autres est refusé :
@@ -487,8 +496,12 @@ def _ensure_hooks_directory(path: Path) -> None:
     ensuite avec les droits du développeur. Un umask 0002 rend `.git/hooks`
     groupe-inscriptible : l'opérateur doit alors faire `chmod g-w`. Les
     parents manquants (``--force`` vers un chemin absolu) sont créés en 0700 :
-    ``mkdir(parents=True)`` les créerait selon l'umask.
+    ``mkdir(parents=True)`` les créerait selon l'umask. Hors zone autorisée,
+    chaque parent existant est soumis à la même règle (voir
+    :func:`_check_ancestors_private`).
     """
+    if outside:
+        _check_ancestors_private(path)
     try:
         if path.exists() and not path.is_dir():
             raise HookError
@@ -504,6 +517,27 @@ def _ensure_hooks_directory(path: Path) -> None:
         raise HookError from None
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & 0o022:
         raise HookError
+
+
+def _check_ancestors_private(path: Path) -> None:
+    """Refuse un parent existant inscriptible au groupe ou aux autres, sauf sticky.
+
+    Renommer un composant d'un chemin exige l'écriture dans son parent : un
+    parent non sticky inscriptible par d'autres permet donc de remplacer le
+    dossier de hooks. Le bit sticky (p. ex. ``/tmp``) protège les entrées.
+    Les parents encore absents seront créés en 0700 dans un parent contrôlé.
+    """
+    try:
+        for parent in path.parents:
+            if not os.path.lexists(parent):
+                continue
+            metadata = os.stat(parent)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise HookError
+            if metadata.st_mode & 0o022 and not metadata.st_mode & stat.S_ISVTX:
+                raise HookError
+    except OSError:
+        raise HookError from None
 
 
 def _open_repository(root: Path) -> GitAccess:
@@ -576,10 +610,11 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
     _ensure_interpreter_outside_repository(access)
     hooks_directory = _git_path(access, "hooks")
     _validate_hooks_directory(access, hooks_directory)
-    if not force and not _inside_allowed_roots(access, hooks_directory):
+    outside = not _inside_allowed_roots(access, hooks_directory)
+    if not force and outside:
         raise OutsideRepositoryError
     _verify_root(access)
-    _ensure_hooks_directory(hooks_directory)
+    _ensure_hooks_directory(hooks_directory, outside=outside)
     # Le mkdir peut avoir changé le ctime de la racine : on rouvre pour
     # comparer la suite des écritures à l'identité courante, pas à l'ancienne.
     access = _open_repository(root)

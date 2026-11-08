@@ -323,6 +323,52 @@ def test_reads_and_index_writes_refuse_without_o_nofollow(
     assert not (git_repo.root / ".git" / "index.lock").exists()
 
 
+def test_install_force_refuses_a_group_writable_existing_parent(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o775)
+    custom = shared / "hooks"
+    git_repo.git("config", "core.hooksPath", str(custom))
+    previous = os.umask(0o002)
+    try:
+        result = _run("hook", "install", str(git_repo.root), "--force")
+    finally:
+        os.umask(previous)
+
+    assert result.exit_code == 2
+    assert not custom.exists()
+
+
+def test_atomic_write_refuses_a_temporary_swapped_for_a_symlink(
+    git_repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hooks = _hook(git_repo).parent
+    hooks.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "target"
+    target.write_text("do not touch", encoding="utf-8")
+    real_fsync = os.fsync
+    swapped: list[Path] = []
+
+    def swapping_fsync(descriptor: int) -> None:
+        real_fsync(descriptor)
+        if not swapped:
+            for temporary in hooks.glob(".heimdall-hook-*"):
+                temporary.unlink()
+                temporary.symlink_to(target)
+                swapped.append(temporary)
+
+    monkeypatch.setattr(hook_module.os, "fsync", swapping_fsync)
+
+    with pytest.raises(HookError):
+        hook_module._atomic_write(_hook(git_repo), b"#!/bin/sh\n")
+
+    assert swapped
+    assert target.read_text(encoding="utf-8") == "do not touch"
+    assert not _hook(git_repo).exists()
+
+
 def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:
     result = _run("hook", "install", str(git_repo.root))
 

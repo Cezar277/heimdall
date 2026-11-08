@@ -76,6 +76,10 @@ par le groupe ni par les autres : un umask `0002` rend `.git/hooks` groupe-inscr
 et l'installation refuse alors en code 2 ; faire `chmod g-w .git/hooks` (ou
 utiliser un `core.hooksPath` dédié en `0700`). Un lien symbolique de hook
 n'est jamais suivi : il est déplacé comme sauvegarde et n'est pas chaîné.
+Hors zone autorisée (`--force`), tout parent existant du dossier de hooks doit
+aussi être non inscriptible par le groupe et les autres, sauf bit sticky
+(comme `/tmp`) ; sinon l'installation refuse en code 2 avant de créer quoi que
+ce soit. Les parents manquants sont créés en `0700`.
 
 ## Anti-récursion
 
