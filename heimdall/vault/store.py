@@ -53,6 +53,7 @@ from heimdall.vault.database import (
     list_secret_page,
     rotate_secrets_kek,
     validate_kek_version,
+    validate_secret_page_bounds,
 )
 from heimdall.vault.database import runtime_db_session as db_session
 
@@ -128,6 +129,9 @@ class InMemorySecretStore:
     workers (workers > 1), chaque worker détiendrait une instance mémoire indépendante
     et divergente sans garantie d'unicité inter-processus ; utiliser
     ``SqliteSecretStore`` pour un déploiement multi-worker.
+    Le listage met en cache l'ordre trié par projet, invalidé à chaque
+    création/suppression/clear : une page ne refait pas un tri complet
+    O(n log n) à chaque requête.
     """
 
     def __init__(
@@ -139,6 +143,8 @@ class InMemorySecretStore:
     ) -> None:
         self._secrets: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._project_counts: dict[str, int] = {}
+        # Cache de l'ordre (env, name) par projet, invalidé à chaque mutation.
+        self._sorted_keys_by_project: dict[str, list[tuple[str, str, str]]] = {}
         self._lock = asyncio.Lock()
         self._max_secrets = max_secrets
         self._max_secrets_per_project = max_secrets_per_project
@@ -188,6 +194,7 @@ class InMemorySecretStore:
             }
             self._secrets[key] = record
             self._project_counts[project] = project_count + 1
+            self._sorted_keys_by_project.pop(project, None)
             # Métadonnées seules : la route POST n'a pas besoin de la valeur et
             # le plaintext ne doit pas prolonger sa durée de vie en mémoire.
             return {
@@ -207,12 +214,21 @@ class InMemorySecretStore:
                 self._project_counts.pop(project, None)
             else:
                 self._project_counts[project] = count - 1
+            self._sorted_keys_by_project.pop(project, None)
             return True
 
     async def list_page(self, project: str, limit: int, offset: int) -> list[dict[str, str]]:
-        """Retourne uniquement les métadonnées, sans déchiffrement."""
+        """Retourne uniquement les métadonnées, sans déchiffrement.
+
+        L'ordre (env, name) est mis en cache par projet et invalidé à chaque
+        mutation, pour éviter un tri complet à chaque page.
+        """
+        validate_secret_page_bounds(limit, offset)
         async with self._lock:
-            keys = sorted(key for key in self._secrets if key[0] == project)
+            keys = self._sorted_keys_by_project.get(project)
+            if keys is None:
+                keys = sorted(key for key in self._secrets if key[0] == project)
+                self._sorted_keys_by_project[project] = keys
             return [
                 {
                     field: str(self._secrets[key][field])
@@ -225,6 +241,7 @@ class InMemorySecretStore:
         async with self._lock:
             self._secrets.clear()
             self._project_counts.clear()
+            self._sorted_keys_by_project.clear()
 
     async def rotate_kek(
         self,
@@ -487,6 +504,7 @@ class SqliteSecretStore:
 
     async def list_page(self, project: str, limit: int, offset: int) -> list[dict[str, str]]:
         """Borne la lecture SQL et ne charge aucune valeur ni empreinte."""
+        validate_secret_page_bounds(limit, offset)
         return await asyncio.to_thread(self._list_page, project, limit, offset)
 
     def _list_page(self, project: str, limit: int, offset: int) -> list[dict[str, str]]:

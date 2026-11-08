@@ -282,12 +282,11 @@ ne doit pas être présenté comme cette mitigation de débit : les deux mécani
 sont distincts et testés séparément. Le quota SQLite est vérifié dans la même
 transaction que l'insertion, sous `BEGIN IMMEDIATE` : le verrou d'écriture est
 acquis avant le comptage, ce qui empêche tout dépassement inter-workers. Un 429
-de capacité n'est pas transitoire sans route DELETE : le retry reste refusé
-tant que la capacité est pleine, même si `Retry-After` reste contractuel.
-Le client ne doit donc pas boucler sur ce 429 : le retry est **inutile**
-tant que la capacité est pleine (libération par une route DELETE suivie en
-#62). Ce 429 de capacité est distinct du 429 de débit (rate-limit), lui
-transitoire.
+de capacité n'est pas transitoire : le retry reste refusé tant que la capacité
+est pleine, même si `Retry-After` reste contractuel. Le client ne doit donc pas
+boucler sur ce 429 : il doit d'abord libérer un emplacement via
+`DELETE /api/v1/secrets/{project}/{env}/{name}` (#158). Ce 429 de capacité est
+distinct du 429 de débit (rate-limit), lui transitoire.
 Les rejets avant lecture du corps répondent `Connection: close` : 400 du
 middleware de taille, 429 de débit (pair/global et clé), 403 loopback et 401 pour
 une clé surdimensionnée. Les tests socket uvicorn/h11 vérifient la fermeture,

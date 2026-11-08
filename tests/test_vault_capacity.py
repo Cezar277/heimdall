@@ -113,6 +113,51 @@ def test_invalid_pagination_is_400(vault: TestClient, params: dict[str, str | in
     assert _CANARY not in response.text
 
 
+@pytest.mark.parametrize(
+    "limit, offset",
+    [(0, 0), (-1, 0), (102, 0), (1, -1), (101, -1)],
+)
+def test_store_rejects_out_of_bounds_pagination(vault: TestClient, limit: int, offset: int) -> None:
+    store = vault.app.state.secret_store
+    with pytest.raises(ValueError, match="pagination hors bornes"):
+        asyncio.run(store.list_page("demo", limit, offset))
+
+
+def test_store_accepts_internal_limit_plus_one(vault: TestClient) -> None:
+    store = vault.app.state.secret_store
+    assert asyncio.run(store.list_page("demo", 101, 0)) == []
+
+
+def test_memory_list_page_caches_order_and_invalidates() -> None:
+    async def scenario() -> None:
+        store = InMemorySecretStore()
+        for name in ("DEMO_C", "DEMO_A", "DEMO_B"):
+            await store.create("demo", "dev", name, _CANARY)
+        first = await store.list_page("demo", 10, 0)
+        assert [item["name"] for item in first] == ["DEMO_A", "DEMO_B", "DEMO_C"]
+        cached = store._sorted_keys_by_project["demo"]
+        second = await store.list_page("demo", 10, 0)
+        assert [item["name"] for item in second] == ["DEMO_A", "DEMO_B", "DEMO_C"]
+        assert store._sorted_keys_by_project["demo"] is cached
+        await store.create("demo", "dev", "DEMO_D", _CANARY)
+        assert "demo" not in store._sorted_keys_by_project
+        third = await store.list_page("demo", 10, 0)
+        assert [item["name"] for item in third] == [
+            "DEMO_A",
+            "DEMO_B",
+            "DEMO_C",
+            "DEMO_D",
+        ]
+        assert await store.delete("demo", "dev", "DEMO_B") is True
+        assert "demo" not in store._sorted_keys_by_project
+        fourth = await store.list_page("demo", 10, 0)
+        assert [item["name"] for item in fourth] == ["DEMO_A", "DEMO_C", "DEMO_D"]
+        await store.clear()
+        assert store._sorted_keys_by_project == {}
+
+    asyncio.run(scenario())
+
+
 def test_default_and_maximum_page_size(vault: TestClient) -> None:
     async def populate() -> None:
         for index in range(101):
