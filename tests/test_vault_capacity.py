@@ -173,6 +173,33 @@ def test_default_and_maximum_page_size(vault: TestClient) -> None:
     assert _CANARY not in default.text + maximum.text
 
 
+@pytest.mark.parametrize(
+    "method, path, params, expected_status",
+    [
+        ("get", _COLLECTION, {"project": "other"}, 403),
+        ("get", _COLLECTION, {"project": "demo", "limit": 0}, 400),
+        ("delete", _RESOURCE, None, 404),
+    ],
+)
+def test_error_responses_are_no_store(
+    vault: TestClient,
+    method: str,
+    path: str,
+    params: dict[str, str | int] | None,
+    expected_status: int,
+) -> None:
+    response = getattr(vault, method)(path, params=params)
+    assert response.status_code == expected_status
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_auth_error_response_is_no_store(vault: TestClient) -> None:
+    vault.headers.pop("X-Heimdall-API-Key")
+    response = vault.get(_COLLECTION, params={"project": "demo"})
+    assert response.status_code == 401
+    assert response.headers["Cache-Control"] == "no-store"
+
+
 def test_project_access_precedes_storage(vault: TestClient) -> None:
     _create(vault)
     store = vault.app.state.secret_store
@@ -207,6 +234,7 @@ def test_rate_limit_also_applies_to_new_routes(vault: TestClient) -> None:
     limited = vault.delete(_RESOURCE)
     assert limited.status_code == 429
     assert 1 <= int(limited.headers["Retry-After"]) <= 2
+    assert limited.headers["Cache-Control"] == "no-store"
 
 
 @pytest.mark.parametrize("operation", ["list_page", "delete"])

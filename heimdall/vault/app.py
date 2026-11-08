@@ -1178,6 +1178,24 @@ async def _limiter_consume_authenticated(
     return limiter.check_authenticated(peer, key_hash)
 
 
+def _register_no_store_middleware(app: FastAPI) -> None:
+    """Force ``Cache-Control: no-store`` sur toutes les réponses de secrets.
+
+    Les handlers de succès posent déjà l'en-tête ; ce middleware couvre les
+    chemins d'erreur (400/401/403/404/429) sans dupliquer la logique dans
+    chaque route. Les 503 de ``DatabaseAvailabilityMiddleware``, plus externe,
+    portent déjà l'en-tête.
+    """
+
+    @app.middleware("http")
+    async def secrets_no_store_middleware(request: Request, call_next: Any) -> Any:
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/api/v1/secrets" or path.startswith("/api/v1/secrets/"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response
+
+
 def _register_middleware(app: FastAPI) -> None:
     """Enregistre les middlewares du serveur Vault."""
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=_MAX_BODY_SIZE)
@@ -1303,6 +1321,8 @@ def _register_middleware(app: FastAPI) -> None:
                 headers={"Connection": "close"},
             )
         return await call_next(request)
+
+    _register_no_store_middleware(app)
 
 
 def _register_exception_handlers(app: FastAPI) -> None:
