@@ -127,6 +127,17 @@ def test_run_git_rejects_a_redirecting_environment(git_repo: GitRepo) -> None:
         )
 
 
+def test_run_git_rejects_an_unexpected_absolute_index_file(
+    git_repo: GitRepo,
+) -> None:
+    with pytest.raises(HookError):
+        hook_module._run_git(
+            git_repo.root,
+            ("rev-parse", "--git-dir"),
+            extra_env={"GIT_INDEX_FILE": "/nonexistent/index"},
+        )
+
+
 def test_run_git_rejects_a_relative_index_file(git_repo: GitRepo) -> None:
     with pytest.raises(HookError):
         hook_module._run_git(
@@ -793,6 +804,25 @@ def test_restage_refuses_when_the_index_lock_exists(git_repo: GitRepo) -> None:
 
     assert git_repo.git_output("show", ":app.py") == before
     assert lock.exists()
+
+
+def test_restage_refuses_a_symlink_index_lock(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    git_repo.write("app.py", "old\n")
+    git_repo.stage("app.py")
+    git_repo.commit_all("base")
+    git_repo.write("app.py", "new\n")
+    target = tmp_path / "target"
+    target.write_text("do not touch", encoding="utf-8")
+    lock = git_repo.root / ".git" / "index.lock"
+    lock.symlink_to(target)
+
+    with pytest.raises(HookError):
+        hook_module._restage_paths(git_repo.root, ["app.py"])
+
+    assert target.read_text(encoding="utf-8") == "do not touch"
+    assert lock.is_symlink()
 
 
 def test_verify_root_detects_a_replaced_root(git_repo: GitRepo) -> None:

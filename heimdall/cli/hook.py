@@ -142,13 +142,14 @@ def _git_binary(root: Path) -> str:
     return git
 
 
-def _run_git(
+def _run_git(  # noqa: PLR0913 - options explicites
     root: Path,
     arguments: Sequence[str],
     *,
     stdin: bytes | None = None,
     timeout: float = GIT_TIMEOUT_SECONDS,
     extra_env: dict[str, str] | None = None,
+    allowed_index_file: Path | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Exécute une commande git figée, sans shell et sans hooks du dépôt.
 
@@ -165,11 +166,19 @@ def _run_git(
         index_file = extra_env.get("GIT_INDEX_FILE")
         if (
             index_file is None
+            or allowed_index_file is None
             or not Path(index_file).is_absolute()
             or any(character in index_file for character in ("\x00", "\n", "\r"))
         ):
             raise HookError
+        try:
+            if Path(index_file).resolve() != allowed_index_file.resolve():
+                raise HookError
+        except (OSError, RuntimeError):
+            raise HookError from None
         environment.update(extra_env)
+    elif allowed_index_file is not None:
+        raise HookError
     command = [
         _git_binary(root),
         *GIT_CONFIG_OVERRIDES,
@@ -743,11 +752,17 @@ def _verify_index_entries(
     entries: Sequence[tuple[str, str, str]],
     *,
     extra_env: dict[str, str],
+    allowed_index_file: Path,
 ) -> None:
     """Vérifie que l'index temporaire contient exactement les entrées voulues."""
     arguments = ["ls-files", "-s", "-z", "--"]
     arguments.extend(relative for _, _, relative in entries)
-    completed = _run_git(root, arguments, extra_env=extra_env)
+    completed = _run_git(
+        root,
+        arguments,
+        extra_env=extra_env,
+        allowed_index_file=allowed_index_file,
+    )
     if completed.returncode != 0:
         raise HookError
     actual: dict[str, tuple[str, str]] = {}
@@ -771,6 +786,37 @@ def _verify_index_entries(
     expected = {relative: (mode, digest) for mode, digest, relative in entries}
     if actual != expected:
         raise HookError
+
+
+def _create_locked_index_copy(index_path: Path, lock_path: Path) -> None:
+    """Crée ``index.lock`` et y copie l'index via le descripteur verrouillé.
+
+    Le chemin du verrou n'est jamais rouvert par nom après sa création : un
+    remplacement par un lien symbolique entre ``O_EXCL`` et la copie ne peut
+    donc pas faire tronquer la cible du lien.
+    """
+    try:
+        descriptor = os.open(
+            lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+    except OSError:
+        raise HookError from None
+    try:
+        with open(index_path, "rb") as source:
+            with os.fdopen(descriptor, "wb", closefd=True) as target:
+                descriptor = -1
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fsync(target.fileno())
+        os.chmod(lock_path, 0o600)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(lock_path)
+        raise
+    finally:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
 
 def _restage_paths(root: Path, paths: Iterable[str]) -> int:
@@ -802,21 +848,28 @@ def _restage_paths(root: Path, paths: Iterable[str]) -> int:
         # Protocole Git natif : prendre ``index.lock`` AVANT de copier, pour
         # qu'un ``git add`` concurrent ne puisse pas se terminer puis être
         # écrasé silencieusement par notre ``os.replace``.
-        lock_descriptor = os.open(
-            lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-        )
+        _create_locked_index_copy(index_path, lock_path)
         lock_created = True
-        os.close(lock_descriptor)
-        shutil.copyfile(index_path, lock_path)
-        os.chmod(lock_path, 0o600)
         extra_env = {"GIT_INDEX_FILE": str(lock_path)}
         arguments = ["update-index", "--add"]
         for mode, digest, relative in entries:
             arguments.extend(["--cacheinfo", mode, digest, relative])
-        completed = _run_git(repository_root, arguments, extra_env=extra_env)
+        completed = _run_git(
+            repository_root,
+            arguments,
+            extra_env=extra_env,
+            allowed_index_file=lock_path,
+        )
         if completed.returncode != 0:
             raise HookError
-        _verify_index_entries(repository_root, entries, extra_env=extra_env)
+        _verify_index_entries(
+            repository_root,
+            entries,
+            extra_env=extra_env,
+            allowed_index_file=lock_path,
+        )
+        if not stat.S_ISREG(os.lstat(lock_path).st_mode):
+            raise HookError
         os.replace(lock_path, index_path)
         lock_created = False
     except OSError:

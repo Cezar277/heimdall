@@ -95,9 +95,10 @@ La ré-indexation n'exécute **ni filtre `clean` ni hook Git** du dépôt :
 le contenu est lu par Heimdall (`O_NOFOLLOW`, taille bornée), haché par
 `git hash-object -w --no-filters --stdin`, puis écrit dans un **index
 temporaire** par `git update-index --add --cacheinfo`. Le verrou Git
-`index.lock` est pris **avant** la copie de l'index, puis l'index réel est
-remplacé atomiquement (`os.replace`) après vérification des entrées
-(`git ls-files -s -z`) : ni panne médiane ni `git add` concurrent ne laisse
+`index.lock` est pris **avant** la copie de l'index ; la copie passe par le
+descripteur du verrou (jamais par une réouverture du nom, donc pas de suivi
+de lien), puis l'index réel est remplacé atomiquement (`os.replace`) après
+vérification des entrées (`git ls-files -s -z`) : ni panne médiane ni `git add` concurrent ne laisse
 l'index partiellement modifié ou n'écrase une mise à jour concurrente. Les commandes git internes utilisent
 un argv figé, `core.fsmonitor=false` et `core.hooksPath=os.devnull` ; les
 chemins passent par la garde unique `heimdall.mcp.paths.confine` (résolution
@@ -110,8 +111,9 @@ niveau ; seul le **fichier** exact `.env.example` (dernier composant,
 Le binaire `git` est résolu hors `PATH` hérité et refusé s'il est situé dans
 le dépôt ou dans le répertoire courant. L'environnement des commandes
 internes n'accepte qu'une variable supplémentaire, `GIT_INDEX_FILE`, avec un
-chemin absolu ; toute autre variable (`GIT_DIR`, `GIT_WORK_TREE`,
-`GIT_CONFIG_*`…) est refusée.
+chemin absolu qui doit être **exactement** le verrou `index.lock` du dépôt ;
+toute autre variable (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_*`…) ou un
+index hors de ce verrou est refusée.
 
 Le hook installé se contente de scanner et bloquer : le branchement du
 moteur de remédiation interactif reste le ticket #30/#32.
@@ -138,9 +140,9 @@ moteur de remédiation interactif reste le ticket #30/#32.
   le second hunk reste intact dans le dossier de travail ;
 - refus des modifications non indexées avant remédiation ;
 - ré-indexation sans exécuter les filtres `clean` ni le hook
-  `post-index-change`, avec verrou `index.lock` pris avant copie, échec
-  `update-index` sans modification de l'index réel et refus si le verrou
-  est déjà pris ;
+  `post-index-change`, avec verrou `index.lock` pris avant copie, copie via
+  descripteur, échec `update-index` sans modification de l'index réel et
+  refus si le verrou est déjà pris ou remplacé par un symlink ;
 - chemins commençant par `-` refusés, `.env.example/` répertoire refusé,
   restauration d'un legacy symlink ou refus d'un legacy répertoire ;
 - détection « notre hook » ancrée au préambule, pas à une sous-chaîne ;
