@@ -20,6 +20,66 @@ security:
   - ProjectApiKey: []
 paths:
   /api/v1/secrets:
+    get:
+      tags: [Secrets]
+      operationId: listSecrets
+      summary: Lister les métadonnées des secrets d'un projet
+      description: >-
+        Autorisation du projet avant toute lecture. Aucune valeur, empreinte
+        ou donnée chiffrée. Ordre stable par env puis name, lexicographique ASCII.
+        Une page vide retourne items vide et next_offset null. Les pages ne
+        constituent pas un snapshot si des écritures concurrentes ont lieu.
+        Tout next_offset non null est réutilisable comme offset avec le même
+        limit. Si la page suivante dépasserait l'offset maximal de 1000000,
+        next_offset vaut null même s'il reste des métadonnées au-delà.
+      parameters:
+        - name: project
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/ProjectId'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+            default: 0
+      responses:
+        '200':
+          description: Page de métadonnées, sans valeur.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        'default':
+          $ref: '#/components/responses/UnexpectedError'
     post:
       tags: [Secrets]
       operationId: createSecret
@@ -28,6 +88,9 @@ paths:
         La clé doit autoriser l'écriture dans le projet et l'environnement.
         Crée un secret vaulté après persistance chiffrée ; n'écrase jamais un
         secret existant. La réponse ne contient pas la valeur.
+        Le 429 de capacité conserve Retry-After: 60 pour le contrat, mais
+        attendre ne libère aucun emplacement : utiliser DELETE avant de recréer.
+        Le 429 de débit est transitoire et indique le délai de sa fenêtre.
       requestBody:
         description: >-
           Le serveur DOIT (MUST) rejeter avec HTTP 400 bad_request tout corps
@@ -119,6 +182,38 @@ paths:
         '503':
           $ref: '#/components/responses/Unavailable'
         default:
+          $ref: '#/components/responses/UnexpectedError'
+    delete:
+      tags: [Secrets]
+      operationId: deleteSecret
+      summary: Supprimer un secret et libérer sa capacité
+      description: >-
+        Autorise le projet avant toute recherche. Supprime le secret sans le
+        déchiffrer et libère les quotas global et par projet. Une seconde
+        suppression du même secret retourne 404.
+      responses:
+        '204':
+          description: Secret supprimé, capacité libérée. Aucun corps.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        'default':
           $ref: '#/components/responses/UnexpectedError'
   /api/v1/secrets/{project}/{env}/{name}/state:
     parameters:
@@ -333,6 +428,22 @@ components:
             code: internal_error
             message: Erreur interne
   schemas:
+    SecretPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_offset]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/SecretMetadata'
+        next_offset:
+          anyOf:
+            - type: integer
+              minimum: 0
+              maximum: 1000000
+            - type: 'null'
     InternalError:
       type: object
       additionalProperties: false

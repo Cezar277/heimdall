@@ -1074,13 +1074,13 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_secrets_routes_method_not_allowed_405(self) -> None:
         """Méthodes non déclarées sur /api/v1/secrets retournent 405 avec en-tête Allow."""
-        res_get = await self.client.get("/api/v1/secrets")
-        self.assertEqual(res_get.status_code, 405)
+        res_put = await self.client.put("/api/v1/secrets")
+        self.assertEqual(res_put.status_code, 405)
         self.assertEqual(
-            res_get.json(),
+            res_put.json(),
             {"code": "method_not_allowed", "message": "Méthode non autorisée"},
         )
-        self.assertIn("Allow", res_get.headers)
+        self.assertIn("Allow", res_put.headers)
 
         res_delete = await self.client.delete("/api/v1/secrets")
         self.assertEqual(res_delete.status_code, 405)
@@ -1673,10 +1673,8 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         """Le 429 de CAPACITÉ n'est pas transitoire : le retry échoue (documenté #62).
 
         Le contrat impose `Retry-After` sur tout 429, mais la saturation du
-        quota de stockage ne se résorbe pas : sans route DELETE dans le contrat
-        #63, aucun emplacement ne peut être libéré. Le client qui réessaie
-        (même après le délai annoncé) reçoit donc à nouveau 429. Cette sémantique
-        est documentée dans le code (store + handler) et pinnée ici.
+        quota de stockage ne se résorbe pas avec le temps. Un retry reçoit
+        encore 429 tant que DELETE (#158) n'a pas libéré un emplacement.
         """
         bounded_store = InMemorySecretStore(max_secrets=1, max_secrets_per_project=1)
         test_app = create_app(secret_store=bounded_store)
@@ -1711,11 +1709,13 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     {"code": "rate_limited", "message": "Trop de requêtes"},
                 )
 
-        # La sémantique « retry inutile » est documentée dans le code lui-même.
-        store_doc = SqliteSecretStore.__doc__ or ""
-        self.assertIn("INUTILE", store_doc)
-        self.assertIn("TODO(#156)", store_doc)
-        self.assertIn("transitoire", store_doc)
+            deleted = await client.delete("/api/v1/secrets/demo/dev/CAPACITY_KEY")
+            self.assertEqual(deleted.status_code, 204)
+            recreated = await client.post(
+                "/api/v1/secrets",
+                json={"project": "demo", "env": "dev", "name": "AFTER_DELETE", "value": "val2"},
+            )
+            self.assertEqual(recreated.status_code, 201)
 
     async def test_post_secret_malformed_content_length_rejected_400(self) -> None:
         """Un en-tête Content-Length malformé, négatif ou dupliqué est rejeté avec HTTP 400."""
@@ -1814,12 +1814,6 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(re_fetched)
         assert re_fetched is not None
         self.assertEqual(re_fetched["value"], "v2")
-
-    def test_in_memory_secret_store_documents_quota_followup(self) -> None:
-        """Le docstring de InMemorySecretStore documente le suivi quota/pagination (#156)."""
-        doc = InMemorySecretStore.__doc__ or ""
-        self.assertIn("TODO(#156)", doc)
-        self.assertIn("quota", doc)
 
     async def test_body_size_limit_rejections_close_connection(self) -> None:
         """Tout rejet du middleware de taille porte Connection: close (keep-alive sûr).

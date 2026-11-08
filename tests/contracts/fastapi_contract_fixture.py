@@ -6,12 +6,12 @@ import re
 
 from typing import Annotated, Any, Literal, NoReturn
 
-from fastapi import Depends, FastAPI, Path
+from fastapi import Depends, FastAPI, Path, Query, Response
 from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 Project = Annotated[str, StringConstraints(min_length=1, max_length=64, pattern=re.compile(r"^[a-z][a-z0-9_-]{0,63}(?![\s\S])"))]
 Environment = Annotated[str, StringConstraints(min_length=1, max_length=32, pattern=re.compile(r"^[a-z][a-z0-9_-]{0,31}(?![\s\S])"))]
@@ -40,6 +40,11 @@ class SecretMetadata(StrictModel):
 
 class SecretRead(SecretMetadata):
     value: Value
+
+
+class SecretPage(StrictModel):
+    items: list[SecretMetadata] = Field(max_length=100)
+    next_offset: int | None = Field(ge=0, le=1_000_000)
 
 
 class BadRequestError(StrictModel):
@@ -150,6 +155,19 @@ def build_app() -> FastAPI:
                                                        201: {"headers": no_store}},
               dependencies=[Depends(require_api_key)])
     def create_secret(body: SecretCreate) -> NoReturn:
+        raise NotImplementedError("Fixture de contrat uniquement")
+
+    @app.get("/api/v1/secrets", response_model=SecretPage, operation_id="listSecrets",
+             responses={**{k: v for k, v in responses.items() if k != 404}, 200: {"headers": no_store}},
+             dependencies=[Depends(require_api_key)])
+    def list_secrets(project: Annotated[Project, Query()], limit: Annotated[int, Query(ge=1, le=100)] = 50,
+                     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0) -> NoReturn:
+        raise NotImplementedError("Fixture de contrat uniquement")
+
+    @app.delete("/api/v1/secrets/{project}/{env}/{name}", status_code=204, response_class=Response, response_model=None,
+                operation_id="deleteSecret", responses={**responses, 204: {"headers": no_store}},
+                dependencies=[Depends(require_api_key)])
+    def delete_secret(project: Annotated[Project, Path()], env: Annotated[Environment, Path()], name: Annotated[Name, Path()]) -> NoReturn:
         raise NotImplementedError("Fixture de contrat uniquement")
 
     @app.get("/api/v1/secrets/{project}/{env}/{name}", response_model=SecretRead,

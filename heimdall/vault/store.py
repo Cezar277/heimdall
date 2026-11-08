@@ -1,7 +1,7 @@
 """Stockage des secrets du Vault — mémoire chiffrée ou SQLite chiffré (tickets #25/#26/#62).
 
 Deux implémentations interchangeables exposent la même interface asynchrone
-``get`` / ``create`` / ``clear`` :
+``get`` / ``create`` / ``delete`` / ``list_page`` / ``clear`` :
 
 - ``InMemorySecretStore`` : squelette de développement/test. Les valeurs sont
   chiffrées en mémoire (AES-256-GCM) avec une KEK éphémère, jamais conservées
@@ -46,11 +46,14 @@ from heimdall.vault.database import (
     count_secrets,
     create_secret,
     delete_all_secrets,
+    delete_secret,
     ensure_project,
     get_secret,
     init_db,
+    list_secret_page,
     rotate_secrets_kek,
     validate_kek_version,
+    validate_secret_page_bounds,
 )
 from heimdall.vault.database import runtime_db_session as db_session
 
@@ -116,9 +119,8 @@ class InMemorySecretStore:
     (``SqliteSecretStore``) existe avec contrainte d'unicité
     UNIQUE(project_id, env, name) et PRAGMA foreign_keys=ON ; c'est le backend
     prod par défaut, et le quota par projet y est vérifié atomiquement.
-    RESTE (suivi post-#63, hors contrat v1) : pagination (pas de route de
-    listage) et route DELETE (libération de capacité) — sans elles, le 429 de
-    capacité reste permanent (retry inutile), voir TODO(#156).
+    Le listage paginé et DELETE (#158) permettent de retrouver les métadonnées
+    sans déchiffrement et de libérer les quotas global et par projet.
     Ce quota n'est PAS le rate-limiting : il ne borne pas le débit des requêtes.
     Le débit est borné séparément par le middleware `ratelimit.py` (buckets par
     clé validée, pair réseau et global, 400/401 inclus, lot #63), conformément
@@ -127,6 +129,9 @@ class InMemorySecretStore:
     workers (workers > 1), chaque worker détiendrait une instance mémoire indépendante
     et divergente sans garantie d'unicité inter-processus ; utiliser
     ``SqliteSecretStore`` pour un déploiement multi-worker.
+    Le listage met en cache l'ordre trié par projet, invalidé à chaque
+    création/suppression/clear : une page ne refait pas un tri complet
+    O(n log n) à chaque requête.
     """
 
     def __init__(
@@ -138,6 +143,8 @@ class InMemorySecretStore:
     ) -> None:
         self._secrets: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._project_counts: dict[str, int] = {}
+        # Cache de l'ordre (env, name) par projet, invalidé à chaque mutation.
+        self._sorted_keys_by_project: dict[str, list[tuple[str, str, str]]] = {}
         self._lock = asyncio.Lock()
         self._max_secrets = max_secrets
         self._max_secrets_per_project = max_secrets_per_project
@@ -187,6 +194,7 @@ class InMemorySecretStore:
             }
             self._secrets[key] = record
             self._project_counts[project] = project_count + 1
+            self._sorted_keys_by_project.pop(project, None)
             # Métadonnées seules : la route POST n'a pas besoin de la valeur et
             # le plaintext ne doit pas prolonger sa durée de vie en mémoire.
             return {
@@ -196,10 +204,44 @@ class InMemorySecretStore:
                 "status": "vaulte",
             }
 
+    async def delete(self, project: str, env: str, name: str) -> bool:
+        """Supprime atomiquement le secret et libère les quotas mémoire."""
+        async with self._lock:
+            if self._secrets.pop((project, env, name), None) is None:
+                return False
+            count = self._project_counts.get(project, 0)
+            if count <= 1:
+                self._project_counts.pop(project, None)
+            else:
+                self._project_counts[project] = count - 1
+            self._sorted_keys_by_project.pop(project, None)
+            return True
+
+    async def list_page(self, project: str, limit: int, offset: int) -> list[dict[str, str]]:
+        """Retourne uniquement les métadonnées, sans déchiffrement.
+
+        L'ordre (env, name) est mis en cache par projet et invalidé à chaque
+        mutation, pour éviter un tri complet à chaque page.
+        """
+        validate_secret_page_bounds(limit, offset)
+        async with self._lock:
+            keys = self._sorted_keys_by_project.get(project)
+            if keys is None:
+                keys = sorted(key for key in self._secrets if key[0] == project)
+                self._sorted_keys_by_project[project] = keys
+            return [
+                {
+                    field: str(self._secrets[key][field])
+                    for field in ("project", "env", "name", "status")
+                }
+                for key in keys[offset : offset + limit]
+            ]
+
     async def clear(self) -> None:
         async with self._lock:
             self._secrets.clear()
             self._project_counts.clear()
+            self._sorted_keys_by_project.clear()
 
     async def rotate_kek(
         self,
@@ -314,10 +356,8 @@ class SqliteSecretStore:
 
     Le 429 de capacité (``QuotaExceededError``) n'est PAS transitoire : le
     contrat impose l'en-tête ``Retry-After`` sur tout 429, mais un retry avec
-    ce délai restera refusé tant que la capacité est pleine — le contrat #63
-    n'expose aucune route DELETE, donc aucun emplacement ne peut être libéré.
-    Le retry est donc INUTILE tant que la capacité est pleine ; la libération
-    (route DELETE, quotas par projet) est suivie dans TODO(#156). Ce 429 de
+    ce délai restera refusé tant que la capacité est pleine. DELETE (#158)
+    libère un emplacement avant une nouvelle création. Ce 429 de
     capacité est distinct du 429 de débit (rate-limit, lot #63), lui transitoire.
 
     L'empreinte d'intégrité persistée utilise la sous-clé HKDF dédiée et le
@@ -453,6 +493,23 @@ class SqliteSecretStore:
     def _clear(self) -> None:
         with db_session(self._db_path) as conn:
             delete_all_secrets(conn)
+
+    async def delete(self, project: str, env: str, name: str) -> bool:
+        """Supprime sous transaction SQLite, partagée entre workers."""
+        return await asyncio.to_thread(self._delete, project, env, name)
+
+    def _delete(self, project: str, env: str, name: str) -> bool:
+        with db_session(self._db_path) as conn:
+            return delete_secret(conn, project, env, name)
+
+    async def list_page(self, project: str, limit: int, offset: int) -> list[dict[str, str]]:
+        """Borne la lecture SQL et ne charge aucune valeur ni empreinte."""
+        validate_secret_page_bounds(limit, offset)
+        return await asyncio.to_thread(self._list_page, project, limit, offset)
+
+    def _list_page(self, project: str, limit: int, offset: int) -> list[dict[str, str]]:
+        with db_session(self._db_path) as conn:
+            return list_secret_page(conn, project, limit, offset)
 
     async def rotate_kek(
         self,

@@ -472,7 +472,7 @@ class VaultOpenapiContractTests(VaultIntegrationTestCase):
         self.assertEqual(set(runtime["paths"]), set(CONTRACT["paths"]))
         for path, path_item in CONTRACT["paths"].items():
             for method, operation in path_item.items():
-                if method not in ("get", "post"):
+                if method not in ("get", "post", "delete"):
                     continue
                 with self.subTest(path=path, method=method):
                     runtime_operation = runtime["paths"][path][method]
@@ -485,12 +485,12 @@ class VaultOpenapiContractTests(VaultIntegrationTestCase):
     def test_runtime_payload_schemas_match_the_contract(self) -> None:
         """Les schémas de charge utile produits par l'application respectent le contrat."""
         runtime = self.app.openapi()["components"]["schemas"]
-        for name in ("SecretCreate", "SecretMetadata", "SecretRead"):
+        for name in ("SecretCreate", "SecretMetadata", "SecretRead", "SecretPage"):
             with self.subTest(schema=name):
                 contract_schema = _structural(
                     _resolve(CONTRACT, {"$ref": f"#/components/schemas/{name}"})
                 )
-                runtime_schema = _structural(runtime[name])
+                runtime_schema = _structural(_resolve(self.app.openapi(), runtime[name]))
                 self.assertEqual(runtime_schema, contract_schema)
 
     def test_runtime_error_schemas_match_the_contract(self) -> None:

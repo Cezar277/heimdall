@@ -1,5 +1,46 @@
 # Vault API v1 — contrat OpenAPI
 
+## Gestion de capacité et pagination (#158)
+
+`GET /api/v1/secrets?project=demo&limit=50&offset=0` retourne
+`{"items": [...], "next_offset": 50}`. La clé doit appartenir au projet demandé.
+Chaque élément contient exclusivement `project`, `env`, `name`, `status` :
+aucune valeur, empreinte, DEK ou donnée chiffrée n'est chargée pour le listage.
+`limit` vaut 50 par défaut et accepte 1 à 100 ; `offset` vaut 0 par défaut et
+accepte 0 à 1 000 000. Les paramètres invalides retournent 400.
+L'ordre est lexicographique ASCII par `env`, puis `name`. `next_offset` vaut
+`null` sur la dernière page, y compris une page vide. La pagination par offset
+renvoie également `null` si l'offset suivant dépasserait 1 000 000 : tout
+`next_offset` non nul est réutilisable avec le même `limit`, sans erreur 400.
+Ce plafond arrête la navigation même s'il reste des métadonnées au-delà.
+La pagination par offset ne garantit pas un instantané entre requêtes si des créations/suppressions
+concurrentes modifient la collection.
+
+`DELETE /api/v1/secrets/{project}/{env}/{name}` vérifie l'accès au projet avant
+toute recherche, supprime sans déchiffrer et retourne **204 sans corps** avec
+`Cache-Control: no-store`, comme le listage. Une ressource absente (ou déjà
+supprimée) retourne 404 ; une clé absente/invalide retourne 401 et une clé
+d'un autre projet retourne 403, que le secret existe ou non.
+La suppression libère les quotas global et par projet, également entre workers
+SQLite. Un doublon reste 409, même lorsque le quota est atteint.
+
+Le **429 de capacité** de POST conserve `Retry-After: 60` pour le contrat ;
+attendre ne libère pas de capacité. Lister puis supprimer un secret permet de
+recréer avec **201**. Le **429 de débit** est transitoire : son `Retry-After`
+indique le temps restant de la fenêtre du limiteur (1 à 3600 secondes).
+DELETE et le listage sont soumis à ce même limiteur de débit.
+
+Preuves : `tests/test_vault_capacity.py` (deux backends, quota libéré,
+pagination bornée, canari absent, autorisation avant stockage et visibilité
+inter-workers) ; `tests/contracts/test_vault_openapi.py` (contrat indépendant)
+et `tests/test_vault_integration_testclient.py` (schéma runtime).
+
+| Garantie | Implémentation | Preuve automatisée |
+| --- | --- | --- |
+| Autorisation avant accès au stockage | `heimdall/vault/app.py:1387`, `heimdall/vault/app.py:1419` | `tests/test_vault_capacity.py:131` |
+| Libération atomique des quotas | `heimdall/vault/store.py:200`, `heimdall/vault/store.py:480` | `tests/test_vault_capacity.py:59`, `tests/test_vault_capacity.py:145` |
+| Pagination bornée et absence de valeur | `heimdall/vault/database.py:1376`, `heimdall/vault/app.py:1387` | `tests/test_vault_capacity.py:76`, `tests/test_vault_capacity.py:116` |
+
 Ticket #15 · Porteur : C · Relecteur : A · Estimation : 6 h.
 
 Source contract-first : [openapi.yaml](../../openapi.yaml), OpenAPI 3.1.0.
@@ -241,12 +282,11 @@ ne doit pas être présenté comme cette mitigation de débit : les deux mécani
 sont distincts et testés séparément. Le quota SQLite est vérifié dans la même
 transaction que l'insertion, sous `BEGIN IMMEDIATE` : le verrou d'écriture est
 acquis avant le comptage, ce qui empêche tout dépassement inter-workers. Un 429
-de capacité n'est pas transitoire sans route DELETE : le retry reste refusé
-tant que la capacité est pleine, même si `Retry-After` reste contractuel.
-Le client ne doit donc pas boucler sur ce 429 : le retry est **inutile**
-tant que la capacité est pleine (libération par une route DELETE suivie en
-#62). Ce 429 de capacité est distinct du 429 de débit (rate-limit), lui
-transitoire.
+de capacité n'est pas transitoire : le retry reste refusé tant que la capacité
+est pleine, même si `Retry-After` reste contractuel. Le client ne doit donc pas
+boucler sur ce 429 : il doit d'abord libérer un emplacement via
+`DELETE /api/v1/secrets/{project}/{env}/{name}` (#158). Ce 429 de capacité est
+distinct du 429 de débit (rate-limit), lui transitoire.
 Les rejets avant lecture du corps répondent `Connection: close` : 400 du
 middleware de taille, 429 de débit (pair/global et clé), 403 loopback et 401 pour
 une clé surdimensionnée. Les tests socket uvicorn/h11 vérifient la fermeture,

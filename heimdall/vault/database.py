@@ -1373,6 +1373,42 @@ def list_secrets(
     return [dict(row) for row in cursor.fetchall()]
 
 
+_MAX_SECRET_PAGE_LIMIT = 101
+_MAX_SECRET_PAGE_OFFSET = 1_000_000
+
+
+def validate_secret_page_bounds(limit: int, offset: int) -> None:
+    """Refuse fail-closed une pagination hors bornes (défense en profondeur).
+
+    La couche HTTP valide déjà ``limit`` (1..100) et ``offset``
+    (0..1 000 000). Ce garde couvre les appelants directs du store et de la
+    couche SQLite : la route demande ``limit + 1`` au store pour détecter la
+    page suivante, donc la borne interne est 101. En SQLite, ``LIMIT -1``
+    signifie « illimité » et un ``OFFSET`` négatif a une sémantique
+    surprenante.
+    """
+    if (
+        limit < 1
+        or limit > _MAX_SECRET_PAGE_LIMIT
+        or offset < 0
+        or offset > _MAX_SECRET_PAGE_OFFSET
+    ):
+        raise ValueError("pagination hors bornes")
+
+
+def list_secret_page(
+    conn: sqlite3.Connection, project_id: str, limit: int, offset: int
+) -> list[dict[str, str]]:
+    """Lit une page de métadonnées publiques, sans charger les blobs chiffrés."""
+    validate_secret_page_bounds(limit, offset)
+    rows = conn.execute(
+        "SELECT project_id AS project, env, name, status FROM secrets "
+        "WHERE project_id = ? ORDER BY env ASC, name ASC LIMIT ? OFFSET ?",
+        (project_id, limit, offset),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def count_secrets(conn: sqlite3.Connection, project_id: str | None = None) -> int:
     """Compte les secrets (globalement ou pour un projet), sans exposer de valeur."""
     if project_id is None:
