@@ -88,12 +88,15 @@ fournie pour le moteur de remédiation (#30/#32) :
    automatique est refusée (`UnstagedChangesError`) : un `git add` après
    coup indexerait des lignes que le développeur n'a pas choisies ;
 2. `apply()` applique le patch ;
-3. `restage_paths` ré-indexe le contenu exact des seuls fichiers cibles.
+3. `_restage_paths` (interne) ré-indexe le contenu exact des seuls fichiers cibles.
 
 La ré-indexation n'exécute **ni filtre `clean` ni hook Git** du dépôt :
 le contenu est lu par Heimdall (`O_NOFOLLOW`, taille bornée), haché par
-`git hash-object -w --no-filters --stdin`, puis écrit par un unique
-`git update-index --add --cacheinfo`. Les commandes git internes utilisent
+`git hash-object -w --no-filters --stdin`, puis écrit dans un **index
+temporaire** par `git update-index --add --cacheinfo`. L'index réel est
+remplacé atomiquement (`os.replace`) sous le verrou Git `index.lock`, après
+vérification des entrées (`git ls-files -s -z`) : une panne médiane ne laisse
+pas l'index partiellement modifié. Les commandes git internes utilisent
 un argv figé, `core.fsmonitor=false` et `core.hooksPath=os.devnull` ; les
 chemins passent par la garde unique `heimdall.mcp.paths.confine` (résolution
 réelle, confinement à la racine, refus des liens sortants). Les chemins
@@ -126,8 +129,11 @@ moteur de remédiation interactif reste le ticket #30/#32.
   le second hunk reste intact dans le dossier de travail ;
 - refus des modifications non indexées avant remédiation ;
 - ré-indexation sans exécuter les filtres `clean` ni le hook
-  `post-index-change` ;
-- chemins commençant par `-` refusés, restauration d'un legacy symlink ;
+  `post-index-change`, avec index temporaire et échec `update-index` sans
+  modification de l'index réel ;
+- chemins commençant par `-` refusés, `.env.example/` répertoire refusé,
+  restauration d'un legacy symlink ou refus d'un legacy répertoire ;
+- détection « notre hook » ancrée au préambule, pas à une sous-chaîne ;
 - anti-récursion `HEIMDALL_IN_HOOK=1`.
 
 ```sh
