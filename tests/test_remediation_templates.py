@@ -32,6 +32,10 @@ from heimdall.remediation import templates as templates_module
 from heimdall.scanner.finding import Finding
 
 SECRET = "SYNTHETIC_ONLY_VALUE"  # noqa: S105 - valeur synthétique de test
+#: Nom de variable déjà présent dans les cas d'idempotence (pas un secret).
+ENV_NAME = "APP_KEY"
+#: Directive prologue utilisée comme valeur à remplacer.
+DIRECTIVE = "use strict"
 
 
 def patch(
@@ -272,6 +276,28 @@ def test_python_refuses_shadowed_os(source: str) -> None:
     assert plan.reason is ManualReason.SHADOWED_MODULE
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        'os.environ["APP_KEY"]\n',
+        'os.environ["APP_KEY"] = value\n',
+        'os.environ.get("APP_KEY")\n',
+        'os.getenv("APP_KEY")\n',
+    ],
+)
+def test_python_refuses_environment_key_auto_targeting(source: str) -> None:
+    """Un indice ``os.environ`` déjà assaini ne doit pas être re-ciblé."""
+    plan = manual("app.py", source, 1, secret=ENV_NAME)
+    assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+def test_python_environment_key_guard_does_not_refuse_other_subscripts() -> None:
+    source = 'headers["APP_KEY"] = value\n'
+    plan = patch("app.py", source, 1, secret=ENV_NAME)
+    assert plan.after == 'import os\nheaders[os.environ["APP_KEY"]] = value\n'
+    ast.parse(plan.after)
+
+
 def test_python_invalid_syntax_and_stale_line_are_manual() -> None:
     assert manual("app.py", f'KEY = "{SECRET}"\n', 9).reason is ManualReason.STALE_LINE
     assert manual("app.py", f'KEY = "{SECRET}\n', 1).reason is ManualReason.INVALID_SYNTAX
@@ -361,6 +387,97 @@ def test_javascript_refuses_ambiguous_or_absent_cases(source: str, reason: Manua
     assert manual("app.js", source, 1).reason is reason
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        f'function f(process) {{ const k = "{SECRET}"; }}\n',
+        f'function f(...process) {{ const k = "{SECRET}"; }}\n',
+        f'const f = (process) => {{ const k = "{SECRET}"; }};\n',
+        f'const f = process => {{ const k = "{SECRET}"; }};\n',
+        f'const f = async (process) => {{ const k = "{SECRET}"; }};\n',
+        f'let process = {{}}; const k = "{SECRET}";\n',
+        f'var process; const k = "{SECRET}";\n',
+        f'const process = 1; const k = "{SECRET}";\n',
+        f'function process() {{}} const k = "{SECRET}";\n',
+        f'function* process() {{}} const k = "{SECRET}";\n',
+        f'class process {{}} const k = "{SECRET}";\n',
+        f'import process from "module"; const k = "{SECRET}";\n',
+        f'import {{ process }} from "module"; const k = "{SECRET}";\n',
+        f'import * as process from "module"; const k = "{SECRET}";\n',
+        f'const {{process}} = source; const k = "{SECRET}";\n',
+        f'function f({{process}}) {{ const k = "{SECRET}"; }}\n',
+        f'try {{}} catch (process) {{ const k = "{SECRET}"; }}\n',
+        f'process = {{}}; const k = "{SECRET}";\n',
+        f'process += 1; const k = "{SECRET}";\n',
+        f'process++; const k = "{SECRET}";\n',
+    ],
+)
+def test_javascript_refuses_shadowed_process(source: str) -> None:
+    plan = manual("app.js", source, 1)
+    assert plan.reason is ManualReason.SHADOWED_MODULE
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'process.env["APP_KEY"];\n',
+        "process.env['APP_KEY'];\n",
+        'process.env.get("APP_KEY");\n',
+    ],
+)
+def test_javascript_refuses_environment_key_auto_targeting(source: str) -> None:
+    plan = manual("app.js", source, 1, secret=ENV_NAME)
+    assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '"use strict";\n',
+        'function f() { "use strict"; }\n',
+        '"use strict"\n"other";\n',
+    ],
+)
+def test_javascript_refuses_directive_prologue(source: str) -> None:
+    plan = manual("app.js", source, 1, secret=DIRECTIVE)
+    assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+def test_javascript_global_process_references_are_not_shadowing() -> None:
+    source = f'const k = "{SECRET}"; const home = process.env.HOME; f(process.argv);\n'
+    plan = patch("app.js", source, 1)
+    assert plan.after == (
+        "const k = process.env.APP_KEY; const home = process.env.HOME; f(process.argv);\n"
+    )
+
+
+def test_javascript_global_process_in_parameter_default_is_not_shadowing() -> None:
+    source = f'function f(home = process.env.HOME) {{ const k = "{SECRET}"; }}\n'
+    plan = patch("app.js", source, 1)
+    assert plan.after == (
+        "function f(home = process.env.HOME) { const k = process.env.APP_KEY; }\n"
+    )
+
+
+def test_javascript_process_comparisons_are_not_shadowing() -> None:
+    source = (
+        f'const k = "{SECRET}"; const same = process === other; const lower = process.pid <= 10;\n'
+    )
+    plan = patch("app.js", source, 1)
+    assert plan.after == (
+        "const k = process.env.APP_KEY; const same = process === other; "
+        "const lower = process.pid <= 10;\n"
+    )
+
+
+def test_javascript_process_property_names_are_not_shadowing() -> None:
+    source = f'const k = "{SECRET}"; const x = {{ process: process.env.HOME }}; obj.process = 1;\n'
+    plan = patch("app.js", source, 1)
+    assert plan.after == (
+        "const k = process.env.APP_KEY; const x = { process: process.env.HOME }; obj.process = 1;\n"
+    )
+
+
 def test_javascript_comparison_operators_are_not_field_names() -> None:
     plan = patch("app.js", f'const ok = "{SECRET}" == expected;\n', 1)
     assert plan.after == "const ok = process.env.APP_KEY == expected;\n"
@@ -419,6 +536,14 @@ def test_repr_never_contains_the_secret_or_source() -> None:
     assert "app.py" in rendered
     assert "patch" in rendered
     assert SECRET not in repr(manual("app.py", f'TOKEN = f"{SECRET}"\n', 1))
+
+
+def test_token_repr_never_contains_the_decoded_secret() -> None:
+    tokens = templates_module._tokenize_js(f'"{SECRET}"')
+    assert len(tokens) == 1
+    assert tokens[0].value == SECRET
+    assert SECRET not in repr(tokens[0])
+    assert "SYNTHETIC" not in repr(tokens[0])
 
 
 def test_manual_plan_invariants_are_checked() -> None:

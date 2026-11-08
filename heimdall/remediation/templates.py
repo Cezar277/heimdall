@@ -10,9 +10,10 @@ d'environnement faut-il écrire à la place du littéral ?
 Le langage est déduit de l'extension du fichier. Le remplacement ne porte que
 sur le **littéral de chaîne** contenant exactement le secret, jamais sur la
 ligne entière. En cas de doute (f-string, template literal, concaténation,
-littéral partiel, plusieurs candidats, ``os`` masqué…), rien n'est modifié :
-le résultat est marqué ``manual_remediation=True``. Refuser est toujours
-préférable à corrompre le code.
+littéral partiel, plusieurs candidats, ``os`` ou ``process`` masqué, clé
+``os.environ``/``process.env`` déjà assainie, directive prologue…), rien n'est
+modifié : le résultat est marqué ``manual_remediation=True``. Refuser est
+toujours préférable à corrompre le code.
 
 Défenses de ce module :
 
@@ -393,6 +394,43 @@ def _ambiguous_parent(  # noqa: PLR0911 - un refus explicite par contexte
     return None
 
 
+def _is_os_environ(node: ast.AST) -> bool:
+    """Vrai pour l'expression ``os.environ``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    )
+
+
+def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    """Vrai si le littéral sert de **nom** de variable d'environnement.
+
+    Remplacer ``os.environ["APP_KEY"]`` par ``os.environ[os.environ["APP_KEY"]]``
+    changerait la clé lue : le patch est refusé plutôt que corrompu. Le cas
+    ``os.getenv(...)``/``os.environ.get(...)`` est traité de la même façon.
+    """
+    child = node
+    parent = parents.get(child)
+    while parent is not None:
+        if isinstance(parent, ast.Subscript) and _is_os_environ(parent.value):
+            return True
+        if isinstance(parent, ast.Call) and isinstance(parent.func, ast.Attribute):
+            function = parent.func
+            if _is_os_environ(function.value):
+                return True
+            if (
+                isinstance(function.value, ast.Name)
+                and function.value.id == "os"
+                and function.attr == "getenv"
+            ):
+                return True
+        child = parent
+        parent = parents.get(child)
+    return False
+
+
 def _single_string_token(segment: str) -> bool:
     """Vrai si le segment AST est exactement **un** jeton de chaîne simple.
 
@@ -603,6 +641,8 @@ def _python_replacement(  # noqa: PLR0911, PLR0912, PLR0915 - un refus par garde
             return _python_failure(file, source, line, variable, unsafe)
         if _annotation_context(node, parents):
             return _python_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
+        if _environment_key_context(node, parents):
+            return _python_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
         if node.end_lineno != line:
             return _python_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
         try:
@@ -677,7 +717,10 @@ def _python_replacement(  # noqa: PLR0911, PLR0912, PLR0915 - un refus par garde
 @dataclass(frozen=True, slots=True)
 class _JsToken:
     kind: str
-    value: str | None
+    # ``value`` contient la valeur **décodée** d'une chaîne : comme ``text``,
+    # elle est exclue de ``repr`` pour qu'une traceback ne journalise jamais le
+    # secret (invariant 8).
+    value: str | None = field(repr=False)
     start: int
     end: int
     line: int
@@ -1007,6 +1050,365 @@ def _nearest_open_delimiter(tokens: list[_JsToken], position: int) -> str | None
 
 
 _CALL_NAME_OFFSET: Final[int] = 2
+#: Recul nécessaire pour retrouver ``function`` avant ``*`` ou ``process``.
+_JS_FUNCTION_KEYWORD_LOOKBACK: Final[int] = 2
+#: Recul nécessaire pour reconnaître ``...process`` (rest parameter).
+_JS_ELLIPSIS_LOOKBACK: Final[int] = 3
+#: Nombre maximal de jetons d'opérateur avant le ``=`` d'une affectation.
+_JS_ASSIGNMENT_LOOKBACK: Final[int] = 3
+#: Recul nécessaire pour reconnaître ``process.env[...]`` avant l'indice.
+_JS_PROCESS_ENV_LOOKBACK: Final[int] = 4
+#: Recul nécessaire pour reconnaître ``process.env.get(...)`` avant l'argument.
+_JS_PROCESS_ENV_METHOD_LOOKBACK: Final[int] = 6
+
+#: Mots-clés dont la parenthèse suivante n'est **pas** une liste de paramètres.
+_JS_NON_BINDING_PAREN_KEYWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "await",
+        "case",
+        "delete",
+        "do",
+        "else",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "new",
+        "of",
+        "return",
+        "switch",
+        "throw",
+        "typeof",
+        "void",
+        "while",
+        "with",
+        "yield",
+    }
+)
+#: Mots-clés qui introduisent une déclaration de nom lié.
+_JS_BINDING_KEYWORDS: Final[frozenset[str]] = frozenset(
+    {"as", "class", "const", "function", "import", "let", "var"}
+)
+
+
+def _js_delimiters(
+    tokens: list[_JsToken],
+) -> tuple[list[int | None], dict[int, int]]:
+    """Délimiteur ouvrant englobant chaque jeton, et appariements ouverts/fermés."""
+    enclosing: list[int | None] = [None] * len(tokens)
+    matching: dict[int, int] = {}
+    stack: list[int] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for index, token in enumerate(tokens):
+        enclosing[index] = stack[-1] if stack else None
+        if token.kind != "punct" or token.value is None:
+            continue
+        if token.value in {"(", "[", "{"}:
+            stack.append(index)
+        elif token.value in pairs and stack:
+            if tokens[stack[-1]].value == pairs[token.value]:
+                opening = stack.pop()
+                matching[opening] = index
+                matching[index] = opening
+    return enclosing, matching
+
+
+def _js_arrow_at(tokens: list[_JsToken], position: int) -> bool:
+    """Vrai si les jetons ``position``/``position + 1`` forment une flèche ``=>``."""
+    if position + 1 >= len(tokens):
+        return False
+    first, second = tokens[position], tokens[position + 1]
+    return (
+        first.kind == "punct"
+        and first.value == "="
+        and second.kind == "punct"
+        and second.value == ">"
+        and first.end == second.start
+    )
+
+
+def _js_paren_is_parameter_list(  # noqa: PLR0911 - un refus par contexte
+    tokens: list[_JsToken], opening: int, matching: dict[int, int]
+) -> bool:
+    """Heuristique fermée : la parenthèse ouvre-t-elle des paramètres liés ?
+
+    Une parenthèse non appariée est traitée comme une liste de paramètres :
+    le doute profite au refus, jamais au patch.
+    """
+    closing = matching.get(opening)
+    if closing is None:
+        return True
+    after = tokens[closing + 1] if closing + 1 < len(tokens) else None
+    if _js_arrow_at(tokens, closing + 1):
+        return True
+    previous = tokens[opening - 1] if opening > 0 else None
+    if previous is None:
+        return False
+    if previous.kind == "ident":
+        if previous.value in {"catch", "for", "function"}:
+            return True
+        if previous.value in _JS_NON_BINDING_PAREN_KEYWORDS:
+            return False
+        # Méthode ou fonction nommée : un corps ``{`` suit la parenthèse.
+        return after is not None and after.kind == "punct" and after.value == "{"
+    if previous.kind == "punct" and previous.value == "*":
+        before_star = (
+            tokens[opening - _JS_FUNCTION_KEYWORD_LOOKBACK]
+            if opening >= _JS_FUNCTION_KEYWORD_LOOKBACK
+            else None
+        )
+        return (
+            before_star is not None
+            and before_star.kind == "ident"
+            and before_star.value == "function"
+        )
+    return False
+
+
+def _js_binding_contexts(
+    tokens: list[_JsToken],
+    enclosing: list[int | None],
+    matching: dict[int, int],
+) -> list[bool]:
+    """Pour chaque jeton, vrai s'il est dans un motif de liaison/déstructuration.
+
+    Calcul itératif (le parent d'un délimiteur a toujours un indice plus petit)
+    pour rester linéaire : un fichier hostile rempli de ``process`` imbriqués ne
+    doit pas déclencher un parcours quadratique.
+    """
+    binding: list[bool] = [False] * len(tokens)
+    for index, token in enumerate(tokens):
+        if token.kind != "punct" or token.value not in {"(", "[", "{"}:
+            continue
+        if token.value == "(":
+            binding[index] = _js_paren_is_parameter_list(tokens, index, matching)
+            continue
+        previous = tokens[index - 1] if index > 0 else None
+        direct = False
+        if previous is not None:
+            if previous.kind == "ident" and previous.value in _JS_BINDING_KEYWORDS:
+                direct = True
+            elif previous.kind == "punct" and previous.value == "(":
+                direct = _js_paren_is_parameter_list(tokens, index - 1, matching)
+        if not direct:
+            closing = matching.get(index)
+            if closing is not None and closing + 1 < len(tokens):
+                after = tokens[closing + 1]
+                if (
+                    after.kind == "punct"
+                    and after.value == "="
+                    and (
+                        previous is None
+                        or (
+                            previous.kind == "punct" and previous.value in {";", "{", "}", "(", ","}
+                        )
+                    )
+                ):
+                    # Affectation déstructurante : ``[a] = xs``, ``({a} = obj)``.
+                    direct = True
+        parent = enclosing[index]
+        binding[index] = direct or (parent is not None and binding[parent])
+    return [binding[opening] if opening is not None else False for opening in enclosing]
+
+
+def _js_import_binds_process(tokens: list[_JsToken]) -> bool:
+    """Vrai si une clause ``import`` lie le nom ``process``."""
+    in_import = False
+    for index, token in enumerate(tokens):
+        if token.kind == "ident" and token.value == "import":
+            previous = tokens[index - 1] if index > 0 else None
+            following = tokens[index + 1] if index + 1 < len(tokens) else None
+            if previous is not None and previous.kind == "punct" and previous.value == ".":
+                continue
+            if (
+                following is not None
+                and following.kind == "punct"
+                and following.value in {"(", "."}
+            ):
+                # ``import(...)`` dynamique ou ``import.meta`` : pas de liaison.
+                continue
+            in_import = True
+            continue
+        if not in_import:
+            continue
+        if token.kind == "string" or (token.kind == "punct" and token.value in {";", "}"}):
+            in_import = False
+            continue
+        if token.kind == "ident" and token.value == "from":
+            in_import = False
+            continue
+        if token.kind == "ident" and token.value == "process":
+            return True
+    return False
+
+
+#: Ponctuations pouvant composer une affectation (simple, composée ou update).
+_JS_ASSIGNMENT_PUNCT: Final[frozenset[str]] = frozenset(
+    {"+", "-", "*", "/", "%", "&", "|", "^", "<", ">", "?"}
+)
+#: Ponctuation d'entrée d'une affectation, ``=`` compris.
+_JS_ASSIGNMENT_START: Final[frozenset[str]] = _JS_ASSIGNMENT_PUNCT | {"="}
+
+
+def _js_assignment_follows(  # noqa: PLR0911 - un refus par opérateur
+    source: str, tokens: list[_JsToken], position: int
+) -> bool:
+    """Vrai si ``process`` est immédiatement affecté/incrémenté.
+
+    Couvre ``process = ...``, ``process += ...``, ``process++`` et les formes
+    composées ; ``==``, ``===``, ``=>``, ``<=`` et ``>=`` restent des lectures.
+    """
+    if position + 1 >= len(tokens):
+        return False
+    first = tokens[position + 1]
+    if first.kind != "punct" or first.value not in _JS_ASSIGNMENT_START:
+        return False
+    if first.value == "=":
+        # ``==``, ``===`` et ``=>`` ne sont pas des affectations.
+        return source[first.end : first.end + 1] not in {"=", ">"}
+    cursor = position + 1
+    while cursor + 1 < len(tokens) and cursor - position <= _JS_ASSIGNMENT_LOOKBACK:
+        current = tokens[cursor]
+        following = tokens[cursor + 1]
+        if (
+            current.kind != "punct"
+            or current.value not in _JS_ASSIGNMENT_PUNCT
+            or following.kind != "punct"
+            or current.end != following.start
+        ):
+            return False
+        if following.value == "=":
+            # ``<=``/``>=`` sont des comparaisons, pas des affectations.
+            if current.value in {"<", ">"} and cursor == position + 1:
+                return False
+            return True
+        if following.value == current.value and current.value in {"+", "-"}:
+            return True
+        if current.value in {"<", ">"} and following.value != current.value:
+            return False
+        cursor += 1
+    return False
+
+
+def _js_process_is_binding(  # noqa: PLR0911 - un refus par contexte
+    source: str,
+    tokens: list[_JsToken],
+    position: int,
+    binding: list[bool],
+) -> bool:
+    """Vrai si ce jeton ``process`` lie (ou écrase) le nom global."""
+    previous = tokens[position - 1] if position > 0 else None
+    following = tokens[position + 1] if position + 1 < len(tokens) else None
+    if previous is not None and previous.kind == "punct" and previous.value == ".":
+        ellipsis = (
+            position >= _JS_ELLIPSIS_LOOKBACK
+            and tokens[position - 2].kind == "punct"
+            and tokens[position - 2].value == "."
+            and tokens[position - 3].kind == "punct"
+            and tokens[position - 3].value == "."
+        )
+        if not ellipsis:
+            # ``obj.process`` n'est pas le nom global.
+            return False
+    if following is not None and following.kind == "punct" and following.value in {".", "["}:
+        # ``process.env`` / ``process["env"]`` : lecture du global, pas une liaison,
+        # même à l'intérieur d'une liste de paramètres (valeur par défaut).
+        return False
+    if (
+        following is not None
+        and following.kind == "punct"
+        and following.value == "?"
+        and position + 2 < len(tokens)
+        and tokens[position + 2].kind == "punct"
+        and tokens[position + 2].value == "."
+    ):
+        return False
+    if previous is not None and previous.kind == "ident":
+        if previous.value in _JS_BINDING_KEYWORDS:
+            return True
+    if (
+        previous is not None
+        and previous.kind == "punct"
+        and previous.value == "*"
+        and position >= _JS_FUNCTION_KEYWORD_LOOKBACK
+        and tokens[position - _JS_FUNCTION_KEYWORD_LOOKBACK].kind == "ident"
+        and tokens[position - _JS_FUNCTION_KEYWORD_LOOKBACK].value == "function"
+    ):
+        return True
+    if following is not None and following.kind == "punct" and following.value == "=":
+        if _js_arrow_at(tokens, position + 1):
+            return True
+    if _js_assignment_follows(source, tokens, position):
+        return True
+    return binding[position]
+
+
+def _javascript_process_shadowed(source: str, tokens: list[_JsToken]) -> bool:
+    """Vrai si le fichier peut lier ``process`` ailleurs qu'au global Node."""
+    if _js_import_binds_process(tokens):
+        return True
+    enclosing, matching = _js_delimiters(tokens)
+    binding = _js_binding_contexts(tokens, enclosing, matching)
+    return any(
+        token.kind == "ident"
+        and token.value == "process"
+        and _js_process_is_binding(source, tokens, position, binding)
+        for position, token in enumerate(tokens)
+    )
+
+
+def _js_process_env_key(tokens: list[_JsToken], position: int) -> bool:
+    """Vrai si le littéral est une clé lue dans ``process.env`` (auto-ciblage)."""
+    if (
+        position >= _JS_PROCESS_ENV_LOOKBACK
+        and tokens[position - 1].kind == "punct"
+        and tokens[position - 1].value == "["
+        and tokens[position - 2].kind == "ident"
+        and tokens[position - 2].value == "env"
+        and tokens[position - 3].kind == "punct"
+        and tokens[position - 3].value == "."
+        and tokens[position - 4].kind == "ident"
+        and tokens[position - 4].value == "process"
+    ):
+        return True
+    # ``process.env.get("NOM")`` : la valeur deviendrait le nom de la variable.
+    return (
+        position >= _JS_PROCESS_ENV_METHOD_LOOKBACK
+        and tokens[position - 1].kind == "punct"
+        and tokens[position - 1].value == "("
+        and tokens[position - 2].kind == "ident"
+        and tokens[position - 3].kind == "punct"
+        and tokens[position - 3].value == "."
+        and tokens[position - 4].kind == "ident"
+        and tokens[position - 4].value == "env"
+        and tokens[position - 5].kind == "punct"
+        and tokens[position - 5].value == "."
+        and tokens[position - 6].kind == "ident"
+        and tokens[position - 6].value == "process"
+    )
+
+
+def _js_standalone_string(tokens: list[_JsToken], position: int) -> bool:
+    """Vrai pour une chaîne en position d'instruction (directive prologue)."""
+    token = tokens[position]
+    previous = tokens[position - 1] if position > 0 else None
+    following = tokens[position + 1] if position + 1 < len(tokens) else None
+    if previous is None:
+        before = True
+    elif previous.kind == "punct" and previous.value in {";", "{", "}"}:
+        before = True
+    elif previous.kind == "string" and previous.line < token.line:
+        # Chaîne de directives juxtaposées par ASI : ``"use strict"\n"autre"``.
+        before = True
+    else:
+        before = False
+    if following is None:
+        after = True
+    elif following.kind == "punct" and following.value in {";", "}"}:
+        after = True
+    else:
+        after = following.line > token.end_line
+    return before and after
 
 
 def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
@@ -1039,6 +1441,14 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
         return _js_failure(file, source, line, variable, ManualReason.MULTIPLE_LITERALS)
 
     position, token = candidates[0]
+    if _javascript_process_shadowed(source, tokens):
+        return _js_failure(file, source, line, variable, ManualReason.SHADOWED_MODULE)
+    if _js_process_env_key(tokens, position):
+        return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
+    if _js_standalone_string(tokens, position):
+        # Directive prologue (``"use strict"``) : remplacer le littéral ferait
+        # perdre la sémantique de directive.
+        return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
     if token.end_line != token.line:
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
     previous = tokens[position - 1] if position > 0 else None
