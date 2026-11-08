@@ -96,11 +96,16 @@ expression et une raison stable (`ManualReason`) :
 | F-string ou template literal | `AMBIGUOUS_STRING` |
 | Concaténation explicite ou implicite | `AMBIGUOUS_CONCATENATION` |
 | Docstring, annotation, `match`, clé/méthode d'objet, import statique | `AMBIGUOUS_CONTEXT` |
-| Nom `os` masqué côté Python | `SHADOWED_MODULE` |
+| Clé déjà assainie lue via `os.environ[...]`/`os.getenv(...)` ou `process.env[...]`/`process.env.get(...)` | `AMBIGUOUS_CONTEXT` |
+| Directive prologue JavaScript (`"use strict"`) | `AMBIGUOUS_CONTEXT` |
+| Nom `os` masqué côté Python ou `process` masqué côté JavaScript | `SHADOWED_MODULE` |
 
 Cas particuliers refusés côté JavaScript : clé d'objet littérale
 (`{"secret": 1}`), nom de méthode ou champ de classe, spécificateur
-`import`/`from`, `require(...)`. Côté Python : f-string, concaténation,
+`import`/`from`, `require(...)`. Un nom `process` lié localement (paramètre,
+`var`/`let`/`const`, fonction/classe, import, déstructuration, `catch`,
+affectation) provoque aussi `SHADOWED_MODULE` : le patch ne doit jamais lire un
+objet qui n'est pas le global Node. Côté Python : f-string, concaténation,
 docstring, annotation, motif `case`, littéral multiligne.
 
 JSX et TypeScript sont hors périmètre : leurs extensions (`.jsx`, `.tsx`,
@@ -119,7 +124,9 @@ une chaîne JavaScript ordinaire.
 - **Bornes** : source 1 Mio UTF-8, secret 100 000 caractères, chemin 4096
   caractères. Toute erreur d'API est statique et ne reflète jamais l'entrée.
 - **Pas de fuite par `repr`** : `before` et `after` sont exclus de la
-  représentation du plan ; un journal de session n'y verra pas le secret.
+  représentation du plan, et la valeur décodée d'un jeton JavaScript
+  (`_JsToken.value`) est également masquée. Un journal de session n'y verra
+  pas le secret.
 - **Patch vérifié** : après substitution et ajout éventuel de l'import, le
   texte Python final doit reparser ; sinon aucun patch n'est rendu.
 
