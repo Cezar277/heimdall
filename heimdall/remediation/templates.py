@@ -411,41 +411,85 @@ def _is_os_module(node: ast.AST) -> bool:
     return _is_os_environ(node)
 
 
+def _python_env_access_in(node: ast.AST) -> bool:
+    """Vrai si l'expression mentionne une lecture d'``os.environ`` (racine ``os``).
+
+    Couvre les formes directes (``os.environ``, ``os.environ.get``, ``os.getenv``,
+    ``operator.getitem``) et les formes indirectionnées : curryfication
+    (``getattr(os.environ, "get")("NOM")``), sous-référence via ``vars`` ou
+    ``getattr`` (``vars(os.environ)["NOM"]``, ``getattr(os, "environ")["NOM"]``).
+    Dans chaque cas, la clé littérale deviendrait la valeur lue si le patch était
+    appliqué : le contexte est donc un re-ciblage.
+    """
+    if _is_os_environ(node):
+        return True
+    if isinstance(node, ast.Attribute):
+        return _python_env_access_in(node.value)
+    if isinstance(node, ast.Call):
+        if _python_env_access_in(node.func):
+            return True
+        return any(
+            _python_env_access_in(argument)
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+        )
+    if isinstance(node, ast.Subscript):
+        return _python_env_access_in(node.value) or _python_env_access_in(node.slice)
+    return _is_os_module(node)
+
+
+def _python_call_env_access(call: ast.Call) -> bool:
+    """Vrai pour un appel dont le but ou un argument lit via ``os.environ``."""
+    if _python_env_access_in(call.func):
+        return True
+    return any(
+        _python_env_access_in(argument)
+        for argument in (*call.args, *(keyword.value for keyword in call.keywords))
+    )
+
+
 def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     """Vrai si le littéral sert de **nom** de variable d'environnement.
 
     Remplacer ``os.environ["APP_KEY"]`` par ``os.environ[os.environ["APP_KEY"]]``
     changerait la clé lue : le patch est refusé plutôt que corrompu. Le cas
-    ``os.getenv(...)``/``os.environ.get(...)`` est traité de la même façon.
+    ``os.getenv(...)``/``os.environ.get(...)`` est traité de la même façon, ainsi
+    que les formes indirectionnées (curryfication ``getattr(os.environ, "get")``,
+    sous-référence ``vars(os.environ)``/``getattr(os, "environ")``).
     """
     child = node
     parent = parents.get(child)
     while parent is not None:
-        if isinstance(parent, ast.Subscript) and _is_os_environ(parent.value):
+        if isinstance(parent, ast.Subscript) and _python_env_access_in(parent.value):
+            # ``os.environ["NOM"]``, ``vars(os.environ)["NOM"]``,
+            # ``getattr(os, "environ")["NOM"]`` : la clé devient la valeur.
             return True
+        if isinstance(parent, ast.Call) and _python_call_env_access(parent):
+            # ``os.environ.get("NOM")``, ``getattr(os.environ, "get")("NOM")``,
+            # ``operator.getitem(os.environ, "NOM")``, ``getattr(os, "NOM")`` :
+            # la clé devient la valeur.
+            return True
+        child = parent
+        parent = parents.get(child)
+    return False
+
+
+#: Appels dont le but évalue le littéral comme du code source (``eval("NOM")``).
+_CODE_EVALUATION_FUNCS: Final[frozenset[str]] = frozenset({"eval", "exec", "compile", "__import__"})
+
+
+def _python_code_evaluation_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    """Vrai si un ancêtre d'appel évalue le littéral comme du code source.
+
+    ``eval("APP_KEY")`` transformerait la valeur d'environnement en code : le
+    patch ``eval(os.environ["APP_KEY"])`` changerait la sémantique (et introduirait
+    une évaluation dynamique). Le doute profite au refus.
+    """
+    child = node
+    parent = parents.get(child)
+    while parent is not None:
         if isinstance(parent, ast.Call):
             function = parent.func
-            if isinstance(function, ast.Attribute):
-                if _is_os_environ(function.value):
-                    return True
-                if (
-                    isinstance(function.value, ast.Name)
-                    and function.value.id == "os"
-                    and function.attr == "getenv"
-                ):
-                    return True
-                if function.attr == "getitem" and len(parent.args) > 1 and parent.args[1] is node:
-                    # ``operator.getitem(os.environ, "NOM")`` : la clé lue
-                    # deviendrait la valeur lue.
-                    return True
-            elif (
-                isinstance(function, ast.Name)
-                and function.id == "getattr"
-                and parent.args
-                and _is_os_module(parent.args[0])
-            ):
-                # ``getattr(os, "NOM")`` / ``getattr(os.environ, "NOM")`` : la
-                # clé lue deviendrait la valeur lue.
+            if isinstance(function, ast.Name) and function.id in _CODE_EVALUATION_FUNCS:
                 return True
         child = parent
         parent = parents.get(child)
@@ -663,6 +707,9 @@ def _python_replacement(  # noqa: PLR0911, PLR0912, PLR0915 - un refus par garde
         if _annotation_context(node, parents):
             return _python_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
         if _environment_key_context(node, parents):
+            return _python_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
+        if _python_code_evaluation_context(node, parents):
+            # ``eval("NOM")`` : la valeur d'env serait ré-évaluée comme du code.
             return _python_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
         if node.end_lineno != line:
             return _python_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
@@ -1398,40 +1445,119 @@ def _js_process_env_key(tokens: list[_JsToken], position: int) -> bool:
     return _js_env_access_present(tokens, start, end)
 
 
+def _js_normalize_optional_chaining(tokens: list[_JsToken], start: int, end: int) -> list[_JsToken]:
+    """Fusionne les sauts optionnels avant analyse : ``?.`` et ``?[``.
+
+    ``?`` suivi de ``.`` (``a?.b``) fusionne en saut membre, ``?`` suivi de ``[``
+    (``a?.[b]``) fusionne en saut indice : l'analyse ne doit pas voir le ``?`` comme
+    un séparateur ambigu.
+    """
+    window = tokens[start:end] if end > start else []
+    normalized: list[_JsToken] = []
+    cursor = 0
+    while cursor < len(window):
+        token = window[cursor]
+        if (
+            token.kind == "punct"
+            and token.value == "?"
+            and cursor + 1 < len(window)
+            and window[cursor + 1].kind == "punct"
+            and window[cursor + 1].value in {".", "["}
+        ):
+            following = window[cursor + 1]
+            normalized.append(
+                _JsToken(
+                    kind="punct",
+                    value=following.value,
+                    start=token.start,
+                    end=following.end,
+                    line=token.line,
+                    end_line=token.end_line,
+                    text=following.value or "",
+                )
+            )
+            cursor += 2
+            continue
+        normalized.append(token)
+        cursor += 1
+    return normalized
+
+
 def _js_env_access_present(tokens: list[_JsToken], start: int, end: int) -> bool:
     """Vrai si la plage ``[start, end)`` contient un accès ``process.env``.
 
     Détecte les lectures par membre (``process.env``, ``process.env.FOO``) et
-    par indice (``process["env"]``), y compris comme récepteur d'un getter.
-    L'analyse est une fenêtre glissante : le doute profite au refus, jamais au
-    patch.
+    par indice (``process["env"]``), y compris avec chaînage optionnel
+    (``process?.env``, ``process?.env?.get``, ``process?.["env"]``,
+    ``process?.[...]``) : la séquence optionnelle ``?`` + ``.``/``[`` est fusionnée
+    avant l'analyse, de sorte que ``process?.env`` soit vu comme un saut membre
+    classique et ``process?.[...]`` comme un saut indice. L'analyse reste une
+    fenêtre glissante : le doute profite au refus, jamais au patch.
     """
-    for index in range(start, max(start, end)):
-        token = tokens[index]
-        is_env_name = token.kind in {"ident", "string"} and token.value == "env"
+    normalized = _js_normalize_optional_chaining(tokens, start, end)
+    for position, token in enumerate(normalized):
+        if token.kind not in {"ident", "string"} or token.value != "env":
+            continue
+        previous = normalized[position - 1] if position > 0 else None
         if (
-            is_env_name
-            and index - 2 >= start
-            and tokens[index - 1].kind == "punct"
-            and tokens[index - 1].value == "."
-            and tokens[index - 2].kind == "ident"
-            and tokens[index - 2].value == "process"
+            previous is not None
+            and previous.kind == "punct"
+            and previous.value == "."
+            and position - 2 >= 0
+            and normalized[position - 2].kind == "ident"
+            and normalized[position - 2].value == "process"
         ):
             # Membre : ``process.env`` ou un sous-récepteur déjà env-rooted.
+            # La fusion ``?.`` a rendu l'accès membre lisible.
             return True
         if (
-            is_env_name
-            and index - 1 > start
-            and tokens[index - 1].kind == "punct"
-            and tokens[index - 1].value == "["
-            and index + 1 < len(tokens)
-            and tokens[index + 1].kind == "punct"
-            and tokens[index + 1].value == "]"
-            and index - 2 >= start
-            and tokens[index - 2].kind == "ident"
-            and tokens[index - 2].value == "process"
+            previous is not None
+            and previous.kind == "punct"
+            and previous.value == "["
+            and position + 1 < len(normalized)
+            and normalized[position + 1].kind == "punct"
+            and normalized[position + 1].value == "]"
+            and position - 2 >= 0
+            and normalized[position - 2].kind == "ident"
+            and normalized[position - 2].value == "process"
         ):
             # Indice : ``process["env"]`` — le sous-clé est ``env``.
+            return True
+    return False
+
+
+def _js_computed_process_key(tokens: list[_JsToken], position: int) -> bool:
+    """Vrai si le littéral est une clé de propriété **calculée** ``process[...]``.
+
+    ``process["en" + "v"]["APP_KEY"]`` : la fenêtre glissante ne peut pas
+    prouver, à partir du seul littéral, que la clé remontée est ``env``. Le doute
+    profite au refus : un accès membre calculé sur ``process`` est ambigu.
+
+    Le saut optionnel compte : ``process?.[KEY]`` est un accès par indice comme
+    ``process[KEY]``, la clé étant une expression dont la fenêtre littérale ne
+    suffit pas à prouver la racine ``env``. De même, toute fenêtre contenant un
+    ident ``process`` alors que le littéral est en position d'indice, d'appel ou
+    d'argument (c'est-à-dire potentiellement une clé remontée) déclenche le refus.
+    """
+    start = max(0, position - _JS_ENV_ACCESS_LOOKBACK)
+    normalized = _js_normalize_optional_chaining(tokens, start, position)
+    previous = tokens[position - 1] if position > 0 else None
+    if previous is None or previous.kind != "punct" or previous.value not in {"[", "(", ",", ")"}:
+        # Littéral hors position de clé : simple valeur (``const k = "SECRET"``),
+        # pas une clé remontée ; seules les lectures dynamiques restent bloquées.
+        return False
+    for index, token in enumerate(normalized):
+        if token.line < tokens[position].line:
+            break
+        if (
+            token.kind == "ident"
+            and token.value == "process"
+            and index + 1 < len(normalized)
+            and normalized[index + 1].kind == "punct"
+            and normalized[index + 1].value in {".", "["}
+        ):
+            # Accès membre (``process.env…``) ou par indice (``process[...]``,
+            # ``process?.[...]``) : la clé remonte une expression dynamique.
             return True
     return False
 
@@ -1492,6 +1618,10 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
     if _javascript_process_shadowed(source, tokens):
         return _js_failure(file, source, line, variable, ManualReason.SHADOWED_MODULE)
     if _js_process_env_key(tokens, position):
+        return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
+    if _js_computed_process_key(tokens, position):
+        # Clé de propriété calculée (``process["en" + "v"]…``) : la fenêtre
+        # littérale seule ne prouve pas la clé ``env`` — le doute profite au refus.
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
     if _js_standalone_string(tokens, position):
         # Directive prologue (``"use strict"``) : remplacer le littéral ferait

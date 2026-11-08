@@ -96,7 +96,10 @@ expression et une raison stable (`ManualReason`) :
 | F-string ou template literal | `AMBIGUOUS_STRING` |
 | Concaténation explicite (`+`/`-`) ou implicite (chaîne adjacente, non reconnue par le tokenizer JS) | `AMBIGUOUS_CONCATENATION` |
 | Docstring, annotation, `match`, clé/méthode d'objet, import statique | `AMBIGUOUS_CONTEXT` |
-| Clé déjà assainie lue via `os.environ[...]`/`os.getenv(...)`, `getattr(os, ...)`/`operator.getitem(os.environ, ...)` ou `process.env[...]`/`process.env.get(...)`, `process["env"][...]`/`Reflect.get(process.env, ...)` | `AMBIGUOUS_CONTEXT` |
+| Clé déjà assainie lue via `os.environ[...]`/`os.getenv(...)`, `getattr(os, ...)`/`operator.getitem(os.environ, ...)`, `os.environ.get(...)`, ou via `process.env[...]`, `process.env.get(...)`, `process["env"][...]`, `Reflect.get(process.env, ...)`, `process?.env[...]`, `process?.[...]` | `AMBIGUOUS_CONTEXT` |
+| Accès `os.environ` indirect (curryfication `getattr(os.environ, "get")`, sous-référence `vars(os.environ)`/`getattr(os, "environ")`) | `AMBIGUOUS_CONTEXT` |
+| Littéral passé à `eval`/`exec`/`compile`/`__import__` : la valeur d'environnement serait ré-évaluée comme du code | `AMBIGUOUS_CONTEXT` |
+| Clé de propriété calculée (`process["en" + "v"]...`, `process["env"][...]`, `process?.[...]`) | `AMBIGUOUS_CONTEXT` |
 | Directive prologue JavaScript (`"use strict"`) | `AMBIGUOUS_CONTEXT` |
 | Nom `os` masqué côté Python ou `process` masqué côté JavaScript | `SHADOWED_MODULE` |
 

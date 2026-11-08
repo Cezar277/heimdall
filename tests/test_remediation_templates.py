@@ -253,6 +253,11 @@ def test_python_handles_non_ascii_on_the_same_line() -> None:
         (f'"""{SECRET}"""\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'KEY = ("{SECRET[:10]}"\n    "{SECRET[10:]}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         ('KEY = "another value"\n', ManualReason.SECRET_NOT_FOUND),
+        (f'x = eval("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = exec("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = getattr(os.environ, "get")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = vars(os.environ)["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = getattr(os, "environ")["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
     ],
 )
 def test_python_refuses_ambiguous_or_absent_cases(source: str, reason: ManualReason) -> None:
@@ -384,6 +389,8 @@ def test_javascript_regex_with_quotes_does_not_hide_the_real_string() -> None:
         (f"// {SECRET}\n", ManualReason.NO_SIMPLE_LITERAL),
         (f'const x = "{SECRET}"; const y = "{SECRET}";\n', ManualReason.MULTIPLE_LITERALS),
         ('const KEY = "other";\n', ManualReason.SECRET_NOT_FOUND),
+        (f'const x = process["en" + "v"]["{SECRET}"];\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'const x = process?.["{SECRET}"];\n', ManualReason.AMBIGUOUS_CONTEXT),
     ],
 )
 def test_javascript_refuses_ambiguous_or_absent_cases(source: str, reason: ManualReason) -> None:
@@ -429,6 +436,11 @@ def test_javascript_refuses_shadowed_process(source: str) -> None:
         'x = process["env"]["APP_KEY"];\n',
         'KEY = Reflect.get(process.env, "APP_KEY");\n',
         'KEY = operator.getitem(process.env, "APP_KEY");\n',
+        'const x = process?.env["APP_KEY"];\n',
+        'const x = process?.env.get("APP_KEY");\n',
+        'const x = process?.env?.["APP_KEY"];\n',
+        'const x = process ?. env ["APP_KEY"];\n',
+        'const x = process?.["env"]["APP_KEY"];\n',
     ],
 )
 def test_javascript_refuses_environment_key_auto_targeting(source: str) -> None:
