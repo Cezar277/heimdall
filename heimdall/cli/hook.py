@@ -121,10 +121,23 @@ class UninstallOutcome(str, Enum):
     NOT_INSTALLED = "not_installed"
 
 
-def _git_binary() -> str:
-    """Résout git hors PATH hérité, comme le reste du projet."""
+def _git_binary(root: Path) -> str:
+    """Résout git hors PATH hérité et refuse un binaire détourné par le dépôt.
+
+    Même garde que :class:`heimdall.mcp.gitdiff.GitAccess` : un ``git``
+    résolu sous la racine du dépôt (ou dans le répertoire courant, cas
+    Windows) ne doit jamais être exécuté.
+    """
     git = shutil.which("git", path=os.defpath)
     if git is None:
+        raise HookError
+    try:
+        resolved = Path(git).resolve()
+        repository_root = root.resolve()
+        current = Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        raise HookError from None
+    if resolved.is_relative_to(repository_root) or resolved.parent == current:
         raise HookError
     return git
 
@@ -147,9 +160,18 @@ def _run_git(
     environment = confined_environment(str(root.parent))
     environment[HEIMDALL_IN_HOOK_ENV] = "1"
     if extra_env is not None:
+        if set(extra_env) - {"GIT_INDEX_FILE"}:
+            raise HookError
+        index_file = extra_env.get("GIT_INDEX_FILE")
+        if (
+            index_file is None
+            or not Path(index_file).is_absolute()
+            or any(character in index_file for character in ("\x00", "\n", "\r"))
+        ):
+            raise HookError
         environment.update(extra_env)
     command = [
-        _git_binary(),
+        _git_binary(root),
         *GIT_CONFIG_OVERRIDES,
         "-c",
         f"core.hooksPath={os.devnull}",

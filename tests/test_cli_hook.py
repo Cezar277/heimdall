@@ -19,6 +19,7 @@ from heimdall.cli.hook import (
     HOOK_MARKER,
     HookError,
     UnstagedChangesError,
+    _git_binary,
     _restage_paths,
     _verify_root,
     apply_and_restage,
@@ -103,6 +104,36 @@ def _write_foreign_hook(repo: GitRepo, content: str, *, executable: bool = True)
     hook.write_text(content, encoding="utf-8")
     hook.chmod(0o755 if executable else 0o644)
     return hook
+
+
+def test_git_binary_refuses_a_binary_inside_the_repository(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = git_repo.root / "git"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setattr(hook_module.shutil, "which", lambda *args, **kwargs: str(fake))
+
+    with pytest.raises(HookError):
+        _git_binary(git_repo.root)
+
+
+def test_run_git_rejects_a_redirecting_environment(git_repo: GitRepo) -> None:
+    with pytest.raises(HookError):
+        hook_module._run_git(
+            git_repo.root,
+            ("rev-parse", "--git-dir"),
+            extra_env={"GIT_DIR": "/nonexistent/heimdall-git-dir"},
+        )
+
+
+def test_run_git_rejects_a_relative_index_file(git_repo: GitRepo) -> None:
+    with pytest.raises(HookError):
+        hook_module._run_git(
+            git_repo.root,
+            ("rev-parse", "--git-dir"),
+            extra_env={"GIT_INDEX_FILE": "relative-index"},
+        )
 
 
 def test_install_creates_an_executable_managed_hook(git_repo: GitRepo) -> None:

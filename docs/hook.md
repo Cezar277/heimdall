@@ -107,6 +107,12 @@ niveau ; seul le **fichier** exact `.env.example` (dernier composant,
 **casse incluse**) est accepté, un répertoire `.env.example/` ou un nom
 `.ENV.EXAMPLE` est refusé.
 
+Le binaire `git` est résolu hors `PATH` hérité et refusé s'il est situé dans
+le dépôt ou dans le répertoire courant. L'environnement des commandes
+internes n'accepte qu'une variable supplémentaire, `GIT_INDEX_FILE`, avec un
+chemin absolu ; toute autre variable (`GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_CONFIG_*`…) est refusée.
+
 Le hook installé se contente de scanner et bloquer : le branchement du
 moteur de remédiation interactif reste le ticket #30/#32.
 
