@@ -13,15 +13,16 @@ import pytest
 from support.git_repo import GIT, GitRepo
 from typer.testing import CliRunner, Result
 
+import heimdall.cli.hook as hook_module
 from heimdall.cli.hook import (
     HEIMDALL_IN_HOOK_ENV,
     HOOK_MARKER,
     HookError,
     UnstagedChangesError,
+    _restage_paths,
     _verify_root,
     apply_and_restage,
     install_hook,
-    restage_paths,
     uninstall_hook,
 )
 from heimdall.cli.main import app
@@ -240,6 +241,23 @@ def test_uninstall_restores_a_symlinked_legacy_hook(
 
     assert hook.is_symlink()
     assert os.readlink(hook) == str(target)
+
+
+def test_foreign_hook_with_marker_in_body_is_not_ours(git_repo: GitRepo) -> None:
+    original = "#!/bin/sh\necho LEGACY\n# heimdall-managed-hook: v1\n"
+    hook = _write_foreign_hook(git_repo, original)
+
+    untouched = _run("hook", "uninstall", str(git_repo.root))
+    assert untouched.exit_code == 0
+    assert hook.read_text(encoding="utf-8") == original
+
+    installed = _run("hook", "install", str(git_repo.root))
+    assert installed.exit_code == 0
+    assert _legacy(git_repo).read_text(encoding="utf-8") == original
+
+    restored = _run("hook", "uninstall", str(git_repo.root))
+    assert restored.exit_code == 0
+    assert hook.read_text(encoding="utf-8") == original
 
 
 @pytest.mark.parametrize("absolute", [False, True])
@@ -626,7 +644,7 @@ def test_apply_and_restage_restores_state_when_apply_fails(git_repo: GitRepo) ->
 )
 def test_restage_rejects_unsafe_paths(git_repo: GitRepo, path: str) -> None:
     with pytest.raises(HookError):
-        restage_paths(git_repo.root, [path])
+        _restage_paths(git_repo.root, [path])
 
 
 def test_restage_requires_the_repository_root(git_repo: GitRepo) -> None:
@@ -635,14 +653,14 @@ def test_restage_requires_the_repository_root(git_repo: GitRepo) -> None:
     (subdirectory / "app.py").write_text("x\n", encoding="utf-8")
 
     with pytest.raises(HookError):
-        restage_paths(subdirectory, ["app.py"])
+        _restage_paths(subdirectory, ["app.py"])
 
 
 def test_restage_rejects_a_directory(git_repo: GitRepo) -> None:
     (git_repo.root / "dir").mkdir()
 
     with pytest.raises(HookError):
-        restage_paths(git_repo.root, ["dir"])
+        _restage_paths(git_repo.root, ["dir"])
 
 
 def test_restage_rejects_an_outgoing_symlink(git_repo: GitRepo, tmp_path: Path) -> None:
@@ -651,7 +669,7 @@ def test_restage_rejects_an_outgoing_symlink(git_repo: GitRepo, tmp_path: Path) 
     (git_repo.root / "link.txt").symlink_to(outside)
 
     with pytest.raises(HookError):
-        restage_paths(git_repo.root, ["link.txt"])
+        _restage_paths(git_repo.root, ["link.txt"])
 
 
 def test_restage_does_not_run_filters_or_hooks(git_repo: GitRepo, tmp_path: Path) -> None:
@@ -674,12 +692,35 @@ def test_restage_does_not_run_filters_or_hooks(git_repo: GitRepo, tmp_path: Path
     hook.chmod(0o755)
     git_repo.write("app.py", "new\n")
 
-    count = restage_paths(git_repo.root, ["app.py"])
+    count = _restage_paths(git_repo.root, ["app.py"])
 
     assert count == 1
     assert not filter_canary.exists()
     assert not hook_canary.exists()
     assert git_repo.git_output("show", ":app.py") == "new\n"
+
+
+def test_restage_discards_the_temporary_index_on_failure(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git_repo.write("app.py", "old\n")
+    git_repo.stage("app.py")
+    git_repo.commit_all("base")
+    before = git_repo.git_output("show", ":app.py")
+    git_repo.write("app.py", "new\n")
+    real_run = hook_module._run_git
+
+    def failing_run(root, arguments, **kwargs):
+        if arguments and arguments[0] == "update-index":
+            return subprocess.CompletedProcess(arguments, 1, b"", b"")
+        return real_run(root, arguments, **kwargs)
+
+    monkeypatch.setattr(hook_module, "_run_git", failing_run)
+
+    with pytest.raises(HookError):
+        hook_module._restage_paths(git_repo.root, ["app.py"])
+
+    assert git_repo.git_output("show", ":app.py") == before
 
 
 def test_verify_root_detects_a_replaced_root(git_repo: GitRepo) -> None:

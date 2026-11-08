@@ -75,6 +75,10 @@ MAX_RESTAGE_PATHS: Final[int] = 32
 _OBJECT_RE: Final[re.Pattern[str]] = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 #: Taille de lecture par bloc pour les fichiers locaux.
 _READ_CHUNK: Final[int] = 65_536
+#: Nombre de lignes du préambule du hook généré (shebang + marqueur).
+_HOOK_PREFIX_LINES: Final[int] = 2
+#: Champs de l'en-tête ``git ls-files -s`` : ``mode sha stage``.
+_LS_FILES_FIELDS: Final[int] = 3
 
 
 class HookError(Exception):
@@ -131,6 +135,7 @@ def _run_git(
     *,
     stdin: bytes | None = None,
     timeout: float = GIT_TIMEOUT_SECONDS,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Exécute une commande git figée, sans shell et sans hooks du dépôt.
 
@@ -141,6 +146,8 @@ def _run_git(
     """
     environment = confined_environment(str(root.parent))
     environment[HEIMDALL_IN_HOOK_ENV] = "1"
+    if extra_env is not None:
+        environment.update(extra_env)
     command = [
         _git_binary(),
         *GIT_CONFIG_OVERRIDES,
@@ -299,14 +306,24 @@ def _read_regular(path: Path, limit: int) -> bytes:
 
 
 def _is_ours(path: Path) -> bool:
-    """True si le fichier existe, est régulier et porte le marqueur Heimdall."""
+    """True si le fichier est exactement le hook Heimdall généré.
+
+    Le marqueur doit être la deuxième ligne, juste après ``#!/bin/sh`` : un
+    hook étranger qui contiendrait la chaîne en corps de fichier ne doit ni
+    être écrasé à l'installation ni supprimé à la désinstallation.
+    """
     try:
         metadata = os.lstat(path)
     except OSError:
         return False
     if not stat.S_ISREG(metadata.st_mode):
         return False
-    return HOOK_MARKER.encode("utf-8") in _read_regular(path, MAX_HOOK_BYTES)
+    lines = _read_regular(path, MAX_HOOK_BYTES).splitlines()
+    return (
+        len(lines) >= _HOOK_PREFIX_LINES
+        and lines[0] == b"#!/bin/sh"
+        and lines[1] == HOOK_MARKER.encode()
+    )
 
 
 def _is_chainable(path: Path) -> bool:
@@ -695,13 +712,49 @@ def assert_no_unstaged_changes(root: Path, paths: Iterable[str]) -> list[Confine
     return confined
 
 
-def restage_paths(root: Path, paths: Iterable[str]) -> int:
+def _verify_index_entries(
+    root: Path,
+    entries: Sequence[tuple[str, str, str]],
+    *,
+    extra_env: dict[str, str],
+) -> None:
+    """Vérifie que l'index temporaire contient exactement les entrées voulues."""
+    arguments = ["ls-files", "-s", "-z", "--"]
+    arguments.extend(relative for _, _, relative in entries)
+    completed = _run_git(root, arguments, extra_env=extra_env)
+    if completed.returncode != 0:
+        raise HookError
+    actual: dict[str, tuple[str, str]] = {}
+    for record in completed.stdout.split(b"\x00"):
+        if not record:
+            continue
+        header, separator, path_bytes = record.partition(b"\t")
+        fields = header.split(b" ")
+        if not separator or len(fields) != _LS_FILES_FIELDS:
+            raise HookError
+        mode_bytes, digest_bytes, stage_bytes = fields
+        if stage_bytes != b"0":
+            raise HookError
+        try:
+            mode = mode_bytes.decode("ascii")
+            digest = digest_bytes.decode("ascii")
+            relative = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HookError from None
+        actual[relative] = (mode, digest)
+    expected = {relative: (mode, digest) for mode, digest, relative in entries}
+    if actual != expected:
+        raise HookError
+
+
+def _restage_paths(root: Path, paths: Iterable[str]) -> int:
     """Ré-indexe le contenu exact de fichiers remédiés, sans filtre ni hook.
 
-    Le contenu est lu par Heimdall (``O_NOFOLLOW``, taille bornée), haché par
-    ``git hash-object --no-filters`` puis écrit dans l'index par un unique
-    ``git update-index --cacheinfo``. Aucun filtre ``clean`` du dépôt n'est
-    exécuté et aucun hook Git n'est déclenché.
+    Fonction **interne** : l'appelant public est :func:`apply_and_restage`,
+    qui vérifie d'abord l'absence de modifications non indexées. L'index est
+    mis à jour dans un fichier temporaire puis remplacé atomiquement sous le
+    verrou Git ``index.lock`` : une panne médiane ne laisse pas l'index réel
+    partiellement modifié.
     """
     access = _open_repository(root)
     repository_root = access.root
@@ -713,12 +766,44 @@ def restage_paths(root: Path, paths: Iterable[str]) -> int:
         digest = _hash_blob(repository_root, data)
         mode = "100755" if metadata.st_mode & 0o111 else "100644"
         entries.append((mode, digest, item.relative))
-    arguments = ["update-index", "--add"]
-    for mode, digest, relative in entries:
-        arguments.extend(["--cacheinfo", mode, digest, relative])
-    completed = _run_git(repository_root, arguments)
-    if completed.returncode != 0:
-        raise HookError
+    try:
+        index_path = access.index_path()
+    except ToolFailure:
+        raise HookError from None
+    lock_path = index_path.with_name(index_path.name + ".lock")
+    temporary: str | None = None
+    lock_descriptor = -1
+    try:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".heimdall-index-", dir=index_path.parent
+        )
+        os.close(descriptor)
+        shutil.copyfile(index_path, temporary)
+        os.chmod(temporary, 0o600)
+        extra_env = {"GIT_INDEX_FILE": temporary}
+        arguments = ["update-index", "--add"]
+        for mode, digest, relative in entries:
+            arguments.extend(["--cacheinfo", mode, digest, relative])
+        completed = _run_git(repository_root, arguments, extra_env=extra_env)
+        if completed.returncode != 0:
+            raise HookError
+        _verify_index_entries(repository_root, entries, extra_env=extra_env)
+        lock_descriptor = os.open(
+            lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+        os.replace(temporary, index_path)
+        temporary = None
+    except OSError:
+        raise HookError from None
+    finally:
+        if lock_descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(lock_descriptor)
+            with contextlib.suppress(OSError):
+                os.unlink(lock_path)
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
     _verify_root(access)
     return len(entries)
 
@@ -740,7 +825,7 @@ def apply_and_restage(
     os.environ[HEIMDALL_IN_HOOK_ENV] = "1"
     try:
         apply()
-        return restage_paths(root, [item.relative for item in confined])
+        return _restage_paths(root, [item.relative for item in confined])
     finally:
         if previous is None:
             os.environ.pop(HEIMDALL_IN_HOOK_ENV, None)
