@@ -28,7 +28,8 @@ defaut, `python -I -P -m heimdall.cli.main` (Python ≥ 3.11). `PYTHONSAFEPATH=1
 est exporté et `-P` empêche le préfixe du cwd : un `heimdall/` local ne peut
 pas détourner l'import. Sur Python 3.10, `-P` n'existe pas : le script
 console **hors du dépôt** est alors obligatoire, sinon `hook install` refuse
-en code 2. Git lance les hooks avec `cwd` = racine ; si le script est invoqué
+en code 2. Sous Windows, Python ≥ 3.11 est requis (le hook n'utilise pas
+`heimdall.exe`), donc `hook install` refuse en code 2 sur Python 3.10. Git lance les hooks avec `cwd` = racine ; si le script est invoqué
 depuis un sous-dossier, `$PWD` n'est pas une racine de dépôt et le scan
 échoue en code 2 (fail-closed), jamais un périmètre partiel. Un console
 script situé sous la racine, même s'il pointe par lien vers l'extérieur (venv

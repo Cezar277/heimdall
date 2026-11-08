@@ -207,6 +207,22 @@ def test_launcher_requires_a_console_on_python_310(
         _launcher(git_repo.root)
 
 
+def test_launcher_requires_python_311_on_windows(
+    git_repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv_scripts = tmp_path / "outside-venv" / "Scripts"
+    venv_scripts.mkdir(parents=True)
+    python = venv_scripts / "python.exe"
+    python.write_text("", encoding="utf-8")
+    (venv_scripts / "heimdall.exe").write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module.sys, "executable", str(python))
+    monkeypatch.setattr(hook_module.sys, "version_info", (3, 10, 0))
+    monkeypatch.setattr(hook_module.os, "name", "nt")
+
+    with pytest.raises(HookError):
+        _launcher(git_repo.root)
+
+
 def test_launcher_uses_safe_path_on_python_311(
     git_repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

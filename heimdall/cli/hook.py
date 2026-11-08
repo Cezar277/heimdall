@@ -296,11 +296,16 @@ def _launcher(root: Path) -> str:
     Le script console ``heimdall`` est préféré s'il est **hors du dépôt** :
     son ``sys.path[0]`` est le dossier ``bin`` de l'environnement, pas la
     racine du dépôt. Un console script sous la racine (venv dans le dépôt)
-    est refusé et remplacé par ``python -I -m``, qui isole aussi
+    est refusé et remplacé par ``python -I -P -m`` (3.11+), qui isole aussi
     l'interpréteur (pas de ``heimdall`` local importable, pas de
-    ``PYTHONPATH``).
+    ``PYTHONPATH``). Sur 3.10, ``-P`` n'existe pas : sans console hors du
+    dépôt, l'installation est refusée (``HookError``).
     """
     python = _interpreter()
+    if os.name == "nt" and sys.version_info < (3, 11):
+        # Sous Windows, ``heimdall.exe`` n'est pas utilisé par le hook et le
+        # repli ``-m`` n'est pas sûr sans ``-P`` : Python >= 3.11 est requis.
+        raise HookError
     console = Path(python).with_name("heimdall")
     fallback = f"{shlex.quote(python)} -I -m heimdall.cli.main"
     if sys.version_info >= (3, 11):
