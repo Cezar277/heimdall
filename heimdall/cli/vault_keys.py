@@ -22,6 +22,7 @@ Codes de sortie (convention de la CLI) : 0 (succès), 1 (échec opérationnel),
 2 (usage ou configuration invalide).
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from heimdall.cli.vault_client import (
     vault_run,
 )
 from heimdall.vault import auth as vault_auth
+from heimdall.vault.audit import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, SqliteAuditLog
 from heimdall.vault.database import init_db, resolve_db_path
 
 key_app = typer.Typer(
@@ -48,6 +50,13 @@ vault_app = typer.Typer(
     no_args_is_help=True,
 )
 vault_app.add_typer(key_app, name="key")
+
+audit_app = typer.Typer(
+    name="audit",
+    help="Consultation du journal d'audit chaîné (ticket #113).",
+    no_args_is_help=True,
+)
+vault_app.add_typer(audit_app, name="audit")
 
 # Client Vault CLI (tickets #35, #99, #100, #101).
 # `vault run` est un alias de la voie canonique `heimdall run` (main.py) :
@@ -191,4 +200,91 @@ def revoke_key(
     typer.echo(f"Clé API {key_id} révoquée : elle n'authentifie plus aucune requête.")
 
 
-__all__ = ["key_app", "vault_app"]
+@audit_app.command("list")
+def list_audit_events(
+    db_path: Path | None = _DB_PATH_OPTION,
+    limit: int = typer.Option(
+        DEFAULT_LIST_LIMIT,
+        "--limit",
+        min=1,
+        max=MAX_LIST_LIMIT,
+        help="Nombre maximum d'événements récents à afficher.",
+    ),
+    project: str | None = typer.Option(
+        None,
+        "--project",
+        "-p",
+        help="Filtrer sur un projet (défaut : tous les projets).",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Sortie JSON (aucune valeur de secret).",
+    ),
+) -> None:
+    """Liste les derniers événements d'audit (jamais de secret ni de clé)."""
+    try:
+        resolved = _resolve_db_path(db_path)
+        if project is not None:
+            vault_auth.validate_project_id(project)
+        if not resolved.is_file():
+            raise FileNotFoundError
+        audit_log = SqliteAuditLog(resolved, create=False)
+        events = audit_log.list_events(limit=limit, project=project)
+    except ValueError as exc:
+        typer.echo(f"Erreur : {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    except FileNotFoundError:
+        typer.echo("Erreur : base du journal d'audit introuvable.", err=True)
+        raise typer.Exit(code=1) from None
+    except Exception:
+        typer.echo("Erreur : échec de la lecture du journal d'audit.", err=True)
+        raise typer.Exit(code=1) from None
+    if not events:
+        typer.echo("Aucun événement d'audit.")
+        return
+    if json_output:
+        typer.echo(json.dumps(events, sort_keys=True, ensure_ascii=True))
+        return
+    for event in events:
+        typer.echo(
+            f"{event['id']}  {event['occurred_at']}  {event['outcome']}  "
+            f"status={event['status_code']}  peer={event['peer']}  "
+            f"projet={event['project'] or '-'}  "
+            f"cle_id={event['key_id'] or '-'}  "
+            f"cle={event['key_fingerprint'] or '-'}  "
+            f"action={event['action']}  cible={event['target'] or '-'}"
+        )
+
+
+@audit_app.command("verify")
+def verify_audit_chain(
+    db_path: Path | None = _DB_PATH_OPTION,
+) -> None:
+    """Vérifie le chaînage par hash du journal d'audit."""
+    try:
+        resolved = _resolve_db_path(db_path)
+        if not resolved.is_file():
+            raise FileNotFoundError
+        audit_log = SqliteAuditLog(resolved, create=False)
+        valid, invalid_id = audit_log.verify_chain()
+        total = audit_log.count()
+    except ValueError as exc:
+        typer.echo(f"Erreur : {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    except FileNotFoundError:
+        typer.echo("Erreur : base du journal d'audit introuvable.", err=True)
+        raise typer.Exit(code=1) from None
+    except Exception:
+        typer.echo("Erreur : échec de la vérification du journal d'audit.", err=True)
+        raise typer.Exit(code=1) from None
+    if not valid:
+        typer.echo(
+            f"Erreur : chaîne d'audit invalide à l'événement {invalid_id}.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"Chaîne d'audit valide ({total} événements).")
+
+
+__all__ = ["audit_app", "key_app", "vault_app"]

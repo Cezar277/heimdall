@@ -487,6 +487,7 @@ class ApiKeyRegistry:
         self._persist_lock = Lock()
         self._entries: dict[str, ApiKeyEntry] = {}
         self._active: dict[str, str] = {}
+        self._active_ids: dict[str, str] = {}
 
     # -- Introspection (aucune clé brute n'est exposée) --------------------
 
@@ -573,6 +574,7 @@ class ApiKeyRegistry:
                 )
                 if not revoked:
                     self._active[key_hash] = project_id
+                    self._active_ids[key_hash] = effective_id
             logger.debug("Clé API enregistrée pour le projet %s.", project_id)
             return effective_id
 
@@ -619,6 +621,7 @@ class ApiKeyRegistry:
                 if entry is not None and entry.revoked_at is None:
                     entry.revoked_at = get_iso_timestamp()
                     self._active.pop(entry.key_hash, None)
+                    self._active_ids.pop(entry.key_hash, None)
             logger.debug("Clé API révoquée (%s).", key_id)
             return True
 
@@ -631,6 +634,25 @@ class ApiKeyRegistry:
                 if project_id is None or entry.project_id == project_id
             ]
         return sorted(entries, key=lambda entry: entry.created_at)
+
+    def key_id_for_hash(self, key_hash: str) -> str | None:
+        """Retourne l'identifiant interne d'une empreinte DÉJÀ validée (audit #113).
+
+        Cette lecture est réservée au journal d'audit : elle ne décide JAMAIS
+        de l'authentification (le parcours exhaustif à temps constant reste
+        seul juge). En mode SQLite, l'index UNIQUE ``key_hash`` est utilisé
+        après validation ; en mode mémoire, la correspondance est tenue à jour
+        à l'enregistrement et à la révocation.
+        """
+        if self._storage_backend == "sqlite" and self._db_path is not None:
+            with db_session(self._db_path) as conn:
+                row = conn.execute(
+                    "SELECT id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+                    (key_hash,),
+                ).fetchone()
+            return str(row["id"]) if row is not None else None
+        with self._lock:
+            return self._active_ids.get(key_hash)
 
     # -- Internes ----------------------------------------------------------
 
@@ -821,12 +843,21 @@ async def verify_api_key(
     le refus est un 401 générique, identique pour une clé absente, inconnue,
     révoquée ou invalide.
     """
+    raw_header = request.headers.get(API_KEY_HEADER_NAME)
     if api_key is None:
-        if _require_auth(request):
-            raise _unauthorized()
-        return None
+        # Distingue l'en-tête ABSENT de l'en-tête VIDE : une valeur vide est
+        # une clé fournie (donc hachée et parcourue comme les autres), tandis
+        # qu'une absence relève du mode sans authentification explicite.
+        if raw_header is None:
+            if _require_auth(request):
+                raise _unauthorized()
+            return None
+        api_key = raw_header
 
-    if len(api_key) > MAX_API_KEY_LENGTH or api_key != api_key.strip() or not api_key:
+    # Garde de coût borné : au-delà de MAX_API_KEY_LENGTH, aucun hachage n'est
+    # effectué (protection CPU/DoS). C'est le seul rejet ANTÉRIEUR au hachage ;
+    # il est indépendant de l'existence d'une clé et ne crée aucun oracle.
+    if len(api_key) > MAX_API_KEY_LENGTH:
         raise _unauthorized()
 
     registry = _registry(request)
@@ -834,22 +865,51 @@ async def verify_api_key(
         # Fail-closed : sans registre, aucune authentification n'est possible.
         raise _unauthorized()
 
-    try:
-        provided_hash = hash_project_api_key(api_key, pepper=registry.pepper)
-    except ValueError:
-        # Encodage impossible (ex. surrogate isolé) : 401 générique, jamais 500
-        # ni écho de la valeur fournie.
-        raise _unauthorized() from None
+    provided_hash: str | None
+    cached_hash = getattr(request.state, "audit_key_hash", None)
+    if (
+        isinstance(cached_hash, str)
+        and HASH_PATTERN.fullmatch(cached_hash)
+        and raw_header == api_key
+    ):
+        # Le middleware de débit a déjà haché CETTE requête : réutiliser son
+        # résultat évite un second HMAC et garde un coût identique entre clé
+        # inconnue, malformée et valide. La comparaison avec l'en-tête brut
+        # empêche une dépendance surchargée de réutiliser le hash d'une autre
+        # valeur.
+        provided_hash = cached_hash
+    else:
+        try:
+            provided_hash = hash_project_api_key(api_key, pepper=registry.pepper)
+        except ValueError:
+            # Encodage impossible (ex. surrogate isolé) : le parcours exhaustif
+            # est tout de même effectué avec l'empreinte factice, puis le refus
+            # est générique (jamais 500 ni écho de la valeur fournie).
+            provided_hash = None
 
-    matching_project, evaluated_count = await find_api_key_project_cached(request, provided_hash)
+    # Même travail pour une clé inconnue, malformée, vide ou non encodable :
+    # le hachage (ou l'empreinte factice) et le parcours exhaustif sont
+    # exécutés AVANT le rejet de format. Le résultat est mémoïsé pour que le
+    # middleware de débit ne refasse pas ce parcours.
+    lookup_hash = provided_hash if provided_hash is not None else DUMMY_HASH
+    request.state.audit_key_hash = provided_hash
+    matching_project, evaluated_count = await find_api_key_project_cached(request, lookup_hash)
 
     # Coût comparable : comparaison factice si aucune clé n'a été évaluée
     if evaluated_count == 0:
-        constant_time_equal(provided_hash, DUMMY_HASH)
+        constant_time_equal(lookup_hash, DUMMY_HASH)
+
+    # Le format est contrôlé APRÈS le hachage et le parcours : une clé vide ou
+    # entourée d'espaces ne court-circuite pas le travail d'authentification.
+    if provided_hash is None or not api_key or api_key != api_key.strip():
+        raise _unauthorized()
 
     if matching_project is None:
         raise _unauthorized()
 
+    request.state.audit_project = matching_project
+    if getattr(request.state, "audit_key_id", None) is None:
+        request.state.audit_key_id = registry.key_id_for_hash(provided_hash)
     return matching_project
 
 
