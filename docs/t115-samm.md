@@ -20,8 +20,8 @@ Documents associés : [ADR-006](adr/006-table-etats-et-transitions.md), [Finding
 | **Transitions réflexives interdites** : une relecture n'est pas une transition d'avancement | `heimdall/vault/transitions.py` (`validate_transition`) | `tests/test_vault_transitions.py::ForbiddenTransitionsTests::test_reflexive_transitions_are_forbidden` |
 | **Normalisation et alias métier (`ecarte`, casse, espaces)** | `heimdall/vault/transitions.py` (`canonicalize_state`, `STATE_ALIASES`) | `tests/test_vault_transitions.py::SecretLifecycleStateTests::test_canonicalize_state_aliases`, `test_canonicalize_state_normalizes_case_and_whitespace` |
 | **Fail-closed sur état inconnu** | `heimdall/vault/transitions.py` (`canonicalize_state`, `UnknownStateError`) | `tests/test_vault_transitions.py::SecretLifecycleStateTests::test_canonicalize_state_unknown_raises_error`, `ForbiddenTransitionsTests::test_unknown_state_in_transition_fails_closed` |
-| **Invariant 8 — Non-reflet strict des entrées dans les erreurs** | `heimdall/vault/transitions.py` (`UnknownStateError`, message statique sans interpolation, `self.state = None`) | `tests/test_vault_transitions.py::SecretLifecycleStateTests::test_unknown_state_error_never_reflects_input`, `ErrorHierarchyAndSanitizationTests::test_error_message_is_static_and_deterministic` |
-| **Immuabilité des tables de transitions** : protection contre altération mémoire / monkey-patch | `heimdall/vault/transitions.py` (`MappingProxyType`) | `tests/test_vault_transitions.py::SecretLifecycleStateTests::test_immutability_of_transition_tables` |
+| **Invariant 8 — Non-reflet strict des entrées dans les erreurs** | `heimdall/vault/transitions.py` (`UnknownStateError`, message statique sans interpolation ni attribut, constructeur sans argument) | `tests/test_vault_transitions.py::SecretLifecycleStateTests::test_unknown_state_error_has_no_parameters`, `test_unknown_state_error_never_reflects_input`, `ErrorHierarchyAndSanitizationTests::test_error_message_is_static_and_deterministic` |
+| **Immuabilité des tables de transitions** : protection contre altération mémoire / monkey-patch et aucun backing dict exposé | `heimdall/vault/transitions.py` (`MappingProxyType`, sans dictionnaire mutable exposé au module) | `tests/test_vault_transitions.py::SecretLifecycleStateTests::test_immutability_of_transition_tables` |
 | **Canonique persisté & interdiction de persister les alias** : sortie de `canonicalize_state` toujours dans `LIFECYCLE_STATES_SET` | `heimdall/vault/transitions.py` (`canonicalize_state`, ADR-006 §6) | `tests/test_vault_transitions.py::SecretLifecycleStateTests::test_canonical_state_persisted_invariants` |
 | **Robustesse & bornage mémoire (DoS)** : rejet immédiat si longueur > 64 chars | `heimdall/vault/transitions.py` (`MAX_STATE_CHARS = 64`) | `tests/test_vault_transitions.py::SecretLifecycleStateTests::test_canonicalize_state_robustness` |
 | **Complétude de la matrice 5x5** : partition autorisés/interdits exacte | `heimdall/vault/transitions.py` (`get_transition_matrix`, `get_allowed_transitions`, `get_forbidden_transitions`) | `tests/test_vault_transitions.py::TransitionMatrixAndPartitionsTests::test_allowed_and_forbidden_partition_states`, `test_transition_matrix_dimensions_and_values` |
@@ -58,18 +58,18 @@ Environnement : Linux, Python 3.14 (environnement virtuel `.venv`).
 
 ```text
 ==================================== pytest ====================================
-tests/test_vault_transitions.py .........................                 [100%]
-25 passed, 81 subtests passed in 0.16s
+tests/test_vault_transitions.py ..........................                 [100%]
+26 passed, 81 subtests passed in 0.30s
 
 tests/test_crypto_confinement.py ......                                   [100%]
-6 passed, 19 subtests passed in 0.14s
+6 passed, 19 subtests passed in 0.24s
 
 Couverture heimdall/vault/transitions.py :
 Name                            Stmts   Miss  Cover   Missing
 -------------------------------------------------------------
-heimdall/vault/transitions.py      64      0   100%
+heimdall/vault/transitions.py      65      0   100%
 -------------------------------------------------------------
-TOTAL                              64      0   100%
+TOTAL                              65      0   100%
 
 =================================== Linters ====================================
 ruff check heimdall tests                     --> All checks passed!
@@ -82,25 +82,26 @@ python docs/security/check_model.py           --> OK (48 scénarios STRIDE, DFD,
 
 ---
 
-## 4. Liens permanents pour la feuille SAMM (SHA testé `aa5b90b63612d6e5ae64d9fe6e9f7f93b30df9dc`)
+## 4. Liens permanents pour la feuille SAMM (SHA testé `fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3`)
 
 Les numéros de lignes et identifiants ci-dessous référencent les symboles exacts du module `heimdall/vault/transitions.py` et de sa suite de tests `tests/test_vault_transitions.py` :
 
 - **Module d'implémentation `transitions.py`** :
-  - [`SecretLifecycleState` et `LIFECYCLE_STATES`, transitions.py:32–47](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/heimdall/vault/transitions.py#L32-L47) : constantes des 5 états formels.
-  - [`STATE_ALIASES`, transitions.py:57–63](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/heimdall/vault/transitions.py#L57-L63) : alias métier immuables `ecarte` -> `faux_positif`.
-  - [`INITIAL_STATE` et `TERMINAL_STATES`, transitions.py:66–69](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/heimdall/vault/transitions.py#L66-L69) : bornes du cycle de vie.
-  - [`ALLOWED_TRANSITIONS`, transitions.py:86–88](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/heimdall/vault/transitions.py#L86-L88) : table immuable (`MappingProxyType`) des 5 transitions permises.
-  - [`FORBIDDEN_TRANSITION_REASONS`, transitions.py:160–162](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/heimdall/vault/transitions.py#L160-L162) : justifications immuables de chaque transition interdite.
-  - [`canonicalize_state`, transitions.py:192–211](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/heimdall/vault/transitions.py#L192-L211) : normalisation, bornage mémoire et validation.
-  - [`is_transition_allowed`, transitions.py:223–235](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/heimdall/vault/transitions.py#L223-L235) : prédicat booléen fail-closed.
-  - [`validate_transition`, transitions.py:238–255](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/heimdall/vault/transitions.py#L238-L255) : point de contrôle obligatoire fail-closed.
-  - [`get_transition_matrix`, transitions.py:274–279](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/heimdall/vault/transitions.py#L274-L279) : matrice d'adjacence 5x5 complète.
+  - [`SecretLifecycleState` et `LIFECYCLE_STATES`, transitions.py:32–47](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L32-L47) : constantes des 5 états formels.
+  - [`STATE_ALIASES`, transitions.py:57–63](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L57-L63) : alias métier immuables `ecarte` -> `faux_positif`.
+  - [`INITIAL_STATE` et `TERMINAL_STATES`, transitions.py:66–69](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L66-L69) : bornes du cycle de vie.
+  - [`ALLOWED_TRANSITIONS`, transitions.py:93–95](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L93-L95) : table immuable (`MappingProxyType`) des 5 transitions permises sans backing dict exposé.
+  - [`FORBIDDEN_TRANSITION_REASONS`, transitions.py:179–181](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L179-L181) : justifications immuables de chaque transition interdite.
+  - [`UnknownStateError`, transitions.py:188–196](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L188-L196) : exception sans argument ni reflet (Invariant 8).
+  - [`canonicalize_state`, transitions.py:210–230](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L210-L230) : normalisation, bornage mémoire et validation.
+  - [`is_transition_allowed`, transitions.py:241–254](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L241-L254) : prédicat booléen fail-closed.
+  - [`validate_transition`, transitions.py:256–274](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L256-L274) : point de contrôle obligatoire fail-closed.
+  - [`get_transition_matrix`, transitions.py:292–297](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/heimdall/vault/transitions.py#L292-L297) : matrice d'adjacence 5x5 complète.
 - **Suite de tests automatisés `test_vault_transitions.py`** :
-  - [`SecretLifecycleStateTests`, test_vault_transitions.py:37–174](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/tests/test_vault_transitions.py#L37-L174) : validation des états, non-reflet Invariant 8, robustesse et immuabilité.
-  - [`AllowedTransitionsTests`, test_vault_transitions.py:177–228](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/tests/test_vault_transitions.py#L177-L228) : validation des 5 transitions nominales.
-  - [`ForbiddenTransitionsTests`, test_vault_transitions.py:230–311](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/tests/test_vault_transitions.py#L230-L311) : validation exhaustive des 20 interdictions et passages critiques.
-  - [`TransitionMatrixAndPartitionsTests`, test_vault_transitions.py:313–348](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/tests/test_vault_transitions.py#L313-L348) : exhaustivité et partitions.
-  - [`ErrorHierarchyAndSanitizationTests`, test_vault_transitions.py:350–379](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/tests/test_vault_transitions.py#L350-L379) : hiérarchie d'erreurs et messages déterministes.
+  - [`SecretLifecycleStateTests`, test_vault_transitions.py:39–187](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/tests/test_vault_transitions.py#L39-L187) : validation des états, non-reflet Invariant 8, signature sans argument, robustesse et immuabilité.
+  - [`AllowedTransitionsTests`, test_vault_transitions.py:190–241](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/tests/test_vault_transitions.py#L190-L241) : validation des 5 transitions nominales.
+  - [`ForbiddenTransitionsTests`, test_vault_transitions.py:243–324](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/tests/test_vault_transitions.py#L243-L324) : validation exhaustive des 20 interdictions et passages critiques.
+  - [`TransitionMatrixAndPartitionsTests`, test_vault_transitions.py:326–361](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/tests/test_vault_transitions.py#L326-L361) : exhaustivité et partitions.
+  - [`ErrorHierarchyAndSanitizationTests`, test_vault_transitions.py:363–393](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/tests/test_vault_transitions.py#L363-L393) : hiérarchie d'erreurs et messages déterministes.
 - **Décision d'architecture ADR-006** :
-  - [`docs/adr/006-table-etats-et-transitions.md`](https://github.com/Cezar277/heimdall/blob/a2d411ea9b6db6ec9739da63739b76ac5ee77be8/docs/adr/006-table-etats-et-transitions.md#L1).
+  - [`docs/adr/006-table-etats-et-transitions.md`](https://github.com/Cezar277/heimdall/blob/fe7529dc3d3c786be8209ffeb8eb9a8ec1bc04a3/docs/adr/006-table-etats-et-transitions.md#L1).
