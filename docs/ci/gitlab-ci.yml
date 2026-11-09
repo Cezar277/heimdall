@@ -23,8 +23,9 @@ heimdall:
     - .heimdall-venv/bin/pip install "heimdall @ git+https://github.com/Cezar277/heimdall@${HEIMDALL_REVISION}"
   script:
     - git fetch --no-tags origin -- "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-    - set -o pipefail
-    - .heimdall-venv/bin/heimdall scan --ci --diff "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --no-allowlist --json | tee heimdall-scan.json
+    # Redirection + exit explicite : pas de pipefail inter-lignes, pas de
+    # `tee` qui masquerait l'exit 1/2 de Heimdall.
+    - .heimdall-venv/bin/heimdall scan --ci --diff "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --no-allowlist --json > heimdall-scan.json; code=$?; cat heimdall-scan.json; exit $code
   artifacts:
     when: always
     paths:

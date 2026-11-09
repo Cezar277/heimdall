@@ -50,4 +50,7 @@ def test_gitlab_template_fetches_full_history_and_scans_the_diff() -> None:
     assert "CI_MERGE_REQUEST_TARGET_BRANCH_NAME" in script
     assert 'git fetch --no-tags origin -- "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"' in script
     assert "--no-allowlist" in script
+    assert "> heimdall-scan.json; code=$?; cat heimdall-scan.json; exit $code" in script
+    assert "| tee" not in script
+    assert "set -o pipefail" not in script
     assert job["artifacts"]["when"] == "always"
