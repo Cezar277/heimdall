@@ -212,6 +212,19 @@ def test_scan_diff_clean_branch_exits_zero(git_repo: GitRepo) -> None:
 
     assert result.exit_code == EXIT_CLEAN
     assert "Aucun secret détecté" in result.stdout
+    assert "1 fichier(s) analysé(s)" in result.stderr
+
+
+def test_scan_diff_empty_range_reports_zero_files(git_repo: GitRepo) -> None:
+    """``--diff HEAD`` est une plage vide : le résumé CI doit le rendre visible."""
+    _base_and_feature(git_repo)
+
+    result = _run(
+        "scan", "--ci", "--diff", "HEAD", "--no-allowlist", str(git_repo.root)
+    )
+
+    assert result.exit_code == EXIT_CLEAN
+    assert "0 fichier(s) analysé(s)" in result.stderr
 
 
 def test_scan_diff_ignores_a_secret_outside_the_diff(git_repo: GitRepo) -> None:

@@ -206,8 +206,10 @@ def scan(  # noqa: PLR0913, PLR0917
             # le verdict, les findings ignorés, les bases VCS élaguées et
             # l'empreinte sha256 de config.
             hash_info = f" (config sha256:{report.config_hash})" if report.config_hash else ""
+            scanned = report.scanned_files if report.scanned_files is not None else 0
             typer.echo(
                 f"heimdall scan : périmètre {report.scope}, "
+                f"{scanned} fichier(s) analysé(s), "
                 f"{len(report.findings)} secret(s) détecté(s), "
                 f"{report.ignored_count} ignoré(s) par l'allowlist{hash_info}, "
                 f"{report.vcs_ignored} base(s) VCS élaguée(s) "

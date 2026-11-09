@@ -163,6 +163,11 @@ class ScanReport:
     config_hash: str | None = None
     vcs_ignored: int = 0
     git_ignored: int = 0
+    #: Nombre de fichiers/blobs effectivement analysés, pour le résumé
+    #: ``--ci`` sur stderr. Ce champ n'est **pas** sérialisé dans le JSON
+    #: (contrat v1 inchangé) : il rend seulement observable une plage vide
+    #: (``--diff HEAD``) ou un périmètre sans contenu.
+    scanned_files: int | None = None
 
     def __post_init__(self) -> None:
         # Garde runtime pour les appelants non typés : le `Literal` protège
@@ -173,6 +178,10 @@ class ScanReport:
         if type(self.vcs_ignored) is not int or self.vcs_ignored < 0:
             raise ScanError(_MSG_INVALID_SCOPE)
         if type(self.git_ignored) is not int or self.git_ignored < 0:
+            raise ScanError(_MSG_INVALID_SCOPE)
+        if self.scanned_files is not None and (
+            type(self.scanned_files) is not int or self.scanned_files < 0
+        ):
             raise ScanError(_MSG_INVALID_SCOPE)
 
     @property
@@ -637,6 +646,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
         config_hash=allowlist.sha256,
         vcs_ignored=scanner.vcs_ignored,
         git_ignored=scanner.git_ignored,
+        scanned_files=scanner.files_scanned,
     )
 
 
@@ -809,6 +819,7 @@ def _collect_staged(
         findings=tuple(findings),
         traces=traces,
         config_hash=allowlist.sha256,
+        scanned_files=len(changes),
     )
 
 
@@ -884,6 +895,7 @@ def _collect_diff(
         findings=tuple(findings),
         traces=traces,
         config_hash=allowlist.sha256,
+        scanned_files=len(changes),
     )
 
 

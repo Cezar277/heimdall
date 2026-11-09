@@ -433,6 +433,7 @@ def test_collect_tree_uses_the_pinned_root(
             self.traces: tuple[object, ...] = ()
             self.vcs_ignored = 0
             self.git_ignored = 0
+            self.files_scanned = 0
 
         def scan(self, *, deadline: float | None = None) -> list[object]:
             assert deadline is not None
@@ -2107,6 +2108,7 @@ def test_scan_ci_on_a_clean_repository_exits_zero(tmp_path: Path) -> None:
     racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
     resultat = _run("scan", "--ci", str(racine))
     assert resultat.exit_code == EXIT_CLEAN
+    assert "1 fichier(s) analysé(s)" in resultat.stderr
     assert "0 secret(s) détecté(s)" in resultat.stderr
 
 
@@ -2162,6 +2164,7 @@ def test_scan_ci_json_staged_combines(git_repo: GitRepo) -> None:
     assert document["scope"] == "staged"
     assert document["count"] == 1
     assert document["findings"][0]["file"] == "vendor/evil.py"
+    assert "2 fichier(s) analysé(s)" in resultat.stderr
     assert "1 secret(s) détecté(s)" in resultat.stderr
     assert FAKE_AWS_KEY not in resultat.stdout
     assert FAKE_AWS_KEY not in resultat.stderr
