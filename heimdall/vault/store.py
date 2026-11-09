@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_SECRETS: int = 10_000
 _DEFAULT_MAX_SECRETS_PER_PROJECT: int = 1_000
+_FINGERPRINT_HEX_LEN: int = 64  # Longueur en caractères hexadécimaux d'un SHA-256 (ticket #116)
 
 
 class QuotaExceededError(Exception):
@@ -253,7 +254,15 @@ class InMemorySecretStore:
 
         Permet de savoir si la valeur en production est encore celle qui a fuité,
         sans jamais déchiffrer ni renvoyer l'empreinte au client (ticket #116).
+        Exige une clé HMAC serveur explicite (non dérivée de la KEK) pour rester
+        valide et immunisée contre la rotation de KEK.
         """
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
         aad = VaultCipher.aad(project, env, name)
         candidate_val = unicodedata.normalize("NFC", candidate_value)
         candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
@@ -262,7 +271,9 @@ class InMemorySecretStore:
             if record is None:
                 return False
             stored_fp = str(record.get("fingerprint") or "")
-            if stored_fp:
+            if len(stored_fp) == _FINGERPRINT_HEX_LEN and all(
+                c in "0123456789abcdef" for c in stored_fp
+            ):
                 return constant_time_equal(candidate_fp, stored_fp)
             decrypted = _decrypt_record(record, self._cipher, project, env, name)
             return constant_time_equal(candidate_val, decrypted["value"])
@@ -278,7 +289,14 @@ class InMemorySecretStore:
         Permet de détecter quels secrets en production sont compromis par une fuite.
         Retourne uniquement les métadonnées (project, env, name, status), JAMAIS
         la valeur ni l'empreinte (ticket #116).
+        Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
         candidate_val = unicodedata.normalize("NFC", candidate_value)
         results: list[dict[str, str]] = []
         async with self._lock:
@@ -291,7 +309,9 @@ class InMemorySecretStore:
                 candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
                 stored_fp = str(record.get("fingerprint") or "")
                 matched = False
-                if stored_fp:
+                if len(stored_fp) == _FINGERPRINT_HEX_LEN and all(
+                    c in "0123456789abcdef" for c in stored_fp
+                ):
                     matched = constant_time_equal(candidate_fp, stored_fp)
                 else:
                     decrypted = _decrypt_record(record, self._cipher, p, e, n)
@@ -314,6 +334,14 @@ class InMemorySecretStore:
         env: str | None = None,
     ) -> list[dict[str, str]]:
         """Recherche les secrets par empreinte HMAC sans déchiffrement (ticket #116)."""
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != _FINGERPRINT_HEX_LEN
+            or not all(c in "0123456789abcdef" for c in fingerprint)
+        ):
+            raise ValueError(
+                "L'empreinte HMAC doit être une chaîne hexadécimale de 64 caractères minuscules."
+            )
         async with self._lock:
             results = [
                 {
@@ -588,7 +616,14 @@ class SqliteSecretStore:
 
         Permet de savoir si la valeur en production est encore celle qui a fuité,
         sans jamais déchiffrer ni renvoyer l'empreinte au client (ticket #116).
+        Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
         return await asyncio.to_thread(
             self._is_secret_value_matching,
             project,
@@ -612,7 +647,9 @@ class SqliteSecretStore:
             if record is None:
                 return False
             stored_fp = str(record.get("fingerprint") or "")
-            if stored_fp:
+            if len(stored_fp) == _FINGERPRINT_HEX_LEN and all(
+                c in "0123456789abcdef" for c in stored_fp
+            ):
                 return constant_time_equal(candidate_fp, stored_fp)
             full_record = get_secret(conn, project, env, name)
             if full_record is None:
@@ -631,7 +668,14 @@ class SqliteSecretStore:
         Permet de détecter quels secrets en production sont compromis par une fuite.
         Retourne uniquement les métadonnées (project, env, name, status), JAMAIS
         la valeur ni l'empreinte (ticket #116).
+        Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
         return await asyncio.to_thread(
             self._find_secrets_matching_value,
             project,
@@ -654,7 +698,18 @@ class SqliteSecretStore:
                 aad = VaultCipher.aad(p, e, n)
                 candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
                 stored_fp = str(item.get("fingerprint") or "")
-                if stored_fp and constant_time_equal(candidate_fp, stored_fp):
+                matched = False
+                if len(stored_fp) == _FINGERPRINT_HEX_LEN and all(
+                    c in "0123456789abcdef" for c in stored_fp
+                ):
+                    matched = constant_time_equal(candidate_fp, stored_fp)
+                else:
+                    # Repli transparent pour les secrets hérités sans empreinte (ticket #25/#62)
+                    full_record = get_secret(conn, p, e, n)
+                    if full_record is not None:
+                        decrypted = _decrypt_record(full_record, self._cipher, p, e, n)
+                        matched = constant_time_equal(candidate_val, decrypted["value"])
+                if matched:
                     results.append(
                         {
                             "project": p,

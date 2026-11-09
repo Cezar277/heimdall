@@ -46,6 +46,7 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 import errno
 import logging
 import os
+import re
 import sqlite3
 import stat as stat_module
 import sys
@@ -1368,6 +1369,9 @@ def list_secrets(
     return [dict(row) for row in cursor.fetchall()]
 
 
+_HEX_64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
 def find_secrets_by_fingerprint(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1380,6 +1384,10 @@ def find_secrets_by_fingerprint(
     sans jamais déchiffrer les valeurs ni exposer l'empreinte au client (ticket #116).
     Retourne uniquement les métadonnées publiques (project, env, name, status).
     """
+    if not isinstance(fingerprint, str) or not _HEX_64_PATTERN.match(fingerprint):
+        raise ValueError(
+            "L'empreinte HMAC doit être une chaîne hexadécimale de 64 caractères minuscules."
+        )
     if env is not None:
         query = (
             "SELECT project_id AS project, env, name, status "

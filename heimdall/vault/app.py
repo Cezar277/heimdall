@@ -100,13 +100,13 @@ from heimdall.vault import auth as vault_auth
 from heimdall.vault.crypto import (
     MIN_MASTER_KEY_BYTES,
     VaultCipher,
+    _normalize_server_hmac_key,
     constant_time_equal,
     decode_kek_salt,
     derive_kek_from_master_key,
     generate_api_key,
     generate_api_key_pepper,
     kek_matches_pepper,
-    server_hmac_key_matches_master_key,
 )
 from heimdall.vault.database import (
     _MAX_SECRET_PAGE_OFFSET,
@@ -373,8 +373,8 @@ def _validate_explicit_secret_store_configuration(
         raise ValueError(
             "La KEK du store et le pepper d'authentification doivent être distincts (invariant 5)."
         )
-    if settings.server_hmac_key is not None and server_hmac_key_matches_master_key(
-        cipher._key, settings.server_hmac_key
+    if settings.server_hmac_key is not None and cipher.key_reuses_server_hmac_key(
+        settings.server_hmac_key
     ):
         raise ValueError(
             "La KEK du store et la clé HMAC serveur doivent être distinctes (invariant 5)."
@@ -935,20 +935,10 @@ class VaultSettings(BaseSettings):
     @field_validator("server_hmac_key")
     @classmethod
     def validate_server_hmac_key(cls, value: str | None) -> str | None:
-        """Valide la clé HMAC serveur : au moins 32 octets (256 bits)."""
+        """Valide la clé HMAC serveur : au moins 32 octets (256 bits), non triviale."""
         if value is None:
             return None
-        if not value or not value.strip():
-            raise ValueError("La clé HMAC serveur ne peut pas être vide ou blanche.")
-        try:
-            key_bytes = value.encode("utf-8")
-        except UnicodeEncodeError:
-            raise ValueError("La clé HMAC serveur doit être encodable en UTF-8.") from None
-        if len(key_bytes) < _MIN_SERVER_HMAC_KEY_BYTES:
-            raise ValueError(
-                f"La clé HMAC serveur doit comporter au moins {_MIN_SERVER_HMAC_KEY_BYTES} "
-                "octets (256 bits)."
-            )
+        _normalize_server_hmac_key(value)
         return value
 
     @model_validator(mode="after")

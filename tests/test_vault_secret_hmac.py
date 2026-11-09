@@ -7,6 +7,9 @@ Exigences couvertes :
 3. L'empreinte n'est JAMAIS renvoyée au client (audit des réponses API et des schémas).
 4. Empreinte stable et déterministe, résistance aux attaques par dictionnaire / tables arc-en-ciel.
 5. Détection de compromission en production sans jamais stocker ni exposer la valeur en clair.
+6. Résistance à la rotation de KEK (fail-closed en mode dérivé, persistance en mode explicite).
+7. Parité SQLite et mémoire pour les lignes héritées sans empreinte (repli déchiffrement).
+8. Suppression de toute API d'extraction de la clé HMAC en clair sur VaultCipher.
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ from heimdall.vault.auth import generate_project_api_key
 from heimdall.vault.crypto import (
     _SHA256_HEX_LEN,
     VaultCipher,
+    VaultCipherError,
+    _normalize_server_hmac_key,
     compute_secret_hmac,
     generate_encryption_key,
     generate_server_hmac_key,
@@ -48,11 +53,12 @@ from heimdall.vault.store import (
     SqliteSecretStore,
 )
 
-_VALID_SERVER_HMAC_KEY = "S" * 32
-_VALID_ALT_HMAC_KEY = "T" * 32
+# Clés de test robustes et diversifiées (satisfaisant les contrôles d'entropie)
+_VALID_SERVER_HMAC_KEY = "s3rv3r_hm4c_k3y_s3cur3_v4ult_t0k3n_256!"
+_VALID_ALT_HMAC_KEY = "4lt3rn4t1v3_hm4c_s3rv3r_k3y_d1st1nct_t0k3n"
 _VALID_KEK = generate_encryption_key()
-_VALID_PEPPER = "P" * 32
-_VALID_MASTER_KEY = "M" * 32
+_VALID_PEPPER = "p3pp3r_s3rv3r_s3cur3_t0k3n_256_b1ts_v4ult"
+_VALID_MASTER_KEY = "m4st3r_p4ssphr4s3_s3cur3_v4ult_k3y_t0k3n"
 
 
 class SecretHmacCryptoTests(TestCase):
@@ -83,12 +89,7 @@ class SecretHmacCryptoTests(TestCase):
         self.assertEqual(first, second)
 
     def test_compute_secret_hmac_is_non_reversible_and_differs_from_plain_sha256(self) -> None:
-        """L'empreinte est non réversible et déjoue les attaques par dictionnaire (piège évité).
-
-        Un simple SHA-256 sans clé permettrait à un attaquant volant la base de tester
-        des valeurs connues via des tables arc-en-ciel. La clé HMAC serveur secrète
-        empêche ce calcul hors-ligne.
-        """
+        """L'empreinte est non réversible et déjoue les attaques par dictionnaire (piège évité)."""
         key = _VALID_SERVER_HMAC_KEY
         valeur = "password123"
 
@@ -106,7 +107,6 @@ class SecretHmacCryptoTests(TestCase):
     def test_compute_secret_hmac_supports_nfc_canonicalization(self) -> None:
         """Deux formes Unicode (NFC vs NFD) d'une même valeur produisent la même empreinte."""
         key = _VALID_SERVER_HMAC_KEY
-        # « secret_clé » avec é précomposé (NFC) vs e + accent combinant (NFD)
         val_nfc = unicodedata.normalize("NFC", "secret_clé_prod")
         val_nfd = unicodedata.normalize("NFD", "secret_clé_prod")
         self.assertNotEqual(val_nfc.encode("utf-8"), val_nfd.encode("utf-8"))
@@ -132,29 +132,40 @@ class SecretHmacCryptoTests(TestCase):
 
     def test_compute_secret_hmac_input_validation(self) -> None:
         """Refus fail-closed sur entrée vide, type invalide ou clé trop courte."""
-        # Valeur vide
         with self.assertRaises(ValueError):
             compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "")
         with self.assertRaises(ValueError):
             compute_secret_hmac(_VALID_SERVER_HMAC_KEY, b"")
 
-        # Type de valeur invalide
         with self.assertRaises(TypeError):
             compute_secret_hmac(_VALID_SERVER_HMAC_KEY, 12345)  # type: ignore[arg-type]
 
-        # Clé serveur absente / None
         with self.assertRaises(ValueError):
             compute_secret_hmac(None, "valid_value")  # type: ignore[arg-type]
 
-        # Clé serveur vide ou blanche
         with self.assertRaises(ValueError):
             compute_secret_hmac("", "valid_value")
         with self.assertRaises(ValueError):
             compute_secret_hmac("   ", "valid_value")
 
-        # Clé serveur trop courte (< 32 octets)
         with self.assertRaises(ValueError):
             compute_secret_hmac("short_key_16_bytes!", "valid_value")
+
+    def test_normalize_server_hmac_key_rejects_trivial_or_repetitive_keys(self) -> None:
+        """Refuse les clés de faible entropie (répétitives ou périodiques)."""
+        # Caractère unique répété
+        with self.assertRaises(ValueError) as ctx1:
+            _normalize_server_hmac_key("S" * 32)
+        self.assertIn("generate_server_hmac_key()", str(ctx1.exception))
+
+        with self.assertRaises(ValueError) as ctx2:
+            _normalize_server_hmac_key(b"\x00" * 32)
+        self.assertIn("generate_server_hmac_key()", str(ctx2.exception))
+
+        # Période triviale
+        with self.assertRaises(ValueError) as ctx3:
+            _normalize_server_hmac_key("1234" * 8)
+        self.assertIn("generate_server_hmac_key()", str(ctx3.exception))
 
     def test_generate_server_hmac_key(self) -> None:
         """generate_server_hmac_key produit au moins 256 bits d'entropie aléatoire."""
@@ -162,6 +173,9 @@ class SecretHmacCryptoTests(TestCase):
         k2 = generate_server_hmac_key()
         self.assertNotEqual(k1, k2)
         self.assertGreaterEqual(len(k1.encode("utf-8")), 32)
+        # La clé générée doit être acceptée sans erreur par la normalisation
+        norm = _normalize_server_hmac_key(k1)
+        self.assertGreaterEqual(len(norm), 32)
 
     def test_verify_secret_hmac_constant_time(self) -> None:
         """verify_secret_hmac vérifie l'égalité en temps constant."""
@@ -169,19 +183,12 @@ class SecretHmacCryptoTests(TestCase):
         valeur = "valid-token-secret"
         expected = compute_secret_hmac(key, valeur)
 
-        # Cas nominal : correspondance
         self.assertTrue(verify_secret_hmac(key, valeur, expected))
-
-        # Non-correspondance de la valeur
         self.assertFalse(verify_secret_hmac(key, "wrong-token", expected))
-
-        # Non-correspondance de la clé
         self.assertFalse(verify_secret_hmac(_VALID_ALT_HMAC_KEY, valeur, expected))
 
-        # Format attendu invalide
         self.assertFalse(verify_secret_hmac(key, valeur, "invalid_len"))
         self.assertFalse(verify_secret_hmac(key, valeur, 12345))  # type: ignore[arg-type]
-        # Exceptions internes lors du calcul -> False
         self.assertFalse(verify_secret_hmac(key, "", expected))
         self.assertFalse(verify_secret_hmac("short", valeur, expected))
         self.assertFalse(verify_secret_hmac(key, 12345, expected))  # type: ignore[arg-type]
@@ -212,20 +219,47 @@ class SecretHmacCryptoTests(TestCase):
         self.assertFalse(cipher.is_secret_value_matching("other", fp_aad, aad=aad))
         self.assertFalse(cipher.is_secret_value_matching(val, "invalid_len", aad=aad))
 
-    def test_vault_cipher_factories_propagate_server_hmac_key(self) -> None:
-        """from_encoded_key, from_master_key et generate propagent server_hmac_key."""
+    def test_vault_cipher_factories_propagate_server_hmac_key_without_exposure(self) -> None:
+        """Les factories propagent server_hmac_key sans exposer la propriété en clair."""
         c1 = VaultCipher.from_encoded_key(_VALID_KEK, server_hmac_key=_VALID_SERVER_HMAC_KEY)
-        self.assertEqual(c1.server_hmac_key, _VALID_SERVER_HMAC_KEY.encode("utf-8"))
+        self.assertTrue(c1.has_explicit_server_hmac_key)
+        self.assertEqual(
+            c1.compute_secret_hmac("probe"),
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "probe"),
+        )
 
         c2 = VaultCipher.from_master_key(
             _VALID_MASTER_KEY,
             "s" * 22,
             server_hmac_key=_VALID_SERVER_HMAC_KEY,
         )
-        self.assertEqual(c2.server_hmac_key, _VALID_SERVER_HMAC_KEY.encode("utf-8"))
+        self.assertTrue(c2.has_explicit_server_hmac_key)
+        self.assertEqual(
+            c2.compute_secret_hmac("probe"),
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "probe"),
+        )
 
         c3 = VaultCipher.generate(server_hmac_key=_VALID_SERVER_HMAC_KEY)
-        self.assertEqual(c3.server_hmac_key, _VALID_SERVER_HMAC_KEY.encode("utf-8"))
+        self.assertTrue(c3.has_explicit_server_hmac_key)
+        self.assertEqual(
+            c3.compute_secret_hmac("probe"),
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "probe"),
+        )
+
+    def test_find_secrets_by_fingerprint_validates_format(self) -> None:
+        """find_secrets_by_fingerprint refuse fail-closed tout format non-hex64."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                ensure_project(conn, "proj1")
+                # Format non hexadécimal ou longueur incorrecte -> ValueError
+                with self.assertRaises(ValueError):
+                    find_secrets_by_fingerprint(conn, "proj1", "not_a_valid_hex_hash")
+                with self.assertRaises(ValueError):
+                    find_secrets_by_fingerprint(conn, "proj1", "f" * 63)
+                with self.assertRaises(ValueError):
+                    find_secrets_by_fingerprint(conn, "proj1", "G" * 64)
 
 
 class KeySeparationTests(TestCase):
@@ -233,14 +267,26 @@ class KeySeparationTests(TestCase):
 
     def test_server_hmac_key_matches_master_key_detects_collision(self) -> None:
         """server_hmac_key_matches_master_key détecte la réutilisation directe ou encodée."""
-        master = "M" * 32
+        master = _VALID_MASTER_KEY
         self.assertTrue(server_hmac_key_matches_master_key(master, master))
         self.assertFalse(server_hmac_key_matches_master_key(master, _VALID_SERVER_HMAC_KEY))
 
-        # Détection de collision KEK brute vs HMAC
         kek_bytes = b"K" * 32
         self.assertTrue(server_hmac_key_matches_master_key(kek_bytes, kek_bytes))
         self.assertFalse(server_hmac_key_matches_master_key(kek_bytes, _VALID_SERVER_HMAC_KEY))
+
+    def test_vault_cipher_key_reuses_server_hmac_key_method(self) -> None:
+        """VaultCipher expose key_reuses_server_hmac_key pour encapsulation propre."""
+        kek = b"K" * 32
+        cipher = VaultCipher(kek, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        self.assertFalse(cipher.key_reuses_server_hmac_key(_VALID_SERVER_HMAC_KEY))
+        self.assertTrue(cipher.key_reuses_server_hmac_key(kek))
+
+    def test_vault_cipher_server_hmac_key_property_removed(self) -> None:
+        """La propriété server_hmac_key a été supprimée pour interdire l'extraction de la clé."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        self.assertFalse(hasattr(cipher, "server_hmac_key"))
+        self.assertTrue(cipher.has_explicit_server_hmac_key)
 
     def test_vault_cipher_rejects_server_hmac_key_equal_to_kek(self) -> None:
         """VaultCipher refuse à la construction une clé HMAC serveur identique à sa KEK."""
@@ -253,7 +299,7 @@ class KeySeparationTests(TestCase):
         """Sans server_hmac_key explicite, la sous-clé HKDF dérivée est distincte de la KEK."""
         kek = b"K" * 32
         cipher = VaultCipher(kek)
-        self.assertNotEqual(cipher.server_hmac_key, kek)
+        self.assertFalse(cipher.has_explicit_server_hmac_key)
         self.assertNotEqual(
             cipher.compute_secret_hmac("val"),
             hmac.new(kek, b"val", hashlib.sha256).hexdigest(),
@@ -345,7 +391,6 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             self.assertFalse(
                 await store.is_secret_value_matching("demo", "prod", "GH_TOKEN", leaked_value)
             )
-            # La nouvelle valeur est bien celle courante
             self.assertTrue(
                 await store.is_secret_value_matching("demo", "prod", "GH_TOKEN", new_rotated_value)
             )
@@ -365,6 +410,121 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             await store.is_secret_value_matching("demo", "prod", "SLACK_BOT_TOKEN", "xoxb_other")
         )
 
+    def test_cipher_is_secret_value_matching_rejects_raw_fp_when_aad_is_provided(self) -> None:
+        """Non-régression double chemin : un AAD fourni n'accepte JAMAIS l'empreinte brute."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        val = "secret_cross_triplet_probe"
+        raw_fp = cipher.compute_secret_hmac(val)
+        aad = VaultCipher.aad("project", "env", "name")
+
+        # Avec AAD, l'empreinte brute sans AAD doit être strictement refusée (False)
+        self.assertFalse(cipher.is_secret_value_matching(val, raw_fp, aad=aad))
+
+        # Et l'empreinte liée à l'AAD est bien acceptée
+        bound_fp = cipher.fingerprint(val.encode("utf-8"), aad=aad)
+        self.assertTrue(cipher.is_secret_value_matching(val, bound_fp, aad=aad))
+
+    def test_cipher_is_secret_value_matching_in_derived_mode_raises_error(self) -> None:
+        """is_secret_value_matching refuse fail-closed en mode dérivé de la KEK."""
+        cipher_derived = VaultCipher(b"K" * 32)
+        self.assertFalse(cipher_derived.has_explicit_server_hmac_key)
+        with self.assertRaises(VaultCipherError) as ctx:
+            cipher_derived.is_secret_value_matching("val", "0" * 64)
+        self.assertIn("exige une clé HMAC serveur explicite", str(ctx.exception))
+
+    async def test_leak_detection_post_kek_rotation_in_derived_mode_fails_closed(self) -> None:
+        """Après rotation KEK en mode dérivé, is_secret_value_matching échoue fail-closed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(b"A" * 32)
+            store = SqliteSecretStore(db_path, old_cipher)
+            await store.create("demo", "prod", "TOKEN", "secret123")
+
+            new_cipher = VaultCipher(b"B" * 32)
+            await store.rotate_kek(new_cipher)
+
+            # Échec fail-closed avec VaultCipherError (pas de faux négatif silencieux)
+            with self.assertRaises(VaultCipherError):
+                await store.is_secret_value_matching("demo", "prod", "TOKEN", "secret123")
+            with self.assertRaises(VaultCipherError):
+                await store.find_secrets_matching_value("demo", "secret123")
+
+    async def test_leak_detection_post_kek_rotation_in_explicit_mode_remains_true(self) -> None:
+        """Après rotation KEK avec server_hmac_key explicite, la détection reste vraie."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            old_cipher = VaultCipher(b"A" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            store = SqliteSecretStore(db_path, old_cipher)
+            await store.create("demo", "prod", "TOKEN", "secret123")
+
+            # Rotation de la KEK avec le même server_hmac_key
+            new_cipher = VaultCipher(b"B" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            await store.rotate_kek(new_cipher)
+
+            # La vérification continue de fonctionner et retourne True
+            self.assertTrue(
+                await store.is_secret_value_matching("demo", "prod", "TOKEN", "secret123")
+            )
+            matches = await store.find_secrets_matching_value("demo", "secret123")
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["name"], "TOKEN")
+
+    async def test_legacy_secrets_without_fingerprint_parity_sqlite_and_memory(self) -> None:
+        """Secrets legacy sans fingerprint : parité SQLite et mémoire via repli déchiffrement."""
+        # 1. En mémoire
+        mem_cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        mem_store = InMemorySecretStore(cipher=mem_cipher)
+        await mem_store.create("p", "prod", "LEGACY_MEM", "legacy_val")
+        # Forcer la suppression de l'empreinte pour simuler un secret pré-#116
+        mem_store._secrets[("p", "prod", "LEGACY_MEM")]["fingerprint"] = None
+
+        self.assertTrue(
+            await mem_store.is_secret_value_matching("p", "prod", "LEGACY_MEM", "legacy_val")
+        )
+        mem_matches = await mem_store.find_secrets_matching_value("p", "legacy_val")
+        self.assertEqual(len(mem_matches), 1)
+
+        # 2. En SQLite
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            sql_store = SqliteSecretStore(db_path, sql_cipher)
+            await sql_store.create("p", "prod", "LEGACY_SQL", "legacy_val")
+            # Forcer l'empreinte à vide en base (comme dans les bases pré-#116)
+            with db_session(db_path) as conn:
+                conn.execute(
+                    "UPDATE secrets SET fingerprint = '' WHERE project_id = ? AND name = ?",
+                    ("p", "LEGACY_SQL"),
+                )
+
+            # Parité stricte : SQLite détecte aussi le secret hérité via le repli déchiffrement
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("p", "prod", "LEGACY_SQL", "legacy_val")
+            )
+            sql_matches = await sql_store.find_secrets_matching_value("p", "legacy_val")
+            self.assertEqual(len(sql_matches), 1)
+            self.assertEqual(sql_matches[0]["name"], "LEGACY_SQL")
+
+    async def test_corrupted_fingerprint_in_database_handled_safely(self) -> None:
+        """Une empreinte corrompue en base bascule sur le repli sans planter."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            store = SqliteSecretStore(db_path, cipher)
+            await store.create("p", "prod", "CORRUPT", "real_value")
+
+            with db_session(db_path) as conn:
+                conn.execute(
+                    "UPDATE secrets SET fingerprint = ? WHERE project_id = ? AND name = ?",
+                    ("corrupted_non_hex_short_string", "p", "CORRUPT"),
+                )
+
+            self.assertTrue(
+                await store.is_secret_value_matching("p", "prod", "CORRUPT", "real_value")
+            )
+            matches = await store.find_secrets_matching_value("p", "real_value")
+            self.assertEqual(len(matches), 1)
+
     async def test_find_secrets_matching_value_returns_only_metadata(self) -> None:
         """find_secrets_matching_value ne retourne JAMAIS la valeur ni l'empreinte."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -377,21 +537,18 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             await store.create("acme", "staging", "DB_PASS", shared_leaked_value)
             await store.create("acme", "prod", "OTHER_PASS", "different_safe_pass")
 
-            # Recherche globale par valeur ayant fuité dans le projet
             matches = await store.find_secrets_matching_value("acme", shared_leaked_value)
             self.assertEqual(len(matches), 2)
             names_and_envs = [(m["env"], m["name"]) for m in matches]
             self.assertIn(("prod", "DB_PASS"), names_and_envs)
             self.assertIn(("staging", "DB_PASS"), names_and_envs)
 
-            # Vérification stricte : ni valeur ni empreinte dans les métadonnées retournées
             for match in matches:
                 self.assertNotIn("value", match)
                 self.assertNotIn("fingerprint", match)
                 self.assertNotIn("encrypted_value", match)
                 self.assertNotIn("encrypted_dek", match)
 
-            # Recherche ciblée sur prod uniquement
             prod_matches = await store.find_secrets_matching_value(
                 "acme", shared_leaked_value, env="prod"
             )
@@ -455,7 +612,6 @@ class FingerprintNeverReturnedToClientTests(TestCase):
             require_auth=True,
         )
         self.app = create_app(self.settings)
-        # On utilise le store initialisé avec client de boucle locale
         self.client = TestClient(
             self.app,
             base_url="http://127.0.0.1:8443",
@@ -470,7 +626,7 @@ class FingerprintNeverReturnedToClientTests(TestCase):
         self.app.state.register_api_key(self.api_key, "myproj")
         headers = {"X-Heimdall-API-Key": self.api_key}
 
-        # 1. POST /api/v1/secrets (Création de secret)
+        # 1. POST /api/v1/secrets
         post_resp = self.client.post(
             "/api/v1/secrets",
             json={
@@ -487,7 +643,7 @@ class FingerprintNeverReturnedToClientTests(TestCase):
         self.assertNotIn("value", post_data)
         self.assertEqual(set(post_data.keys()), {"project", "env", "name", "status"})
 
-        # 2. GET /api/v1/secrets/{project}/{env}/{name} (Lecture)
+        # 2. GET /api/v1/secrets/{project}/{env}/{name}
         get_resp = self.client.get("/api/v1/secrets/myproj/prod/MY_SECRET", headers=headers)
         self.assertEqual(get_resp.status_code, 200)
         get_data = get_resp.json()
@@ -495,7 +651,7 @@ class FingerprintNeverReturnedToClientTests(TestCase):
         self.assertEqual(get_data["value"], "secret_plain_value_42")
         self.assertEqual(set(get_data.keys()), {"project", "env", "name", "status", "value"})
 
-        # 3. GET /api/v1/secrets/{project}/{env}/{name}/state (État sans la valeur)
+        # 3. GET /api/v1/secrets/{project}/{env}/{name}/state
         state_resp = self.client.get("/api/v1/secrets/myproj/prod/MY_SECRET/state", headers=headers)
         self.assertEqual(state_resp.status_code, 200)
         state_data = state_resp.json()
@@ -503,7 +659,7 @@ class FingerprintNeverReturnedToClientTests(TestCase):
         self.assertNotIn("value", state_data)
         self.assertEqual(set(state_data.keys()), {"project", "env", "name", "status"})
 
-        # 4. GET /api/v1/secrets (Liste paginée)
+        # 4. GET /api/v1/secrets
         list_resp = self.client.get("/api/v1/secrets?project=myproj", headers=headers)
         self.assertEqual(list_resp.status_code, 200)
         list_data = list_resp.json()
@@ -513,13 +669,21 @@ class FingerprintNeverReturnedToClientTests(TestCase):
         self.assertNotIn("value", item)
         self.assertEqual(set(item.keys()), {"project", "env", "name", "status"})
 
+    def test_no_http_route_exposes_fingerprint_or_leak_detection(self) -> None:
+        """Aucune route HTTP n'expose l'empreinte ou l'API de fuite (réservé à #117)."""
+        for route in self.app.routes:
+            path = getattr(route, "path", "")
+            self.assertNotIn("fingerprint", path.lower())
+            self.assertNotIn("matching", path.lower())
+            self.assertNotIn("leak", path.lower())
+
 
 class KeyLeakHuntTests(TestCase):
     """Vérification de l'absence de fuite de la clé HMAC serveur dans logs, exceptions et repr()."""
 
     def test_server_hmac_key_is_never_leaked_in_repr_or_serialization(self) -> None:
         """repr/model_dump/model_dump_json n'exposent jamais la clé HMAC serveur."""
-        canary = "HMAC_CANARY_UNIQUE_SECRET_VAL_12345"
+        canary = "HMAC_CANARY_UNIQUE_SECRET_VAL_12345!"
         settings = VaultSettings(
             kek=_VALID_KEK,
             api_key_pepper=_VALID_PEPPER,
