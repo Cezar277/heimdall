@@ -17,6 +17,7 @@ from heimdall.vault.transitions import (
     INITIAL_STATE,
     LIFECYCLE_STATES,
     LIFECYCLE_STATES_SET,
+    MAX_STATE_CHARS,
     STATE_ALIASES,
     TERMINAL_STATES,
     InvalidTransitionError,
@@ -75,13 +76,92 @@ class SecretLifecycleStateTests(unittest.TestCase):
         self.assertEqual(canonicalize_state("  ECARTE  "), "faux_positif")
 
     def test_canonicalize_state_unknown_raises_error(self) -> None:
-        """Tout état non reconnu lève UnknownStateError."""
+        """Tout état non reconnu lève UnknownStateError sans refléter l'entrée (Invariant 8)."""
         for invalid in ("inconnu", "pending", "revoked", "active", "", " ", None, 42):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(UnknownStateError) as ctx:
                     canonicalize_state(invalid)
-                self.assertEqual(ctx.exception.state, invalid)
-                self.assertIn("inconnu", str(ctx.exception).lower())
+                self.assertIsNone(ctx.exception.state)
+                self.assertEqual(str(ctx.exception), "État de cycle de vie inconnu.")
+
+    def test_unknown_state_error_never_reflects_input(self) -> None:
+        """Invariant 8 : aucune entrée brute (secret, payload) n'est reflétée."""
+        malicious_inputs = [
+            "sk_live_1234567890abcdef",
+            "sk_l****\nINJECTED",
+            "DROP TABLE secrets;--",
+            "<script>alert(1)</script>",
+            "SECRET_VALUE_IN_STATE",
+        ]
+        for raw in malicious_inputs:
+            with self.subTest(raw=raw):
+                # Via canonicalize_state direct
+                with self.assertRaises(UnknownStateError) as ctx:
+                    canonicalize_state(raw)
+                self.assertIsNone(ctx.exception.state)
+                self.assertEqual(str(ctx.exception), "État de cycle de vie inconnu.")
+                self.assertNotIn(raw, str(ctx.exception))
+
+                # Via validate_transition
+                with self.assertRaises(UnknownStateError) as ctx2:
+                    validate_transition(raw, "detecte")
+                self.assertIsNone(ctx2.exception.state)
+                self.assertEqual(str(ctx2.exception), "État de cycle de vie inconnu.")
+                self.assertNotIn(raw, str(ctx2.exception))
+
+    def test_canonicalize_state_robustness(self) -> None:
+        """Défense en profondeur : bornage mémoire, types hostiles et sous-classes."""
+        # 1. Très grande chaîne (1 Mo) : rejetée immédiatement sans OOM
+        huge_input = "a" * 1_000_000
+        self.assertGreater(len(huge_input), MAX_STATE_CHARS)
+        with self.assertRaises(UnknownStateError) as ctx:
+            canonicalize_state(huge_input)
+        self.assertIsNone(ctx.exception.state)
+
+        # 2. Types non-str variés
+        for bad_type in (b"detecte", {"state": "detecte"}, ["detecte"], (1, 2), 3.14):
+            with self.subTest(bad_type=type(bad_type)):
+                with self.assertRaises(UnknownStateError) as ctx:
+                    canonicalize_state(bad_type)
+                self.assertIsNone(ctx.exception.state)
+
+        # 3. Sous-classe de str avec strip surchargé
+        class HostileStr(str):
+            def strip(self, chars: object = None) -> str:
+                return "detecte"
+
+        self.assertEqual(canonicalize_state(HostileStr("detecte")), "detecte")
+
+    def test_immutability_of_transition_tables(self) -> None:
+        """ALLOWED_TRANSITIONS et FORBIDDEN_TRANSITION_REASONS sont immuables."""
+        with self.assertRaises(TypeError):
+            ALLOWED_TRANSITIONS["rote"] = frozenset({"detecte"})  # type: ignore[index]
+
+        with self.assertRaises(AttributeError):
+            FORBIDDEN_TRANSITION_REASONS.clear()  # type: ignore[attr-defined]
+
+        with self.assertRaises(TypeError):
+            STATE_ALIASES["hack"] = "vaulte"  # type: ignore[index]
+
+    def test_canonical_state_persisted_invariants(self) -> None:
+        """Seuls les 5 états canoniques sont retournés par canonicalize_state."""
+        # Normalisation stricte
+        self.assertEqual(canonicalize_state("  ECARTE  "), "faux_positif")
+        self.assertEqual(canonicalize_state("ecarte"), "faux_positif")
+        self.assertEqual(canonicalize_state("ecarté"), "faux_positif")
+        self.assertEqual(canonicalize_state("discarded"), "faux_positif")
+
+        # Équivalence de comportement entre alias et forme canonique
+        self.assertEqual(
+            get_allowed_transitions("ecarte"),
+            get_allowed_transitions("faux_positif"),
+        )
+
+        # Invariant contractuel : tout retour de canonicalize_state est dans LIFECYCLE_STATES_SET
+        for alias in STATE_ALIASES:
+            canon = canonicalize_state(alias)
+            self.assertIn(canon, LIFECYCLE_STATES_SET)
+            self.assertNotIn(canon, STATE_ALIASES)
 
     def test_is_valid_state(self) -> None:
         """is_valid_state retourne True pour les états et alias, False sinon."""
@@ -220,11 +300,14 @@ class ForbiddenTransitionsTests(unittest.TestCase):
         self.assertFalse(is_transition_allowed("unknown", "unknown"))
 
     def test_unknown_state_in_validate_transition_raises_unknown_state_error(self) -> None:
-        """Un état inconnu dans validate_transition lève UnknownStateError."""
-        with self.assertRaises(UnknownStateError):
+        """Un état inconnu dans validate_transition lève UnknownStateError sans reflet."""
+        with self.assertRaises(UnknownStateError) as ctx:
             validate_transition("detecte", "unknown")
-        with self.assertRaises(UnknownStateError):
+        self.assertIsNone(ctx.exception.state)
+
+        with self.assertRaises(UnknownStateError) as ctx2:
             validate_transition("unknown", "confirme")
+        self.assertIsNone(ctx2.exception.state)
 
 
 class TransitionMatrixAndPartitionsTests(unittest.TestCase):
@@ -276,6 +359,7 @@ class ErrorHierarchyAndSanitizationTests(unittest.TestCase):
 
     def test_error_message_is_static_and_deterministic(self) -> None:
         """Le message d'erreur est déterministe et ne contient pas de valeur de secret."""
+        # 1. InvalidTransitionError
         try:
             validate_transition("detecte", "rote")
         except InvalidTransitionError as exc:
@@ -284,6 +368,14 @@ class ErrorHierarchyAndSanitizationTests(unittest.TestCase):
             self.assertEqual(exc.source, "detecte")
             self.assertEqual(exc.target, "rote")
             self.assertEqual(exc.reason, FORBIDDEN_TRANSITION_REASONS[("detecte", "rote")])
+
+        # 2. UnknownStateError (Invariant 8)
+        try:
+            validate_transition("sk_live_SECRET_DATA", "detecte")
+        except UnknownStateError as exc2:
+            self.assertEqual(str(exc2), "État de cycle de vie inconnu.")
+            self.assertIsNone(exc2.state)
+            self.assertNotIn("SECRET_DATA", str(exc2))
 
 
 if __name__ == "__main__":

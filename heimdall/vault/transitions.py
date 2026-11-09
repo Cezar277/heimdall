@@ -11,14 +11,22 @@ Aligné sur le contrat Finding v1 (ticket #14, ``docs/contracts/finding.md``,
 Règles de sécurité :
 1. Aucun champ ne porte la valeur du secret (invariant 8).
 2. Fail-closed : toute transition non explicitement autorisée est interdite.
-3. Messages d'erreur statiques : aucune donnée sensible n'est reflétée.
+3. Messages d'erreur statiques : aucune donnée sensible ou entrée brute n'est
+   reflétée dans les exceptions ou messages d'erreur.
 4. Aucun faux positif n'est stocké dans le Vault.
 5. L'état terminal `rote` interdit toute transition sortante.
+6. Tout mutateur d'état (future API #117, store DB, CLI) DOIT obligatoirement
+   appeler ``validate_transition()`` et ne persister que la forme canonique
+   issue de ``canonicalize_state()`` (les alias ne sont jamais persistés).
 """
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Final, Literal, get_args
+
+#: Longueur maximale autorisée pour un identifiant d'état (défense DoS / bornage mémoire).
+MAX_STATE_CHARS: Final[int] = 64
 
 #: États formels du cycle de vie d'un secret (alignés sur le contrat #14).
 SecretLifecycleState = Literal[
@@ -44,11 +52,15 @@ LIFECYCLE_STATES_SET: Final[frozenset[SecretLifecycleState]] = frozenset(
 )
 
 #: Alias acceptés pour la compatibilité métier (notamment « écarté »).
-STATE_ALIASES: Final[dict[str, SecretLifecycleState]] = {
-    "ecarte": "faux_positif",
-    "ecarté": "faux_positif",
-    "discarded": "faux_positif",
-}
+#: Ces alias ne doivent être acceptés qu'aux frontières (CLI / HTTP) et
+#: NE DOIVENT JAMAIS être persistés directement (utiliser canonicalize_state()).
+STATE_ALIASES: Final[MappingProxyType[str, SecretLifecycleState]] = MappingProxyType(
+    {
+        "ecarte": "faux_positif",
+        "ecarté": "faux_positif",
+        "discarded": "faux_positif",
+    }
+)
 
 #: État initial obligatoire lors de la création d'un Finding par le scanner.
 INITIAL_STATE: Final[SecretLifecycleState] = "detecte"
@@ -56,9 +68,7 @@ INITIAL_STATE: Final[SecretLifecycleState] = "detecte"
 #: États terminaux : aucune transition sortante permise.
 TERMINAL_STATES: Final[frozenset[SecretLifecycleState]] = frozenset({"rote"})
 
-#: Table des transitions autorisées (source -> cibles autorisées).
-#: 100 % cohérente avec la machine d'états du ticket #14.
-ALLOWED_TRANSITIONS: Final[dict[SecretLifecycleState, frozenset[SecretLifecycleState]]] = {
+_ALLOWED_TRANSITIONS_DATA: dict[SecretLifecycleState, frozenset[SecretLifecycleState]] = {
     # 1. Détecté par le scanner déterministe
     "detecte": frozenset({"confirme", "faux_positif"}),
     # 2. Confirmé par validation humaine explicite (dialogue Y/N/E #32)
@@ -71,8 +81,13 @@ ALLOWED_TRANSITIONS: Final[dict[SecretLifecycleState, frozenset[SecretLifecycleS
     "faux_positif": frozenset({"detecte"}),
 }
 
-#: Justifications fermées pour chaque transition interdite (5x5 - 5 autorisées).
-FORBIDDEN_TRANSITION_REASONS: Final[dict[tuple[str, str], str]] = {
+#: Table immuable des transitions autorisées (source -> cibles autorisées).
+#: Protégée par MappingProxyType contre toute mutation externe.
+ALLOWED_TRANSITIONS: Final[
+    MappingProxyType[SecretLifecycleState, frozenset[SecretLifecycleState]]
+] = MappingProxyType(_ALLOWED_TRANSITIONS_DATA)
+
+_FORBIDDEN_REASONS_DATA: dict[tuple[str, str], str] = {
     # Depuis 'detecte'
     ("detecte", "detecte"): "Transition réflexive interdite : l'état reste inchangé.",
     ("detecte", "vaulte"): (
@@ -138,8 +153,13 @@ FORBIDDEN_TRANSITION_REASONS: Final[dict[tuple[str, str], str]] = {
         "Non-sens fonctionnel : un faux positif n'est pas un secret réel et "
         "ne peut faire l'objet d'aucune rotation."
     ),
-    ("faux_positif", "faux_positif"): ("Transition réflexive interdite : l'état reste inchangé."),
+    ("faux_positif", "faux_positif"): "Transition réflexive interdite : l'état reste inchangé.",
 }
+
+#: Justifications fermées immuables pour chaque transition interdite (5x5 - 5 autorisées).
+FORBIDDEN_TRANSITION_REASONS: Final[MappingProxyType[tuple[str, str], str]] = MappingProxyType(
+    _FORBIDDEN_REASONS_DATA
+)
 
 
 class LifecycleTransitionError(ValueError):
@@ -147,11 +167,15 @@ class LifecycleTransitionError(ValueError):
 
 
 class UnknownStateError(LifecycleTransitionError):
-    """État non reconnu dans le cycle de vie du secret."""
+    """État non reconnu dans le cycle de vie du secret.
 
-    def __init__(self, state: object) -> None:
-        super().__init__(f"État de cycle de vie inconnu : {state!r}")
-        self.state = state
+    Invariant 8 : message d'erreur statique sans reflet d'entrée pour
+    prévenir toute fuite de secret ou injection dans les logs/réponses.
+    """
+
+    def __init__(self, state: object = None) -> None:
+        super().__init__("État de cycle de vie inconnu.")
+        self.state: object = None
 
 
 class InvalidTransitionError(LifecycleTransitionError):
@@ -168,20 +192,23 @@ class InvalidTransitionError(LifecycleTransitionError):
 def canonicalize_state(state: object) -> SecretLifecycleState:
     """Normalise et valide un état du cycle de vie.
 
+    Invariant 8 : message statique sans reflet en cas d'erreur.
     Gère les alias transparents (ex. ``ecarte`` -> ``faux_positif``).
-    Lève ``UnknownStateError`` si l'état n'est pas reconnu.
+    L'état retourné appartient toujours à ``LIFECYCLE_STATES_SET``.
+    Lève ``UnknownStateError`` si l'état n'est pas une chaîne valide ou
+    si sa longueur dépasse ``MAX_STATE_CHARS`` (défense DoS).
     """
-    if not isinstance(state, str):
-        raise UnknownStateError(state)
+    if not isinstance(state, str) or len(state) > MAX_STATE_CHARS:
+        raise UnknownStateError()
 
-    normalized = state.strip().lower()
+    normalized = str.strip(state).lower()
     if normalized in LIFECYCLE_STATES_SET:
         return normalized
 
     if normalized in STATE_ALIASES:
         return STATE_ALIASES[normalized]
 
-    raise UnknownStateError(state)
+    raise UnknownStateError()
 
 
 def is_valid_state(state: object) -> bool:
@@ -211,7 +238,7 @@ def is_transition_allowed(source: object, target: object) -> bool:
 def validate_transition(source: object, target: object) -> None:
     """Valide strictement une transition d'état.
 
-    Lève ``UnknownStateError`` si un état est inconnu.
+    Lève ``UnknownStateError`` si un état est inconnu (sans reflet).
     Lève ``InvalidTransitionError`` si la transition est interdite, avec
     la justification formelle associée.
     """

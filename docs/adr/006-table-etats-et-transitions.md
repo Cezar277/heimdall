@@ -27,7 +27,7 @@ Le cycle de vie comporte cinq états formels, alignés à 100 % sur le contrat F
 - **`confirme` (Confirmé)** : L'opérateur humain a validé explicitement le candidat comme étant un secret réel lors de la revue interactive dans le terminal (action `Y`).
 - **`vaulte` (Vaulté)** : Le secret a été transmis au Vault, chiffré au repos (AES-256-GCM enveloppé par DEK unique) avec confirmation de persistance, et la remédiation locale a été vérifiée (remplacement par variable d'environnement, exclusion dans `.gitignore`, génération de `.env.example`).
 - **`rote` (Roté)** : La valeur du secret a fait l'objet d'une rotation effective vérifiée par le composant responsable, et l'ancienne valeur a été révoquée et rendue inutilisable. Cet état est **terminal** pour cette version du secret.
-- **`faux_positif` (Faux positif / Écarté)** : Le candidat a été explicitement rejeté par l'opérateur humain (action `N`). L'alias métier `ecarte` est reconnu comme synonyme direct de `faux_positif`.
+- **`faux_positif` (Faux positif / Écarté)** : Le candidat a été explicitement rejeté par l'opérateur humain (action `N`). L'alias métier `ecarte` est reconnu comme synonyme d'entrée vers `faux_positif`.
 
 La chaîne nominale de remédiation d'un secret est strictement linéaire :
 $$\text{detecte} \longrightarrow \text{confirme} \longrightarrow \text{vaulte} \longrightarrow \text{rote}$$
@@ -75,6 +75,8 @@ L'espace complet des transitions entre les 5 états forme une matrice $5 \times 
 | `rote` | *(aucune)* | `detecte`, `confirme`, `vaulte`, `rote`, `faux_positif` | **État terminal** : la version est révoquée. Toute modification ou nouvelle valeur du secret doit commencer un cycle vierge et indépendant. |
 | `faux_positif` | `detecte` | `confirme`, `vaulte`, `rote`, `faux_positif` | **faux_positif → confirme interdit** : doit obligatoirement repasser par `detecte` pour qualification.<br>**faux_positif → vaulte interdit** : un faux positif ne doit JAMAIS entrer dans le Vault.<br>**faux_positif → rote interdit** : aucun secret à roter.<br>**faux_positif → faux_positif interdit** : réflexif. |
 
+Les tables `ALLOWED_TRANSITIONS` et `FORBIDDEN_TRANSITION_REASONS` sont encapsulées dans des `types.MappingProxyType` immuables afin de prévenir toute falsification dynamique ou pollution mémoire (interdiction de mutation runtime).
+
 ---
 
 ### 3. Décision sur le traitement du faux positif (état « écarté » en lien avec #33)
@@ -115,11 +117,31 @@ Une requête demandant de passer un secret d'un état $S$ au même état $S$ (ex
 
 ---
 
+### 6. Canonicalisation obligatoire et interdiction de persistance des alias
+
+Le contrat Finding v1 ([`docs/contracts/finding.md`](../contracts/finding.md)) et le schéma JSON ([`schemas/finding.schema.json`](../../schemas/finding.schema.json)) n'autorisent strictement que les 5 états canoniques (`detecte`, `confirme`, `vaulte`, `rote`, `faux_positif`).
+
+- Les alias (`ecarte`, `ecarté`, `discarded`) ainsi que les variations de casse ou d'espaces ne sont tolérés qu'en entrée aux frontières d'interface (CLI, paramètres de requête HTTP) pour l'ergonomie.
+- **Règle de persistance** : Tout mutateur d'état (route API dans #117, store Vault SQLite ou écriture de Finding) **DOIT obligatoirement appeler `canonicalize_state()`** et persister exclusivement l'identifiant canonique résultant.
+- Il est **formellement interdit de persister un alias** en base de données ou dans un fichier de sortie.
+
+---
+
+### 7. Non-reflet des entrées et sécurité Invariant 8
+
+Afin de respecter l'invariant 8 (« Aucun secret dans les logs, exceptions ou repr ») :
+- `UnknownStateError` renvoie un message d'erreur strictement statique : `"État de cycle de vie inconnu."`.
+- L'objet ou la chaîne non fiable fournie en entrée n'est jamais interpolée dans le message d'erreur et n'est pas stockée sur l'instance d'exception (`self.state = None`).
+- Cela empêche qu'un secret, un token d'API ou un payload hostile (ex. `sk_l****\nINJECTED`) passé par erreur ou malice à la place d'un état ne soit réémis dans une réponse HTTP, un log serveur ou un journal d'audit.
+- Les entrées sont bornées défensivement à `MAX_STATE_CHARS = 64` caractères pour écarter tout risque de saturation mémoire (DoS).
+
+---
+
 ## Conséquences et limites
 
 - **Sécurité et robustesse** : Toute logique de contrôle de flux s'appuie désormais sur `heimdall.vault.transitions` (`validate_transition`), éliminant tout risque de désynchronisation entre la documentation, le contrat JSON et le comportement d'exécution.
 - **Confinement cryptographique** : Le module `heimdall/vault/transitions.py` est 100 % déterministe et n'utilise que la bibliothèque standard Python. Il respecte l'invariant 5 et n'importe aucune primitive de `cryptography` ou `argon2`.
-- **Préparation des sous-tickets suivants** :
-  - Ticket **#116** : associera l'empreinte HMAC calculée avec la clé serveur pour lier les Findings à leur enregistrement dans le Vault ;
-  - Ticket **#117** : exposera l'API de transition dans le service Vault (`/api/v1/secrets/.../transition`) en branchant directement `validate_transition` ;
-  - Ticket **#118** : automatisera la vérification des 20 transitions interdites contre l'API HTTP du Vault.
+- **Découpage des sous-tickets (socle vs application)** :
+  - Le ticket **#115** livre le socle formel contractuel, les tables immuables et la bibliothèque de validation logicielle (`validate_transition`, `canonicalize_state`).
+  - L'application opérationnelle (branchement obligatoire dans les endpoints FastAPI `/api/v1/secrets/.../transition` et dans les mutateurs du store Vault) est réservée et portée par le sous-ticket **#117** (« API de transition »).
+  - La vérification automatisée de bout en bout des 20 transitions interdites contre l'API HTTP du Vault est portée par le sous-ticket **#118**.
