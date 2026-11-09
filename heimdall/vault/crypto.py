@@ -71,6 +71,7 @@ _TAG_SIZE_BYTES: int = 16  # étiquette d'authentification GCM, en fin de cipher
 # Défense en profondeur : un pepper plus court que 256 bits réduit la
 # résistance hors ligne si les empreintes stockées et le pepper fuient.
 _MIN_PEPPER_BYTES: int = 32
+_SHA256_HEX_LEN: int = 64  # Longueur en caractères hexadécimaux d'un SHA-256 (ticket #116)
 
 # Une DEK fait 256 bits, comme la KEK : l'AES-256-GCM exige une clé de 32 octets.
 _DEK_SIZE_BYTES: int = 32
@@ -143,6 +144,150 @@ def generate_api_key() -> str:
 def generate_api_key_pepper() -> str:
     """Génère un pepper éphémère indépendant avec 256 bits d'entropie."""
     return secrets.token_urlsafe(_KEY_SIZE_BYTES)
+
+
+def generate_server_hmac_key() -> str:
+    """Génère une clé HMAC serveur aléatoire avec au moins 256 bits d'entropie (ticket #116).
+
+    À utiliser comme clé HMAC serveur dédiée pour le calcul des empreintes de secrets,
+    distincte de la KEK et de la clé maîtresse de chiffrement.
+    """
+    return secrets.token_urlsafe(_KEY_SIZE_BYTES)
+
+
+def _normalize_server_hmac_key(key: str | bytes | None) -> bytes:
+    """Normalise la clé HMAC serveur en octets ; refuse absent, vide ou trop courte.
+
+    Le seuil de 32 octets (256 bits) garantit la résistance contre les attaques
+    par dictionnaire et tables arc-en-ciel en cas d'accès à la base de données (ticket #116).
+    """
+    if key is None:
+        raise ValueError(
+            "La clé HMAC serveur est obligatoire. Aucun repli silencieux sur un secret par défaut."
+        )
+    if isinstance(key, str):
+        if not key or not key.strip():
+            raise ValueError("La clé HMAC serveur ne peut pas être vide ou blanche.")
+        try:
+            key_bytes = key.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("La clé HMAC serveur doit être encodable en UTF-8.") from None
+    elif isinstance(key, (bytes, bytearray)):
+        key_bytes = bytes(key)
+        if not key_bytes or not key_bytes.strip():
+            raise ValueError("La clé HMAC serveur ne peut pas être vide ou blanche.")
+    else:
+        raise ValueError("Clé HMAC serveur invalide : chaîne ou octets attendus.")
+    if len(key_bytes) < _MIN_PEPPER_BYTES:
+        raise ValueError(
+            f"La clé HMAC serveur doit comporter au moins {_MIN_PEPPER_BYTES} octets "
+            "(256 bits) pour une résistance hors ligne suffisante."
+        )
+    return key_bytes
+
+
+def server_hmac_key_matches_master_key(
+    master_or_kek: str | bytes,
+    server_hmac_key: str | bytes,
+) -> bool:
+    """Détecte la réutilisation de la clé maîtresse ou KEK comme clé HMAC serveur (Invariant 5).
+
+    Compare en temps constant la clé maîtresse ou la KEK (brute, normalisée, décodée)
+    et la clé HMAC serveur pour s'assurer que les deux clés sont strictement distinctes.
+    """
+    try:
+        norm_hmac = _normalize_server_hmac_key(server_hmac_key)
+    except ValueError:
+        return False
+
+    candidates: list[bytes] = []
+    if isinstance(master_or_kek, str):
+        try:
+            candidates.append(master_or_kek.encode("utf-8"))
+        except UnicodeEncodeError:
+            pass
+        try:
+            candidates.append(decode_encoded_key(master_or_kek))
+        except ValueError:
+            pass
+        try:
+            if kek_matches_pepper(master_or_kek, norm_hmac.decode("utf-8", errors="ignore")):
+                return True
+        except ValueError:
+            pass
+    elif isinstance(master_or_kek, (bytes, bytearray)):
+        candidates.append(bytes(master_or_kek))
+        try:
+            candidates.append(decode_encoded_key(master_or_kek))
+        except ValueError:
+            pass
+
+    return any(constant_time_equal(cand, norm_hmac) for cand in candidates)
+
+
+def compute_secret_hmac(
+    server_key: str | bytes,
+    value: str | bytes,
+    *,
+    aad: bytes | str | None = None,
+) -> str:
+    """Calcule l'empreinte HMAC-SHA256 non réversible d'un secret avec la clé serveur (ticket #116).
+
+    Formule exacte : ``hmac.new(cle_serveur, valeur, sha256).hexdigest()``.
+
+    Permet de déterminer si une valeur en production correspond à une valeur ayant
+    fuité, sans jamais stocker ni renvoyer cette valeur au client.
+
+    Paramètres :
+    - ``server_key`` : Clé HMAC du serveur (au moins 32 octets / 256 bits), distincte
+      de la clé maîtresse de chiffrement.
+    - ``value`` : Valeur secrète (chaîne ou octets). Si chaîne, normalisée en Unicode NFC.
+    - ``aad`` : Contexte d'authentification optionnel lié au triplet (project, env, name).
+      Si fourni, préfixé avec un octet NUL pour lier l'empreinte au triplet spécifique.
+    """
+    key_bytes = _normalize_server_hmac_key(server_key)
+    if not isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("La valeur du secret doit être de type str ou bytes.")
+    if isinstance(value, str):
+        if not value:
+            raise ValueError("La valeur du secret ne peut pas être vide.")
+        try:
+            value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("La valeur du secret doit être encodable en UTF-8.") from None
+    else:
+        value_bytes = bytes(value)
+        if not value_bytes:
+            raise ValueError("La valeur du secret ne peut pas être vide.")
+
+    if aad:
+        aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
+        message = aad_bytes + b"\x00" + value_bytes
+    else:
+        message = value_bytes
+
+    return hmac.new(key_bytes, message, hashlib.sha256).hexdigest()
+
+
+def verify_secret_hmac(
+    server_key: str | bytes,
+    value: str | bytes,
+    expected_hmac: str,
+    *,
+    aad: bytes | str | None = None,
+) -> bool:
+    """Vérifie en temps constant si une valeur candidate correspond à l'empreinte HMAC.
+
+    Ticket #116 : permet de vérifier si la valeur en production est encore celle qui a fuité,
+    sans jamais déchiffrer ni exposer l'empreinte au client.
+    """
+    if not isinstance(expected_hmac, str) or len(expected_hmac) != _SHA256_HEX_LEN:
+        return False
+    try:
+        computed = compute_secret_hmac(server_key, value, aad=aad)
+    except (ValueError, TypeError):
+        return False
+    return constant_time_equal(computed, expected_hmac)
 
 
 def constant_time_equal(left: str | bytes, right: str | bytes) -> bool:
@@ -406,9 +551,7 @@ def decode_encoded_key(encoded: str | bytes) -> bytes:
     except Exception:
         raise ValueError("KEK invalide : encodage base64 incorrect.") from None
     if len(key) != _KEY_SIZE_BYTES:
-        raise ValueError(
-            f"KEK invalide : {_KEY_SIZE_BYTES} octets décodés requis."
-        )
+        raise ValueError(f"KEK invalide : {_KEY_SIZE_BYTES} octets décodés requis.")
     return key
 
 
@@ -508,42 +651,72 @@ class VaultCipher:
       valeur, ce que la rotation interdit explicitement.
     """
 
-    def __init__(self, key: bytes) -> None:
+    def __init__(
+        self,
+        key: bytes,
+        *,
+        server_hmac_key: bytes | str | None = None,
+    ) -> None:
         if not isinstance(key, (bytes, bytearray)) or len(key) != _KEY_SIZE_BYTES:
-            raise ValueError(
-                f"KEK invalide : {_KEY_SIZE_BYTES} octets exactement sont requis."
-            )
+            raise ValueError(f"KEK invalide : {_KEY_SIZE_BYTES} octets exactement sont requis.")
         self._key = bytes(key)
         self._aead = AESGCM(self._key)
-        self._fingerprint_key = HKDF(
-            algorithm=hashes.SHA256(),
-            length=_KEY_SIZE_BYTES,
-            salt=None,
-            info=_FINGERPRINT_HKDF_INFO,
-        ).derive(self._key)
+        if server_hmac_key is not None:
+            norm_hmac = _normalize_server_hmac_key(server_hmac_key)
+            if server_hmac_key_matches_master_key(self._key, norm_hmac):
+                raise ValueError(
+                    "La clé HMAC serveur doit être distincte de la KEK / clé maîtresse."
+                )
+            self._fingerprint_key = norm_hmac
+        else:
+            self._fingerprint_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=_KEY_SIZE_BYTES,
+                salt=None,
+                info=_FINGERPRINT_HKDF_INFO,
+            ).derive(self._key)
 
     def __repr__(self) -> str:
         return "VaultCipher(<REDACTED>)"
 
+    @property
+    def server_hmac_key(self) -> bytes:
+        """Clé HMAC serveur utilisée pour les empreintes de secrets (ticket #116)."""
+        return self._fingerprint_key
+
     @classmethod
-    def generate(cls) -> "VaultCipher":
+    def generate(cls, *, server_hmac_key: bytes | str | None = None) -> "VaultCipher":
         """Génère une KEK éphémère (mémoire uniquement, hors production)."""
-        return cls(secrets.token_bytes(_KEY_SIZE_BYTES))
+        return cls(secrets.token_bytes(_KEY_SIZE_BYTES), server_hmac_key=server_hmac_key)
 
     @classmethod
-    def from_encoded_key(cls, encoded: str | bytes) -> "VaultCipher":
+    def from_encoded_key(
+        cls,
+        encoded: str | bytes,
+        *,
+        server_hmac_key: bytes | str | None = None,
+    ) -> "VaultCipher":
         """Décode une KEK base64 URL-safe (ou standard) de 32 octets."""
-        return cls(decode_encoded_key(encoded))
+        return cls(decode_encoded_key(encoded), server_hmac_key=server_hmac_key)
 
     @classmethod
-    def from_master_key(cls, master_key: str | bytes, salt: str | bytes) -> "VaultCipher":
+    def from_master_key(
+        cls,
+        master_key: str | bytes,
+        salt: str | bytes,
+        *,
+        server_hmac_key: bytes | str | None = None,
+    ) -> "VaultCipher":
         """Dérive la KEK avec Argon2id puis construit le chiffreur (ticket #262).
 
         À appeler **une seule fois au démarrage** : la dérivation est coûteuse
         (64 Mio, 3 itérations) et la KEK obtenue reste en mémoire pour la durée
         de vie du processus.
         """
-        return cls(derive_kek_from_master_key(master_key, salt))
+        return cls(
+            derive_kek_from_master_key(master_key, salt),
+            server_hmac_key=server_hmac_key,
+        )
 
     def key_reuses_pepper(self, pepper: str) -> bool:
         """Détecte si la KEK de ce chiffreur réutilise l'entropie du pepper.
@@ -611,9 +784,7 @@ class VaultCipher:
         if not isinstance(plaintext, (bytes, bytearray)):
             raise TypeError("La valeur à chiffrer doit être de type bytes.")
         if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
-            raise ValueError(
-                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
-            )
+            raise ValueError(f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis.")
         return _encrypt_token(AESGCM(bytes(dek)), bytes(plaintext), aad)
 
     @staticmethod
@@ -625,9 +796,7 @@ class VaultCipher:
     ) -> bytes:
         """Déchiffre une valeur avec sa DEK ; toute altération lève ``VaultCipherError``."""
         if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
-            raise ValueError(
-                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
-            )
+            raise ValueError(f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis.")
         return _decrypt_token(AESGCM(bytes(dek)), token, aad)
 
     def wrap_dek(self, dek: bytes | bytearray, *, aad: bytes = b"") -> str:
@@ -638,9 +807,7 @@ class VaultCipher:
         comme une valeur, ni déplacée vers un autre secret.
         """
         if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
-            raise ValueError(
-                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
-            )
+            raise ValueError(f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis.")
         return self.encrypt(bytes(dek), aad=_DEK_WRAP_AAD_PREFIX + bytes(aad))
 
     def unwrap_dek(self, encrypted_dek: str, *, aad: bytes = b"") -> bytes:
@@ -729,6 +896,58 @@ class VaultCipher:
         """
         message = bytes(aad) + b"\x00" + bytes(plaintext)
         return hmac.new(self._fingerprint_key, message, hashlib.sha256).hexdigest()
+
+    def compute_secret_hmac(
+        self,
+        value: str | bytes,
+        *,
+        aad: bytes | str | None = None,
+    ) -> str:
+        """Calcule l'empreinte HMAC-SHA256 avec la clé serveur dédiée (ticket #116).
+
+        Formule : ``hmac.new(cle_serveur, valeur, sha256).hexdigest()``.
+        Empreinte stable et non réversible, jamais renvoyée au client.
+        """
+        return compute_secret_hmac(self._fingerprint_key, value, aad=aad)
+
+    def verify_secret_hmac(
+        self,
+        value: str | bytes,
+        expected_hmac: str,
+        *,
+        aad: bytes | str | None = None,
+    ) -> bool:
+        """Vérifie en temps constant si la valeur correspond à l'empreinte HMAC (ticket #116)."""
+        return verify_secret_hmac(self._fingerprint_key, value, expected_hmac, aad=aad)
+
+    def is_secret_value_matching(
+        self,
+        value: str | bytes,
+        expected_fingerprint: str,
+        *,
+        aad: bytes = b"",
+    ) -> bool:
+        """Vérifie en temps constant si la valeur correspond à l'empreinte stockée.
+
+        Permet de savoir si la valeur en production est encore celle qui a fuité,
+        sans jamais stocker ni renvoyer l'empreinte au client (ticket #116).
+        """
+        if (
+            not isinstance(expected_fingerprint, str)
+            or len(expected_fingerprint) != _SHA256_HEX_LEN
+        ):
+            return False
+        if aad:
+            val_bytes = (
+                unicodedata.normalize("NFC", value).encode("utf-8")
+                if isinstance(value, str)
+                else bytes(value)
+            )
+            candidate_fp = self.fingerprint(val_bytes, aad=aad)
+            if constant_time_equal(candidate_fp, expected_fingerprint):
+                return True
+        direct_fp = self.compute_secret_hmac(value)
+        return constant_time_equal(direct_fp, expected_fingerprint)
 
 
 def encrypt_at_rest(plaintext: bytes, key_id: str) -> bytes:

@@ -73,6 +73,7 @@ class _SessionConnection(sqlite3.Connection):
 
     _heimdall_session: bool = False
 
+
 SecretStatus = Literal["vaulte", "rote"]
 _ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
 _SCHEMA_MIGRATION_HINT: str = (
@@ -104,6 +105,7 @@ class KekVersionError(RuntimeError):
 
 class KekConcurrencyError(RuntimeError):
     """Écriture conditionnelle sur ``kek_version`` perdante (concurrence)."""
+
 
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
@@ -162,6 +164,7 @@ CREATE TABLE IF NOT EXISTS secrets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_secrets_project_env_name ON secrets(project_id, env, name);
+CREATE INDEX IF NOT EXISTS idx_secrets_project_fingerprint ON secrets(project_id, fingerprint);
 
 -- Buckets de rate-limiting partagés entre workers (lot #63). Les noms de
 -- buckets par clé sont des empreintes HMAC, jamais les clés brutes.
@@ -1012,9 +1015,7 @@ def _ensure_secret_envelope_column(conn: sqlite3.Connection) -> None:
     restent lisibles via le repli KEK direct de `SqliteSecretStore`, et aucune
     donnée existante n'est réécrite ni supprimée.
     """
-    columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
-    }
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()}
     if "encrypted_dek" in columns:
         return
     try:
@@ -1023,9 +1024,7 @@ def _ensure_secret_envelope_column(conn: sqlite3.Connection) -> None:
         # Course entre deux workers au démarrage : un autre processus a pu
         # ajouter la colonne entre le PRAGMA et l'ALTER. On ne masque l'erreur
         # que si la colonne est réellement présente ; sinon elle est remontée.
-        columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
-        }
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()}
         if "encrypted_dek" not in columns:
             raise
 
@@ -1036,9 +1035,7 @@ def _ensure_secret_kek_version_column(conn: sqlite3.Connection) -> None:
     La migration est idempotente et purement additive : la valeur par défaut
     est 1 pour toutes les lignes existantes.
     """
-    columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
-    }
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()}
     if "kek_version" in columns:
         return
     try:
@@ -1047,9 +1044,7 @@ def _ensure_secret_kek_version_column(conn: sqlite3.Connection) -> None:
             "CHECK (kek_version >= 1)"
         )
     except sqlite3.OperationalError:
-        columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
-        }
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()}
         if "kek_version" not in columns:
             raise
 
@@ -1373,6 +1368,35 @@ def list_secrets(
     return [dict(row) for row in cursor.fetchall()]
 
 
+def find_secrets_by_fingerprint(
+    conn: sqlite3.Connection,
+    project_id: str,
+    fingerprint: str,
+    env: str | None = None,
+) -> list[dict[str, str]]:
+    """Trouve les métadonnées des secrets d'un projet correspondant à une empreinte HMAC.
+
+    Permet de vérifier si une valeur ayant fuité est encore présente en production
+    sans jamais déchiffrer les valeurs ni exposer l'empreinte au client (ticket #116).
+    Retourne uniquement les métadonnées publiques (project, env, name, status).
+    """
+    if env is not None:
+        query = (
+            "SELECT project_id AS project, env, name, status "
+            "FROM secrets WHERE project_id = ? AND env = ? AND fingerprint = ? "
+            "ORDER BY name ASC"
+        )
+        cursor = conn.execute(query, (project_id, env, fingerprint))
+    else:
+        query = (
+            "SELECT project_id AS project, env, name, status "
+            "FROM secrets WHERE project_id = ? AND fingerprint = ? "
+            "ORDER BY env ASC, name ASC"
+        )
+        cursor = conn.execute(query, (project_id, fingerprint))
+    return [dict(row) for row in cursor.fetchall()]
+
+
 _MAX_SECRET_PAGE_LIMIT = 101
 _MAX_SECRET_PAGE_OFFSET = 1_000_000
 
@@ -1462,7 +1486,6 @@ def update_secret(  # noqa: PLR0913
         raise ValueError("Statut de secret invalide.")
 
     with _write_transaction(conn):
-
         if kek_version is not None:
             validate_kek_version(kek_version)
         row = conn.execute(
@@ -1541,7 +1564,6 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
     validate_kek_version(kek_version)
 
     with _write_transaction(conn):
-
         # Lire la version courante et imposer la monotonie.
         row = conn.execute(
             "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
@@ -1632,10 +1654,7 @@ def rotate_secrets_kek(
                 raise KekVersionError("Version de KEK illisible en base.")
 
         current_max = max(
-            (
-                r["kek_version"] if r["kek_version"] is not None else 1
-                for r in secrets_to_rotate
-            ),
+            (r["kek_version"] if r["kek_version"] is not None else 1 for r in secrets_to_rotate),
             default=1,
         )
         if target_kek_version is not None:

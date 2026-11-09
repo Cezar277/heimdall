@@ -38,7 +38,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from heimdall.vault.crypto import VaultCipher, VaultCipherError
+from heimdall.vault.crypto import VaultCipher, VaultCipherError, constant_time_equal
 from heimdall.vault.database import (
     MAX_KEK_VERSION,
     DatabaseUnavailableError,
@@ -48,9 +48,12 @@ from heimdall.vault.database import (
     delete_all_secrets,
     delete_secret,
     ensure_project,
+    find_secrets_by_fingerprint,
     get_secret,
+    get_secret_metadata,
     init_db,
     list_secret_page,
+    list_secrets,
     rotate_secrets_kek,
     validate_kek_version,
     validate_secret_page_bounds,
@@ -183,6 +186,7 @@ class InMemorySecretStore:
                     f"Quota maximal de secrets atteint pour le projet '{project}'"
                 )
             envelope = self._cipher.encrypt_envelope(value.encode("utf-8"), aad=aad)
+            fingerprint = self._cipher.fingerprint(value.encode("utf-8"), aad=aad)
             record = {
                 "project": project,
                 "env": env,
@@ -191,6 +195,7 @@ class InMemorySecretStore:
                 "encrypted_value": envelope.encrypted_value,
                 "encrypted_dek": envelope.encrypted_dek,
                 "kek_version": self._kek_version,
+                "fingerprint": fingerprint,
             }
             self._secrets[key] = record
             self._project_counts[project] = project_count + 1
@@ -237,6 +242,93 @@ class InMemorySecretStore:
                 for key in keys[offset : offset + limit]
             ]
 
+    async def is_secret_value_matching(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        candidate_value: str,
+    ) -> bool:
+        """Vérifie en temps constant si candidate_value correspond au secret stocké.
+
+        Permet de savoir si la valeur en production est encore celle qui a fuité,
+        sans jamais déchiffrer ni renvoyer l'empreinte au client (ticket #116).
+        """
+        aad = VaultCipher.aad(project, env, name)
+        candidate_val = unicodedata.normalize("NFC", candidate_value)
+        candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
+        async with self._lock:
+            record = self._secrets.get((project, env, name))
+            if record is None:
+                return False
+            stored_fp = str(record.get("fingerprint") or "")
+            if stored_fp:
+                return constant_time_equal(candidate_fp, stored_fp)
+            decrypted = _decrypt_record(record, self._cipher, project, env, name)
+            return constant_time_equal(candidate_val, decrypted["value"])
+
+    async def find_secrets_matching_value(
+        self,
+        project: str,
+        candidate_value: str,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Trouve les métadonnées des secrets d'un projet correspondant à candidate_value.
+
+        Permet de détecter quels secrets en production sont compromis par une fuite.
+        Retourne uniquement les métadonnées (project, env, name, status), JAMAIS
+        la valeur ni l'empreinte (ticket #116).
+        """
+        candidate_val = unicodedata.normalize("NFC", candidate_value)
+        results: list[dict[str, str]] = []
+        async with self._lock:
+            for (p, e, n), record in self._secrets.items():
+                if p != project:
+                    continue
+                if env is not None and e != env:
+                    continue
+                aad = VaultCipher.aad(p, e, n)
+                candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
+                stored_fp = str(record.get("fingerprint") or "")
+                matched = False
+                if stored_fp:
+                    matched = constant_time_equal(candidate_fp, stored_fp)
+                else:
+                    decrypted = _decrypt_record(record, self._cipher, p, e, n)
+                    matched = constant_time_equal(candidate_val, decrypted["value"])
+                if matched:
+                    results.append(
+                        {
+                            "project": p,
+                            "env": e,
+                            "name": n,
+                            "status": str(record.get("status", "vaulte")),
+                        }
+                    )
+        return sorted(results, key=lambda r: (r["env"], r["name"]))
+
+    async def find_secrets_by_fingerprint(
+        self,
+        project: str,
+        fingerprint: str,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Recherche les secrets par empreinte HMAC sans déchiffrement (ticket #116)."""
+        async with self._lock:
+            results = [
+                {
+                    "project": str(record["project"]),
+                    "env": str(record["env"]),
+                    "name": str(record["name"]),
+                    "status": str(record["status"]),
+                }
+                for (p, e, _n), record in self._secrets.items()
+                if p == project
+                and (env is None or e == env)
+                and constant_time_equal(str(record.get("fingerprint") or ""), fingerprint)
+            ]
+            return sorted(results, key=lambda r: (r["env"], r["name"]))
+
     async def clear(self) -> None:
         async with self._lock:
             self._secrets.clear()
@@ -269,9 +361,7 @@ class InMemorySecretStore:
 
             current_max = max(
                 (
-                    r["kek_version"]
-                    if r.get("kek_version") is not None
-                    else 1
+                    r["kek_version"] if r.get("kek_version") is not None else 1
                     for r in self._secrets.values()
                 ),
                 default=1,
@@ -280,7 +370,7 @@ class InMemorySecretStore:
                 if target_kek_version <= current_max:
                     raise ValueError(
                         "Le numéro de version cible doit être strictement supérieur "
-                    "à la version actuelle."
+                        "à la version actuelle."
                     )
                 new_version = target_kek_version
             else:
@@ -486,6 +576,117 @@ class SqliteSecretStore:
             "name": name,
             "status": "vaulte",
         }
+
+    async def is_secret_value_matching(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        candidate_value: str,
+    ) -> bool:
+        """Vérifie en temps constant si candidate_value correspond au secret stocké.
+
+        Permet de savoir si la valeur en production est encore celle qui a fuité,
+        sans jamais déchiffrer ni renvoyer l'empreinte au client (ticket #116).
+        """
+        return await asyncio.to_thread(
+            self._is_secret_value_matching,
+            project,
+            env,
+            name,
+            candidate_value,
+        )
+
+    def _is_secret_value_matching(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        candidate_value: str,
+    ) -> bool:
+        aad = VaultCipher.aad(project, env, name)
+        candidate_val = unicodedata.normalize("NFC", candidate_value)
+        candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
+        with db_session(self._db_path) as conn:
+            record = get_secret_metadata(conn, project, env, name)
+            if record is None:
+                return False
+            stored_fp = str(record.get("fingerprint") or "")
+            if stored_fp:
+                return constant_time_equal(candidate_fp, stored_fp)
+            full_record = get_secret(conn, project, env, name)
+            if full_record is None:
+                return False
+            decrypted = _decrypt_record(full_record, self._cipher, project, env, name)
+            return constant_time_equal(candidate_val, decrypted["value"])
+
+    async def find_secrets_matching_value(
+        self,
+        project: str,
+        candidate_value: str,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Trouve les métadonnées des secrets d'un projet correspondant à candidate_value.
+
+        Permet de détecter quels secrets en production sont compromis par une fuite.
+        Retourne uniquement les métadonnées (project, env, name, status), JAMAIS
+        la valeur ni l'empreinte (ticket #116).
+        """
+        return await asyncio.to_thread(
+            self._find_secrets_matching_value,
+            project,
+            candidate_value,
+            env,
+        )
+
+    def _find_secrets_matching_value(
+        self,
+        project: str,
+        candidate_value: str,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        candidate_val = unicodedata.normalize("NFC", candidate_value)
+        with db_session(self._db_path) as conn:
+            secrets_list = list_secrets(conn, project, env=env)
+            results: list[dict[str, str]] = []
+            for item in secrets_list:
+                p, e, n = item["project_id"], item["env"], item["name"]
+                aad = VaultCipher.aad(p, e, n)
+                candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
+                stored_fp = str(item.get("fingerprint") or "")
+                if stored_fp and constant_time_equal(candidate_fp, stored_fp):
+                    results.append(
+                        {
+                            "project": p,
+                            "env": e,
+                            "name": n,
+                            "status": str(item.get("status", "vaulte")),
+                        }
+                    )
+            return results
+
+    async def find_secrets_by_fingerprint(
+        self,
+        project: str,
+        fingerprint: str,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Recherche les secrets par empreinte HMAC sans déchiffrement (ticket #116)."""
+        return await asyncio.to_thread(
+            self._find_secrets_by_fingerprint,
+            project,
+            fingerprint,
+            env,
+        )
+
+    def _find_secrets_by_fingerprint(
+        self,
+        project: str,
+        fingerprint: str,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        with db_session(self._db_path) as conn:
+            return find_secrets_by_fingerprint(conn, project, fingerprint, env=env)
 
     async def clear(self) -> None:
         await asyncio.to_thread(self._clear)
