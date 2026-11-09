@@ -324,12 +324,15 @@ limite de débit.
 
 Les admissions expirées de toutes les fenêtres sont purgées à chaque évaluation,
 rejets compris (index `idx_rate_limit_hits_at`) : la table ne retient que la
-fenêtre courante, donc sa taille reste proportionnelle au débit reçu pendant la
-fenêtre, sans dépendre des admissions autorisées. Le backend mémoire applique la
-même règle : un bucket n'est créé qu'au moment où une admission est réellement
-consommée (chemin autorisé, ou pair/global consommés sur un rejet clé), et la
-purge des budgets expirés a lieu sur les deux chemins. Un flot de rejets avec
-des empreintes de clé distinctes ne laisse donc pas une entrée vide par hash.
+fenêtre courante. Sa taille est bornée par la somme des budgets actifs
+(clé + pair + global) : `consume_on_reject` n'insère que si le budget
+correspondant n'est pas plein, donc un flot de rejets avec un budget clé plein
+s'arrête à cette somme, sans croître au rythme des requêtes. Le backend mémoire
+applique la même règle : un bucket n'est créé qu'au moment où une admission est
+réellement consommée (chemin autorisé, ou pair/global consommés sur un rejet
+clé), et la purge des budgets expirés a lieu sur les deux chemins. Un flot de
+rejets avec des empreintes de clé distinctes ne laisse donc pas une entrée vide
+par hash.
 
 ## Journal d'audit (#113)
 
