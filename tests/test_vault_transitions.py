@@ -8,8 +8,10 @@ la totalité des transitions autorisées et l'interdiction stricte de tous les p
 
 from __future__ import annotations
 
+import inspect
 import unittest
 
+import heimdall.vault.transitions as vt
 from heimdall.scanner.finding import FINDING_STATUSES
 from heimdall.vault.transitions import (
     ALLOWED_TRANSITIONS,
@@ -81,8 +83,15 @@ class SecretLifecycleStateTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(UnknownStateError) as ctx:
                     canonicalize_state(invalid)
-                self.assertIsNone(ctx.exception.state)
+                self.assertFalse(hasattr(ctx.exception, "state"))
                 self.assertEqual(str(ctx.exception), "État de cycle de vie inconnu.")
+
+    def test_unknown_state_error_has_no_parameters(self) -> None:
+        """Invariant 8 : UnknownStateError n'accepte aucun argument (zéro reflet)."""
+        sig = inspect.signature(UnknownStateError.__init__)
+        self.assertEqual(list(sig.parameters.keys()), ["self"])
+        with self.assertRaises(TypeError):
+            UnknownStateError("sk_live_malicious_input")  # type: ignore[call-arg]
 
     def test_unknown_state_error_never_reflects_input(self) -> None:
         """Invariant 8 : aucune entrée brute (secret, payload) n'est reflétée."""
@@ -98,14 +107,14 @@ class SecretLifecycleStateTests(unittest.TestCase):
                 # Via canonicalize_state direct
                 with self.assertRaises(UnknownStateError) as ctx:
                     canonicalize_state(raw)
-                self.assertIsNone(ctx.exception.state)
+                self.assertFalse(hasattr(ctx.exception, "state"))
                 self.assertEqual(str(ctx.exception), "État de cycle de vie inconnu.")
                 self.assertNotIn(raw, str(ctx.exception))
 
                 # Via validate_transition
                 with self.assertRaises(UnknownStateError) as ctx2:
                     validate_transition(raw, "detecte")
-                self.assertIsNone(ctx2.exception.state)
+                self.assertFalse(hasattr(ctx2.exception, "state"))
                 self.assertEqual(str(ctx2.exception), "État de cycle de vie inconnu.")
                 self.assertNotIn(raw, str(ctx2.exception))
 
@@ -116,14 +125,14 @@ class SecretLifecycleStateTests(unittest.TestCase):
         self.assertGreater(len(huge_input), MAX_STATE_CHARS)
         with self.assertRaises(UnknownStateError) as ctx:
             canonicalize_state(huge_input)
-        self.assertIsNone(ctx.exception.state)
+        self.assertFalse(hasattr(ctx.exception, "state"))
 
         # 2. Types non-str variés
         for bad_type in (b"detecte", {"state": "detecte"}, ["detecte"], (1, 2), 3.14):
             with self.subTest(bad_type=type(bad_type)):
                 with self.assertRaises(UnknownStateError) as ctx:
                     canonicalize_state(bad_type)
-                self.assertIsNone(ctx.exception.state)
+                self.assertFalse(hasattr(ctx.exception, "state"))
 
         # 3. Sous-classe de str avec strip surchargé
         class HostileStr(str):
@@ -133,7 +142,11 @@ class SecretLifecycleStateTests(unittest.TestCase):
         self.assertEqual(canonicalize_state(HostileStr("detecte")), "detecte")
 
     def test_immutability_of_transition_tables(self) -> None:
-        """ALLOWED_TRANSITIONS et FORBIDDEN_TRANSITION_REASONS sont immuables."""
+        """Tables de transition immuables et sans backing dict exposé."""
+        # Aucun dictionnaire modifiable n'est exposé au niveau du module
+        self.assertFalse(hasattr(vt, "_ALLOWED_TRANSITIONS_DATA"))
+        self.assertFalse(hasattr(vt, "_FORBIDDEN_REASONS_DATA"))
+
         with self.assertRaises(TypeError):
             ALLOWED_TRANSITIONS["rote"] = frozenset({"detecte"})  # type: ignore[index]
 
@@ -303,11 +316,11 @@ class ForbiddenTransitionsTests(unittest.TestCase):
         """Un état inconnu dans validate_transition lève UnknownStateError sans reflet."""
         with self.assertRaises(UnknownStateError) as ctx:
             validate_transition("detecte", "unknown")
-        self.assertIsNone(ctx.exception.state)
+        self.assertFalse(hasattr(ctx.exception, "state"))
 
         with self.assertRaises(UnknownStateError) as ctx2:
             validate_transition("unknown", "confirme")
-        self.assertIsNone(ctx2.exception.state)
+        self.assertFalse(hasattr(ctx2.exception, "state"))
 
 
 class TransitionMatrixAndPartitionsTests(unittest.TestCase):
@@ -374,7 +387,7 @@ class ErrorHierarchyAndSanitizationTests(unittest.TestCase):
             validate_transition("sk_live_SECRET_DATA", "detecte")
         except UnknownStateError as exc2:
             self.assertEqual(str(exc2), "État de cycle de vie inconnu.")
-            self.assertIsNone(exc2.state)
+            self.assertFalse(hasattr(exc2, "state"))
             self.assertNotIn("SECRET_DATA", str(exc2))
 
 

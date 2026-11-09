@@ -68,97 +68,116 @@ INITIAL_STATE: Final[SecretLifecycleState] = "detecte"
 #: États terminaux : aucune transition sortante permise.
 TERMINAL_STATES: Final[frozenset[SecretLifecycleState]] = frozenset({"rote"})
 
-_ALLOWED_TRANSITIONS_DATA: dict[SecretLifecycleState, frozenset[SecretLifecycleState]] = {
-    # 1. Détecté par le scanner déterministe
-    "detecte": frozenset({"confirme", "faux_positif"}),
-    # 2. Confirmé par validation humaine explicite (dialogue Y/N/E #32)
-    "confirme": frozenset({"vaulte"}),
-    # 3. Vaulté après persistance chiffrée et remédiation vérifiée
-    "vaulte": frozenset({"rote"}),
-    # 4. Roté : fin de cycle pour cette version du secret (état terminal)
-    "rote": frozenset(),
-    # 5. Faux positif (écarté) : réexamen explicite uniquement
-    "faux_positif": frozenset({"detecte"}),
-}
+
+def _make_allowed_transitions() -> MappingProxyType[
+    SecretLifecycleState, frozenset[SecretLifecycleState]
+]:
+    return MappingProxyType(
+        {
+            # 1. Détecté par le scanner déterministe
+            "detecte": frozenset({"confirme", "faux_positif"}),
+            # 2. Confirmé par validation humaine explicite (dialogue Y/N/E #32)
+            "confirme": frozenset({"vaulte"}),
+            # 3. Vaulté après persistance chiffrée et remédiation vérifiée
+            "vaulte": frozenset({"rote"}),
+            # 4. Roté : fin de cycle pour cette version du secret (état terminal)
+            "rote": frozenset(),
+            # 5. Faux positif (écarté) : réexamen explicite uniquement
+            "faux_positif": frozenset({"detecte"}),
+        }
+    )
+
 
 #: Table immuable des transitions autorisées (source -> cibles autorisées).
-#: Protégée par MappingProxyType contre toute mutation externe.
+#: Protégée par MappingProxyType sans dictionnaire sous-jacent exposé au module.
 ALLOWED_TRANSITIONS: Final[
     MappingProxyType[SecretLifecycleState, frozenset[SecretLifecycleState]]
-] = MappingProxyType(_ALLOWED_TRANSITIONS_DATA)
+] = _make_allowed_transitions()
 
-_FORBIDDEN_REASONS_DATA: dict[tuple[str, str], str] = {
-    # Depuis 'detecte'
-    ("detecte", "detecte"): "Transition réflexive interdite : l'état reste inchangé.",
-    ("detecte", "vaulte"): (
-        "Passage direct interdit : un secret détecté doit d'abord être confirmé "
-        "par un humain avant tout stockage chiffré dans le Vault."
-    ),
-    ("detecte", "rote"): (
-        "Passage direct interdit : un secret détecté ne peut pas être roté sans "
-        "avoir été préalablement confirmé et vaulté."
-    ),
-    # Depuis 'confirme'
-    ("confirme", "detecte"): (
-        "Régression arrière interdite : un secret confirmé ne peut pas redevenir "
-        "un simple candidat non qualifié."
-    ),
-    ("confirme", "confirme"): "Transition réflexive interdite : l'état reste inchangé.",
-    ("confirme", "faux_positif"): (
-        "Contradiction de qualification : un secret confirmé ne peut pas être "
-        "écarté comme faux positif sans réexamen complet à la source."
-    ),
-    ("confirme", "rote"): (
-        "Passage direct interdit : un secret confirmé doit d'abord être persisté "
-        "dans le Vault avant de pouvoir être roté."
-    ),
-    # Depuis 'vaulte'
-    ("vaulte", "detecte"): (
-        "Régression arrière interdite : un secret vaulté est compromis et "
-        "ne peut pas revenir à l'état de détection."
-    ),
-    ("vaulte", "confirme"): (
-        "Régression arrière interdite : un secret vaulté a déjà dépassé l'étape de confirmation."
-    ),
-    ("vaulte", "vaulte"): "Transition réflexive interdite : l'état reste inchangé.",
-    ("vaulte", "faux_positif"): (
-        "Interdiction formelle : un secret vaulté a été reconnu sensible et stocké ; "
-        "il ne peut pas être déclassé en faux positif."
-    ),
-    # Depuis 'rote' (état terminal)
-    ("rote", "detecte"): (
-        "État terminal : la version du secret est révoquée ; une nouvelle valeur "
-        "doit entamer un nouveau cycle indépendant."
-    ),
-    ("rote", "confirme"): "État terminal : aucune transition sortante permise depuis 'rote'.",
-    ("rote", "vaulte"): (
-        "État terminal : impossible de re-vaulter un secret révoqué ; la rotation "
-        "génère une nouvelle version du secret."
-    ),
-    ("rote", "rote"): "Transition réflexive interdite : l'état terminal reste inchangé.",
-    ("rote", "faux_positif"): (
-        "État terminal : un secret roté a été avéré et révoqué ; il ne peut pas "
-        "être classé en faux positif."
-    ),
-    # Depuis 'faux_positif' (écarté)
-    ("faux_positif", "confirme"): (
-        "Passage direct interdit : un faux positif écarté doit obligatoirement "
-        "repasser par l'état 'detecte' lors d'un réexamen avant toute confirmation."
-    ),
-    ("faux_positif", "vaulte"): (
-        "Interdiction absolue : un faux positif ne doit JAMAIS être persisté dans "
-        "le Vault (protection contre la pollution et l'épuisement des quotas)."
-    ),
-    ("faux_positif", "rote"): (
-        "Non-sens fonctionnel : un faux positif n'est pas un secret réel et "
-        "ne peut faire l'objet d'aucune rotation."
-    ),
-    ("faux_positif", "faux_positif"): "Transition réflexive interdite : l'état reste inchangé.",
-}
+
+def _make_forbidden_reasons() -> MappingProxyType[tuple[str, str], str]:
+    return MappingProxyType(
+        {
+            # Depuis 'detecte'
+            ("detecte", "detecte"): "Transition réflexive interdite : l'état reste inchangé.",
+            ("detecte", "vaulte"): (
+                "Passage direct interdit : un secret détecté doit d'abord être confirmé "
+                "par un humain avant tout stockage chiffré dans le Vault."
+            ),
+            ("detecte", "rote"): (
+                "Passage direct interdit : un secret détecté ne peut pas être roté sans "
+                "avoir été préalablement confirmé et vaulté."
+            ),
+            # Depuis 'confirme'
+            ("confirme", "detecte"): (
+                "Régression arrière interdite : un secret confirmé ne peut pas redevenir "
+                "un simple candidat non qualifié."
+            ),
+            ("confirme", "confirme"): "Transition réflexive interdite : l'état reste inchangé.",
+            ("confirme", "faux_positif"): (
+                "Contradiction de qualification : un secret confirmé ne peut pas être "
+                "écarté comme faux positif sans réexamen complet à la source."
+            ),
+            ("confirme", "rote"): (
+                "Passage direct interdit : un secret confirmé doit d'abord être persisté "
+                "dans le Vault avant de pouvoir être roté."
+            ),
+            # Depuis 'vaulte'
+            ("vaulte", "detecte"): (
+                "Régression arrière interdite : un secret vaulté est compromis et "
+                "ne peut pas revenir à l'état de détection."
+            ),
+            ("vaulte", "confirme"): (
+                "Régression arrière interdite : un secret vaulté a déjà dépassé "
+                "l'étape de confirmation."
+            ),
+            ("vaulte", "vaulte"): "Transition réflexive interdite : l'état reste inchangé.",
+            ("vaulte", "faux_positif"): (
+                "Interdiction formelle : un secret vaulté a été reconnu sensible et stocké ; "
+                "il ne peut pas être déclassé en faux positif."
+            ),
+            # Depuis 'rote' (état terminal)
+            ("rote", "detecte"): (
+                "État terminal : la version du secret est révoquée ; une nouvelle valeur "
+                "doit entamer un nouveau cycle indépendant."
+            ),
+            (
+                "rote",
+                "confirme",
+            ): "État terminal : aucune transition sortante permise depuis 'rote'.",
+            ("rote", "vaulte"): (
+                "État terminal : impossible de re-vaulter un secret révoqué ; la rotation "
+                "génère une nouvelle version du secret."
+            ),
+            ("rote", "rote"): "Transition réflexive interdite : l'état terminal reste inchangé.",
+            ("rote", "faux_positif"): (
+                "État terminal : un secret roté a été avéré et révoqué ; il ne peut pas "
+                "être classé en faux positif."
+            ),
+            # Depuis 'faux_positif' (écarté)
+            ("faux_positif", "confirme"): (
+                "Passage direct interdit : un faux positif écarté doit obligatoirement "
+                "repasser par l'état 'detecte' lors d'un réexamen avant toute confirmation."
+            ),
+            ("faux_positif", "vaulte"): (
+                "Interdiction absolue : un faux positif ne doit JAMAIS être persisté dans "
+                "le Vault (protection contre la pollution et l'épuisement des quotas)."
+            ),
+            ("faux_positif", "rote"): (
+                "Non-sens fonctionnel : un faux positif n'est pas un secret réel et "
+                "ne peut faire l'objet d'aucune rotation."
+            ),
+            (
+                "faux_positif",
+                "faux_positif",
+            ): "Transition réflexive interdite : l'état reste inchangé.",
+        }
+    )
+
 
 #: Justifications fermées immuables pour chaque transition interdite (5x5 - 5 autorisées).
-FORBIDDEN_TRANSITION_REASONS: Final[MappingProxyType[tuple[str, str], str]] = MappingProxyType(
-    _FORBIDDEN_REASONS_DATA
+FORBIDDEN_TRANSITION_REASONS: Final[MappingProxyType[tuple[str, str], str]] = (
+    _make_forbidden_reasons()
 )
 
 
@@ -169,13 +188,12 @@ class LifecycleTransitionError(ValueError):
 class UnknownStateError(LifecycleTransitionError):
     """État non reconnu dans le cycle de vie du secret.
 
-    Invariant 8 : message d'erreur statique sans reflet d'entrée pour
-    prévenir toute fuite de secret ou injection dans les logs/réponses.
+    Invariant 8 : message d'erreur statique sans aucun paramètre
+    pour éliminer tout risque de reflet d'entrée ou de secret.
     """
 
-    def __init__(self, state: object = None) -> None:
+    def __init__(self) -> None:
         super().__init__("État de cycle de vie inconnu.")
-        self.state: object = None
 
 
 class InvalidTransitionError(LifecycleTransitionError):

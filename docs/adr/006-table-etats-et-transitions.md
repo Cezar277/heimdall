@@ -131,7 +131,7 @@ Le contrat Finding v1 ([`docs/contracts/finding.md`](../contracts/finding.md)) e
 
 Afin de respecter l'invariant 8 (« Aucun secret dans les logs, exceptions ou repr ») :
 - `UnknownStateError` renvoie un message d'erreur strictement statique : `"État de cycle de vie inconnu."`.
-- L'objet ou la chaîne non fiable fournie en entrée n'est jamais interpolée dans le message d'erreur et n'est pas stockée sur l'instance d'exception (`self.state = None`).
+- L'objet ou la chaîne non fiable fournie en entrée n'est jamais acceptée ni stockée sur l'instance d'exception (`UnknownStateError.__init__(self)` n'accepte aucun argument pour éliminer tout risque de reflet ou fuite de secret).
 - Cela empêche qu'un secret, un token d'API ou un payload hostile (ex. `sk_l****\nINJECTED`) passé par erreur ou malice à la place d'un état ne soit réémis dans une réponse HTTP, un log serveur ou un journal d'audit.
 - Les entrées sont bornées défensivement à `MAX_STATE_CHARS = 64` caractères pour écarter tout risque de saturation mémoire (DoS).
 
@@ -139,7 +139,7 @@ Afin de respecter l'invariant 8 (« Aucun secret dans les logs, exceptions ou re
 
 ## Conséquences et limites
 
-- **Sécurité et robustesse** : Toute logique de contrôle de flux s'appuie désormais sur `heimdall.vault.transitions` (`validate_transition`), éliminant tout risque de désynchronisation entre la documentation, le contrat JSON et le comportement d'exécution.
+- **Sécurité et robustesse** : Toute logique de contrôle de flux s'appuiera sur `heimdall.vault.transitions` (`validate_transition`) une fois l'API #117 branchée : tout mutateur d'état (route `/api/v1/secrets/.../transition` dans #117 et store Vault) devra obligatoirement appeler `validate_transition()` et persister exclusivement le statut canonique, éliminant tout risque de contournement ou de désynchronisation entre la documentation, le contrat JSON et le comportement d'exécution.
 - **Confinement cryptographique** : Le module `heimdall/vault/transitions.py` est 100 % déterministe et n'utilise que la bibliothèque standard Python. Il respecte l'invariant 5 et n'importe aucune primitive de `cryptography` ou `argon2`.
 - **Découpage des sous-tickets (socle vs application)** :
   - Le ticket **#115** livre le socle formel contractuel, les tables immuables et la bibliothèque de validation logicielle (`validate_transition`, `canonicalize_state`).
