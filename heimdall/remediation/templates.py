@@ -411,13 +411,27 @@ def _is_os_module(node: ast.AST) -> bool:
     return _is_os_environ(node)
 
 
+def _python_dynamic_import(node: ast.AST) -> bool:
+    """Vrai pour un appel d'import dynamique potentiellement lié à ``os``.
+
+    ``__import__("os")``, ``importlib.import_module("os")`` : ces formes
+    contournent la simple résolution du nom ``os`` et doivent être traitées
+    comme des racines d'accès à l'environnement.
+    """
+    function = node.func if isinstance(node, ast.Call) else node
+    return (isinstance(function, ast.Name) and function.id in {"__import__", "import_module"}) or (
+        isinstance(function, ast.Attribute) and function.attr == "import_module"
+    )
+
+
 def _python_env_access_in(node: ast.AST) -> bool:
     """Vrai si l'expression mentionne une lecture d'``os.environ`` (racine ``os``).
 
     Couvre les formes directes (``os.environ``, ``os.environ.get``, ``os.getenv``,
     ``operator.getitem``) et les formes indirectionnées : curryfication
     (``getattr(os.environ, "get")("NOM")``), sous-référence via ``vars`` ou
-    ``getattr`` (``vars(os.environ)["NOM"]``, ``getattr(os, "environ")["NOM"]``).
+    ``getattr`` (``vars(os.environ)["NOM"]``, ``getattr(os, "environ")["NOM"]``),
+    et import dynamique (``__import__("os")``, ``importlib.import_module("os")``).
     Dans chaque cas, la clé littérale deviendrait la valeur lue si le patch était
     appliqué : le contexte est donc un re-ciblage.
     """
@@ -426,7 +440,10 @@ def _python_env_access_in(node: ast.AST) -> bool:
     if isinstance(node, ast.Attribute):
         return _python_env_access_in(node.value)
     if isinstance(node, ast.Call):
-        if _python_env_access_in(node.func):
+        if _python_dynamic_import(node) or _python_env_access_in(node.func):
+            # ``__import__("os")`` / ``importlib.import_module("os")`` : import
+            # dynamique, forme d'accès indirect à un module potentiellement ``os``
+            # — le doute profite au refus, jamais au remplacement.
             return True
         return any(
             _python_env_access_in(argument)
@@ -441,6 +458,10 @@ def _python_call_env_access(call: ast.Call) -> bool:
     """Vrai pour un appel dont le but ou un argument lit via ``os.environ``."""
     if _python_env_access_in(call.func):
         return True
+    if _python_dynamic_import(call):
+        # ``__import__("os")``, ``importlib.import_module("os")`` : accès
+        # indirect à un module potentiellement ``os`` — le doute profite au refus.
+        return True
     return any(
         _python_env_access_in(argument)
         for argument in (*call.args, *(keyword.value for keyword in call.keywords))
@@ -454,7 +475,8 @@ def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> 
     changerait la clé lue : le patch est refusé plutôt que corrompu. Le cas
     ``os.getenv(...)``/``os.environ.get(...)`` est traité de la même façon, ainsi
     que les formes indirectionnées (curryfication ``getattr(os.environ, "get")``,
-    sous-référence ``vars(os.environ)``/``getattr(os, "environ")``).
+    sous-référence ``vars(os.environ)``/``getattr(os, "environ")``) et les
+    imports dynamiques (``__import__("os")``, ``importlib.import_module``).
     """
     child = node
     parent = parents.get(child)
@@ -490,6 +512,10 @@ def _python_code_evaluation_context(node: ast.AST, parents: dict[ast.AST, ast.AS
         if isinstance(parent, ast.Call):
             function = parent.func
             if isinstance(function, ast.Name) and function.id in _CODE_EVALUATION_FUNCS:
+                return True
+            if isinstance(function, ast.Attribute) and function.attr in _CODE_EVALUATION_FUNCS:
+                # ``builtins.eval("NOM")``, ``__builtins__.exec("NOM")`` : l'attribut
+                # porte la même fonction d'évaluation que le nom court.
                 return True
         child = parent
         parent = parents.get(child)
@@ -1124,9 +1150,6 @@ _JS_FUNCTION_KEYWORD_LOOKBACK: Final[int] = 2
 _JS_ELLIPSIS_LOOKBACK: Final[int] = 3
 #: Nombre maximal de jetons d'opérateur avant le ``=`` d'une affectation.
 _JS_ASSIGNMENT_LOOKBACK: Final[int] = 3
-#: Fenêtre de contexte glissant pour détecter un accès ``process.env`` autour
-#: du littéral scruté (indice, getter, objet d'un appel).
-_JS_ENV_ACCESS_LOOKBACK: Final[int] = 12
 
 #: Mots-clés dont la parenthèse suivante n'est **pas** une liste de paramètres.
 _JS_NON_BINDING_PAREN_KEYWORDS: Final[frozenset[str]] = frozenset(
@@ -1441,7 +1464,19 @@ def _js_process_env_key(tokens: list[_JsToken], position: int) -> bool:
         # seuls un indice, un appel ou un argument peut être une clé dynamique.
         return False
     end = position - 1
-    start = max(0, position - _JS_ENV_ACCESS_LOOKBACK)
+    # Fenêtre glissante **bornée par le délimiteur ouvrant englobant** le
+    # littéral, jamais par une distance fixe : un crochet de clé calculée
+    # (``process.env[(a0, ..., a14, "SECRET")``) peut se situer à une distance
+    # quelconque du littéral dans la limite globale du fichier.
+    enclosing_map, _matching_delimiter = _js_delimiters(tokens)
+    node = enclosing_map[position]
+    while node is not None and not (tokens[node].kind == "punct" and tokens[node].value == "["):
+        node = enclosing_map[node]
+    start = 0
+    if node is not None:
+        parent = enclosing_map[node]
+        if parent is not None:
+            start = parent + 1
     return _js_env_access_present(tokens, start, end)
 
 
@@ -1535,20 +1570,30 @@ def _js_computed_process_key(tokens: list[_JsToken], position: int) -> bool:
 
     Le saut optionnel compte : ``process?.[KEY]`` est un accès par indice comme
     ``process[KEY]``, la clé étant une expression dont la fenêtre littérale ne
-    suffit pas à prouver la racine ``env``. De même, toute fenêtre contenant un
-    ident ``process`` alors que le littéral est en position d'indice, d'appel ou
-    d'argument (c'est-à-dire potentiellement une clé remontée) déclenche le refus.
+    suffit pas à prouver la racine ``env``. De même, toute clé dont le
+    délimiteur ouvrant englobant est un crochet ``[...]`` et dont le récepteur
+    mentionne ``process`` (membre ou indice) déclenche le refus. La recherche
+    part du délimiteur englobant, et non d'une distance fixe : la clé peut se
+    trouver à une profondeur variable dans la limite globale du fichier.
     """
-    start = max(0, position - _JS_ENV_ACCESS_LOOKBACK)
-    normalized = _js_normalize_optional_chaining(tokens, start, position)
     previous = tokens[position - 1] if position > 0 else None
     if previous is None or previous.kind != "punct" or previous.value not in {"[", "(", ",", ")"}:
         # Littéral hors position de clé : simple valeur (``const k = "SECRET"``),
         # pas une clé remontée ; seules les lectures dynamiques restent bloquées.
         return False
+    enclosing_map, _matching_delimiter = _js_delimiters(tokens)
+    opener = enclosing_map[position]
+    while opener is not None and not (
+        tokens[opener].kind == "punct" and tokens[opener].value == "["
+    ):
+        opener = enclosing_map[opener]
+    if opener is None:
+        # Le littéral n'est pas posé sur une clé de propriété calculée : les
+        # arguments d'appel (``f("SECRET")``) et les éléments de tableau
+        # (``["SECRET"]``) restent des positions d'expression éligibles au patch.
+        return False
+    normalized = _js_normalize_optional_chaining(tokens, 0, opener)
     for index, token in enumerate(normalized):
-        if token.line < tokens[position].line:
-            break
         if (
             token.kind == "ident"
             and token.value == "process"
@@ -1661,6 +1706,19 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
         and tokens[position - _CALL_NAME_OFFSET].kind == "ident"
         and tokens[position - _CALL_NAME_OFFSET].value in {"require", "import"}
     ):
+        return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
+    if (
+        previous is not None
+        and previous.kind == "punct"
+        and previous.value == "("
+        and position >= _CALL_NAME_OFFSET
+        and tokens[position - _CALL_NAME_OFFSET].kind == "ident"
+        and tokens[position - _CALL_NAME_OFFSET].value in {"eval", "Function", "compile"}
+    ):
+        # ``eval("NOM")`` / ``Function("NOM")`` / ``compile("NOM")`` : la valeur
+        # d'environnement serait ré-évaluée comme du code source (``eval`` du
+        # littéral, ``Function`` pour l'invocation dynamique). Le doute profite au
+        # refus, jamais au remplacement.
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
     if (
         following is not None
