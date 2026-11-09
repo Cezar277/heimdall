@@ -435,6 +435,31 @@ class AuditRetentionTests(unittest.IsolatedAsyncioTestCase):
                 conn.execute("UPDATE audit_events SET status_code = 500 WHERE id = 5")
             self.assertEqual(app.state.audit_log.verify_chain(), (False, 5))
 
+    async def test_sqlite_prune_handles_large_excess_in_batches(self) -> None:
+        """Une purge avec ``excess >> 1`` reste bornée et préserve la chaîne."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = _sqlite_app(tmp)
+            with patch.object(audit_module, "MAX_AUDIT_EVENTS", 1_000):
+                for index in range(50):
+                    await app.state.audit_log.record(
+                        peer="127.0.0.1",
+                        action=f"GET /{index}",
+                        target=None,
+                        status_code=200,
+                    )
+            with (
+                patch.object(audit_module, "MAX_AUDIT_EVENTS", 5),
+                patch.object(audit_module, "_PRUNE_BATCH_SIZE", 7),
+            ):
+                await app.state.audit_log.record(
+                    peer="127.0.0.1",
+                    action="GET /final",
+                    target=None,
+                    status_code=200,
+                )
+            self.assertEqual(app.state.audit_log.count(), 5)
+            self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
+
     async def test_sqlite_tampering_first_retained_row_is_located_after_prune(self) -> None:
         """Après purge, le premier événement retenu est ancré au point de contrôle."""
         with tempfile.TemporaryDirectory() as tmp:

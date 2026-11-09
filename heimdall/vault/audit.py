@@ -56,6 +56,9 @@ DEFAULT_LIST_LIMIT: Final[int] = 50
 # point de contrôle de chaîne est conservé. La valeur est volontairement
 # généreuse ; les tests la réduisent par patch pour vérifier la purge.
 MAX_AUDIT_EVENTS: Final[int] = 100_000
+# Purge par lots : chaque transaction ne supprime qu'un lot borné, pour ne pas
+# tenir le verrou d'écriture SQLite pendant une purge massive (excess >> 1).
+_PRUNE_BATCH_SIZE: Final[int] = 1_000
 
 _AUDIT_TABLE_SQL: Final[str] = """
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -413,24 +416,25 @@ class SqliteAuditLog(AuditLog):
         return str(row["checkpoint_hash"]), int(row["pruned_events"])
 
     @staticmethod
-    def _prune(conn: Any) -> None:
-        """Borne la table et avance le point de contrôle de chaîne.
+    def _prune(conn: Any) -> bool:
+        """Supprime au plus ``_PRUNE_BATCH_SIZE`` événements excédentaires.
 
-        Les événements supprimés restent prouvables par leur dernier
-        ``entry_hash`` conservé dans ``audit_chain_state`` : le premier
-        événement retenu pointe dessus, donc ``verify_chain`` reste valide.
+        Retourne ``True`` s'il reste des événements à purger. Chaque lot avance
+        le point de contrôle de chaîne avec le dernier ``entry_hash`` supprimé :
+        les événements retenus restent prouvables et ``verify_chain`` valide.
         """
         row = conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()
         count = int(row[0]) if row is not None else 0
         excess = count - max(1, MAX_AUDIT_EVENTS)
         if excess <= 0:
-            return
+            return False
+        batch = min(excess, _PRUNE_BATCH_SIZE)
         rows = conn.execute(
             "SELECT id, entry_hash FROM audit_events ORDER BY id ASC LIMIT ?",
-            (excess,),
+            (batch,),
         ).fetchall()
         if not rows:
-            return
+            return False
         checkpoint_hash = str(rows[-1]["entry_hash"])
         conn.executemany(
             "DELETE FROM audit_events WHERE id = ?",
@@ -446,6 +450,20 @@ class SqliteAuditLog(AuditLog):
             "updated_at = excluded.updated_at",
             (checkpoint_hash, len(rows), get_iso_timestamp()),
         )
+        return excess > len(rows)
+
+    def _prune_batched(self) -> None:
+        """Purge les excédents par lots, chaque lot dans sa propre transaction.
+
+        Le verrou d'écriture n'est donc tenu que pour ``_PRUNE_BATCH_SIZE``
+        suppressions au plus, même après l'import d'une base pré-remplie.
+        """
+        while True:
+            with db_session(self._db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                more = self._prune(conn)
+            if not more:
+                return
 
     async def record(  # noqa: PLR0913
         self,
@@ -528,7 +546,12 @@ class SqliteAuditLog(AuditLog):
                 ),
             )
             event_id = int(cursor.lastrowid or 0)
-            self._prune(conn)
+            row = conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()
+            needs_prune = int(row[0] if row is not None else 0) > max(
+                1, MAX_AUDIT_EVENTS
+            )
+        if needs_prune:
+            self._prune_batched()
         return AuditEvent(
             id=event_id,
             occurred_at=occurred_at,
