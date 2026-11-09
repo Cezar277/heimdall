@@ -322,6 +322,23 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
 - **Backends** : `SqliteAuditLog` en production (table partagée entre workers,
   écriture sous `BEGIN IMMEDIATE`) ; `InMemoryAuditLog` pour le backend mémoire
   de développement/test, strictement mono-processus et perdu au redémarrage.
+  Les identifiants d'événements ne sont jamais réutilisés, y compris après
+  purge (compteur monotone dans `InMemoryAuditLog`, `AUTOINCREMENT` en SQLite).
+- **Résiduel accepté : amplification des 429** : chaque 429, y compris le
+  refus issu du contrôle de débit en lecture seule (peek), produit une ligne
+  d'audit écrite sous `BEGIN IMMEDIATE`. Un processus local qui émet des
+  requêtes rejetées peut donc sérialiser des écritures et saturer le verrou
+  SQLite au détriment du trafic légitime. C'est un déni de service local, sans
+  élévation de privilège : le fail-closed reste tenu (503 générique, jamais
+  500) et la table reste bornée par `MAX_AUDIT_EVENTS`. Chaque écriture inclut
+  un `COUNT(*)` sur la table. Ce coût n'a pas été mesuré en charge ; si la
+  cadence l'exige, les mitigations sont la coalescence des 429 ou une alerte
+  sur la taille de la base.
+- **Résiduel documenté : `/api/v1/health` ignore la clé API** : l'en-tête
+  `X-Heimdall-API-Key` n'est ni haché ni recherché sur cette route, et seules
+  les limites pair/global s'appliquent. L'événement d'audit correspondant porte
+  donc `key_id` et `key_fingerprint` vides : un health avec clé valide est
+  indiscernable d'un health anonyme, et ne peut pas être corrélé à une clé.
 
 ## Rejeu de requête (#114)
 
