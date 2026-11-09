@@ -1411,7 +1411,7 @@ def _register_exception_handlers(app: FastAPI) -> None:
         )
 
 
-def _register_routes(app: FastAPI) -> None:
+def _register_routes(app: FastAPI) -> None:  # noqa: PLR0915
     """Enregistre les routes de l'API Vault."""
 
     @app.get(
@@ -1434,13 +1434,15 @@ def _register_routes(app: FastAPI) -> None:
         summary="Lister les métadonnées des secrets d'un projet",
         operation_id="listSecrets",
     )
-    async def list_secrets(
+    async def list_secrets(  # noqa: PLR0913, PLR0917
         project: Annotated[ProjectId, Query()],
+        request: Request,
         response: Response,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         offset: Annotated[int, Query(ge=0, le=_MAX_SECRET_OFFSET)] = 0,
         authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretPage:
+        request.state.audit_target = project
         vault_auth.ensure_project_access(
             authenticated_project, project, require_auth=app.state.settings.require_auth
         )

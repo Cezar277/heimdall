@@ -59,6 +59,34 @@ def _client(app):
 
 
 class AuditTrailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_list_is_audited_with_its_requested_project_target(self) -> None:
+        """GET /secrets?project= : la cible est le projet demandé, en succès comme en 403."""
+        app = _memory_app()
+        key = generate_api_key()
+        app.state.register_api_key(key, "demo")
+        async with _client(app) as client:
+            allowed = await client.get(
+                "/api/v1/secrets",
+                params={"project": "demo"},
+                headers={"X-Heimdall-API-Key": key},
+            )
+            forbidden = await client.get(
+                "/api/v1/secrets",
+                params={"project": "other"},
+                headers={"X-Heimdall-API-Key": key},
+            )
+            anonymous = await client.get("/api/v1/secrets", params={"project": "demo"})
+        self.assertEqual(
+            [allowed.status_code, forbidden.status_code, anonymous.status_code],
+            [200, 403, 401],
+        )
+        events = app.state.audit_log.list_events(limit=10)
+        self.assertEqual(
+            [(event["status_code"], event["target"]) for event in events],
+            [(200, "demo"), (403, "other"), (401, None)],
+        )
+        self.assertNotIn(key, json.dumps(events))
+
     async def test_success_and_auth_rejections_are_audited(self) -> None:
         """Chaque accès produit un événement : 200, 404, 403 et 401 compris."""
         app = _memory_app()
