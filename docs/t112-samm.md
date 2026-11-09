@@ -40,7 +40,7 @@ Révision du code testé : `591523beab901d06f229ccfe7a07dd1e318e990a`
 | Spoofing (oracle temporel sur l'existence d'une clé) | Parcours exhaustif, comparaison constante, empreinte factice, même 401 | `heimdall/vault/auth.py:823`, `:717`, `:738` ; `tests/test_vault_constant_time.py` |
 | Information disclosure (message d'erreur distinct) | 401 générique unique, aucun écho de la clé reçue | `heimdall/vault/auth.py:142`, test `test_missing_unknown_revoked_and_malformed_share_the_same_401` |
 | Denial of service (clé surdimensionnée) | Refus 401 avant hachage au-delà de 512 caractères | `heimdall/vault/auth.py:837`, `tests/test_vault_review_regressions.py:330` |
-| Contrat openapi.yaml:197–208 | `compare_digest`, haché salé, 401 générique, coût comparable | `openapi.yaml` (securitySchemes.ProjectApiKey), `docs/contracts/vault-api.md:345–365` |
+| Contrat openapi.yaml:197–208 | `compare_digest`, haché salé, 401 générique, coût comparable | `openapi.yaml` (securitySchemes.ProjectApiKey), `docs/contracts/vault-api.md:424–431` |
 
 ## 4. Résultats locaux
 

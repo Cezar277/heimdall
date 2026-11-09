@@ -382,9 +382,12 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
   SQLite au détriment du trafic légitime. C'est un déni de service local, sans
   élévation de privilège : le fail-closed reste tenu (503 générique, jamais
   500) et la table reste bornée par `MAX_AUDIT_EVENTS`. Chaque écriture inclut
-  un `COUNT(*)` sur la table. Ce coût n'a pas été mesuré en charge ; si la
-  cadence l'exige, les mitigations sont la coalescence des 429 ou une alerte
-  sur la taille de la base.
+  un `COUNT(*)` sur la table. Mesure locale (un processus, une machine de
+  développement, table pleine à 100 000 lignes) : environ 1,6 ms par écriture,
+  soit au plus environ 600 écritures d'audit par seconde en série. Quand le
+  verrou reste indisponible plus de 250 ms (`busy_timeout`), les requêtes qui
+  attendent reçoivent un 503 générique, sans 500. Mitigations si la cadence l'exige : coalescence des 429 ou alerte sur la
+  taille de la base. Une mesure sur matériel de production reste à faire.
 - **Résiduel documenté : `/api/v1/health` ignore la clé API** : l'en-tête
   `X-Heimdall-API-Key` n'est ni haché ni recherché sur cette route, et seules
   les limites pair/global s'appliquent. L'événement d'audit correspondant porte

@@ -64,9 +64,9 @@ Chaque événement contient `occurred_at`, `key_id`, `key_fingerprint`,
 | Denial of service (journal indisponible) | Fail-closed 503 générique, pas de fuite interne | `heimdall/vault/audit.py:625`, `:716` ; test `test_audit_failure_is_fail_closed` |
 | Denial of service (croissance disque) | Rétention bornée + point de contrôle, purge testée | `heimdall/vault/audit.py:57`, `:411` ; tests de rétention |
 | Log injection | Troncature au premier non-imprimable, longueurs bornées | `heimdall/vault/audit.py:98` ; test `test_audit_sanitizes_control_characters` |
-| Denial of service (saturation du verrou par 429 répétés) | Résiduel **accepté et documenté** : fail-closed 503 tenu, table bornée ; coût en charge non mesuré | `heimdall/vault/audit.py:628`, `docs/contracts/vault-api.md:327` |
-| Corrélation health / clé API | Résiduel **documenté** : `/api/v1/health` ignore la clé, événement d'audit sans `key_id` ni empreinte | `heimdall/vault/app.py:1168`, `docs/contracts/vault-api.md:337` |
-| Contrat openapi.yaml | Aucune route HTTP ajoutée : le journal est consulté par la CLI, pas exposé sur le réseau | `heimdall/cli/vault_keys.py:203`, `docs/contracts/vault-api.md:285` |
+| Denial of service (saturation du verrou par 429 répétés) | Résiduel **accepté et documenté** : fail-closed 503 tenu, table bornée ; coût mesuré localement (~1,6 ms par écriture à 100 000 lignes, un processus) | `heimdall/vault/audit.py:628`, `docs/contracts/vault-api.md:378` |
+| Corrélation health / clé API | Résiduel **documenté** : `/api/v1/health` ignore la clé, événement d'audit sans `key_id` ni empreinte | `heimdall/vault/app.py:1168`, `docs/contracts/vault-api.md:391` |
+| Contrat openapi.yaml | Aucune route HTTP ajoutée : le journal est consulté par la CLI, pas exposé sur le réseau | `heimdall/cli/vault_keys.py:203`, `docs/contracts/vault-api.md:330` |
 
 ## 4. Résultats locaux
 
