@@ -19,9 +19,10 @@
     "scope": {
       "enum": [
         "working-tree",
-        "staged"
+        "staged",
+        "diff"
       ],
-      "description": "Périmètre analysé : arbre de travail (base VCS et entrées `.gitignore` non suivies écartées) ou blobs ajoutés ou modifiés de l'index, sans aucune exclusion de chemin."
+      "description": "Périmètre analysé : arbre de travail (base VCS et entrées `.gitignore` non suivies écartées), blobs ajoutés ou modifiés de l'index, ou blobs ajoutés ou modifiés entre l'ancêtre commun d'une référence et HEAD (mode `--ci --diff`, trois points), sans aucune exclusion de chemin."
     },
     "count": {
       "type": "integer",
@@ -83,13 +84,13 @@
       "type": "integer",
       "minimum": 0,
       "default": 0,
-      "description": "Nombre de bases VCS (`.git/`, `.hg/`, `.svn/`) élaguées par politique lors d'un scan d'arbre. Toujours 0 en `--staged`, qui ne parcourt pas l'arbre. Un `0` de ce champ signifie « aucune base rencontrée », jamais « historique analysé ». En mode `--ci`, un arbre sans aucun contenu lu alors qu'une exclusion a été appliquée (`vcs_ignored > 0` ou `git_ignored > 0`) est refusé en code 2 : il ne produit donc pas de document JSON avec un faux verdict propre."
+      "description": "Nombre de bases VCS (`.git/`, `.hg/`, `.svn/`) élaguées par politique lors d'un scan d'arbre. Toujours 0 en `--staged` et `--diff`, qui ne parcourent pas l'arbre. Un `0` de ce champ signifie « aucune base rencontrée », jamais « historique analysé ». En mode `--ci`, un arbre sans aucun contenu lu alors qu'une exclusion a été appliquée (`vcs_ignored > 0` ou `git_ignored > 0`) est refusé en code 2 : il ne produit donc pas de document JSON avec un faux verdict propre."
     },
     "git_ignored": {
       "type": "integer",
       "minimum": 0,
       "default": 0,
-      "description": "Nombre d'entrées non suivies et ignorées par un `.gitignore` du dépôt, écartées lors d'un scan d'arbre (#59) : un fichier ignoré compte pour une entrée, un répertoire ignoré élagué compte aussi pour une. Un fichier suivi n'est jamais compté ni écarté, même si un `.gitignore` le matche (`git add -f`) : il reste analysé. Toujours 0 en `--staged` et avec `--no-gitignore`. En mode `--ci`, un arbre dont aucune entrée de contenu n'a été lue (exclusions seules) est refusé en code 2."
+      "description": "Nombre d'entrées non suivies et ignorées par un `.gitignore` du dépôt, écartées lors d'un scan d'arbre (#59) : un fichier ignoré compte pour une entrée, un répertoire ignoré élagué compte aussi pour une. Un fichier suivi n'est jamais compté ni écarté, même si un `.gitignore` le matche (`git add -f`) : il reste analysé. Toujours 0 en `--staged`, `--diff` et avec `--no-gitignore`. En mode `--ci`, un arbre dont aucune entrée de contenu n'a été lue (exclusions seules) est refusé en code 2."
     }
   }
 }

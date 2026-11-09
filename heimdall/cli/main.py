@@ -118,13 +118,22 @@ def scan(  # noqa: PLR0913, PLR0917
         "--no-gitignore",
         help=(
             "Scanne aussi les fichiers non suivis ignorés par .gitignore "
-            "(aucune exclusion Git). Sans effet avec --staged."
+            "(aucune exclusion Git). Sans effet avec --staged et --diff."
         ),
     ),
     ci: bool = typer.Option(
         False,
         "--ci",
         help="Mode CI headless : verdict déterministe porté par le code de sortie.",
+    ),
+    diff: str | None = typer.Option(
+        None,
+        "--diff",
+        metavar="REF",
+        help=(
+            "Analyse les blobs ajoutés ou modifiés entre REF et HEAD "
+            "(merge-base, trois points). Exige --ci."
+        ),
     ),
     staged: bool = typer.Option(
         False,
@@ -146,7 +155,10 @@ def scan(  # noqa: PLR0913, PLR0917
     ``.gitignore`` (``git add -f``) ; ``vendor/`` et les lockfiles non ignorés
     sont donc parcourus. ``--no-gitignore`` restaure un parcours intégral.
     Avec ``--staged``, ce sont les blobs **ajoutés ou modifiés** dans l'index
-    git qui sont analysés, sans aucune exclusion de chemin.
+    git qui sont analysés, sans aucune exclusion de chemin. Avec
+    ``--ci --diff REF``, ce sont les blobs **ajoutés ou modifiés** entre
+    l'ancêtre commun de ``REF`` et ``HEAD`` et ``HEAD`` (trois points) :
+    seuls les changements de la branche courante sont jugés.
 
     L'allowlist déterministe (#24) écarte les cas évidents sans passer par
     le LLM et émet une trace pour chaque rejet (règle, fichier, ligne).
@@ -162,12 +174,19 @@ def scan(  # noqa: PLR0913, PLR0917
     if config is not None and no_allowlist:
         _echo_stderr_best_effort("options incompatibles : --config et --no-allowlist")
         raise typer.Exit(code=2)
+    if diff is not None and not ci:
+        _echo_stderr_best_effort("options incompatibles : --diff exige --ci")
+        raise typer.Exit(code=2)
+    if diff is not None and staged:
+        _echo_stderr_best_effort("options incompatibles : --diff et --staged")
+        raise typer.Exit(code=2)
 
     try:
         custom_allowlist = Allowlist.empty() if no_allowlist else None
         report = collect(
             Path(path),
             staged=staged,
+            diff=diff,
             config=config,
             allowlist=custom_allowlist,
             ci=ci,

@@ -2167,6 +2167,35 @@ def test_scan_ci_json_staged_combines(git_repo: GitRepo) -> None:
     assert FAKE_AWS_KEY not in resultat.stderr
 
 
+def test_scan_ci_json_diff_matches_the_schema(git_repo: GitRepo) -> None:
+    """Le document ``--json --diff`` valide le contrat ``heimdall.scan.v1`` (#37)."""
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.commit_all("base")
+    git_repo.git("branch", "-M", "main")
+    git_repo.git("update-ref", "refs/remotes/origin/main", "main")
+    git_repo.git("checkout", "-q", "-b", "feature")
+    git_repo.write("new.py", f'AWS = "{FAKE_AWS_KEY}"\n')
+    git_repo.commit_all("feature")
+
+    resultat = _run(
+        "scan",
+        "--ci",
+        "--json",
+        "--diff",
+        "origin/main",
+        "--no-allowlist",
+        str(git_repo.root),
+    )
+
+    assert resultat.exit_code == EXIT_FINDINGS
+    document = json.loads(resultat.stdout)
+    _validate_scan_document(document)
+    assert document["scope"] == "diff"
+    assert document["count"] == 1
+    assert FAKE_AWS_KEY not in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.stderr
+
+
 # --- lecture de l'index : analyse de la sortie « raw » ----------------------
 
 
