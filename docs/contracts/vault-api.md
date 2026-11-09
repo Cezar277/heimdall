@@ -359,7 +359,10 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
   les plus anciens événements sont purgés et leur dernier `entry_hash` est
   conservé dans `audit_chain_state.checkpoint_hash` ; le premier événement
   retenu pointe dessus, donc `verify` reste valide sans charger tout
-  l'historique. La purge est testée par patch du seuil (mémoire et SQLite).
+  l'historique. La purge SQLite procède par lots de 1000, chaque lot dans sa
+  propre transaction, pour ne pas tenir le verrou d'écriture pendant une
+  suppression massive. La purge est testée par patch du seuil (mémoire et
+  SQLite), y compris avec un excès bien supérieur à un lot.
 - **Listage borné** : `list_events` applique le même bornage aux deux backends,
   `max(1, min(MAX_LIST_LIMIT, int(limit)))` (1 à 1000). Une limite négative ou
   nulle retombe sur 1 et une limite supérieure à 1000 est plafonnée : un appel
