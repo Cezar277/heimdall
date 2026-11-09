@@ -322,6 +322,11 @@ limite effective serait multipliée par le nombre de workers ; la production
 utilise donc le backend SQLite. Le quota de stockage reste indépendant de cette
 limite de débit.
 
+Les admissions expirées de toutes les fenêtres sont purgées à chaque évaluation,
+rejets compris (index `idx_rate_limit_hits_at`) : la table ne retient que la
+fenêtre courante, donc sa taille reste proportionnelle au débit reçu pendant la
+fenêtre, sans dépendre des admissions autorisées.
+
 ## Journal d'audit (#113)
 
 Chaque accès au Vault produit un événement dans `audit_events`, **y compris les
