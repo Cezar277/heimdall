@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Final, Literal
 
 from heimdall.mcp.errors import ToolFailure
-from heimdall.mcp.gitdiff import GIT_TIMEOUT_SECONDS, GitAccess
+from heimdall.mcp.gitdiff import GIT_TIMEOUT_SECONDS, GitAccess, StagedChange
 from heimdall.scanner.allowlist import (
     MAX_CONFIG_BYTES,
     Allowlist,
@@ -70,12 +70,14 @@ EXIT_FINDINGS: Final[int] = 1
 EXIT_ERROR: Final[int] = 2
 
 #: Périmètres contractuels du scan (contrat de sortie JSON, `scope`).
-Scope = Literal["working-tree", "staged"]
+Scope = Literal["working-tree", "staged", "diff"]
 
 #: Périmètre « arbre de travail ».
 SCOPE_TREE: Final[Scope] = "working-tree"
 #: Périmètre « index git ».
 SCOPE_STAGED: Final[Scope] = "staged"
+#: Périmètre « plage de commits » (#37) : merge-base(base, HEAD) → HEAD.
+SCOPE_DIFF: Final[Scope] = "diff"
 
 #: Version du contrat de sortie JSON (``--json``).
 JSON_SCHEMA: Final[str] = "heimdall.scan.v1"
@@ -128,6 +130,7 @@ logger = logging.getLogger("heimdall.cli.scan")
 _SCOPE_LABELS: Final[dict[Scope, str]] = {
     SCOPE_TREE: "arbre de travail (base VCS et entrées .gitignore non suivies écartées)",
     SCOPE_STAGED: "index git (blobs ajoutés ou modifiés, aucune exclusion de chemin)",
+    SCOPE_DIFF: "plage de commits (merge-base...HEAD, blobs ajoutés ou modifiés)",
 }
 
 #: Rappel du contrat de codes de sortie, affiché à l'humain.
@@ -160,6 +163,11 @@ class ScanReport:
     config_hash: str | None = None
     vcs_ignored: int = 0
     git_ignored: int = 0
+    #: Nombre de fichiers/blobs effectivement analysés, pour le résumé
+    #: ``--ci`` sur stderr. Ce champ n'est **pas** sérialisé dans le JSON
+    #: (contrat v1 inchangé) : il rend seulement observable une plage vide
+    #: (``--diff HEAD``) ou un périmètre sans contenu.
+    scanned_files: int | None = None
 
     def __post_init__(self) -> None:
         # Garde runtime pour les appelants non typés : le `Literal` protège
@@ -170,6 +178,10 @@ class ScanReport:
         if type(self.vcs_ignored) is not int or self.vcs_ignored < 0:
             raise ScanError(_MSG_INVALID_SCOPE)
         if type(self.git_ignored) is not int or self.git_ignored < 0:
+            raise ScanError(_MSG_INVALID_SCOPE)
+        if self.scanned_files is not None and (
+            type(self.scanned_files) is not int or self.scanned_files < 0
+        ):
             raise ScanError(_MSG_INVALID_SCOPE)
 
     @property
@@ -182,6 +194,7 @@ def collect(  # noqa: PLR0913 - explicit scan options
     root: Path,
     *,
     staged: bool,
+    diff: str | None = None,
     config: str | Path | None = None,
     allowlist: Allowlist | None = None,
     ci: bool = False,
@@ -202,7 +215,15 @@ def collect(  # noqa: PLR0913 - explicit scan options
     mode arbre : ``False`` restaure un parcours intégral (``--no-gitignore``).
     Une valeur non booléenne est refusée (``ScanError``) au lieu d'activer ou
     de désactiver l'exclusion par accident. L'option est sans effet avec
-    ``staged=True`` : ce périmètre ne consulte jamais ``.gitignore``.
+    ``staged=True`` et avec ``diff`` : ces périmètres ne consultent jamais
+    ``.gitignore``.
+
+    ``diff`` (#37) active le périmètre différentiel ``base...HEAD`` (trois
+    points = depuis l'ancêtre commun). Il exige ``ci=True``, est incompa-
+    tible avec ``staged=True`` et avec les options réservées à l'arbre
+    (``max_file_bytes``, ``skipped_files``). La référence est validée puis
+    résolue en SHA avant tout appel git ; un clone superficiel sans ancêtre
+    commun est une erreur d'outillage (code 2), jamais un verdict propre.
 
     **Auto-attestation (CWE-345)** : si ``allowlist`` est fourni (API), la
     garde anti auto-attestation est contournée. Le seul usage légitime dans
@@ -212,6 +233,15 @@ def collect(  # noqa: PLR0913 - explicit scan options
     de ``heimdall.toml`` interne. En cas de doute, ne pas injecter
     d'allowlist non-vide ou utiliser ``config`` externe / ``--no-allowlist``.
     """
+    if diff is not None:
+        if staged:
+            raise ScanError("périmètres incompatibles")
+        if not isinstance(diff, str) or not diff:
+            raise ScanError("référence de diff invalide")
+        if not ci:
+            raise ScanError("le mode diff exige --ci")
+        if max_file_bytes is not None or skipped_files is not None:
+            raise ScanError("limite de fichier invalide")
     if staged and (max_file_bytes is not None or skipped_files is not None):
         raise ScanError("limite de fichier invalide")
     if max_file_bytes is not None and (
@@ -221,6 +251,8 @@ def collect(  # noqa: PLR0913 - explicit scan options
     if not isinstance(respect_gitignore, bool):
         raise ScanError("politique d'exclusions Git invalide")
     try:
+        if diff is not None:
+            return _collect_diff(root, base=diff, config=config, custom_allowlist=allowlist)
         if staged:
             return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
         return _collect_tree(
@@ -614,6 +646,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
         config_hash=allowlist.sha256,
         vcs_ignored=scanner.vcs_ignored,
         git_ignored=scanner.git_ignored,
+        scanned_files=scanner.files_scanned,
     )
 
 
@@ -629,6 +662,90 @@ def _call_timeout(deadline: float) -> float:
     if remaining <= 0:
         raise ScanError(_MSG_TIMEOUT)
     return min(remaining, GIT_TIMEOUT_SECONDS)
+
+
+def _scan_changes(
+    access: GitAccess,
+    changes: Sequence[StagedChange],
+    allowlist: Allowlist,
+    deadline: float,
+) -> tuple[list[Finding], tuple[AllowlistTrace, ...]]:
+    """Scanne les blobs d'une liste de changements (index ou plage de commits).
+
+    Mutualise les bornes et le moteur entre ``--staged`` (#29) et ``--diff``
+    (#37). Chaque blob est lu, décodé, scanné puis oublié avant le suivant :
+    au plus un blob (1 Mio) vit en mémoire, pas les 32 Mio du périmètre. Les
+    Findings sont triés (fichier, ligne, type, empreinte) ; les traces de
+    l'allowlist sont rendues avec eux.
+    """
+    # Même échéance que la passe : un blob dense est interrompu à l'intérieur,
+    # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).
+    engine = SignatureEngine(
+        max_findings=MAX_STAGED_FINDINGS,
+        deadline=deadline,
+        allowlist=allowlist,
+    )
+    moteur = TargetScanner(engine)
+    findings: list[Finding] = []
+    total = 0
+    for change in changes:
+        size = access.blob_size(
+            change.blob,
+            timeout=_call_timeout(deadline),
+        )
+        # Plancher explicite : même si un `GitAccess` dérivé rendait une
+        # taille négative, `total` ne doit jamais reculer (la borne de
+        # volume serait sinon contournable). Zéro reste valide : un blob
+        # vide ne porte aucun candidat.
+        if size < 0 or size > MAX_FILE_BYTES:
+            raise ScanError(_MSG_TOO_LARGE)
+        total += size
+        if total > MAX_STAGED_BYTES:
+            raise ScanError(_MSG_TOO_LARGE)
+        data = access.blob_bytes(
+            change.blob,
+            timeout=_call_timeout(deadline),
+        )
+        # La taille annoncée par `cat-file -s` est un oracle, pas une
+        # garantie : le contenu relu doit faire exactement cette taille.
+        # Un écart (store incohérent, objet remplacé) refuserait sinon un
+        # scan partiel ou ferait lire un blob au-delà de la borne 1 Mio.
+        if len(data) != size:
+            raise ScanError(_MSG_BLOB_CHANGED)
+        if len(data) > MAX_FILE_BYTES:
+            raise ScanError(_MSG_TOO_LARGE)
+        text = decode_text(data)
+        # Le texte n'est jamais retenu : chaque blob est lu, décodé, scanné
+        # puis oublié avant le suivant — au plus un blob (1 Mio) vit en
+        # mémoire, pas les 32 Mio du périmètre. `text`, `data` et `target`
+        # sont réassignés à chaque tour ; rien ne les accumule.
+        if text is None:
+            # Binaire reconnu : aucun texte à analyser. Contrairement à une
+            # exclusion de chemin, ce n'est pas une raison de rendre un
+            # verdict propre : un secret peut vivre dans le binaire (même
+            # limite qu'en mode arbre). Refus fail-closed, code 2.
+            raise ScanError(_MSG_BINARY)
+        # `FileTarget` valide le chemin (contrat #14) : un chemin que le
+        # contrat ne sait pas représenter est une erreur, pas un fichier
+        # ignoré en silence.
+        target = FileTarget(path=change.path, text=text)
+        # Cible par cible, pas `scan_all` : le plafond Findings est vérifié
+        # par candidat dans le moteur (un seul blob dense ne fait jamais
+        # gonfler la liste), et ici entre cibles (l'accumulation sur tout
+        # le périmètre reste bornée). L'ordre de sortie reste celui de
+        # `scan_all` (même clé de tri ci-dessous).
+        findings.extend(moteur.scan(target))
+        if len(findings) > MAX_STAGED_FINDINGS:
+            raise ScanError(_MSG_TOO_MANY_FINDINGS)
+    findings.sort(
+        key=lambda finding: (
+            finding.file,
+            finding.line,
+            finding.type,
+            finding.snippet_hash,
+        )
+    )
+    return findings, tuple(engine.traces)
 
 
 def _collect_staged(
@@ -687,73 +804,7 @@ def _collect_staged(
             )
         )
     )
-    # Même échéance que la passe : un blob dense est interrompu à l'intérieur,
-    # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).
-    engine = SignatureEngine(
-        max_findings=MAX_STAGED_FINDINGS,
-        deadline=deadline,
-        allowlist=allowlist,
-    )
-    moteur = TargetScanner(engine)
-    findings: list[Finding] = []
-    total = 0
-    for change in changes:
-        size = access.blob_size(
-            change.blob,
-            timeout=_call_timeout(deadline),
-        )
-        # Plancher explicite : même si un `GitAccess` dérivé rendait une
-        # taille négative, `total` ne doit jamais reculer (la borne de
-        # volume serait sinon contournable). Zéro reste valide : un blob
-        # vide ne porte aucun candidat.
-        if size < 0 or size > MAX_FILE_BYTES:
-            raise ScanError(_MSG_TOO_LARGE)
-        total += size
-        if total > MAX_STAGED_BYTES:
-            raise ScanError(_MSG_TOO_LARGE)
-        data = access.blob_bytes(
-            change.blob,
-            timeout=_call_timeout(deadline),
-        )
-        # La taille annoncée par `cat-file -s` est un oracle, pas une
-        # garantie : le contenu relu doit faire exactement cette taille.
-        # Un écart (store incohérent, objet remplacé) refuserait sinon un
-        # scan partiel ou ferait lire un blob au-delà de la borne 1 Mio.
-        if len(data) != size:
-            raise ScanError(_MSG_BLOB_CHANGED)
-        if len(data) > MAX_FILE_BYTES:
-            raise ScanError(_MSG_TOO_LARGE)
-        text = decode_text(data)
-        # Le texte n'est jamais retenu : chaque blob est lu, décodé, scanné
-        # puis oublié avant le suivant — au plus un blob (1 Mio) vit en
-        # mémoire, pas les 32 Mio du périmètre. `text`, `data` et `target`
-        # sont réassignés à chaque tour ; rien ne les accumule.
-        if text is None:
-            # Binaire reconnu : aucun texte à analyser. Contrairement à une
-            # exclusion de chemin, ce n'est pas une raison de rendre un
-            # verdict propre : un secret peut vivre dans le binaire (même
-            # limite qu'en mode arbre). Refus fail-closed, code 2.
-            raise ScanError(_MSG_BINARY)
-        # `FileTarget` valide le chemin (contrat #14) : un chemin que le
-        # contrat ne sait pas représenter est une erreur, pas un fichier
-        # ignoré en silence.
-        target = FileTarget(path=change.path, text=text)
-        # Cible par cible, pas `scan_all` : le plafond Findings est vérifié
-        # par candidat dans le moteur (un seul blob dense ne fait jamais
-        # gonfler la liste), et ici entre cibles (l'accumulation sur tout
-        # l'index reste bornée). L'ordre de sortie reste celui de `scan_all`
-        # (même clé de tri ci-dessous).
-        findings.extend(moteur.scan(target))
-        if len(findings) > MAX_STAGED_FINDINGS:
-            raise ScanError(_MSG_TOO_MANY_FINDINGS)
-    findings.sort(
-        key=lambda finding: (
-            finding.file,
-            finding.line,
-            finding.type,
-            finding.snippet_hash,
-        )
-    )
+    findings, traces = _scan_changes(access, changes, allowlist, deadline)
     if set(access.staged_changes(timeout=_call_timeout(deadline))) != set(changes):
         # L'index a bougé pendant le scan : le snapshot analysé ne décrit
         # plus ce qui sera committé. Refus, pas de verdict périmé. La
@@ -763,12 +814,88 @@ def _collect_staged(
         raise ScanError(_MSG_INDEX_CHANGED)
     _call_timeout(deadline)
     _verify_root_unchanged(access, root)
-    traces = engine.traces
     return ScanReport(
         scope=SCOPE_STAGED,
         findings=tuple(findings),
-        traces=tuple(traces),
+        traces=traces,
         config_hash=allowlist.sha256,
+        scanned_files=len(changes),
+    )
+
+
+def _collect_diff(
+    root: Path,
+    *,
+    base: str,
+    config: str | Path | None = None,
+    custom_allowlist: Allowlist | None = None,
+) -> ScanReport:
+    """Scanne les blobs ajoutés ou modifiés entre ``base...HEAD`` (#37).
+
+    Comparaison à **trois points** : ``git diff base...HEAD`` part de
+    l'ancêtre commun, donc seuls les changements apportés par la branche
+    courante sont jugés. Un secret présent sur la branche cible mais absent
+    de la branche courante n'est pas dans le diff ; un secret supprimé par
+    la branche courante n'a plus de blob à scanner. Le mode est strictement
+    headless : ``collect`` exige ``ci=True``, aucun LLM n'est appelé.
+
+    La base est validée puis résolue en SHA avant tout appel git ; ``HEAD``
+    est également figé en SHA. Après l'analyse, ``HEAD`` est re-résolu : s'il
+    a bougé, le verdict est refusé (code 2). La plage elle-même est immuable
+    (deux SHA), donc aucune relecture de diff n'est nécessaire. Les bornes
+    de volume, de Findings et de durée sont celles de ``--staged``
+    (:data:`MAX_STAGED_FILES`, :data:`MAX_STAGED_BYTES`,
+    :data:`MAX_STAGED_FINDINGS`, :data:`MAX_STAGED_SECONDS`).
+
+    Un clone superficiel sans ancêtre commun fait échouer git : le scan
+    rend 2, jamais 0. Les modèles CI de ``docs/ci/`` imposent
+    ``fetch-depth: 0`` / ``GIT_DEPTH: 0`` pour l'éviter.
+    """
+    deadline = time.monotonic() + MAX_STAGED_SECONDS
+    access = GitAccess(root)
+    if not access.is_repository(timeout=_call_timeout(deadline)):
+        raise ScanError(_MSG_NOT_A_REPO)
+    base_sha = access.resolve_commit(base, timeout=_call_timeout(deadline))
+    head_sha = access.resolve_commit("HEAD", timeout=_call_timeout(deadline))
+    changes = access.diff_changes(base_sha, head_sha, timeout=_call_timeout(deadline))
+    if len(changes) > MAX_STAGED_FILES:
+        raise ScanError(_MSG_TOO_MANY_FILES)
+
+    # Le mode diff est un mode CI : la configuration du dépôt scanné ne peut
+    # jamais s'auto-attester. Un `--config` externe reste autorisé. En CI, la
+    # garde ne rend jamais de `_VerifiedConfig` : soit elle refuse, soit la
+    # configuration est externe (ou absente).
+    _guard_anti_self_attestation(
+        access,
+        ci=True,
+        config=config,
+        custom_allowlist=custom_allowlist,
+        staged_changes=changes,
+        timeout=_call_timeout(deadline),
+        is_staged_scan=False,
+    )
+    allowlist = (
+        custom_allowlist
+        if custom_allowlist is not None
+        else load_allowlist(
+            access.root,
+            config_file=config,
+            allow_external=True,
+        )
+    )
+    findings, traces = _scan_changes(access, changes, allowlist, deadline)
+    if access.resolve_commit("HEAD", timeout=_call_timeout(deadline)) != head_sha:
+        # HEAD a bougé pendant l'analyse : le diff figé ne décrit plus le
+        # commit courant. Refus, pas de verdict périmé.
+        raise ScanError(_MSG_INDEX_CHANGED)
+    _call_timeout(deadline)
+    _verify_root_unchanged(access, root)
+    return ScanReport(
+        scope=SCOPE_DIFF,
+        findings=tuple(findings),
+        traces=traces,
+        config_hash=allowlist.sha256,
+        scanned_files=len(changes),
     )
 
 
@@ -779,9 +906,9 @@ def render_json(report: ScanReport) -> str:
     eux-mêmes (les sept champs du contrat #14), ainsi que le nombre de
     findings ignorés et les traces de chaque rejet par l'allowlist (#24), le
     nombre de bases VCS élaguées (``vcs_ignored``, toujours 0 en
-    ``--staged``) et le nombre d'entrées non suivies ignorées par
-    ``.gitignore`` (``git_ignored``, toujours 0 en ``--staged`` et avec
-    ``--no-gitignore``). Aucun secret n'est inclus.
+    ``--staged`` et ``--diff``) et le nombre d'entrées non suivies ignorées
+    par ``.gitignore`` (``git_ignored``, toujours 0 en ``--staged``,
+    ``--diff`` et avec ``--no-gitignore``). Aucun secret n'est inclus.
     """
     payload = {
         "schema": JSON_SCHEMA,
@@ -875,6 +1002,7 @@ __all__ = [
     "MAX_STAGED_FINDINGS",
     "MAX_STAGED_SECONDS",
     "MAX_TREE_SECONDS",
+    "SCOPE_DIFF",
     "SCOPE_STAGED",
     "SCOPE_TREE",
     "ScanReport",

@@ -43,6 +43,7 @@ Références :
 heimdall scan [CHEMIN]              # arbre de travail (mode strict)
 heimdall scan --staged [CHEMIN]     # blobs ajoutés ou modifiés dans l'index
 heimdall scan --ci [CHEMIN]         # mode CI headless (verdict = code de sortie)
+heimdall scan --ci --diff REF [CHEMIN]  # merge-base(REF, HEAD)...HEAD
 heimdall scan --json [CHEMIN]       # rapport JSON sur stdout
 heimdall scan --no-gitignore [CHEMIN]  # parcours intégral de l'arbre
 ```
@@ -50,7 +51,8 @@ heimdall scan --no-gitignore [CHEMIN]  # parcours intégral de l'arbre
 | Option | Effet |
 | --- | --- |
 | `--staged` | change le **périmètre** : les blobs **ajoutés ou modifiés** de l'index git, lus blob par blob, **sans aucune exclusion de chemin** (les `.gitignore` n'ont aucun effet) |
-| `--no-gitignore` | désactive les **exclusions Git sûres** du mode arbre : les entrées non suivies ignorées par un `.gitignore` sont aussi scannées. Sans effet en `--staged` |
+| `--diff REF` | change le **périmètre** : les blobs **ajoutés ou modifiés** entre l'ancêtre commun de `REF` et `HEAD` et `HEAD` (trois points). Exige `--ci`, incompatible avec `--staged` ; aucune exclusion de chemin |
+| `--no-gitignore` | désactive les **exclusions Git sûres** du mode arbre : les entrées non suivies ignorées par un `.gitignore` sont aussi scannées. Sans effet en `--staged` et `--diff` |
 | `--ci` | mode **headless** : aucun dialogue, aucun LLM, aucun réseau ; le verdict est le code de sortie, et un résumé déterministe est écrit sur stderr (secrets ignorés par l'allowlist, bases VCS élaguées et entrées `.gitignore` écartées) |
 | `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; inclut les traces et décomptes d'allowlist (#24) ; les erreurs restent sur stderr |
 | `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) ; un chemin **hors du dépôt** est accepté : choix opérateur explicite, soumis aux mêmes gardes (`_resolve_root` + `O_NOFOLLOW`, plafond de taille, contrat fermé) |
@@ -105,22 +107,23 @@ Sous Python ≥ 3.13, `fnmatch` complète cette borne avec des groupes
 atomiques natifs.
 
 `CHEMIN` vaut `.` par défaut. Il doit être la **racine** d'un dépôt git,
-dans les deux périmètres (sinon : erreur, code 2) : hors dépôt —
+dans les trois périmètres (sinon : erreur, code 2) : hors dépôt —
 répertoire quelconque, fichier isolé — il n'y a pas de verdict « propre »,
 pour qu'une CI mal configurée (mauvais chemin) échoue loud au lieu de
 rendre 0 en silence. Le scan de fichier isolé reste possible en
 bibliothèque (`Scanner`, #22), hors contrat hook/CI.
 
-## Les deux périmètres
+## Les trois périmètres
 
 | Périmètre | Ce qui est analysé | Exclusions |
 | --- | --- | --- |
 | `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **base VCS** (`.git/`, `.hg/`, `.svn/` : métadonnées, pas du contenu) et **entrées non suivies ignorées par un `.gitignore` du dépôt**. Un fichier **suivi** est toujours lu, même si un motif le matche (`git add -f`). Tout le reste (`vendor/`, `node_modules/`, `.venv/`, lockfiles, sorties de build **non ignorés**) est lu par contenu ; binaire connu, lien ou fichier illisible est **refusé** (code 2), jamais sauté |
 | `staged` (`--staged`) | le contenu **indexé** de chaque fichier ajouté ou modifié | **aucune exclusion de chemin** : `vendor/`, `third_party/`, `package-lock.json`, `.gitignore`… sont analysés ; un binaire connu est **refusé** (code 2), jamais sauté |
+| `diff` (`--ci --diff REF`) | les blobs **ajoutés ou modifiés** entre `merge-base(REF, HEAD)` et `HEAD` (trois points) | **aucune exclusion de chemin** ; suppressions et gitlinks ignorés (aucun blob à scanner), binaire connu **refusé** (code 2) |
 
 « Aucune exclusion de **chemin** » ne veut pas dire « aucune exclusion du
 tout » : un contenu dont la signature magique **et** la majorité sont
-binaires (PNG, PDF, ZIP, ELF…) n'a pas de texte à analyser. Dans **les deux
+binaires (PNG, PDF, ZIP, ELF…) n'a pas de texte à analyser. Dans **les trois
 périmètres**, ce contenu est **refusé** (`ScanError`), ce qui rend le verdict
 propre impossible (code 2) : un secret placé dans un commentaire PNG ou une
 archive ne devient jamais un faux négatif silencieux. Un contenu inconnu
@@ -169,7 +172,25 @@ ni 1. Les appels `cat-file` sont figés (`cat-file <mode> -- <sha>`) : le
 séparateur `--` est accepté par le git de CI et figé par un test e2e
 (`tests/test_mcp_units.py`).
 
-La **racine elle-même est re-contrôlée** après l'analyse, dans les deux
+En mode `--ci --diff REF`, la comparaison est **différentielle** :
+`git diff REF...HEAD` part de l'ancêtre commun (trois points), donc seuls
+les changements de la branche courante sont jugés. Un secret présent sur la
+branche cible mais absent de la branche courante n'est pas dans le diff ;
+un secret supprimé par la branche courante n'a plus de blob à scanner. Le
+blob entier est analysé, pas seulement les lignes ajoutées. La référence
+est validée puis résolue en SHA avant tout appel git ; `HEAD` est figé en
+SHA et re-résolu après l'analyse (s'il a bougé, code 2). Un clone
+superficiel sans ancêtre commun fait échouer git : code 2, jamais 0. Une
+référence égale à `HEAD` (`--diff HEAD`) produit une **plage vide** et donc
+un verdict 0 : c'est une misconfiguration, pas un scan complet — utiliser
+la branche cible (`origin/main`). Les modèles [`docs/ci/`](ci/README.md)
+imposent `fetch-depth: 0` / `GIT_DEPTH: 0`. En `--ci --diff`, la
+configuration du dépôt ne peut pas
+s'auto-attester : utiliser `--no-allowlist` (verdict maximal) ou `--config`
+vers un fichier **hors du dépôt**. Le mode est strictement headless : aucun
+LLM n'est appelé.
+
+La **racine elle-même est re-contrôlée** après l'analyse, dans les trois
 périmètres : la garde unique (refus symlink, égalité du résolu) est rejouée
 sur le chemin demandé et comparée à la forme figée à l'entrée — chemin
 résolu **et** identité (`st_dev`, `st_ino`, `st_ctime_ns` épinglés à la
@@ -200,32 +221,33 @@ scanné.
 
 ## Bornes
 
-Le scan est **borné** dans les deux périmètres : au-delà, il est refusé
+Le scan est **borné** dans les trois périmètres : au-delà, il est refusé
 (code 2), jamais tronqué ni présenté comme complet.
 
 | Périmètre | Borne par fichier | Nombre de fichiers | Volume total | Findings |
 | --- | --- | --- | --- | --- |
 | `working-tree` | 1 Mio ([`MAX_FILE_BYTES`](../heimdall/scanner/detect.py)) | 50 000 ([`MAX_FILES`](../heimdall/scanner/detect.py)) | 256 Mio ([`MAX_TOTAL_BYTES`](../heimdall/scanner/detect.py)) | 10 000 ([`MAX_FINDINGS`](../heimdall/scanner/detect.py)) |
 | `staged` | 1 Mio | 1 000 ([`MAX_STAGED_FILES`](../heimdall/cli/scan.py)) | 32 Mio ([`MAX_STAGED_BYTES`](../heimdall/cli/scan.py)) | 10 000 ([`MAX_STAGED_FINDINGS`](../heimdall/cli/scan.py)) |
+| `diff` (`--ci --diff REF`) | 1 Mio | 1 000 ([`MAX_STAGED_FILES`](../heimdall/cli/scan.py)) | 32 Mio ([`MAX_STAGED_BYTES`](../heimdall/cli/scan.py)) | 10 000 ([`MAX_STAGED_FINDINGS`](../heimdall/cli/scan.py)) |
 
-En `--staged`, la taille annoncée par `git cat-file -s` est un oracle
+En `--staged` et `--diff`, la taille annoncée par `git cat-file -s` est un oracle
 **re-vérifié après lecture** : le contenu relu doit faire exactement cette
 taille (et rester sous 1 Mio). Un écart — store incohérent, objet échangé —
 est refusé (code 2) avant tout décodage, jamais scanné partiellement. Une
 taille négative est également refusée ; zéro reste valide (blob vide, aucun
 candidat).
 
-Les deux périmètres ont aussi une **deadline globale** de 120 s :
+Les trois périmètres ont aussi une **deadline globale** de 120 s :
 [`MAX_TREE_SECONDS`](../heimdall/cli/scan.py) en arbre (vérifiée entre chaque
 fichier, périodiquement à l'intérieur d'un fichier dense, et avant le rendu),
 [`MAX_STAGED_SECONDS`](../heimdall/cli/scan.py) en `--staged` (vérifiée entre
 blobs **et** à l'intérieur d'un blob, toutes les 256 lignes et 256 candidats,
 comme en arbre : un blob d'1 Mio de lignes vides coûte ~10 s de moteur). En
 arbre, les plafonds de volume ne bornent pas le temps de
-regex + HMAC ; en `--staged`, chaque blob coûte deux appels `git cat-file`
+regex + HMAC ; en `--staged` et `--diff`, chaque blob coûte deux appels `git cat-file`
 séquentiels, et 1 000 blobs représenteraient 2 000 processus. Au-delà de la
 deadline, refus (code 2), jamais un job CI qui s'éternise sans verdict. En
-`--staged`, le restant de deadline est propagé comme timeout à chaque appel
+`--staged` et `--diff`, le restant de deadline est propagé comme timeout à chaque appel
 git (borné au timeout unitaire de 30 s), y compris la seconde énumération de
 l'index. La lecture de la sortie et l'attente de fin partagent ce délai : un
 appel git ne dépasse jamais le restant de deadline qui lui a été passé.
@@ -326,9 +348,9 @@ les Findings eux-mêmes, avec **exactement les sept champs** du contrat
 Finding v1 (#14). Il porte aussi les décomptes d'allowlist (#24),
 `vcs_ignored` (bases VCS élaguées par le mode arbre) et `git_ignored`
 (entrées non suivies ignorées par un `.gitignore` du dépôt). Les deux
-compteurs valent toujours 0 en `--staged` ; `git_ignored` vaut aussi 0 avec
-`--no-gitignore`. Il n'y a rien d'autre : pas de valeur de secret, pas de
-champ libre, pas d'extrait de ligne.
+compteurs valent toujours 0 en `--staged` et `--diff` ; `git_ignored` vaut aussi 0 avec
+`--no-gitignore`. En mode `--diff`, `scope` vaut `"diff"`. Il n'y a rien
+d'autre : pas de valeur de secret, pas de champ libre, pas d'extrait de ligne.
 
 Le contrat machine est figé par [`schemas/scan.schema.json`](../schemas/scan.schema.json)
 (draft 2020-12) : objet fermé (`additionalProperties: false`), `schema` en
@@ -371,15 +393,16 @@ document si `count != len(findings)` (contrainte explicitée dans la
   panne de Git au premier snapshot parcourt tout l'arbre : elle n'exclut
   jamais un fichier en silence ; une panne au second snapshot après un skip
   est fail-closed (code 2).
-- **Racine sans lien symbolique, dans les deux périmètres** : une seule
+- **Racine sans lien symbolique, dans les trois périmètres** : une seule
   garde (celle du mode arbre, `Scanner._resolve_root`), rejouée à
-  l'entrée comme en fin de scan. `scan` et `scan --staged` disent la même
-  chose sur la même entrée — jamais de verdict sur un périmètre échangé.
+  l'entrée comme en fin de scan. `scan`, `scan --staged` et `scan --diff`
+  disent la même chose sur la même entrée — jamais de verdict sur un
+  périmètre échangé.
 
 ## Limites connues (honnêtes)
 
 - Le contenu **binaire** n'est pas analysé : un secret placé dans un
-  commentaire PNG ou une archive n'est pas détecté. Dans **les deux
+  commentaire PNG ou une archive n'est pas détecté. Dans **les trois
   périmètres**, un binaire du périmètre est **refusé** (`ScanError`) et la
   CLI sort en **2** (verdict propre impossible) : il n'existe plus de `0`
   propre pour un contenu binaire non analysable. C'est une impossibilité
@@ -388,18 +411,28 @@ document si `count != len(findings)` (contrainte explicitée dans la
   comptée dans `git_ignored` : elle ne peut pas être commitée sans devenir
   suivie, donc sans être scannée. Les répertoires et fichiers textuels de
   `node_modules/`, `vendor/`, `.venv/`, `build/`, `dist/`, `target/` ou
-  `htmlcov/` sont, eux, scannés dans les deux périmètres dès qu'ils sont
+  `htmlcov/` sont, eux, scannés dans les trois périmètres dès qu'ils sont
   suivis ou non ignorés.
 - La fenêtre multi-ligne reste bornée à 4 Kio : un secret coupé par un
   retour à la ligne au-delà de cette borne n'est pas recherché.
 - Le mode `--staged` analyse l'**index**, pas l'historique : un secret déjà
   commité n'est pas re-détecté par `--staged` (c'est le rôle de
-  `heimdall scan` sur l'arbre de travail, et du job de CI de #37).
+  `heimdall scan` sur l'arbre de travail, et de `--ci --diff` pour les
+  changements d'une branche, #37).
+- **`--diff` ne juge que le tip de la branche** : `git diff base...HEAD`
+  compare l'état **final**, pas chaque commit intermédiaire. Un secret
+  introduit puis supprimé ou réécrit dans un commit intermédiaire n'apparaît
+  pas dans le diff final ; il reste dans l'historique de la branche et peut
+  atterrir dans `main` si le merge n'est pas un squash. Pour couvrir
+  l'historique, compléter par `heimdall deep-scan` (#108–#110) ou imposer le
+  squash-merge. C'est une limite de conception du mode différentiel : le
+  hook local `--staged` voit chaque commit, mais il est contournable
+  (`--no-verify`), donc la CI reste la barrière opposable.
 - Un chemin de fichier doit être représentable dans le contrat
   [Finding v1](contracts/finding.md) : au-delà de **4096 caractères**, le
   scan est refusé (code 2), jamais un chemin tronqué. Un nom **non-UTF8**
   (surrogates issus de `os.walk`, octets invalides en index) est également
-  refusé en code 2 dans les deux périmètres. Les noms contenant une espace ou
+  refusé en code 2 dans les trois périmètres. Les noms contenant une espace ou
   des caractères Unicode valides sont, eux, parfaitement acceptés.
 - Le scanner de signatures ne décode ni base64 ni concaténation de chaînes :
   ces obfuscations restent des `limite_connue` (#23/#24), comme documenté dans
@@ -417,39 +450,42 @@ document si `count != len(findings)` (contrainte explicitée dans la
   `my-dummy-key-12345`. C'est volontaire et documenté dans le fichier lui-même :
   les répertoires de test ne doivent jamais contenir de vrais secrets. En CI
   stricte (sans `heimdall.toml`, allowlist vide), tout y est signalé.
-- **Non-atomicité assumée du mode arbre (`working-tree`) vs atomicité stricte de `--staged`** :
+- **Non-atomicité assumée du mode arbre (`working-tree`) vs atomicité stricte de `--staged` et `--diff`** :
   L'arbre de travail est un parcours direct du système de fichiers (`os.walk`), par nature
   **non atomique** (best-effort). Le re-contrôle final d'identité racine (`st_dev`, `st_ino`,
   `st_ctime_ns`) détecte tout remplacement ou altération des entrées directes de la racine,
   mais la mutation d'un fichier imbriqué (ex. substitution walk -> open où un processus
   concurrent remplace un fichier piégé par un fichier propre avant sa lecture) ne modifie pas
   le `ctime` racine et aboutit à un verdict propre (0 mélangé). En revanche, le mode
-  `--staged` est **strictement atomique** : il lit des objets immuables dans le dépôt git,
-  adressés par SHA (`cat-file blob <sha>`), et re-vérifie l'état complet de l'index avant de
-  rendre son verdict (toute modification concurrente refuse en code 2). Seul `--staged` est
-  atomique et fait donc foi pour les barrières de sécurité bloquantes (hook de pré-commit et CI).
-- **Mode arbre local indicatif, pas une barrière** : hors `--ci` et hors `--staged`,
+  `--staged` et `--diff` sont **strictement atomiques** : ils lisent des objets immuables
+  dans le dépôt git, adressés par SHA (`cat-file blob <sha>`). `--staged` re-vérifie l'état
+  complet de l'index avant de rendre son verdict ; `--diff` fige `HEAD` en SHA et le
+  re-résout après l'analyse. Toute modification concurrente refuse en code 2. Ces deux modes
+  font donc foi pour les barrières de sécurité bloquantes (hook de pré-commit et CI).
+- **Mode arbre local indicatif, pas une barrière** : hors `--ci`, `--staged` et `--diff`,
   `heimdall scan` refuse une configuration **stagée**, mais ne vérifie pas que le
   fichier `heimdall.toml` (ou un `--config` interne) du worktree est propre et suivi
   dans l'index. Un fichier de configuration local dirty/untracked peut donc fausser le
-  verdict local (jusqu'à 0). Seuls `--ci` (refus de toute configuration interne) et
-  `--staged` (configuration propre et suivie, contenu vérifié lié au parseur) sont
-  opposables ; le hook de pré-commit et la CI doivent utiliser ces modes.
+  verdict local (jusqu'à 0). Seuls `--ci` (refus de toute configuration interne), ses
+  variantes `--staged` (configuration propre et suivie, contenu vérifié lié au parseur)
+  et `--diff` (même garde, plage de commits) sont opposables ; le hook de pre-commit et
+  la CI doivent utiliser ces modes.
 - **Course résiduelle à l'initialisation de la racine (re-contrôle final garant)** :
   Dans `GitAccess.__init__`, entre `_resolve_root` et `os.stat`, un échange rapide
   `dossier` -> `symlink` -> `autre dossier` à la racine pourrait théoriquement échapper
   au `is_symlink` immédiat si le lien est retiré avant le `stat`. Cette fenêtre résiduelle est
   assumée : le nouveau dossier porte une identité (`st_ctime_ns` / `st_ino`) différente, et
   le re-contrôle d'identité final en fin de passe (`_verify_root_unchanged`) refuse
-  systématiquement en code 2 dans les deux périmètres (`working-tree` et `--staged`).
+  systématiquement en code 2 dans les trois périmètres (`working-tree`, `--staged` et
+  `--diff`).
 - La validation humaine (Y/N/E) et le remplacement du secret ne sont pas
   dans ce ticket : `scan` signale, il ne répare pas (#32).
 
 ## Preuves locales
 
 ```sh
-.venv/bin/python -m pytest tests/test_cli_scan.py -v
-.venv/bin/python -m pytest tests/test_cli_scan.py \
+.venv/bin/python -m pytest tests/test_cli_scan.py tests/test_cli_scan_diff.py -v
+.venv/bin/python -m pytest tests/test_cli_scan.py tests/test_cli_scan_diff.py \
   --cov=heimdall.cli --cov-branch --cov-report=term-missing
 .venv/bin/ruff check heimdall tests
 .venv/bin/mypy heimdall
