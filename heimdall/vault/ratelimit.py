@@ -300,7 +300,11 @@ class SqliteRateLimiter:
 
         Appelée à chaque évaluation, rejets compris : un rejet peut insérer une
         admission pour un pair neuf, et sans purge sur ce chemin la table ne se
-        bornerait qu'aux admissions autorisées.
+        bornerait qu'aux admissions autorisées. La taille reste bornée par la
+        somme des budgets actifs : ``consume_on_reject`` n'insère que pour un
+        budget dont le compte est encore inférieur à sa limite, donc un flot de
+        rejets avec un budget clé plein s'arrête à ``clé + pair + global``
+        lignes pour ce bucket, sans croître au rythme des requêtes.
         """
         conn.execute("DELETE FROM rate_limit_hits WHERE hit_at <= ?", (cutoff,))
 

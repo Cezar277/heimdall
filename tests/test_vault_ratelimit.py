@@ -232,6 +232,29 @@ class SlidingWindowSqliteTests(unittest.TestCase):
                 rows = conn.execute("SELECT COUNT(*) FROM rate_limit_hits").fetchone()[0]
             self.assertLessEqual(rows, 40)
 
+    def test_sqlite_authenticated_reject_flood_keeps_table_bounded(self) -> None:
+        """Budget clé plein : les rejets ne dépassent pas la somme des budgets."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            now = [0.0]
+            limiter = SqliteRateLimiter(
+                db_path,
+                per_key=1,
+                per_peer=3,
+                global_limit=5,
+                window_seconds=10,
+                clock=lambda: now[0],
+            )
+            self.assertTrue(limiter.check_authenticated("127.0.0.1", "key")[0])
+            for index in range(1, 500):
+                now[0] = index * 0.001
+                allowed, retry = limiter.check_authenticated("127.0.0.1", "key")
+                self.assertFalse(allowed)
+                self.assertTrue(1 <= retry <= 10)
+            with db_session(db_path) as conn:
+                rows = conn.execute("SELECT COUNT(*) FROM rate_limit_hits").fetchone()[0]
+            self.assertLessEqual(rows, 1 + 3 + 5)
+
     def test_sqlite_clear_resets_every_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             limiter = SqliteRateLimiter(
