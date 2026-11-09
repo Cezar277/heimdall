@@ -38,6 +38,7 @@ from typing import Any, Final
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from heimdall.vault.auth import validate_project_id
 from heimdall.vault.database import DatabaseUnavailableError, get_iso_timestamp
 from heimdall.vault.database import runtime_db_session as db_session
 
@@ -701,6 +702,19 @@ class AuditMiddleware:
                 ]
                 if all(isinstance(part, str) and part for part in parts):
                     target = "/".join(str(part) for part in parts)
+        if (
+            (not isinstance(target, str) or not target)
+            and path == "/api/v1/secrets"
+            and method == "GET"
+        ):
+            # 401 avant le handler : le projet demandé est un identifiant public
+            # déjà validé par le contrat. On ne recopie jamais la query brute.
+            query_project = request.query_params.get("project")
+            if query_project is not None:
+                try:
+                    target = validate_project_id(query_project)
+                except ValueError:
+                    target = None
 
         fingerprint = getattr(request.state, "audit_key_hash", None)
         key_id = getattr(request.state, "audit_key_id", None)
