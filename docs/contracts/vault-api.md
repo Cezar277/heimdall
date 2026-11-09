@@ -374,10 +374,11 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
   créer, lire et lire l'état ; `projet` pour la liste), y compris pour un
   refus 403 cross-projet. Une requête rejetée avant le handler n'a pas de
   cible : c'est le cas du 401 sur `POST /api/v1/secrets` (le corps n'est pas
-  lu avant l'authentification) et du 401 sur `GET /api/v1/secrets?project=`
-  (le handler n'est pas exécuté, et le projet de la requête n'est pas
-  journalisé). La corrélation se fait alors par `action`, `peer` et
-  `status_code`.
+  lu avant l'authentification). Pour `GET /api/v1/secrets?project=`, le repli
+  du middleware lit le query-param `project` et le valide avec
+  `validate_project_id` : un 401 porte donc le projet demandé, et une valeur
+  invalide n'est jamais recopiée (`target` reste vide). La corrélation ne
+  dépend plus uniquement de `action`, `peer` et `status_code`.
 - **Pas de log injection** : les champs texte sont filtrés (caractères non
   imprimables supprimés) et bornés avant persistance.
 - **Backends** : `SqliteAuditLog` en production (table partagée entre workers,
