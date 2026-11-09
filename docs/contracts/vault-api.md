@@ -304,8 +304,16 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
   Modifier, insérer ou supprimer une ligne casse la chaîne ; `verify` localise
   la première ligne invalide. On parle de journal **résistant à l'altération**,
   pas « inviolable » : un attaquant qui contrôle toute la base peut recalculer
-  la chaîne. La protection contre la suppression totale relève de la sauvegarde
-  externe.
+  la chaîne ou le point de contrôle. La protection contre la suppression
+  totale relève de la sauvegarde externe.
+- **Rétention bornée** : `MAX_AUDIT_EVENTS` (100 000) borne la table. Au-delà,
+  les plus anciens événements sont purgés et leur dernier `entry_hash` est
+  conservé dans `audit_chain_state.checkpoint_hash` ; le premier événement
+  retenu pointe dessus, donc `verify` reste valide sans charger tout
+  l'historique. La purge est testée par patch du seuil (mémoire et SQLite).
+- **Panne SQLite** : une contention ou une erreur d'ouverture/commit du
+  rate-limiter ou du journal est traduite en **503** (`Retry-After: 1`,
+  `Connection: close`, `Cache-Control: no-store`), jamais en 500.
 - **Fail-closed** : si l'écriture d'audit échoue, la réponse devient un 503
   générique (`Retry-After: 1`, `Connection: close`, `Cache-Control: no-store`)
   au lieu de laisser passer un accès non journalisé.
