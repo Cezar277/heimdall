@@ -398,11 +398,12 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
   verrou reste indisponible plus de 250 ms (`busy_timeout`), les requêtes qui
   attendent reçoivent un 503 générique, sans 500. Mitigations si la cadence l'exige : coalescence des 429 ou alerte sur la
   taille de la base. Une mesure sur matériel de production reste à faire.
-- **Résiduel documenté : `/api/v1/health` ignore la clé API** : l'en-tête
-  `X-Heimdall-API-Key` n'est ni haché ni recherché sur cette route, et seules
-  les limites pair/global s'appliquent. L'événement d'audit correspondant porte
-  donc `key_id` et `key_fingerprint` vides : un health avec clé valide est
-  indiscernable d'un health anonyme, et ne peut pas être corrélé à une clé.
+- **Health et clé API** : l'en-tête `X-Heimdall-API-Key` n'est jamais consommé
+  sur cette route publique (seules les limites pair/global s'appliquent), mais
+  son empreinte est mémoïsée pour l'audit. Un health avec clé valide porte donc
+  `key_fingerprint` (16 hexadécimaux) et reste corrélable à une clé ; un health
+  anonyme garde `key_fingerprint` vide. Aucun `key_id` n'est recherché sur cette
+  route, pour ne pas ajouter de lookup d'identifiant à un endpoint de santé.
 
 ## Rejeu de requête (#114)
 
