@@ -419,6 +419,15 @@ document si `count != len(findings)` (contrainte explicitée dans la
   commité n'est pas re-détecté par `--staged` (c'est le rôle de
   `heimdall scan` sur l'arbre de travail, et de `--ci --diff` pour les
   changements d'une branche, #37).
+- **`--diff` ne juge que le tip de la branche** : `git diff base...HEAD`
+  compare l'état **final**, pas chaque commit intermédiaire. Un secret
+  introduit puis supprimé ou réécrit dans un commit intermédiaire n'apparaît
+  pas dans le diff final ; il reste dans l'historique de la branche et peut
+  atterrir dans `main` si le merge n'est pas un squash. Pour couvrir
+  l'historique, compléter par `heimdall deep-scan` (#108–#110) ou imposer le
+  squash-merge. C'est une limite de conception du mode différentiel : le
+  hook local `--staged` voit chaque commit, mais il est contournable
+  (`--no-verify`), donc la CI reste la barrière opposable.
 - Un chemin de fichier doit être représentable dans le contrat
   [Finding v1](contracts/finding.md) : au-delà de **4096 caractères**, le
   scan est refusé (code 2), jamais un chemin tronqué. Un nom **non-UTF8**

@@ -29,7 +29,7 @@ heimdall scan --ci --diff "origin/<branche-cible>" --no-allowlist --json
 - **JSON** : `--json` écrit le contrat `heimdall.scan.v1` sur stdout, avec
   `scope: "diff"`. Aucun secret n'y figure : seulement des empreintes HMAC.
 
-## Les trois pièges à éviter
+## Les quatre pièges à éviter
 
 1. **Clone superficiel** : sans historique complet, git ne trouve pas
    l'ancêtre commun et le scan sort en 2. Les modèles imposent
@@ -48,6 +48,12 @@ heimdall scan --ci --diff "origin/<branche-cible>" --no-allowlist --json
    heimdall scan --ci --diff origin/main \
      --config /opt/heimdall/allowlist.toml --json
    ```
+4. **Merge non-squash** : `--diff` ne juge que l'état **final** de la branche
+   (`merge-base...HEAD`). Un secret introduit puis supprimé ou réécrit dans un
+   commit intermédiaire n'apparaît pas dans le diff final ; il reste dans
+   l'historique de la branche et peut atterrir dans `main` via un merge
+   non-squash. Imposer le squash-merge ou compléter par
+   `heimdall deep-scan` (#108–#110) pour les projets en merge-commit.
 
 ## GitHub Actions
 
@@ -58,7 +64,7 @@ Heimdall vérifié (jamais une branche mobile). Le workflow :
 - se déclenche sur `pull_request` (pas de `pull_request_target`) ;
 - demande seulement `contents: read` ;
 - épingle `actions/checkout` par SHA ;
-- compare `origin/${{ github.base_ref }}` à `HEAD` ;
+- compare `origin/$BASE_REF` (`BASE_REF` fourni via `env:`, jamais interpolé dans `run:`) à `HEAD` ;
 - écrit le JSON dans le journal via `tee`, avec `set -o pipefail` pour que
   l'exit 1/2 échoue bien l'étape.
 
