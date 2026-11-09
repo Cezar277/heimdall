@@ -1189,7 +1189,7 @@ async def _resolve_request_key_hash(request: Request) -> str | None:
     ni HMAC ni full-scan. Retourne l'empreinte seulement si la clé est valide.
     """
     raw_key = request.headers.get("X-Heimdall-API-Key")
-    if raw_key is None or request.url.path == "/api/v1/health":
+    if raw_key is None:
         return None
     try:
         candidate_hash = vault_auth.hash_project_api_key(
@@ -1199,6 +1199,11 @@ async def _resolve_request_key_hash(request: Request) -> str | None:
     except ValueError:
         candidate_hash = None
     request.state.audit_key_hash = candidate_hash
+    if request.url.path == "/api/v1/health":
+        # Route publique : la clé éventuelle n'est jamais consommée (aucun bucket
+        # clé), mais son empreinte reste mémoïsée pour corréler l'événement
+        # d'audit. Un health anonyme garde ``None``.
+        return None
     registry = getattr(request.app.state, "api_key_registry", None)
     if candidate_hash is None:
         # Même travail que le chemin valide : parcours exhaustif avec l'empreinte

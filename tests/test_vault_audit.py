@@ -127,6 +127,31 @@ class AuditTrailTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(key, json.dumps(events))
         self.assertNotIn("unknown-key-value", json.dumps(events))
 
+    async def test_health_with_key_is_correlated_without_consuming_key_budget(self) -> None:
+        """Health reste public : la clé est corrélée dans l'audit, pas consommée."""
+        app = _memory_app(
+            rate_limit_per_key=1,
+            rate_limit_per_peer=100,
+            rate_limit_global=100,
+        )
+        key = generate_api_key()
+        app.state.register_api_key(key, "demo")
+        async with _client(app) as client:
+            health = await client.get(
+                "/api/v1/health", headers={"X-Heimdall-API-Key": key}
+            )
+            read = await client.get(
+                "/api/v1/secrets/demo/dev/TOKEN",
+                headers={"X-Heimdall-API-Key": key},
+            )
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(read.status_code, 404)
+        events = app.state.audit_log.list_events(limit=10)
+        self.assertEqual([event["status_code"] for event in events], [200, 404])
+        self.assertIsNotNone(events[0]["key_fingerprint"])
+        self.assertEqual(len(events[0]["key_fingerprint"]), 16)
+        self.assertNotIn(key, json.dumps(events))
+
     async def test_rate_limited_requests_are_audited(self) -> None:
         """Un 429 de débit est journalisé avec l'outcome ``rate_limited``."""
         app = _memory_app(
