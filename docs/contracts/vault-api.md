@@ -364,10 +364,12 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
   au lieu de laisser passer un accès non journalisé.
 - **Cible** : `target` est renseignée par le handler (`projet/env/nom` pour
   créer, lire et lire l'état ; `projet` pour la liste), y compris pour un
-  refus 403 cross-projet. Une requête rejetée avant le handler (401 sur
-  `POST /api/v1/secrets`) n'a pas de cible : le corps n'est pas lu avant
-  l'authentification, donc aucun projet demandé n'est journalisé. La
-  corrélation se fait alors par `action`, `peer` et `status_code`.
+  refus 403 cross-projet. Une requête rejetée avant le handler n'a pas de
+  cible : c'est le cas du 401 sur `POST /api/v1/secrets` (le corps n'est pas
+  lu avant l'authentification) et du 401 sur `GET /api/v1/secrets?project=`
+  (le handler n'est pas exécuté, et le projet de la requête n'est pas
+  journalisé). La corrélation se fait alors par `action`, `peer` et
+  `status_code`.
 - **Pas de log injection** : les champs texte sont filtrés (caractères non
   imprimables supprimés) et bornés avant persistance.
 - **Backends** : `SqliteAuditLog` en production (table partagée entre workers,
