@@ -1201,8 +1201,10 @@ async def _resolve_request_key_hash(request: Request) -> str | None:
     request.state.audit_key_hash = candidate_hash
     registry = getattr(request.app.state, "api_key_registry", None)
     if candidate_hash is None:
-        # Même travail que le chemin valide : un lookup d'identifiant factice
-        # est effectué, puis jeté (pas d'oracle de coût sur key_id, #112).
+        # Même travail que le chemin valide : parcours exhaustif avec l'empreinte
+        # factice (mémoïsé, réutilisé par verify_api_key), puis lookup factice
+        # jeté (pas d'oracle de coût sur key_id, #112).
+        await vault_auth.find_api_key_project_cached(request, vault_auth.DUMMY_HASH)
         if registry is not None:
             registry.key_id_for_hash(vault_auth.DUMMY_HASH)
             request.state.audit_key_id_checked = True

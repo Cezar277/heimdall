@@ -2136,6 +2136,51 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
                     {"code": "unauthorized", "message": "Authentification requise"},
                 )
 
+    async def test_unhashable_key_scans_before_the_pair_global_decision(self) -> None:
+        """Le parcours de clé précède la décision pair/global (comme pour une clé au format)."""
+        canary = "CANARY_UNENCODABLE_API_KEY"
+        test_app = create_app()
+        test_app.state.register_api_key(generate_api_key(), "demo")
+
+        async def get_with_key(key: str):
+            transport = ASGITransport(app=test_app, client=("127.0.0.1", 54321))
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://127.0.0.1:8443",
+                headers={"X-Heimdall-API-Key": key},
+            ) as client:
+                return await client.get("/api/v1/secrets/demo/dev/UNHASHABLE")
+
+        async def refused(*_args: object) -> tuple[bool, int]:
+            return False, 1
+
+        with (
+            patch.object(
+                vault_auth_module,
+                "find_api_key_project",
+                wraps=vault_auth_module.find_api_key_project,
+            ) as unknown_scan,
+            patch("heimdall.vault.app._limiter_consume_peer", side_effect=refused),
+        ):
+            unknown = await get_with_key(generate_api_key())
+        with (
+            patch.object(
+                vault_auth_module,
+                "find_api_key_project",
+                wraps=vault_auth_module.find_api_key_project,
+            ) as unhashable_scan,
+            patch.object(
+                vault_auth_module,
+                "hash_project_api_key",
+                side_effect=ValueError(f"clé invalide : {canary}"),
+            ),
+            patch("heimdall.vault.app._limiter_consume_peer", side_effect=refused),
+        ):
+            unhashable = await get_with_key(canary)
+        self.assertEqual((unknown.status_code, unhashable.status_code), (429, 429))
+        self.assertNotIn(canary, unhashable.text)
+        self.assertEqual((unknown_scan.call_count, unhashable_scan.call_count), (1, 1))
+
     async def test_unhashable_api_key_returns_generic_401_without_echo(self) -> None:
         """Une clé non hachable (ex. surrogate) reste un 401 générique, jamais un 500."""
         canary = "CANARY_UNENCODABLE_API_KEY"
