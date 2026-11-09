@@ -489,6 +489,13 @@ class ApiKeyRegistry:
         self._active: dict[str, str] = {}
         self._active_ids: dict[str, str] = {}
 
+    def __repr__(self) -> str:
+        """Représentation expurgée : le pepper n'apparaît jamais dans un log."""
+        return (
+            f"ApiKeyRegistry(storage_backend={self._storage_backend!r}, "
+            "pepper=<REDACTED>)"
+        )
+
     # -- Introspection (aucune clé brute n'est exposée) --------------------
 
     @property

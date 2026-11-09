@@ -44,6 +44,7 @@ Preuves SAMM : module + ligne (voir `docs/t255-samm.md`).
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -289,7 +290,7 @@ class VaultNominalFlowTests(VaultIntegrationTestCase):
         raw_database = self.db_path.read_bytes()
         self.assertNotIn(_TEST_VALUE.encode("utf-8"), raw_database)
         # La ligne existe bien et n'est pas vide : le secret est stocké, chiffré.
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection:
             rows = connection.execute(
                 "SELECT encrypted_value, status FROM secrets WHERE project_id = ? AND name = ?",
                 (_PROJECT, _NAME),
@@ -356,7 +357,7 @@ class VaultInvalidApiKeyTests(VaultIntegrationTestCase):
         response = self._create_secret(generate_api_key())
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json(), _UNAUTHORIZED_BODY)
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection:
             count = connection.execute("SELECT COUNT(*) FROM secrets").fetchone()[0]
         self.assertEqual(count, 0)
 
@@ -408,7 +409,7 @@ class VaultCrossProjectAccessTests(VaultIntegrationTestCase):
         )
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json(), _FORBIDDEN_BODY)
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection:
             count = connection.execute("SELECT COUNT(*) FROM secrets").fetchone()[0]
         self.assertEqual(count, 0)
 
@@ -471,7 +472,7 @@ class VaultOpenapiContractTests(VaultIntegrationTestCase):
         self.assertEqual(set(runtime["paths"]), set(CONTRACT["paths"]))
         for path, path_item in CONTRACT["paths"].items():
             for method, operation in path_item.items():
-                if method not in ("get", "post"):
+                if method not in ("get", "post", "delete"):
                     continue
                 with self.subTest(path=path, method=method):
                     runtime_operation = runtime["paths"][path][method]
@@ -484,12 +485,12 @@ class VaultOpenapiContractTests(VaultIntegrationTestCase):
     def test_runtime_payload_schemas_match_the_contract(self) -> None:
         """Les schémas de charge utile produits par l'application respectent le contrat."""
         runtime = self.app.openapi()["components"]["schemas"]
-        for name in ("SecretCreate", "SecretMetadata", "SecretRead"):
+        for name in ("SecretCreate", "SecretMetadata", "SecretRead", "SecretPage"):
             with self.subTest(schema=name):
                 contract_schema = _structural(
                     _resolve(CONTRACT, {"$ref": f"#/components/schemas/{name}"})
                 )
-                runtime_schema = _structural(runtime[name])
+                runtime_schema = _structural(_resolve(self.app.openapi(), runtime[name]))
                 self.assertEqual(runtime_schema, contract_schema)
 
     def test_runtime_error_schemas_match_the_contract(self) -> None:

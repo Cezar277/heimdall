@@ -168,7 +168,7 @@ class VaultContractTests(unittest.TestCase):
 
     def test_examples_valid(self):
         for path_item in SPEC["paths"].values():
-            for method in ("get", "post"):
+            for method in ("get", "post", "delete"):
                 operation = path_item.get(method, {})
                 bodies = [operation.get("requestBody", {})] + list(operation.get("responses", {}).values())
                 for body in bodies:
@@ -178,13 +178,13 @@ class VaultContractTests(unittest.TestCase):
 
     def test_all_secret_routes_authenticated(self):
         for path, item in SPEC["paths"].items():
-            for method in ("get", "post"):
+            for method in ("get", "post", "delete"):
                 if method in item and "secrets" in path:
                     self.assertEqual(item[method].get("security", SPEC["security"]), [{"ProjectApiKey": []}])
 
     def test_error_format_and_codes(self):
         for item in SPEC["paths"].values():
-            for method in ("get", "post"):
+            for method in ("get", "post", "delete"):
                 for status, response in item.get(method, {}).get("responses", {}).items():
                     if status in ERROR_SCHEMAS:
                         name, code = ERROR_SCHEMAS[status]
@@ -232,7 +232,7 @@ class VaultContractTests(unittest.TestCase):
 
     def test_error_code_matches_http_status(self):
         for path, item in SPEC["paths"].items():
-            for method in ("get", "post"):
+            for method in ("get", "post", "delete"):
                 for status, response in item.get(method, {}).get("responses", {}).items():
                     if status not in ERROR_SCHEMAS:
                         continue
@@ -299,7 +299,7 @@ class VaultContractTests(unittest.TestCase):
 
     def test_retry_after_bounds_on_every_rate_limited_route(self):
         for path, item in SPEC["paths"].items():
-            for method in ("get", "post"):
+            for method in ("get", "post", "delete"):
                 if method not in item:
                     continue
                 with self.subTest(path=path, method=method):
@@ -317,7 +317,7 @@ class VaultContractTests(unittest.TestCase):
                    {"code": "internal_error", "message": "Traceback DEMO_PASSWORD"},
                    {**valid, "traceback": "PLACEHOLDER"}]
         for path, item in SPEC["paths"].items():
-            for method in ("get", "post"):
+            for method in ("get", "post", "delete"):
                 if method not in item:
                     continue
                 with self.subTest(path=path, method=method):
@@ -337,16 +337,18 @@ class VaultContractTests(unittest.TestCase):
         baseline = build_app().openapi()
         expected = [
             ("/api/v1/secrets", "post", "201", "Cache-Control"),
+            ("/api/v1/secrets", "get", "200", "Cache-Control"),
+            ("/api/v1/secrets/{project}/{env}/{name}", "delete", "204", "Cache-Control"),
             ("/api/v1/secrets/{project}/{env}/{name}", "get", "200", "Cache-Control"),
             ("/api/v1/secrets/{project}/{env}/{name}/state", "get", "200", "Cache-Control"),
         ]
         expected += [(path, method, "429", "Retry-After")
                      for path, item in SPEC["paths"].items()
-                     for method in ("get", "post") if method in item]
+                     for method in ("get", "post", "delete") if method in item]
         # LOW-3 : la 503 porte le même signal de backoff que les 429.
         expected += [(path, method, "503", "Retry-After")
                      for path, item in SPEC["paths"].items()
-                     for method in ("get", "post") if method in item]
+                     for method in ("get", "post", "delete") if method in item]
         for path, method, status, name in expected:
             with self.subTest(path=path, status=status, header=name):
                 response = resolve(SPEC["paths"][path][method]["responses"][status], SPEC)
@@ -410,7 +412,7 @@ class VaultContractTests(unittest.TestCase):
         self.assertIs(project_api_key.auto_error, False)
         app = build_app()
         for item in app.openapi()["paths"].values():
-            for method in ("get", "post"):
+            for method in ("get", "post", "delete"):
                 if method in item:
                     self.assertNotIn("422", item[method]["responses"])
         # ASGI en mémoire, sans port réseau ; la fixture n'a aucune clé valide.

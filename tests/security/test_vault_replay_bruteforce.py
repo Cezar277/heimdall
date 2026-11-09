@@ -24,10 +24,11 @@ def test_replay_without_overwrite() -> None:
     assert "409" in contract
     assert "Secret déjà existant" in contract
     assert "n'écrase jamais" in contract
-    # Aucun etat choisi par le client : pas de PUT/PATCH/DELETE sur les secrets.
+    # Aucun etat choisi par le client : pas de PUT/PATCH sur les secrets.
+    # DELETE (#158) libère la capacité sans permettre de choisir un état.
     for line in contract.splitlines():
         stripped = line.strip()
-        if stripped in ("put:", "patch:", "delete:"):
+        if stripped in ("put:", "patch:"):
             raise AssertionError(f"etat client refuse, methode interdite : {stripped}")
     assert "Aucun endpoint" in contract or "hors v1" in contract
     # Autoriser (projet/env/operation) AVANT toute recherche du secret.

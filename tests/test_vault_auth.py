@@ -20,6 +20,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -71,7 +72,7 @@ class ApiKeyGenerationTests(unittest.TestCase):
             db_path = Path(tmp) / "vault.db"
             init_db(db_path)
             issued = vault_auth.issue_api_key(db_path, "demo", PEPPER)
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn:
                 rows = conn.execute("SELECT id, project_id, key_hash FROM api_keys").fetchall()
             self.assertEqual(len(rows), 1)
             key_id, project_id, key_hash = rows[0]
@@ -384,7 +385,7 @@ class VaultKeyCliTests(unittest.IsolatedAsyncioTestCase):
         output = self._create()
         raw_key = self._extract_key(output)
         self.assertGreaterEqual(len(raw_key), 43)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             rows = conn.execute("SELECT id, key_hash FROM api_keys").fetchall()
         self.assertEqual(len(rows), 1)
         self.assertNotEqual(rows[0][1], raw_key)
@@ -445,7 +446,7 @@ class VaultKeyCliTests(unittest.IsolatedAsyncioTestCase):
                 ["vault", "key", "revoke", key_id, "--db-path", str(self.db_path)],
             )
             self.assertEqual(result.exit_code, 0, result.output)
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn:
                 revoked_at = conn.execute(
                     "SELECT revoked_at FROM api_keys WHERE id = ?", (key_id,)
                 ).fetchone()[0]
@@ -494,7 +495,7 @@ class VaultKeyCliTests(unittest.IsolatedAsyncioTestCase):
             ["vault", "key", "revoke", key_id, "--db-path", str(self.db_path)],
         )
         self.assertEqual(result.exit_code, 0, result.output)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             revoked_at = conn.execute(
                 "SELECT revoked_at FROM api_keys WHERE id = ?", (key_id,)
             ).fetchone()[0]
