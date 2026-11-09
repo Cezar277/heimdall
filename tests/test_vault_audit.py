@@ -289,6 +289,21 @@ class AuditRetentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
         self.assertNotEqual(events[0]["previous_hash"], audit_module.GENESIS_HASH)
 
+    async def test_memory_ids_stay_unique_and_monotonic_after_prune(self) -> None:
+        """Après purge, les nouveaux ids ne réutilisent jamais un id déjà attribué."""
+        app = _memory_app()
+        with patch.object(audit_module, "MAX_AUDIT_EVENTS", 5):
+            for index in range(8):
+                await app.state.audit_log.record(
+                    peer="127.0.0.1",
+                    action=f"GET /{index}",
+                    target=None,
+                    status_code=200,
+                )
+        ids = [event["id"] for event in app.state.audit_log.list_events(limit=100)]
+        self.assertEqual(ids, [4, 5, 6, 7, 8])
+        self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
+
     async def test_sqlite_retention_bounds_growth_and_preserves_chain(self) -> None:
         """La purge SQLite avance un point de contrôle et garde la chaîne vérifiable."""
         with tempfile.TemporaryDirectory() as tmp:

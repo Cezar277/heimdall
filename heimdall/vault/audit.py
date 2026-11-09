@@ -263,6 +263,7 @@ class InMemoryAuditLog(AuditLog):
         self._events: list[AuditEvent] = []
         self._checkpoint_hash = GENESIS_HASH
         self._pruned_events = 0
+        self._next_id = 1
         self._lock = threading.Lock()
 
     def _prune_locked(self) -> None:
@@ -311,7 +312,7 @@ class InMemoryAuditLog(AuditLog):
                 previous_hash=previous_hash,
             )
             event = AuditEvent(
-                id=len(self._events) + 1,
+                id=self._next_id,
                 occurred_at=occurred_at,
                 key_id=safe_key_id,
                 key_fingerprint=safe_fingerprint,
@@ -324,6 +325,7 @@ class InMemoryAuditLog(AuditLog):
                 previous_hash=previous_hash,
                 entry_hash=_entry_hash(payload),
             )
+            self._next_id += 1
             self._events.append(event)
             self._prune_locked()
             return event
@@ -374,6 +376,7 @@ class InMemoryAuditLog(AuditLog):
             self._events.clear()
             self._checkpoint_hash = GENESIS_HASH
             self._pruned_events = 0
+            self._next_id = 1
 
 
 class SqliteAuditLog(AuditLog):
