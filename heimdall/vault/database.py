@@ -156,6 +156,16 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_events_occurred_at
     ON audit_events(occurred_at);
+
+-- Point de contrôle de chaîne après purge de rétention (ticket #113).
+-- Le premier événement retenu pointe sur `checkpoint_hash` ; la vérification
+-- reprend donc à ce point sans charger tout l'historique.
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    checkpoint_hash TEXT NOT NULL,
+    pruned_events INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -723,7 +733,14 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
     tables = {
         row[0] for row in cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
     }
-    required_tables = {"projects", "api_keys", "secrets", "rate_limit_hits", "audit_events"}
+    required_tables = {
+        "projects",
+        "api_keys",
+        "secrets",
+        "rate_limit_hits",
+        "audit_events",
+        "audit_chain_state",
+    }
     if not required_tables.issubset(tables):
         raise RuntimeError("Schéma de base de données non conforme : tables manquantes.")
 

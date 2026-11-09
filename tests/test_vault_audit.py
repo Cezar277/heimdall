@@ -23,9 +23,10 @@ from httpx import ASGITransport, AsyncClient
 from typer.testing import CliRunner
 
 from heimdall.cli.main import app as cli_app
+from heimdall.vault import audit as audit_module
 from heimdall.vault.app import VaultSettings, create_app
 from heimdall.vault.crypto import generate_api_key, generate_encryption_key
-from heimdall.vault.database import db_session
+from heimdall.vault.database import DatabaseUnavailableError, db_session, init_db
 
 PEPPER = "t113_pepper_value_0123456789abcdef"
 CANARY_VALUE = "canary-secret-value-t113-never-in-audit"
@@ -185,6 +186,41 @@ class AuditTrailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["Connection"], "close")
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
+    async def test_audit_database_unavailable_is_503_not_500(self) -> None:
+        """Une panne SQLite du journal est un 503 contractuel, jamais un 500."""
+        app = _memory_app()
+
+        async def failing_record(**kwargs: object) -> None:
+            raise DatabaseUnavailableError("stockage indisponible")
+
+        with patch.object(app.state.audit_log, "record", failing_record):
+            async with _client(app) as client:
+                response = await client.get("/api/v1/health")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json(),
+            {"code": "unavailable", "message": "Service indisponible"},
+        )
+        self.assertEqual(response.headers["Retry-After"], "1")
+
+    async def test_inner_database_unavailable_is_503_not_500(self) -> None:
+        """Une panne du rate-limiter est traduite en 503 par la couche disponibilité."""
+        app = _memory_app()
+
+        def failing_peek(peer: str) -> tuple[bool, int]:
+            raise DatabaseUnavailableError("stockage indisponible")
+
+        with patch.object(app.state.rate_limiter, "peek", failing_peek):
+            async with _client(app) as client:
+                response = await client.get("/api/v1/health")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json(),
+            {"code": "unavailable", "message": "Service indisponible"},
+        )
+        events = app.state.audit_log.list_events(limit=1)
+        self.assertEqual(events[0]["status_code"], 503)
+
     async def test_sqlite_audit_log_is_shared_between_workers(self) -> None:
         """Deux instances sur la même base partagent le journal et sa chaîne."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -233,6 +269,72 @@ class AuditTrailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(app.state.audit_log.list_events(limit=2)), 2)
         demo = app.state.audit_log.list_events(limit=10, project="demo")
         self.assertEqual([event["action"] for event in demo], ["GET /0", "GET /2", "GET /4"])
+
+
+class AuditRetentionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_memory_retention_bounds_growth_and_preserves_chain(self) -> None:
+        """Au-delà du seuil, les plus anciens événements sont purgés, chaîne valide."""
+        app = _memory_app()
+        with patch.object(audit_module, "MAX_AUDIT_EVENTS", 5):
+            for index in range(8):
+                await app.state.audit_log.record(
+                    peer="127.0.0.1",
+                    action=f"GET /{index}",
+                    target=None,
+                    status_code=200,
+                )
+        events = app.state.audit_log.list_events(limit=100)
+        self.assertEqual([event["action"] for event in events], [f"GET /{i}" for i in range(3, 8)])
+        self.assertEqual(app.state.audit_log.pruned_count(), 3)
+        self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
+        self.assertNotEqual(events[0]["previous_hash"], audit_module.GENESIS_HASH)
+
+    async def test_sqlite_retention_bounds_growth_and_preserves_chain(self) -> None:
+        """La purge SQLite avance un point de contrôle et garde la chaîne vérifiable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            app = _sqlite_app(tmp)
+            with patch.object(audit_module, "MAX_AUDIT_EVENTS", 5):
+                for index in range(8):
+                    await app.state.audit_log.record(
+                        peer="127.0.0.1",
+                        action=f"GET /{index}",
+                        target=None,
+                        status_code=200,
+                    )
+            events = app.state.audit_log.list_events(limit=100)
+            self.assertEqual(
+                [event["action"] for event in events],
+                [f"GET /{i}" for i in range(3, 8)],
+            )
+            self.assertEqual(app.state.audit_log.count(), 5)
+            self.assertEqual(app.state.audit_log.pruned_count(), 3)
+            self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
+            self.assertNotEqual(events[0]["previous_hash"], audit_module.GENESIS_HASH)
+            with db_session(db_path) as conn:
+                conn.execute("UPDATE audit_events SET status_code = 500 WHERE id = 5")
+            self.assertEqual(app.state.audit_log.verify_chain(), (False, 5))
+
+    def test_init_db_recreates_audit_tables_on_pre_t39_database(self) -> None:
+        """Une base antérieure à #39 reçoit les tables de débit, d'audit et d'état."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                conn.execute("DROP TABLE audit_chain_state")
+                conn.execute("DROP TABLE audit_events")
+                conn.execute("DROP TABLE rate_limit_hits")
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+        self.assertTrue(
+            {"rate_limit_hits", "audit_events", "audit_chain_state"}.issubset(tables)
+        )
 
 
 class AuditCliTests(unittest.IsolatedAsyncioTestCase):

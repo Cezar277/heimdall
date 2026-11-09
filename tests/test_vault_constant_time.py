@@ -95,6 +95,38 @@ class ConstantTimeAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 404)
         self.assertGreaterEqual(len(comparisons), 5)
 
+    async def test_key_id_lookup_is_performed_once_for_valid_and_invalid_keys(self) -> None:
+        """Le lookup d'identifiant a le même coût (une requête) dans les deux cas."""
+        app = create_app(VaultSettings(api_key_pepper=PEPPER))
+        key = generate_api_key()
+        app.state.register_api_key(key, "demo")
+        calls: list[str] = []
+        real_lookup = app.state.api_key_registry.key_id_for_hash
+
+        def counting_lookup(key_hash: str) -> str | None:
+            calls.append(key_hash)
+            return real_lookup(key_hash)
+
+        with patch.object(app.state.api_key_registry, "key_id_for_hash", counting_lookup):
+            async with _client(app) as client:
+                valid = await client.get(
+                    "/api/v1/secrets/demo/dev/TOKEN",
+                    headers={"X-Heimdall-API-Key": key},
+                )
+            self.assertEqual(valid.status_code, 404)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0], auth_module.hash_project_api_key(key, PEPPER))
+
+            calls.clear()
+            async with _client(app) as client:
+                invalid = await client.get(
+                    "/api/v1/secrets/demo/dev/TOKEN",
+                    headers={"X-Heimdall-API-Key": "unknown-key-value"},
+                )
+            self.assertEqual(invalid.status_code, 401)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0], auth_module.DUMMY_HASH)
+
     async def test_missing_unknown_revoked_and_malformed_share_the_same_401(self) -> None:
         """Même corps et même code pour toutes les causes d'échec d'authentification."""
         app = create_app(VaultSettings(api_key_pepper=PEPPER))

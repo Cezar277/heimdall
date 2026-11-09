@@ -38,7 +38,7 @@ from typing import Any, Final
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from heimdall.vault.database import get_iso_timestamp
+from heimdall.vault.database import DatabaseUnavailableError, get_iso_timestamp
 from heimdall.vault.database import runtime_db_session as db_session
 
 logger = logging.getLogger("heimdall.vault.audit")
@@ -51,6 +51,10 @@ MAX_KEY_ID_LENGTH: Final[int] = 64
 MAX_LIST_LIMIT: Final[int] = 1_000
 _FINGERPRINT_HEX_LENGTH: Final[int] = 16
 DEFAULT_LIST_LIMIT: Final[int] = 50
+# Rétention bornée : au-delà, les plus anciens événements sont purgés et un
+# point de contrôle de chaîne est conservé. La valeur est volontairement
+# généreuse ; les tests la réduisent par patch pour vérifier la purge.
+MAX_AUDIT_EVENTS: Final[int] = 100_000
 
 _AUDIT_TABLE_SQL: Final[str] = """
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -71,6 +75,14 @@ CREATE TABLE IF NOT EXISTS audit_events (
 _AUDIT_INDEX_SQL: Final[str] = """
 CREATE INDEX IF NOT EXISTS idx_audit_events_occurred_at
     ON audit_events(occurred_at);
+"""
+_AUDIT_STATE_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    checkpoint_hash TEXT NOT NULL,
+    pruned_events INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
 """
 
 _UNAVAILABLE_PAYLOAD: Final[dict[str, str]] = {
@@ -249,7 +261,19 @@ class InMemoryAuditLog(AuditLog):
 
     def __init__(self) -> None:
         self._events: list[AuditEvent] = []
+        self._checkpoint_hash = GENESIS_HASH
+        self._pruned_events = 0
         self._lock = threading.Lock()
+
+    def _prune_locked(self) -> None:
+        """Purge les plus anciens événements et avance le point de contrôle."""
+        excess = len(self._events) - max(1, MAX_AUDIT_EVENTS)
+        if excess <= 0:
+            return
+        pruned = self._events[:excess]
+        self._checkpoint_hash = pruned[-1].entry_hash
+        self._pruned_events += len(pruned)
+        del self._events[:excess]
 
     async def record(  # noqa: PLR0913
         self,
@@ -263,7 +287,9 @@ class InMemoryAuditLog(AuditLog):
         project: str | None = None,
     ) -> AuditEvent:
         with self._lock:
-            previous_hash = self._events[-1].entry_hash if self._events else GENESIS_HASH
+            previous_hash = (
+                self._events[-1].entry_hash if self._events else self._checkpoint_hash
+            )
             occurred_at = get_iso_timestamp()
             safe_peer = _sanitize(peer, MAX_PEER_LENGTH) or "unknown"
             safe_action = _sanitize(action, MAX_ACTION_LENGTH) or "UNKNOWN"
@@ -299,6 +325,7 @@ class InMemoryAuditLog(AuditLog):
                 entry_hash=_entry_hash(payload),
             )
             self._events.append(event)
+            self._prune_locked()
             return event
 
     def list_events(
@@ -315,7 +342,7 @@ class InMemoryAuditLog(AuditLog):
 
     def verify_chain(self) -> tuple[bool, int | None]:
         with self._lock:
-            previous_hash = GENESIS_HASH
+            previous_hash = self._checkpoint_hash
             for event in self._events:
                 if event.previous_hash != previous_hash:
                     return False, event.id
@@ -336,10 +363,17 @@ class InMemoryAuditLog(AuditLog):
                 previous_hash = event.entry_hash
             return True, None
 
+    def pruned_count(self) -> int:
+        """Nombre d'événements purgés par la rétention (diagnostic)."""
+        with self._lock:
+            return self._pruned_events
+
     def clear(self) -> None:
         """Réinitialise le journal (tests isolés)."""
         with self._lock:
             self._events.clear()
+            self._checkpoint_hash = GENESIS_HASH
+            self._pruned_events = 0
 
 
 class SqliteAuditLog(AuditLog):
@@ -356,11 +390,57 @@ class SqliteAuditLog(AuditLog):
             with db_session(self._db_path) as conn:
                 conn.execute(_AUDIT_TABLE_SQL)
                 conn.execute(_AUDIT_INDEX_SQL)
+                conn.execute(_AUDIT_STATE_TABLE_SQL)
 
     @property
     def db_path(self) -> Path | str:
         """Chemin de la base SQLite du journal."""
         return self._db_path
+
+    @staticmethod
+    def _checkpoint(conn: Any) -> tuple[str, int]:
+        """Retourne le point de contrôle de chaîne et le nombre d'événements purgés."""
+        row = conn.execute(
+            "SELECT checkpoint_hash, pruned_events FROM audit_chain_state WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return GENESIS_HASH, 0
+        return str(row["checkpoint_hash"]), int(row["pruned_events"])
+
+    @staticmethod
+    def _prune(conn: Any) -> None:
+        """Borne la table et avance le point de contrôle de chaîne.
+
+        Les événements supprimés restent prouvables par leur dernier
+        ``entry_hash`` conservé dans ``audit_chain_state`` : le premier
+        événement retenu pointe dessus, donc ``verify_chain`` reste valide.
+        """
+        row = conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()
+        count = int(row[0]) if row is not None else 0
+        excess = count - max(1, MAX_AUDIT_EVENTS)
+        if excess <= 0:
+            return
+        rows = conn.execute(
+            "SELECT id, entry_hash FROM audit_events ORDER BY id ASC LIMIT ?",
+            (excess,),
+        ).fetchall()
+        if not rows:
+            return
+        checkpoint_hash = str(rows[-1]["entry_hash"])
+        conn.executemany(
+            "DELETE FROM audit_events WHERE id = ?",
+            [(int(item["id"]),) for item in rows],
+        )
+        conn.execute(
+            "INSERT INTO audit_chain_state ("
+            "id, checkpoint_hash, pruned_events, updated_at"
+            ") VALUES (1, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "checkpoint_hash = excluded.checkpoint_hash, "
+            "pruned_events = audit_chain_state.pruned_events + excluded.pruned_events, "
+            "updated_at = excluded.updated_at",
+            (checkpoint_hash, len(rows), get_iso_timestamp()),
+        )
 
     async def record(  # noqa: PLR0913
         self,
@@ -405,10 +485,11 @@ class SqliteAuditLog(AuditLog):
         occurred_at = get_iso_timestamp()
         with db_session(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            checkpoint_hash, _pruned = self._checkpoint(conn)
             row = conn.execute(
                 "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            previous_hash = str(row[0]) if row is not None else GENESIS_HASH
+            previous_hash = str(row[0]) if row is not None else checkpoint_hash
             payload = _canonical_payload(
                 occurred_at=occurred_at,
                 key_id=safe_key_id,
@@ -442,6 +523,7 @@ class SqliteAuditLog(AuditLog):
                 ),
             )
             event_id = int(cursor.lastrowid or 0)
+            self._prune(conn)
         return AuditEvent(
             id=event_id,
             occurred_at=occurred_at,
@@ -483,29 +565,28 @@ class SqliteAuditLog(AuditLog):
 
     def verify_chain(self) -> tuple[bool, int | None]:
         with db_session(self._db_path) as conn:
-            rows = conn.execute(
-                "SELECT * FROM audit_events ORDER BY id ASC"
-            ).fetchall()
-        previous_hash = GENESIS_HASH
-        for row in rows:
-            event_id = int(row["id"])
-            if str(row["previous_hash"]) != previous_hash:
-                return False, event_id
-            payload = _canonical_payload(
-                occurred_at=str(row["occurred_at"]),
-                key_id=row["key_id"],
-                key_fingerprint_value=row["key_fingerprint"],
-                project=row["project"],
-                peer=str(row["peer"]),
-                action=str(row["action"]),
-                target=row["target"],
-                status_code=int(row["status_code"]),
-                outcome=str(row["outcome"]),
-                previous_hash=str(row["previous_hash"]),
-            )
-            if _entry_hash(payload) != str(row["entry_hash"]):
-                return False, event_id
-            previous_hash = str(row["entry_hash"])
+            previous_hash, _pruned = self._checkpoint(conn)
+            # Itération du curseur : la table est bornée par la rétention, donc
+            # la vérification ne charge pas un historique illimité en mémoire.
+            for row in conn.execute("SELECT * FROM audit_events ORDER BY id ASC"):
+                event_id = int(row["id"])
+                if str(row["previous_hash"]) != previous_hash:
+                    return False, event_id
+                payload = _canonical_payload(
+                    occurred_at=str(row["occurred_at"]),
+                    key_id=row["key_id"],
+                    key_fingerprint_value=row["key_fingerprint"],
+                    project=row["project"],
+                    peer=str(row["peer"]),
+                    action=str(row["action"]),
+                    target=row["target"],
+                    status_code=int(row["status_code"]),
+                    outcome=str(row["outcome"]),
+                    previous_hash=str(row["previous_hash"]),
+                )
+                if _entry_hash(payload) != str(row["entry_hash"]):
+                    return False, event_id
+                previous_hash = str(row["entry_hash"])
         return True, None
 
     def count(self) -> int:
@@ -514,11 +595,19 @@ class SqliteAuditLog(AuditLog):
             row = conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()
         return int(row[0]) if row is not None else 0
 
+    def pruned_count(self) -> int:
+        """Nombre d'événements purgés par la rétention (diagnostic)."""
+        with db_session(self._db_path) as conn:
+            _checkpoint_hash, pruned = self._checkpoint(conn)
+        return pruned
+
     def clear(self) -> None:
         """Réinitialise le journal (tests isolés)."""
         with db_session(self._db_path) as conn:
             conn.execute(_AUDIT_TABLE_SQL)
+            conn.execute(_AUDIT_STATE_TABLE_SQL)
             conn.execute("DELETE FROM audit_events")
+            conn.execute("DELETE FROM audit_chain_state")
 
 
 class AuditMiddleware:
@@ -559,6 +648,17 @@ class AuditMiddleware:
 
         try:
             await self.app(scope, receive, send_wrapper)
+        except DatabaseUnavailableError:
+            # Panne SQLite (contention, ouverture, commit) : le contrat exige
+            # 503, jamais 500. DatabaseAvailabilityMiddleware le fait déjà pour
+            # les routes ; cette garde couvre le cas où l'exception remonte
+            # jusqu'au middleware d'audit (le plus externe).
+            if audit_failed:
+                return
+            if response_started:
+                raise
+            await self._send_unavailable(scope, receive, send)
+            return
         except Exception:
             if audit_failed:
                 # La réponse 503 a déjà été envoyée : ne pas laisser le

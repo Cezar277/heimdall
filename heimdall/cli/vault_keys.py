@@ -269,6 +269,7 @@ def verify_audit_chain(
         audit_log = SqliteAuditLog(resolved, create=False)
         valid, invalid_id = audit_log.verify_chain()
         total = audit_log.count()
+        pruned = audit_log.pruned_count()
     except ValueError as exc:
         typer.echo(f"Erreur : {exc}", err=True)
         raise typer.Exit(code=2) from None
@@ -284,7 +285,9 @@ def verify_audit_chain(
             err=True,
         )
         raise typer.Exit(code=1)
-    typer.echo(f"Chaîne d'audit valide ({total} événements).")
+    typer.echo(
+        f"Chaîne d'audit valide ({total} événements retenus, {pruned} purgés)."
+    )
 
 
 __all__ = ["audit_app", "key_app", "vault_app"]

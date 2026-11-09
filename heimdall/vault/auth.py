@@ -902,15 +902,31 @@ async def verify_api_key(
     # Le format est contrôlé APRÈS le hachage et le parcours : une clé vide ou
     # entourée d'espaces ne court-circuite pas le travail d'authentification.
     if provided_hash is None or not api_key or api_key != api_key.strip():
+        _ensure_audit_key_id_checked(request, registry)
         raise _unauthorized()
 
     if matching_project is None:
+        _ensure_audit_key_id_checked(request, registry)
         raise _unauthorized()
 
     request.state.audit_project = matching_project
     if getattr(request.state, "audit_key_id", None) is None:
         request.state.audit_key_id = registry.key_id_for_hash(provided_hash)
+        request.state.audit_key_id_checked = True
     return matching_project
+
+
+def _ensure_audit_key_id_checked(request: Request, registry: ApiKeyRegistry) -> None:
+    """Égalise le coût du lookup d'identifiant entre clé valide et invalide.
+
+    Le chemin valide effectue un ``key_id_for_hash`` réel ; le chemin invalide
+    effectue un lookup factice sur ``DUMMY_HASH``. Le drapeau de requête évite
+    de doubler ce lookup quand le middleware de débit l'a déjà fait.
+    """
+    if getattr(request.state, "audit_key_id_checked", False):
+        return
+    registry.key_id_for_hash(DUMMY_HASH)
+    request.state.audit_key_id_checked = True
 
 
 def ensure_project_access(

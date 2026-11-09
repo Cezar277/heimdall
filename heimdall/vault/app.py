@@ -1175,17 +1175,26 @@ async def _resolve_request_key_hash(request: Request) -> str | None:
     except ValueError:
         candidate_hash = None
     request.state.audit_key_hash = candidate_hash
+    registry = getattr(request.app.state, "api_key_registry", None)
     if candidate_hash is None:
+        # Même travail que le chemin valide : un lookup d'identifiant factice
+        # est effectué, puis jeté (pas d'oracle de coût sur key_id, #112).
+        if registry is not None:
+            registry.key_id_for_hash(vault_auth.DUMMY_HASH)
+            request.state.audit_key_id_checked = True
         return None
     registered_project, _ = await vault_auth.find_api_key_project_cached(
         request, candidate_hash
     )
     if registered_project is None:
+        if registry is not None:
+            registry.key_id_for_hash(vault_auth.DUMMY_HASH)
+            request.state.audit_key_id_checked = True
         return None
     request.state.audit_project = registered_project
-    registry = getattr(request.app.state, "api_key_registry", None)
     if registry is not None:
         request.state.audit_key_id = registry.key_id_for_hash(candidate_hash)
+        request.state.audit_key_id_checked = True
     return candidate_hash
 
 
