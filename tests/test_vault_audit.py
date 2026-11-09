@@ -330,6 +330,37 @@ class AuditRetentionTests(unittest.IsolatedAsyncioTestCase):
                 conn.execute("UPDATE audit_events SET status_code = 500 WHERE id = 5")
             self.assertEqual(app.state.audit_log.verify_chain(), (False, 5))
 
+    async def test_sqlite_tampering_first_retained_row_is_located_after_prune(self) -> None:
+        """Après purge, le premier événement retenu est ancré au point de contrôle."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            app = _sqlite_app(tmp)
+            with patch.object(audit_module, "MAX_AUDIT_EVENTS", 5):
+                for index in range(8):
+                    await app.state.audit_log.record(
+                        peer="127.0.0.1",
+                        action=f"GET /{index}",
+                        target=None,
+                        status_code=200,
+                    )
+            with db_session(db_path) as conn:
+                checkpoint = conn.execute(
+                    "SELECT checkpoint_hash, pruned_events FROM audit_chain_state WHERE id = 1"
+                ).fetchone()
+                first_retained = conn.execute(
+                    "SELECT id FROM audit_events ORDER BY id ASC LIMIT 1"
+                ).fetchone()
+            self.assertEqual(int(checkpoint["pruned_events"]), 3)
+            self.assertNotEqual(checkpoint["checkpoint_hash"], audit_module.GENESIS_HASH)
+            self.assertEqual(first_retained["id"], 4)
+            self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
+            with db_session(db_path) as conn:
+                conn.execute(
+                    "UPDATE audit_events SET previous_hash = ? WHERE id = 4",
+                    (audit_module.GENESIS_HASH,),
+                )
+            self.assertEqual(app.state.audit_log.verify_chain(), (False, 4))
+
     def test_init_db_recreates_audit_tables_on_pre_t39_database(self) -> None:
         """Une base antérieure à #39 reçoit les tables de débit, d'audit et d'état."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -434,6 +465,30 @@ class AuditCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 1)
         self.assertIn("introuvable", result.output)
         self.assertFalse(missing.exists())
+
+    def test_verify_on_deleted_database_fails_without_creating_it(self) -> None:
+        missing = Path(self._tmp.name) / "absent.db"
+        result = self.runner.invoke(
+            cli_app,
+            ["vault", "audit", "verify", "--db-path", str(missing)],
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("introuvable", result.output)
+        self.assertFalse(missing.exists())
+
+    def test_verify_on_corrupt_database_fails_generically(self) -> None:
+        corrupt = Path(self._tmp.name) / "corrupt.db"
+        corrupt.write_bytes(b"corrupt-audit-canary" * 50)
+        result = self.runner.invoke(
+            cli_app,
+            ["vault", "audit", "verify", "--db-path", str(corrupt)],
+        )
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("échec de la vérification", result.output)
+        self.assertNotIn("corrupt-audit-canary", result.output)
+        self.assertNotIn(str(corrupt), result.output)
+        self.assertNotIn("sqlite", result.output.lower())
+        self.assertNotIn(self.key, result.output)
 
     def test_invalid_project_filter_is_a_usage_error(self) -> None:
         result = self.runner.invoke(

@@ -175,3 +175,60 @@ class DatabaseAvailabilityTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
                 self.assertEqual(unknown.status_code, 401)
+
+    async def test_concurrent_sqlite_writers_never_return_500(self) -> None:
+        """Requêtes concurrentes sur une même base : jamais de 500, 503 générique seulement."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.db"
+            apps = [self.make_app(path) for _ in range(3)]
+            key = generate_api_key()
+            for app in apps:
+                app.state.register_api_key(key, "demo")
+                app.state.rate_limiter = memory_limiter()
+            clients = [self.client(app) for app in apps]
+            try:
+                responses = await asyncio.gather(
+                    *(
+                        clients[index % len(clients)].get(
+                            "/api/v1/secrets/demo/dev/TOKEN",
+                            headers={"X-Heimdall-API-Key": key},
+                        )
+                        for index in range(12)
+                    )
+                )
+            finally:
+                for client in clients:
+                    await client.aclose()
+        statuses = {response.status_code for response in responses}
+        self.assertTrue(statuses <= {404, 503}, statuses)
+        self.assertNotIn(500, statuses)
+        for response in responses:
+            if response.status_code == 503:
+                self.assert_unavailable(response)
+
+    async def test_writer_lock_held_by_peer_gives_503_to_all_concurrent_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.db"
+            apps = [self.make_app(path) for _ in range(3)]
+            key = generate_api_key()
+            for app in apps:
+                app.state.register_api_key(key, "demo")
+                app.state.rate_limiter = memory_limiter()
+            clients = [self.client(app) for app in apps]
+            try:
+                with db_session(path) as blocker:
+                    blocker.execute("BEGIN IMMEDIATE")
+                    responses = await asyncio.gather(
+                        *(
+                            clients[index % len(clients)].get(
+                                "/api/v1/secrets/demo/dev/TOKEN",
+                                headers={"X-Heimdall-API-Key": key},
+                            )
+                            for index in range(8)
+                        )
+                    )
+            finally:
+                for client in clients:
+                    await client.aclose()
+        for response in responses:
+            self.assert_unavailable(response)
