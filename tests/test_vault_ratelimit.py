@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from heimdall.vault.database import db_session
 from heimdall.vault.ratelimit import RateLimiter, SqliteRateLimiter
 
 
@@ -162,6 +163,32 @@ class SlidingWindowSqliteTests(unittest.TestCase):
             allowed, retry = limiter.check_authenticated("127.0.0.1", "key")
             self.assertFalse(allowed)
             self.assertEqual(retry, 7)
+
+    def test_sqlite_rejected_flood_from_distinct_peers_keeps_table_bounded(self) -> None:
+        """Un flot de rejets de pairs neufs ne fait pas croître la table sans borne."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            now = [0.0]
+            limiter = SqliteRateLimiter(
+                db_path,
+                per_key=1,
+                per_peer=3,
+                global_limit=5,
+                window_seconds=10,
+                clock=lambda: now[0],
+            )
+            self.assertTrue(limiter.check("10.0.0.0", "key")[0])
+            rejected = 0
+            for index in range(1, 2000):
+                now[0] = index * 0.5
+                allowed, retry = limiter.check(f"10.0.{index // 250}.{index % 250}", "key")
+                if not allowed:
+                    rejected += 1
+                    self.assertTrue(1 <= retry <= 10)
+            self.assertGreater(rejected, 1500)
+            with db_session(db_path) as conn:
+                rows = conn.execute("SELECT COUNT(*) FROM rate_limit_hits").fetchone()[0]
+            self.assertLessEqual(rows, 40)
 
     def test_sqlite_clear_resets_every_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

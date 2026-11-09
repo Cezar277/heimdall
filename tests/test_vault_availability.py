@@ -176,6 +176,33 @@ class DatabaseAvailabilityTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(unknown.status_code, 401)
 
+    async def test_prolonged_rejected_flood_is_429_never_500(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.db"
+            app = create_app(
+                VaultSettings(
+                    db_path=str(path),
+                    storage_backend="sqlite",
+                    kek=generate_encryption_key(),
+                    api_key_pepper="p" * 32,
+                    rate_limit_per_peer=3,
+                    rate_limit_global=100,
+                )
+            )
+            self.assertIsInstance(app.state.rate_limiter, SqliteRateLimiter)
+            async with self.client(app) as client:
+                responses = [
+                    await client.get("/api/v1/secrets/demo/dev/TOKEN") for _ in range(300)
+                ]
+            statuses = {response.status_code for response in responses}
+            self.assertEqual(statuses, {401, 429})
+            for response in responses:
+                if response.status_code == 429:
+                    self.assertTrue(1 <= int(response.headers["Retry-After"]) <= 3600)
+            with db_session(path) as conn:
+                rows = conn.execute("SELECT COUNT(*) FROM rate_limit_hits").fetchone()[0]
+            self.assertLessEqual(rows, 10)
+
     async def test_concurrent_sqlite_writers_never_return_500(self) -> None:
         """Requêtes concurrentes sur une même base : jamais de 500, 503 générique seulement."""
         with tempfile.TemporaryDirectory() as tmp:

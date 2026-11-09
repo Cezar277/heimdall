@@ -171,6 +171,8 @@ CREATE TABLE IF NOT EXISTS rate_limit_hits (
 );
 CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_name_at
     ON rate_limit_hits(name, hit_at);
+CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_at
+    ON rate_limit_hits(hit_at);
 
 -- Ancienne table de fenêtres fixes (lot #63), conservée pour compatibilité
 -- des bases existantes : plus aucun code ne la lit ni ne l'écrit.

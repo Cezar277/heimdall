@@ -41,7 +41,6 @@ from heimdall.vault.database import runtime_db_session as db_session
 
 _MAX_RETRY_AFTER_SECONDS: int = 3_600
 _MAX_TRACKED_BUCKETS: int = 100_000
-_MAX_TRACKED_HITS: int = 100_000
 _SQLITE_TABLE_SQL: str = """
 CREATE TABLE IF NOT EXISTS rate_limit_hits (
     name TEXT NOT NULL,
@@ -51,6 +50,10 @@ CREATE TABLE IF NOT EXISTS rate_limit_hits (
 _SQLITE_INDEX_SQL: str = """
 CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_name_at
     ON rate_limit_hits(name, hit_at);
+"""
+_SQLITE_HITS_AT_INDEX_SQL: str = """
+CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_at
+    ON rate_limit_hits(hit_at);
 """
 
 
@@ -269,14 +272,17 @@ class SqliteRateLimiter:
         with db_session(self._db_path) as conn:
             conn.execute(_SQLITE_TABLE_SQL)
             conn.execute(_SQLITE_INDEX_SQL)
+            conn.execute(_SQLITE_HITS_AT_INDEX_SQL)
 
     @staticmethod
-    def _prune_bucket(conn: sqlite3.Connection, name: str, cutoff: float) -> None:
-        """Supprime les admissions sorties de la fenêtre pour un budget."""
-        conn.execute(
-            "DELETE FROM rate_limit_hits WHERE name = ? AND hit_at <= ?",
-            (name, cutoff),
-        )
+    def _prune_global(conn: sqlite3.Connection, cutoff: float) -> None:
+        """Supprime toutes les admissions sorties de la fenêtre (index sur hit_at).
+
+        Appelée à chaque évaluation, rejets compris : un rejet peut insérer une
+        admission pour un pair neuf, et sans purge sur ce chemin la table ne se
+        bornerait qu'aux admissions autorisées.
+        """
+        conn.execute("DELETE FROM rate_limit_hits WHERE hit_at <= ?", (cutoff,))
 
     @staticmethod
     def _count(conn: sqlite3.Connection, name: str, cutoff: float) -> int:
@@ -308,10 +314,10 @@ class SqliteRateLimiter:
     ) -> tuple[bool, int]:
         """Évalue et consomme les budgets dans la transaction courante."""
         cutoff = now - self._window_seconds
+        self._prune_global(conn, cutoff)
         states: list[tuple[str, int, int, float | None]] = []
         full: float | None = None
         for name, limit in specs:
-            self._prune_bucket(conn, name, cutoff)
             count = self._count(conn, name, cutoff)
             oldest = self._oldest(conn, name, cutoff)
             states.append((name, limit, count, oldest))
@@ -338,20 +344,7 @@ class SqliteRateLimiter:
                 "INSERT INTO rate_limit_hits (name, hit_at) VALUES (?, ?)",
                 (name, now),
             )
-        self._prune_global(conn, cutoff)
         return True, 0
-
-    @staticmethod
-    def _prune_global(conn: sqlite3.Connection, cutoff: float) -> None:
-        """Borne la table : purge les admissions expirées au-delà du seuil."""
-        row = conn.execute(
-            "SELECT COUNT(*) FROM rate_limit_hits"
-        ).fetchone()
-        if row is not None and int(row[0]) > _MAX_TRACKED_HITS:
-            conn.execute(
-                "DELETE FROM rate_limit_hits WHERE hit_at <= ?",
-                (cutoff,),
-            )
 
     def check(self, peer: str, key_hash: str | None = None) -> tuple[bool, int]:
         """Consomme une unité de façon atomique entre workers, sans stocker la clé."""
