@@ -855,9 +855,13 @@ _OBJECT_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{
 #: ``_`` ou ``@``), pas de métacaractère de revision git (``~``, ``^``,
 #: ``:``, ``?``, ``*``, ``[``, ``\``), pas de composant vide, commençant
 #: par ``.`` ou finissant par ``.lock``. ``origin/main``, ``HEAD``, un SHA
-#: complet et un tag simple passent ; une entrée douteuse est refusée avant
-#: tout appel git.
+#: complet et un tag simple passent ; ``@`` seul est l'alias git de ``HEAD``.
+#: Une entrée douteuse est refusée avant tout appel git.
 _REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_@][A-Za-z0-9._/@-]*")
+#: Longueur maximale d'une référence acceptée : un SHA fait 64 octets, un
+#: nom de branche court tient largement ; au-delà, l'argv de ``rev-parse``
+#: serait démesuré (déni de service local).
+MAX_REF_BYTES: Final[int] = 256
 #: Statuts de `--raw` dont le blob indexé doit être scanné : ajout,
 #: modification, changement de type (le nouveau contenu est scanné).
 _SCAN_STATUSES: Final[frozenset[str]] = frozenset({"A", "M", "T"})
@@ -876,11 +880,14 @@ def _checked_ref(ref: str) -> str:
     expression de revision (``-`` initial, ``..``, ``@{``, ``~``, ``^``,
     ``:``, ``?``, ``*``, ``[``, ``\\``), les composants vides, ceux qui
     commencent par ``.`` et ceux qui finissent par ``.lock``. ``@`` seul est
-    l'alias git de ``HEAD`` : il est accepté comme ``HEAD``. Un nom refusé
-    est une panne d'outillage (``ToolFailure``), jamais un scan partiel.
+    l'alias git de ``HEAD`` : il est accepté comme ``HEAD``. La longueur est
+    bornée à 256 octets : une référence géante ne devient jamais un argv
+    démesuré pour ``rev-parse``. Un nom refusé est une panne d'outillage
+    (``ToolFailure``), jamais un scan partiel.
     """
     if (
         not ref
+        or len(ref) > MAX_REF_BYTES
         or _REF_PATTERN.fullmatch(ref) is None
         or ".." in ref
         or "@{" in ref

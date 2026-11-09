@@ -29,8 +29,11 @@ def test_github_template_fetches_full_history_and_scans_the_diff() -> None:
     script = _joined_runs(job)
     assert "--ci" in script
     assert "--diff" in script
-    assert "origin/${{ github.base_ref }}" in script
+    assert "origin/$BASE_REF" in script
     assert "--no-allowlist" in script
+    assert "${{" not in script
+    scan_step = job["steps"][-1]
+    assert scan_step["env"]["BASE_REF"] == "${{ github.base_ref }}"
     assert document["permissions"] == {"contents": "read"}
     # PyYAML 1.1 lit la clé `on` comme le booléen True.
     triggers = document.get(True, document.get("on"))

@@ -89,6 +89,14 @@ def test_resolve_commit_accepts_at_as_head(git_repo: GitRepo) -> None:
     assert access.resolve_commit("@") == access.resolve_commit("HEAD")
 
 
+def test_resolve_commit_refuses_an_overlong_ref(git_repo: GitRepo) -> None:
+    """Une référence géante est refusée avant de devenir un argv démesuré."""
+    _base_and_feature(git_repo)
+    access = GitAccess(git_repo.root)
+    with pytest.raises(ToolFailure):
+        access.resolve_commit("a" * 257)
+
+
 def test_resolve_commit_refuses_an_unknown_ref(git_repo: GitRepo) -> None:
     _base_and_feature(git_repo)
     access = GitAccess(git_repo.root)
@@ -350,18 +358,23 @@ def test_scan_diff_accepts_an_external_config(
     assert document["config_hash"] is not None
 
 
-def test_collect_diff_rejects_tree_options(git_repo: GitRepo) -> None:
+@pytest.mark.parametrize(
+    "options",
+    [{"max_file_bytes": 1024}, {"skipped_files": []}],
+)
+def test_collect_diff_rejects_tree_options(
+    git_repo: GitRepo, options: dict[str, object]
+) -> None:
     """Le contrat API refuse les options d'arbre avec ``diff``."""
     _base_and_feature(git_repo)
-    for options in ({"max_file_bytes": 1024}, {"skipped_files": []}):
-        with pytest.raises(ScanError):
-            collect(
-                git_repo.root,
-                staged=False,
-                diff="origin/main",
-                ci=True,
-                **options,
-            )
+    with pytest.raises(ScanError):
+        collect(
+            git_repo.root,
+            staged=False,
+            diff="origin/main",
+            ci=True,
+            **options,
+        )
 
 
 def test_collect_diff_rejects_staged_and_non_ci(git_repo: GitRepo) -> None:

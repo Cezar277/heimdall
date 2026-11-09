@@ -39,10 +39,14 @@ jobs:
 
       - name: Scanner le diff de la PR
         shell: bash
+        env:
+          # Jamais d'interpolation GHA directe dans le script bash : un nom
+          # de branche cible contenant $(...) serait exécuté avant Heimdall.
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -o pipefail
           .heimdall-venv/bin/heimdall scan \
             --ci \
-            --diff "origin/${{ github.base_ref }}" \
+            --diff "origin/$BASE_REF" \
             --no-allowlist \
             --json | tee heimdall-scan.json

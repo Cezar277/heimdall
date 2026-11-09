@@ -29,14 +29,17 @@ heimdall scan --ci --diff "origin/<branche-cible>" --no-allowlist --json
 - **JSON** : `--json` écrit le contrat `heimdall.scan.v1` sur stdout, avec
   `scope: "diff"`. Aucun secret n'y figure : seulement des empreintes HMAC.
 
-## Les deux pièges à éviter
+## Les trois pièges à éviter
 
 1. **Clone superficiel** : sans historique complet, git ne trouve pas
    l'ancêtre commun et le scan sort en 2. Les modèles imposent
    `fetch-depth: 0` (GitHub) et `GIT_DEPTH: "0"` (GitLab). Ne pas les
    retirer pour gagner du temps : un job vert sur un historique incomplet
    serait un faux négatif.
-2. **Allowlist du dépôt** : en `--ci`, un `heimdall.toml` du dépôt scanné ne
+2. **Référence égale à `HEAD`** : `--diff HEAD` produit une plage vide et
+   donc un verdict 0. Ce n'est pas un scan complet : utiliser la branche
+   cible (`origin/main`, `origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME`).
+3. **Allowlist du dépôt** : en `--ci`, un `heimdall.toml` du dépôt scanné ne
    peut pas s'auto-attester. Les modèles utilisent `--no-allowlist` (verdict
    maximal). Pour une allowlist d'équipe, utiliser `--config` vers un fichier
    **hors du dépôt** :

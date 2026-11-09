@@ -180,9 +180,12 @@ un secret supprimé par la branche courante n'a plus de blob à scanner. Le
 blob entier est analysé, pas seulement les lignes ajoutées. La référence
 est validée puis résolue en SHA avant tout appel git ; `HEAD` est figé en
 SHA et re-résolu après l'analyse (s'il a bougé, code 2). Un clone
-superficiel sans ancêtre commun fait échouer git : code 2, jamais 0. Les
-modèles [`docs/ci/`](ci/README.md) imposent `fetch-depth: 0` /
-`GIT_DEPTH: 0`. En `--ci --diff`, la configuration du dépôt ne peut pas
+superficiel sans ancêtre commun fait échouer git : code 2, jamais 0. Une
+référence égale à `HEAD` (`--diff HEAD`) produit une **plage vide** et donc
+un verdict 0 : c'est une misconfiguration, pas un scan complet — utiliser
+la branche cible (`origin/main`). Les modèles [`docs/ci/`](ci/README.md)
+imposent `fetch-depth: 0` / `GIT_DEPTH: 0`. En `--ci --diff`, la
+configuration du dépôt ne peut pas
 s'auto-attester : utiliser `--no-allowlist` (verdict maximal) ou `--config`
 vers un fichier **hors du dépôt**. Le mode est strictement headless : aucun
 LLM n'est appelé.
