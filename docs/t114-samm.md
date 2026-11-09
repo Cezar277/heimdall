@@ -3,8 +3,8 @@
 Périmètre : sous-ticket **#114** du ticket parent `#39 « Auth durcie,
 rate-limiting et audit log »`.
 
-Révision du code testé : `3c403b2ad699fbc3eebc3f75199c4783d7743d40`
-(`test(vault): contention avec limiteur SQLite reel et trafic authentifie (#39)`).
+Révision du code testé : `c3bb619d6f26f57fbce83974acaf6d6d20fb802c`
+(`test(vault): deplace les tests d'abus runtime hors de tests/security (#39)`).
 
 Ce sous-ticket ne modifie pas le code de production : il attaque le Vault
 existant (force brute, rejeu, charge) et archive les preuves. Les défenses
@@ -14,12 +14,12 @@ testées sont celles de #111/#112/#113.
 
 | Exigence vérifiée | Implémentation / défense testée | Test et preuve permanente | Résultat local |
 |---|---|---|---|
-| Force brute de clés API : 429 attendus | [heimdall/vault/ratelimit.py:173–235](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/heimdall/vault/ratelimit.py#L173-L235), [heimdall/vault/app.py:1223–1282](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/heimdall/vault/app.py#L1223-L1282) | [tests/security/test_vault_abuse_runtime.py:57–86](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/tests/security/test_vault_abuse_runtime.py#L57-L86) | Réussi |
-| Rejeu d'un POST capturé : rejet sans écrasement | [heimdall/vault/database.py:118–120](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/heimdall/vault/database.py#L118-L120), [heimdall/vault/store.py:253–295](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/heimdall/vault/store.py#L253-L295) | [tests/security/test_vault_abuse_runtime.py:118–152](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/tests/security/test_vault_abuse_runtime.py#L118-L152) | Réussi |
-| Rejeu après révocation : 401 générique | [heimdall/vault/auth.py:823–916](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/heimdall/vault/auth.py#L823-L916) | [tests/security/test_vault_abuse_runtime.py:154–184](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/tests/security/test_vault_abuse_runtime.py#L154-L184) | Réussi |
-| Charge simple : quelques centaines de requêtes sans plantage | [heimdall/vault/app.py:1598–1736](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/heimdall/vault/app.py#L1598-L1736), [heimdall/vault/audit.py:382–614](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/heimdall/vault/audit.py#L382-L614) | [tests/security/test_vault_abuse_runtime.py:186–208](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/tests/security/test_vault_abuse_runtime.py#L186-L208), [tests/security/test_vault_abuse_runtime.py:210–229](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/tests/security/test_vault_abuse_runtime.py#L210-L229) | Réussi |
-| `X-Forwarded-For` falsifié : pas de remise à zéro du budget pair | [heimdall/vault/app.py:1223–1247](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/heimdall/vault/app.py#L1223-L1247) | [tests/security/test_vault_abuse_runtime.py:89–115](https://github.com/Cezar277/heimdall/blob/3c403b2ad699fbc3eebc3f75199c4783d7743d40/tests/security/test_vault_abuse_runtime.py#L89-L115) | Réussi |
-| Tous les tests d'abus passent | — | `python -m pytest tests/security/test_vault_abuse_runtime.py -q` → 6 passed | Réussi |
+| Force brute de clés API : 429 attendus | [heimdall/vault/ratelimit.py:173–235](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/heimdall/vault/ratelimit.py#L173-L235), [heimdall/vault/app.py:1265–1324](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/heimdall/vault/app.py#L1265-L1324) | [tests/test_vault_abuse_runtime.py:57–86](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/tests/test_vault_abuse_runtime.py#L57-L86) | Réussi |
+| Rejeu d'un POST capturé : rejet sans écrasement | [heimdall/vault/database.py:159–162](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/heimdall/vault/database.py#L159-L162), [heimdall/vault/store.py:431–484](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/heimdall/vault/store.py#L431-L484) | [tests/test_vault_abuse_runtime.py:118–152](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/tests/test_vault_abuse_runtime.py#L118-L152) | Réussi |
+| Rejeu après révocation : 401 générique | [heimdall/vault/auth.py:830–923](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/heimdall/vault/auth.py#L830-L923) | [tests/test_vault_abuse_runtime.py:154–184](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/tests/test_vault_abuse_runtime.py#L154-L184) | Réussi |
+| Charge simple : quelques centaines de requêtes sans plantage | [heimdall/vault/app.py:1690–1828](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/heimdall/vault/app.py#L1690-L1828), [heimdall/vault/audit.py:382–614](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/heimdall/vault/audit.py#L382-L614) | [tests/test_vault_abuse_runtime.py:186–208](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/tests/test_vault_abuse_runtime.py#L186-L208), [tests/test_vault_abuse_runtime.py:210–229](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/tests/test_vault_abuse_runtime.py#L210-L229) | Réussi |
+| `X-Forwarded-For` falsifié : pas de remise à zéro du budget pair | [heimdall/vault/app.py:1265–1289](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/heimdall/vault/app.py#L1265-L1289) | [tests/test_vault_abuse_runtime.py:89–115](https://github.com/Cezar277/heimdall/blob/c3bb619d6f26f57fbce83974acaf6d6d20fb802c/tests/test_vault_abuse_runtime.py#L89-L115) | Réussi |
+| Tous les tests d'abus passent | — | `python -m pytest tests/test_vault_abuse_runtime.py -q` → 6 passed | Réussi |
 
 ## 2. Sémantique de rejeu définie
 
@@ -48,7 +48,7 @@ testée est donc :
 ## 4. Résultats locaux
 
 ```sh
-python -m pytest tests/security/test_vault_abuse_runtime.py -q
+python -m pytest tests/test_vault_abuse_runtime.py -q
 # 6 passed
 python -m pytest tests/security/test_vault_replay_bruteforce.py -q
 # 2 passed (contrat statique + assertions #111/#113/#114)
