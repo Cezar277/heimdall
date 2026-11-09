@@ -91,3 +91,13 @@ ouvert : rien n'est « clos » par erreur au titre de #63.
 | `api_keys_lock` tenu pendant l'I/O DB | verrou de persistance distinct du verrou de snapshot : le chemin de lecture ne bloque plus | `tests/test_vault_review_regressions.py::test_registration_db_io_does_not_block_read_path` |
 | 429 de capacité permanent | sémantique documentée et pinnée : retry inutile tant que la capacité est pleine (route DELETE suivie en #62) | `tests/test_vault_app.py::test_capacity_429_retry_is_useless_until_capacity_freed` |
 | Quota inter-processus (suggestion de revue) | deux workers sur le même fichier, `max_secrets=2` : jamais de dépassement | `tests/test_vault_app.py::test_sqlite_quota_never_exceeded_with_two_workers` |
+
+## 4. Exception de regroupement #39
+
+Le lot **#39 « Auth durcie, rate-limiting et audit log »** regroupe ses quatre
+sous-tickets (#111 à #114) sur demande explicite de l'opérateur. La PR de ce lot
+ne ferme que le ticket parent (`Closes #39`) : les sous-tickets restent tracés
+dans la matrice ci-dessus et sont clôturés séparément après fusion. Cette
+exception de regroupement est volontairement limitée à ce lot ; les PR suivantes
+respectent le découpage « une PR = un sous-ticket ». Les preuves par brique
+restent disponibles dans `docs/t111-samm.md` à `docs/t114-samm.md`.

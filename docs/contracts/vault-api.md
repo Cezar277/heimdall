@@ -325,7 +325,11 @@ limite de débit.
 Les admissions expirées de toutes les fenêtres sont purgées à chaque évaluation,
 rejets compris (index `idx_rate_limit_hits_at`) : la table ne retient que la
 fenêtre courante, donc sa taille reste proportionnelle au débit reçu pendant la
-fenêtre, sans dépendre des admissions autorisées.
+fenêtre, sans dépendre des admissions autorisées. Le backend mémoire applique la
+même règle : un bucket n'est créé qu'au moment où une admission est réellement
+consommée (chemin autorisé, ou pair/global consommés sur un rejet clé), et la
+purge des budgets expirés a lieu sur les deux chemins. Un flot de rejets avec
+des empreintes de clé distinctes ne laisse donc pas une entrée vide par hash.
 
 ## Journal d'audit (#113)
 
@@ -356,6 +360,10 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
   conservé dans `audit_chain_state.checkpoint_hash` ; le premier événement
   retenu pointe dessus, donc `verify` reste valide sans charger tout
   l'historique. La purge est testée par patch du seuil (mémoire et SQLite).
+- **Listage borné** : `list_events` applique le même bornage aux deux backends,
+  `max(1, min(MAX_LIST_LIMIT, int(limit)))` (1 à 1000). Une limite négative ou
+  nulle retombe sur 1 et une limite supérieure à 1000 est plafonnée : un appel
+  direct ne charge jamais tout l'historique mémoire.
 - **Panne SQLite** : une contention ou une erreur d'ouverture/commit du
   rate-limiter ou du journal est traduite en **503** (`Retry-After: 1`,
   `Connection: close`, `Cache-Control: no-store`), jamais en 500.
