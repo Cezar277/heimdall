@@ -396,6 +396,8 @@ def test_collect_diff_rejects_staged_and_non_ci(git_repo: GitRepo) -> None:
         collect(git_repo.root, staged=True, diff="origin/main", ci=True)
     with pytest.raises(ScanError):
         collect(git_repo.root, staged=False, diff="origin/main", ci=False)
+    with pytest.raises(ScanError):
+        collect(git_repo.root, staged=False, diff="", ci=True)
 
 
 def test_scan_diff_shallow_clone_exits_two(git_repo: GitRepo, tmp_path: Path) -> None:
