@@ -362,6 +362,12 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
 - **Fail-closed** : si l'écriture d'audit échoue, la réponse devient un 503
   générique (`Retry-After: 1`, `Connection: close`, `Cache-Control: no-store`)
   au lieu de laisser passer un accès non journalisé.
+- **Cible** : `target` est renseignée par le handler (`projet/env/nom` pour
+  créer, lire et lire l'état ; `projet` pour la liste), y compris pour un
+  refus 403 cross-projet. Une requête rejetée avant le handler (401 sur
+  `POST /api/v1/secrets`) n'a pas de cible : le corps n'est pas lu avant
+  l'authentification, donc aucun projet demandé n'est journalisé. La
+  corrélation se fait alors par `action`, `peer` et `status_code`.
 - **Pas de log injection** : les champs texte sont filtrés (caractères non
   imprimables supprimés) et bornés avant persistance.
 - **Backends** : `SqliteAuditLog` en production (table partagée entre workers,
