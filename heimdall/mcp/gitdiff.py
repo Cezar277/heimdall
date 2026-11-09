@@ -875,7 +875,8 @@ def _checked_ref(ref: str) -> str:
     refuse tout ce qui pourrait être interprété comme une option ou une
     expression de revision (``-`` initial, ``..``, ``@{``, ``~``, ``^``,
     ``:``, ``?``, ``*``, ``[``, ``\\``), les composants vides, ceux qui
-    commencent par ``.`` et ceux qui finissent par ``.lock``. Un nom refusé
+    commencent par ``.`` et ceux qui finissent par ``.lock``. ``@`` seul est
+    l'alias git de ``HEAD`` : il est accepté comme ``HEAD``. Un nom refusé
     est une panne d'outillage (``ToolFailure``), jamais un scan partiel.
     """
     if (

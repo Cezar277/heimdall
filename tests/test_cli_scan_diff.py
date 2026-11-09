@@ -19,9 +19,16 @@ from typer.testing import CliRunner
 
 import heimdall.cli.scan as scan_module
 from heimdall.cli.main import app
-from heimdall.cli.scan import EXIT_CLEAN, EXIT_ERROR, EXIT_FINDINGS, JSON_SCHEMA
+from heimdall.cli.scan import (
+    EXIT_CLEAN,
+    EXIT_ERROR,
+    EXIT_FINDINGS,
+    JSON_SCHEMA,
+    collect,
+)
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess
+from heimdall.scanner.errors import ScanError
 
 #: Exemple officiel de la documentation AWS : jamais une clé fonctionnelle.
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
@@ -73,6 +80,13 @@ def test_resolve_commit_returns_a_full_sha(git_repo: GitRepo) -> None:
     assert len(sha) == 40
     assert set(sha) <= set("0123456789abcdef")
     assert access.resolve_commit("HEAD") == sha
+
+
+def test_resolve_commit_accepts_at_as_head(git_repo: GitRepo) -> None:
+    """``@`` seul est l'alias git de ``HEAD`` (accepté, pas une option)."""
+    _base_and_feature(git_repo)
+    access = GitAccess(git_repo.root)
+    assert access.resolve_commit("@") == access.resolve_commit("HEAD")
 
 
 def test_resolve_commit_refuses_an_unknown_ref(git_repo: GitRepo) -> None:
@@ -307,6 +321,55 @@ def test_scan_diff_refuses_a_repo_config_in_ci(git_repo: GitRepo) -> None:
         "scan", "--ci", "--diff", "origin/main", "--no-allowlist", str(git_repo.root)
     )
     assert result.exit_code == EXIT_FINDINGS
+
+
+def test_scan_diff_accepts_an_external_config(
+    git_repo: GitRepo, tmp_path: Path
+) -> None:
+    """Un ``--config`` hors dépôt reste autorisé en ``--ci --diff``."""
+    _base_and_feature(git_repo)
+    git_repo.write("new.py", f'AWS = "{FAKE_AWS_KEY}"\n')
+    _commit(git_repo, "feature")
+    external = tmp_path / "allowlist.toml"
+    external.write_text('[allowlist]\nversion = "1"\n', encoding="utf-8")
+
+    result = _run(
+        "scan",
+        "--ci",
+        "--diff",
+        "origin/main",
+        "--config",
+        str(external),
+        "--json",
+        str(git_repo.root),
+    )
+
+    assert result.exit_code == EXIT_FINDINGS
+    document = json.loads(result.stdout)
+    assert document["scope"] == "diff"
+    assert document["config_hash"] is not None
+
+
+def test_collect_diff_rejects_tree_options(git_repo: GitRepo) -> None:
+    """Le contrat API refuse les options d'arbre avec ``diff``."""
+    _base_and_feature(git_repo)
+    for options in ({"max_file_bytes": 1024}, {"skipped_files": []}):
+        with pytest.raises(ScanError):
+            collect(
+                git_repo.root,
+                staged=False,
+                diff="origin/main",
+                ci=True,
+                **options,
+            )
+
+
+def test_collect_diff_rejects_staged_and_non_ci(git_repo: GitRepo) -> None:
+    _base_and_feature(git_repo)
+    with pytest.raises(ScanError):
+        collect(git_repo.root, staged=True, diff="origin/main", ci=True)
+    with pytest.raises(ScanError):
+        collect(git_repo.root, staged=False, diff="origin/main", ci=False)
 
 
 def test_scan_diff_shallow_clone_exits_two(git_repo: GitRepo, tmp_path: Path) -> None:

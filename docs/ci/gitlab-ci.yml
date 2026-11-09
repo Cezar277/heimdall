@@ -22,7 +22,7 @@ heimdall:
     - python -m venv .heimdall-venv
     - .heimdall-venv/bin/pip install "heimdall @ git+https://github.com/Cezar277/heimdall@${HEIMDALL_REVISION}"
   script:
-    - git fetch --no-tags origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - git fetch --no-tags origin -- "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
     - set -o pipefail
     - .heimdall-venv/bin/heimdall scan --ci --diff "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --no-allowlist --json | tee heimdall-scan.json
   artifacts:
