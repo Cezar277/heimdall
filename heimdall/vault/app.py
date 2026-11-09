@@ -97,6 +97,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
 from heimdall.vault import auth as vault_auth
+from heimdall.vault.audit import AuditMiddleware, InMemoryAuditLog, SqliteAuditLog
 from heimdall.vault.crypto import (
     MIN_MASTER_KEY_BYTES,
     VaultCipher,
@@ -1179,6 +1180,55 @@ async def _limiter_consume_authenticated(
     return limiter.check_authenticated(peer, key_hash)
 
 
+async def _resolve_request_key_hash(request: Request) -> str | None:
+    """Hache et retrouve la clé d'une requête, sans jamais la journaliser.
+
+    Ticket #112 : toute clé fournie (vide, malformée, inconnue) est hachée et
+    parcourue de façon exhaustive, même si le format est refusé plus tard. Le
+    résultat est mémoïsé dans la requête pour que l'authentification ne refasse
+    ni HMAC ni full-scan. Retourne l'empreinte seulement si la clé est valide.
+    """
+    raw_key = request.headers.get("X-Heimdall-API-Key")
+    if raw_key is None:
+        return None
+    try:
+        candidate_hash = vault_auth.hash_project_api_key(
+            raw_key,
+            pepper=request.app.state.settings.effective_api_key_pepper,
+        )
+    except ValueError:
+        candidate_hash = None
+    request.state.audit_key_hash = candidate_hash
+    if request.url.path == "/api/v1/health":
+        # Route publique : la clé éventuelle n'est jamais consommée (aucun bucket
+        # clé), mais son empreinte reste mémoïsée pour corréler l'événement
+        # d'audit. Un health anonyme garde ``None``.
+        return None
+    registry = getattr(request.app.state, "api_key_registry", None)
+    if candidate_hash is None:
+        # Même travail que le chemin valide : parcours exhaustif avec l'empreinte
+        # factice (mémoïsé, réutilisé par verify_api_key), puis lookup factice
+        # jeté (pas d'oracle de coût sur key_id, #112).
+        await vault_auth.find_api_key_project_cached(request, vault_auth.DUMMY_HASH)
+        if registry is not None:
+            registry.key_id_for_hash(vault_auth.DUMMY_HASH)
+            request.state.audit_key_id_checked = True
+        return None
+    registered_project, _ = await vault_auth.find_api_key_project_cached(
+        request, candidate_hash
+    )
+    if registered_project is None:
+        if registry is not None:
+            registry.key_id_for_hash(vault_auth.DUMMY_HASH)
+            request.state.audit_key_id_checked = True
+        return None
+    request.state.audit_project = registered_project
+    if registry is not None:
+        request.state.audit_key_id = registry.key_id_for_hash(candidate_hash)
+        request.state.audit_key_id_checked = True
+    return candidate_hash
+
+
 def _register_no_store_middleware(app: FastAPI) -> None:
     """Force ``Cache-Control: no-store`` sur toutes les réponses de secrets.
 
@@ -1267,21 +1317,7 @@ def _register_middleware(app: FastAPI) -> None:
                 content=_ERROR_PAYLOADS[401],
                 headers={"Connection": "close"},
             )
-        if raw_key and raw_key == raw_key.strip() and request.url.path != "/api/v1/health":
-            try:
-                candidate_hash = vault_auth.hash_project_api_key(
-                    raw_key,
-                    pepper=request.app.state.settings.effective_api_key_pepper,
-                )
-            except ValueError:
-                candidate_hash = None
-            if candidate_hash is not None:
-                registered_project, _ = await vault_auth.find_api_key_project_cached(
-                    request, candidate_hash
-                )
-                if registered_project is not None:
-                    key_hash = candidate_hash
-
+        key_hash = await _resolve_request_key_hash(request)
         if key_hash is not None:
             allowed, retry_after = await _limiter_consume_authenticated(limiter, peer, key_hash)
         else:
@@ -1382,7 +1418,7 @@ def _register_exception_handlers(app: FastAPI) -> None:
         )
 
 
-def _register_routes(app: FastAPI) -> None:
+def _register_routes(app: FastAPI) -> None:  # noqa: PLR0915
     """Enregistre les routes de l'API Vault."""
 
     @app.get(
@@ -1405,13 +1441,15 @@ def _register_routes(app: FastAPI) -> None:
         summary="Lister les métadonnées des secrets d'un projet",
         operation_id="listSecrets",
     )
-    async def list_secrets(
+    async def list_secrets(  # noqa: PLR0913, PLR0917
         project: Annotated[ProjectId, Query()],
+        request: Request,
         response: Response,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         offset: Annotated[int, Query(ge=0, le=_MAX_SECRET_OFFSET)] = 0,
         authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretPage:
+        request.state.audit_target = project
         vault_auth.ensure_project_access(
             authenticated_project, project, require_auth=app.state.settings.require_auth
         )
@@ -1458,10 +1496,12 @@ def _register_routes(app: FastAPI) -> None:
     )
     async def create_secret(
         secret_in: SecretCreate,
+        request: Request,
         response: Response,
         authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretMetadata:
         """Créer un secret vaulté (ticket #63)."""
+        request.state.audit_target = f"{secret_in.project}/{secret_in.env}/{secret_in.name}"
         settings: VaultSettings | None = getattr(app.state, "settings", None)
         require_auth = True if settings is None else settings.require_auth
         # Autorisation AVANT toute écriture : une clé d'un autre projet est
@@ -1531,9 +1571,11 @@ def _register_routes(app: FastAPI) -> None:
             SecretName,
             FastApiPath(description="Nom de variable ; aucune valeur secrète."),
         ],
+        request: Request,
         response: Response,
     ) -> SecretRead:
         """Lire la valeur courante d'un secret (ticket #63)."""
+        request.state.audit_target = f"{project}/{env}/{name}"
         response.headers["Cache-Control"] = "no-store"
         store: InMemorySecretStore = app.state.secret_store
         record = await store.get(project=project, env=env, name=name)
@@ -1559,7 +1601,7 @@ def _register_routes(app: FastAPI) -> None:
         summary="Lire l'état courant d'un secret sans la valeur",
         operation_id="getSecretState",
     )
-    async def get_secret_state(
+    async def get_secret_state(  # noqa: PLR0913, PLR0917
         project: Annotated[
             ProjectId,
             FastApiPath(description="Identifiant public du projet ; aucune valeur secrète."),
@@ -1572,6 +1614,7 @@ def _register_routes(app: FastAPI) -> None:
             SecretName,
             FastApiPath(description="Nom de variable ; aucune valeur secrète."),
         ],
+        request: Request,
         response: Response,
         authenticated_project: Annotated[str | None, Depends(verify_api_key)] = None,
     ) -> SecretMetadata:
@@ -1581,6 +1624,7 @@ def _register_routes(app: FastAPI) -> None:
         isolement par projet (403), 404 si inexistant, `Cache-Control: no-store`.
         Seules les métadonnées sont retournées, jamais la valeur.
         """
+        request.state.audit_target = f"{project}/{env}/{name}"
         settings: VaultSettings | None = getattr(app.state, "settings", None)
         if settings is None:
             settings = VaultSettings(require_auth=True)
@@ -1706,6 +1750,13 @@ def create_app(
     app.state.storage_backend = _configure_secret_store(
         app, effective_settings, resolved_db, secret_store
     )
+    # Journal d'audit (ticket #113) : SQLite en mode persistant (partagé entre
+    # workers), mémoire pour le backend de développement/test. Le chemin est
+    # celui du store effectif, aligné sur l'authentification et le débit.
+    if app.state.storage_backend == "sqlite":
+        app.state.audit_log = SqliteAuditLog(app.state.db_path)
+    else:
+        app.state.audit_log = InMemoryAuditLog()
 
     if api_key_hashes is not None and api_keys is not None:
         raise ValueError(
@@ -1776,6 +1827,10 @@ def create_app(
 
     _register_middleware(app)
     app.add_middleware(DatabaseAvailabilityMiddleware)
+    # Audit ajouté en dernier : il est le middleware le plus externe et voit
+    # donc TOUTES les réponses, y compris les 403 loopback, 401/403 d'auth,
+    # 429 de débit et 503 de disponibilité. Fail-closed si l'audit échoue.
+    app.add_middleware(AuditMiddleware, audit_log=app.state.audit_log)
     _register_exception_handlers(app)
     _register_routes(app)
 

@@ -389,10 +389,12 @@ components:
             $ref: '#/components/schemas/ConflictError'
     TooManyRequests:
       description: >-
-        Limite dépassée. Bucket par identifiant de clé API validée, erreurs
-        400/401 incluses ; requêtes sans clé valide et health limités par pair
-        réseau et limite globale. X-Forwarded-For ignoré hors proxy explicitement
-        approuvé ; ne jamais utiliser une clé arbitraire comme bucket illimité.
+        Limite dépassée. Fenêtre glissante par identifiant de clé API validée,
+        erreurs 400/401 incluses ; requêtes sans clé valide et health limités
+        par pair réseau et limite globale. Retry-After calculé sur la plus
+        ancienne admission de la fenêtre. X-Forwarded-For ignoré hors proxy
+        explicitement approuvé ; ne jamais utiliser une clé arbitraire comme
+        budget illimité.
       headers:
         Retry-After:
           $ref: '#/components/headers/RetryAfter'

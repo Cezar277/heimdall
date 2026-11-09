@@ -163,12 +163,52 @@ CREATE TABLE IF NOT EXISTS secrets (
 
 CREATE INDEX IF NOT EXISTS idx_secrets_project_env_name ON secrets(project_id, env, name);
 
--- Buckets de rate-limiting partagés entre workers (lot #63). Les noms de
--- buckets par clé sont des empreintes HMAC, jamais les clés brutes.
+-- Admissions de rate-limiting en fenêtre glissante (tickets #63/#111).
+-- Les noms de budgets par clé sont des empreintes HMAC, jamais les clés brutes.
+CREATE TABLE IF NOT EXISTS rate_limit_hits (
+    name TEXT NOT NULL,
+    hit_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_name_at
+    ON rate_limit_hits(name, hit_at);
+CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_at
+    ON rate_limit_hits(hit_at);
+
+-- Ancienne table de fenêtres fixes (lot #63), conservée pour compatibilité
+-- des bases existantes : plus aucun code ne la lit ni ne l'écrit.
 CREATE TABLE IF NOT EXISTS rate_limit_buckets (
     name TEXT PRIMARY KEY,
     count INTEGER NOT NULL,
     reset_at REAL NOT NULL
+);
+
+-- Journal d'audit chaîné (ticket #113). Aucune valeur de secret, aucune clé
+-- complète : uniquement des métadonnées publiques et une empreinte tronquée.
+CREATE TABLE IF NOT EXISTS audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    key_id TEXT,
+    key_fingerprint TEXT,
+    project TEXT,
+    peer TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT,
+    status_code INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    previous_hash TEXT NOT NULL,
+    entry_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_occurred_at
+    ON audit_events(occurred_at);
+
+-- Point de contrôle de chaîne après purge de rétention (ticket #113).
+-- Le premier événement retenu pointe sur `checkpoint_hash` ; la vérification
+-- reprend donc à ce point sans charger tout l'historique.
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    checkpoint_hash TEXT NOT NULL,
+    pruned_events INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
 );
 """
 
@@ -784,7 +824,14 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
     tables = {
         row[0] for row in cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
     }
-    required_tables = {"projects", "api_keys", "secrets"}
+    required_tables = {
+        "projects",
+        "api_keys",
+        "secrets",
+        "rate_limit_hits",
+        "audit_events",
+        "audit_chain_state",
+    }
     if not required_tables.issubset(tables):
         raise RuntimeError("Schéma de base de données non conforme : tables manquantes.")
 
