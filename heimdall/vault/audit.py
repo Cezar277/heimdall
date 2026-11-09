@@ -336,11 +336,12 @@ class InMemoryAuditLog(AuditLog):
         limit: int = DEFAULT_LIST_LIMIT,
         project: str | None = None,
     ) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(MAX_LIST_LIMIT, int(limit)))
         with self._lock:
             selected = [
                 event for event in self._events if project is None or event.project == project
             ]
-            return [event.as_dict() for event in selected[-limit:]]
+            return [event.as_dict() for event in selected[-bounded_limit:]]
 
     def verify_chain(self) -> tuple[bool, int | None]:
         with self._lock:

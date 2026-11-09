@@ -12,7 +12,9 @@ Preuves SAMM : module + ligne (voir ``docs/t111-samm.md``).
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from heimdall.vault import ratelimit as ratelimit_module
 from heimdall.vault.database import db_session
 from heimdall.vault.ratelimit import RateLimiter, SqliteRateLimiter
 
@@ -96,6 +98,46 @@ class SlidingWindowMemoryTests(unittest.TestCase):
         self.assertFalse(limiter.check("127.0.0.1", "key")[0])
         limiter.clear()
         self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+
+    def test_rejected_distinct_key_hashes_do_not_create_buckets(self) -> None:
+        """Un rejet global/pair ne laisse pas un bucket vide par hash évalué."""
+        now = [0.0]
+        limiter = RateLimiter(
+            per_key=1,
+            per_peer=1,
+            global_limit=1,
+            window_seconds=10,
+            clock=lambda: now[0],
+        )
+        self.assertTrue(limiter.check_authenticated("127.0.0.1", "key-0")[0])
+        initial = set(limiter._buckets)
+        for index in range(1, 500):
+            now[0] = index * 0.001
+            allowed, retry = limiter.check_authenticated("127.0.0.1", f"key-{index}")
+            self.assertFalse(allowed)
+            self.assertTrue(1 <= retry <= 10)
+        self.assertEqual(set(limiter._buckets), initial)
+
+    def test_rejected_request_prunes_expired_buckets(self) -> None:
+        """La purge des budgets expirés a aussi lieu sur le chemin de rejet."""
+        now = [0.0]
+        limiter = RateLimiter(
+            per_key=1,
+            per_peer=100,
+            global_limit=1,
+            window_seconds=10,
+            clock=lambda: now[0],
+        )
+        with patch.object(ratelimit_module, "_MAX_TRACKED_BUCKETS", 100):
+            for index in range(10):
+                self.assertTrue(limiter.check_key(f"key-{index}")[0])
+            now[0] = 20.0
+            self.assertTrue(limiter.check_authenticated("127.0.0.1", "key-new")[0])
+            self.assertGreater(len(limiter._buckets), 5)
+        with patch.object(ratelimit_module, "_MAX_TRACKED_BUCKETS", 5):
+            allowed, _retry = limiter.check_authenticated("127.0.0.1", "key-other")
+        self.assertFalse(allowed)
+        self.assertLessEqual(len(limiter._buckets), 3)
 
 
 class SlidingWindowSqliteTests(unittest.TestCase):

@@ -298,6 +298,49 @@ class AuditTrailTests(unittest.IsolatedAsyncioTestCase):
         demo = app.state.audit_log.list_events(limit=10, project="demo")
         self.assertEqual([event["action"] for event in demo], ["GET /0", "GET /2", "GET /4"])
 
+    async def test_list_events_limit_is_bounded_like_sqlite(self) -> None:
+        """Mémoire : >MAX_LIST_LIMIT borné, <=0 normalisé à 1 (parité SQLite)."""
+        app = _memory_app()
+        for index in range(audit_module.MAX_LIST_LIMIT + 5):
+            await app.state.audit_log.record(
+                peer="127.0.0.1",
+                action=f"GET /{index}",
+                target=None,
+                status_code=200,
+            )
+        events = app.state.audit_log.list_events(limit=100_000)
+        self.assertEqual(len(events), audit_module.MAX_LIST_LIMIT)
+        self.assertEqual(events[-1]["action"], f"GET /{audit_module.MAX_LIST_LIMIT + 4}")
+        for limit in (0, -5):
+            with self.subTest(limit=limit):
+                bounded = app.state.audit_log.list_events(limit=limit)
+                self.assertEqual(len(bounded), 1)
+                self.assertEqual(bounded[0]["action"], f"GET /{audit_module.MAX_LIST_LIMIT + 4}")
+
+    async def test_list_events_limit_parity_between_memory_and_sqlite(self) -> None:
+        """Le bornage mémoire et SQLite reste identique, y compris aux extrêmes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = _memory_app()
+            sqlite = _sqlite_app(tmp)
+            for index in range(5):
+                for app in (memory, sqlite):
+                    await app.state.audit_log.record(
+                        peer="127.0.0.1",
+                        action=f"GET /{index}",
+                        target=None,
+                        status_code=200,
+                    )
+            with patch.object(audit_module, "MAX_LIST_LIMIT", 3):
+                for limit in (100, 3, 1, 0, -2):
+                    with self.subTest(limit=limit):
+                        memory_events = memory.state.audit_log.list_events(limit=limit)
+                        sqlite_events = sqlite.state.audit_log.list_events(limit=limit)
+                        self.assertEqual(
+                            [event["action"] for event in memory_events],
+                            [event["action"] for event in sqlite_events],
+                        )
+                        self.assertLessEqual(len(memory_events), 3)
+
 
 class AuditRetentionTests(unittest.IsolatedAsyncioTestCase):
     async def test_memory_retention_bounds_growth_and_preserves_chain(self) -> None:

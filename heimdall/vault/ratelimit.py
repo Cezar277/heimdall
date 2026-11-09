@@ -119,12 +119,24 @@ class RateLimiter:
         while bucket.hits and bucket.hits[0] <= cutoff:
             bucket.hits.popleft()
 
-    def _bucket(self, name: str, now: float) -> _Bucket:
+    def _existing_bucket(self, name: str, now: float) -> _Bucket | None:
+        """Retourne le bucket existant après purge, sans jamais en créer.
+
+        Un rejet ne doit pas laisser d'entrée vide pour chaque nom évalué :
+        les buckets sont créés uniquement quand une admission est réellement
+        consommée (chemin autorisé ou pair/global consommés sur rejet clé).
+        """
+        bucket = self._buckets.get(name)
+        if bucket is not None:
+            self._prune_bucket(bucket, now)
+        return bucket
+
+    def _ensure_bucket(self, name: str) -> _Bucket:
+        """Crée le bucket au moment de la première admission consommée."""
         bucket = self._buckets.get(name)
         if bucket is None:
             bucket = _Bucket()
             self._buckets[name] = bucket
-        self._prune_bucket(bucket, now)
         return bucket
 
     def _prune(self, now: float) -> None:
@@ -151,25 +163,33 @@ class RateLimiter:
         pair/global sont consommés même quand le budget clé est plein, tandis
         qu'un rejet pair/global n'ajoute rien.
         """
-        buckets: list[tuple[str, int, _Bucket]] = []
+        buckets: list[tuple[str, int, _Bucket | None]] = []
         full: tuple[_Bucket, int] | None = None
         for name, limit in specs:
-            bucket = self._bucket(name, now)
+            bucket = self._existing_bucket(name, now)
             buckets.append((name, limit, bucket))
-            if full is None and bucket.count >= limit:
+            if full is None and bucket is not None and bucket.count >= limit:
                 full = (bucket, limit)
 
         if full is not None:
-            bucket, limit = full
+            bucket, _limit = full
             if consume_on_reject:
                 for name, spec_limit, candidate in buckets:
-                    if name in consume_on_reject and candidate.count < spec_limit:
-                        candidate.hits.append(now)
+                    if name not in consume_on_reject:
+                        continue
+                    current = candidate.count if candidate is not None else 0
+                    if current < spec_limit:
+                        target = candidate if candidate is not None else self._ensure_bucket(name)
+                        target.hits.append(now)
+            # Purge aussi sur le chemin rejet : les budgets expirés ne doivent
+            # pas survivre à un flot de rejets (parité avec le backend SQLite).
+            self._prune(now)
             oldest = bucket.hits[0] if bucket.hits else now
             return False, _retry_after(oldest, now, self._window_seconds)
 
-        for _name, _limit, bucket in buckets:
-            bucket.hits.append(now)
+        for name, _limit, bucket in buckets:
+            target = bucket if bucket is not None else self._ensure_bucket(name)
+            target.hits.append(now)
         self._prune(now)
         return True, 0
 
