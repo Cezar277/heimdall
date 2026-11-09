@@ -216,17 +216,21 @@ des empreintes dupliquées, l'initialisation échoue sans suppression automatiqu
 La génération du pepper et les comparaisons sensibles sont confinées dans
 `heimdall/vault/crypto.py`.
 
-Rate-limiting débit (lot #63) : fenêtres fixes par clé API validée, par pair réseau
-et globale. Un `peek` pair/global en lecture seule (sans consommation ni
-verrou d'écriture) précède le hachage et le parcours d'authentification ;
-leur rejet 429 ne déclenche aucun lookup de clé. Après résolution de
-l'empreinte, `check_authenticated` consomme pair/global + clé en une seule
-transaction (mémoire : une seule section critique ; SQLite : un seul
-`BEGIN IMMEDIATE`), sans fenêtre inter-transactions ni double verrou
-d'écriture. Sémantique préservée : pair/global restent consommés même quand
-le bucket clé est plein. Les
-400/401 consomment les buckets pair/global, une clé absente ou invalide ne crée
-pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
+Rate-limiting débit (lot #63, **fenêtre glissante** #111) : chaque admission
+est horodatée et seule la fenêtre `[now - window, now]` est comptée, par clé API
+validée, par pair réseau et globalement. Contrairement à une fenêtre fixe, un
+attaquant ne peut pas doubler son budget à cheval sur deux fenêtres. Un `peek`
+pair/global en lecture seule (sans consommation ni verrou d'écriture) précède le
+hachage et le parcours d'authentification ; leur rejet 429 ne déclenche aucun
+lookup de clé. Après résolution de l'empreinte, `check_authenticated` consomme
+pair/global + clé en une seule transaction (mémoire : une seule section
+critique ; SQLite : un seul `BEGIN IMMEDIATE`), sans fenêtre inter-transactions
+ni double verrou d'écriture. Sémantique préservée : pair/global restent
+consommés même quand le budget clé est plein. Les 400/401 consomment les
+budgets pair/global, une clé absente ou invalide ne crée pas de budget
+arbitraire, et `X-Forwarded-For` reste ignoré. Le délai `Retry-After` est
+calculé sur la plus ancienne admission encore dans la fenêtre, puis borné à
+1..3600 s.
 Le choix du bucket par clé (`auth.find_api_key_project_cached`) emprunte le même
 parcours complet à coût comparable que `verify_api_key` (parcours exhaustif
 du backend actif, sans `break` précoce) et le mémoïse dans l'état de la
@@ -267,12 +271,66 @@ et la clé refusée répond 401 générique — y compris pour un serveur déjà
 démarré, dont la lecture en base voit la révocation à la requête suivante.
 Ré-enregistrer une clé révoquée ne la réactive pas.
 
-Backend de débit (lot #63) : avec le stockage SQLite, les buckets sont persistés dans
-la base et incrémentés sous `BEGIN IMMEDIATE` : la limite (clé/pair/global) est
+Backend de débit (lot #63, fenêtre glissante #111) : avec le stockage SQLite,
+les admissions sont persistées dans `rate_limit_hits(name, hit_at)` et
+comptées/insérées sous `BEGIN IMMEDIATE` : la limite (clé/pair/global) est
 partagée entre workers et n'est jamais multipliée par leur nombre. Le backend
 mémoire, réservé au développement/test, reste strictement mono-processus et
-`run_server` épingle `workers=1` par défaut. Le quota de stockage reste
-indépendant de cette limite de débit.
+`run_server` épingle `workers=1` par défaut. **Un cache en mémoire ne suffit
+pas avec plusieurs processus** : chaque worker aurait son propre compteur et la
+limite effective serait multipliée par le nombre de workers ; la production
+utilise donc le backend SQLite. Le quota de stockage reste indépendant de cette
+limite de débit.
+
+## Journal d'audit (#113)
+
+Chaque accès au Vault produit un événement dans `audit_events`, **y compris les
+refus 401/403 et les limitations 429**. Le journal est consultable avec
+`heimdall vault audit list --db-path <base>` (option `--project`, `--limit`,
+`--json`) et vérifiable avec `heimdall vault audit verify --db-path <base>`.
+
+Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
+`peer`, `action`, `target`, `status_code`, `outcome`, `previous_hash`,
+`entry_hash`.
+
+- **Aucun secret** : le corps de requête, les en-têtes et la valeur d'un secret
+  ne sont jamais lus par le module d'audit. La clé API n'est jamais persistée,
+  même partiellement : `key_id` est l'identifiant interne public (`key_...`,
+  jamais la clé) et `key_fingerprint` est une **empreinte tronquée** de 16
+  caractères hexadécimaux (HMAC calculé avec le pepper serveur) qui permet de
+  corréler les accès d'une même clé, y compris pour une clé inconnue.
+- **Chaînage par hash** : `entry_hash = SHA-256(charge canonique JSON)` et
+  `previous_hash` référence l'événement précédent (`GENESIS` pour le premier).
+  Modifier, insérer ou supprimer une ligne casse la chaîne ; `verify` localise
+  la première ligne invalide. On parle de journal **résistant à l'altération**,
+  pas « inviolable » : un attaquant qui contrôle toute la base peut recalculer
+  la chaîne. La protection contre la suppression totale relève de la sauvegarde
+  externe.
+- **Fail-closed** : si l'écriture d'audit échoue, la réponse devient un 503
+  générique (`Retry-After: 1`, `Connection: close`, `Cache-Control: no-store`)
+  au lieu de laisser passer un accès non journalisé.
+- **Pas de log injection** : les champs texte sont filtrés (caractères non
+  imprimables supprimés) et bornés avant persistance.
+- **Backends** : `SqliteAuditLog` en production (table partagée entre workers,
+  écriture sous `BEGIN IMMEDIATE`) ; `InMemoryAuditLog` pour le backend mémoire
+  de développement/test, strictement mono-processus et perdu au redémarrage.
+
+## Rejeu de requête (#114)
+
+Le contrat v1 n'ajoute ni nonce ni date de validité : la sémantique anti-rejeu
+est portée par les routes existantes et doit être vérifiée par des tests
+d'abus runtime :
+
+- un **POST rejoué** ne remplace jamais un secret existant : 409
+  `conflict`, la valeur d'origine reste inchangée ;
+- un **GET rejoué** est idempotent et renvoie la même valeur (ou 404) tant que
+  la clé est valide ;
+- une **requête capturée rejouée après révocation** de la clé est refusée en
+  401 générique ;
+- la force brute de clés API est bornée par le budget pair/global puis par le
+  budget clé, avec 429 et `Retry-After` ;
+- une charge de quelques centaines de requêtes ne doit produire ni 500 ni
+  arrêt du serveur.
 
 Transport (#25) : en production, `run_server` refuse de démarrer sans
 `HEIMDALL_VAULT_SSL_CERTFILE` et `HEIMDALL_VAULT_SSL_KEYFILE` (fail-closed) et
