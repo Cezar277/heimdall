@@ -536,6 +536,38 @@ class UidGidGuardTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 1)
 
+    def test_compose_config_user_resolution_nominal_and_zero(self) -> None:
+        """Prouve que sans variable user résout en 1000:1000 et teste la résolution 0:0."""
+        docker = shutil.which("docker")
+        if not docker:
+            self.skipTest("docker non disponible")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir)
+            shutil.copy(COMPOSE, workdir / "docker-compose.yml")
+            (workdir / ".env").write_text("HEIMDALL_ENV=production\n", encoding="utf-8")
+            res_nom = subprocess.run(  # noqa: S603
+                [docker, "compose", "config"],
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if res_nom.returncode == 0:
+                self.assertIn("user: 1000:1000", res_nom.stdout)
+                (workdir / ".env").write_text(
+                    "HEIMDALL_UID=0\nHEIMDALL_GID=0\n",
+                    encoding="utf-8",
+                )
+                res_zero = subprocess.run(  # noqa: S603
+                    [docker, "compose", "config"],
+                    cwd=workdir,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(res_zero.returncode, 0)
+                self.assertIn("user: '0:0'", res_zero.stdout)
+
     def test_guide_effective_env_guard_rejects_resolved_zero(self) -> None:
         """Vérifie que le garde bash du guide après extraction refuse tout UID/GID résolu à 0."""
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")

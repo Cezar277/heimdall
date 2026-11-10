@@ -4,7 +4,7 @@ Périmètre : ticket parent **#41 « Docker, compose et doc d'installation »** 
 ses sous-tickets #119 à #122. Cette fiche archive les commandes, les fichiers
 et les résultats vérifiés pour l'audit croisé.
 
-Code testé : tag `t41-audit` vérifié par `git rev-parse` = `49bb5ccce63a102e1f00a075f1cd6c83dfbe366e` ; docs et tests re-pinnés sur `be3c8d2b23f555f5eecc05db109fb1bde7b6f699` (aucun changement de code).
+Code testé : tag `t41-audit` vérifié par `git rev-parse` = `49bb5ccce63a102e1f00a075f1cd6c83dfbe366e` ; docs et tests re-pinnés sur `be3c8d2b23f555f5eecc05db109fb1bde7b6f699` (aucun changement du code embarqué).
 
 ## 1. Correspondance ticket → livrable → preuve
 
