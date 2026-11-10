@@ -116,6 +116,7 @@ class ComposeSecurityTests(unittest.TestCase):
         self.assertIn("no-new-privileges:true", self.service["security_opt"])
         self.assertIn("HEIMDALL_UID", self.service["user"])
         self.assertIn("HEIMDALL_GID", self.service["user"])
+        self.assertNotIn("0:0", self.service["user"])
         self.assertIn("/tmp:rw,noexec,nosuid,size=64m", self.service["tmpfs"])  # noqa: S108
         self.assertEqual(self.service["pids_limit"], 256)
 
@@ -199,6 +200,14 @@ class InstallGuideTests(unittest.TestCase):
         self.assertNotIn('curl -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY"', text)
         self.assertNotIn("export HEIMDALL_API_KEY=", text)
         self.assertNotIn("/tmp/heimdall-auth.header", text)  # noqa: S108
+
+
+class ReadmeQuickstartTests(unittest.TestCase):
+    def test_readme_quickstart_protects_env(self) -> None:
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("cp .env.example .env", text)
+        self.assertIn("chmod 600 .env", text)
+        self.assertIn("docs/install.md", text)
 
 
 class HealthcheckTests(unittest.TestCase):
