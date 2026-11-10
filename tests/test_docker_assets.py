@@ -263,7 +263,7 @@ class InstallGuideTests(unittest.TestCase):
         self.assertGreaterEqual(text.count("set -euo pipefail"), 4)
         # Durcissements revue db325b4 : restauration à déchiffrement unique,
         # dépannage sans écrasement.
-        self.assertIn('T="$(mktemp)"', text)
+        self.assertIn('T="$(mktemp /tmp/heimdall-restore.XXXXXX)"', text)
         self.assertIn('gpg --output "$T" --decrypt "$BK"', text)
         self.assertEqual(text.count("--decrypt"), 1)
         self.assertIn("test ! -e .env", text)

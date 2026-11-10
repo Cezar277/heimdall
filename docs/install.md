@@ -360,7 +360,7 @@ des membres inattendus :
 ```sh
 set -euo pipefail
 BK="${HOME}/heimdall-backup-AAAA-MM-JJ.tgz.gpg"
-T="$(mktemp)"
+T="$(mktemp /tmp/heimdall-restore.XXXXXX)"
 trap 'rm -f "$T"' EXIT INT TERM HUP
 chmod 600 "$T"
 gpg --output "$T" --decrypt "$BK"
