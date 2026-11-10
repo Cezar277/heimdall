@@ -531,15 +531,18 @@ class UidGidGuardTests(unittest.TestCase):
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")
         self.assertIn('"${HEIMDALL_UID:-1000}" =~ ^0+$', guide)
         self.assertIn('"${HEIMDALL_GID:-1000}" =~ ^0+$', guide)
+        self.assertIn(") || exit 1", guide)
         bash = shutil.which("bash")
         self.assertIsNotNone(bash)
         script = (
-            'set -eu\n'
-            '[ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }\n'
-            'if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then\n'
-            '  exit 1\n'
-            'fi\n'
-            'exit 0\n'
+            "set -eu\n"
+            "(\n"
+            '  [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }\n'
+            '  if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then\n'
+            "    exit 1\n"
+            "  fi\n"
+            ") || exit 1\n"
+            "exit 0\n"
         )
         with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
             for env_content, expected_exit in (
@@ -568,6 +571,44 @@ class UidGidGuardTests(unittest.TestCase):
                         expected_exit,
                         f"Échec pour env: {env_content!r}",
                     )
+
+    def test_guide_env_guard_does_not_leak_secrets_into_parent_shell(self) -> None:
+        """Vérifie que le sourcing en sous-shell du §4 n'exporte pas les secrets dans le parent."""
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        script = (
+            "set -eu\n"
+            "(\n"
+            '  [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }\n'
+            '  if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then\n'
+            "    exit 1\n"
+            "  fi\n"
+            ") || exit 1\n"
+            'echo "MASTER_KEY=${HEIMDALL_VAULT_MASTER_KEY:-unset}"\n'
+            'echo "PEPPER=${HEIMDALL_VAULT_API_KEY_PEPPER:-unset}"\n'
+        )
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
+            handle.write(
+                "HEIMDALL_UID=1000\n"
+                "HEIMDALL_GID=1000\n"
+                "HEIMDALL_VAULT_MASTER_KEY=secret_master_key\n"
+                "HEIMDALL_VAULT_API_KEY_PEPPER=secret_pepper\n"
+            )
+            handle.flush()
+            env = {k: v for k, v in os.environ.items() if not k.startswith("HEIMDALL_")}
+            env["ENV_FILE"] = handle.name
+            res = subprocess.run(  # noqa: S603
+                [bash, "-c", script],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("MASTER_KEY=unset", res.stdout)
+            self.assertIn("PEPPER=unset", res.stdout)
+            self.assertNotIn("secret_master_key", res.stdout)
+            self.assertNotIn("secret_pepper", res.stdout)
 
 
 if __name__ == "__main__":
