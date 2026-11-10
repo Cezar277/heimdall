@@ -187,6 +187,10 @@ class InstallGuideTests(unittest.TestCase):
             'mv -f "$ENV_TMP" .env',
             "docker compose config --quiet",
             "gpg --symmetric --cipher-algo AES256",
+            "docker compose stop vault",
+            'F="heimdall-backup-$(date +%F).tgz.gpg"',
+            'chmod 600 "$F"',
+            "docker compose start vault",
             "docker inspect",
             "network_mode: host",
         ):

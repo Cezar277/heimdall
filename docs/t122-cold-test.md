@@ -45,8 +45,10 @@ et lancer Heimdall **avec la seule documentation** `docs/install.md`.
 | Image de base mutable (`python:3.12-slim`) | Digest `@sha256:...` épinglé dans le Dockerfile |
 | `HEIMDALL_UID=0` pouvait relancer le conteneur en root | Entrypoint refusant `euid == 0`, testé |
 | Sauvegarde non chiffrée de `.env`/`secrets` | Archive chiffrée authentifiée `gpg --symmetric --cipher-algo AES256` |
+| Sauvegarde SQLite à chaud | Le guide arrête le Vault (`docker compose stop vault`) avant l'archive et le redémarre après |
 | Permissions de `data/`/`secrets/` dépendantes de l'umask | `chmod 700 data secrets` et `chmod 600` explicites |
 | `.env` écrit en place, race possible | Écriture atomique via `mktemp` + `mv -f` |
+| Nom de sauvegarde recalculé entre `gpg` et `chmod` | Nom figé dans `F` avant l'écriture |
 | Secrets `.env` visibles via `docker inspect` | Avertissement explicite dans la section Sécurité |
 | `data/`/`secrets/` pouvaient être des symlinks préexistants | Garde `test ! -L data && test ! -L secrets` avant `mkdir` |
 

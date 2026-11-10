@@ -249,12 +249,17 @@ pour la mettre à jour, relever le digest avec
 La sauvegarde contient la clé maîtresse, le pepper et la clé TLS : elle doit
 être chiffrée avant d'être écrite sur disque.
 
+La base SQLite doit être **quiescente** : arrêter le Vault avant la copie,
+sinon une sauvegarde à chaud peut être déchirée ou exclure des transactions.
+
 ```sh
+docker compose stop vault
 umask 077
+F="heimdall-backup-$(date +%F).tgz.gpg"
 tar --exclude='data/vault.db-*' -czf - data .env secrets \
-  | gpg --symmetric --cipher-algo AES256 \
-      --output "heimdall-backup-$(date +%F).tgz.gpg"
-chmod 600 "heimdall-backup-$(date +%F).tgz.gpg"
+  | gpg --symmetric --cipher-algo AES256 --output "$F"
+chmod 600 "$F"
+docker compose start vault
 ```
 
 Restauration (après `docker compose down`) :
@@ -265,7 +270,8 @@ gpg --decrypt "heimdall-backup-AAAA-MM-JJ.tgz.gpg" | tar -xzf -
 
 `gpg --symmetric` utilise un chiffrement authentifié (MDC) : une archive
 altérée est refusée au déchiffrement. Ne jamais conserver l'archive `.tgz` en
-clair.
+clair. Le nom de fichier est figé dans `F` pour que le `chmod` porte sur
+exactement le fichier écrit, même à cheval sur minuit.
 
 ### Réinitialisation (destructif)
 
