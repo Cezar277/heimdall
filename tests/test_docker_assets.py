@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -55,7 +56,7 @@ class DockerfileSecurityTests(unittest.TestCase):
         self.assertIn("--require-hashes", text)
         self.assertIn("--no-deps", text)
         self.assertIn("--no-build-isolation", text)
-        self.assertIn("python -m pip uninstall -y setuptools", text)
+        self.assertIn("python -m pip uninstall -y pip setuptools", text)
 
     def test_image_runs_as_non_root_and_has_healthcheck(self) -> None:
         text = DOCKERFILE.read_text(encoding="utf-8")
@@ -175,9 +176,9 @@ class InstallGuideTests(unittest.TestCase):
         text = INSTALL_GUIDE.read_text(encoding="utf-8")
         for expected in (
             '[[ "$(id -u)" != 0 ]]',
-            "git checkout 2cd13cc",
+            "git checkout t41-audit",
             "git fetch origin",
-            "grep -Eq '^HEIMDALL_(UID|GID)=0",
+            'grep -Eq "^HEIMDALL_(UID|GID)=',
             "docker compose stop vault || exit 1",
             "basicConstraints=critical,CA:FALSE",
             ".env.??????",
@@ -194,7 +195,7 @@ class InstallGuideTests(unittest.TestCase):
             "A-Za-z0-9_-]{43,}",
             "mktemp /tmp/heimdall-auth.XXXXXX",
             '-K "$AUTH_HEADER"',
-            "trap 'rm -f \"$AUTH_HEADER\"' EXIT INT TERM",
+            "trap 'rm -f \"$AUTH_HEADER\"' EXIT INT TERM HUP",
             'rm -f "$AUTH_HEADER"',
             "mktemp .env.XXXXXX",
             'mv -f "$ENV_TMP" .env',
@@ -241,27 +242,31 @@ class ReadmeQuickstartTests(unittest.TestCase):
 
 
 class HealthcheckTests(unittest.TestCase):
-    def test_http_healthcheck_returns_zero_on_200(self) -> None:
-        module = _load_healthcheck()
+    @staticmethod
+    def _response(status: int) -> MagicMock:
         response = MagicMock()
-        response.status = 200
+        response.status = status
         response.__enter__ = MagicMock(return_value=response)
         response.__exit__ = MagicMock(return_value=False)
+        return response
+
+    def test_http_healthcheck_disables_proxies_and_returns_zero_on_200(self) -> None:
+        module = _load_healthcheck()
+        opener = MagicMock()
+        opener.open.return_value = self._response(200)
         with (
             patch.dict("os.environ", {"HEIMDALL_VAULT_PORT": "8443"}, clear=True),
-            patch("urllib.request.urlopen", return_value=response) as urlopen,
+            patch("urllib.request.build_opener", return_value=opener) as build_opener,
         ):
             self.assertEqual(module.main(), 0)
-        urlopen.assert_called_once_with(
-            "http://127.0.0.1:8443/api/v1/health", timeout=2, context=None
-        )
+        self.assertIsInstance(build_opener.call_args.args[0], urllib.request.ProxyHandler)
+        self.assertEqual(len(build_opener.call_args.args), 1)
+        opener.open.assert_called_once_with("http://127.0.0.1:8443/api/v1/health", timeout=2)
 
     def test_https_healthcheck_verifies_the_local_certificate(self) -> None:
         module = _load_healthcheck()
-        response = MagicMock()
-        response.status = 200
-        response.__enter__ = MagicMock(return_value=response)
-        response.__exit__ = MagicMock(return_value=False)
+        opener = MagicMock()
+        opener.open.return_value = self._response(200)
         context = MagicMock()
         with (
             patch.dict(
@@ -273,13 +278,13 @@ class HealthcheckTests(unittest.TestCase):
                 clear=True,
             ),
             patch("ssl.create_default_context", return_value=context) as create_context,
-            patch("urllib.request.urlopen", return_value=response) as urlopen,
+            patch("urllib.request.build_opener", return_value=opener) as build_opener,
         ):
             self.assertEqual(module.main(), 0)
         create_context.assert_called_once_with(cafile="/run/secrets/cert.pem")
-        urlopen.assert_called_once_with(
-            "https://127.0.0.1:9443/api/v1/health", timeout=2, context=context
-        )
+        self.assertIsInstance(build_opener.call_args.args[0], urllib.request.ProxyHandler)
+        self.assertIsInstance(build_opener.call_args.args[1], urllib.request.HTTPSHandler)
+        opener.open.assert_called_once_with("https://127.0.0.1:9443/api/v1/health", timeout=2)
 
     def test_healthcheck_rejects_malformed_port_without_reflection(self) -> None:
         module = _load_healthcheck()
@@ -296,19 +301,18 @@ class HealthcheckTests(unittest.TestCase):
 
     def test_healthcheck_fails_closed_on_error_or_non_200(self) -> None:
         module = _load_healthcheck()
-        response = MagicMock()
-        response.status = 503
-        response.__enter__ = MagicMock(return_value=response)
-        response.__exit__ = MagicMock(return_value=False)
+        opener = MagicMock()
+        opener.open.return_value = self._response(503)
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch("urllib.request.urlopen", return_value=response),
+            patch("urllib.request.build_opener", return_value=opener),
             patch("sys.stderr", new_callable=io.StringIO),
         ):
             self.assertEqual(module.main(), 1)
+        opener.open.side_effect = OSError("down")
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch("urllib.request.urlopen", side_effect=OSError("down")),
+            patch("urllib.request.build_opener", return_value=opener),
             patch("sys.stderr", new_callable=io.StringIO),
         ):
             self.assertEqual(module.main(), 1)
@@ -320,6 +324,18 @@ class EntrypointTests(unittest.TestCase):
         stderr = io.StringIO()
         with (
             patch("os.geteuid", return_value=0),
+            patch("os.getegid", return_value=10001),
+            patch("sys.stderr", stderr),
+        ):
+            self.assertEqual(module.main(), 1)
+        self.assertIn("root", stderr.getvalue())
+
+    def test_entrypoint_refuses_root_group(self) -> None:
+        module = _load_entrypoint()
+        stderr = io.StringIO()
+        with (
+            patch("os.geteuid", return_value=10001),
+            patch("os.getegid", return_value=0),
             patch("sys.stderr", stderr),
         ):
             self.assertEqual(module.main(), 1)
@@ -329,6 +345,7 @@ class EntrypointTests(unittest.TestCase):
         module = _load_entrypoint()
         with (
             patch("os.geteuid", return_value=10001),
+            patch("os.getegid", return_value=10001),
             patch("os.execvp") as execvp,
         ):
             self.assertEqual(module.main(), 1)

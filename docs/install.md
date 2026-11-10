@@ -40,7 +40,7 @@ python3 --version
 git clone https://github.com/Cezar277/heimdall.git
 cd heimdall
 # Révision auditée (voir docs/t41-samm.md) : installation reproductible.
-git checkout 2cd13cc
+git checkout t41-audit
 git rev-parse --short HEAD
 ```
 
@@ -75,7 +75,7 @@ HEIMDALL_UID=$(id -u)
 HEIMDALL_GID=$(id -g)
 ENV_FILE
 mv -f "$ENV_TMP" .env
-trap - EXIT INT TERM
+trap - EXIT INT TERM HUP
 
 openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
   -keyout secrets/vault_tls_key.pem \
@@ -111,7 +111,7 @@ tourner avec l'UID de l'utilisateur hôte, jamais `0`.
   echo "installation en root refusée : utiliser un compte non privilégié" >&2
   exit 1
 }
-grep -Eq '^HEIMDALL_(UID|GID)=0([[:space:]]|$)' .env && {
+grep -Eq "^HEIMDALL_(UID|GID)=['\"]?[[:space:]]*0+['\"]?([[:space:]#]|$)" .env && {
   echo "HEIMDALL_UID/HEIMDALL_GID=0 interdit dans .env" >&2
   exit 1
 }
@@ -175,7 +175,7 @@ read -rsp "Clé API: " HEIMDALL_API_KEY; echo
 }
 umask 077
 AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
-trap 'rm -f "$AUTH_HEADER"' EXIT INT TERM
+trap 'rm -f "$AUTH_HEADER"' EXIT INT TERM HUP
 chmod 600 "$AUTH_HEADER"
 printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
   > "$AUTH_HEADER"
@@ -192,7 +192,7 @@ curl --cacert secrets/vault_tls_cert.pem \
   https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
 
 rm -f "$AUTH_HEADER"
-trap - EXIT INT TERM
+trap - EXIT INT TERM HUP
 ```
 
 Attendu : `201` puis `200` avec la valeur. Le journal d'audit est consultable
@@ -259,7 +259,7 @@ docker compose start
 
 ```sh
 git fetch origin
-git checkout 2cd13cc   # même révision auditée qu'au §2
+git checkout t41-audit   # même révision auditée qu'au §2
 git rev-parse --short HEAD
 docker compose build --pull
 docker compose up -d

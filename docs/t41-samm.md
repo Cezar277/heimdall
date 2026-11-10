@@ -70,7 +70,7 @@ read -rsp "Clé API: " HEIMDALL_API_KEY; echo
 }
 umask 077
 AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
-trap 'rm -f "$AUTH_HEADER"' EXIT INT TERM
+trap 'rm -f "$AUTH_HEADER"' EXIT INT TERM HUP
 chmod 600 "$AUTH_HEADER"
 printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
   > "$AUTH_HEADER"
@@ -89,7 +89,7 @@ curl --cacert secrets/vault_tls_cert.pem \
 # 200 avec la valeur
 
 rm -f "$AUTH_HEADER"
-trap - EXIT INT TERM
+trap - EXIT INT TERM HUP
 docker compose exec -T vault heimdall vault audit list --limit 5
 # événements 201/200, aucune valeur de secret
 ```

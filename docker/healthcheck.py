@@ -37,9 +37,14 @@ def main() -> int:
     certfile = os.environ.get("HEIMDALL_VAULT_SSL_CERTFILE")
     scheme = "https" if certfile else "http"
     url = f"{scheme}://127.0.0.1:{port}/api/v1/health"
-    context = ssl.create_default_context(cafile=certfile) if certfile else None
+    handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({})]
+    if certfile:
+        handlers.append(
+            urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=certfile))
+        )
+    opener = urllib.request.build_opener(*handlers)
     try:
-        with urllib.request.urlopen(url, timeout=_TIMEOUT_SECONDS, context=context) as response:
+        with opener.open(url, timeout=_TIMEOUT_SECONDS) as response:
             return 0 if response.status == 200 else 1
     except Exception:
         # Message générique : jamais de chemin, de certificat ni de secret.

@@ -15,7 +15,7 @@ _REFUS_ROOT = "refus: le conteneur Vault ne doit pas tourner en root"
 
 
 def main() -> int:
-    if os.geteuid() == 0:
+    if os.geteuid() == 0 or os.getegid() == 0:
         print(_REFUS_ROOT, file=sys.stderr)
         return 1
     os.execvp(sys.executable, [sys.executable, "-m", "heimdall.vault.app"])
