@@ -232,6 +232,9 @@ class InstallGuideTests(unittest.TestCase):
         self.assertNotIn("HEIMDALL_UID=$(id -u)", text)
         self.assertNotIn("HEIMDALL_GID=$(id -g)", text)
         self.assertNotIn("HEIMDALL_(UID|GID)", text)
+        # chown préserve les bits : aucun `chmod` sans sudo après le chown.
+        self.assertIn("`chown` préserve les bits", text)
+        self.assertNotIn("sudo chown -R 10001:10001 data secrets\nchmod 700", text)
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
 
@@ -365,6 +368,8 @@ class ReadmeQuickstartTests(unittest.TestCase):
         self.assertIn("install -m 600 .env.example .env", text)
         self.assertIn("docs/install.md", text)
         self.assertIn("docs/install.md §3", text)
+        self.assertIn("docs/install.md §4", text)
+        self.assertIn("jamais en root hôte", text)
         self.assertIn('user: "10001:10001"', text)
         self.assertIn("sudo chown -R 10001:10001 data secrets", text)
         self.assertNotIn("HEIMDALL_UID", text)

@@ -38,6 +38,7 @@ dépendances hashées, TLS obligatoire) via Docker Compose :
 install -m 600 .env.example .env
 # Générer les valeurs avec docs/install.md §3 (umask 077, openssl rand,
 # `sudo chown -R 10001:10001 data secrets` pour l'UID figé).
+# Exécuter les gardes docs/install.md §4 avant tout `up`, jamais en root hôte.
 # Le compose fige `user: "10001:10001"` : aucun `up` ne peut démarrer en root.
 docker compose up -d --build
 curl --cacert secrets/vault_tls_cert.pem https://127.0.0.1:8443/api/v1/health

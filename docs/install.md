@@ -92,8 +92,9 @@ chmod 600 secrets/vault_tls_cert.pem secrets/vault_tls_key.pem
 # UID/GID) : transférer la propriété des bind mounts à cet UID fixe.
 # Requiert sudo/root une seule fois ; `.env` reste possédé par l'hôte (lu par
 # Compose côté hôte, pas besoin de chown).
+# `chown` préserve les bits (700 posés ci-dessus) : pas de second `chmod` —
+# un `chmod` sans sudo échouerait ici en EPERM (non-propriétaire).
 sudo chown -R 10001:10001 data secrets
-chmod 700 data secrets
 ```
 
 - `HEIMDALL_VAULT_MASTER_KEY` : phrase de passe longue et unique, **sans
