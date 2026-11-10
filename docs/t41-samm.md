@@ -99,7 +99,23 @@ docker compose exec -T vault heimdall vault audit list --limit 5
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install --require-hashes -r requirements-runtime.lock
-.venv/bin/pip install -e . --no-deps --no-build-isolation
+test -z "$(git status --porcelain)" || {
+  echo "arbre de travail modifié : installer uniquement la révision auditée" >&2
+  exit 1
+}
+SHA_PRE="$(git rev-parse HEAD)"
+D="$(mktemp -d)"
+trap 'rm -rf "$D"' EXIT
+git archive HEAD | tar -x -C "$D"
+test "$(git rev-parse HEAD)" = "$SHA_PRE" || {
+  echo "HEAD modifiée pendant l'archivage" >&2
+  exit 1
+}
+test -z "$(git status --porcelain)" || {
+  echo "arbre altéré pendant l'archivage" >&2
+  exit 1
+}
+.venv/bin/pip install --no-deps --no-build-isolation "$D"
 
 D="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
 trap 'rm -rf "$D"' EXIT

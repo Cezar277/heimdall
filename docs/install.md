@@ -123,13 +123,17 @@ grep -Eq "^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)[[:space:]]*=[[:sp
   exit 1
 }
 # shellcheck disable=SC1091
-(
-  [ -f .env ] && { set -a; . ./.env; set +a; }
-  if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then
-    echo "HEIMDALL_UID/HEIMDALL_GID résolu à 0 interdit" >&2
+for VAR in HEIMDALL_UID HEIMDALL_GID; do
+  VAL=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${VAR}[[:space:]]*=" .env 2>/dev/null | tail -1 | sed -e 's/^[^=]*=//' -e 's/[[:space:]#].*$//' -e 's/["'\'']//g')
+  if [[ -n "$VAL" && "$VAL" =~ ^0+$ ]]; then
+    echo "${VAR} résolu à 0 interdit dans .env" >&2
     exit 1
   fi
-) || exit 1
+done
+if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then
+  echo "HEIMDALL_UID/HEIMDALL_GID résolu à 0 interdit dans l'environnement" >&2
+  exit 1
+fi
 for f in .env.??????; do
   [ -e "$f" ] && { echo "fichier .env temporaire résiduel : $f" >&2; exit 1; }
 done

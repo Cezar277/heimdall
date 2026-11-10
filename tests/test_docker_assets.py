@@ -330,6 +330,14 @@ class SamnAndPinTests(unittest.TestCase):
             f"Désynchronisation: install.md ({shas_install[0]}) != samm.md ({sha_samm})",
         )
 
+    def test_samm_cli_snippet_imposes_clean_status_and_snapshot(self) -> None:
+        """Vérifie que la SAMM impose status propre + git archive + contrôle SHA_PRE."""
+        samm = (ROOT / "docs" / "t41-samm.md").read_text(encoding="utf-8")
+        self.assertIn("git status --porcelain", samm)
+        self.assertIn("git archive HEAD", samm)
+        self.assertIn('SHA_PRE="$(git rev-parse HEAD)"', samm)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$SHA_PRE"', samm)
+
     def test_runtime_lock_script_writes_atomically(self) -> None:
         script = (ROOT / "scripts" / "regen_runtime_lock.py").read_text(encoding="utf-8")
         self.assertIn("os.replace", script)
@@ -529,21 +537,26 @@ class UidGidGuardTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
 
     def test_guide_effective_env_guard_rejects_resolved_zero(self) -> None:
-        """Vérifie que le garde bash du guide après sourcing refuse tout UID ou GID résolu à 0."""
+        """Vérifie que le garde bash du guide après extraction refuse tout UID/GID résolu à 0."""
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")
         self.assertIn('"${HEIMDALL_UID:-1000}" =~ ^0+$', guide)
         self.assertIn('"${HEIMDALL_GID:-1000}" =~ ^0+$', guide)
-        self.assertIn(") || exit 1", guide)
+        self.assertNotIn(". ./.env", guide)
         bash = shutil.which("bash")
         self.assertIsNotNone(bash)
         script = (
             "set -eu\n"
-            "(\n"
-            '  [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }\n'
-            '  if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then\n'
+            "for VAR in HEIMDALL_UID HEIMDALL_GID; do\n"
+            '  VAL=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${VAR}[[:space:]]*=" '
+            '"$ENV_FILE" 2>/dev/null | tail -1 | '
+            'sed -e "s/^[^=]*=//" -e "s/[[:space:]#].*$//" -e "s/[\\"\'\']//g")\n'
+            '  if [[ -n "$VAL" && "$VAL" =~ ^0+$ ]]; then\n'
             "    exit 1\n"
             "  fi\n"
-            ") || exit 1\n"
+            "done\n"
+            'if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then\n'
+            "  exit 1\n"
+            "fi\n"
             "exit 0\n"
         )
         with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
@@ -574,43 +587,48 @@ class UidGidGuardTests(unittest.TestCase):
                         f"Échec pour env: {env_content!r}",
                     )
 
-    def test_guide_env_guard_does_not_leak_secrets_into_parent_shell(self) -> None:
-        """Vérifie que le sourcing en sous-shell du §4 n'exporte pas les secrets dans le parent."""
+    def test_guide_env_guard_does_not_execute_code_or_leak_secrets(self) -> None:
+        """Vérifie que le garde n'exécute pas de code arbitraire et ne fuite aucun secret."""
         bash = shutil.which("bash")
         self.assertIsNotNone(bash)
-        script = (
-            "set -eu\n"
-            "(\n"
-            '  [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }\n'
-            '  if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then\n'
-            "    exit 1\n"
-            "  fi\n"
-            ") || exit 1\n"
-            'echo "MASTER_KEY=${HEIMDALL_VAULT_MASTER_KEY:-unset}"\n'
-            'echo "PEPPER=${HEIMDALL_VAULT_API_KEY_PEPPER:-unset}"\n'
-        )
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
-            handle.write(
-                "HEIMDALL_UID=1000\n"
-                "HEIMDALL_GID=1000\n"
-                "HEIMDALL_VAULT_MASTER_KEY=secret_master_key\n"
-                "HEIMDALL_VAULT_API_KEY_PEPPER=secret_pepper\n"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pwned = Path(tmpdir) / "pwned"
+            script = (
+                "set -eu\n"
+                "for VAR in HEIMDALL_UID HEIMDALL_GID; do\n"
+                '  VAL=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${VAR}[[:space:]]*=" '
+                '"$ENV_FILE" 2>/dev/null | tail -1 | '
+                'sed -e "s/^[^=]*=//" -e "s/[[:space:]#].*$//" -e "s/[\\"\'\']//g")\n'
+                '  if [[ -n "$VAL" && "$VAL" =~ ^0+$ ]]; then\n'
+                "    exit 1\n"
+                "  fi\n"
+                "done\n"
+                'echo "MASTER_KEY=${HEIMDALL_VAULT_MASTER_KEY:-unset}"\n'
+                'echo "PEPPER=${HEIMDALL_VAULT_API_KEY_PEPPER:-unset}"\n'
             )
-            handle.flush()
-            env = {k: v for k, v in os.environ.items() if not k.startswith("HEIMDALL_")}
-            env["ENV_FILE"] = handle.name
-            res = subprocess.run(  # noqa: S603
-                [bash, "-c", script],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(res.returncode, 0)
-            self.assertIn("MASTER_KEY=unset", res.stdout)
-            self.assertIn("PEPPER=unset", res.stdout)
-            self.assertNotIn("secret_master_key", res.stdout)
-            self.assertNotIn("secret_pepper", res.stdout)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
+                handle.write(
+                    f"HEIMDALL_UID=$(touch {pwned})\n"
+                    "HEIMDALL_GID=1000\n"
+                    "HEIMDALL_VAULT_MASTER_KEY=secret_master_key\n"
+                    "HEIMDALL_VAULT_API_KEY_PEPPER=secret_pepper\n"
+                )
+                handle.flush()
+                env = {k: v for k, v in os.environ.items() if not k.startswith("HEIMDALL_")}
+                env["ENV_FILE"] = handle.name
+                res = subprocess.run(  # noqa: S603
+                    [bash, "-c", script],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(res.returncode, 0)
+                self.assertFalse(pwned.exists(), "Code arbitraire exécuté depuis .env")
+                self.assertIn("MASTER_KEY=unset", res.stdout)
+                self.assertIn("PEPPER=unset", res.stdout)
+                self.assertNotIn("secret_master_key", res.stdout)
+                self.assertNotIn("secret_pepper", res.stdout)
 
 
 if __name__ == "__main__":
