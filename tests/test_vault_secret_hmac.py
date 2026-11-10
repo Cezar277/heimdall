@@ -167,6 +167,34 @@ class SecretHmacCryptoTests(TestCase):
             _normalize_server_hmac_key("1234" * 8)
         self.assertIn("generate_server_hmac_key()", str(ctx3.exception))
 
+    def test_normalize_server_hmac_key_rejects_subtle_weak_patterns(self) -> None:
+        """Refuse les clés subtilement faibles (période > 4, diversité < 16, entropie < 3.5)."""
+        # Période 8 avec 8 symboles distincts ("ABCDEFGH" * 4 = 32 octets)
+        with self.assertRaises(ValueError) as ctx1:
+            _normalize_server_hmac_key("ABCDEFGH" * 4)
+        self.assertIn("generate_server_hmac_key()", str(ctx1.exception))
+
+        # Motif périodique de 10 caractères avec diversité insuffisante ("0123456789" * 3 + "01")
+        with self.assertRaises(ValueError) as ctx2:
+            _normalize_server_hmac_key("0123456789" * 3 + "01")
+        self.assertIn("generate_server_hmac_key()", str(ctx2.exception))
+
+        # Motif de période 16
+        with self.assertRaises(ValueError) as ctx3:
+            _normalize_server_hmac_key("abcdefghijklmnop" * 2)
+        self.assertIn("generate_server_hmac_key()", str(ctx3.exception))
+
+    def test_candidate_value_empty_parity_cipher(self) -> None:
+        """Une valeur candidate vide retourne False en toute circonstance (avec ou sans AAD)."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        dummy_fp = "a" * 64
+        aad = VaultCipher.aad("project", "prod", "TOKEN")
+
+        self.assertFalse(cipher.is_secret_value_matching("", dummy_fp))
+        self.assertFalse(cipher.is_secret_value_matching("", dummy_fp, aad=aad))
+        self.assertFalse(cipher.is_secret_value_matching(b"", dummy_fp))
+        self.assertFalse(cipher.is_secret_value_matching(b"", dummy_fp, aad=aad))
+
     def test_generate_server_hmac_key(self) -> None:
         """generate_server_hmac_key produit au moins 256 bits d'entropie aléatoire."""
         k1 = generate_server_hmac_key()
@@ -554,6 +582,63 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(prod_matches), 1)
             self.assertEqual(prod_matches[0]["name"], "DB_PASS")
+
+    async def test_candidate_value_empty_parity_stores(self) -> None:
+        """Une valeur candidate vide retourne False / [] sans déchiffrer ni planter."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+
+        # 1. En mémoire
+        mem_store = InMemorySecretStore(cipher=cipher)
+        await mem_store.create("demo", "prod", "SEC1", "some_secret_value")
+        self.assertFalse(await mem_store.is_secret_value_matching("demo", "prod", "SEC1", ""))
+        self.assertEqual(await mem_store.find_secrets_matching_value("demo", ""), [])
+
+        # 2. En SQLite
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            await sql_store.create("demo", "prod", "SEC1", "some_secret_value")
+            self.assertFalse(await sql_store.is_secret_value_matching("demo", "prod", "SEC1", ""))
+            self.assertEqual(await sql_store.find_secrets_matching_value("demo", ""), [])
+
+    async def test_explicit_server_hmac_key_change_fails_closed(self) -> None:
+        """Changer la clé HMAC serveur invalide les empreintes et échoue fail-closed."""
+        # 1. En SQLite : détection via canari persistant en base
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            cipher1 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            store1 = SqliteSecretStore(db_path, cipher1)
+            await store1.create("demo", "prod", "API_KEY", "super_secret_value")
+
+            # Réouverture du store avec une clé HMAC serveur différente
+            cipher2 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY)
+            store2 = SqliteSecretStore(db_path, cipher2)
+
+            with self.assertRaises(VaultCipherError) as ctx_sql_is:
+                await store2.is_secret_value_matching(
+                    "demo", "prod", "API_KEY", "super_secret_value"
+                )
+            self.assertIn("modifiée", str(ctx_sql_is.exception))
+
+            with self.assertRaises(VaultCipherError) as ctx_sql_find:
+                await store2.find_secrets_matching_value("demo", "super_secret_value")
+            self.assertIn("modifiée", str(ctx_sql_find.exception))
+
+        # 2. En mémoire : détection via canari du store
+        mem_store = InMemorySecretStore(cipher=cipher1)
+        await mem_store.create("demo", "prod", "API_KEY", "super_secret_value")
+        # Simuler un changement de cipher sous-jacent
+        mem_store._cipher = cipher2
+
+        with self.assertRaises(VaultCipherError) as ctx_mem_is:
+            await mem_store.is_secret_value_matching(
+                "demo", "prod", "API_KEY", "super_secret_value"
+            )
+        self.assertIn("modifiée", str(ctx_mem_is.exception))
+
+        with self.assertRaises(VaultCipherError) as ctx_mem_find:
+            await mem_store.find_secrets_matching_value("demo", "super_secret_value")
+        self.assertIn("modifiée", str(ctx_mem_find.exception))
 
     def test_database_find_secrets_by_fingerprint_uses_index(self) -> None:
         """find_secrets_by_fingerprint retourne les métadonnées sans déchiffrer."""

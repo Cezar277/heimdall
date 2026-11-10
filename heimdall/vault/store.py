@@ -51,10 +51,12 @@ from heimdall.vault.database import (
     find_secrets_by_fingerprint,
     get_secret,
     get_secret_metadata,
+    get_server_hmac_canary,
     init_db,
     list_secret_page,
     list_secrets,
     rotate_secrets_kek,
+    set_server_hmac_canary,
     validate_kek_version,
     validate_secret_page_bounds,
 )
@@ -154,6 +156,7 @@ class InMemorySecretStore:
         self._max_secrets_per_project = max_secrets_per_project
         self._cipher = cipher if cipher is not None else VaultCipher.generate()
         self._kek_version: int = 1
+        self._server_hmac_canary: str | None = None
 
     @property
     def kek_version(self) -> int:
@@ -188,6 +191,15 @@ class InMemorySecretStore:
                 )
             envelope = self._cipher.encrypt_envelope(value.encode("utf-8"), aad=aad)
             fingerprint = self._cipher.fingerprint(value.encode("utf-8"), aad=aad)
+            if self._cipher.has_explicit_server_hmac_key:
+                if self._server_hmac_canary is None:
+                    self._server_hmac_canary = self._cipher.server_hmac_key_canary()
+                elif not constant_time_equal(
+                    self._server_hmac_canary, self._cipher.server_hmac_key_canary()
+                ):
+                    raise VaultCipherError(
+                        "La clé HMAC serveur a changé depuis l'enregistrement (fail-closed)."
+                    )
             record = {
                 "project": project,
                 "env": env,
@@ -257,11 +269,21 @@ class InMemorySecretStore:
         Exige une clé HMAC serveur explicite (non dérivée de la KEK) pour rester
         valide et immunisée contre la rotation de KEK.
         """
+        if not candidate_value:
+            return False
         if not self._cipher.has_explicit_server_hmac_key:
             raise VaultCipherError(
                 "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
                 "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
                 "la KEK, la rotation de clé invalide les empreintes."
+            )
+        if self._server_hmac_canary is not None and not constant_time_equal(
+            self._server_hmac_canary, self._cipher.server_hmac_key_canary()
+        ):
+            raise VaultCipherError(
+                "La clé HMAC serveur a été modifiée depuis l'enregistrement des secrets. "
+                "Les empreintes stockées sont invalidées (refus fail-closed pour interdire "
+                "tout faux négatif)."
             )
         aad = VaultCipher.aad(project, env, name)
         candidate_val = unicodedata.normalize("NFC", candidate_value)
@@ -291,11 +313,21 @@ class InMemorySecretStore:
         la valeur ni l'empreinte (ticket #116).
         Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
+        if not candidate_value:
+            return []
         if not self._cipher.has_explicit_server_hmac_key:
             raise VaultCipherError(
                 "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
                 "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
                 "la KEK, la rotation de clé invalide les empreintes."
+            )
+        if self._server_hmac_canary is not None and not constant_time_equal(
+            self._server_hmac_canary, self._cipher.server_hmac_key_canary()
+        ):
+            raise VaultCipherError(
+                "La clé HMAC serveur a été modifiée depuis l'enregistrement des secrets. "
+                "Les empreintes stockées sont invalidées (refus fail-closed pour interdire "
+                "tout faux négatif)."
             )
         candidate_val = unicodedata.normalize("NFC", candidate_value)
         results: list[dict[str, str]] = []
@@ -596,6 +628,8 @@ class SqliteSecretStore:
                     kek_version=self._kek_version,
                     fingerprint=fingerprint,
                 )
+                if self._cipher.has_explicit_server_hmac_key:
+                    set_server_hmac_canary(conn, self._cipher.server_hmac_key_canary())
             except sqlite3.IntegrityError:
                 raise KeyError("Secret déjà existant") from None
         return {
@@ -618,6 +652,8 @@ class SqliteSecretStore:
         sans jamais déchiffrer ni renvoyer l'empreinte au client (ticket #116).
         Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
+        if not candidate_value:
+            return False
         if not self._cipher.has_explicit_server_hmac_key:
             raise VaultCipherError(
                 "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
@@ -639,10 +675,22 @@ class SqliteSecretStore:
         name: str,
         candidate_value: str,
     ) -> bool:
+        if not candidate_value:
+            return False
         aad = VaultCipher.aad(project, env, name)
         candidate_val = unicodedata.normalize("NFC", candidate_value)
         candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
         with db_session(self._db_path) as conn:
+            persisted_canary = get_server_hmac_canary(conn)
+            if persisted_canary is not None and not constant_time_equal(
+                persisted_canary, self._cipher.server_hmac_key_canary()
+            ):
+                raise VaultCipherError(
+                    "La clé HMAC serveur (HEIMDALL_VAULT_SERVER_HMAC_KEY) a été modifiée depuis "
+                    "l'enregistrement des secrets en base. Les empreintes stockées sont invalidées "
+                    "(refus fail-closed pour interdire tout faux négatif). Une migration des "
+                    "empreintes est requise."
+                )
             record = get_secret_metadata(conn, project, env, name)
             if record is None:
                 return False
@@ -670,6 +718,8 @@ class SqliteSecretStore:
         la valeur ni l'empreinte (ticket #116).
         Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
+        if not candidate_value:
+            return []
         if not self._cipher.has_explicit_server_hmac_key:
             raise VaultCipherError(
                 "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
@@ -689,7 +739,20 @@ class SqliteSecretStore:
         candidate_value: str,
         env: str | None = None,
     ) -> list[dict[str, str]]:
+        if not candidate_value:
+            return []
         candidate_val = unicodedata.normalize("NFC", candidate_value)
+        with db_session(self._db_path) as conn:
+            persisted_canary = get_server_hmac_canary(conn)
+            if persisted_canary is not None and not constant_time_equal(
+                persisted_canary, self._cipher.server_hmac_key_canary()
+            ):
+                raise VaultCipherError(
+                    "La clé HMAC serveur (HEIMDALL_VAULT_SERVER_HMAC_KEY) a été modifiée depuis "
+                    "l'enregistrement des secrets en base. Les empreintes stockées sont invalidées "
+                    "(refus fail-closed pour interdire tout faux négatif). Une migration des "
+                    "empreintes est requise."
+                )
         with db_session(self._db_path) as conn:
             secrets_list = list_secrets(conn, project, env=env)
             results: list[dict[str, str]] = []

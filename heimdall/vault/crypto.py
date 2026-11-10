@@ -52,8 +52,10 @@ pas rendre illisibles les blobs existants ; les deux modes sont exclusifs.
 """
 
 import base64
+import collections
 import hashlib
 import hmac
+import math
 import os
 import secrets
 import unicodedata
@@ -72,7 +74,18 @@ _TAG_SIZE_BYTES: int = 16  # étiquette d'authentification GCM, en fin de cipher
 # résistance hors ligne si les empreintes stockées et le pepper fuient.
 _MIN_PEPPER_BYTES: int = 32
 _SHA256_HEX_LEN: int = 64  # Longueur en caractères hexadécimaux d'un SHA-256 (ticket #116)
-_MIN_DISTINCT_SERVER_HMAC_KEY_BYTES: int = 8  # Diversité minimale pour clé HMAC (ticket #116)
+_MIN_DISTINCT_SERVER_HMAC_KEY_BYTES: int = 16  # Diversité minimale pour clé HMAC (ticket #116)
+_MIN_SERVER_HMAC_KEY_SHANNON_ENTROPY: float = 3.5  # Seuil d'entropie de Shannon minimale
+
+
+def _shannon_entropy(data: bytes) -> float:
+    """Calcule l'entropie de Shannon en bits par octet d'un bloc binaire."""
+    if not data:
+        return 0.0
+    length = len(data)
+    counts = collections.Counter(data)
+    return -sum((c / length) * math.log2(c / length) for c in counts.values())
+
 
 # Une DEK fait 256 bits, comme la KEK : l'AES-256-GCM exige une clé de 32 octets.
 _DEK_SIZE_BYTES: int = 32
@@ -159,9 +172,10 @@ def generate_server_hmac_key() -> str:
 def _normalize_server_hmac_key(key: str | bytes | None) -> bytes:
     """Normalise la clé HMAC serveur en octets ; refuse absent, vide, courte ou triviale.
 
-    Le seuil de 32 octets (256 bits) et l'exigence de diversité garantissent la
-    résistance contre les attaques par dictionnaire et tables arc-en-ciel en cas
-    d'accès à la base de données (ticket #116).
+    Exige au moins 32 octets (256 bits), au moins 16 symboles distincts, aucune période
+    répétitive et une entropie de Shannon >= 3.5 bits/octet. Ces contrôles neutralisent
+    les attaques par dictionnaire et tables arc-en-ciel en cas d'accès à la base de données
+    (ticket #116). Seule la fonction ``generate_server_hmac_key()`` est supportée.
     """
     if key is None:
         raise ValueError(
@@ -188,14 +202,22 @@ def _normalize_server_hmac_key(key: str | bytes | None) -> bytes:
     if len(set(key_bytes)) < _MIN_DISTINCT_SERVER_HMAC_KEY_BYTES:
         raise ValueError(
             "La clé HMAC serveur est trop simple ou répétitive (diversité insuffisante) : "
-            "utiliser generate_server_hmac_key() pour générer une clé aléatoire de 256 bits."
+            "utiliser generate_server_hmac_key() comme seule voie supportée pour "
+            "générer une clé aléatoire cryptographiquement sûre de 256 bits."
         )
-    for period in (1, 2, 3, 4):
+    for period in range(1, len(key_bytes) // 2 + 1):
         if all(key_bytes[i] == key_bytes[i % period] for i in range(len(key_bytes))):
             raise ValueError(
-                "La clé HMAC serveur ne peut pas être un motif périodique trivial : "
-                "utiliser generate_server_hmac_key() pour générer une clé aléatoire de 256 bits."
+                "La clé HMAC serveur ne peut pas être un motif périodique répétitif : "
+                "utiliser generate_server_hmac_key() comme seule voie supportée pour "
+                "générer une clé aléatoire cryptographiquement sûre de 256 bits."
             )
+    if _shannon_entropy(key_bytes) < _MIN_SERVER_HMAC_KEY_SHANNON_ENTROPY:
+        raise ValueError(
+            "La clé HMAC serveur a une entropie insuffisante : "
+            "utiliser generate_server_hmac_key() comme seule voie supportée pour "
+            "générer une clé aléatoire cryptographiquement sûre de 256 bits."
+        )
     return key_bytes
 
 
@@ -718,6 +740,17 @@ class VaultCipher:
         """
         return server_hmac_key_matches_master_key(self._key, server_hmac_key)
 
+    def server_hmac_key_canary(self) -> str:
+        """Retourne une empreinte publique non réversible de la clé HMAC active.
+
+        Permet aux stores de détecter tout changement de clé HMAC serveur
+        (rotation non migrée ou ré-instanciation) et d'échouer fail-closed pour
+        interdire tout faux négatif de compromission.
+        """
+        return hashlib.sha256(
+            b"heimdall-vault-server-hmac-canary-v1\x00" + self._fingerprint_key
+        ).hexdigest()
+
     @classmethod
     def generate(cls, *, server_hmac_key: bytes | str | None = None) -> "VaultCipher":
         """Génère une KEK éphémère (mémoire uniquement, hors production)."""
@@ -974,6 +1007,8 @@ class VaultCipher:
                 "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
                 "la KEK, la rotation de clé invalide les empreintes."
             )
+        if not value:
+            return False
         if (
             not isinstance(expected_fingerprint, str)
             or len(expected_fingerprint) != _SHA256_HEX_LEN

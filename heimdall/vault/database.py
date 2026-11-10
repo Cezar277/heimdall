@@ -174,6 +174,14 @@ CREATE TABLE IF NOT EXISTS rate_limit_buckets (
     count INTEGER NOT NULL,
     reset_at REAL NOT NULL
 );
+
+-- Enregistrement du canari de clé HMAC serveur (ticket #116).
+-- Détecte tout changement de HEIMDALL_VAULT_SERVER_HMAC_KEY et échoue fail-closed
+-- pour empêcher un faux négatif silencieux sur les empreintes existantes.
+CREATE TABLE IF NOT EXISTS server_hmac_canary (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    canary TEXT NOT NULL
+);
 """
 
 
@@ -1048,6 +1056,35 @@ def _ensure_secret_kek_version_column(conn: sqlite3.Connection) -> None:
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()}
         if "kek_version" not in columns:
             raise
+
+
+def _ensure_server_hmac_canary_table(conn: sqlite3.Connection) -> None:
+    """Crée la table server_hmac_canary si elle n'existe pas (idempotent, ticket #116)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS server_hmac_canary (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            canary TEXT NOT NULL
+        );
+        """
+    )
+
+
+def get_server_hmac_canary(conn: sqlite3.Connection) -> str | None:
+    """Lit le canari de clé HMAC serveur persisté en base (ticket #116)."""
+    _ensure_server_hmac_canary_table(conn)
+    cursor = conn.execute("SELECT canary FROM server_hmac_canary WHERE id = 1;")
+    row = cursor.fetchone()
+    return str(row[0]) if row else None
+
+
+def set_server_hmac_canary(conn: sqlite3.Connection, canary: str) -> None:
+    """Enregistre le canari de clé HMAC serveur si absent (ticket #116)."""
+    _ensure_server_hmac_canary_table(conn)
+    conn.execute(
+        "INSERT OR IGNORE INTO server_hmac_canary (id, canary) VALUES (1, ?);",
+        (canary,),
+    )
 
 
 def init_db(db_path: Path | str | None = None) -> None:
