@@ -130,8 +130,9 @@ def main() -> int:
             output.extend(str(line) for line in lines)
             output.append("")
     tmp = LOCK_RUNTIME.with_name(f"{LOCK_RUNTIME.name}.tmp")
+    content = "\n".join(output).rstrip("\n") + "\n"
     with tmp.open("w", encoding="utf-8") as handle:
-        handle.write("\n".join(output) + "\n")
+        handle.write(content)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, LOCK_RUNTIME)

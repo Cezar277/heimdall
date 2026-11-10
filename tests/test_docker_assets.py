@@ -224,6 +224,8 @@ class InstallGuideTests(unittest.TestCase):
             "install -m 600 .env.example .env",
             "docker inspect",
             "network_mode: host",
+            'SHA_PRE="$(git rev-parse HEAD)"',
+            'test "$(git rev-parse HEAD)" = "$SHA_PRE"',
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, text)
@@ -232,6 +234,53 @@ class InstallGuideTests(unittest.TestCase):
         self.assertNotIn("/tmp/heimdall-auth.header", text)  # noqa: S108
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
+
+
+class CliSnapshotInstallationTests(unittest.TestCase):
+    def test_git_status_and_archive_rejects_dirty_worktree(self) -> None:
+        """Vérifie que le couple status + archive refuse un arbre modifié (fenêtre TOCTOU)."""
+        git = shutil.which("git")
+        bash = shutil.which("bash")
+        self.assertIsNotNone(git)
+        self.assertIsNotNone(bash)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            subprocess.run([git, "init", "-q", str(repo)], check=True)  # noqa: S603
+            subprocess.run(  # noqa: S603
+                [git, "-C", str(repo), "config", "user.name", "Test"],
+                check=True,
+            )
+            subprocess.run(  # noqa: S603
+                [git, "-C", str(repo), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            dummy = repo / "file.txt"
+            dummy.write_text("v1\n", encoding="utf-8")
+            subprocess.run([git, "-C", str(repo), "add", "file.txt"], check=True)  # noqa: S603
+            subprocess.run(  # noqa: S603
+                [git, "-C", str(repo), "commit", "-qm", "init"],
+                check=True,
+            )
+
+            script = (
+                "set -eu\n"
+                'test -z "$(git status --porcelain)" || exit 2\n'
+                'SHA_PRE="$(git rev-parse HEAD)"\n'
+                'D="$(mktemp -d)"\n'
+                'trap \'rm -rf "$D"\' EXIT\n'
+                'git archive HEAD | tar -x -C "$D"\n'
+                'test "$(git rev-parse HEAD)" = "$SHA_PRE" || exit 3\n'
+                'test -z "$(git status --porcelain)" || exit 4\n'
+                "exit 0\n"
+            )
+
+            res = subprocess.run([bash, "-c", script], cwd=repo, check=False)  # noqa: S603
+            self.assertEqual(res.returncode, 0)
+
+            dummy.write_text("v2 uncommitted\n", encoding="utf-8")
+            res_dirty = subprocess.run([bash, "-c", script], cwd=repo, check=False)  # noqa: S603
+            self.assertEqual(res_dirty.returncode, 2)
 
 
 class SamnAndPinTests(unittest.TestCase):

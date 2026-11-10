@@ -108,7 +108,10 @@ chmod 600 secrets/vault_tls_cert.pem secrets/vault_tls_key.pem
 ## 4. Démarrer le Vault
 
 Refuser explicitement une installation lancée en root : le conteneur doit
-tourner avec l'UID de l'utilisateur hôte, jamais `0`.
+tourner avec l'UID de l'utilisateur hôte, jamais `0`. Tout lancement du conteneur
+(`docker compose up`) doit impérativement passer par les gardes ci-dessous afin
+de garantir qu'aucun démarrage transitoire en root ne se produise avant l'arrêt
+de l'entrypoint.
 
 ```sh
 [[ "$(id -u)" != 0 ]] || {
@@ -216,7 +219,8 @@ docker compose exec -T vault heimdall vault audit list --limit 5
 
 Le scan est une opération de la CLI locale : il n'est pas exposé par le
 conteneur Vault. Installez la CLI dans un venv dédié, avec le lock runtime
-hashé :
+hashé. Toute modification locale impose un nouveau `checkout` du SHA audité ;
+l'archivage snapshot vérifie l'intégrité de l'arbre avant et après extraction :
 
 ```sh
 python3 -m venv .venv
@@ -225,10 +229,18 @@ test -z "$(git status --porcelain)" || {
   echo "arbre de travail modifié : installer uniquement la révision auditée" >&2
   exit 1
 }
-git rev-parse --short HEAD
+SHA_PRE="$(git rev-parse HEAD)"
 D="$(mktemp -d)"
 trap 'rm -rf "$D"' EXIT
 git archive HEAD | tar -x -C "$D"
+test "$(git rev-parse HEAD)" = "$SHA_PRE" || {
+  echo "HEAD modifiée pendant l'archivage" >&2
+  exit 1
+}
+test -z "$(git status --porcelain)" || {
+  echo "arbre altéré pendant l'archivage" >&2
+  exit 1
+}
 .venv/bin/pip install --no-deps --no-build-isolation "$D"
 .venv/bin/heimdall --version
 ```
