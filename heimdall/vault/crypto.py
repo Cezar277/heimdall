@@ -221,6 +221,31 @@ def _normalize_server_hmac_key(key: str | bytes | None) -> bytes:
     return key_bytes
 
 
+def _extract_key_variants(raw: str | bytes) -> list[bytes]:
+    """Extrait les représentations brutes, base64 décodées et hexadécimales d'une clé."""
+    variants: list[bytes] = []
+    if isinstance(raw, str):
+        try:
+            raw_bytes: bytes | None = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            raw_bytes = None
+    else:
+        raw_bytes = bytes(raw)
+
+    if raw_bytes is not None:
+        variants.append(raw_bytes)
+        try:
+            padding = b"=" * (-len(raw_bytes) % 4)
+            variants.append(base64.b64decode(raw_bytes + padding, altchars=b"-_", validate=True))
+        except ValueError:
+            pass
+        try:
+            variants.append(bytes.fromhex(raw_bytes.decode("utf-8", errors="ignore")))
+        except ValueError:
+            pass
+    return variants
+
+
 def server_hmac_key_matches_master_key(
     master_or_kek: str | bytes,
     server_hmac_key: str | bytes,
@@ -246,29 +271,27 @@ def server_hmac_key_matches_master_key(
     except ValueError:
         return False
 
-    candidates: list[bytes] = []
-    if isinstance(master_or_kek, str):
-        try:
-            candidates.append(master_or_kek.encode("utf-8"))
-        except UnicodeEncodeError:
-            pass
-        try:
-            candidates.append(decode_encoded_key(master_or_kek))
-        except ValueError:
-            pass
-        try:
-            if kek_matches_pepper(master_or_kek, norm_hmac.decode("utf-8", errors="ignore")):
-                return True
-        except ValueError:
-            pass
-    elif isinstance(master_or_kek, (bytes, bytearray)):
-        candidates.append(bytes(master_or_kek))
-        try:
-            candidates.append(decode_encoded_key(master_or_kek))
-        except ValueError:
-            pass
+    master_str = (
+        master_or_kek
+        if isinstance(master_or_kek, str)
+        else bytes(master_or_kek).decode("utf-8", errors="ignore")
+    )
+    hmac_str = norm_hmac.decode("utf-8", errors="ignore")
+    try:
+        if kek_matches_pepper(master_str, hmac_str):
+            return True
+    except ValueError:
+        pass
 
-    return any(constant_time_equal(cand, norm_hmac) for cand in candidates)
+    candidates = _extract_key_variants(master_or_kek)
+    hmac_variants = _extract_key_variants(norm_hmac)
+
+    for cand in candidates:
+        for var in hmac_variants:
+            if constant_time_equal(cand, var):
+                return True
+
+    return False
 
 
 def compute_secret_hmac(
@@ -306,8 +329,10 @@ def compute_secret_hmac(
         if not value_bytes:
             raise ValueError("La valeur du secret ne peut pas être vide.")
 
-    if aad:
+    if aad is not None:
         aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
+        if not aad_bytes:
+            raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
         message = aad_bytes + b"\x00" + value_bytes
     else:
         message = value_bytes
@@ -327,6 +352,8 @@ def verify_secret_hmac(
     Ticket #116 : permet de vérifier si la valeur en production est encore celle qui a fuité,
     sans jamais déchiffrer ni exposer l'empreinte au client.
     """
+    if aad is not None and not aad:
+        return False
     if not isinstance(expected_hmac, str) or len(expected_hmac) != _SHA256_HEX_LEN:
         return False
     try:
@@ -743,12 +770,17 @@ class VaultCipher:
     def server_hmac_key_canary(self) -> str:
         """Retourne une empreinte publique non réversible de la clé HMAC active.
 
-        Permet aux stores de détecter tout changement de clé HMAC serveur
-        (rotation non migrée ou ré-instanciation) et d'échouer fail-closed pour
-        interdire tout faux négatif de compromission.
+        Dérivée par HMAC-SHA256 avec la clé d'empreinte active sur une constante
+        de domaine dédiée, cette valeur publique permet aux stores de détecter
+        tout changement de clé HMAC serveur (rotation non migrée ou ré-instanciation)
+        et d'échouer fail-closed pour interdire tout faux négatif de compromission.
+        Ce canari est cryptographiquement sûr pour toute clé de 256 bits issue
+        de ``generate_server_hmac_key()`` (résistance absolue aux pré-images).
         """
-        return hashlib.sha256(
-            b"heimdall-vault-server-hmac-canary-v1\x00" + self._fingerprint_key
+        return hmac.new(
+            self._fingerprint_key,
+            b"heimdall-vault-server-hmac-canary-v1",
+            hashlib.sha256,
         ).hexdigest()
 
     @classmethod
@@ -1014,13 +1046,15 @@ class VaultCipher:
             or len(expected_fingerprint) != _SHA256_HEX_LEN
         ):
             return False
-        if aad:
+        if aad is not None:
+            aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
+            if not aad_bytes:
+                return False
             val_bytes = (
                 unicodedata.normalize("NFC", value).encode("utf-8")
                 if isinstance(value, str)
                 else bytes(value)
             )
-            aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
             candidate_fp = self.fingerprint(val_bytes, aad=aad_bytes)
             return constant_time_equal(candidate_fp, expected_fingerprint)
         direct_fp = self.compute_secret_hmac(value)

@@ -14,6 +14,7 @@ Exigences couvertes :
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import tempfile
@@ -45,6 +46,7 @@ from heimdall.vault.database import (
     db_session,
     ensure_project,
     find_secrets_by_fingerprint,
+    get_secret_metadata,
     init_db,
     update_secret,
 )
@@ -129,6 +131,23 @@ class SecretHmacCryptoTests(TestCase):
         self.assertNotEqual(fp_raw, fp_prod)
         self.assertNotEqual(fp_raw, fp_dev)
         self.assertNotEqual(fp_prod, fp_dev)
+
+    def test_compute_secret_hmac_rejects_empty_aad_explicitly(self) -> None:
+        """compute_secret_hmac refuse un AAD vide explicite au lieu de basculer silencieusement."""
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", aad=b"")
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", aad="")
+
+    def test_verify_and_matching_empty_aad_parity(self) -> None:
+        """verify_secret_hmac et is_secret_value_matching refusent un AAD vide (False)."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        dummy_fp = "a" * 64
+
+        self.assertFalse(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", dummy_fp, aad=b""))
+        self.assertFalse(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", dummy_fp, aad=""))
+        self.assertFalse(cipher.is_secret_value_matching("val", dummy_fp, aad=b""))
+        self.assertFalse(cipher.is_secret_value_matching("val", dummy_fp, aad=""))
 
     def test_compute_secret_hmac_input_validation(self) -> None:
         """Refus fail-closed sur entrée vide, type invalide ou clé trop courte."""
@@ -367,6 +386,36 @@ class KeySeparationTests(TestCase):
             server_hmac_key=_VALID_SERVER_HMAC_KEY,
         )
         self.assertEqual(settings.server_hmac_key, _VALID_SERVER_HMAC_KEY)
+
+    def test_vault_settings_rejects_encoded_forms_of_keys(self) -> None:
+        """VaultSettings refuse server_hmac_key égale à master_key ou KEK sous forme encodée."""
+        # 1. master_key sous forme base64 comme server_hmac_key
+        b64_master = base64.b64encode(_VALID_MASTER_KEY.encode("utf-8")).decode("ascii")
+        with self.assertRaises(ValidationError):
+            VaultSettings(
+                master_key=_VALID_MASTER_KEY,
+                kek_salt="s" * 22,
+                api_key_pepper=_VALID_PEPPER,
+                server_hmac_key=b64_master,
+            )
+
+        # 2. KEK sous forme hexadécimale comme server_hmac_key
+        hex_kek = _VALID_KEK.encode("utf-8").hex()
+        with self.assertRaises(ValidationError):
+            VaultSettings(
+                kek=_VALID_KEK,
+                api_key_pepper=_VALID_PEPPER,
+                server_hmac_key=hex_kek,
+            )
+
+        # 3. pepper sous forme base64 comme server_hmac_key
+        b64_pepper = base64.b64encode(_VALID_PEPPER.encode("utf-8")).decode("ascii")
+        with self.assertRaises(ValidationError):
+            VaultSettings(
+                kek=_VALID_KEK,
+                api_key_pepper=_VALID_PEPPER,
+                server_hmac_key=b64_pepper,
+            )
 
 
 class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
@@ -639,6 +688,42 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
         with self.assertRaises(VaultCipherError) as ctx_mem_find:
             await mem_store.find_secrets_matching_value("demo", "super_secret_value")
         self.assertIn("modifiée", str(ctx_mem_find.exception))
+
+    async def test_sqlite_create_with_changed_server_hmac_key_fails_closed(self) -> None:
+        """SqliteSecretStore.create refuse fail-closed si la clé HMAC a changé."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            cipher1 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            store1 = SqliteSecretStore(db_path, cipher1)
+            await store1.create("demo", "prod", "INITIAL", "initial_val")
+
+            # 1. Tentative d'écriture sous une clé HMAC différente -> VaultCipherError
+            cipher2 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY)
+            store2 = SqliteSecretStore(db_path, cipher2)
+            with self.assertRaises(VaultCipherError) as ctx_create:
+                await store2.create("demo", "prod", "NEW_SECRET", "new_val")
+            self.assertIn("modifiée", str(ctx_create.exception))
+
+            # 2. Le secret NEW_SECRET n'a PAS été créé en base
+            with db_session(db_path) as conn:
+                record = get_secret_metadata(conn, "demo", "prod", "NEW_SECRET")
+                self.assertIsNone(record)
+
+            # 3. Revenir à cipher1 : l'état reste cohérent et les lectures fonctionnent
+            self.assertTrue(
+                await store1.is_secret_value_matching("demo", "prod", "INITIAL", "initial_val")
+            )
+
+    async def test_in_memory_create_with_changed_server_hmac_key_fails_closed(self) -> None:
+        """InMemorySecretStore.create refuse fail-closed si la clé HMAC a changé."""
+        cipher1 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        mem_store = InMemorySecretStore(cipher=cipher1)
+        await mem_store.create("demo", "prod", "INITIAL", "initial_val")
+
+        cipher2 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY)
+        mem_store._cipher = cipher2
+        with self.assertRaises(VaultCipherError):
+            await mem_store.create("demo", "prod", "NEW_SECRET", "new_val")
 
     def test_database_find_secrets_by_fingerprint_uses_index(self) -> None:
         """find_secrets_by_fingerprint retourne les métadonnées sans déchiffrer."""

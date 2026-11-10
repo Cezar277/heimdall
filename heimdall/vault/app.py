@@ -108,6 +108,7 @@ from heimdall.vault.crypto import (
     generate_api_key,
     generate_api_key_pepper,
     kek_matches_pepper,
+    server_hmac_key_matches_master_key,
 )
 from heimdall.vault.database import (
     _MAX_SECRET_PAGE_OFFSET,
@@ -948,18 +949,18 @@ class VaultSettings(BaseSettings):
         hmac_k = self.server_hmac_key
         if hmac_k is None:
             return self
-        if self.master_key is not None and constant_time_equal(
-            self.master_key.encode("utf-8"), hmac_k.encode("utf-8")
+        if self.master_key is not None and server_hmac_key_matches_master_key(
+            self.master_key, hmac_k
         ):
             raise ValueError(
                 "La clé maîtresse et la clé HMAC serveur doivent être distinctes (invariant 5)."
             )
-        if self.kek is not None and kek_matches_pepper(self.kek, hmac_k):
+        if self.kek is not None and server_hmac_key_matches_master_key(self.kek, hmac_k):
             raise ValueError(
                 "La KEK de chiffrement et la clé HMAC serveur doivent être distinctes."
             )
-        if self.api_key_pepper is not None and constant_time_equal(
-            self.api_key_pepper.encode("utf-8"), hmac_k.encode("utf-8")
+        if self.api_key_pepper is not None and server_hmac_key_matches_master_key(
+            self.api_key_pepper, hmac_k
         ):
             raise ValueError(
                 "Le pepper d'authentification et la clé HMAC serveur doivent être distincts."
@@ -1268,9 +1269,7 @@ async def _resolve_request_key_hash(request: Request) -> str | None:
             registry.key_id_for_hash(vault_auth.DUMMY_HASH)
             request.state.audit_key_id_checked = True
         return None
-    registered_project, _ = await vault_auth.find_api_key_project_cached(
-        request, candidate_hash
-    )
+    registered_project, _ = await vault_auth.find_api_key_project_cached(request, candidate_hash)
     if registered_project is None:
         if registry is not None:
             registry.key_id_for_hash(vault_auth.DUMMY_HASH)

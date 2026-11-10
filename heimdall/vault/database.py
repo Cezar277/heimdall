@@ -44,6 +44,7 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 """
 
 import errno
+import hmac
 import logging
 import os
 import re
@@ -1126,10 +1127,21 @@ def get_server_hmac_canary(conn: sqlite3.Connection) -> str | None:
 
 
 def set_server_hmac_canary(conn: sqlite3.Connection, canary: str) -> None:
-    """Enregistre le canari de clé HMAC serveur si absent (ticket #116)."""
+    """Enregistre le canari de clé HMAC serveur si absent (ticket #116).
+
+    Vérifie la cohérence si un canari existe déjà pour interdire toute cohabitation silencieuse.
+    """
     _ensure_server_hmac_canary_table(conn)
+    cursor = conn.execute("SELECT canary FROM server_hmac_canary WHERE id = 1;")
+    row = cursor.fetchone()
+    if row is not None:
+        if not hmac.compare_digest(str(row[0]), canary):
+            raise ValueError(
+                "La clé HMAC serveur a changé par rapport au canari persistant en base."
+            )
+        return
     conn.execute(
-        "INSERT OR IGNORE INTO server_hmac_canary (id, canary) VALUES (1, ?);",
+        "INSERT INTO server_hmac_canary (id, canary) VALUES (1, ?);",
         (canary,),
     )
 

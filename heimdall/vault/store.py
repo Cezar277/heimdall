@@ -595,6 +595,17 @@ class SqliteSecretStore:
             # quota et l'insertion forment une seule transaction atomique,
             # même entre workers partageant le fichier SQLite.
             conn.execute("BEGIN IMMEDIATE")
+            if self._cipher.has_explicit_server_hmac_key:
+                persisted_canary = get_server_hmac_canary(conn)
+                if persisted_canary is not None and not constant_time_equal(
+                    persisted_canary, self._cipher.server_hmac_key_canary()
+                ):
+                    raise VaultCipherError(
+                        "La clé HMAC serveur (HEIMDALL_VAULT_SERVER_HMAC_KEY) a été modifiée "
+                        "depuis l'enregistrement des secrets en base. Les empreintes stockées "
+                        "sont invalidées (refus fail-closed pour interdire tout faux négatif). "
+                        "Une migration des empreintes est requise."
+                    )
             # Vérification de non-obsolescence de la KEK (ticket #71 MEDIUM) :
             # si une rotation externe (ex. via CLI) a incrémenté la version en base
             # au-delà de celle chargée en mémoire par ce worker, refuser fail-closed
