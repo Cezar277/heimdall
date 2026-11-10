@@ -54,6 +54,11 @@ test ! -L data && test ! -L secrets || {
   exit 1
 }
 mkdir -p data secrets
+# Re-vérification après création : ferme la fenêtre TOCTOU test -> mkdir.
+test ! -L data && test ! -L secrets || {
+  echo "data/ et secrets/ ne doivent pas être des liens symboliques" >&2
+  exit 1
+}
 chmod 700 data secrets
 
 ENV_TMP="$(mktemp .env.XXXXXX)"
@@ -254,6 +259,11 @@ sinon une sauvegarde à chaud peut être déchirée ou exclure des transactions.
 
 ```sh
 docker compose stop vault
+if ls data/vault.db-* >/dev/null 2>&1; then
+  echo "WAL/SHM résiduel : arrêt incomplet, sauvegarde refusée" >&2
+  docker compose start vault
+  exit 1
+fi
 umask 077
 F="${HOME}/heimdall-backup-$(date +%F).tgz.gpg"
 tar --exclude='data/vault.db-*' -czf - data .env secrets \

@@ -192,6 +192,8 @@ class InstallGuideTests(unittest.TestCase):
             "docker compose config --quiet",
             "gpg --symmetric --cipher-algo AES256",
             "docker compose stop vault",
+            "ls data/vault.db-*",
+            "WAL/SHM résiduel",
             'F="${HOME}/heimdall-backup-$(date +%F).tgz.gpg"',
             'chmod 600 "$F"',
             "docker compose start vault",
@@ -204,6 +206,7 @@ class InstallGuideTests(unittest.TestCase):
         self.assertNotIn('curl -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY"', text)
         self.assertNotIn("export HEIMDALL_API_KEY=", text)
         self.assertNotIn("/tmp/heimdall-auth.header", text)  # noqa: S108
+        self.assertGreaterEqual(text.count("test ! -L data"), 2)
 
 
 class BackupIgnoreTests(unittest.TestCase):
