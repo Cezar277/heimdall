@@ -39,7 +39,7 @@ et lancer Heimdall **avec la seule documentation** `docs/install.md`.
 |---|---|
 | Le scan échoue hors dépôt Git (exit 2) | Le guide impose `git init -q` avant le premier scan |
 | Le Vault refuse un port mapping Docker (403 loopback) | Le guide et le compose imposent `network_mode: host` |
-| Les secrets TLS montés en `0600` root ne sont pas lisibles par l'utilisateur du conteneur | Le compose fige `user: "10001:10001"` et le guide fait `sudo chown -R 10001:10001 data secrets` |
+| Les secrets TLS montés en `0600` root ne sont pas lisibles par l'utilisateur du conteneur | Le compose fige `user: "10001:10001"` et le guide fait `sudo chown -R --no-dereference 10001:10001 data secrets` |
 | Le healthcheck doit vérifier TLS | `docker/healthcheck.py` vérifie le certificat local, sans désactiver la validation |
 | Le scan n'est pas dans l'image Vault minimale | Le guide installe la CLI locale dans un venv dédié |
 | Clé API visible dans `ps`/historique avec `curl -H` | Le guide utilise `read -rsp`, valide le charset, `mktemp`, un fichier d'en-tête `600`, `curl -K` et supprime le fichier après usage |

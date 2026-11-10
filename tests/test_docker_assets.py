@@ -188,7 +188,7 @@ class InstallGuideTests(unittest.TestCase):
             "set -euo pipefail",
             "git fetch origin",
             "10001:10001",
-            "sudo chown -R 10001:10001 data secrets",
+            "sudo chown -R --no-dereference 10001:10001 data secrets",
             "docker compose stop vault || exit 1",
             "basicConstraints=critical,CA:FALSE",
             ".env.??????",
@@ -234,7 +234,14 @@ class InstallGuideTests(unittest.TestCase):
         self.assertNotIn("HEIMDALL_(UID|GID)", text)
         # chown préserve les bits : aucun `chmod` sans sudo après le chown.
         self.assertIn("`chown` préserve les bits", text)
-        self.assertNotIn("sudo chown -R 10001:10001 data secrets\nchmod 700", text)
+        self.assertNotIn("data secrets\nchmod 700 data secrets", text)
+        # Durcissements revue 6b748c0 : liens internes, restauration confinée.
+        self.assertIn("--no-dereference 10001:10001 data secrets", text)
+        self.assertIn('test -z "$(find data secrets -type l)"', text)
+        self.assertIn("tar -tzf -", text)
+        self.assertIn("--exclude='.git/*'", text)
+        self.assertIn("-xzf - data .env secrets", text)
+        self.assertIn("ne jamais ajouter `-P`", text)
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
 
@@ -345,6 +352,11 @@ class SamnAndPinTests(unittest.TestCase):
         script = (ROOT / "scripts" / "regen_runtime_lock.py").read_text(encoding="utf-8")
         self.assertIn("os.replace", script)
         self.assertIn("os.fsync", script)
+        # Durcissement revue 6b748c0 : ne jamais suivre un symlink sur le .tmp.
+        self.assertIn("is_symlink", script)
+        self.assertIn("O_EXCL", script)
+        self.assertIn("O_CREAT", script)
+        self.assertIn("os.open", script)
 
 
 class BackupIgnoreTests(unittest.TestCase):
@@ -371,7 +383,7 @@ class ReadmeQuickstartTests(unittest.TestCase):
         self.assertIn("docs/install.md §4", text)
         self.assertIn("jamais en root hôte", text)
         self.assertIn('user: "10001:10001"', text)
-        self.assertIn("sudo chown -R 10001:10001 data secrets", text)
+        self.assertIn("sudo chown -R --no-dereference 10001:10001 data secrets", text)
         self.assertNotIn("HEIMDALL_UID", text)
 
 
@@ -509,7 +521,7 @@ class UidGidGuardTests(unittest.TestCase):
         self.assertNotIn("HEIMDALL_GID", serialized)
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")
         self.assertIn("10001:10001", guide)
-        self.assertIn("sudo chown -R 10001:10001 data secrets", guide)
+        self.assertIn("sudo chown -R --no-dereference 10001:10001 data secrets", guide)
         self.assertIn('[[ "$(id -u)" != 0 ]]', guide)
         self.assertNotIn("${HEIMDALL_UID", guide)
         self.assertNotIn("HEIMDALL_UID=$(id -u)", guide)

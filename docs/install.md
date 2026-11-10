@@ -94,7 +94,14 @@ chmod 600 secrets/vault_tls_cert.pem secrets/vault_tls_key.pem
 # Compose côté hôte, pas besoin de chown).
 # `chown` préserve les bits (700 posés ci-dessus) : pas de second `chmod` —
 # un `chmod` sans sudo échouerait ici en EPERM (non-propriétaire).
-sudo chown -R 10001:10001 data secrets
+# Refuser tout lien interne avant le chown (le `test ! -L` ci-dessus ne couvre
+# que la racine) et ne jamais déréférencer : sans `-h`, un `data/lien ->
+# /victime` ferait chmoder la cible en root.
+test -z "$(find data secrets -type l)" || {
+  echo "lien symbolique interne refusé dans data/ ou secrets/" >&2
+  exit 1
+}
+sudo chown -R --no-dereference 10001:10001 data secrets
 ```
 
 - `HEIMDALL_VAULT_MASTER_KEY` : phrase de passe longue et unique, **sans
@@ -105,9 +112,10 @@ sudo chown -R 10001:10001 data secrets
   clé maîtresse et de la KEK.
 - `HEIMDALL_UID` / `HEIMDALL_GID` : supprimés — le conteneur tourne en
   `10001:10001` figé (`docker-compose.yml`, `Dockerfile:43-57`). Rendre
-  `data/` et `secrets/` accessibles via `sudo chown -R 10001:10001 data
-  secrets` (ci-dessus). L'entrypoint refuse toujours `euid == 0` ou
-  `egid == 0` en défense en profondeur (ex. `docker compose run --user 0`).
+  `data/` et `secrets/` accessibles via `sudo chown -R --no-dereference
+  10001:10001 data secrets` (ci-dessus, après refus des liens internes).
+  L'entrypoint refuse toujours `euid == 0` ou `egid == 0` en défense en
+  profondeur (ex. `docker compose run --user 0`).
 
 > **Sauvegarde.** Sauvegardez `.env` et `secrets/` dans un coffre séparé. Sans
 > eux, la base `data/vault.db` est définitivement illisible.
@@ -326,11 +334,15 @@ chmod 600 "$F"
 docker compose start vault
 ```
 
-Restauration (après `docker compose down`) :
+Restauration (après `docker compose down`) — inspecter avant d'extraire,
+confinée à `data/`, `.env`, `secrets/` (GNU tar retire les `/` initiaux par
+défaut ; ne jamais ajouter `-P`/`--absolute-names`) :
 
 ```sh
 set -euo pipefail
-gpg --decrypt "${HOME}/heimdall-backup-AAAA-MM-JJ.tgz.gpg" | tar -xzf -
+BK="${HOME}/heimdall-backup-AAAA-MM-JJ.tgz.gpg"
+gpg --decrypt "$BK" | tar -tzf -   # inspection : attendre data/ .env secrets/ seuls
+gpg --decrypt "$BK" | tar --exclude='.git/*' -xzf - data .env secrets
 ```
 
 `gpg --symmetric` utilise un chiffrement authentifié (MDC) : une archive
@@ -359,7 +371,7 @@ et les valeurs sont perdues.
 | `Connection refused` | Conteneur arrêté ou port 8443 occupé | `docker compose ps`, `ss -ltnp \| grep 8443`, `docker compose logs vault` |
 | `TLS obligatoire en production` | `secrets/vault_tls_cert.pem` ou `vault_tls_key.pem` absent | Régénérer les fichiers de l'étape 3 |
 | `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `install -m 600 .env.example .env`, remplir via §3, `docker compose up -d` |
-| `Permission denied` sur `/data` | `data/` non possédé par `10001:10001` | `sudo chown -R 10001:10001 data secrets`, `chmod 700 data secrets` |
+| `Permission denied` sur `/data` | `data/` non possédé par `10001:10001` | `test -z "$(find data secrets -type l)"`, `sudo chown -R --no-dereference 10001:10001 data secrets` |
 | `refus: le conteneur Vault ne doit pas tourner en root` | surcharge `--user 0` manuelle | Ne jamais surcharger `user:` (figé à `10001:10001` dans le compose) |
 | `data/ et secrets/ ne doivent pas être des liens symboliques` | Un lien a été créé avant l'installation | Supprimer le lien et recréer un répertoire réel (`rm data && mkdir data`, idem `secrets`) |
 | `docker compose config --quiet` échoue | `.env` ou secrets manquants | Créer les fichiers de l'étape 3 |

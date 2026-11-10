@@ -131,7 +131,12 @@ def main() -> int:
             output.append("")
     tmp = LOCK_RUNTIME.with_name(f"{LOCK_RUNTIME.name}.tmp")
     content = "\n".join(output).rstrip("\n") + "\n"
-    with tmp.open("w", encoding="utf-8") as handle:
+    # Ne jamais suivre un symlink planté sur le `.tmp` : le supprimer d'abord,
+    # puis créer en O_EXCL (échec si recréé entre-temps), mode 0600.
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(content)
         handle.flush()
         os.fsync(handle.fileno())
