@@ -356,6 +356,8 @@ class ReadmeQuickstartTests(unittest.TestCase):
         text = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("install -m 600 .env.example .env", text)
         self.assertIn("docs/install.md", text)
+        self.assertIn("docs/install.md §4", text)
+        self.assertIn("jamais UID/GID 0", text)
 
 
 class HealthcheckTests(unittest.TestCase):
