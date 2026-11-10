@@ -58,6 +58,9 @@ class DockerfileSecurityTests(unittest.TestCase):
         self.assertIn("--no-deps", text)
         self.assertIn("--no-build-isolation", text)
         self.assertIn("python -m pip uninstall -y pip setuptools", text)
+        # Durcissement revue 32b8afd : ensurepip stdlib retiré du runtime.
+        self.assertIn("ensurepip", text)
+        self.assertIn("rm -rf /usr/local/lib/python3.12/ensurepip", text)
 
     def test_image_runs_as_non_root_and_has_healthcheck(self) -> None:
         text = DOCKERFILE.read_text(encoding="utf-8")
@@ -271,6 +274,10 @@ class InstallGuideTests(unittest.TestCase):
         self.assertIn("archive sans .env", text)
         self.assertIn("lien symbolique interne refusé après restauration", text)
         self.assertIn("existant : sauvegarder puis rm -rf data secrets .env", text)
+        # Durcissements revue 32b8afd : pas de test -a, re-vérification après chown.
+        self.assertIn("test ! -e .env && test ! -e secrets && test ! -e data", text)
+        self.assertNotIn("test ! -e .env -a ", text)
+        self.assertIn("lien symbolique interne refusé après chown", text)
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
 

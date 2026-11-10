@@ -102,6 +102,13 @@ test -z "$(find data secrets -type l)" || {
   exit 1
 }
 sudo chown -R --no-dereference 10001:10001 data secrets
+# Re-vérification après chown : un lien planté entre les deux ne doit pas
+# survivre dans le bind mount (le --no-dereference protège la cible, pas la
+# présence du lien).
+test -z "$(find data secrets -type l)" || {
+  echo "lien symbolique interne refusé après chown" >&2
+  exit 1
+}
 ```
 
 - `HEIMDALL_VAULT_MASTER_KEY` : phrase de passe longue et unique, **sans
@@ -381,7 +388,7 @@ tar -tzf "$T" | grep -Eq '^(\./)?\.env$' || {
 # Ne jamais écraser l'existant sans sauvegarde explicite (disponibilité :
 # écraser .env rend data/vault.db illisible). Comme le quickstart et le
 # dépannage, refuser si .env/secrets/data existent déjà.
-test ! -e .env -a ! -e secrets -a ! -e data || {
+test ! -e .env && test ! -e secrets && test ! -e data || {
   echo "existant : sauvegarder puis rm -rf data secrets .env avant restauration" >&2
   exit 1
 }

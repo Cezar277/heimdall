@@ -40,12 +40,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HEIMDALL_VAULT_DB_PATH=/data/vault.db
 
 # Utilisateur système non root, sans home ni shell de connexion.
+# `ensurepip` (stdlib) retiré : sinon `python -m ensurepip` réinstallerait
+# `pip` après RCE malgré `pip uninstall` du builder.
 RUN groupadd --gid 10001 heimdall \
     && useradd --uid 10001 --gid heimdall \
         --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin heimdall \
     && mkdir -p /data /app \
     && chown heimdall:heimdall /data /app \
-    && chmod 0700 /data
+    && chmod 0700 /data \
+    && rm -rf /usr/local/lib/python3.12/ensurepip /usr/lib/python3.12/ensurepip
 
 # Uniquement le runtime Python et l'entrée CLI : pas d'outils de développement dans le PATH.
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
