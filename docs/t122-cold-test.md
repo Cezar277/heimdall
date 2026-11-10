@@ -41,6 +41,11 @@ et lancer Heimdall **avec la seule documentation** `docs/install.md`.
 | Les secrets TLS montés en `0600` root ne sont pas lisibles par l'utilisateur du conteneur | Le compose utilise l'UID/GID hôte (`HEIMDALL_UID`/`HEIMDALL_GID`) et un bind mount `./secrets` |
 | Le healthcheck doit vérifier TLS | `docker/healthcheck.py` vérifie le certificat local, sans désactiver la validation |
 | Le scan n'est pas dans l'image Vault minimale | Le guide installe la CLI locale dans un venv dédié |
+| Clé API visible dans `ps`/historique avec `curl -H` | Le guide utilise `read -rsp`, un fichier d'en-tête `600` et `curl -K` |
+| Image de base mutable (`python:3.12-slim`) | Digest `@sha256:...` épinglé dans le Dockerfile |
+| `HEIMDALL_UID=0` pouvait relancer le conteneur en root | Entrypoint refusant `euid == 0`, testé |
+| Sauvegarde non chiffrée de `.env`/`secrets` | Archive chiffrée `openssl enc -aes-256-cbc -pbkdf2` |
+| Permissions de `data/`/`secrets/` dépendantes de l'umask | `chmod 700 data secrets` et `chmod 600` explicites |
 
 ## 4. Validation par une personne externe
 
