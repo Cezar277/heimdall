@@ -43,7 +43,7 @@ et lancer Heimdall **avec la seule documentation** `docs/install.md`.
 | Le scan n'est pas dans l'image Vault minimale | Le guide installe la CLI locale dans un venv dédié |
 | Clé API visible dans `ps`/historique avec `curl -H` | Le guide utilise `read -rsp`, valide le charset, `mktemp`, un fichier d'en-tête `600`, `curl -K` et supprime le fichier après usage |
 | Image de base mutable (`python:3.12-slim`) | Digest `@sha256:...` épinglé dans le Dockerfile |
-| `HEIMDALL_UID=0` pouvait relancer le conteneur en root | Entrypoint refusant `euid == 0`, testé |
+| `HEIMDALL_UID=0` pouvait relancer le conteneur en root | Entrypoint refusant `euid == 0`, testé ; guide refusant aussi une installation lancée en root (`id -u`) |
 | Sauvegarde non chiffrée de `.env`/`secrets` | Archive chiffrée authentifiée `gpg --symmetric --cipher-algo AES256` |
 | Sauvegarde SQLite à chaud | Le guide arrête le Vault (`docker compose stop vault`), refuse un WAL/SHM résiduel, archive puis redémarre |
 | Permissions de `data/`/`secrets/` dépendantes de l'umask | `chmod 700 data secrets` et `chmod 600` explicites |

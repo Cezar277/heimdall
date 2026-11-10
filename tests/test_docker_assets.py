@@ -120,6 +120,7 @@ class ComposeSecurityTests(unittest.TestCase):
         self.assertIn("HEIMDALL_UID", self.service["user"])
         self.assertIn("HEIMDALL_GID", self.service["user"])
         self.assertNotIn("0:0", self.service["user"])
+        self.assertNotIn(":-0", self.service["user"])
         self.assertIn("/tmp:rw,noexec,nosuid,size=64m", self.service["tmpfs"])  # noqa: S108
         self.assertEqual(self.service["pids_limit"], 256)
 
@@ -173,6 +174,7 @@ class InstallGuideTests(unittest.TestCase):
     def test_guide_covers_the_cold_start_path(self) -> None:
         text = INSTALL_GUIDE.read_text(encoding="utf-8")
         for expected in (
+            '[[ "$(id -u)" != 0 ]]',
             "docker compose up -d --build",
             "curl --cacert secrets/vault_tls_cert.pem",
             "heimdall vault key create --project demo",

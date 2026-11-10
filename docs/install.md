@@ -99,7 +99,14 @@ chmod 600 secrets/vault_tls_cert.pem secrets/vault_tls_key.pem
 
 ## 4. Démarrer le Vault
 
+Refuser explicitement une installation lancée en root : le conteneur doit
+tourner avec l'UID de l'utilisateur hôte, jamais `0`.
+
 ```sh
+[[ "$(id -u)" != 0 ]] || {
+  echo "installation en root refusée : utiliser un compte non privilégié" >&2
+  exit 1
+}
 docker compose up -d --build
 docker compose ps
 ```
