@@ -28,7 +28,7 @@ Révision du code testé : `71084b1950f30278518b403808a4aede14d9091c`.
 | **TLS fail-closed** | certificat/clé obligatoires en production, montés depuis `./secrets` en lecture seule | [docker-compose.yml:34](https://github.com/Cezar277/heimdall/blob/71084b1950f30278518b403808a4aede14d9091c/docker-compose.yml#L34), [docs/install.md](https://github.com/Cezar277/heimdall/blob/71084b1950f30278518b403808a4aede14d9091c/docs/install.md#L44-L83), healthcheck HTTPS avec vérification du certificat |
 | **Healthcheck sans secret** | `docker/healthcheck.py` interroge `/api/v1/health`, vérifie le certificat local, message d'échec générique | [docker/healthcheck.py:21](https://github.com/Cezar277/heimdall/blob/71084b1950f30278518b403808a4aede14d9091c/docker/healthcheck.py#L21), test `HealthcheckTests` |
 | **Aucun secret dans le dépôt** | `.env`, `data/`, `secrets/`, `*.key`, `*.pem` ignorés ; `.env.example` à valeurs vides | [.gitignore](https://github.com/Cezar277/heimdall/blob/71084b1950f30278518b403808a4aede14d9091c/.gitignore#L21-L40), [.env.example](https://github.com/Cezar277/heimdall/blob/71084b1950f30278518b403808a4aede14d9091c/.env.example#L1-L12), test `test_env_example_has_no_real_secret` |
-| **Clé API hors `argv`** | guide : `read -rsp` + fichier d'en-tête `600` + `curl -K`, jamais `curl -H "...$KEY"` | [docs/install.md](https://github.com/Cezar277/heimdall/blob/71084b1950f30278518b403808a4aede14d9091c/docs/install.md#L117-L166), test `test_guide_covers_the_cold_start_path` |
+| **Clé API hors `argv`** | guide : `read -rsp` + `mktemp` + fichier d'en-tête `600` + `curl -K`, jamais `curl -H "...$KEY"` | [docs/install.md](https://github.com/Cezar277/heimdall/blob/71084b1950f30278518b403808a4aede14d9091c/docs/install.md#L117-L166), test `test_guide_covers_the_cold_start_path` |
 | **Image de base immuable** | `FROM python:3.12-slim@sha256:...` (builder et runtime) | [Dockerfile:12,32](https://github.com/Cezar277/heimdall/blob/71084b1950f30278518b403808a4aede14d9091c/Dockerfile#L12), test `test_image_is_multi_stage_and_pinned` |
 
 ## 3. Commandes vérifiées
@@ -62,24 +62,25 @@ docker compose exec -T vault heimdall vault key create --project demo
 
 read -rsp "Clé API: " HEIMDALL_API_KEY; echo
 umask 077
+AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
+trap 'rm -f "$AUTH_HEADER"' EXIT
+chmod 600 "$AUTH_HEADER"
 printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
-  > /tmp/heimdall-auth.header
-chmod 600 /tmp/heimdall-auth.header
+  > "$AUTH_HEADER"
 unset HEIMDALL_API_KEY
 
 curl --cacert secrets/vault_tls_cert.pem \
-  -K /tmp/heimdall-auth.header \
+  -K "$AUTH_HEADER" \
   -H 'Content-Type: application/json' \
   -d '{"project":"demo","env":"dev","name":"DEMO_PASSWORD","value":"valeur-de-demonstration"}' \
   https://127.0.0.1:8443/api/v1/secrets
 # 201
 
 curl --cacert secrets/vault_tls_cert.pem \
-  -K /tmp/heimdall-auth.header \
+  -K "$AUTH_HEADER" \
   https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
 # 200 avec la valeur
 
-rm -f /tmp/heimdall-auth.header
 docker compose exec -T vault heimdall vault audit list --limit 5
 # événements 201/200, aucune valeur de secret
 ```

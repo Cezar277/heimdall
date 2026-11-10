@@ -200,14 +200,15 @@ d'en-tête `600` lu par `curl -K`.
 ```sh
 read -rsp "Clé API: " HEIMDALL_API_KEY; echo
 umask 077
+AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
+trap 'rm -f "$AUTH_HEADER"' EXIT
+chmod 600 "$AUTH_HEADER"
 printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
-  > /tmp/heimdall-auth.header
-chmod 600 /tmp/heimdall-auth.header
+  > "$AUTH_HEADER"
 unset HEIMDALL_API_KEY
 
-curl --cacert /chemin/server.crt -K /tmp/heimdall-auth.header \
+curl --cacert /chemin/server.crt -K "$AUTH_HEADER" \
   https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
-rm -f /tmp/heimdall-auth.header
 ```
 
 Comportement fail-closed appliqué par `heimdall/vault/auth.py` :

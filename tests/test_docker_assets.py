@@ -175,14 +175,16 @@ class InstallGuideTests(unittest.TestCase):
             "docs/t122-cold-test.md",
             "chmod 700 data secrets",
             "chmod 600 .env",
-            "-K /tmp/heimdall-auth.header",
+            "mktemp /tmp/heimdall-auth.XXXXXX",
+            '-K "$AUTH_HEADER"',
             "docker compose config --quiet",
-            "openssl enc -aes-256-cbc -pbkdf2",
+            "gpg --symmetric --cipher-algo AES256",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, text)
         self.assertNotIn('curl -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY"', text)
         self.assertNotIn("export HEIMDALL_API_KEY=", text)
+        self.assertNotIn("/tmp/heimdall-auth.header", text)  # noqa: S108
 
 
 class HealthcheckTests(unittest.TestCase):
@@ -259,10 +261,6 @@ class HealthcheckTests(unittest.TestCase):
             self.assertEqual(module.main(), 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class EntrypointTests(unittest.TestCase):
     def test_entrypoint_refuses_root(self) -> None:
         module = _load_entrypoint()
@@ -283,3 +281,7 @@ class EntrypointTests(unittest.TestCase):
             self.assertEqual(module.main(), 1)
         execvp.assert_called_once()
         self.assertEqual(execvp.call_args.args[1][1:], ["-m", "heimdall.vault.app"])
+
+
+if __name__ == "__main__":
+    unittest.main()

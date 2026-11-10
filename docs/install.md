@@ -19,7 +19,7 @@ Ce guide est le chemin d'installation testé pour l'audit croisé. Il couvre :
 
 - Linux x86_64 ou arm64.
 - Docker Engine 24+ et Docker Compose v2 (`docker compose version`).
-- `git`, `openssl`, `curl`.
+- `git`, `openssl`, `curl`, `gpg`.
 - Python 3.10+ pour la CLI locale.
 - Le port **8443** libre sur `127.0.0.1`.
 - Environ 1 Go d'espace disque pour l'image et les données.
@@ -139,22 +139,22 @@ Puis, depuis l'hôte. La clé ne doit **jamais** apparaître dans `argv`
 ```sh
 read -rsp "Clé API: " HEIMDALL_API_KEY; echo
 umask 077
+AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
+trap 'rm -f "$AUTH_HEADER"' EXIT
+chmod 600 "$AUTH_HEADER"
 printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
-  > /tmp/heimdall-auth.header
-chmod 600 /tmp/heimdall-auth.header
+  > "$AUTH_HEADER"
 unset HEIMDALL_API_KEY
 
 curl --cacert secrets/vault_tls_cert.pem \
-  -K /tmp/heimdall-auth.header \
+  -K "$AUTH_HEADER" \
   -H 'Content-Type: application/json' \
   -d '{"project":"demo","env":"dev","name":"DEMO_PASSWORD","value":"valeur-de-demonstration"}' \
   https://127.0.0.1:8443/api/v1/secrets
 
 curl --cacert secrets/vault_tls_cert.pem \
-  -K /tmp/heimdall-auth.header \
+  -K "$AUTH_HEADER" \
   https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
-
-rm -f /tmp/heimdall-auth.header
 ```
 
 Attendu : `201` puis `200` avec la valeur. Le journal d'audit est consultable
@@ -237,19 +237,20 @@ La sauvegarde contient la clé maîtresse, le pepper et la clé TLS : elle doit
 ```sh
 umask 077
 tar --exclude='data/vault.db-*' -czf - data .env secrets \
-  | openssl enc -aes-256-cbc -pbkdf2 -salt \
-      -out "heimdall-backup-$(date +%F).tgz.enc"
-chmod 600 "heimdall-backup-$(date +%F).tgz.enc"
+  | gpg --symmetric --cipher-algo AES256 \
+      --output "heimdall-backup-$(date +%F).tgz.gpg"
+chmod 600 "heimdall-backup-$(date +%F).tgz.gpg"
 ```
 
 Restauration (après `docker compose down`) :
 
 ```sh
-openssl enc -d -aes-256-cbc -pbkdf2 \
-  -in "heimdall-backup-AAAA-MM-JJ.tgz.enc" | tar -xzf -
+gpg --decrypt "heimdall-backup-AAAA-MM-JJ.tgz.gpg" | tar -xzf -
 ```
 
-Ne jamais conserver l'archive `.tgz` en clair.
+`gpg --symmetric` utilise un chiffrement authentifié (MDC) : une archive
+altérée est refusée au déchiffrement. Ne jamais conserver l'archive `.tgz` en
+clair.
 
 ### Réinitialisation (destructif)
 
