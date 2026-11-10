@@ -179,6 +179,7 @@ class InstallGuideTests(unittest.TestCase):
             '[[ "$(id -u)" != 0 ]]',
             "git checkout t41-audit",
             "git status --porcelain",
+            "set -euo pipefail",
             "git fetch origin",
             'grep -Eq "^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)',
             "docker compose stop vault || exit 1",
@@ -233,7 +234,7 @@ class SamnAndPinTests(unittest.TestCase):
         samm = (ROOT / "docs" / "t41-samm.md").read_text(encoding="utf-8")
         self.assertIn("git checkout t41-audit", install)
         self.assertIn("git rev-parse --short HEAD", install)
-        self.assertIn("49bb5cc", install)
+        self.assertIn("49bb5ccce63a102e1f00a075f1cd6c83dfbe366e", install)
         self.assertIn(sha, samm)
         self.assertIn("t41-audit", install + samm)
 
@@ -402,6 +403,7 @@ class UidGidGuardTests(unittest.TestCase):
             for line in (
                 "HEIMDALL_UID=0",
                 "HEIMDALL_UID=00",
+                "HEIMDALL_GID=00",
                 "HEIMDALL_UID = 0",
                 'HEIMDALL_UID="0"',
                 "export HEIMDALL_UID=0",

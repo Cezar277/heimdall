@@ -41,7 +41,7 @@ git clone https://github.com/Cezar277/heimdall.git
 cd heimdall
 # Révision auditée (voir docs/t41-samm.md) : installation reproductible.
 git checkout t41-audit
-test "$(git rev-parse --short HEAD)" = "49bb5cc" || {
+test "$(git rev-parse HEAD)" = "49bb5ccce63a102e1f00a075f1cd6c83dfbe366e" || {
   echo "tag t41-audit déplacé : révision non auditée" >&2
   exit 1
 }
@@ -269,7 +269,7 @@ docker compose start
 ```sh
 git fetch origin
 git checkout t41-audit   # même tag audité qu'au §2
-test "$(git rev-parse --short HEAD)" = "49bb5cc" || {
+test "$(git rev-parse HEAD)" = "49bb5ccce63a102e1f00a075f1cd6c83dfbe366e" || {
   echo "tag t41-audit déplacé : révision non auditée" >&2
   exit 1
 }
@@ -293,6 +293,7 @@ La base SQLite doit être **quiescente** : arrêter le Vault avant la copie,
 sinon une sauvegarde à chaud peut être déchirée ou exclure des transactions.
 
 ```sh
+set -euo pipefail
 docker compose stop vault || exit 1
 if ls data/vault.db-* >/dev/null 2>&1; then
   echo "WAL/SHM résiduel : arrêt incomplet, sauvegarde refusée" >&2
