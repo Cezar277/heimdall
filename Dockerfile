@@ -1,4 +1,7 @@
 # syntax=docker/dockerfile:1.7
+# Digest de base : mettre à jour avec
+#   docker buildx imagetools inspect python:3.12-slim
+# puis remplacer le @sha256 ci-dessous après test du build.
 #
 # Image de production du Vault Heimdall (#119).
 # - Build multi-étapes : aucun compilateur ni outil de développement dans l'image finale.
@@ -6,7 +9,7 @@
 # - Utilisateur non root, système de fichiers racine en lecture seule côté compose.
 # - Aucun secret n'est copié dans l'image : ils arrivent par .env / secrets Docker.
 
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -22,10 +25,11 @@ RUN python -m pip install --require-hashes --no-cache-dir --no-compile \
 # Paquet Heimdall (Vault + CLI), sans dépendances supplémentaires.
 COPY pyproject.toml README.md ./
 COPY heimdall ./heimdall
-RUN python -m pip install --no-deps --no-build-isolation --no-cache-dir --no-compile .
+RUN python -m pip install --no-deps --no-build-isolation --no-cache-dir --no-compile . \
+    && python -m pip uninstall -y setuptools
 
 
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -47,6 +51,7 @@ RUN groupadd --gid 10001 heimdall \
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin/heimdall /usr/local/bin/heimdall
 COPY --chown=heimdall:heimdall docker/healthcheck.py /app/healthcheck.py
+COPY --chown=heimdall:heimdall docker/entrypoint.py /app/entrypoint.py
 
 WORKDIR /app
 USER 10001:10001
@@ -58,4 +63,4 @@ STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
     CMD ["python", "/app/healthcheck.py"]
 
-ENTRYPOINT ["python", "-m", "heimdall.vault.app"]
+ENTRYPOINT ["python", "/app/entrypoint.py"]

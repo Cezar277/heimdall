@@ -193,11 +193,21 @@ heimdall vault key list --project demo
 heimdall vault key revoke key_edb63e52fce048669734ddf21aa06cbf
 ```
 
-Puis, côté serveur, chaque requête porte la clé du projet concerné :
+Puis, côté serveur, chaque requête porte la clé du projet concerné. La clé ne
+doit jamais apparaître dans `argv` (`ps`, historique) : utilisez un fichier
+d'en-tête `600` lu par `curl -K`.
 
 ```sh
-curl -H "X-Heimdall-API-Key: <clé du projet>" \
-  http://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
+read -rsp "Clé API: " HEIMDALL_API_KEY; echo
+umask 077
+printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
+  > /tmp/heimdall-auth.header
+chmod 600 /tmp/heimdall-auth.header
+unset HEIMDALL_API_KEY
+
+curl --cacert /chemin/server.crt -K /tmp/heimdall-auth.header \
+  https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
+rm -f /tmp/heimdall-auth.header
 ```
 
 Comportement fail-closed appliqué par `heimdall/vault/auth.py` :

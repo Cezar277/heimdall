@@ -18,8 +18,22 @@ _PORT_DEFAULT = "8443"
 _TIMEOUT_SECONDS = 2
 
 
+def _validated_port() -> str | None:
+    """Retourne un port valide ou ``None`` sans refléter la valeur reçue."""
+    raw = os.environ.get("HEIMDALL_VAULT_PORT", _PORT_DEFAULT).strip()
+    if not raw.isdigit():
+        return None
+    port = int(raw)
+    if not 1 <= port <= 65535:
+        return None
+    return str(port)
+
+
 def main() -> int:
-    port = os.environ.get("HEIMDALL_VAULT_PORT", _PORT_DEFAULT)
+    port = _validated_port()
+    if port is None:
+        print("healthcheck: configuration invalide", file=sys.stderr)
+        return 1
     certfile = os.environ.get("HEIMDALL_VAULT_SSL_CERTFILE")
     scheme = "https" if certfile else "http"
     url = f"{scheme}://127.0.0.1:{port}/api/v1/health"

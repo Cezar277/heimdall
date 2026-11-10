@@ -20,21 +20,23 @@ Révision du code testé : `e463bb214abd54a275b74ba36924e924f9aab61d`.
 | Invariant | Implémentation | Preuve |
 |---|---|---|
 | **Le Vault reste loopback-only** | `network_mode: host`, aucun `ports`, `HEIMDALL_VAULT_HOST=127.0.0.1` | [docker-compose.yml:20](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L20), test `test_vault_is_loopback_only_via_host_network` ; health et secrets testés sur `127.0.0.1:8443` |
-| **Conteneur non root** | `USER 10001:10001` dans l'image, `user: "${HEIMDALL_UID}:${HEIMDALL_GID}"` dans compose | [Dockerfile:52](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/Dockerfile#L52), [docker-compose.yml:25](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L25), test `test_image_runs_as_non_root_and_has_healthcheck`, `docker compose exec -T vault id` |
+| **Conteneur non root** | `USER 10001:10001` dans l'image, `user: "${HEIMDALL_UID}:${HEIMDALL_GID}"` dans compose, entrypoint refusant `euid == 0` | [Dockerfile:52](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/Dockerfile#L52), [docker-compose.yml:25](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L25), [docker/entrypoint.py](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker/entrypoint.py#L1-L30), tests `test_entrypoint_refuses_root`, `test_image_runs_as_non_root_and_has_healthcheck` |
 | **Système de fichiers en lecture seule** | `read_only: true`, `tmpfs /tmp`, volume `./data` seul inscriptible | [docker-compose.yml:21](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L21), test `test_container_is_hardened` |
 | **Moindre privilège** | `cap_drop: ALL`, `no-new-privileges:true`, `pids_limit`, `mem_limit` | [docker-compose.yml:41](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L41), test `test_container_is_hardened` |
 | **Aucun secret dans l'image** | `.dockerignore` exclut `.env`, `secrets/`, `*.key`, `*.pem` ; Dockerfile ne définit aucune variable secrète | [.dockerignore](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/.dockerignore#L1-L40), tests `test_no_secret_or_dev_tool_is_baked_into_the_image`, `test_dockerignore_excludes_secrets_and_dev_context` |
-| **Dépendances runtime hashées** | `requirements-runtime.lock` généré depuis `requirements.lock`, sans pytest/mypy/ruff/bandit/pip-audit | [scripts/regen_runtime_lock.py](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/scripts/regen_runtime_lock.py#L1-L20), test `test_runtime_lock_excludes_dev_tools` |
+| **Dépendances runtime hashées** | `requirements-runtime.lock` généré depuis `requirements.lock`, sans pytest/mypy/ruff/bandit/pip-audit ; `setuptools` retiré de l'image runtime | [scripts/regen_runtime_lock.py](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/scripts/regen_runtime_lock.py#L1-L20), [Dockerfile:28-29](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/Dockerfile#L28-L29), test `test_runtime_lock_excludes_dev_tools` |
 | **TLS fail-closed** | certificat/clé obligatoires en production, montés depuis `./secrets` en lecture seule | [docker-compose.yml:34](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L34), [docs/install.md](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docs/install.md#L44-L83), healthcheck HTTPS avec vérification du certificat |
 | **Healthcheck sans secret** | `docker/healthcheck.py` interroge `/api/v1/health`, vérifie le certificat local, message d'échec générique | [docker/healthcheck.py:21](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker/healthcheck.py#L21), test `HealthcheckTests` |
 | **Aucun secret dans le dépôt** | `.env`, `data/`, `secrets/`, `*.key`, `*.pem` ignorés ; `.env.example` à valeurs vides | [.gitignore](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/.gitignore#L21-L40), [.env.example](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/.env.example#L1-L12), test `test_env_example_has_no_real_secret` |
+| **Clé API hors `argv`** | guide : `read -rsp` + fichier d'en-tête `600` + `curl -K`, jamais `curl -H "...$KEY"` | [docs/install.md](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docs/install.md#L130-L160), test `test_guide_covers_the_cold_start_path` |
+| **Image de base immuable** | `FROM python:3.12-slim@sha256:...` (builder et runtime) | [Dockerfile:12,32](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/Dockerfile#L12), test `test_image_is_multi_stage_and_pinned` |
 
 ## 3. Commandes vérifiées
 
 ### Build et démarrage
 
 ```sh
-docker compose config
+docker compose config --quiet
 docker compose build --pull
 docker compose up -d --build
 docker compose ps
@@ -58,18 +60,26 @@ curl --cacert secrets/vault_tls_cert.pem \
 docker compose exec -T vault heimdall vault key create --project demo
 # clé affichée une seule fois
 
+read -rsp "Clé API: " HEIMDALL_API_KEY; echo
+umask 077
+printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
+  > /tmp/heimdall-auth.header
+chmod 600 /tmp/heimdall-auth.header
+unset HEIMDALL_API_KEY
+
 curl --cacert secrets/vault_tls_cert.pem \
-  -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY" \
+  -K /tmp/heimdall-auth.header \
   -H 'Content-Type: application/json' \
   -d '{"project":"demo","env":"dev","name":"DEMO_PASSWORD","value":"valeur-de-demonstration"}' \
   https://127.0.0.1:8443/api/v1/secrets
 # 201
 
 curl --cacert secrets/vault_tls_cert.pem \
-  -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY" \
+  -K /tmp/heimdall-auth.header \
   https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
 # 200 avec la valeur
 
+rm -f /tmp/heimdall-auth.header
 docker compose exec -T vault heimdall vault audit list --limit 5
 # événements 201/200, aucune valeur de secret
 ```

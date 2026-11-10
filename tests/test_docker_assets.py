@@ -24,31 +24,41 @@ ENV_EXAMPLE = ROOT / ".env.example"
 RUNTIME_LOCK = ROOT / "requirements-runtime.lock"
 INSTALL_GUIDE = ROOT / "docs" / "install.md"
 HEALTHCHECK = ROOT / "docker" / "healthcheck.py"
+ENTRYPOINT = ROOT / "docker" / "entrypoint.py"
 
 
-def _load_healthcheck():
-    spec = importlib.util.spec_from_file_location("heimdall_docker_healthcheck", HEALTHCHECK)
+def _load_script(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
+def _load_healthcheck():
+    return _load_script("heimdall_docker_healthcheck", HEALTHCHECK)
+
+
+def _load_entrypoint():
+    return _load_script("heimdall_docker_entrypoint", ENTRYPOINT)
+
+
 class DockerfileSecurityTests(unittest.TestCase):
     def test_image_is_multi_stage_and_pinned(self) -> None:
         text = DOCKERFILE.read_text(encoding="utf-8")
-        self.assertEqual(text.count("FROM python:3.12-slim"), 2)
+        self.assertEqual(text.count("FROM python:3.12-slim@sha256:"), 2)
         self.assertIn("AS builder", text)
         self.assertIn("AS runtime", text)
         self.assertIn("--require-hashes", text)
         self.assertIn("--no-deps", text)
         self.assertIn("--no-build-isolation", text)
+        self.assertIn("python -m pip uninstall -y setuptools", text)
 
     def test_image_runs_as_non_root_and_has_healthcheck(self) -> None:
         text = DOCKERFILE.read_text(encoding="utf-8")
         self.assertIn("USER 10001:10001", text)
         self.assertIn("HEALTHCHECK", text)
-        self.assertIn('ENTRYPOINT ["python", "-m", "heimdall.vault.app"]', text)
+        self.assertIn('ENTRYPOINT ["python", "/app/entrypoint.py"]', text)
         self.assertIn("STOPSIGNAL SIGTERM", text)
         self.assertIn('VOLUME ["/data"]', text)
 
@@ -95,6 +105,9 @@ class ComposeSecurityTests(unittest.TestCase):
     def test_vault_is_loopback_only_via_host_network(self) -> None:
         self.assertEqual(self.service["network_mode"], "host")
         self.assertNotIn("ports", self.service)
+        self.assertNotIn("privileged", self.service)
+        self.assertNotIn("cap_add", self.service)
+        self.assertNotIn("pid", self.service)
 
     def test_container_is_hardened(self) -> None:
         self.assertIs(self.service["read_only"], True)
@@ -143,9 +156,12 @@ class ComposeSecurityTests(unittest.TestCase):
         for package in ("pytest", "mypy", "ruff", "bandit", "pip-audit"):
             with self.subTest(package=package):
                 self.assertNotRegex(text, rf"(?m)^{package}==")
-        for package in ("fastapi", "cryptography", "argon2-cffi", "setuptools"):
+        for package in ("fastapi", "cryptography", "argon2-cffi"):
             with self.subTest(package=package):
                 self.assertRegex(text, rf"(?m)^{package}==")
+        # setuptools reste dans le lock pour le builder, mais l'image runtime
+        # l'uninstalle explicitement avant le COPY.
+        self.assertRegex(text, r"(?m)^setuptools==")
 
 
 class InstallGuideTests(unittest.TestCase):
@@ -157,9 +173,16 @@ class InstallGuideTests(unittest.TestCase):
             "heimdall vault key create --project demo",
             "heimdall scan",
             "docs/t122-cold-test.md",
+            "chmod 700 data secrets",
+            "chmod 600 .env",
+            "-K /tmp/heimdall-auth.header",
+            "docker compose config --quiet",
+            "openssl enc -aes-256-cbc -pbkdf2",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, text)
+        self.assertNotIn('curl -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY"', text)
+        self.assertNotIn("export HEIMDALL_API_KEY=", text)
 
 
 class HealthcheckTests(unittest.TestCase):
@@ -203,6 +226,19 @@ class HealthcheckTests(unittest.TestCase):
             "https://127.0.0.1:9443/api/v1/health", timeout=2, context=context
         )
 
+    def test_healthcheck_rejects_malformed_port_without_reflection(self) -> None:
+        module = _load_healthcheck()
+        for port in ("", "abc", "0", "65536", "8443/x", "-1"):
+            with self.subTest(port=port):
+                stderr = io.StringIO()
+                with (
+                    patch.dict("os.environ", {"HEIMDALL_VAULT_PORT": port}, clear=True),
+                    patch("sys.stderr", stderr),
+                ):
+                    self.assertEqual(module.main(), 1)
+                if port:
+                    self.assertNotIn(port, stderr.getvalue())
+
     def test_healthcheck_fails_closed_on_error_or_non_200(self) -> None:
         module = _load_healthcheck()
         response = MagicMock()
@@ -225,3 +261,25 @@ class HealthcheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EntrypointTests(unittest.TestCase):
+    def test_entrypoint_refuses_root(self) -> None:
+        module = _load_entrypoint()
+        stderr = io.StringIO()
+        with (
+            patch("os.geteuid", return_value=0),
+            patch("sys.stderr", stderr),
+        ):
+            self.assertEqual(module.main(), 1)
+        self.assertIn("root", stderr.getvalue())
+
+    def test_entrypoint_drops_to_the_server_for_non_root(self) -> None:
+        module = _load_entrypoint()
+        with (
+            patch("os.geteuid", return_value=10001),
+            patch("os.execvp") as execvp,
+        ):
+            self.assertEqual(module.main(), 1)
+        execvp.assert_called_once()
+        self.assertEqual(execvp.call_args.args[1][1:], ["-m", "heimdall.vault.app"])

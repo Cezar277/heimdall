@@ -50,6 +50,7 @@ par Git. Les commandes ci-dessous créent des valeurs aléatoires et les
 ```sh
 umask 077
 mkdir -p data secrets
+chmod 700 data secrets
 
 cat > .env <<ENV_FILE
 HEIMDALL_VAULT_MASTER_KEY=$(openssl rand -base64 32)
@@ -67,7 +68,7 @@ openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
   -addext "subjectAltName=IP:127.0.0.1" \
   -addext "keyUsage=digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth"
-chmod 600 secrets/vault_tls_key.pem
+chmod 600 secrets/vault_tls_cert.pem secrets/vault_tls_key.pem
 ```
 
 - `HEIMDALL_VAULT_MASTER_KEY` : phrase de passe longue et unique, **sans
@@ -78,6 +79,7 @@ chmod 600 secrets/vault_tls_key.pem
   clé maîtresse et de la KEK.
 - `HEIMDALL_UID` / `HEIMDALL_GID` : UID/GID de l'utilisateur hôte qui possède
   `data/` et `secrets/`. Le conteneur tourne avec cet UID, jamais en root.
+  **Ne jamais mettre `0`** : l'entrypoint refuse explicitement `euid == 0`.
 
 > **Sauvegarde.** Sauvegardez `.env` et `secrets/` dans un coffre séparé. Sans
 > eux, la base `data/vault.db` est définitivement illisible.
@@ -130,20 +132,29 @@ Identifiant : key_...
 Projet      : demo
 ```
 
-Puis, depuis l'hôte :
+Puis, depuis l'hôte. La clé ne doit **jamais** apparaître dans `argv`
+(`ps aux`, `/proc/<pid>/cmdline`) ni dans l'historique shell : on la lit sans
+écho, on écrit un fichier d'en-tête `600`, puis `curl -K` lit ce fichier.
 
 ```sh
-export HEIMDALL_API_KEY='<cle-api-a-copier>'
+read -rsp "Clé API: " HEIMDALL_API_KEY; echo
+umask 077
+printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
+  > /tmp/heimdall-auth.header
+chmod 600 /tmp/heimdall-auth.header
+unset HEIMDALL_API_KEY
 
 curl --cacert secrets/vault_tls_cert.pem \
-  -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY" \
+  -K /tmp/heimdall-auth.header \
   -H 'Content-Type: application/json' \
   -d '{"project":"demo","env":"dev","name":"DEMO_PASSWORD","value":"valeur-de-demonstration"}' \
   https://127.0.0.1:8443/api/v1/secrets
 
 curl --cacert secrets/vault_tls_cert.pem \
-  -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY" \
+  -K /tmp/heimdall-auth.header \
   https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
+
+rm -f /tmp/heimdall-auth.header
 ```
 
 Attendu : `201` puis `200` avec la valeur. Le journal d'audit est consultable
@@ -213,16 +224,32 @@ docker compose up -d
 ```
 
 Les migrations de base sont additives ; sauvegardez `data/` avant une mise à
-jour importante.
+jour importante. L'image de base est épinglée par digest dans le `Dockerfile` :
+pour la mettre à jour, relever le digest avec
+`docker buildx imagetools inspect python:3.12-slim`, remplacer les deux
+`FROM ...@sha256:...`, puis reconstruire et rejouer le test à froid.
 
-### Sauvegarde
+### Sauvegarde chiffrée
+
+La sauvegarde contient la clé maîtresse, le pepper et la clé TLS : elle doit
+être chiffrée avant d'être écrite sur disque.
 
 ```sh
-tar --exclude='data/vault.db-*' -czf "heimdall-backup-$(date +%F).tgz" \
-  data .env secrets
+umask 077
+tar --exclude='data/vault.db-*' -czf - data .env secrets \
+  | openssl enc -aes-256-cbc -pbkdf2 -salt \
+      -out "heimdall-backup-$(date +%F).tgz.enc"
+chmod 600 "heimdall-backup-$(date +%F).tgz.enc"
 ```
 
-Conservez la sauvegarde chiffrée et séparément des secrets de production.
+Restauration (après `docker compose down`) :
+
+```sh
+openssl enc -d -aes-256-cbc -pbkdf2 \
+  -in "heimdall-backup-AAAA-MM-JJ.tgz.enc" | tar -xzf -
+```
+
+Ne jamais conserver l'archive `.tgz` en clair.
 
 ### Réinitialisation (destructif)
 
@@ -243,19 +270,23 @@ et les valeurs sont perdues.
 | `Connection refused` | Conteneur arrêté ou port 8443 occupé | `docker compose ps`, `ss -ltnp \| grep 8443`, `docker compose logs vault` |
 | `TLS obligatoire en production` | `secrets/vault_tls_cert.pem` ou `vault_tls_key.pem` absent | Régénérer les fichiers de l'étape 3 |
 | `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `cp .env.example .env`, remplir les valeurs, `docker compose up -d` |
-| `Permission denied` sur `/data` | UID/GID du conteneur différent du propriétaire de `data/` | Renseigner `HEIMDALL_UID`/`HEIMDALL_GID` avec `id -u`/`id -g`, `chown -R` sur `data/` |
-| `docker compose config` échoue | `.env` ou secrets manquants | Créer les fichiers de l'étape 3 |
+| `Permission denied` sur `/data` | UID/GID du conteneur différent du propriétaire de `data/` | Renseigner `HEIMDALL_UID`/`HEIMDALL_GID` avec `id -u`/`id -g`, `chown -R` sur `data/`, `chmod 700 data secrets` |
+| `refus: le conteneur Vault ne doit pas tourner en root` | `HEIMDALL_UID=0` ou `user: "0:0"` | Remettre l'UID/GID de l'hôte (`id -u`/`id -g`), jamais `0` |
+| `docker compose config --quiet` échoue | `.env` ou secrets manquants | Créer les fichiers de l'étape 3 |
 | Le healthcheck reste `unhealthy` | Certificat sans SAN `127.0.0.1` ou service pas prêt | Vérifier `openssl x509 -in secrets/vault_tls_cert.pem -text -noout`, logs |
 | `scan impossible` (exit 2) | Répertoire sans base Git ou fichier illisible | `git init` dans le répertoire de test, vérifier les permissions |
 
 Commandes de diagnostic utiles :
 
 ```sh
-docker compose config
+docker compose config --quiet   # valide sans imprimer les secrets de .env
 docker compose logs --tail=100 vault
 docker compose exec -T vault id
 docker compose exec -T vault ls -ld /data /run/secrets
 ```
+
+> N'utilisez **pas** `docker compose config` sans `--quiet` dans un terminal
+> partagé ou un log : il imprime les valeurs de `.env`, donc les secrets.
 
 ## 10. Sécurité
 
