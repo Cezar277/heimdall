@@ -136,3 +136,11 @@ en CI. Le test à froid réel est archivé dans `docs/t122-cold-test.md`.
   minimale) : la CLI locale est installée dans un venv dédié.
 - Le test à froid par une personne externe reste à signer par l'opérateur
   avant l'audit ; le protocole et les résultats automatisés sont fournis.
+
+## 6. Procédure de re-pin au merge
+
+Lors du merge de la PR #41 sur `main`, le commit mergé devient la révision auditée :
+1. Mettre à jour le SHA de checkout dans `docs/install.md` aux sections 2 et Mise à jour (`test "$(git rev-parse HEAD)" = "<SHA_MERGE>"`).
+2. Reporter ce SHA dans `docs/t41-samm.md:7` (la cohérence des pins entre `docs/install.md` et `docs/t41-samm.md` est garantie par `test_pins_coherence_between_guide_and_samm`).
+3. Déplacer le tag `t41-audit` sur le commit de merge (`git tag -f t41-audit <SHA_MERGE>`).
+4. Consigner le SHA court (`git rev-parse --short HEAD`) dans `docs/t122-cold-test.md`.

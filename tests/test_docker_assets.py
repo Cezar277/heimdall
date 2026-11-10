@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import re
 import shutil
 import subprocess
@@ -123,6 +124,15 @@ class ComposeSecurityTests(unittest.TestCase):
         self.assertIn("HEIMDALL_GID", self.service["user"])
         self.assertNotIn("0:0", self.service["user"])
         self.assertNotIn(":-0", self.service["user"])
+        user_match = re.fullmatch(
+            r"\$\{HEIMDALL_UID:-(\d+)\}:\$\{HEIMDALL_GID:-(\d+)\}",
+            self.service["user"],
+        )
+        self.assertIsNotNone(user_match, f"user format non conforme: {self.service['user']}")
+        assert user_match is not None
+        uid_default, gid_default = int(user_match.group(1)), int(user_match.group(2))
+        self.assertGreater(uid_default, 0, "UID résolu par défaut ne doit pas valoir 0")
+        self.assertGreater(gid_default, 0, "GID résolu par défaut ne doit pas valoir 0")
         self.assertIn("/tmp:rw,noexec,nosuid,size=64m", self.service["tmpfs"])  # noqa: S108
         self.assertEqual(self.service["pids_limit"], 256)
 
@@ -239,6 +249,37 @@ class SamnAndPinTests(unittest.TestCase):
         self.assertIn("49bb5ccce63a102e1f00a075f1cd6c83dfbe366e", install)
         self.assertIn(sha, samm)
         self.assertIn("t41-audit", install + samm)
+
+    def test_pins_coherence_between_guide_and_samm(self) -> None:
+        """Vérifie la cohérence des pins (install.md §2 == mise à jour == t41-samm.md:7)."""
+        install = INSTALL_GUIDE.read_text(encoding="utf-8")
+        samm = (ROOT / "docs" / "t41-samm.md").read_text(encoding="utf-8")
+        shas_install = re.findall(
+            r'test "\$\(git rev-parse HEAD\)" = "([0-9a-f]{40})"',
+            install,
+        )
+        self.assertGreaterEqual(
+            len(shas_install),
+            2,
+            "Au moins 2 vérifications de SHA attendues dans docs/install.md (§2 et §Mise à jour)",
+        )
+        self.assertEqual(
+            shas_install[0],
+            shas_install[1],
+            f"docs/install.md désynchronisé: §2 ({shas_install[0]}) != maj ({shas_install[1]})",
+        )
+        match_samm = re.search(
+            r"tag `t41-audit` vérifié par `git rev-parse` = `([0-9a-f]{40})`",
+            samm,
+        )
+        self.assertIsNotNone(match_samm, "SHA du tag t41-audit introuvable dans docs/t41-samm.md:7")
+        assert match_samm is not None
+        sha_samm = match_samm.group(1)
+        self.assertEqual(
+            shas_install[0],
+            sha_samm,
+            f"Désynchronisation: install.md ({shas_install[0]}) != samm.md ({sha_samm})",
+        )
 
     def test_runtime_lock_script_writes_atomically(self) -> None:
         script = (ROOT / "scripts" / "regen_runtime_lock.py").read_text(encoding="utf-8")
@@ -435,6 +476,49 @@ class UidGidGuardTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 1)
+
+    def test_guide_effective_env_guard_rejects_resolved_zero(self) -> None:
+        """Vérifie que le garde bash du guide après sourcing refuse tout UID ou GID résolu à 0."""
+        guide = INSTALL_GUIDE.read_text(encoding="utf-8")
+        self.assertIn('"${HEIMDALL_UID:-1000}" =~ ^0+$', guide)
+        self.assertIn('"${HEIMDALL_GID:-1000}" =~ ^0+$', guide)
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        script = (
+            'set -eu\n'
+            '[ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }\n'
+            'if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then\n'
+            '  exit 1\n'
+            'fi\n'
+            'exit 0\n'
+        )
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
+            for env_content, expected_exit in (
+                ("", 0),  # defauts 1000:1000 -> non-root
+                ("HEIMDALL_UID=1000\nHEIMDALL_GID=1000\n", 0),
+                ("HEIMDALL_UID=10001\nHEIMDALL_GID=10001\n", 0),
+                ("HEIMDALL_UID=0\n", 1),
+                ("HEIMDALL_UID=00\n", 1),
+                ("HEIMDALL_GID=0\n", 1),
+                ("HEIMDALL_GID=00\n", 1),
+                ('HEIMDALL_UID="0"\n', 1),
+                ('HEIMDALL_GID="0"\n', 1),
+                ("export HEIMDALL_UID=0\n", 1),
+                ("export HEIMDALL_GID=0\n", 1),
+            ):
+                with self.subTest(env=env_content):
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(env_content)
+                    handle.flush()
+                    env = {k: v for k, v in os.environ.items() if not k.startswith("HEIMDALL_")}
+                    env["ENV_FILE"] = handle.name
+                    res = subprocess.run([bash, "-c", script], env=env, check=False)  # noqa: S603
+                    self.assertEqual(
+                        res.returncode,
+                        expected_exit,
+                        f"Échec pour env: {env_content!r}",
+                    )
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ et lancer Heimdall **avec la seule documentation** `docs/install.md`.
 4. Noter chaque hésitation, commande ambiguë, erreur ou résultat inattendu.
 5. Corriger `docs/install.md` et recommencer si un blocage est reproductible.
 6. Signer la section « Validation par une personne externe » ci-dessous.
+7. Au merge sur `main`, consigner le SHA final mergé (`git rev-parse --short HEAD`) et déplacer le tag `t41-audit`.
 
 ## 2. Résultats du test automatisé (environnement neuf)
 
