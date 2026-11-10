@@ -48,6 +48,7 @@ from heimdall.vault.database import (
     find_secrets_by_fingerprint,
     get_secret_metadata,
     init_db,
+    set_server_hmac_canary,
     update_secret,
 )
 from heimdall.vault.store import (
@@ -140,14 +141,18 @@ class SecretHmacCryptoTests(TestCase):
             compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", aad="")
 
     def test_verify_and_matching_empty_aad_parity(self) -> None:
-        """verify_secret_hmac et is_secret_value_matching refusent un AAD vide (False)."""
+        """verify_secret_hmac et is_secret_value_matching refusent un AAD vide (ValueError)."""
         cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
         dummy_fp = "a" * 64
 
-        self.assertFalse(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", dummy_fp, aad=b""))
-        self.assertFalse(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", dummy_fp, aad=""))
-        self.assertFalse(cipher.is_secret_value_matching("val", dummy_fp, aad=b""))
-        self.assertFalse(cipher.is_secret_value_matching("val", dummy_fp, aad=""))
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", dummy_fp, aad=b"")
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", dummy_fp, aad="")
+        with self.assertRaises(ValueError):
+            cipher.is_secret_value_matching("val", dummy_fp, aad=b"")
+        with self.assertRaises(ValueError):
+            cipher.is_secret_value_matching("val", dummy_fp, aad="")
 
     def test_compute_secret_hmac_input_validation(self) -> None:
         """Refus fail-closed sur entrée vide, type invalide ou clé trop courte."""
@@ -724,6 +729,89 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
         mem_store._cipher = cipher2
         with self.assertRaises(VaultCipherError):
             await mem_store.create("demo", "prod", "NEW_SECRET", "new_val")
+
+    async def test_find_secrets_by_fingerprint_fails_closed_on_key_change_or_derived_mode(
+        self,
+    ) -> None:
+        """find_secrets_by_fingerprint refuse fail-closed sans clé explicite ou après changement."""
+        fp = "a" * 64
+
+        # 1. Mode dérivé (sans clé HMAC serveur explicite)
+        mem_derived = InMemorySecretStore(cipher=VaultCipher(b"K" * 32))
+        with self.assertRaises(VaultCipherError):
+            await mem_derived.find_secrets_by_fingerprint("demo", fp)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_derived = SqliteSecretStore(db_path, VaultCipher(b"K" * 32))
+            with self.assertRaises(VaultCipherError):
+                await sql_derived.find_secrets_by_fingerprint("demo", fp)
+
+        # 2. Après changement de clé HMAC serveur
+        # En mémoire
+        c1 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        mem_store = InMemorySecretStore(cipher=c1)
+        await mem_store.create("demo", "prod", "S", "v")
+        mem_store._cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY)
+        with self.assertRaises(VaultCipherError):
+            await mem_store.find_secrets_by_fingerprint("demo", fp)
+
+        # En SQLite
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store1 = SqliteSecretStore(db_path, c1)
+            await sql_store1.create("demo", "prod", "S", "v")
+            sql_store2 = SqliteSecretStore(
+                db_path,
+                VaultCipher(b"K" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY),
+            )
+            with self.assertRaises(VaultCipherError):
+                await sql_store2.find_secrets_by_fingerprint("demo", fp)
+
+    async def test_stores_reject_empty_identity_triplet(self) -> None:
+        """Les stores refusent un triplet d'identité vide avec ValueError."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        mem_store = InMemorySecretStore(cipher=cipher)
+        with self.assertRaises(ValueError):
+            await mem_store.is_secret_value_matching("", "prod", "NAME", "val")
+        with self.assertRaises(ValueError):
+            await mem_store.is_secret_value_matching("proj", "", "NAME", "val")
+        with self.assertRaises(ValueError):
+            await mem_store.is_secret_value_matching("proj", "prod", "", "val")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            with self.assertRaises(ValueError):
+                await sql_store.is_secret_value_matching("", "prod", "NAME", "val")
+            with self.assertRaises(ValueError):
+                await sql_store.is_secret_value_matching("proj", "", "NAME", "val")
+            with self.assertRaises(ValueError):
+                await sql_store.is_secret_value_matching("proj", "prod", "", "val")
+
+    async def test_divergent_canary_during_creation_raises_vault_cipher_error_and_rolls_back(
+        self,
+    ) -> None:
+        """En cas de désaccord de canari à l'écriture, lève VaultCipherError et rollback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            c1 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            c2 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY)
+            sql_store = SqliteSecretStore(db_path, c2)
+
+            # Initialiser le canari avec c1
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                ensure_project(conn, "proj")
+                set_server_hmac_canary(conn, c1.server_hmac_key_canary())
+
+            # Tentative de création avec store sous c2 -> VaultCipherError
+            with self.assertRaises(VaultCipherError):
+                await sql_store.create("proj", "prod", "SECRET_KEY", "value123")
+
+            # Vérifier qu'aucun secret n'a été inséré
+            with db_session(db_path) as conn:
+                self.assertIsNone(get_secret_metadata(conn, "proj", "prod", "SECRET_KEY"))
 
     def test_database_find_secrets_by_fingerprint_uses_index(self) -> None:
         """find_secrets_by_fingerprint retourne les métadonnées sans déchiffrer."""

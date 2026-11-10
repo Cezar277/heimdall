@@ -269,6 +269,8 @@ class InMemorySecretStore:
         Exige une clé HMAC serveur explicite (non dérivée de la KEK) pour rester
         valide et immunisée contre la rotation de KEK.
         """
+        if not project or not env or not name:
+            raise ValueError("Le triplet d'identité (project, env, name) ne peut pas être vide.")
         if not candidate_value:
             return False
         if not self._cipher.has_explicit_server_hmac_key:
@@ -373,6 +375,20 @@ class InMemorySecretStore:
         ):
             raise ValueError(
                 "L'empreinte HMAC doit être une chaîne hexadécimale de 64 caractères minuscules."
+            )
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La recherche par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
+        if self._server_hmac_canary is not None and not constant_time_equal(
+            self._server_hmac_canary, self._cipher.server_hmac_key_canary()
+        ):
+            raise VaultCipherError(
+                "La clé HMAC serveur a été modifiée depuis l'enregistrement des secrets. "
+                "Les empreintes stockées sont invalidées (refus fail-closed pour interdire "
+                "tout faux négatif)."
             )
         async with self._lock:
             results = [
@@ -640,7 +656,10 @@ class SqliteSecretStore:
                     fingerprint=fingerprint,
                 )
                 if self._cipher.has_explicit_server_hmac_key:
-                    set_server_hmac_canary(conn, self._cipher.server_hmac_key_canary())
+                    try:
+                        set_server_hmac_canary(conn, self._cipher.server_hmac_key_canary())
+                    except ValueError as exc:
+                        raise VaultCipherError(str(exc)) from exc
             except sqlite3.IntegrityError:
                 raise KeyError("Secret déjà existant") from None
         return {
@@ -663,6 +682,8 @@ class SqliteSecretStore:
         sans jamais déchiffrer ni renvoyer l'empreinte au client (ticket #116).
         Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
+        if not project or not env or not name:
+            raise ValueError("Le triplet d'identité (project, env, name) ne peut pas être vide.")
         if not candidate_value:
             return False
         if not self._cipher.has_explicit_server_hmac_key:
@@ -686,6 +707,8 @@ class SqliteSecretStore:
         name: str,
         candidate_value: str,
     ) -> bool:
+        if not project or not env or not name:
+            raise ValueError("Le triplet d'identité (project, env, name) ne peut pas être vide.")
         if not candidate_value:
             return False
         aad = VaultCipher.aad(project, env, name)
@@ -814,7 +837,23 @@ class SqliteSecretStore:
         fingerprint: str,
         env: str | None = None,
     ) -> list[dict[str, str]]:
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La recherche par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
         with db_session(self._db_path) as conn:
+            persisted_canary = get_server_hmac_canary(conn)
+            if persisted_canary is not None and not constant_time_equal(
+                persisted_canary, self._cipher.server_hmac_key_canary()
+            ):
+                raise VaultCipherError(
+                    "La clé HMAC serveur (HEIMDALL_VAULT_SERVER_HMAC_KEY) a été modifiée "
+                    "depuis l'enregistrement des secrets en base. Les empreintes stockées "
+                    "sont invalidées (refus fail-closed pour interdire tout faux négatif). "
+                    "Une migration des empreintes est requise."
+                )
             return find_secrets_by_fingerprint(conn, project, fingerprint, env=env)
 
     async def clear(self) -> None:

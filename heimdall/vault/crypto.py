@@ -352,8 +352,10 @@ def verify_secret_hmac(
     Ticket #116 : permet de vérifier si la valeur en production est encore celle qui a fuité,
     sans jamais déchiffrer ni exposer l'empreinte au client.
     """
-    if aad is not None and not aad:
-        return False
+    if aad is not None:
+        aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
+        if not aad_bytes:
+            raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
     if not isinstance(expected_hmac, str) or len(expected_hmac) != _SHA256_HEX_LEN:
         return False
     try:
@@ -1049,7 +1051,7 @@ class VaultCipher:
         if aad is not None:
             aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
             if not aad_bytes:
-                return False
+                raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
             val_bytes = (
                 unicodedata.normalize("NFC", value).encode("utf-8")
                 if isinstance(value, str)
