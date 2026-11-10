@@ -73,6 +73,7 @@ _TAG_SIZE_BYTES: int = 16  # étiquette d'authentification GCM, en fin de cipher
 # Défense en profondeur : un pepper plus court que 256 bits réduit la
 # résistance hors ligne si les empreintes stockées et le pepper fuient.
 _MIN_PEPPER_BYTES: int = 32
+MAX_SERVER_HMAC_KEY_BYTES: int = 512  # Borne maximale pour la clé HMAC serveur (ticket #116)
 _SHA256_HEX_LEN: int = 64  # Longueur en caractères hexadécimaux d'un SHA-256 (ticket #116)
 _MIN_DISTINCT_SERVER_HMAC_KEY_BYTES: int = 16  # Diversité minimale pour clé HMAC (ticket #116)
 _MIN_SERVER_HMAC_KEY_SHANNON_ENTROPY: float = 3.5  # Seuil d'entropie de Shannon minimale
@@ -169,14 +170,7 @@ def generate_server_hmac_key() -> str:
     return secrets.token_urlsafe(_KEY_SIZE_BYTES)
 
 
-def _normalize_server_hmac_key(key: str | bytes | None) -> bytes:
-    """Normalise la clé HMAC serveur en octets ; refuse absent, vide, courte ou triviale.
-
-    Exige au moins 32 octets (256 bits), au moins 16 symboles distincts, aucune période
-    répétitive et une entropie de Shannon >= 3.5 bits/octet. Ces contrôles neutralisent
-    les attaques par dictionnaire et tables arc-en-ciel en cas d'accès à la base de données
-    (ticket #116). Seule la fonction ``generate_server_hmac_key()`` est supportée.
-    """
+def _to_raw_server_hmac_bytes(key: str | bytes | None) -> bytes:
     if key is None:
         raise ValueError(
             "La clé HMAC serveur est obligatoire. Aucun repli silencieux sur un secret par défaut."
@@ -185,19 +179,27 @@ def _normalize_server_hmac_key(key: str | bytes | None) -> bytes:
         if not key or not key.strip():
             raise ValueError("La clé HMAC serveur ne peut pas être vide ou blanche.")
         try:
-            key_bytes = key.encode("utf-8")
+            return key.encode("utf-8")
         except UnicodeEncodeError:
             raise ValueError("La clé HMAC serveur doit être encodable en UTF-8.") from None
-    elif isinstance(key, (bytes, bytearray)):
+    if isinstance(key, (bytes, bytearray)):
         key_bytes = bytes(key)
         if not key_bytes or not key_bytes.strip():
             raise ValueError("La clé HMAC serveur ne peut pas être vide ou blanche.")
-    else:
-        raise ValueError("Clé HMAC serveur invalide : chaîne ou octets attendus.")
+        return key_bytes
+    raise ValueError("Clé HMAC serveur invalide : chaîne ou octets attendus.")
+
+
+def _validate_key_complexity(key_bytes: bytes) -> None:
     if len(key_bytes) < _MIN_PEPPER_BYTES:
         raise ValueError(
             f"La clé HMAC serveur doit comporter au moins {_MIN_PEPPER_BYTES} octets "
             "(256 bits) pour une résistance hors ligne suffisante."
+        )
+    if len(key_bytes) > MAX_SERVER_HMAC_KEY_BYTES:
+        raise ValueError(
+            f"La clé HMAC serveur ne doit pas dépasser {MAX_SERVER_HMAC_KEY_BYTES} octets "
+            "(longueur excessive)."
         )
     if len(set(key_bytes)) < _MIN_DISTINCT_SERVER_HMAC_KEY_BYTES:
         raise ValueError(
@@ -218,7 +220,23 @@ def _normalize_server_hmac_key(key: str | bytes | None) -> bytes:
             "utiliser generate_server_hmac_key() comme seule voie supportée pour "
             "générer une clé aléatoire cryptographiquement sûre de 256 bits."
         )
+
+
+def validate_server_hmac_key(key: str | bytes | None) -> bytes:
+    """Valide et normalise la clé HMAC serveur en octets (ticket #116).
+
+    Exige au moins 32 octets (256 bits), au plus 512 octets (borne maximale),
+    au moins 16 symboles distincts, aucune période répétitive et une entropie
+    de Shannon >= 3.5 bits/octet. Ces contrôles neutralisent les attaques par
+    dictionnaire et les ralentissements par clés géantes.
+    Seule la fonction ``generate_server_hmac_key()`` est supportée.
+    """
+    key_bytes = _to_raw_server_hmac_bytes(key)
+    _validate_key_complexity(key_bytes)
     return key_bytes
+
+
+_normalize_server_hmac_key = validate_server_hmac_key
 
 
 def _extract_key_variants(raw: str | bytes) -> list[bytes]:
@@ -1035,6 +1053,8 @@ class VaultCipher:
         Si un AAD est fourni, la vérification est liée à ce seul AAD (aucun repli
         vers une empreinte brute non liée).
         """
+        if not isinstance(value, (str, bytes, bytearray)):
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
         if not self._has_explicit_server_hmac_key:
             raise VaultCipherError(
                 "La vérification d'empreinte exige une clé HMAC serveur explicite "
@@ -1049,6 +1069,8 @@ class VaultCipher:
         ):
             return False
         if aad is not None:
+            if not isinstance(aad, (str, bytes, bytearray)):
+                raise TypeError("Le contexte AAD doit être de type str, bytes ou bytearray.")
             aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
             if not aad_bytes:
                 raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")

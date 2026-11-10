@@ -101,7 +101,6 @@ from heimdall.vault.audit import AuditMiddleware, InMemoryAuditLog, SqliteAuditL
 from heimdall.vault.crypto import (
     MIN_MASTER_KEY_BYTES,
     VaultCipher,
-    _normalize_server_hmac_key,
     constant_time_equal,
     decode_kek_salt,
     derive_kek_from_master_key,
@@ -109,6 +108,7 @@ from heimdall.vault.crypto import (
     generate_api_key_pepper,
     kek_matches_pepper,
     server_hmac_key_matches_master_key,
+    validate_server_hmac_key,
 )
 from heimdall.vault.database import (
     _MAX_SECRET_PAGE_OFFSET,
@@ -937,10 +937,10 @@ class VaultSettings(BaseSettings):
     @field_validator("server_hmac_key")
     @classmethod
     def validate_server_hmac_key(cls, value: str | None) -> str | None:
-        """Valide la clé HMAC serveur : au moins 32 octets (256 bits), non triviale."""
+        """Valide la clé HMAC serveur : au moins 32 octets (256 bits), max 512, non triviale."""
         if value is None:
             return None
-        _normalize_server_hmac_key(value)
+        validate_server_hmac_key(value)
         return value
 
     @model_validator(mode="after")

@@ -32,6 +32,7 @@ from heimdall.vault.app import (
 from heimdall.vault.auth import generate_project_api_key
 from heimdall.vault.crypto import (
     _SHA256_HEX_LEN,
+    MAX_SERVER_HMAC_KEY_BYTES,
     VaultCipher,
     VaultCipherError,
     _normalize_server_hmac_key,
@@ -39,6 +40,7 @@ from heimdall.vault.crypto import (
     generate_encryption_key,
     generate_server_hmac_key,
     server_hmac_key_matches_master_key,
+    validate_server_hmac_key,
     verify_secret_hmac,
 )
 from heimdall.vault.database import (
@@ -47,6 +49,7 @@ from heimdall.vault.database import (
     ensure_project,
     find_secrets_by_fingerprint,
     get_secret_metadata,
+    get_server_hmac_canary,
     init_db,
     set_server_hmac_canary,
     update_secret,
@@ -312,6 +315,39 @@ class SecretHmacCryptoTests(TestCase):
                     find_secrets_by_fingerprint(conn, "proj1", "f" * 63)
                 with self.assertRaises(ValueError):
                     find_secrets_by_fingerprint(conn, "proj1", "G" * 64)
+
+    def test_validate_server_hmac_key_rejects_overlong_keys(self) -> None:
+        """Une clé HMAC dépassant 512 octets est refusée pour prévenir les abus CPU."""
+        with self.assertRaises(ValueError) as ctx:
+            validate_server_hmac_key("A" * 4096)
+        self.assertIn("ne doit pas dépasser 512 octets", str(ctx.exception))
+
+        with self.assertRaises(ValueError):
+            validate_server_hmac_key(b"B" * (MAX_SERVER_HMAC_KEY_BYTES + 1))
+
+        with self.assertRaises(ValidationError):
+            VaultSettings(
+                kek=_VALID_KEK,
+                api_key_pepper=_VALID_PEPPER,
+                server_hmac_key="A" * 4096,
+            )
+
+    def test_is_secret_value_matching_rejects_non_string_bytes_types(self) -> None:
+        """is_secret_value_matching valide le type en tête et lève TypeError sur types invalides."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        valid_fp = "a" * 64
+
+        # Sans AAD
+        with self.assertRaises(TypeError):
+            cipher.is_secret_value_matching(123, valid_fp)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            cipher.is_secret_value_matching(object(), valid_fp)  # type: ignore[arg-type]
+
+        # Avec AAD
+        with self.assertRaises(TypeError):
+            cipher.is_secret_value_matching(123, valid_fp, aad=b"context")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            cipher.is_secret_value_matching("val", valid_fp, aad=123)  # type: ignore[arg-type]
 
 
 class KeySeparationTests(TestCase):
@@ -852,6 +888,106 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
                 for item in found:
                     self.assertNotIn("encrypted_value", item)
                     self.assertNotIn("fingerprint", item)
+
+    async def test_derived_to_explicit_mode_transition_fails_closed_without_migration(
+        self,
+    ) -> None:
+        """Passage dérivé -> explicite sans migration : refuse fail-closed sans faux négatif."""
+        # 1. En SQLite
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            derived_cipher = VaultCipher(b"K" * 32, server_hmac_key=None)
+            derived_store = SqliteSecretStore(db_path, derived_cipher)
+            await derived_store.create("demo", "prod", "S1", "secret123")
+
+            # Passage en mode clé explicite sans migration
+            explicit_cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            explicit_store = SqliteSecretStore(db_path, explicit_cipher)
+
+            # Refus fail-closed de création sous nouvelle clé (anti-base hétérogène)
+            with self.assertRaises(VaultCipherError):
+                await explicit_store.create("demo", "prod", "S2", "val2")
+
+            # Refus fail-closed de vérification sur l'ancien secret (anti-faux négatif)
+            with self.assertRaises(VaultCipherError):
+                await explicit_store.is_secret_value_matching("demo", "prod", "S1", "secret123")
+
+            # Refus fail-closed de détection groupée
+            with self.assertRaises(VaultCipherError):
+                await explicit_store.find_secrets_matching_value("demo", "secret123")
+
+            # Refus fail-closed de recherche par empreinte
+            with self.assertRaises(VaultCipherError):
+                await explicit_store.find_secrets_by_fingerprint("demo", "a" * 64)
+
+        # 2. En mémoire
+        mem_derived = VaultCipher(b"K" * 32, server_hmac_key=None)
+        mem_store = InMemorySecretStore(cipher=mem_derived)
+        await mem_store.create("demo", "prod", "S1", "secret123")
+
+        mem_store._cipher = explicit_cipher
+        with self.assertRaises(VaultCipherError):
+            await mem_store.create("demo", "prod", "S2", "val2")
+        with self.assertRaises(VaultCipherError):
+            await mem_store.is_secret_value_matching("demo", "prod", "S1", "secret123")
+        with self.assertRaises(VaultCipherError):
+            await mem_store.find_secrets_matching_value("demo", "secret123")
+        with self.assertRaises(VaultCipherError):
+            await mem_store.find_secrets_by_fingerprint("demo", "a" * 64)
+
+    async def test_clear_resets_canary_and_allows_recreation_under_new_explicit_key(
+        self,
+    ) -> None:
+        """clear() réinitialise le canari et permet la recréation sous clé explicite."""
+        c1 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        c2 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY)
+
+        # 1. En mémoire
+        mem_store = InMemorySecretStore(cipher=c1)
+        await mem_store.create("p", "prod", "S1", "val1")
+        self.assertIsNotNone(mem_store._server_hmac_canary)
+
+        await mem_store.clear()
+        self.assertIsNone(mem_store._server_hmac_canary)
+
+        mem_store._cipher = c2
+        await mem_store.create("p", "prod", "S2", "val2")
+        self.assertTrue(await mem_store.is_secret_value_matching("p", "prod", "S2", "val2"))
+
+        # 2. En SQLite
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, c1)
+            await sql_store.create("p", "prod", "S1", "val1")
+
+            await sql_store.clear()
+            with db_session(db_path) as conn:
+                self.assertIsNone(get_server_hmac_canary(conn))
+
+            sql_store_2 = SqliteSecretStore(db_path, c2)
+            await sql_store_2.create("p", "prod", "S2", "val2")
+            self.assertTrue(await sql_store_2.is_secret_value_matching("p", "prod", "S2", "val2"))
+
+    async def test_stores_reject_invalid_candidate_value_types(self) -> None:
+        """Les stores rejettent avec TypeError tout type invalide de candidate_value."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        mem_store = InMemorySecretStore(cipher=cipher)
+        await mem_store.create("p", "prod", "S", "v")
+
+        with self.assertRaises(TypeError):
+            await mem_store.is_secret_value_matching("p", "prod", "S", 123)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            await mem_store.find_secrets_matching_value("p", 123)  # type: ignore[arg-type]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            await sql_store.create("p", "prod", "S", "v")
+
+            with self.assertRaises(TypeError):
+                await sql_store.is_secret_value_matching("p", "prod", "S", 123)  # type: ignore[arg-type]
+            with self.assertRaises(TypeError):
+                await sql_store.find_secrets_matching_value("p", 123)  # type: ignore[arg-type]
 
 
 class FingerprintNeverReturnedToClientTests(TestCase):
