@@ -236,7 +236,7 @@ test -z "$(git status --porcelain)" || {
   exit 1
 }
 SHA_PRE="$(git rev-parse HEAD)"
-D_SNAP="$(mktemp -d)"
+D_SNAP="$(mktemp -d /tmp/heimdall-snap.XXXXXX)"
 trap 'rm -rf "$D_SNAP"' EXIT
 git archive HEAD | tar -x -C "$D_SNAP" || {
   echo "archivage snapshot échoué" >&2
@@ -258,8 +258,9 @@ Test sur un dépôt propre (le scanner exige une base Git) :
 
 ```sh
 set -euo pipefail
+D_SNAP="${D_SNAP:-}"
 D_CLEAN="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
-trap 'rm -rf "$D_SNAP" "$D_CLEAN"' EXIT
+trap 'rm -rf "${D_SNAP:-}" "$D_CLEAN"' EXIT
 cd "$D_CLEAN" || exit 1
 git init -q
 /path/vers/heimdall/.venv/bin/heimdall scan .
@@ -364,10 +365,35 @@ tar -tzf "$T" | grep -E '(^/|\.\.)' && {
   echo "chemin absolu ou '..' refusé" >&2
   exit 1
 }
+# Archive vide refusée : grep -Ev ne voit rien et laisserait passer.
+tar -tzf "$T" | grep -Eq '^(\./)?data/' || {
+  echo "archive sans data/ : restauration refusée" >&2
+  exit 1
+}
+tar -tzf "$T" | grep -Eq '^(\./)?secrets/' || {
+  echo "archive sans secrets/ : restauration refusée" >&2
+  exit 1
+}
+tar -tzf "$T" | grep -Eq '^(\./)?\.env$' || {
+  echo "archive sans .env : restauration refusée" >&2
+  exit 1
+}
+# Ne jamais écraser l'existant sans sauvegarde explicite (disponibilité :
+# écraser .env rend data/vault.db illisible). Comme le quickstart et le
+# dépannage, refuser si .env/secrets/data existent déjà.
+test ! -e .env -a ! -e secrets -a ! -e data || {
+  echo "existant : sauvegarder puis rm -rf data secrets .env avant restauration" >&2
+  exit 1
+}
 # `--no-absolute-filenames` explicite quand supporté (bsdtar), repli GNU tar
-# (retire les `/` initiaux par défaut, jamais -P) ; une seule déchiffrement.
+# (retire les `/` initiaux par défaut, jamais -P) ; un seul déchiffrement.
 tar --no-absolute-filenames --exclude='.git/*' -xzf "$T" data .env secrets 2>/dev/null \
   || tar --exclude='.git/*' -xzf "$T" data .env secrets
+# Refuser les liens internes apportés par l'archive (comme au §3).
+test -z "$(find data secrets -type l)" || {
+  echo "lien symbolique interne refusé après restauration" >&2
+  exit 1
+}
 rm -f "$T"
 trap - EXIT INT TERM HUP
 ```

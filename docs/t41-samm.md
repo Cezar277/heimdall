@@ -105,7 +105,7 @@ test -z "$(git status --porcelain)" || {
   exit 1
 }
 SHA_PRE="$(git rev-parse HEAD)"
-D_SNAP="$(mktemp -d)"
+D_SNAP="$(mktemp -d /tmp/heimdall-snap.XXXXXX)"
 trap 'rm -rf "$D_SNAP"' EXIT
 git archive HEAD | tar -x -C "$D_SNAP" || {
   echo "archivage snapshot échoué" >&2
@@ -121,8 +121,9 @@ test -z "$(git status --porcelain)" || {
 }
 .venv/bin/pip install --no-deps --no-build-isolation "$D_SNAP"
 
+D_SNAP="${D_SNAP:-}"
 D_CLEAN="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
-trap 'rm -rf "$D_SNAP" "$D_CLEAN"' EXIT
+trap 'rm -rf "${D_SNAP:-}" "$D_CLEAN"' EXIT
 cd "$D_CLEAN" || exit 1
 git init -q
 /path/vers/heimdall/.venv/bin/heimdall scan .
