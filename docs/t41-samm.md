@@ -4,30 +4,30 @@ Périmètre : ticket parent **#41 « Docker, compose et doc d'installation »** 
 ses sous-tickets #119 à #122. Cette fiche archive les commandes, les fichiers
 et les résultats vérifiés pour l'audit croisé.
 
-Révision du code testé : `HEAD` (mise à jour au commit final de la PR).
+Révision du code testé : `e463bb214abd54a275b74ba36924e924f9aab61d`.
 
 ## 1. Correspondance ticket → livrable → preuve
 
 | Ticket | Livrable | Preuve |
 |---|---|---|
-| **#119** Dockerfile durci du Vault | `Dockerfile`, `.dockerignore`, `docker/healthcheck.py`, `requirements-runtime.lock` | Build multi-étapes, `USER 10001:10001`, `HEALTHCHECK`, dépendances hashées, aucun secret dans l'image ; tests `tests/test_docker_assets.py` |
-| **#120** docker-compose | `docker-compose.yml`, `.env.example` | `network_mode: host` (loopback), `read_only`, `cap_drop: ALL`, `no-new-privileges`, limites, volume `./data`, secrets TLS montés en lecture seule ; `docker compose config` valide |
-| **#121** Guide d'installation | `docs/install.md` | Procédure pas à pas testée : génération des secrets/TLS, `docker compose up`, health, clé API, secret, audit, premier scan |
-| **#122** Test à froid | `docs/t122-cold-test.md` | Protocole et résultats du test à froid ; validation par une personne externe à signer avant l'audit |
+| **#119** Dockerfile durci du Vault | [Dockerfile](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/Dockerfile#L9-L61), [.dockerignore](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/.dockerignore#L1-L40), [docker/healthcheck.py](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker/healthcheck.py#L21-L33), [requirements-runtime.lock](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/requirements-runtime.lock#L1-L5) | Build multi-étapes, `USER 10001:10001`, `HEALTHCHECK`, dépendances hashées, aucun secret dans l'image ; [tests/test_docker_assets.py](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/tests/test_docker_assets.py#L37-L87) |
+| **#120** docker-compose | [docker-compose.yml](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L20-L52), [.env.example](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/.env.example#L1-L12) | `network_mode: host` (loopback), `read_only`, `cap_drop: ALL`, `no-new-privileges`, limites, volume `./data`, secrets TLS montés en lecture seule ; `docker compose config` valide ; [tests/test_docker_assets.py](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/tests/test_docker_assets.py#L90-L148) |
+| **#121** Guide d'installation | [docs/install.md](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docs/install.md#L44-L238) | Procédure pas à pas testée : génération des secrets/TLS, `docker compose up`, health, clé API, secret, audit, premier scan ; [tests/test_docker_assets.py](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/tests/test_docker_assets.py#L151-L162) |
+| **#122** Test à froid | [docs/t122-cold-test.md](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docs/t122-cold-test.md#L1-L80) | Protocole et résultats du test à froid ; validation par une personne externe à signer avant l'audit |
 
 ## 2. Invariants de sécurité vérifiés
 
 | Invariant | Implémentation | Preuve |
 |---|---|---|
-| **Le Vault reste loopback-only** | `network_mode: host`, aucun `ports`, `HEIMDALL_VAULT_HOST=127.0.0.1` | `docker-compose.yml`, test `test_vault_is_loopback_only_via_host_network` ; health et secrets testés sur `127.0.0.1:8443` |
-| **Conteneur non root** | `USER 10001:10001` dans l'image, `user: "${HEIMDALL_UID}:${HEIMDALL_GID}"` dans compose | `Dockerfile`, test `test_image_runs_as_non_root_and_has_healthcheck`, `docker compose exec -T vault id` |
-| **Système de fichiers en lecture seule** | `read_only: true`, `tmpfs /tmp`, volume `./data` seul inscriptible | `docker-compose.yml`, test `test_container_is_hardened` |
-| **Moindre privilège** | `cap_drop: ALL`, `no-new-privileges:true`, `pids_limit`, `mem_limit` | `docker-compose.yml`, test `test_container_is_hardened` |
-| **Aucun secret dans l'image** | `.dockerignore` exclut `.env`, `secrets/`, `*.key`, `*.pem` ; Dockerfile ne définit aucune variable secrète | tests `test_no_secret_or_dev_tool_is_baked_into_the_image`, `test_dockerignore_excludes_secrets_and_dev_context` |
-| **Dépendances runtime hashées** | `requirements-runtime.lock` généré depuis `requirements.lock`, sans pytest/mypy/ruff/bandit/pip-audit | `scripts/regen_runtime_lock.py`, test `test_runtime_lock_excludes_dev_tools` |
-| **TLS fail-closed** | certificat/clé obligatoires en production, montés depuis `./secrets` en lecture seule | `docker-compose.yml`, `docs/install.md` § 3, healthcheck HTTPS avec vérification du certificat |
-| **Healthcheck sans secret** | `docker/healthcheck.py` interroge `/api/v1/health`, vérifie le certificat local, message d'échec générique | test `HealthcheckTests` |
-| **Aucun secret dans le dépôt** | `.env`, `data/`, `secrets/`, `*.key`, `*.pem` ignorés ; `.env.example` à valeurs vides | `.gitignore`, `.env.example`, test `test_env_example_has_no_real_secret` |
+| **Le Vault reste loopback-only** | `network_mode: host`, aucun `ports`, `HEIMDALL_VAULT_HOST=127.0.0.1` | [docker-compose.yml:20](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L20), test `test_vault_is_loopback_only_via_host_network` ; health et secrets testés sur `127.0.0.1:8443` |
+| **Conteneur non root** | `USER 10001:10001` dans l'image, `user: "${HEIMDALL_UID}:${HEIMDALL_GID}"` dans compose | [Dockerfile:52](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/Dockerfile#L52), [docker-compose.yml:25](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L25), test `test_image_runs_as_non_root_and_has_healthcheck`, `docker compose exec -T vault id` |
+| **Système de fichiers en lecture seule** | `read_only: true`, `tmpfs /tmp`, volume `./data` seul inscriptible | [docker-compose.yml:21](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L21), test `test_container_is_hardened` |
+| **Moindre privilège** | `cap_drop: ALL`, `no-new-privileges:true`, `pids_limit`, `mem_limit` | [docker-compose.yml:41](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L41), test `test_container_is_hardened` |
+| **Aucun secret dans l'image** | `.dockerignore` exclut `.env`, `secrets/`, `*.key`, `*.pem` ; Dockerfile ne définit aucune variable secrète | [.dockerignore](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/.dockerignore#L1-L40), tests `test_no_secret_or_dev_tool_is_baked_into_the_image`, `test_dockerignore_excludes_secrets_and_dev_context` |
+| **Dépendances runtime hashées** | `requirements-runtime.lock` généré depuis `requirements.lock`, sans pytest/mypy/ruff/bandit/pip-audit | [scripts/regen_runtime_lock.py](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/scripts/regen_runtime_lock.py#L1-L20), test `test_runtime_lock_excludes_dev_tools` |
+| **TLS fail-closed** | certificat/clé obligatoires en production, montés depuis `./secrets` en lecture seule | [docker-compose.yml:34](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker-compose.yml#L34), [docs/install.md](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docs/install.md#L44-L83), healthcheck HTTPS avec vérification du certificat |
+| **Healthcheck sans secret** | `docker/healthcheck.py` interroge `/api/v1/health`, vérifie le certificat local, message d'échec générique | [docker/healthcheck.py:21](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/docker/healthcheck.py#L21), test `HealthcheckTests` |
+| **Aucun secret dans le dépôt** | `.env`, `data/`, `secrets/`, `*.key`, `*.pem` ignorés ; `.env.example` à valeurs vides | [.gitignore](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/.gitignore#L21-L40), [.env.example](https://github.com/Cezar277/heimdall/blob/e463bb214abd54a275b74ba36924e924f9aab61d/.env.example#L1-L12), test `test_env_example_has_no_real_secret` |
 
 ## 3. Commandes vérifiées
 
