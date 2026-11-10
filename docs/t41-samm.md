@@ -104,9 +104,9 @@ test -z "$(git status --porcelain)" || {
   exit 1
 }
 SHA_PRE="$(git rev-parse HEAD)"
-D="$(mktemp -d)"
-trap 'rm -rf "$D"' EXIT
-git archive HEAD | tar -x -C "$D"
+D_SNAP="$(mktemp -d)"
+trap 'rm -rf "$D_SNAP"' EXIT
+git archive HEAD | tar -x -C "$D_SNAP"
 test "$(git rev-parse HEAD)" = "$SHA_PRE" || {
   echo "HEAD modifiée pendant l'archivage" >&2
   exit 1
@@ -115,11 +115,11 @@ test -z "$(git status --porcelain)" || {
   echo "arbre altéré pendant l'archivage" >&2
   exit 1
 }
-.venv/bin/pip install --no-deps --no-build-isolation "$D"
+.venv/bin/pip install --no-deps --no-build-isolation "$D_SNAP"
 
-D="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
-trap 'rm -rf "$D"' EXIT
-cd "$D"
+D_CLEAN="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
+trap 'rm -rf "$D_SNAP" "$D_CLEAN"' EXIT
+cd "$D_CLEAN"
 git init -q
 /path/vers/heimdall/.venv/bin/heimdall scan .
 # exit 0

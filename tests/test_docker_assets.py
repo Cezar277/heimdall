@@ -242,6 +242,14 @@ class InstallGuideTests(unittest.TestCase):
         self.assertIn("--exclude='.git/*'", text)
         self.assertIn("-xzf - data .env secrets", text)
         self.assertIn("ne jamais ajouter `-P`", text)
+        # Durcissements revue c5db82c : snapshot sans fuite, refus automatisé.
+        self.assertIn('D_SNAP="$(mktemp -d)"', text)
+        self.assertIn('D_CLEAN="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"', text)
+        self.assertIn('trap \'rm -rf "$D_SNAP" "$D_CLEAN"\' EXIT', text)
+        self.assertNotIn('D="$(mktemp -d)"', text)
+        self.assertIn("grep -Ev", text)
+        self.assertIn("membre inattendu", text)
+        self.assertIn("--no-absolute-filenames", text)
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
 
@@ -347,6 +355,10 @@ class SamnAndPinTests(unittest.TestCase):
         self.assertIn("git archive HEAD", samm)
         self.assertIn('SHA_PRE="$(git rev-parse HEAD)"', samm)
         self.assertIn('test "$(git rev-parse HEAD)" = "$SHA_PRE"', samm)
+        # Durcissement revue c5db82c : pas de fuite mktemp dans la SAMM non plus.
+        self.assertIn('D_SNAP="$(mktemp -d)"', samm)
+        self.assertIn('D_CLEAN="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"', samm)
+        self.assertNotIn('D="$(mktemp -d)"', samm)
 
     def test_runtime_lock_script_writes_atomically(self) -> None:
         script = (ROOT / "scripts" / "regen_runtime_lock.py").read_text(encoding="utf-8")

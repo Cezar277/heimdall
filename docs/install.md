@@ -235,9 +235,9 @@ test -z "$(git status --porcelain)" || {
   exit 1
 }
 SHA_PRE="$(git rev-parse HEAD)"
-D="$(mktemp -d)"
-trap 'rm -rf "$D"' EXIT
-git archive HEAD | tar -x -C "$D"
+D_SNAP="$(mktemp -d)"
+trap 'rm -rf "$D_SNAP"' EXIT
+git archive HEAD | tar -x -C "$D_SNAP"
 test "$(git rev-parse HEAD)" = "$SHA_PRE" || {
   echo "HEAD modifiée pendant l'archivage" >&2
   exit 1
@@ -246,16 +246,16 @@ test -z "$(git status --porcelain)" || {
   echo "arbre altéré pendant l'archivage" >&2
   exit 1
 }
-.venv/bin/pip install --no-deps --no-build-isolation "$D"
+.venv/bin/pip install --no-deps --no-build-isolation "$D_SNAP"
 .venv/bin/heimdall --version
 ```
 
 Test sur un dépôt propre (le scanner exige une base Git) :
 
 ```sh
-D="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
-trap 'rm -rf "$D"' EXIT
-cd "$D"
+D_CLEAN="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
+trap 'rm -rf "$D_SNAP" "$D_CLEAN"' EXIT
+cd "$D_CLEAN"
 git init -q
 /path/vers/heimdall/.venv/bin/heimdall scan .
 # exit 0 : aucun secret détecté
@@ -336,13 +336,24 @@ docker compose start vault
 
 Restauration (après `docker compose down`) — inspecter avant d'extraire,
 confinée à `data/`, `.env`, `secrets/` (GNU tar retire les `/` initiaux par
-défaut ; ne jamais ajouter `-P`/`--absolute-names`) :
+défaut ; ne jamais ajouter `-P`/`--absolute-names`) avec refus automatisé
+des membres inattendus :
 
 ```sh
 set -euo pipefail
 BK="${HOME}/heimdall-backup-AAAA-MM-JJ.tgz.gpg"
-gpg --decrypt "$BK" | tar -tzf -   # inspection : attendre data/ .env secrets/ seuls
-gpg --decrypt "$BK" | tar --exclude='.git/*' -xzf - data .env secrets
+LIST="$(gpg --decrypt "$BK" | tar -tzf -)"
+printf '%s\n' "$LIST" | grep -Ev '^(\./)?(data(/|$)|secrets(/|$)|\.env$)' && {
+  echo "membre inattendu dans l'archive : restauration refusée" >&2
+  exit 1
+}
+printf '%s\n' "$LIST" | grep -E '(^/|\.\.)' && {
+  echo "chemin absolu ou '..' refusé" >&2
+  exit 1
+}
+# `--no-absolute-filenames` explicite quand supporté (bsdtar), repli GNU tar.
+gpg --decrypt "$BK" | tar --no-absolute-filenames --exclude='.git/*' -xzf - data .env secrets 2>/dev/null \
+  || gpg --decrypt "$BK" | tar --exclude='.git/*' -xzf - data .env secrets
 ```
 
 `gpg --symmetric` utilise un chiffrement authentifié (MDC) : une archive
