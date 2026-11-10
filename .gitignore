@@ -40,6 +40,8 @@ vault.db*
 *.db-wal
 *.db-shm
 *.db-journal
+# Archives de sauvegarde chiffrées du guide Docker (hors dépôt par défaut)
+heimdall-backup-*.tgz.gpg
 
 # --- Outils / OS / IDE ---
 bandit-report.json

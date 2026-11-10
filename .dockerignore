@@ -38,3 +38,4 @@ vault.db*
 *.db-wal
 *.db-shm
 *.db-journal
+heimdall-backup-*.tgz.gpg

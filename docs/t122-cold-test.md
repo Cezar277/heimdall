@@ -49,6 +49,7 @@ et lancer Heimdall **avec la seule documentation** `docs/install.md`.
 | Permissions de `data/`/`secrets/` dépendantes de l'umask | `chmod 700 data secrets` et `chmod 600` explicites |
 | `.env` écrit en place, race possible | Écriture atomique via `mktemp` + `mv -f` |
 | Nom de sauvegarde recalculé entre `gpg` et `chmod` | Nom figé dans `F` avant l'écriture |
+| Archive de sauvegarde laissée dans le dépôt | Écriture dans `$HOME`, motifs `heimdall-backup-*.tgz.gpg` ajoutés à `.gitignore` et `.dockerignore` |
 | Secrets `.env` visibles via `docker inspect` | Avertissement explicite dans la section Sécurité |
 | `data/`/`secrets/` pouvaient être des symlinks préexistants | Garde `test ! -L data && test ! -L secrets` avant `mkdir` |
 

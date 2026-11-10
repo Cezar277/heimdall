@@ -11,6 +11,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -91,6 +93,7 @@ class DockerfileSecurityTests(unittest.TestCase):
             "*.pem",
             "*.key",
             "*.db",
+            "heimdall-backup-*.tgz.gpg",
             "tests",
             "docs",
         ):
@@ -189,9 +192,10 @@ class InstallGuideTests(unittest.TestCase):
             "docker compose config --quiet",
             "gpg --symmetric --cipher-algo AES256",
             "docker compose stop vault",
-            'F="heimdall-backup-$(date +%F).tgz.gpg"',
+            'F="${HOME}/heimdall-backup-$(date +%F).tgz.gpg"',
             'chmod 600 "$F"',
             "docker compose start vault",
+            "cp .env.example .env && chmod 600 .env",
             "docker inspect",
             "network_mode: host",
         ):
@@ -200,6 +204,21 @@ class InstallGuideTests(unittest.TestCase):
         self.assertNotIn('curl -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY"', text)
         self.assertNotIn("export HEIMDALL_API_KEY=", text)
         self.assertNotIn("/tmp/heimdall-auth.header", text)  # noqa: S108
+
+
+class BackupIgnoreTests(unittest.TestCase):
+    def test_backup_archives_are_ignored_by_git_and_docker(self) -> None:
+        name = "heimdall-backup-2026-11-10.tgz.gpg"
+        git = shutil.which("git")
+        self.assertIsNotNone(git)
+        ignored = subprocess.run(  # noqa: S603
+            [git, "check-ignore", "-q", name],
+            cwd=ROOT,
+            check=False,
+        )
+        self.assertEqual(ignored.returncode, 0, "archive de sauvegarde non ignorée par Git")
+        dockerignore = DOCKERIGNORE.read_text(encoding="utf-8")
+        self.assertIn("heimdall-backup-*.tgz.gpg", dockerignore)
 
 
 class ReadmeQuickstartTests(unittest.TestCase):

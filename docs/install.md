@@ -255,7 +255,7 @@ sinon une sauvegarde à chaud peut être déchirée ou exclure des transactions.
 ```sh
 docker compose stop vault
 umask 077
-F="heimdall-backup-$(date +%F).tgz.gpg"
+F="${HOME}/heimdall-backup-$(date +%F).tgz.gpg"
 tar --exclude='data/vault.db-*' -czf - data .env secrets \
   | gpg --symmetric --cipher-algo AES256 --output "$F"
 chmod 600 "$F"
@@ -265,13 +265,15 @@ docker compose start vault
 Restauration (après `docker compose down`) :
 
 ```sh
-gpg --decrypt "heimdall-backup-AAAA-MM-JJ.tgz.gpg" | tar -xzf -
+gpg --decrypt "${HOME}/heimdall-backup-AAAA-MM-JJ.tgz.gpg" | tar -xzf -
 ```
 
 `gpg --symmetric` utilise un chiffrement authentifié (MDC) : une archive
-altérée est refusée au déchiffrement. Ne jamais conserver l'archive `.tgz` en
-clair. Le nom de fichier est figé dans `F` pour que le `chmod` porte sur
-exactement le fichier écrit, même à cheval sur minuit.
+altérée est refusée au déchiffrement. Le nom de fichier est figé dans `F` pour
+que le `chmod` porte sur exactement le fichier écrit, même à cheval sur minuit.
+L'archive est écrite dans `$HOME`, **jamais dans le dépôt** : même chiffrée,
+elle contient la clé maîtresse, le pepper et la clé TLS. Ne jamais conserver
+l'archive `.tgz` en clair.
 
 ### Réinitialisation (destructif)
 
@@ -291,7 +293,7 @@ et les valeurs sont perdues.
 | `403` sur `https://127.0.0.1:8443` | Le conteneur n'est pas en `network_mode: host` ou un port mapping a été ajouté | Garder `network_mode: host`, supprimer `ports` |
 | `Connection refused` | Conteneur arrêté ou port 8443 occupé | `docker compose ps`, `ss -ltnp \| grep 8443`, `docker compose logs vault` |
 | `TLS obligatoire en production` | `secrets/vault_tls_cert.pem` ou `vault_tls_key.pem` absent | Régénérer les fichiers de l'étape 3 |
-| `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `cp .env.example .env`, remplir les valeurs, `docker compose up -d` |
+| `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `cp .env.example .env && chmod 600 .env`, remplir via §3, `docker compose up -d` |
 | `Permission denied` sur `/data` | UID/GID du conteneur différent du propriétaire de `data/` | Renseigner `HEIMDALL_UID`/`HEIMDALL_GID` avec `id -u`/`id -g`, `chown -R` sur `data/`, `chmod 700 data secrets` |
 | `refus: le conteneur Vault ne doit pas tourner en root` | `HEIMDALL_UID=0` ou `user: "0:0"` | Remettre l'UID/GID de l'hôte (`id -u`/`id -g`), jamais `0` |
 | `data/ et secrets/ ne doivent pas être des liens symboliques` | Un lien a été créé avant l'installation | Supprimer le lien et recréer un répertoire réel (`rm data && mkdir data`, idem `secrets`) |
