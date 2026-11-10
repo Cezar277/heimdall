@@ -205,7 +205,7 @@ read -rsp "Clé API: " HEIMDALL_API_KEY; echo
 }
 umask 077
 AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
-trap 'rm -f "$AUTH_HEADER"' EXIT
+trap 'rm -f "$AUTH_HEADER"' EXIT INT TERM
 chmod 600 "$AUTH_HEADER"
 printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
   > "$AUTH_HEADER"
@@ -213,6 +213,8 @@ unset HEIMDALL_API_KEY
 
 curl --cacert /chemin/server.crt -K "$AUTH_HEADER" \
   https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
+rm -f "$AUTH_HEADER"
+trap - EXIT INT TERM
 ```
 
 Comportement fail-closed appliqué par `heimdall/vault/auth.py` :

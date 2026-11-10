@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -174,14 +175,20 @@ class InstallGuideTests(unittest.TestCase):
             "heimdall scan",
             "docs/t122-cold-test.md",
             "chmod 700 data secrets",
-            "chmod 600 .env",
+            'chmod 600 "$ENV_TMP"',
             "test ! -L data",
             "test ! -L secrets",
             "A-Za-z0-9_-]{43,}",
             "mktemp /tmp/heimdall-auth.XXXXXX",
             '-K "$AUTH_HEADER"',
+            "trap 'rm -f \"$AUTH_HEADER\"' EXIT INT TERM",
+            'rm -f "$AUTH_HEADER"',
+            "mktemp .env.XXXXXX",
+            'mv -f "$ENV_TMP" .env',
             "docker compose config --quiet",
             "gpg --symmetric --cipher-algo AES256",
+            "docker inspect",
+            "network_mode: host",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, text)
@@ -288,3 +295,14 @@ class EntrypointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuideApiKeyValidationTests(unittest.TestCase):
+    def test_guide_rejects_header_injection_before_writing_the_file(self) -> None:
+        guide = INSTALL_GUIDE.read_text(encoding="utf-8")
+        self.assertIn("^[A-Za-z0-9_-]{43,}$", guide)
+        pattern = re.compile(r"^[A-Za-z0-9_-]{43,}$")
+        self.assertIsNotNone(pattern.fullmatch("A" * 43))
+        for invalid in ("A" * 42, "A" * 43 + '"', "A" * 43 + "\n", "A" * 43 + "\\"):
+            with self.subTest(invalid=repr(invalid)):
+                self.assertIsNone(pattern.fullmatch(invalid))

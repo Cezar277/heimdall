@@ -56,14 +56,18 @@ test ! -L data && test ! -L secrets || {
 mkdir -p data secrets
 chmod 700 data secrets
 
-cat > .env <<ENV_FILE
+ENV_TMP="$(mktemp .env.XXXXXX)"
+trap 'rm -f "$ENV_TMP"' EXIT INT TERM
+chmod 600 "$ENV_TMP"
+cat > "$ENV_TMP" <<ENV_FILE
 HEIMDALL_VAULT_MASTER_KEY=$(openssl rand -base64 32)
 HEIMDALL_VAULT_API_KEY_PEPPER=$(openssl rand -base64 32)
 HEIMDALL_VAULT_KEK_SALT=$(openssl rand -base64 16)
 HEIMDALL_UID=$(id -u)
 HEIMDALL_GID=$(id -g)
 ENV_FILE
-chmod 600 .env
+mv -f "$ENV_TMP" .env
+trap - EXIT INT TERM
 
 openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
   -keyout secrets/vault_tls_key.pem \
@@ -148,7 +152,7 @@ read -rsp "Clé API: " HEIMDALL_API_KEY; echo
 }
 umask 077
 AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
-trap 'rm -f "$AUTH_HEADER"' EXIT
+trap 'rm -f "$AUTH_HEADER"' EXIT INT TERM
 chmod 600 "$AUTH_HEADER"
 printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
   > "$AUTH_HEADER"
@@ -163,6 +167,9 @@ curl --cacert secrets/vault_tls_cert.pem \
 curl --cacert secrets/vault_tls_cert.pem \
   -K "$AUTH_HEADER" \
   https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
+
+rm -f "$AUTH_HEADER"
+trap - EXIT INT TERM
 ```
 
 Attendu : `201` puis `200` avec la valeur. Le journal d'audit est consultable
@@ -312,6 +319,15 @@ docker compose exec -T vault ls -ld /data /run/secrets
 - Les dépendances runtime sont installées depuis
   `requirements-runtime.lock` avec vérification de hashes SHA-256.
 - Le scan ne transmet aucun contenu à un service externe : tout est local.
+- **`network_mode: host` élargit le blast radius** : une compromission du
+  Vault donne accès au loopback de l'hôte (par exemple Ollama sur
+  `127.0.0.1`). Restreindre le groupe `docker` (équivalent root) et ne
+  colocaliser aucun service sensible sur la loopback de la même machine.
+- **`docker inspect` expose les secrets** : les variables de `.env` sont
+  lisibles par tout membre du groupe `docker` via `docker inspect
+  heimdall-vault` ou `/proc/<pid>/environ`, même si `.env` est en `600`.
+  Réserver l'accès Docker aux administrateurs ; une évolution future pourra
+  passer par des fichiers `/run/secrets` plutôt que par l'environnement.
 
 ## 11. Preuves et test à froid
 
