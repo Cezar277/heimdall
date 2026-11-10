@@ -175,6 +175,11 @@ class InstallGuideTests(unittest.TestCase):
         text = INSTALL_GUIDE.read_text(encoding="utf-8")
         for expected in (
             '[[ "$(id -u)" != 0 ]]',
+            "git checkout 2cd13cc",
+            "basicConstraints=critical,CA:FALSE",
+            '"${HEIMDALL_UID:-1000}" != 0',
+            ".env.??????",
+            "mktemp -d /tmp/heimdall-clean.XXXXXX",
             "docker compose up -d --build",
             "curl --cacert secrets/vault_tls_cert.pem",
             "heimdall vault key create --project demo",

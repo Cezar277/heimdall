@@ -39,6 +39,9 @@ python3 --version
 ```sh
 git clone https://github.com/Cezar277/heimdall.git
 cd heimdall
+# Révision auditée (voir docs/t41-samm.md) : installation reproductible.
+git checkout 2cd13cc
+git rev-parse --short HEAD
 ```
 
 ## 3. Générer les secrets et le certificat TLS
@@ -62,7 +65,7 @@ test ! -L data && test ! -L secrets || {
 chmod 700 data secrets
 
 ENV_TMP="$(mktemp .env.XXXXXX)"
-trap 'rm -f "$ENV_TMP"' EXIT INT TERM
+trap 'rm -f "$ENV_TMP"' EXIT INT TERM HUP
 chmod 600 "$ENV_TMP"
 cat > "$ENV_TMP" <<ENV_FILE
 HEIMDALL_VAULT_MASTER_KEY=$(openssl rand -base64 32)
@@ -80,7 +83,8 @@ openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
   -subj "/CN=127.0.0.1" \
   -addext "subjectAltName=IP:127.0.0.1" \
   -addext "keyUsage=digitalSignature,keyEncipherment" \
-  -addext "extendedKeyUsage=serverAuth"
+  -addext "extendedKeyUsage=serverAuth" \
+  -addext "basicConstraints=critical,CA:FALSE"
 chmod 600 secrets/vault_tls_cert.pem secrets/vault_tls_key.pem
 ```
 
@@ -107,6 +111,13 @@ tourner avec l'UID de l'utilisateur hôte, jamais `0`.
   echo "installation en root refusée : utiliser un compte non privilégié" >&2
   exit 1
 }
+[[ "${HEIMDALL_UID:-1000}" != 0 && "${HEIMDALL_GID:-1000}" != 0 ]] || {
+  echo "HEIMDALL_UID/HEIMDALL_GID=0 interdit" >&2
+  exit 1
+}
+for f in .env.??????; do
+  [ -e "$f" ] && { echo "fichier .env temporaire résiduel : $f" >&2; exit 1; }
+done
 docker compose up -d --build
 docker compose ps
 ```
@@ -207,7 +218,9 @@ python3 -m venv .venv
 Test sur un dépôt propre (le scanner exige une base Git) :
 
 ```sh
-mkdir -p /tmp/heimdall-clean && cd /tmp/heimdall-clean
+D="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
+trap 'rm -rf "$D"' EXIT
+cd "$D"
 git init -q
 /path/vers/heimdall/.venv/bin/heimdall scan .
 # exit 0 : aucun secret détecté
