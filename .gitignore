@@ -57,3 +57,6 @@ Thumbs.db
 # étapes amont sans rien écrire dans le dépôt ; cette entrée + le `rm -rf` en
 # tête de workflow ne sont qu'une ceinture pour les résidus existants.
 .github/actions/opencode/
+
+# Données locales du Vault en mode Docker (jamais commitées)
+data/

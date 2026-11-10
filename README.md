@@ -26,6 +26,24 @@ Windows / PowerShell : remplacer `.venv/bin/python` par `.venv\Scripts\python.ex
 Builds reproductibles : versions en `==` dans `pyproject.toml`
 (voir [ADR-002](docs/adr/002-stack-python.md)), gel transitif **avec hashes
 SHA-256** dans `requirements.lock` (en-tête du fichier = commandes exactes).
+Le lock runtime minimal de l'image Docker est `requirements-runtime.lock`
+(régénéré par `scripts/regen_runtime_lock.py`).
+
+### Vault Docker (Linux)
+
+Le Vault peut être lancé dans un conteneur durci (non root, lecture seule,
+dépendances hashées, TLS obligatoire) via Docker Compose :
+
+```sh
+cp .env.example .env   # remplir les secrets, voir docs/install.md
+docker compose up -d --build
+curl --cacert secrets/vault_tls_cert.pem https://127.0.0.1:8443/api/v1/health
+```
+
+Guide complet, génération des secrets/TLS, premier scan et dépannage :
+[`docs/install.md`](docs/install.md). Le Vault reste **loopback-only** :
+`network_mode: host` est requis, et Docker Desktop macOS/Windows n'est pas
+supporté pour ce montage.
 
 ## Usage
 
