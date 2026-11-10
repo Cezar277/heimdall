@@ -97,6 +97,7 @@ docker compose exec -T vault heimdall vault audit list --limit 5
 ### Premier scan local
 
 ```sh
+set -euo pipefail
 python3 -m venv .venv
 .venv/bin/pip install --require-hashes -r requirements-runtime.lock
 test -z "$(git status --porcelain)" || {
@@ -106,7 +107,10 @@ test -z "$(git status --porcelain)" || {
 SHA_PRE="$(git rev-parse HEAD)"
 D_SNAP="$(mktemp -d)"
 trap 'rm -rf "$D_SNAP"' EXIT
-git archive HEAD | tar -x -C "$D_SNAP"
+git archive HEAD | tar -x -C "$D_SNAP" || {
+  echo "archivage snapshot échoué" >&2
+  exit 1
+}
 test "$(git rev-parse HEAD)" = "$SHA_PRE" || {
   echo "HEAD modifiée pendant l'archivage" >&2
   exit 1
@@ -119,7 +123,7 @@ test -z "$(git status --porcelain)" || {
 
 D_CLEAN="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
 trap 'rm -rf "$D_SNAP" "$D_CLEAN"' EXIT
-cd "$D_CLEAN"
+cd "$D_CLEAN" || exit 1
 git init -q
 /path/vers/heimdall/.venv/bin/heimdall scan .
 # exit 0

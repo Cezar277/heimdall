@@ -35,6 +35,7 @@ Le Vault peut être lancé dans un conteneur durci (non root, lecture seule,
 dépendances hashées, TLS obligatoire) via Docker Compose :
 
 ```sh
+test ! -e .env || { echo ".env existe déjà : sauvegarder avant d'écraser" >&2; exit 1; }
 install -m 600 .env.example .env
 # Générer les valeurs avec docs/install.md §3 (umask 077, openssl rand,
 # `sudo chown -R --no-dereference 10001:10001 data secrets` pour l'UID figé).

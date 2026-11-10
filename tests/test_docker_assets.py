@@ -250,6 +250,10 @@ class InstallGuideTests(unittest.TestCase):
         self.assertIn("grep -Ev", text)
         self.assertIn("membre inattendu", text)
         self.assertIn("--no-absolute-filenames", text)
+        # Durcissements revue 89510d7 : §7 fail-closed, quickstart sans écrasement.
+        self.assertIn('git archive HEAD | tar -x -C "$D_SNAP" || {', text)
+        self.assertIn('cd "$D_CLEAN" || exit 1', text)
+        self.assertGreaterEqual(text.count("set -euo pipefail"), 4)
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
 
@@ -390,6 +394,8 @@ class ReadmeQuickstartTests(unittest.TestCase):
     def test_readme_quickstart_protects_env(self) -> None:
         text = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("install -m 600 .env.example .env", text)
+        self.assertIn("test ! -e .env", text)
+        self.assertIn(".env existe déjà", text)
         self.assertIn("docs/install.md", text)
         self.assertIn("docs/install.md §3", text)
         self.assertIn("docs/install.md §4", text)
