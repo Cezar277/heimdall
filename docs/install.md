@@ -352,18 +352,24 @@ des membres inattendus :
 ```sh
 set -euo pipefail
 BK="${HOME}/heimdall-backup-AAAA-MM-JJ.tgz.gpg"
-LIST="$(gpg --decrypt "$BK" | tar -tzf -)"
-printf '%s\n' "$LIST" | grep -Ev '^(\./)?(data(/|$)|secrets(/|$)|\.env$)' && {
+T="$(mktemp)"
+trap 'rm -f "$T"' EXIT INT TERM HUP
+chmod 600 "$T"
+gpg --output "$T" --decrypt "$BK"
+tar -tzf "$T" | grep -Ev '^(\./)?(data(/|$)|secrets(/|$)|\.env$)' && {
   echo "membre inattendu dans l'archive : restauration refusée" >&2
   exit 1
 }
-printf '%s\n' "$LIST" | grep -E '(^/|\.\.)' && {
+tar -tzf "$T" | grep -E '(^/|\.\.)' && {
   echo "chemin absolu ou '..' refusé" >&2
   exit 1
 }
-# `--no-absolute-filenames` explicite quand supporté (bsdtar), repli GNU tar.
-gpg --decrypt "$BK" | tar --no-absolute-filenames --exclude='.git/*' -xzf - data .env secrets 2>/dev/null \
-  || gpg --decrypt "$BK" | tar --exclude='.git/*' -xzf - data .env secrets
+# `--no-absolute-filenames` explicite quand supporté (bsdtar), repli GNU tar
+# (retire les `/` initiaux par défaut, jamais -P) ; une seule déchiffrement.
+tar --no-absolute-filenames --exclude='.git/*' -xzf "$T" data .env secrets 2>/dev/null \
+  || tar --exclude='.git/*' -xzf "$T" data .env secrets
+rm -f "$T"
+trap - EXIT INT TERM HUP
 ```
 
 `gpg --symmetric` utilise un chiffrement authentifié (MDC) : une archive
@@ -391,7 +397,7 @@ et les valeurs sont perdues.
 | `403` sur `https://127.0.0.1:8443` | Le conteneur n'est pas en `network_mode: host` ou un port mapping a été ajouté | Garder `network_mode: host`, supprimer `ports` |
 | `Connection refused` | Conteneur arrêté ou port 8443 occupé | `docker compose ps`, `ss -ltnp \| grep 8443`, `docker compose logs vault` |
 | `TLS obligatoire en production` | `secrets/vault_tls_cert.pem` ou `vault_tls_key.pem` absent | Régénérer les fichiers de l'étape 3 |
-| `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `install -m 600 .env.example .env`, remplir via §3, `docker compose up -d` |
+| `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `test ! -e .env`, `install -m 600 .env.example .env`, remplir via §3, `docker compose up -d` |
 | `Permission denied` sur `/data` | `data/` non possédé par `10001:10001` | `test -z "$(find data secrets -type l)"`, `sudo chown -R --no-dereference 10001:10001 data secrets` |
 | `refus: le conteneur Vault ne doit pas tourner en root` | surcharge `--user 0` manuelle | Ne jamais surcharger `user:` (figé à `10001:10001` dans le compose) |
 | `data/ et secrets/ ne doivent pas être des liens symboliques` | Un lien a été créé avant l'installation | Supprimer le lien et recréer un répertoire réel (`rm data && mkdir data`, idem `secrets`) |

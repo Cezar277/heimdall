@@ -241,9 +241,9 @@ class InstallGuideTests(unittest.TestCase):
         # Durcissements revue 6b748c0 : liens internes, restauration confinée.
         self.assertIn("--no-dereference 10001:10001 data secrets", text)
         self.assertIn('test -z "$(find data secrets -type l)"', text)
-        self.assertIn("tar -tzf -", text)
+        self.assertIn('tar -tzf "$T"', text)
         self.assertIn("--exclude='.git/*'", text)
-        self.assertIn("-xzf - data .env secrets", text)
+        self.assertIn('-xzf "$T" data .env secrets', text)
         self.assertIn("ne jamais ajouter `-P`", text)
         # Durcissements revue c5db82c : snapshot sans fuite, refus automatisé.
         self.assertIn('D_SNAP="$(mktemp -d)"', text)
@@ -257,6 +257,12 @@ class InstallGuideTests(unittest.TestCase):
         self.assertIn('git archive HEAD | tar -x -C "$D_SNAP" || {', text)
         self.assertIn('cd "$D_CLEAN" || exit 1', text)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 4)
+        # Durcissements revue db325b4 : restauration à déchiffrement unique,
+        # dépannage sans écrasement.
+        self.assertIn('T="$(mktemp)"', text)
+        self.assertIn('gpg --output "$T" --decrypt "$BK"', text)
+        self.assertEqual(text.count("--decrypt"), 1)
+        self.assertIn("test ! -e .env", text)
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
 
