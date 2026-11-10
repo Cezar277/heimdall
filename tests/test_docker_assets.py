@@ -293,10 +293,6 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(execvp.call_args.args[1][1:], ["-m", "heimdall.vault.app"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class GuideApiKeyValidationTests(unittest.TestCase):
     def test_guide_rejects_header_injection_before_writing_the_file(self) -> None:
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")
@@ -306,3 +302,7 @@ class GuideApiKeyValidationTests(unittest.TestCase):
         for invalid in ("A" * 42, "A" * 43 + '"', "A" * 43 + "\n", "A" * 43 + "\\"):
             with self.subTest(invalid=repr(invalid)):
                 self.assertIsNone(pattern.fullmatch(invalid))
+
+
+if __name__ == "__main__":
+    unittest.main()
