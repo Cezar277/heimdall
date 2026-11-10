@@ -177,7 +177,8 @@ class InstallGuideTests(unittest.TestCase):
         text = INSTALL_GUIDE.read_text(encoding="utf-8")
         for expected in (
             '[[ "$(id -u)" != 0 ]]',
-            "git checkout 49bb5ccce63a102e1f00a075f1cd6c83dfbe366e",
+            "git checkout t41-audit",
+            "git status --porcelain",
             "git fetch origin",
             'grep -Eq "^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)',
             "docker compose stop vault || exit 1",
@@ -230,9 +231,16 @@ class SamnAndPinTests(unittest.TestCase):
         sha = "49bb5ccce63a102e1f00a075f1cd6c83dfbe366e"
         install = INSTALL_GUIDE.read_text(encoding="utf-8")
         samm = (ROOT / "docs" / "t41-samm.md").read_text(encoding="utf-8")
-        self.assertIn(f"git checkout {sha}", install)
+        self.assertIn("git checkout t41-audit", install)
+        self.assertIn("git rev-parse --short HEAD", install)
+        self.assertIn("49bb5cc", install)
         self.assertIn(sha, samm)
         self.assertIn("t41-audit", install + samm)
+
+    def test_runtime_lock_script_writes_atomically(self) -> None:
+        script = (ROOT / "scripts" / "regen_runtime_lock.py").read_text(encoding="utf-8")
+        self.assertIn("os.replace", script)
+        self.assertIn("os.fsync", script)
 
 
 class BackupIgnoreTests(unittest.TestCase):

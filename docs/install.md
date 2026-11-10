@@ -40,7 +40,11 @@ python3 --version
 git clone https://github.com/Cezar277/heimdall.git
 cd heimdall
 # Révision auditée (voir docs/t41-samm.md) : installation reproductible.
-git checkout 49bb5ccce63a102e1f00a075f1cd6c83dfbe366e
+git checkout t41-audit
+test "$(git rev-parse --short HEAD)" = "49bb5cc" || {
+  echo "tag t41-audit déplacé : révision non auditée" >&2
+  exit 1
+}
 git rev-parse --short HEAD
 ```
 
@@ -211,6 +215,11 @@ hashé :
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install --require-hashes -r requirements-runtime.lock
+test -z "$(git status --porcelain)" || {
+  echo "arbre de travail modifié : installer uniquement la révision auditée" >&2
+  exit 1
+}
+git rev-parse --short HEAD
 .venv/bin/pip install -e . --no-deps --no-build-isolation
 .venv/bin/heimdall --version
 ```
@@ -259,7 +268,11 @@ docker compose start
 
 ```sh
 git fetch origin
-git checkout 49bb5ccce63a102e1f00a075f1cd6c83dfbe366e   # même révision auditée qu'au §2
+git checkout t41-audit   # même tag audité qu'au §2
+test "$(git rev-parse --short HEAD)" = "49bb5cc" || {
+  echo "tag t41-audit déplacé : révision non auditée" >&2
+  exit 1
+}
 git rev-parse --short HEAD
 docker compose build --pull
 docker compose up -d

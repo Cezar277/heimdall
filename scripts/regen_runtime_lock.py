@@ -16,6 +16,7 @@ Le fichier produit reste installable avec ``pip install --require-hashes``.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -128,7 +129,12 @@ def main() -> int:
             assert isinstance(lines, list)
             output.extend(str(line) for line in lines)
             output.append("")
-    LOCK_RUNTIME.write_text("\n".join(output) + "\n", encoding="utf-8")
+    tmp = LOCK_RUNTIME.with_name(f"{LOCK_RUNTIME.name}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write("\n".join(output) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, LOCK_RUNTIME)
     print(f"{LOCK_RUNTIME.name} régénéré ({len(selected)} paquets runtime).")
     return 0
 
