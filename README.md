@@ -35,8 +35,7 @@ Le Vault peut être lancé dans un conteneur durci (non root, lecture seule,
 dépendances hashées, TLS obligatoire) via Docker Compose :
 
 ```sh
-cp .env.example .env
-chmod 600 .env
+install -m 600 .env.example .env
 # Générer les valeurs avec docs/install.md §3 (umask 077, openssl rand).
 docker compose up -d --build
 curl --cacert secrets/vault_tls_cert.pem https://127.0.0.1:8443/api/v1/health

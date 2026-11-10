@@ -176,8 +176,10 @@ class InstallGuideTests(unittest.TestCase):
         for expected in (
             '[[ "$(id -u)" != 0 ]]',
             "git checkout 2cd13cc",
+            "git fetch origin",
+            "grep -Eq '^HEIMDALL_(UID|GID)=0",
+            "docker compose stop vault || exit 1",
             "basicConstraints=critical,CA:FALSE",
-            '"${HEIMDALL_UID:-1000}" != 0',
             ".env.??????",
             "mktemp -d /tmp/heimdall-clean.XXXXXX",
             "docker compose up -d --build",
@@ -204,7 +206,7 @@ class InstallGuideTests(unittest.TestCase):
             'F="${HOME}/heimdall-backup-$(date +%F).tgz.gpg"',
             'chmod 600 "$F"',
             "docker compose start vault",
-            "cp .env.example .env && chmod 600 .env",
+            "install -m 600 .env.example .env",
             "docker inspect",
             "network_mode: host",
         ):
@@ -234,8 +236,7 @@ class BackupIgnoreTests(unittest.TestCase):
 class ReadmeQuickstartTests(unittest.TestCase):
     def test_readme_quickstart_protects_env(self) -> None:
         text = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("cp .env.example .env", text)
-        self.assertIn("chmod 600 .env", text)
+        self.assertIn("install -m 600 .env.example .env", text)
         self.assertIn("docs/install.md", text)
 
 

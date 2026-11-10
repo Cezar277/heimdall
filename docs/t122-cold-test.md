@@ -48,6 +48,7 @@ et lancer Heimdall **avec la seule documentation** `docs/install.md`.
 | Sauvegarde SQLite à chaud | Le guide arrête le Vault (`docker compose stop vault`), refuse un WAL/SHM résiduel, archive puis redémarre |
 | Permissions de `data/`/`secrets/` dépendantes de l'umask | `chmod 700 data secrets` et `chmod 600` explicites |
 | `.env` écrit en place, race possible | Écriture atomique via `mktemp` + `mv -f` |
+| Quickstart `.env` créé en `644` avant `chmod` | `install -m 600 .env.example .env` |
 | Nom de sauvegarde recalculé entre `gpg` et `chmod` | Nom figé dans `F` avant l'écriture |
 | Archive de sauvegarde laissée dans le dépôt | Écriture dans `$HOME`, motifs `heimdall-backup-*.tgz.gpg` ajoutés à `.gitignore` et `.dockerignore` |
 | Clone non reproductible (HEAD) | `git checkout 2cd13cc` (révision auditée) documenté |

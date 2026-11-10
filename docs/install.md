@@ -111,8 +111,8 @@ tourner avec l'UID de l'utilisateur hôte, jamais `0`.
   echo "installation en root refusée : utiliser un compte non privilégié" >&2
   exit 1
 }
-[[ "${HEIMDALL_UID:-1000}" != 0 && "${HEIMDALL_GID:-1000}" != 0 ]] || {
-  echo "HEIMDALL_UID/HEIMDALL_GID=0 interdit" >&2
+grep -Eq '^HEIMDALL_(UID|GID)=0([[:space:]]|$)' .env && {
+  echo "HEIMDALL_UID/HEIMDALL_GID=0 interdit dans .env" >&2
   exit 1
 }
 for f in .env.??????; do
@@ -258,7 +258,9 @@ docker compose start
 ### Mise à jour
 
 ```sh
-git pull --ff-only
+git fetch origin
+git checkout 2cd13cc   # même révision auditée qu'au §2
+git rev-parse --short HEAD
 docker compose build --pull
 docker compose up -d
 ```
@@ -278,7 +280,7 @@ La base SQLite doit être **quiescente** : arrêter le Vault avant la copie,
 sinon une sauvegarde à chaud peut être déchirée ou exclure des transactions.
 
 ```sh
-docker compose stop vault
+docker compose stop vault || exit 1
 if ls data/vault.db-* >/dev/null 2>&1; then
   echo "WAL/SHM résiduel : arrêt incomplet, sauvegarde refusée" >&2
   docker compose start vault
@@ -323,7 +325,7 @@ et les valeurs sont perdues.
 | `403` sur `https://127.0.0.1:8443` | Le conteneur n'est pas en `network_mode: host` ou un port mapping a été ajouté | Garder `network_mode: host`, supprimer `ports` |
 | `Connection refused` | Conteneur arrêté ou port 8443 occupé | `docker compose ps`, `ss -ltnp \| grep 8443`, `docker compose logs vault` |
 | `TLS obligatoire en production` | `secrets/vault_tls_cert.pem` ou `vault_tls_key.pem` absent | Régénérer les fichiers de l'étape 3 |
-| `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `cp .env.example .env && chmod 600 .env`, remplir via §3, `docker compose up -d` |
+| `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `install -m 600 .env.example .env`, remplir via §3, `docker compose up -d` |
 | `Permission denied` sur `/data` | UID/GID du conteneur différent du propriétaire de `data/` | Renseigner `HEIMDALL_UID`/`HEIMDALL_GID` avec `id -u`/`id -g`, `chown -R` sur `data/`, `chmod 700 data secrets` |
 | `refus: le conteneur Vault ne doit pas tourner en root` | `HEIMDALL_UID=0` ou `user: "0:0"` | Remettre l'UID/GID de l'hôte (`id -u`/`id -g`), jamais `0` |
 | `data/ et secrets/ ne doivent pas être des liens symboliques` | Un lien a été créé avant l'installation | Supprimer le lien et recréer un répertoire réel (`rm data && mkdir data`, idem `secrets`) |
