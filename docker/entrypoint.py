@@ -18,7 +18,13 @@ def main() -> int:
     if os.geteuid() == 0 or os.getegid() == 0:
         print(_REFUS_ROOT, file=sys.stderr)
         return 1
-    os.execvp(sys.executable, [sys.executable, "-m", "heimdall.vault.app"])
+    try:
+        os.execvp(sys.executable, [sys.executable, "-m", "heimdall.vault.app"])  # noqa: S606
+    except OSError:
+        # Message générique : jamais de chemin, de module ni de secret,
+        # cohérent avec docker/healthcheck.py (fail-closed sans détail).
+        print("démarrage impossible", file=sys.stderr)
+        return 1
     return 1
 
 

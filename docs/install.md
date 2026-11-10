@@ -326,16 +326,21 @@ sinon une sauvegarde à chaud peut être déchirée ou exclure des transactions.
 ```sh
 set -euo pipefail
 docker compose stop vault || exit 1
+trap 'docker compose start vault' EXIT INT TERM HUP
 if ls data/vault.db-* >/dev/null 2>&1; then
   echo "WAL/SHM résiduel : arrêt incomplet, sauvegarde refusée" >&2
-  docker compose start vault
   exit 1
 fi
 umask 077
-F="${HOME}/heimdall-backup-$(date +%F).tgz.gpg"
+F="${HOME}/heimdall-backup-$(date +%F-%H%M).tgz.gpg"
+test ! -e "$F" || {
+  echo "archive déjà existante : $F (attendre la prochaine minute)" >&2
+  exit 1
+}
 tar --exclude='data/vault.db-*' -czf - data .env secrets \
   | gpg --symmetric --cipher-algo AES256 --output "$F"
 chmod 600 "$F"
+trap - EXIT INT TERM HUP
 docker compose start vault
 ```
 

@@ -214,7 +214,10 @@ class InstallGuideTests(unittest.TestCase):
             "docker compose stop vault",
             "ls data/vault.db-*",
             "WAL/SHM résiduel",
-            'F="${HOME}/heimdall-backup-$(date +%F).tgz.gpg"',
+            'F="${HOME}/heimdall-backup-$(date +%F-%H%M).tgz.gpg"',
+            'test ! -e "$F"',
+            "archive déjà existante",
+            "trap 'docker compose start vault' EXIT INT TERM HUP",
             'chmod 600 "$F"',
             "docker compose start vault",
             "install -m 600 .env.example .env",
@@ -515,6 +518,21 @@ class EntrypointTests(unittest.TestCase):
             self.assertEqual(module.main(), 1)
         execvp.assert_called_once()
         self.assertEqual(execvp.call_args.args[1][1:], ["-m", "heimdall.vault.app"])
+
+    def test_entrypoint_exec_failure_is_fail_closed_without_traceback(self) -> None:
+        """Vérifie qu'un exec raté reste fail-closed avec message générique."""
+        module = _load_entrypoint()
+        stderr = io.StringIO()
+        with (
+            patch("os.geteuid", return_value=10001),
+            patch("os.getegid", return_value=10001),
+            patch("os.execvp", side_effect=OSError("corrompu")),
+            patch("sys.stderr", stderr),
+        ):
+            self.assertEqual(module.main(), 1)
+        self.assertIn("démarrage impossible", stderr.getvalue())
+        self.assertNotIn("corrompu", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 class GuideApiKeyValidationTests(unittest.TestCase):
