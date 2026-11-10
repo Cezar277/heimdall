@@ -220,7 +220,10 @@ test -z "$(git status --porcelain)" || {
   exit 1
 }
 git rev-parse --short HEAD
-.venv/bin/pip install -e . --no-deps --no-build-isolation
+D="$(mktemp -d)"
+trap 'rm -rf "$D"' EXIT
+git archive HEAD | tar -x -C "$D"
+.venv/bin/pip install --no-deps --no-build-isolation "$D"
 .venv/bin/heimdall --version
 ```
 

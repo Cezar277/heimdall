@@ -179,6 +179,7 @@ class InstallGuideTests(unittest.TestCase):
             '[[ "$(id -u)" != 0 ]]',
             "git checkout t41-audit",
             "git status --porcelain",
+            "git archive HEAD",
             "set -euo pipefail",
             "git fetch origin",
             'grep -Eq "^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)',
