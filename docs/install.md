@@ -311,6 +311,7 @@ docker compose start vault
 Restauration (après `docker compose down`) :
 
 ```sh
+set -euo pipefail
 gpg --decrypt "${HOME}/heimdall-backup-AAAA-MM-JJ.tgz.gpg" | tar -xzf -
 ```
 

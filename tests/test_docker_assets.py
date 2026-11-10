@@ -220,6 +220,7 @@ class InstallGuideTests(unittest.TestCase):
         self.assertNotIn("export HEIMDALL_API_KEY=", text)
         self.assertNotIn("/tmp/heimdall-auth.header", text)  # noqa: S108
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
+        self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
 
 
 class SamnAndPinTests(unittest.TestCase):
@@ -390,13 +391,18 @@ class GuideApiKeyValidationTests(unittest.TestCase):
 
 
 class UidGidGuardTests(unittest.TestCase):
-    def test_uid_gid_guard_rejects_export_quotes_and_spaces(self) -> None:
+    def test_compose_user_resolved_zero_is_rejected_by_guide_guard(self) -> None:
+        compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+        user = compose["services"]["vault"]["user"]
+        self.assertIn("HEIMDALL_UID", user)
+        self.assertIn("HEIMDALL_GID", user)
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")
         pattern = (
             r"^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)"
             r"[[:space:]]*=[[:space:]]*['\"]?0+['\"]?([[:space:]#]|$)"
         )
         self.assertIn(pattern, guide)
+        self.assertIn("HEIMDALL_(UID|GID)", guide)
         grep = shutil.which("grep")
         self.assertIsNotNone(grep)
         with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
