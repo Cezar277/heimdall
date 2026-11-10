@@ -27,8 +27,9 @@ Révision du code testé : `9a21373f0124d8a5089a833cf61f466dc9966aa7`.
 | **Dépendances runtime hashées** | `requirements-runtime.lock` généré depuis `requirements.lock`, sans pytest/mypy/ruff/bandit/pip-audit ; `setuptools` retiré de l'image runtime | [scripts/regen_runtime_lock.py](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/scripts/regen_runtime_lock.py#L1-L20), [Dockerfile:28-29](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/Dockerfile#L28-L29), test `test_runtime_lock_excludes_dev_tools` |
 | **TLS fail-closed** | certificat/clé obligatoires en production, montés depuis `./secrets` en lecture seule | [docker-compose.yml:34](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/docker-compose.yml#L34), [docs/install.md](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/docs/install.md#L44-L83), healthcheck HTTPS avec vérification du certificat |
 | **Healthcheck sans secret** | `docker/healthcheck.py` interroge `/api/v1/health`, vérifie le certificat local, message d'échec générique | [docker/healthcheck.py:21](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/docker/healthcheck.py#L21), test `HealthcheckTests` |
+| **Bind mounts sans symlink** | `test ! -L data && test ! -L secrets` avant `mkdir`, puis `chmod 700` | [docs/install.md](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/docs/install.md#L50-L58), test `test_guide_covers_the_cold_start_path` |
 | **Aucun secret dans le dépôt** | `.env`, `data/`, `secrets/`, `*.key`, `*.pem` ignorés ; `.env.example` à valeurs vides | [.gitignore](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/.gitignore#L21-L40), [.env.example](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/.env.example#L1-L12), test `test_env_example_has_no_real_secret` |
-| **Clé API hors `argv`** | guide : `read -rsp` + `mktemp` + fichier d'en-tête `600` + `curl -K`, jamais `curl -H "...$KEY"` | [docs/install.md](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/docs/install.md#L117-L166), test `test_guide_covers_the_cold_start_path` |
+| **Clé API hors `argv`** | guide : `read -rsp`, validation charset, `mktemp`, fichier d'en-tête `600`, `curl -K`, jamais `curl -H "...$KEY"` | [docs/install.md](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/docs/install.md#L117-L166), test `test_guide_covers_the_cold_start_path` |
 | **Image de base immuable** | `FROM python:3.12-slim@sha256:...` (builder et runtime) | [Dockerfile:12,32](https://github.com/Cezar277/heimdall/blob/9a21373f0124d8a5089a833cf61f466dc9966aa7/Dockerfile#L12), test `test_image_is_multi_stage_and_pinned` |
 
 ## 3. Commandes vérifiées
@@ -61,6 +62,10 @@ docker compose exec -T vault heimdall vault key create --project demo
 # clé affichée une seule fois
 
 read -rsp "Clé API: " HEIMDALL_API_KEY; echo
+[[ "$HEIMDALL_API_KEY" =~ ^[A-Za-z0-9_-]{43,}$ ]] || {
+  echo "clé API invalide" >&2
+  exit 1
+}
 umask 077
 AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
 trap 'rm -f "$AUTH_HEADER"' EXIT

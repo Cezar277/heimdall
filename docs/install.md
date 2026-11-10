@@ -49,6 +49,10 @@ par Git. Les commandes ci-dessous créent des valeurs aléatoires et les
 
 ```sh
 umask 077
+test ! -L data && test ! -L secrets || {
+  echo "data/ et secrets/ ne doivent pas être des liens symboliques" >&2
+  exit 1
+}
 mkdir -p data secrets
 chmod 700 data secrets
 
@@ -138,6 +142,10 @@ Puis, depuis l'hôte. La clé ne doit **jamais** apparaître dans `argv`
 
 ```sh
 read -rsp "Clé API: " HEIMDALL_API_KEY; echo
+[[ "$HEIMDALL_API_KEY" =~ ^[A-Za-z0-9_-]{43,}$ ]] || {
+  echo "clé API invalide" >&2
+  exit 1
+}
 umask 077
 AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
 trap 'rm -f "$AUTH_HEADER"' EXIT
@@ -273,6 +281,7 @@ et les valeurs sont perdues.
 | `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `cp .env.example .env`, remplir les valeurs, `docker compose up -d` |
 | `Permission denied` sur `/data` | UID/GID du conteneur différent du propriétaire de `data/` | Renseigner `HEIMDALL_UID`/`HEIMDALL_GID` avec `id -u`/`id -g`, `chown -R` sur `data/`, `chmod 700 data secrets` |
 | `refus: le conteneur Vault ne doit pas tourner en root` | `HEIMDALL_UID=0` ou `user: "0:0"` | Remettre l'UID/GID de l'hôte (`id -u`/`id -g`), jamais `0` |
+| `data/ et secrets/ ne doivent pas être des liens symboliques` | Un lien a été créé avant l'installation | Supprimer le lien et recréer un répertoire réel (`rm data && mkdir data`, idem `secrets`) |
 | `docker compose config --quiet` échoue | `.env` ou secrets manquants | Créer les fichiers de l'étape 3 |
 | Le healthcheck reste `unhealthy` | Certificat sans SAN `127.0.0.1` ou service pas prêt | Vérifier `openssl x509 -in secrets/vault_tls_cert.pem -text -noout`, logs |
 | `scan impossible` (exit 2) | Répertoire sans base Git ou fichier illisible | `git init` dans le répertoire de test, vérifier les permissions |

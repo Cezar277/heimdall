@@ -199,6 +199,10 @@ d'en-tête `600` lu par `curl -K`.
 
 ```sh
 read -rsp "Clé API: " HEIMDALL_API_KEY; echo
+[[ "$HEIMDALL_API_KEY" =~ ^[A-Za-z0-9_-]{43,}$ ]] || {
+  echo "clé API invalide" >&2
+  exit 1
+}
 umask 077
 AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
 trap 'rm -f "$AUTH_HEADER"' EXIT
