@@ -244,9 +244,20 @@ class SecretHmacCryptoTests(TestCase):
 
         self.assertFalse(verify_secret_hmac(key, valeur, "invalid_len"))
         self.assertFalse(verify_secret_hmac(key, valeur, 12345))  # type: ignore[arg-type]
-        self.assertFalse(verify_secret_hmac(key, "", expected))
-        self.assertFalse(verify_secret_hmac("short", valeur, expected))
-        self.assertFalse(verify_secret_hmac(key, 12345, expected))  # type: ignore[arg-type]
+
+        # Les erreurs de préconditions sur les entrées lèvent ValueError/TypeError (fail-closed)
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(key, "", expected)
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(key, b"", expected)
+        with self.assertRaises(ValueError):
+            verify_secret_hmac("short", valeur, expected)
+        with self.assertRaises(TypeError):
+            verify_secret_hmac(key, 12345, expected)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(key, valeur, expected, aad="")
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(key, valeur, expected, aad=b"")
 
     def test_compute_secret_hmac_surrogate_unicode_error(self) -> None:
         """Une chaîne avec surrogate isolé non encodable lève ValueError générique."""
@@ -988,6 +999,148 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
                 await sql_store.is_secret_value_matching("p", "prod", "S", 123)  # type: ignore[arg-type]
             with self.assertRaises(TypeError):
                 await sql_store.find_secrets_matching_value("p", 123)  # type: ignore[arg-type]
+
+    async def test_raw_non_utf8_bytes_leak_detection_parity(self) -> None:
+        """Les octets bruts non-UTF8 (ex. b'\\xff\\xfe') sont traités sans UnicodeDecodeError."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        non_utf8 = b"\xff\xfe\x00\x01\x80"
+
+        # 1. VaultCipher direct
+        fp_non_utf8 = cipher.compute_secret_hmac(non_utf8, aad=b"myproj:prod:BLOB_KEY")
+        self.assertTrue(
+            cipher.is_secret_value_matching(
+                non_utf8,
+                fp_non_utf8,
+                aad=b"myproj:prod:BLOB_KEY",
+            )
+        )
+        self.assertFalse(
+            cipher.is_secret_value_matching(
+                b"\xaa\xbb\xcc",
+                fp_non_utf8,
+                aad=b"myproj:prod:BLOB_KEY",
+            )
+        )
+
+        # 2. InMemorySecretStore (avec secret UTF-8 normal)
+        mem_store = InMemorySecretStore(cipher=cipher)
+        await mem_store.create("myproj", "prod", "STR_KEY", "ascii_value_123")
+        self.assertFalse(
+            await mem_store.is_secret_value_matching("myproj", "prod", "STR_KEY", non_utf8)
+        )
+        self.assertEqual(
+            await mem_store.find_secrets_matching_value("myproj", non_utf8),
+            [],
+        )
+
+        # 3. SqliteSecretStore (avec secret UTF-8 normal)
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            await sql_store.create("myproj", "prod", "STR_KEY", "ascii_value_123")
+
+            self.assertFalse(
+                await sql_store.is_secret_value_matching("myproj", "prod", "STR_KEY", non_utf8)
+            )
+            self.assertEqual(
+                await sql_store.find_secrets_matching_value("myproj", non_utf8),
+                [],
+            )
+
+        # 4. Repli legacy sans empreinte (fingerprint=None) : parité mémoire et SQLite
+        # sans conversion decode("utf-8") risquant UnicodeDecodeError
+        await mem_store.create("myproj", "prod", "LEGACY", "ascii_value_123")
+        mem_store._secrets[("myproj", "prod", "LEGACY")]["fingerprint"] = None
+        self.assertFalse(
+            await mem_store.is_secret_value_matching("myproj", "prod", "LEGACY", non_utf8)
+        )
+        self.assertEqual(
+            await mem_store.find_secrets_matching_value("myproj", non_utf8),
+            [],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            await sql_store.create("myproj", "prod", "LEGACY", "ascii_value_123")
+            with db_session(db_path) as conn:
+                conn.execute(
+                    "UPDATE secrets SET fingerprint = '' WHERE project_id = ? AND name = ?",
+                    ("myproj", "LEGACY"),
+                )
+            self.assertFalse(
+                await sql_store.is_secret_value_matching("myproj", "prod", "LEGACY", non_utf8)
+            )
+            self.assertEqual(
+                await sql_store.find_secrets_matching_value("myproj", non_utf8),
+                [],
+            )
+
+    async def test_rotate_kek_with_divergent_hmac_key_fails_closed_immediately(self) -> None:
+        """rotate_kek refuse fail-closed immédiatement si la clé HMAC change (store non-vide)."""
+        c1 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        c_alt = VaultCipher(b"N" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY)
+        c_derived = VaultCipher(b"D" * 32, server_hmac_key=None)
+
+        # 1. InMemorySecretStore non-vide sous clé explicite
+        mem_store = InMemorySecretStore(cipher=c1)
+        await mem_store.create("proj", "prod", "K1", "v1")
+
+        with self.assertRaises(VaultCipherError) as ctx_mem_alt:
+            await mem_store.rotate_kek(c_alt)
+        self.assertIn("diffère", str(ctx_mem_alt.exception))
+
+        with self.assertRaises(VaultCipherError) as ctx_mem_der:
+            await mem_store.rotate_kek(c_derived)
+        self.assertIn("dérivé", str(ctx_mem_der.exception))
+
+        # Store intact après les échecs
+        self.assertIs(mem_store._cipher, c1)
+        self.assertTrue(await mem_store.is_secret_value_matching("proj", "prod", "K1", "v1"))
+
+        # 2. InMemorySecretStore vide : rotate_kek réussit sans effet
+        empty_mem_store = InMemorySecretStore(cipher=c1)
+        self.assertEqual(await empty_mem_store.rotate_kek(c_alt), 0)
+
+        # 3. InMemorySecretStore créé en mode dérivé puis rotation vers explicite
+        mem_derived = InMemorySecretStore(cipher=c_derived)
+        await mem_derived.create("proj", "prod", "KD", "vd")
+        with self.assertRaises(VaultCipherError) as ctx_mem_der_exp:
+            await mem_derived.rotate_kek(c1)
+        self.assertIn("explicite", str(ctx_mem_der_exp.exception))
+
+        # 4. SqliteSecretStore non-vide sous clé explicite
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, c1)
+            await sql_store.create("proj", "prod", "K1", "v1")
+
+            with self.assertRaises(VaultCipherError) as ctx_sql_alt:
+                await sql_store.rotate_kek(c_alt)
+            self.assertIn("diffère", str(ctx_sql_alt.exception))
+
+            with self.assertRaises(VaultCipherError) as ctx_sql_der:
+                await sql_store.rotate_kek(c_derived)
+            self.assertIn("dérivé", str(ctx_sql_der.exception))
+
+            # Store intact
+            self.assertIs(sql_store._cipher, c1)
+            self.assertTrue(await sql_store.is_secret_value_matching("proj", "prod", "K1", "v1"))
+
+        # 5. SqliteSecretStore vide : rotate_kek réussit sans effet
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, c1)
+            self.assertEqual(await sql_store.rotate_kek(c_alt), 0)
+
+        # 6. SqliteSecretStore en mode dérivé puis rotation vers explicite
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store_der = SqliteSecretStore(db_path, c_derived)
+            await sql_store_der.create("proj", "prod", "KD", "vd")
+            with self.assertRaises(VaultCipherError) as ctx_sql_der_exp:
+                await sql_store_der.rotate_kek(c1)
+            self.assertIn("explicite", str(ctx_sql_der_exp.exception))
 
 
 class FingerprintNeverReturnedToClientTests(TestCase):

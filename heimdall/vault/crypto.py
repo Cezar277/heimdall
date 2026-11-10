@@ -369,17 +369,12 @@ def verify_secret_hmac(
 
     Ticket #116 : permet de vérifier si la valeur en production est encore celle qui a fuité,
     sans jamais déchiffrer ni exposer l'empreinte au client.
+    Laisse propager ValueError et TypeError en cas d'entrée invalide (clé faible,
+    valeur vide ou AAD vide), parité avec ``compute_secret_hmac``.
     """
-    if aad is not None:
-        aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
-        if not aad_bytes:
-            raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
     if not isinstance(expected_hmac, str) or len(expected_hmac) != _SHA256_HEX_LEN:
         return False
-    try:
-        computed = compute_secret_hmac(server_key, value, aad=aad)
-    except (ValueError, TypeError):
-        return False
+    computed = compute_secret_hmac(server_key, value, aad=aad)
     return constant_time_equal(computed, expected_hmac)
 
 

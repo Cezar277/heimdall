@@ -293,12 +293,12 @@ class InMemorySecretStore:
                 "la KEK, la rotation de clé invalide les empreintes."
             )
         aad = VaultCipher.aad(project, env, name)
-        candidate_val = (
-            unicodedata.normalize("NFC", candidate_value)
+        candidate_val_bytes = (
+            unicodedata.normalize("NFC", candidate_value).encode("utf-8")
             if isinstance(candidate_value, str)
-            else candidate_value.decode("utf-8")
+            else bytes(candidate_value)
         )
-        candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
+        candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
         async with self._lock:
             if self._server_hmac_canary is not None:
                 if not constant_time_equal(
@@ -325,7 +325,8 @@ class InMemorySecretStore:
                     )
                 return constant_time_equal(candidate_fp, stored_fp)
             decrypted = _decrypt_record(record, self._cipher, project, env, name)
-            return constant_time_equal(candidate_val, decrypted["value"])
+            decrypted_val_bytes = unicodedata.normalize("NFC", decrypted["value"]).encode("utf-8")
+            return constant_time_equal(candidate_val_bytes, decrypted_val_bytes)
 
     async def find_secrets_matching_value(
         self,
@@ -350,10 +351,10 @@ class InMemorySecretStore:
                 "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
                 "la KEK, la rotation de clé invalide les empreintes."
             )
-        candidate_val = (
-            unicodedata.normalize("NFC", candidate_value)
+        candidate_val_bytes = (
+            unicodedata.normalize("NFC", candidate_value).encode("utf-8")
             if isinstance(candidate_value, str)
-            else candidate_value.decode("utf-8")
+            else bytes(candidate_value)
         )
         results: list[dict[str, str]] = []
         async with self._lock:
@@ -371,7 +372,7 @@ class InMemorySecretStore:
                 if env is not None and e != env:
                     continue
                 aad = VaultCipher.aad(p, e, n)
-                candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
+                candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
                 stored_fp = str(record.get("fingerprint") or "")
                 matched = False
                 if len(stored_fp) == _FINGERPRINT_HEX_LEN and all(
@@ -387,7 +388,10 @@ class InMemorySecretStore:
                     matched = constant_time_equal(candidate_fp, stored_fp)
                 else:
                     decrypted = _decrypt_record(record, self._cipher, p, e, n)
-                    matched = constant_time_equal(candidate_val, decrypted["value"])
+                    decrypted_val_bytes = (
+                        unicodedata.normalize("NFC", decrypted["value"]).encode("utf-8")
+                    )
+                    matched = constant_time_equal(candidate_val_bytes, decrypted_val_bytes)
                 if matched:
                     results.append(
                         {
@@ -459,6 +463,28 @@ class InMemorySecretStore:
             self._sorted_keys_by_project.clear()
             self._server_hmac_canary = None
 
+    def _check_rotate_hmac_continuity(self, new_cipher: VaultCipher) -> None:
+        if self._server_hmac_canary is not None:
+            if not new_cipher.has_explicit_server_hmac_key:
+                raise VaultCipherError(
+                    "La rotation de KEK vers un chiffreur en mode dérivé est interdite "
+                    "sur un store contenant des secrets sous clé explicite (refus fail-closed). "
+                    "Une migration des empreintes est requise."
+                )
+            if not constant_time_equal(
+                self._server_hmac_canary, new_cipher.server_hmac_key_canary()
+            ):
+                raise VaultCipherError(
+                    "La clé HMAC serveur du nouveau chiffreur diffère de la clé "
+                    "enregistrée pour ce store (refus fail-closed immédiat). "
+                    "Une migration des empreintes est requise."
+                )
+        elif new_cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "Le store contient des secrets créés en mode dérivé. La rotation vers "
+                "un chiffreur avec clé HMAC explicite nécessite une migration des empreintes."
+            )
+
     async def rotate_kek(
         self,
         new_cipher: VaultCipher,
@@ -476,6 +502,7 @@ class InMemorySecretStore:
         async with self._lock:
             if not self._secrets:
                 return 0
+            self._check_rotate_hmac_continuity(new_cipher)
             for r in self._secrets.values():
                 v = r.get("kek_version")
                 if v is not None and (
@@ -781,12 +808,12 @@ class SqliteSecretStore:
         if not candidate_value:
             return False
         aad = VaultCipher.aad(project, env, name)
-        candidate_val = (
-            unicodedata.normalize("NFC", candidate_value)
+        candidate_val_bytes = (
+            unicodedata.normalize("NFC", candidate_value).encode("utf-8")
             if isinstance(candidate_value, str)
-            else candidate_value.decode("utf-8")
+            else bytes(candidate_value)
         )
-        candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
+        candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
         with db_session(self._db_path) as conn:
             persisted_canary = get_server_hmac_canary(conn)
             if persisted_canary is not None and not constant_time_equal(
@@ -817,7 +844,8 @@ class SqliteSecretStore:
             if full_record is None:
                 return False
             decrypted = _decrypt_record(full_record, self._cipher, project, env, name)
-            return constant_time_equal(candidate_val, decrypted["value"])
+            decrypted_val_bytes = unicodedata.normalize("NFC", decrypted["value"]).encode("utf-8")
+            return constant_time_equal(candidate_val_bytes, decrypted_val_bytes)
 
     async def find_secrets_matching_value(
         self,
@@ -859,10 +887,10 @@ class SqliteSecretStore:
             raise TypeError("La valeur candidate doit être de type str ou bytes.")
         if not candidate_value:
             return []
-        candidate_val = (
-            unicodedata.normalize("NFC", candidate_value)
+        candidate_val_bytes = (
+            unicodedata.normalize("NFC", candidate_value).encode("utf-8")
             if isinstance(candidate_value, str)
-            else candidate_value.decode("utf-8")
+            else bytes(candidate_value)
         )
         with db_session(self._db_path) as conn:
             persisted_canary = get_server_hmac_canary(conn)
@@ -892,14 +920,17 @@ class SqliteSecretStore:
                             "Une migration des empreintes est requise."
                         )
                     aad = VaultCipher.aad(p, e, n)
-                    candidate_fp = self._cipher.fingerprint(candidate_val.encode("utf-8"), aad=aad)
+                    candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
                     matched = constant_time_equal(candidate_fp, stored_fp)
                 else:
                     # Repli transparent pour les secrets hérités sans empreinte (ticket #25/#62)
                     full_record = get_secret(conn, p, e, n)
                     if full_record is not None:
                         decrypted = _decrypt_record(full_record, self._cipher, p, e, n)
-                        matched = constant_time_equal(candidate_val, decrypted["value"])
+                        decrypted_val_bytes = (
+                            unicodedata.normalize("NFC", decrypted["value"]).encode("utf-8")
+                        )
+                        matched = constant_time_equal(candidate_val_bytes, decrypted_val_bytes)
                 if matched:
                     results.append(
                         {

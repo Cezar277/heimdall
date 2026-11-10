@@ -1706,6 +1706,36 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
         return True
 
 
+def _check_rotate_kek_hmac_continuity(
+    conn: sqlite3.Connection,
+    new_cipher: "VaultCipher",
+) -> None:
+    """Vérifie la continuité de clé HMAC serveur lors de rotate_secrets_kek (ticket #116)."""
+    from heimdall.vault.crypto import VaultCipherError  # noqa: PLC0415
+
+    persisted_canary = get_server_hmac_canary(conn)
+    if persisted_canary is not None:
+        if not new_cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La rotation de KEK vers un chiffreur en mode dérivé "
+                "est interdite sur une base contenant des secrets sous clé "
+                "explicite (refus fail-closed). Une migration des "
+                "empreintes est requise."
+            )
+        if not hmac.compare_digest(persisted_canary, new_cipher.server_hmac_key_canary()):
+            raise VaultCipherError(
+                "La clé HMAC serveur du nouveau chiffreur diffère de la clé "
+                "enregistrée en base (refus fail-closed immédiat). "
+                "Une migration des empreintes est requise."
+            )
+    elif new_cipher.has_explicit_server_hmac_key:
+        raise VaultCipherError(
+            "La base de données contient des secrets créés en mode dérivé. "
+            "La rotation vers un chiffreur avec clé HMAC explicite "
+            "nécessite une migration des empreintes."
+        )
+
+
 def rotate_secrets_kek(
     conn: sqlite3.Connection,
     old_cipher: "VaultCipher",
@@ -1749,6 +1779,8 @@ def rotate_secrets_kek(
             # target_kek_version est ignorée pour ne pas faire croire à l'appelant
             # qu'une version non persistée est active (#71 LOW 2).
             return 0, 1
+
+        _check_rotate_kek_hmac_continuity(conn, new_cipher)
 
         for r in secrets_to_rotate:
             v = r["kek_version"]
