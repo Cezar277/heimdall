@@ -433,6 +433,7 @@ def test_collect_tree_uses_the_pinned_root(
             self.traces: tuple[object, ...] = ()
             self.vcs_ignored = 0
             self.git_ignored = 0
+            self.files_scanned = 0
 
         def scan(self, *, deadline: float | None = None) -> list[object]:
             assert deadline is not None
@@ -2107,6 +2108,7 @@ def test_scan_ci_on_a_clean_repository_exits_zero(tmp_path: Path) -> None:
     racine = _arbre(tmp_path, {"app.py": "x = 1\n"})
     resultat = _run("scan", "--ci", str(racine))
     assert resultat.exit_code == EXIT_CLEAN
+    assert "1 fichier(s) analysé(s)" in resultat.stderr
     assert "0 secret(s) détecté(s)" in resultat.stderr
 
 
@@ -2162,7 +2164,37 @@ def test_scan_ci_json_staged_combines(git_repo: GitRepo) -> None:
     assert document["scope"] == "staged"
     assert document["count"] == 1
     assert document["findings"][0]["file"] == "vendor/evil.py"
+    assert "2 fichier(s) analysé(s)" in resultat.stderr
     assert "1 secret(s) détecté(s)" in resultat.stderr
+    assert FAKE_AWS_KEY not in resultat.stdout
+    assert FAKE_AWS_KEY not in resultat.stderr
+
+
+def test_scan_ci_json_diff_matches_the_schema(git_repo: GitRepo) -> None:
+    """Le document ``--json --diff`` valide le contrat ``heimdall.scan.v1`` (#37)."""
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.commit_all("base")
+    git_repo.git("branch", "-M", "main")
+    git_repo.git("update-ref", "refs/remotes/origin/main", "main")
+    git_repo.git("checkout", "-q", "-b", "feature")
+    git_repo.write("new.py", f'AWS = "{FAKE_AWS_KEY}"\n')
+    git_repo.commit_all("feature")
+
+    resultat = _run(
+        "scan",
+        "--ci",
+        "--json",
+        "--diff",
+        "origin/main",
+        "--no-allowlist",
+        str(git_repo.root),
+    )
+
+    assert resultat.exit_code == EXIT_FINDINGS
+    document = json.loads(resultat.stdout)
+    _validate_scan_document(document)
+    assert document["scope"] == "diff"
+    assert document["count"] == 1
     assert FAKE_AWS_KEY not in resultat.stdout
     assert FAKE_AWS_KEY not in resultat.stderr
 

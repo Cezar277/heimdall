@@ -11,5 +11,38 @@ importer ``cryptography`` ou ``argon2`` — vérifié par
 
 from heimdall.vault.client import VaultClient
 from heimdall.vault.database import db_session, get_connection, init_db
+from heimdall.vault.transitions import (
+    ALLOWED_TRANSITIONS,
+    FORBIDDEN_TRANSITION_REASONS,
+    INITIAL_STATE,
+    LIFECYCLE_STATES,
+    TERMINAL_STATES,
+    InvalidTransitionError,
+    LifecycleTransitionError,
+    SecretLifecycleState,
+    UnknownStateError,
+    canonicalize_state,
+    is_transition_allowed,
+    is_valid_state,
+    validate_transition,
+)
 
-__all__ = ["VaultClient", "db_session", "get_connection", "init_db"]
+__all__ = [
+    "ALLOWED_TRANSITIONS",
+    "FORBIDDEN_TRANSITION_REASONS",
+    "INITIAL_STATE",
+    "InvalidTransitionError",
+    "LIFECYCLE_STATES",
+    "LifecycleTransitionError",
+    "SecretLifecycleState",
+    "TERMINAL_STATES",
+    "UnknownStateError",
+    "VaultClient",
+    "canonicalize_state",
+    "db_session",
+    "get_connection",
+    "init_db",
+    "is_transition_allowed",
+    "is_valid_state",
+    "validate_transition",
+]

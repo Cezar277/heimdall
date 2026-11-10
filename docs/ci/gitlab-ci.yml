@@ -1,0 +1,34 @@
+# Modèle de pipeline GitLab CI pour Heimdall (#37).
+# À inclure dans .gitlab-ci.yml du dépôt à protéger.
+#
+# GIT_DEPTH: "0" est indispensable : le mode --diff compare l'ancêtre commun
+# (trois points). Un clone superficiel n'a pas cet ancêtre : Heimdall refuse
+# alors de rendre un verdict (code 2), jamais un faux vert.
+#
+# --no-allowlist : en --ci, un heimdall.toml du dépôt ne peut pas
+# s'auto-attester. Pour une allowlist d'équipe, utiliser --config vers un
+# fichier HORS du dépôt scanné.
+#
+# Épingler l'image par digest en production.
+heimdall:
+  image: python:3.12-slim
+  variables:
+    GIT_DEPTH: "0"
+    # Remplacer par un SHA de commit vérifié, jamais une branche mobile.
+    HEIMDALL_REVISION: "<sha>"
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends git
+    - python -m venv .heimdall-venv
+    - .heimdall-venv/bin/pip install "heimdall @ git+https://github.com/Cezar277/heimdall@${HEIMDALL_REVISION}"
+  script:
+    - git fetch --no-tags origin -- "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    # Redirection + exit explicite : pas de pipefail inter-lignes, pas de
+    # `tee` qui masquerait l'exit 1/2 de Heimdall.
+    - .heimdall-venv/bin/heimdall scan --ci --diff "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --no-allowlist --json > heimdall-scan.json; code=$?; cat heimdall-scan.json; exit $code
+  artifacts:
+    when: always
+    paths:
+      - heimdall-scan.json
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"

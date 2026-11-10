@@ -79,6 +79,8 @@ _ALLOWED_NAMES = frozenset(
         "key_prefix",
         "key_suffix",
         "key_algorithm",
+        # Empreinte tronquée (HMAC, 16 hex) : métadonnée d'audit affichable, jamais la clé.
+        "key_fingerprint",
         "env_master",
         "env_salt",
     }

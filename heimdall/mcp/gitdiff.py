@@ -115,6 +115,21 @@ STAGED_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
     "--no-textconv",
 )
 
+#: Options de l'énumération d'une plage de commits (#37) : même format ``raw``
+#: que l'index, mais comparaison ``base...head`` (trois points = depuis
+#: l'ancêtre commun). ``--no-renames`` rend la sortie déterministe (un
+#: renommage devient une suppression + un ajout, donc le nouveau blob est
+#: scanné). Les SHA sont déjà résolus et validés par ``resolve_commit``.
+DIFF_RAW_ARGUMENTS: Final[tuple[str, ...]] = (
+    "diff",
+    "--raw",
+    "-z",
+    "--no-abbrev",
+    "--no-renames",
+    "--no-ext-diff",
+    "--no-textconv",
+)
+
 #: Modes d'index d'un fichier **ordinaire** suivi : les seuls pour lesquels une
 #: comparaison blob worktree/index a un sens pour la garde CWE-345. Un lien
 #: symbolique (120000) ou un gitlink (160000) n'est pas un fichier de config
@@ -631,6 +646,68 @@ class GitAccess:
         )
         return parse_staged_raw(raw)
 
+    def resolve_commit(
+        self,
+        ref: str,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> str:
+        """Résout une référence en SHA de commit complet (#37).
+
+        La référence est validée par :func:`_checked_ref` avant l'appel :
+        aucune valeur ne peut devenir une option git ou une expression de
+        revision. ``rev-parse --verify --quiet <ref>^{commit}`` refuse un
+        objet qui n'est pas un commit (arbre, blob, tag annoté non résolu)
+        et rend un code non nul pour une référence absente. Dans les deux
+        cas, c'est ``ToolFailure`` : le mode diff ne peut pas rendre un
+        verdict sur une base qu'il n'a pas su résoudre.
+        """
+        checked = _checked_ref(ref)
+        completed = self.execute(
+            ("rev-parse", "--verify", "--quiet", f"{checked}^{{commit}}"),
+            timeout=timeout,
+        )
+        if completed.returncode != 0:
+            raise ToolFailure("INTERNAL")
+        try:
+            sha = completed.stdout.strip().decode("ascii")
+        except UnicodeDecodeError:
+            raise ToolFailure("INTERNAL") from None
+        if _OBJECT_PATTERN.fullmatch(sha) is None:
+            raise ToolFailure("INTERNAL")
+        return sha
+
+    def diff_changes(
+        self,
+        base: str,
+        head: str,
+        *,
+        timeout: float = GIT_TIMEOUT_SECONDS,
+    ) -> list[StagedChange]:
+        """Fichiers ajoutés ou modifiés entre ``base...head`` (#37).
+
+        Les deux bornes sont des SHA **déjà résolus** et validés : aucune
+        référence non contrôlée n'entre dans l'argv. La comparaison à trois
+        points part de l'ancêtre commun, donc un secret présent sur la
+        branche cible mais absent de la branche courante n'est pas scanné
+        (il n'est pas dans le diff de la PR). Un clone superficiel sans
+        ancêtre commun fait échouer git : ``ToolFailure``, code 2, jamais
+        un verdict propre sur un historique incomplet.
+
+        La sortie est lue en flux borné (:data:`MAX_STAGED_RAW_BYTES`),
+        comme l'index : une plage adverse de 100 000 entrées est coupée
+        avant bufferisation. Les suppressions et les gitlinks sont ignorés
+        par le parseur commun ; les autres statuts illisibles sont refusés.
+        """
+        base_sha = _checked_object(base)
+        head_sha = _checked_object(head)
+        raw = self._read_capped(
+            (*DIFF_RAW_ARGUMENTS, f"{base_sha}...{head_sha}", "--"),
+            MAX_STAGED_RAW_BYTES,
+            timeout=timeout,
+        )
+        return parse_staged_raw(raw)
+
     def _read_capped(
         self,
         arguments: Sequence[str],
@@ -773,6 +850,18 @@ _RAW_HEADER_FIELDS: Final[int] = 5
 #: Les deux formats sont acceptés : un dépôt `--object-format=sha256` est
 #: parfaitement valide, et le refuser rendrait `--staged` inutilisable (#29).
 _OBJECT_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+#: Nom de référence accepté pour ``resolve_commit`` (#37). Volontairement
+#: conservateur : pas d'option possible (premier caractère alphanumérique,
+#: ``_`` ou ``@``), pas de métacaractère de revision git (``~``, ``^``,
+#: ``:``, ``?``, ``*``, ``[``, ``\``), pas de composant vide, commençant
+#: par ``.`` ou finissant par ``.lock``. ``origin/main``, ``HEAD``, un SHA
+#: complet et un tag simple passent ; ``@`` seul est l'alias git de ``HEAD``.
+#: Une entrée douteuse est refusée avant tout appel git.
+_REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_@][A-Za-z0-9._/@-]*")
+#: Longueur maximale d'une référence acceptée : un SHA fait 64 octets, un
+#: nom de branche court tient largement ; au-delà, l'argv de ``rev-parse``
+#: serait démesuré (déni de service local).
+MAX_REF_BYTES: Final[int] = 256
 #: Statuts de `--raw` dont le blob indexé doit être scanné : ajout,
 #: modification, changement de type (le nouveau contenu est scanné).
 _SCAN_STATUSES: Final[frozenset[str]] = frozenset({"A", "M", "T"})
@@ -781,6 +870,37 @@ _SCAN_STATUSES: Final[frozenset[str]] = frozenset({"A", "M", "T"})
 def _is_null_object(blob: str) -> bool:
     """True pour le SHA « nul » de git (40 ou 64 zéros) : l'objet n'existe pas."""
     return bool(blob) and set(blob) == {"0"}
+
+
+def _checked_ref(ref: str) -> str:
+    """Valide une référence git avant de la passer à ``rev-parse``.
+
+    La validation est plus stricte que la grammaire complète de git : elle
+    refuse tout ce qui pourrait être interprété comme une option ou une
+    expression de revision (``-`` initial, ``..``, ``@{``, ``~``, ``^``,
+    ``:``, ``?``, ``*``, ``[``, ``\\``), les composants vides, ceux qui
+    commencent par ``.`` et ceux qui finissent par ``.lock``. ``@`` seul est
+    l'alias git de ``HEAD`` : il est accepté comme ``HEAD``. La longueur est
+    bornée à 256 octets : une référence géante ne devient jamais un argv
+    démesuré pour ``rev-parse``. Un nom refusé est une panne d'outillage
+    (``ToolFailure``), jamais un scan partiel.
+    """
+    if (
+        not ref
+        or len(ref) > MAX_REF_BYTES
+        or _REF_PATTERN.fullmatch(ref) is None
+        or ".." in ref
+        or "@{" in ref
+        or ref.endswith("/")
+        or ref.endswith(".")
+        or "//" in ref
+        or any(
+            part == "" or part.startswith(".") or part.endswith(".lock")
+            for part in ref.split("/")
+        )
+    ):
+        raise ToolFailure("INTERNAL")
+    return ref
 
 
 def _checked_object(blob: str) -> str:

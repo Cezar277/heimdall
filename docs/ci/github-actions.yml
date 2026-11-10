@@ -1,0 +1,52 @@
+# Modèle de workflow GitHub Actions pour Heimdall (#37).
+# À copier dans .github/workflows/heimdall.yml du dépôt à protéger.
+#
+# Points non négociables :
+# - fetch-depth: 0 : le mode --diff compare l'ancêtre commun (trois points).
+#   Un clone superficiel n'a pas cet ancêtre : Heimdall refuse alors de
+#   rendre un verdict (code 2), jamais un faux vert.
+# - --no-allowlist : en --ci, un heimdall.toml du dépôt ne peut pas
+#   s'auto-attester. Pour une allowlist d'équipe, utiliser --config vers un
+#   fichier HORS du dépôt scanné.
+# - Aucun pull_request_target, permissions minimales, action épinglée.
+name: Heimdall secret scan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  heimdall:
+    runs-on: ubuntu-latest
+    env:
+      # Remplacer par un SHA de commit vérifié, jamais une branche mobile.
+      HEIMDALL_REVISION: "<sha>"
+    steps:
+      - name: Checkout (historique complet)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Installer Heimdall (révision épinglée)
+        # Pour une installation reproductible, préférer un wheel + hashes.
+        run: |
+          python3 -m venv .heimdall-venv
+          .heimdall-venv/bin/pip install \
+            "heimdall @ git+https://github.com/Cezar277/heimdall@${HEIMDALL_REVISION}"
+
+      - name: Scanner le diff de la PR
+        shell: bash
+        env:
+          # Jamais d'interpolation GHA directe dans le script bash : un nom
+          # de branche cible contenant $(...) serait exécuté avant Heimdall.
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -o pipefail
+          .heimdall-venv/bin/heimdall scan \
+            --ci \
+            --diff "origin/$BASE_REF" \
+            --no-allowlist \
+            --json | tee heimdall-scan.json

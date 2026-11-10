@@ -53,6 +53,8 @@ def test_bruteforce_rate_limit_and_constant_errors() -> None:
     assert "ignoré" in contract
     assert "Retry-After" in contract
     assert "minimum: 1" in contract and "maximum: 3600" in contract
+    # Ticket #111 : la fenêtre est glissante, pas fixe.
+    assert "Fenêtre glissante" in contract
     # Erreurs constantes : meme 401 generique, meme 403, sans oracle.
     assert "même réponse 401 générique" in contract
     assert "sans oracle temporel exploitable" in contract
@@ -69,6 +71,12 @@ def test_bruteforce_rate_limit_and_constant_errors() -> None:
     assert "compare_digest" in doc
     assert "verify=False" in doc  # cite comme interdit
     assert "interdit de désactiver" in doc
+    # Tickets #111/#113/#114 : fenêtre glissante, journal d'audit et rejeu.
+    assert "fenêtre glissante" in doc
+    assert "Journal d'audit" in doc
+    assert "audit_events" in doc
+    assert "Rejeu de requête" in doc
+    assert "409" in doc and "révocation" in doc
     # Client : loopback canonique uniquement, refus local avant tout envoi.
     good = VaultClient("https://127.0.0.1:8443", "SYNTHETIC_API_KEY_01")
     assert "127.0.0.1" in repr(good)

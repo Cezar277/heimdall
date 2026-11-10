@@ -13,7 +13,7 @@ from heimdall.vault import database
 from heimdall.vault.app import VaultSettings, create_app
 from heimdall.vault.crypto import generate_api_key, generate_encryption_key
 from heimdall.vault.database import db_session
-from heimdall.vault.ratelimit import RateLimiter
+from heimdall.vault.ratelimit import RateLimiter, SqliteRateLimiter
 
 
 def memory_limiter() -> RateLimiter:
@@ -175,3 +175,162 @@ class DatabaseAvailabilityTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
                 self.assertEqual(unknown.status_code, 401)
+
+    async def test_prolonged_rejected_flood_is_429_never_500(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.db"
+            app = create_app(
+                VaultSettings(
+                    db_path=str(path),
+                    storage_backend="sqlite",
+                    kek=generate_encryption_key(),
+                    api_key_pepper="p" * 32,
+                    rate_limit_per_peer=3,
+                    rate_limit_global=100,
+                )
+            )
+            self.assertIsInstance(app.state.rate_limiter, SqliteRateLimiter)
+            async with self.client(app) as client:
+                responses = [
+                    await client.get("/api/v1/secrets/demo/dev/TOKEN") for _ in range(300)
+                ]
+            statuses = {response.status_code for response in responses}
+            self.assertEqual(statuses, {401, 429})
+            for response in responses:
+                if response.status_code == 429:
+                    self.assertTrue(1 <= int(response.headers["Retry-After"]) <= 3600)
+            with db_session(path) as conn:
+                rows = conn.execute("SELECT COUNT(*) FROM rate_limit_hits").fetchone()[0]
+            self.assertLessEqual(rows, 10)
+
+    async def test_concurrent_sqlite_writers_never_return_500(self) -> None:
+        """Requêtes concurrentes sur une même base : jamais de 500, 503 générique seulement."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.db"
+            apps = [self.make_app(path) for _ in range(3)]
+            key = generate_api_key()
+            for app in apps:
+                app.state.register_api_key(key, "demo")
+                app.state.rate_limiter = memory_limiter()
+            clients = [self.client(app) for app in apps]
+            try:
+                responses = await asyncio.gather(
+                    *(
+                        clients[index % len(clients)].get(
+                            "/api/v1/secrets/demo/dev/TOKEN",
+                            headers={"X-Heimdall-API-Key": key},
+                        )
+                        for index in range(12)
+                    )
+                )
+            finally:
+                for client in clients:
+                    await client.aclose()
+        statuses = {response.status_code for response in responses}
+        self.assertTrue(statuses <= {404, 503}, statuses)
+        self.assertNotIn(500, statuses)
+        for response in responses:
+            if response.status_code == 503:
+                self.assert_unavailable(response)
+
+    async def test_authenticated_traffic_with_real_sqlite_limiter_never_returns_500(self) -> None:
+        """Chemin prod complet : débit SQLite réel + audit SQLite + clé valide."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.db"
+            apps = [
+                create_app(
+                    VaultSettings(
+                        db_path=str(path),
+                        storage_backend="sqlite",
+                        kek=generate_encryption_key(),
+                        api_key_pepper="p" * 32,
+                    )
+                )
+                for _ in range(3)
+            ]
+            key = generate_api_key()
+            for app in apps:
+                app.state.register_api_key(key, "demo")
+                self.assertIsInstance(app.state.rate_limiter, SqliteRateLimiter)
+            clients = [self.client(app) for app in apps]
+            try:
+                responses = await asyncio.gather(
+                    *(
+                        clients[index % len(clients)].get(
+                            "/api/v1/secrets/demo/dev/TOKEN",
+                            headers={"X-Heimdall-API-Key": key},
+                        )
+                        for index in range(12)
+                    )
+                )
+            finally:
+                for client in clients:
+                    await client.aclose()
+        statuses = {response.status_code for response in responses}
+        self.assertTrue(statuses <= {404, 503}, statuses)
+        for response in responses:
+            if response.status_code == 503:
+                self.assert_unavailable(response)
+
+    async def test_authenticated_writer_lock_with_real_sqlite_limiter_gives_503(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.db"
+            apps = [
+                create_app(
+                    VaultSettings(
+                        db_path=str(path),
+                        storage_backend="sqlite",
+                        kek=generate_encryption_key(),
+                        api_key_pepper="p" * 32,
+                    )
+                )
+                for _ in range(3)
+            ]
+            key = generate_api_key()
+            for app in apps:
+                app.state.register_api_key(key, "demo")
+            clients = [self.client(app) for app in apps]
+            try:
+                with db_session(path) as blocker:
+                    blocker.execute("BEGIN IMMEDIATE")
+                    responses = await asyncio.gather(
+                        *(
+                            clients[index % len(clients)].get(
+                                "/api/v1/secrets/demo/dev/TOKEN",
+                                headers={"X-Heimdall-API-Key": key},
+                            )
+                            for index in range(8)
+                        )
+                    )
+            finally:
+                for client in clients:
+                    await client.aclose()
+        for response in responses:
+            self.assert_unavailable(response)
+
+    async def test_writer_lock_held_by_peer_gives_503_to_all_concurrent_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vault.db"
+            apps = [self.make_app(path) for _ in range(3)]
+            key = generate_api_key()
+            for app in apps:
+                app.state.register_api_key(key, "demo")
+                app.state.rate_limiter = memory_limiter()
+            clients = [self.client(app) for app in apps]
+            try:
+                with db_session(path) as blocker:
+                    blocker.execute("BEGIN IMMEDIATE")
+                    responses = await asyncio.gather(
+                        *(
+                            clients[index % len(clients)].get(
+                                "/api/v1/secrets/demo/dev/TOKEN",
+                                headers={"X-Heimdall-API-Key": key},
+                            )
+                            for index in range(8)
+                        )
+                    )
+            finally:
+                for client in clients:
+                    await client.aclose()
+        for response in responses:
+            self.assert_unavailable(response)

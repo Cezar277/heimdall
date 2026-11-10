@@ -257,17 +257,21 @@ des empreintes dupliquées, l'initialisation échoue sans suppression automatiqu
 La génération du pepper et les comparaisons sensibles sont confinées dans
 `heimdall/vault/crypto.py`.
 
-Rate-limiting débit (lot #63) : fenêtres fixes par clé API validée, par pair réseau
-et globale. Un `peek` pair/global en lecture seule (sans consommation ni
-verrou d'écriture) précède le hachage et le parcours d'authentification ;
-leur rejet 429 ne déclenche aucun lookup de clé. Après résolution de
-l'empreinte, `check_authenticated` consomme pair/global + clé en une seule
-transaction (mémoire : une seule section critique ; SQLite : un seul
-`BEGIN IMMEDIATE`), sans fenêtre inter-transactions ni double verrou
-d'écriture. Sémantique préservée : pair/global restent consommés même quand
-le bucket clé est plein. Les
-400/401 consomment les buckets pair/global, une clé absente ou invalide ne crée
-pas de bucket arbitraire, et `X-Forwarded-For` reste ignoré.
+Rate-limiting débit (lot #63, **fenêtre glissante** #111) : chaque admission
+est horodatée et seule la fenêtre `[now - window, now]` est comptée, par clé API
+validée, par pair réseau et globalement. Contrairement à une fenêtre fixe, un
+attaquant ne peut pas doubler son budget à cheval sur deux fenêtres. Un `peek`
+pair/global en lecture seule (sans consommation ni verrou d'écriture) précède le
+hachage et le parcours d'authentification ; leur rejet 429 ne déclenche aucun
+lookup de clé. Après résolution de l'empreinte, `check_authenticated` consomme
+pair/global + clé en une seule transaction (mémoire : une seule section
+critique ; SQLite : un seul `BEGIN IMMEDIATE`), sans fenêtre inter-transactions
+ni double verrou d'écriture. Sémantique préservée : pair/global restent
+consommés même quand le budget clé est plein. Les 400/401 consomment les
+budgets pair/global, une clé absente ou invalide ne crée pas de budget
+arbitraire, et `X-Forwarded-For` reste ignoré. Le délai `Retry-After` est
+calculé sur la plus ancienne admission encore dans la fenêtre, puis borné à
+1..3600 s.
 Le choix du bucket par clé (`auth.find_api_key_project_cached`) emprunte le même
 parcours complet à coût comparable que `verify_api_key` (parcours exhaustif
 du backend actif, sans `break` précoce) et le mémoïse dans l'état de la
@@ -307,12 +311,123 @@ et la clé refusée répond 401 générique — y compris pour un serveur déjà
 démarré, dont la lecture en base voit la révocation à la requête suivante.
 Ré-enregistrer une clé révoquée ne la réactive pas.
 
-Backend de débit (lot #63) : avec le stockage SQLite, les buckets sont persistés dans
-la base et incrémentés sous `BEGIN IMMEDIATE` : la limite (clé/pair/global) est
+Backend de débit (lot #63, fenêtre glissante #111) : avec le stockage SQLite,
+les admissions sont persistées dans `rate_limit_hits(name, hit_at)` et
+comptées/insérées sous `BEGIN IMMEDIATE` : la limite (clé/pair/global) est
 partagée entre workers et n'est jamais multipliée par leur nombre. Le backend
 mémoire, réservé au développement/test, reste strictement mono-processus et
-`run_server` épingle `workers=1` par défaut. Le quota de stockage reste
-indépendant de cette limite de débit.
+`run_server` épingle `workers=1` par défaut. **Un cache en mémoire ne suffit
+pas avec plusieurs processus** : chaque worker aurait son propre compteur et la
+limite effective serait multipliée par le nombre de workers ; la production
+utilise donc le backend SQLite. Le quota de stockage reste indépendant de cette
+limite de débit.
+
+Les admissions expirées de toutes les fenêtres sont purgées à chaque évaluation,
+rejets compris (index `idx_rate_limit_hits_at`) : la table ne retient que la
+fenêtre courante. Sa taille est bornée par la somme des budgets actifs
+(clé + pair + global) : `consume_on_reject` n'insère que si le budget
+correspondant n'est pas plein, donc un flot de rejets avec un budget clé plein
+s'arrête à cette somme, sans croître au rythme des requêtes. Le backend mémoire
+applique la même règle : un bucket n'est créé qu'au moment où une admission est
+réellement consommée (chemin autorisé, ou pair/global consommés sur un rejet
+clé), et la purge des budgets expirés a lieu sur les deux chemins. Un flot de
+rejets avec des empreintes de clé distinctes ne laisse donc pas une entrée vide
+par hash.
+
+## Journal d'audit (#113)
+
+Chaque accès au Vault produit un événement dans `audit_events`, **y compris les
+refus 401/403 et les limitations 429**. Le journal est consultable avec
+`heimdall vault audit list --db-path <base>` (option `--project`, `--limit`,
+`--json`) et vérifiable avec `heimdall vault audit verify --db-path <base>`.
+
+Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
+`peer`, `action`, `target`, `status_code`, `outcome`, `previous_hash`,
+`entry_hash`.
+
+- **Aucun secret** : le corps de requête, les en-têtes et la valeur d'un secret
+  ne sont jamais lus par le module d'audit. La clé API n'est jamais persistée,
+  même partiellement : `key_id` est l'identifiant interne public (`key_...`,
+  jamais la clé) et `key_fingerprint` est une **empreinte tronquée** de 16
+  caractères hexadécimaux (HMAC calculé avec le pepper serveur) qui permet de
+  corréler les accès d'une même clé, y compris pour une clé inconnue.
+- **Chaînage par hash** : `entry_hash = SHA-256(charge canonique JSON)` et
+  `previous_hash` référence l'événement précédent (`GENESIS` pour le premier).
+  Modifier, insérer ou supprimer une ligne casse la chaîne ; `verify` localise
+  la première ligne invalide. On parle de journal **résistant à l'altération**,
+  pas « inviolable » : un attaquant qui contrôle toute la base peut recalculer
+  la chaîne ou le point de contrôle. La protection contre la suppression
+  totale relève de la sauvegarde externe.
+- **Rétention bornée** : `MAX_AUDIT_EVENTS` (100 000) borne la table. Au-delà,
+  les plus anciens événements sont purgés et leur dernier `entry_hash` est
+  conservé dans `audit_chain_state.checkpoint_hash` ; le premier événement
+  retenu pointe dessus, donc `verify` reste valide sans charger tout
+  l'historique. La purge SQLite procède par lots de 1000, chaque lot dans sa
+  propre transaction, pour ne pas tenir le verrou d'écriture pendant une
+  suppression massive. La purge est testée par patch du seuil (mémoire et
+  SQLite), y compris avec un excès bien supérieur à un lot.
+- **Listage borné** : `list_events` applique le même bornage aux deux backends,
+  `max(1, min(MAX_LIST_LIMIT, int(limit)))` (1 à 1000). Une limite négative ou
+  nulle retombe sur 1 et une limite supérieure à 1000 est plafonnée : un appel
+  direct ne charge jamais tout l'historique mémoire.
+- **Panne SQLite** : une contention ou une erreur d'ouverture/commit du
+  rate-limiter ou du journal est traduite en **503** (`Retry-After: 1`,
+  `Connection: close`, `Cache-Control: no-store`), jamais en 500.
+- **Fail-closed** : si l'écriture d'audit échoue, la réponse devient un 503
+  générique (`Retry-After: 1`, `Connection: close`, `Cache-Control: no-store`)
+  au lieu de laisser passer un accès non journalisé.
+- **Cible** : `target` est renseignée par le handler (`projet/env/nom` pour
+  créer, lire et lire l'état ; `projet` pour la liste), y compris pour un
+  refus 403 cross-projet. Une requête rejetée avant le handler n'a pas de
+  cible : c'est le cas du 401 sur `POST /api/v1/secrets` (le corps n'est pas
+  lu avant l'authentification). Pour `GET /api/v1/secrets?project=`, le repli
+  du middleware lit le query-param `project` et le valide avec
+  `validate_project_id` : un 401 porte donc le projet demandé, et une valeur
+  invalide n'est jamais recopiée (`target` reste vide). La corrélation ne
+  dépend plus uniquement de `action`, `peer` et `status_code`.
+- **Pas de log injection** : les champs texte sont filtrés (caractères non
+  imprimables supprimés) et bornés avant persistance.
+- **Backends** : `SqliteAuditLog` en production (table partagée entre workers,
+  écriture sous `BEGIN IMMEDIATE`) ; `InMemoryAuditLog` pour le backend mémoire
+  de développement/test, strictement mono-processus et perdu au redémarrage.
+  Les identifiants d'événements ne sont jamais réutilisés, y compris après
+  purge (compteur monotone dans `InMemoryAuditLog`, `AUTOINCREMENT` en SQLite).
+- **Résiduel accepté : amplification des 429** : chaque 429, y compris le
+  refus issu du contrôle de débit en lecture seule (peek), produit une ligne
+  d'audit écrite sous `BEGIN IMMEDIATE`. Un processus local qui émet des
+  requêtes rejetées peut donc sérialiser des écritures et saturer le verrou
+  SQLite au détriment du trafic légitime. C'est un déni de service local, sans
+  élévation de privilège : le fail-closed reste tenu (503 générique, jamais
+  500) et la table reste bornée par `MAX_AUDIT_EVENTS`. Chaque écriture inclut
+  un `COUNT(*)` sur la table. Mesure locale (un processus, une machine de
+  développement, table pleine à 100 000 lignes) : environ 1,6 ms par écriture,
+  soit au plus environ 600 écritures d'audit par seconde en série. Quand le
+  verrou reste indisponible plus de 250 ms (`busy_timeout`), les requêtes qui
+  attendent reçoivent un 503 générique, sans 500. Mitigations si la cadence l'exige : coalescence des 429 ou alerte sur la
+  taille de la base. Une mesure sur matériel de production reste à faire.
+- **Health et clé API** : l'en-tête `X-Heimdall-API-Key` n'est jamais consommé
+  sur cette route publique (seules les limites pair/global s'appliquent), mais
+  son empreinte est mémoïsée pour l'audit. Un health avec clé valide porte donc
+  `key_fingerprint` (16 hexadécimaux) et reste corrélable à une clé ; un health
+  anonyme garde `key_fingerprint` vide. Aucun `key_id` n'est recherché sur cette
+  route, pour ne pas ajouter de lookup d'identifiant à un endpoint de santé.
+
+## Rejeu de requête (#114)
+
+Le contrat v1 n'ajoute ni nonce ni date de validité : la sémantique anti-rejeu
+est portée par les routes existantes et doit être vérifiée par des tests
+d'abus runtime :
+
+- un **POST rejoué** ne remplace jamais un secret existant : 409
+  `conflict`, la valeur d'origine reste inchangée ;
+- un **GET rejoué** est idempotent et renvoie la même valeur (ou 404) tant que
+  la clé est valide ;
+- une **requête capturée rejouée après révocation** de la clé est refusée en
+  401 générique ;
+- la force brute de clés API est bornée par le budget pair/global puis par le
+  budget clé, avec 429 et `Retry-After` ;
+- une charge de quelques centaines de requêtes ne doit produire ni 500 ni
+  arrêt du serveur.
 
 Transport (#25) : en production, `run_server` refuse de démarrer sans
 `HEIMDALL_VAULT_SSL_CERTFILE` et `HEIMDALL_VAULT_SSL_KEYFILE` (fail-closed) et
