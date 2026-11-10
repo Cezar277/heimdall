@@ -1,9 +1,9 @@
 """Entrypoint du conteneur Vault (#119/#120).
 
 Le Vault ne doit jamais tourner en root : l'image définit ``USER 10001:10001``
-et le compose utilise l'UID/GID de l'hôte. Ce garde refuse explicitement
-``euid == 0`` (par exemple si ``HEIMDALL_UID=0`` est mis dans ``.env``) avant
-de lancer le serveur. Aucun secret n'est lu ni affiché.
+et le compose fige ``user: "10001:10001"``. Ce garde refuse explicitement
+``euid == 0`` ou ``egid == 0`` (par exemple en cas de surcharge manuelle
+``--user 0``) avant de lancer le serveur. Aucun secret n'est lu ni affiché.
 """
 
 from __future__ import annotations

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import importlib.util
 import io
-import os
 import re
 import shutil
 import subprocess
@@ -120,19 +119,15 @@ class ComposeSecurityTests(unittest.TestCase):
         self.assertIs(self.service["read_only"], True)
         self.assertEqual(self.service["cap_drop"], ["ALL"])
         self.assertIn("no-new-privileges:true", self.service["security_opt"])
-        self.assertIn("HEIMDALL_UID", self.service["user"])
-        self.assertIn("HEIMDALL_GID", self.service["user"])
-        self.assertNotIn("0:0", self.service["user"])
-        self.assertNotIn(":-0", self.service["user"])
-        user_match = re.fullmatch(
-            r"\$\{HEIMDALL_UID:-(\d+)\}:\$\{HEIMDALL_GID:-(\d+)\}",
-            self.service["user"],
-        )
-        self.assertIsNotNone(user_match, f"user format non conforme: {self.service['user']}")
-        assert user_match is not None
-        uid_default, gid_default = int(user_match.group(1)), int(user_match.group(2))
-        self.assertGreater(uid_default, 0, "UID résolu par défaut ne doit pas valoir 0")
-        self.assertGreater(gid_default, 0, "GID résolu par défaut ne doit pas valoir 0")
+        # UID figé : aucune variable résolvable en 0, aucun démarrage
+        # transitoire en root même si l'opérateur saute le §4 du guide.
+        self.assertEqual(self.service["user"], "10001:10001")
+        self.assertNotIn("HEIMDALL_UID", str(self.service["user"]))
+        self.assertNotIn("HEIMDALL_GID", str(self.service["user"]))
+        self.assertNotIn("0:0", str(self.service["user"]))
+        serialized = COMPOSE.read_text(encoding="utf-8")
+        self.assertNotIn("HEIMDALL_UID", serialized)
+        self.assertNotIn("HEIMDALL_GID", serialized)
         self.assertIn("/tmp:rw,noexec,nosuid,size=64m", self.service["tmpfs"])  # noqa: S108
         self.assertEqual(self.service["pids_limit"], 256)
 
@@ -192,7 +187,8 @@ class InstallGuideTests(unittest.TestCase):
             "git archive HEAD",
             "set -euo pipefail",
             "git fetch origin",
-            'grep -Eq "^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)',
+            "10001:10001",
+            "sudo chown -R 10001:10001 data secrets",
             "docker compose stop vault || exit 1",
             "basicConstraints=critical,CA:FALSE",
             ".env.??????",
@@ -232,6 +228,10 @@ class InstallGuideTests(unittest.TestCase):
         self.assertNotIn('curl -H "X-Heimdall-API-Key: $HEIMDALL_API_KEY"', text)
         self.assertNotIn("export HEIMDALL_API_KEY=", text)
         self.assertNotIn("/tmp/heimdall-auth.header", text)  # noqa: S108
+        # UID figé : aucune garde variable, aucun sourcing du .env au §4.
+        self.assertNotIn("HEIMDALL_UID=$(id -u)", text)
+        self.assertNotIn("HEIMDALL_GID=$(id -g)", text)
+        self.assertNotIn("HEIMDALL_(UID|GID)", text)
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
 
@@ -364,8 +364,10 @@ class ReadmeQuickstartTests(unittest.TestCase):
         text = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("install -m 600 .env.example .env", text)
         self.assertIn("docs/install.md", text)
-        self.assertIn("docs/install.md §4", text)
-        self.assertIn("jamais UID/GID 0", text)
+        self.assertIn("docs/install.md §3", text)
+        self.assertIn('user: "10001:10001"', text)
+        self.assertIn("sudo chown -R 10001:10001 data secrets", text)
+        self.assertNotIn("HEIMDALL_UID", text)
 
 
 class HealthcheckTests(unittest.TestCase):
@@ -492,52 +494,23 @@ class GuideApiKeyValidationTests(unittest.TestCase):
 
 
 class UidGidGuardTests(unittest.TestCase):
-    def test_compose_user_resolved_zero_is_rejected_by_guide_guard(self) -> None:
+    def test_compose_user_is_pinned_non_root(self) -> None:
+        """Prouve que le compose fige un UID non-root, sans variable résolvable en 0."""
         compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
         user = compose["services"]["vault"]["user"]
-        self.assertIn("HEIMDALL_UID", user)
-        self.assertIn("HEIMDALL_GID", user)
+        self.assertEqual(user, "10001:10001")
+        serialized = COMPOSE.read_text(encoding="utf-8")
+        self.assertNotIn("HEIMDALL_UID", serialized)
+        self.assertNotIn("HEIMDALL_GID", serialized)
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")
-        pattern = (
-            r"^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)"
-            r"[[:space:]]*=[[:space:]]*['\"]?0+['\"]?([[:space:]#]|$)"
-        )
-        self.assertIn(pattern, guide)
-        self.assertIn("HEIMDALL_(UID|GID)", guide)
-        grep = shutil.which("grep")
-        self.assertIsNotNone(grep)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
-            for line in (
-                "HEIMDALL_UID=0",
-                "HEIMDALL_UID=00",
-                "HEIMDALL_GID=00",
-                "HEIMDALL_UID = 0",
-                'HEIMDALL_UID="0"',
-                "export HEIMDALL_UID=0",
-                "export HEIMDALL_GID= 0",
-            ):
-                with self.subTest(line=line):
-                    handle.seek(0)
-                    handle.truncate()
-                    handle.write(line + "\n")
-                    handle.flush()
-                    result = subprocess.run(  # noqa: S603
-                        [grep, "-Eq", pattern, handle.name],
-                        check=False,
-                    )
-                    self.assertEqual(result.returncode, 0, line)
-            handle.seek(0)
-            handle.truncate()
-            handle.write("HEIMDALL_UID=1000\nHEIMDALL_GID=1000\n")
-            handle.flush()
-            result = subprocess.run(  # noqa: S603
-                [grep, "-Eq", pattern, handle.name],
-                check=False,
-            )
-            self.assertEqual(result.returncode, 1)
+        self.assertIn("10001:10001", guide)
+        self.assertIn("sudo chown -R 10001:10001 data secrets", guide)
+        self.assertIn('[[ "$(id -u)" != 0 ]]', guide)
+        self.assertNotIn("${HEIMDALL_UID", guide)
+        self.assertNotIn("HEIMDALL_UID=$(id -u)", guide)
 
     def test_compose_config_user_resolution_nominal_and_zero(self) -> None:
-        """Prouve que sans variable user résout en 1000:1000 et teste la résolution 0:0."""
+        """Prouve que même avec HEIMDALL_UID=0, `config` reste en 10001:10001."""
         docker = shutil.which("docker")
         if not docker:
             self.skipTest("docker non disponible")
@@ -553,7 +526,8 @@ class UidGidGuardTests(unittest.TestCase):
                 check=False,
             )
             if res_nom.returncode == 0:
-                self.assertIn("user: 1000:1000", res_nom.stdout)
+                self.assertIn("10001", res_nom.stdout)
+                self.assertNotIn("0:0", res_nom.stdout)
                 (workdir / ".env").write_text(
                     "HEIMDALL_UID=0\nHEIMDALL_GID=0\n",
                     encoding="utf-8",
@@ -566,101 +540,14 @@ class UidGidGuardTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(res_zero.returncode, 0)
-                self.assertIn("user: '0:0'", res_zero.stdout)
+                self.assertIn("10001", res_zero.stdout)
+                self.assertNotIn("0:0", res_zero.stdout)
 
-    def test_guide_effective_env_guard_rejects_resolved_zero(self) -> None:
-        """Vérifie que le garde bash du guide après extraction refuse tout UID/GID résolu à 0."""
+    def test_guide_does_not_source_env(self) -> None:
+        """Vérifie que le §4 ne source jamais le .env (aucune exécution, aucune fuite)."""
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")
-        self.assertIn('"${HEIMDALL_UID:-1000}" =~ ^0+$', guide)
-        self.assertIn('"${HEIMDALL_GID:-1000}" =~ ^0+$', guide)
         self.assertNotIn(". ./.env", guide)
-        bash = shutil.which("bash")
-        self.assertIsNotNone(bash)
-        script = (
-            "set -eu\n"
-            "for VAR in HEIMDALL_UID HEIMDALL_GID; do\n"
-            '  VAL=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${VAR}[[:space:]]*=" '
-            '"$ENV_FILE" 2>/dev/null | tail -1 | '
-            'sed -e "s/^[^=]*=//" -e "s/[[:space:]#].*$//" -e "s/[\\"\'\']//g")\n'
-            '  if [[ -n "$VAL" && "$VAL" =~ ^0+$ ]]; then\n'
-            "    exit 1\n"
-            "  fi\n"
-            "done\n"
-            'if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then\n'
-            "  exit 1\n"
-            "fi\n"
-            "exit 0\n"
-        )
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
-            for env_content, expected_exit in (
-                ("", 0),  # defauts 1000:1000 -> non-root
-                ("HEIMDALL_UID=1000\nHEIMDALL_GID=1000\n", 0),
-                ("HEIMDALL_UID=10001\nHEIMDALL_GID=10001\n", 0),
-                ("HEIMDALL_UID=0\n", 1),
-                ("HEIMDALL_UID=00\n", 1),
-                ("HEIMDALL_GID=0\n", 1),
-                ("HEIMDALL_GID=00\n", 1),
-                ('HEIMDALL_UID="0"\n', 1),
-                ('HEIMDALL_GID="0"\n', 1),
-                ("export HEIMDALL_UID=0\n", 1),
-                ("export HEIMDALL_GID=0\n", 1),
-            ):
-                with self.subTest(env=env_content):
-                    handle.seek(0)
-                    handle.truncate()
-                    handle.write(env_content)
-                    handle.flush()
-                    env = {k: v for k, v in os.environ.items() if not k.startswith("HEIMDALL_")}
-                    env["ENV_FILE"] = handle.name
-                    res = subprocess.run([bash, "-c", script], env=env, check=False)  # noqa: S603
-                    self.assertEqual(
-                        res.returncode,
-                        expected_exit,
-                        f"Échec pour env: {env_content!r}",
-                    )
-
-    def test_guide_env_guard_does_not_execute_code_or_leak_secrets(self) -> None:
-        """Vérifie que le garde n'exécute pas de code arbitraire et ne fuite aucun secret."""
-        bash = shutil.which("bash")
-        self.assertIsNotNone(bash)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pwned = Path(tmpdir) / "pwned"
-            script = (
-                "set -eu\n"
-                "for VAR in HEIMDALL_UID HEIMDALL_GID; do\n"
-                '  VAL=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${VAR}[[:space:]]*=" '
-                '"$ENV_FILE" 2>/dev/null | tail -1 | '
-                'sed -e "s/^[^=]*=//" -e "s/[[:space:]#].*$//" -e "s/[\\"\'\']//g")\n'
-                '  if [[ -n "$VAL" && "$VAL" =~ ^0+$ ]]; then\n'
-                "    exit 1\n"
-                "  fi\n"
-                "done\n"
-                'echo "MASTER_KEY=${HEIMDALL_VAULT_MASTER_KEY:-unset}"\n'
-                'echo "PEPPER=${HEIMDALL_VAULT_API_KEY_PEPPER:-unset}"\n'
-            )
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
-                handle.write(
-                    f"HEIMDALL_UID=$(touch {pwned})\n"
-                    "HEIMDALL_GID=1000\n"
-                    "HEIMDALL_VAULT_MASTER_KEY=secret_master_key\n"
-                    "HEIMDALL_VAULT_API_KEY_PEPPER=secret_pepper\n"
-                )
-                handle.flush()
-                env = {k: v for k, v in os.environ.items() if not k.startswith("HEIMDALL_")}
-                env["ENV_FILE"] = handle.name
-                res = subprocess.run(  # noqa: S603
-                    [bash, "-c", script],
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self.assertEqual(res.returncode, 0)
-                self.assertFalse(pwned.exists(), "Code arbitraire exécuté depuis .env")
-                self.assertIn("MASTER_KEY=unset", res.stdout)
-                self.assertIn("PEPPER=unset", res.stdout)
-                self.assertNotIn("secret_master_key", res.stdout)
-                self.assertNotIn("secret_pepper", res.stdout)
+        self.assertNotIn("set -a", guide)
 
 
 if __name__ == "__main__":

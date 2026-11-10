@@ -19,10 +19,13 @@ services:
     init: true
     network_mode: host
     read_only: true
-    # UID/GID de l'utilisateur hôte qui possède ./data et ./secrets.
-    # Évite de lancer le conteneur en root tout en gardant les fichiers locaux
-    # accessibles (10001 par défaut dans l'image, surchargé par .env).
-    user: "${HEIMDALL_UID:-1000}:${HEIMDALL_GID:-1000}"
+    # Utilisateur non-root figé de l'image (10001:10001, voir Dockerfile:43-57).
+    # Volontairement sans variable : un `user:` variable résolvable en 0
+    # (UID 0 dans .env + `docker compose up` direct sans §4)
+    # démarrait transitoirement le conteneur en root avant la sortie 1
+    # de l'entrypoint. Le `chown -R 10001:10001 data secrets` du §3 du guide
+    # rend les bind mounts accessibles à cet UID fixe.
+    user: "10001:10001"
     env_file:
       - .env
     environment:

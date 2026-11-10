@@ -36,16 +36,16 @@ dépendances hashées, TLS obligatoire) via Docker Compose :
 
 ```sh
 install -m 600 .env.example .env
-# Générer les valeurs avec docs/install.md §3 (umask 077, openssl rand).
-# Appliquer impérativement les gardes docs/install.md §4 avant tout `docker compose up` (jamais UID/GID 0).
+# Générer les valeurs avec docs/install.md §3 (umask 077, openssl rand,
+# `sudo chown -R 10001:10001 data secrets` pour l'UID figé).
+# Le compose fige `user: "10001:10001"` : aucun `up` ne peut démarrer en root.
 docker compose up -d --build
 curl --cacert secrets/vault_tls_cert.pem https://127.0.0.1:8443/api/v1/health
 ```
 
-Guide complet, génération des secrets/TLS, gardes de démarrage non-root (§4),
-premier scan et dépannage : [`docs/install.md`](docs/install.md). Ne jamais lancer
-le conteneur directement sans les gardes du §4 (`HEIMDALL_UID`/`HEIMDALL_GID` résolus
-différents de 0). Le Vault reste **loopback-only** :
+Guide complet, génération des secrets/TLS, garde de démarrage non-root (§4),
+premier scan et dépannage : [`docs/install.md`](docs/install.md). Ne jamais
+surcharger `user:` (figé à `10001:10001`). Le Vault reste **loopback-only** :
 `network_mode: host` est requis, et Docker Desktop macOS/Windows n'est pas
 supporté pour ce montage.
 

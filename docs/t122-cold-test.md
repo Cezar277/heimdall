@@ -39,12 +39,12 @@ et lancer Heimdall **avec la seule documentation** `docs/install.md`.
 |---|---|
 | Le scan échoue hors dépôt Git (exit 2) | Le guide impose `git init -q` avant le premier scan |
 | Le Vault refuse un port mapping Docker (403 loopback) | Le guide et le compose imposent `network_mode: host` |
-| Les secrets TLS montés en `0600` root ne sont pas lisibles par l'utilisateur du conteneur | Le compose utilise l'UID/GID hôte (`HEIMDALL_UID`/`HEIMDALL_GID`) et un bind mount `./secrets` |
+| Les secrets TLS montés en `0600` root ne sont pas lisibles par l'utilisateur du conteneur | Le compose fige `user: "10001:10001"` et le guide fait `sudo chown -R 10001:10001 data secrets` |
 | Le healthcheck doit vérifier TLS | `docker/healthcheck.py` vérifie le certificat local, sans désactiver la validation |
 | Le scan n'est pas dans l'image Vault minimale | Le guide installe la CLI locale dans un venv dédié |
 | Clé API visible dans `ps`/historique avec `curl -H` | Le guide utilise `read -rsp`, valide le charset, `mktemp`, un fichier d'en-tête `600`, `curl -K` et supprime le fichier après usage |
 | Image de base mutable (`python:3.12-slim`) | Digest `@sha256:...` épinglé dans le Dockerfile |
-| `HEIMDALL_UID=0` pouvait relancer le conteneur en root | Entrypoint refusant `euid == 0`, testé ; guide refusant `id -u == 0` et `HEIMDALL_UID/GID=0` |
+| `HEIMDALL_UID=0` pouvait relancer le conteneur en root | `user:` figé à `10001:10001` (aucune variable résolvable en 0) + entrypoint refusant `euid == 0`, testé ; guide refusant `id -u == 0` côté hôte |
 | Sauvegarde non chiffrée de `.env`/`secrets` | Archive chiffrée authentifiée `gpg --symmetric --cipher-algo AES256` |
 | Sauvegarde SQLite à chaud | Le guide arrête le Vault (`docker compose stop vault`), refuse un WAL/SHM résiduel, archive puis redémarre |
 | Permissions de `data/`/`secrets/` dépendantes de l'umask | `chmod 700 data secrets` et `chmod 600` explicites |

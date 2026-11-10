@@ -75,8 +75,6 @@ cat > "$ENV_TMP" <<ENV_FILE
 HEIMDALL_VAULT_MASTER_KEY=$(openssl rand -base64 32)
 HEIMDALL_VAULT_API_KEY_PEPPER=$(openssl rand -base64 32)
 HEIMDALL_VAULT_KEK_SALT=$(openssl rand -base64 16)
-HEIMDALL_UID=$(id -u)
-HEIMDALL_GID=$(id -g)
 ENV_FILE
 mv -f "$ENV_TMP" .env
 trap - EXIT INT TERM HUP
@@ -90,6 +88,12 @@ openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
   -addext "extendedKeyUsage=serverAuth" \
   -addext "basicConstraints=critical,CA:FALSE"
 chmod 600 secrets/vault_tls_cert.pem secrets/vault_tls_key.pem
+# Le conteneur tourne en 10001:10001 figé (docker-compose.yml, pas de variable
+# UID/GID) : transférer la propriété des bind mounts à cet UID fixe.
+# Requiert sudo/root une seule fois ; `.env` reste possédé par l'hôte (lu par
+# Compose côté hôte, pas besoin de chown).
+sudo chown -R 10001:10001 data secrets
+chmod 700 data secrets
 ```
 
 - `HEIMDALL_VAULT_MASTER_KEY` : phrase de passe longue et unique, **sans
@@ -98,42 +102,28 @@ chmod 600 secrets/vault_tls_cert.pem secrets/vault_tls_key.pem
   maîtresse. Le perdre rend les secrets existants illisibles.
 - `HEIMDALL_VAULT_API_KEY_PEPPER` : pepper d'authentification, distinct de la
   clé maîtresse et de la KEK.
-- `HEIMDALL_UID` / `HEIMDALL_GID` : UID/GID de l'utilisateur hôte qui possède
-  `data/` et `secrets/`. Le conteneur tourne avec cet UID, jamais en root.
-  **Ne jamais mettre `0`** : l'entrypoint refuse explicitement `euid == 0`.
+- `HEIMDALL_UID` / `HEIMDALL_GID` : supprimés — le conteneur tourne en
+  `10001:10001` figé (`docker-compose.yml`, `Dockerfile:43-57`). Rendre
+  `data/` et `secrets/` accessibles via `sudo chown -R 10001:10001 data
+  secrets` (ci-dessus). L'entrypoint refuse toujours `euid == 0` ou
+  `egid == 0` en défense en profondeur (ex. `docker compose run --user 0`).
 
 > **Sauvegarde.** Sauvegardez `.env` et `secrets/` dans un coffre séparé. Sans
 > eux, la base `data/vault.db` est définitivement illisible.
 
 ## 4. Démarrer le Vault
 
-Refuser explicitement une installation lancée en root : le conteneur doit
-tourner avec l'UID de l'utilisateur hôte, jamais `0`. Tout lancement du conteneur
-(`docker compose up`) doit impérativement passer par les gardes ci-dessous afin
-de garantir qu'aucun démarrage transitoire en root ne se produise avant l'arrêt
-de l'entrypoint.
+Refuser explicitement une installation lancée en root côté hôte. Le conteneur
+tourne en `10001:10001` figé (`docker-compose.yml`) : même un `docker compose
+up` direct sans ce § ne peut pas démarrer en root — aucun `user:` résolvable
+en `0`, l'entrypoint refuse `euid == 0 || egid == 0` en défense en profondeur
+(ex. `docker compose run --user 0`).
 
 ```sh
 [[ "$(id -u)" != 0 ]] || {
   echo "installation en root refusée : utiliser un compte non privilégié" >&2
   exit 1
 }
-grep -Eq "^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)[[:space:]]*=[[:space:]]*['\"]?0+['\"]?([[:space:]#]|$)" .env && {
-  echo "HEIMDALL_UID/HEIMDALL_GID=0 interdit dans .env" >&2
-  exit 1
-}
-# shellcheck disable=SC1091
-for VAR in HEIMDALL_UID HEIMDALL_GID; do
-  VAL=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${VAR}[[:space:]]*=" .env 2>/dev/null | tail -1 | sed -e 's/^[^=]*=//' -e 's/[[:space:]#].*$//' -e 's/["'\'']//g')
-  if [[ -n "$VAL" && "$VAL" =~ ^0+$ ]]; then
-    echo "${VAR} résolu à 0 interdit dans .env" >&2
-    exit 1
-  fi
-done
-if [[ "${HEIMDALL_UID:-1000}" =~ ^0+$ || "${HEIMDALL_GID:-1000}" =~ ^0+$ ]]; then
-  echo "HEIMDALL_UID/HEIMDALL_GID résolu à 0 interdit dans l'environnement" >&2
-  exit 1
-fi
 for f in .env.??????; do
   [ -e "$f" ] && { echo "fichier .env temporaire résiduel : $f" >&2; exit 1; }
 done
@@ -368,8 +358,8 @@ et les valeurs sont perdues.
 | `Connection refused` | Conteneur arrêté ou port 8443 occupé | `docker compose ps`, `ss -ltnp \| grep 8443`, `docker compose logs vault` |
 | `TLS obligatoire en production` | `secrets/vault_tls_cert.pem` ou `vault_tls_key.pem` absent | Régénérer les fichiers de l'étape 3 |
 | `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `install -m 600 .env.example .env`, remplir via §3, `docker compose up -d` |
-| `Permission denied` sur `/data` | UID/GID du conteneur différent du propriétaire de `data/` | Renseigner `HEIMDALL_UID`/`HEIMDALL_GID` avec `id -u`/`id -g`, `chown -R` sur `data/`, `chmod 700 data secrets` |
-| `refus: le conteneur Vault ne doit pas tourner en root` | `HEIMDALL_UID=0` ou `user: "0:0"` | Remettre l'UID/GID de l'hôte (`id -u`/`id -g`), jamais `0` |
+| `Permission denied` sur `/data` | `data/` non possédé par `10001:10001` | `sudo chown -R 10001:10001 data secrets`, `chmod 700 data secrets` |
+| `refus: le conteneur Vault ne doit pas tourner en root` | surcharge `--user 0` manuelle | Ne jamais surcharger `user:` (figé à `10001:10001` dans le compose) |
 | `data/ et secrets/ ne doivent pas être des liens symboliques` | Un lien a été créé avant l'installation | Supprimer le lien et recréer un répertoire réel (`rm data && mkdir data`, idem `secrets`) |
 | `docker compose config --quiet` échoue | `.env` ou secrets manquants | Créer les fichiers de l'étape 3 |
 | Le healthcheck reste `unhealthy` | Certificat sans SAN `127.0.0.1` ou service pas prêt | Vérifier `openssl x509 -in secrets/vault_tls_cert.pem -text -noout`, logs |
@@ -391,7 +381,8 @@ docker compose exec -T vault ls -ld /data /run/secrets
 
 - Le Vault n'écoute que sur `127.0.0.1:8443`. Ne jamais l'exposer sur une
   interface réseau publique.
-- Le conteneur est non root, en lecture seule, avec `cap_drop: ALL`,
+- Le conteneur est non root figé (`user: "10001:10001"`, `USER 10001:10001`),
+  en lecture seule, avec `cap_drop: ALL`,
   `no-new-privileges` et des limites de processus/mémoire.
 - Les secrets arrivent par `.env` (permissions `600`) et `secrets/`
   (permissions restrictives), jamais dans l'image ni dans un commit.
