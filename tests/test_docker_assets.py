@@ -380,10 +380,6 @@ class GuideApiKeyValidationTests(unittest.TestCase):
                 self.assertIsNone(pattern.fullmatch(invalid))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class UidGidGuardTests(unittest.TestCase):
     def test_uid_gid_guard_rejects_export_quotes_and_spaces(self) -> None:
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")
@@ -422,3 +418,7 @@ class UidGidGuardTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
