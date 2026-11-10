@@ -51,7 +51,7 @@ et lancer Heimdall **avec la seule documentation** `docs/install.md`.
 | Quickstart `.env` créé en `644` avant `chmod` | `install -m 600 .env.example .env` |
 | Nom de sauvegarde recalculé entre `gpg` et `chmod` | Nom figé dans `F` avant l'écriture |
 | Archive de sauvegarde laissée dans le dépôt | Écriture dans `$HOME`, motifs `heimdall-backup-*.tgz.gpg` ajoutés à `.gitignore` et `.dockerignore` |
-| Clone non reproductible (HEAD) | `git checkout t41-audit` (tag audité) documenté |
+| Clone non reproductible (HEAD) | `git checkout 49bb5cc` (SHA audité) documenté, tag `t41-audit` comme alias |
 | Certificat auto-signé possiblement `CA:TRUE` | `basicConstraints=critical,CA:FALSE` ajouté |
 | Répertoire de test fixe dans `/tmp` | `mktemp -d /tmp/heimdall-clean.XXXXXX` |
 | `.env` temporaire résiduel après `kill -9` | `trap ... HUP` + refus si `.env.??????` subsiste |

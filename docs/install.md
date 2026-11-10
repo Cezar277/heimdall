@@ -40,7 +40,7 @@ python3 --version
 git clone https://github.com/Cezar277/heimdall.git
 cd heimdall
 # Révision auditée (voir docs/t41-samm.md) : installation reproductible.
-git checkout t41-audit
+git checkout 49bb5ccce63a102e1f00a075f1cd6c83dfbe366e
 git rev-parse --short HEAD
 ```
 
@@ -111,7 +111,7 @@ tourner avec l'UID de l'utilisateur hôte, jamais `0`.
   echo "installation en root refusée : utiliser un compte non privilégié" >&2
   exit 1
 }
-grep -Eq "^HEIMDALL_(UID|GID)=['\"]?[[:space:]]*0+['\"]?([[:space:]#]|$)" .env && {
+grep -Eq "^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)[[:space:]]*=[[:space:]]*['\"]?0+['\"]?([[:space:]#]|$)" .env && {
   echo "HEIMDALL_UID/HEIMDALL_GID=0 interdit dans .env" >&2
   exit 1
 }
@@ -259,7 +259,7 @@ docker compose start
 
 ```sh
 git fetch origin
-git checkout t41-audit   # même révision auditée qu'au §2
+git checkout 49bb5ccce63a102e1f00a075f1cd6c83dfbe366e   # même révision auditée qu'au §2
 git rev-parse --short HEAD
 docker compose build --pull
 docker compose up -d

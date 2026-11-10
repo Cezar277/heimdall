@@ -101,7 +101,9 @@ python3 -m venv .venv
 .venv/bin/pip install --require-hashes -r requirements-runtime.lock
 .venv/bin/pip install -e . --no-deps --no-build-isolation
 
-mkdir -p /tmp/heimdall-clean && cd /tmp/heimdall-clean
+D="$(mktemp -d /tmp/heimdall-clean.XXXXXX)"
+trap 'rm -rf "$D"' EXIT
+cd "$D"
 git init -q
 /path/vers/heimdall/.venv/bin/heimdall scan .
 # exit 0

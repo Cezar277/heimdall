@@ -13,6 +13,7 @@ import io
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 import urllib.request
 from pathlib import Path
@@ -176,9 +177,9 @@ class InstallGuideTests(unittest.TestCase):
         text = INSTALL_GUIDE.read_text(encoding="utf-8")
         for expected in (
             '[[ "$(id -u)" != 0 ]]',
-            "git checkout t41-audit",
+            "git checkout 49bb5ccce63a102e1f00a075f1cd6c83dfbe366e",
             "git fetch origin",
-            'grep -Eq "^HEIMDALL_(UID|GID)=',
+            'grep -Eq "^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)',
             "docker compose stop vault || exit 1",
             "basicConstraints=critical,CA:FALSE",
             ".env.??????",
@@ -217,6 +218,21 @@ class InstallGuideTests(unittest.TestCase):
         self.assertNotIn("export HEIMDALL_API_KEY=", text)
         self.assertNotIn("/tmp/heimdall-auth.header", text)  # noqa: S108
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
+
+
+class SamnAndPinTests(unittest.TestCase):
+    def test_samm_scan_snippet_uses_mktemp(self) -> None:
+        text = (ROOT / "docs" / "t41-samm.md").read_text(encoding="utf-8")
+        self.assertIn("mktemp -d /tmp/heimdall-clean.XXXXXX", text)
+        self.assertNotIn("mkdir -p /tmp/heimdall-clean", text)
+
+    def test_install_and_samm_pin_the_same_audited_sha(self) -> None:
+        sha = "49bb5ccce63a102e1f00a075f1cd6c83dfbe366e"
+        install = INSTALL_GUIDE.read_text(encoding="utf-8")
+        samm = (ROOT / "docs" / "t41-samm.md").read_text(encoding="utf-8")
+        self.assertIn(f"git checkout {sha}", install)
+        self.assertIn(sha, samm)
+        self.assertIn("t41-audit", install + samm)
 
 
 class BackupIgnoreTests(unittest.TestCase):
@@ -366,3 +382,43 @@ class GuideApiKeyValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UidGidGuardTests(unittest.TestCase):
+    def test_uid_gid_guard_rejects_export_quotes_and_spaces(self) -> None:
+        guide = INSTALL_GUIDE.read_text(encoding="utf-8")
+        pattern = (
+            r"^[[:space:]]*(export[[:space:]]+)?HEIMDALL_(UID|GID)"
+            r"[[:space:]]*=[[:space:]]*['\"]?0+['\"]?([[:space:]#]|$)"
+        )
+        self.assertIn(pattern, guide)
+        grep = shutil.which("grep")
+        self.assertIsNotNone(grep)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
+            for line in (
+                "HEIMDALL_UID=0",
+                "HEIMDALL_UID=00",
+                "HEIMDALL_UID = 0",
+                'HEIMDALL_UID="0"',
+                "export HEIMDALL_UID=0",
+                "export HEIMDALL_GID= 0",
+            ):
+                with self.subTest(line=line):
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(line + "\n")
+                    handle.flush()
+                    result = subprocess.run(  # noqa: S603
+                        [grep, "-Eq", pattern, handle.name],
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, line)
+            handle.seek(0)
+            handle.truncate()
+            handle.write("HEIMDALL_UID=1000\nHEIMDALL_GID=1000\n")
+            handle.flush()
+            result = subprocess.run(  # noqa: S603
+                [grep, "-Eq", pattern, handle.name],
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
