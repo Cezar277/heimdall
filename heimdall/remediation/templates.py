@@ -651,13 +651,23 @@ _NAMESPACE_READER_FUNCS: Final[frozenset[str]] = frozenset({"vars", "locals", "g
 
 
 def _const_str_value(node: ast.AST) -> str | None:
-    """Valeur d'une constante chaîne, repliée à travers ``+`` (``"ev"+"al"``).
+    """Valeur d'une constante chaîne, repliée à travers ``+`` et f-string statique.
 
-    Ne replie que les concaténations de littéraux : toute autre forme rend
-    ``None`` et le doute profite au refus par l'appelant.
+    Replie ``"ev"+"al"`` et ``f"eval"`` sans interpolation ; toute autre forme
+    (interpolation, appel, nom) rend ``None`` et le doute profite au refus
+    par l'appelant.
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            else:
+                # Interpolation (``f"ev{'al'}"``) : valeur dynamique, non repliable.
+                return None
+        return "".join(parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         left = _const_str_value(node.left)
         right = _const_str_value(node.right)
@@ -667,19 +677,22 @@ def _const_str_value(node: ast.AST) -> str | None:
 
 
 def _has_str_addition(node: ast.AST) -> bool:
-    """Vrai si la sous-arborescence mélange concaténation et littéraux."""
+    """Vrai si la sous-arborescence mélange concaténation/f-string et littéraux."""
     has_add = False
     has_str = False
+    has_fstring = False
     for child in ast.walk(node):
         if isinstance(child, ast.BinOp) and isinstance(child.op, ast.Add):
             has_add = True
         elif isinstance(child, ast.Constant) and isinstance(child.value, str):
             has_str = True
-    return has_add and has_str
+        elif isinstance(child, ast.JoinedStr):
+            has_fstring = True
+    return (has_add and has_str) or has_fstring
 
 
 def _folded_names_eval(node: ast.AST) -> bool:
-    """Constante (repliée) ou concaténation suspecte nommant ``eval``."""
+    """Constante (repliée) ou concaténation/f-string suspecte nommant ``eval``."""
     folded = _const_str_value(node)
     if folded is not None:
         return folded in _CODE_EVALUATION_FUNCS
@@ -1881,16 +1894,177 @@ _NO_ALIASES: Final[frozenset[str]] = frozenset({})
 _JS_EVAL_ALIASABLE: Final[frozenset[str]] = frozenset({"eval", "Function"})
 
 
+def _js_alias_source_is_process_env(tokens: list[_JsToken], cursor: int) -> bool:
+    """Vrai si ``cursor`` (après ``process``) désigne ``.env`` ou ``["env"]``.
+
+    Accepte ``process.env``, ``process?.env``, ``process["env"]``,
+    ``process['env']``, ``process?.["env"]`` (jetons ``?``/``.``/``[`` normalisés
+    à la volée, miroir de ``_js_env_access_present``). Un membre supplémentaire
+    (``process.env.foo``, ``process["env"].foo``, ``process["env"]["x"]``)
+    n'est pas une source d'alias : l'objet lié n'est plus ``process.env``.
+    """
+    pos = cursor
+    while pos < len(tokens) and tokens[pos].kind == "punct" and tokens[pos].value in {"?", "."}:
+        pos += 1
+    if pos < len(tokens) and tokens[pos].kind == "ident" and tokens[pos].value == "env":
+        nxt = pos + 1
+        if nxt < len(tokens) and tokens[nxt].kind == "punct":
+            if tokens[nxt].value in {"?", ".", "["}:
+                return False
+        return True
+    if pos < len(tokens) and tokens[pos].kind == "punct" and tokens[pos].value == "[":
+        pos += 1
+        while pos < len(tokens) and tokens[pos].kind == "punct" and tokens[pos].value == "?":
+            pos += 1
+        if (
+            pos < len(tokens)
+            and tokens[pos].kind == "string"
+            and tokens[pos].value == "env"
+            and pos + 1 < len(tokens)
+            and tokens[pos + 1].kind == "punct"
+            and tokens[pos + 1].value == "]"
+        ):
+            nxt = pos + 2
+            if nxt < len(tokens) and tokens[nxt].kind == "punct":
+                if tokens[nxt].value in {"?", ".", "["}:
+                    return False
+            return True
+    return False
+
+
+def _js_destructured_env_aliases(  # noqa: PLR0912 - balayage borné des motifs `{…} = process`
+    tokens: list[_JsToken],
+) -> set[str]:
+    """Alias issus de ``const {env[, …]} = process`` (``{env: e}`` inclus).
+
+    Balaye les motifs ``{ … } = process`` : toute propriété ``env`` lie soit
+    ``env`` (``{env}``, ``{env = d}``) soit son alias local (``{env: e}``,
+    ``{env: e = d}``, clé chaîne ``{"env": e}``). Sur-refus documenté : pas
+    d'analyse de flot, le doute profite au refus.
+    """
+    found: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        if tokens[index].kind == "punct" and tokens[index].value == "{":
+            depth = 0
+            closer = -1
+            cursor = index
+            while cursor < len(tokens):
+                if tokens[cursor].kind == "punct":
+                    if tokens[cursor].value == "{":
+                        depth += 1
+                    elif tokens[cursor].value == "}":
+                        depth -= 1
+                        if depth == 0:
+                            closer = cursor
+                            break
+                cursor += 1
+            if closer >= 0 and closer + 2 < len(tokens):
+                if (
+                    tokens[closer + 1].kind == "punct"
+                    and tokens[closer + 1].value == "="
+                    and tokens[closer + 2].kind == "ident"
+                    and tokens[closer + 2].value == "process"
+                ):
+                    inner = tokens[index + 1 : closer]
+                    pos = 0
+                    while pos < len(inner):
+                        tok = inner[pos]
+                        is_env_key = (tok.kind == "ident" and tok.value == "env") or (
+                            tok.kind == "string" and tok.value == "env"
+                        )
+                        if is_env_key:
+                            nxt = pos + 1
+                            if (
+                                nxt < len(inner)
+                                and inner[nxt].kind == "punct"
+                                and inner[nxt].value == ":"
+                            ):
+                                if (
+                                    nxt + 1 < len(inner)
+                                    and inner[nxt + 1].kind == "ident"
+                                    and inner[nxt + 1].value is not None
+                                ):
+                                    found.add(inner[nxt + 1].value or "")
+                                else:
+                                    found.add("env")
+                            else:
+                                found.add("env")
+                        pos += 1
+                    index = closer + 2
+        index += 1
+    return found
+
+
+def _js_imported_env_aliases(  # noqa: PLR0912 - balayage borné des imports `{env}`
+    tokens: list[_JsToken],
+) -> set[str]:
+    """Alias issus de ``import {env[, …]} from …`` (``{env as e}`` inclus).
+
+    Tout ``env`` nommé importé lie ``process.env`` (``node:process``) : par
+    prudence le doute profite au refus quelle que soit la source (sur-refus
+    documenté), miroir de la déstructuration.
+    """
+    found: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        if tokens[index].kind == "ident" and tokens[index].value == "import":
+            cursor = index + 1
+            if (
+                cursor < len(tokens)
+                and tokens[cursor].kind == "punct"
+                and tokens[cursor].value == "{"
+            ):
+                depth = 0
+                closer = -1
+                scan = cursor
+                while scan < len(tokens):
+                    if tokens[scan].kind == "punct":
+                        if tokens[scan].value == "{":
+                            depth += 1
+                        elif tokens[scan].value == "}":
+                            depth -= 1
+                            if depth == 0:
+                                closer = scan
+                                break
+                    scan += 1
+                if closer >= 0:
+                    inner = tokens[cursor + 1 : closer]
+                    pos = 0
+                    while pos < len(inner):
+                        tok = inner[pos]
+                        if tok.kind == "ident" and tok.value == "env":
+                            if (
+                                pos + 2 < len(inner)
+                                and inner[pos + 1].kind == "ident"
+                                and inner[pos + 1].value == "as"
+                                and inner[pos + 2].kind == "ident"
+                                and inner[pos + 2].value is not None
+                            ):
+                                found.add(inner[pos + 2].value or "")
+                            else:
+                                found.add("env")
+                        pos += 1
+                    index = closer
+        index += 1
+    return found
+
+
 def _js_env_aliases(tokens: list[_JsToken]) -> frozenset[str]:
     """Noms liés à ``process.env`` (``const env = process.env``).
 
     Analyse syntaxique bornée, sans dataflow : un identifiant ``X`` suivi
     d'une affectation simple ``=`` (ni ``==``, ``=>``, ``<=``... ni membre
-    ``process.env.foo``) vers ``process.env`` / ``process?.env``. Tout
-    ``X["NOM"]`` / ``X.get("NOM")`` ultérieur est refusé (sur-refus
-    documenté) plutôt que de corrompre la clé.
+    ``process.env.foo``) vers ``process.env`` / ``process?.env`` /
+    ``process["env"]`` / ``process?.["env"]``. La déstructuration
+    (``const {env} = process``, ``const {env: e} = process``) et l'import
+    nommé (``import {env[, …]} from …``, ``{env as e}``) lient aussi
+    ``process.env``. Tout ``X["NOM"]`` / ``X.get("NOM")`` ultérieur est refusé
+    (sur-refus documenté) plutôt que de corrompre la clé.
     """
     aliases: set[str] = set()
+    aliases.update(_js_destructured_env_aliases(tokens))
+    aliases.update(_js_imported_env_aliases(tokens))
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -1913,39 +2087,20 @@ def _js_env_aliases(tokens: list[_JsToken]) -> frozenset[str]:
                 and tokens[index + 3].kind == "punct"
                 and tokens[index + 3].value in {"=", ">"}
             )
-            if plain_assignment:
-                cursor = index + 3
+            if plain_assignment and _js_alias_source_is_process_env(tokens, index + 3):
+                aliases.add(name)
+                start = index
                 while (
-                    cursor < len(tokens)
-                    and tokens[cursor].kind == "punct"
-                    and tokens[cursor].value in {"?", "."}
+                    start - 2 >= 0
+                    and tokens[start - 1].kind == "punct"
+                    and tokens[start - 1].value == "="
+                    and tokens[start - 2].kind == "ident"
                 ):
-                    cursor += 1
-                if (
-                    cursor < len(tokens)
-                    and tokens[cursor].kind == "ident"
-                    and tokens[cursor].value == "env"
-                    and (
-                        cursor + 1 >= len(tokens)
-                        or not (
-                            tokens[cursor + 1].kind == "punct"
-                            and tokens[cursor + 1].value in {"?", "."}
-                        )
-                    )
-                ):
-                    aliases.add(name)
-                    start = index
-                    while (
-                        start - 2 >= 0
-                        and tokens[start - 1].kind == "punct"
-                        and tokens[start - 1].value == "="
-                        and tokens[start - 2].kind == "ident"
-                    ):
-                        chained = tokens[start - 2].value
-                        if chained is None:
-                            break
-                        aliases.add(chained)
-                        start -= 2
+                    chained = tokens[start - 2].value
+                    if chained is None:
+                        break
+                    aliases.add(chained)
+                    start -= 2
         index += 1
     return frozenset(aliases)
 

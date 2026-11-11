@@ -261,6 +261,9 @@ def test_python_handles_non_ascii_on_the_same_line() -> None:
         (f'x = getattr(b, "exec")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = getattr(__builtins__, "ev" + "al")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = getattr(x, "e" + "v" + "al")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = getattr(__builtins__, f"eval")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = getattr(x, f"ev{{\'al\'}}")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = vars(__builtins__)[f"eval"]("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = vars(__builtins__)["eval"]("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = vars(b)["exec"]("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = getattr(vars(), "{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
@@ -569,6 +572,13 @@ def test_javascript_refuses_environment_key_auto_targeting(source: str) -> None:
         'const env = process.env;\nx = env["APP_KEY"];\n',
         'env = process.env;\nx = env["APP_KEY"];\n',
         'const env = process.env;\nx = env.get("APP_KEY");\n',
+        'const env = process["env"];\nx = env["APP_KEY"];\n',
+        "const env = process['env'];\nx = env[\"APP_KEY\"];\n",
+        'const env = process?.["env"];\nx = env["APP_KEY"];\n',
+        'const {env} = process;\nx = env["APP_KEY"];\n',
+        'const {env: e} = process;\nx = e["APP_KEY"];\n',
+        'import {env} from "node:process";\nx = env["APP_KEY"];\n',
+        'import {env as e} from "node:process";\nx = e["APP_KEY"];\n',
     ],
 )
 def test_javascript_refuses_aliased_environment_key(source: str) -> None:
