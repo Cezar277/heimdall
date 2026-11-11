@@ -103,6 +103,24 @@ def test_templates_are_closed_and_exact() -> None:
     assert replacement_expression(Language.JAVASCRIPT, "APP_KEY") == "process.env.APP_KEY"
 
 
+def test_templates_are_immutable() -> None:
+    """`TEMPLATES` immuable : toute réassignation lève `TypeError`."""
+    with pytest.raises(TypeError):
+        TEMPLATES[Language.PYTHON] = "evil"  # type: ignore[index]
+
+
+def test_safe_dict_never_contains_the_secret_or_source() -> None:
+    """`to_safe_dict()` sans contenu, `asdict()` interdit (fuite `before`)."""
+    import dataclasses
+
+    plan = patch("app.py", f'TOKEN = "{SECRET}"\n', 1)
+    safe = plan.to_safe_dict()
+    assert "before" not in safe and "after" not in safe
+    assert SECRET not in str(safe)
+    assert SECRET in plan.before
+    assert SECRET in str(dataclasses.asdict(plan))
+
+
 @pytest.mark.parametrize(
     "variable",
     ["", "a", "APP-KEY", "APP KEY", 'APP"]', "APP\nKEY", "ÄPP_KEY", "A" * 65],
@@ -852,6 +870,7 @@ def test_module_has_no_execution_or_network_dependency() -> None:
             imported.add(node.module.split(".", 1)[0])
     allowed = {
         "ast",
+        "collections",
         "dataclasses",
         "enum",
         "__future__",
@@ -860,6 +879,7 @@ def test_module_has_no_execution_or_network_dependency() -> None:
         "pathlib",
         "re",
         "tokenize",
+        "types",
         "typing",
     }
     assert imported <= allowed

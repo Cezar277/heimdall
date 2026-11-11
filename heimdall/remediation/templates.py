@@ -40,9 +40,11 @@ import ast
 import io
 import re
 import tokenize
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import PurePosixPath
+from types import MappingProxyType
 from typing import Final
 
 from heimdall.scanner.finding import Finding, validate_relative_path
@@ -87,11 +89,14 @@ EXTENSION_LANGUAGE: Final[dict[str, Language]] = {
 }
 
 #: Templates exposés pour la revue et les tests. Le nom est inséré seulement
-#: après validation de sa grammaire fermée.
-TEMPLATES: Final[dict[Language, str]] = {
-    Language.PYTHON: 'os.environ["{variable}"]',
-    Language.JAVASCRIPT: "process.env.{variable}",
-}
+#: après validation de sa grammaire fermée. Immuable (`MappingProxyType`) :
+#: `Final` seul n'empêcherait pas `TEMPLATES[Language.PYTHON] = ...`.
+TEMPLATES: Final[Mapping[Language, str]] = MappingProxyType(
+    {
+        Language.PYTHON: 'os.environ["{variable}"]',
+        Language.JAVASCRIPT: "process.env.{variable}",
+    }
+)
 
 
 class TemplateError(Exception):
@@ -187,6 +192,25 @@ class ReplacementPlan:
             f"language={None if self.language is None else self.language.value!r}, "
             f"{state})"
         )
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Vue sérialisable sans contenu : jamais `before`/`after`.
+
+        `dataclasses.asdict()`/`astuple()` extrairaient `before` (qui contient
+        le secret par définition) en clair : ne jamais les sérialiser ni les
+        journaliser, utiliser cette vue (invariant 8).
+        """
+        return {
+            "file": self.file,
+            "line": self.line,
+            "language": None if self.language is None else self.language.value,
+            "variable": self.variable,
+            "expression": self.expression,
+            "manual_remediation": self.manual_remediation,
+            "reason": None if self.reason is None else self.reason.value,
+            "import_added": self.import_added,
+            "line_after": self.line_after,
+        }
 
 
 def _check_text(value: object, *, name: str) -> str:

@@ -133,7 +133,10 @@ une chaîne JavaScript ordinaire.
 - **Pas de fuite par `repr`** : `before` et `after` sont exclus de la
   représentation du plan, et la valeur décodée d'un jeton JavaScript
   (`_JsToken.value`) est également masquée. Un journal de session n'y verra
-  pas le secret.
+  pas le secret. Ne jamais sérialiser `before`/`after` (`dataclasses.asdict` /
+  `astuple` les extrairaient en clair) : utiliser `to_safe_dict()`, sans contenu.
+- **Templates immuables** : `TEMPLATES` est un `MappingProxyType`, toute
+  réassignation lève `TypeError`.
 - **Patch vérifié** : après substitution et ajout éventuel de l'import, le
   texte Python final doit reparser ; sinon aucun patch n'est rendu. Côté
   JavaScript, aucun patch n'est rendu sur un contexte ambigu (concaténation
