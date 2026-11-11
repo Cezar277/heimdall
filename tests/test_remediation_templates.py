@@ -257,6 +257,10 @@ def test_python_handles_non_ascii_on_the_same_line() -> None:
         (f'x = exec("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = builtins.eval("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = __builtins__.exec("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = getattr(__builtins__, "eval")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = getattr(b, "exec")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = vars()["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = locals()["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = getattr(os.environ, "get")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = vars(os.environ)["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = getattr(os, "environ")["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
@@ -405,6 +409,12 @@ def test_javascript_regex_with_quotes_does_not_hide_the_real_string() -> None:
         ),
         (f'eval("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'Function("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'eval?.("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'Function?.("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'(0, eval)("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'(0,eval)("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'setTimeout("{SECRET}", 0);\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'setInterval("{SECRET}", 0);\n', ManualReason.AMBIGUOUS_CONTEXT),
     ],
 )
 def test_javascript_refuses_ambiguous_or_absent_cases(source: str, reason: ManualReason) -> None:

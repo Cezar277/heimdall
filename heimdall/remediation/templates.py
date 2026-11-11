@@ -485,6 +485,18 @@ def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> 
             # ``os.environ["NOM"]``, ``vars(os.environ)["NOM"]``,
             # ``getattr(os, "environ")["NOM"]`` : la clé devient la valeur.
             return True
+        if isinstance(parent, ast.Subscript) and isinstance(parent.value, ast.Call):
+            receiver = parent.value.func
+            receiver_name = ""
+            if isinstance(receiver, ast.Name):
+                receiver_name = receiver.id
+            elif isinstance(receiver, ast.Attribute):
+                receiver_name = receiver.attr
+            if receiver_name in _NAMESPACE_READER_FUNCS:
+                # ``vars()["NOM"]``, ``locals()["NOM"]``, ``globals()["NOM"]`` :
+                # le littéral nomme une entrée de l'espace de noms lui-même ;
+                # le patch lirait la valeur d'environnement à la place.
+                return True
         if isinstance(parent, ast.Call) and _python_call_env_access(parent):
             # ``os.environ.get("NOM")``, ``getattr(os.environ, "get")("NOM")``,
             # ``operator.getitem(os.environ, "NOM")``, ``getattr(os, "NOM")`` :
@@ -498,25 +510,53 @@ def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> 
 #: Appels dont le but évalue le littéral comme du code source (``eval("NOM")``).
 _CODE_EVALUATION_FUNCS: Final[frozenset[str]] = frozenset({"eval", "exec", "compile", "__import__"})
 
+#: Récepteurs dont l'espace de noms propre est lu (``vars()["NOM"]``).
+_NAMESPACE_READER_FUNCS: Final[frozenset[str]] = frozenset({"vars", "locals", "globals", "dir"})
+
+
+def _call_resolves_to_eval(call: ast.Call) -> bool:
+    """Vrai si l'appel résout (même indirectement) une fonction d'évaluation.
+
+    Couvre les formes directes (``eval``, ``builtins.eval``) et curryfiées
+    (``getattr(__builtins__, "eval")``, ``vars()["eval"]`` appelé) : quand le
+    but de l'appel est lui-même un appel à ``getattr``/``vars`` dont un
+    argument constant nomme une fonction d'évaluation, le littéral passé à
+    l'appel externe serait ré-évalué comme du code. Le doute profite au refus.
+    """
+    function = call.func
+    if isinstance(function, ast.Name) and function.id in _CODE_EVALUATION_FUNCS:
+        return True
+    if isinstance(function, ast.Attribute) and function.attr in _CODE_EVALUATION_FUNCS:
+        return True
+    if isinstance(function, ast.Call):
+        inner = function.func
+        inner_name = ""
+        if isinstance(inner, ast.Name):
+            inner_name = inner.id
+        elif isinstance(inner, ast.Attribute):
+            inner_name = inner.attr
+        if inner_name in {"getattr", "vars"}:
+            for argument in (*function.args, *(keyword.value for keyword in function.keywords)):
+                if isinstance(argument, ast.Constant) and argument.value in _CODE_EVALUATION_FUNCS:
+                    return True
+        return _call_resolves_to_eval(function)
+    return False
+
 
 def _python_code_evaluation_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     """Vrai si un ancêtre d'appel évalue le littéral comme du code source.
 
     ``eval("APP_KEY")`` transformerait la valeur d'environnement en code : le
     patch ``eval(os.environ["APP_KEY"])`` changerait la sémantique (et introduirait
-    une évaluation dynamique). Le doute profite au refus.
+    une évaluation dynamique). Les formes curryfiées
+    (``getattr(__builtins__, "eval")("APP_KEY")``) sont refusées de la même
+    façon : le doute profite au refus.
     """
     child = node
     parent = parents.get(child)
     while parent is not None:
-        if isinstance(parent, ast.Call):
-            function = parent.func
-            if isinstance(function, ast.Name) and function.id in _CODE_EVALUATION_FUNCS:
-                return True
-            if isinstance(function, ast.Attribute) and function.attr in _CODE_EVALUATION_FUNCS:
-                # ``builtins.eval("NOM")``, ``__builtins__.exec("NOM")`` : l'attribut
-                # porte la même fonction d'évaluation que le nom court.
-                return True
+        if isinstance(parent, ast.Call) and _call_resolves_to_eval(parent):
+            return True
         child = parent
         parent = parents.get(child)
     return False
@@ -1630,6 +1670,67 @@ def _js_standalone_string(tokens: list[_JsToken], position: int) -> bool:
     return before and after
 
 
+#: Appels JS dont le premier argument chaîne serait évalué comme du code.
+_JS_EVAL_CALLEES: Final[frozenset[str]] = frozenset(
+    {"eval", "Function", "compile", "setTimeout", "setInterval"}
+)
+
+#: Longueur du suffixe ``, eval`` qui signe un appel indirect ``(0, eval)(...)``.
+_INDIRECT_EVAL_SUFFIX_LEN: Final[int] = 2
+
+
+def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
+    """Vrai si le littéral est le premier argument d'un appel d'évaluation.
+
+    Couvre les formes directes (``eval("NOM")``), optionnelles
+    (``eval?.("NOM")``, ``Function?.("NOM")`` — le ``?`` est sauté avant le
+    test) et indirectes (``(0, eval)("NOM")`` — séquence ``,`` + ident +
+    ``)`` + ``(``). Dans chaque cas la valeur d'environnement serait
+    ré-évaluée comme du code : le doute profite au refus.
+    """
+    previous = tokens[position - 1] if position > 0 else None
+    if previous is None or previous.kind != "punct" or previous.value != "(":
+        return False
+    cursor = position - _CALL_NAME_OFFSET
+    while cursor >= 0 and tokens[cursor].kind == "punct" and tokens[cursor].value in {"?", "."}:
+        # Appel optionnel : ``eval?.(`` est tokenizé ``eval ? . (`` — le
+        # ``?.`` ne change pas le callee.
+        cursor -= 1
+    if cursor >= 0 and tokens[cursor].kind == "ident" and tokens[cursor].value in _JS_EVAL_CALLEES:
+        return True
+    closer = position - _CALL_NAME_OFFSET
+    if closer >= 0 and tokens[closer].kind == "punct" and tokens[closer].value == ")":
+        # Appel indirect : ``(0, eval)("NOM")`` — le ``(`` du littéral ferme
+        # un groupe dont le dernier membre est ``, eval``.
+        depth = 0
+        opener = closer
+        while opener >= 0:
+            candidate = tokens[opener]
+            if candidate.kind == "punct":
+                if candidate.value == ")":
+                    depth += 1
+                elif candidate.value == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            opener -= 1
+        if opener >= 0:
+            inner = [
+                token
+                for token in tokens[opener + 1 : closer]
+                if not (token.kind == "punct" and token.value == "?")
+            ]
+            if (
+                len(inner) >= _INDIRECT_EVAL_SUFFIX_LEN
+                and inner[-2].kind == "punct"
+                and inner[-2].value == ","
+                and inner[-1].kind == "ident"
+                and inner[-1].value in _JS_EVAL_CALLEES
+            ):
+                return True
+    return False
+
+
 def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
     file: str, source: str, line: int, secret: str, variable: str
 ) -> ReplacementPlan:
@@ -1707,18 +1808,12 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
         and tokens[position - _CALL_NAME_OFFSET].value in {"require", "import"}
     ):
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
-    if (
-        previous is not None
-        and previous.kind == "punct"
-        and previous.value == "("
-        and position >= _CALL_NAME_OFFSET
-        and tokens[position - _CALL_NAME_OFFSET].kind == "ident"
-        and tokens[position - _CALL_NAME_OFFSET].value in {"eval", "Function", "compile"}
-    ):
-        # ``eval("NOM")`` / ``Function("NOM")`` / ``compile("NOM")`` : la valeur
-        # d'environnement serait ré-évaluée comme du code source (``eval`` du
-        # littéral, ``Function`` pour l'invocation dynamique). Le doute profite au
-        # refus, jamais au remplacement.
+    if _js_code_evaluation_call(tokens, position):
+        # ``eval("NOM")`` / ``Function("NOM")`` / ``compile("NOM")``,
+        # ``setTimeout("NOM", ...)``, formes optionnelles (``eval?.(...)``) et
+        # indirectes (``(0, eval)(...)``) : la valeur d'environnement serait
+        # ré-évaluée comme du code source. Le doute profite au refus, jamais
+        # au remplacement.
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
     if (
         following is not None
