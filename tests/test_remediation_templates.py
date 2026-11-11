@@ -114,6 +114,13 @@ def test_variable_grammar_prevents_code_injection(variable: str) -> None:
         replacement_expression(Language.JAVASCRIPT, variable)
 
 
+def test_variable_max_length_is_enforced() -> None:
+    """`MAX_VARIABLE_CHARS` (64) verrouille la grammaire `^[A-Z][A-Z0-9_]{1,63}$`."""
+    assert replacement_expression(Language.PYTHON, "A" * 64) == f'os.environ["{"A" * 64}"]'
+    with pytest.raises(TemplateError):
+        replacement_expression(Language.PYTHON, "A" * 65)
+
+
 # --- Python -----------------------------------------------------------------
 
 
@@ -196,6 +203,16 @@ def test_python_preserves_crlf_and_non_ascii_prefix() -> None:
     assert "\n" not in plan.after.replace("\r\n", "")
     assert plan.after == ('# héllo Δ\r\nimport os\r\nKEY = os.environ["APP_KEY"]\r\nTAIL = 1\r\n')
     ast.parse(plan.after)
+
+
+def test_python_import_uses_local_line_ending_on_mixed_file() -> None:
+    """Fichier mixte : l'`import os` suit son voisinage, pas un `\\r\\n` lointain."""
+    source = f'KEY = "{SECRET}"\nsecond = 1\r\nthird = 2\n'
+    plan = patch("app.py", source, 1)
+
+    assert plan.after.split("\n")[0] == "import os"
+    assert plan.after.split("\n")[1] == 'KEY = os.environ["APP_KEY"]'
+    ast.parse(plan.after.replace("\r\n", "\n"))
 
 
 @pytest.mark.parametrize(
@@ -669,6 +686,19 @@ def test_javascript_invalid_and_stale_lines_are_manual() -> None:
     assert manual("app.js", f'const K = "{SECRET};\n', 1).reason is ManualReason.INVALID_SYNTAX
     too_many_tokens = ";" * 100_001 + f'\nconst K = "{SECRET}";\n'
     assert manual("app.js", too_many_tokens, 2).reason is ManualReason.INVALID_SYNTAX
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'const K = "' + SECRET + '"; }};\n',
+        f'const K = "{SECRET}"; ];\n',
+        'const K = "' + SECRET + '"; }}};\n',
+    ],
+)
+def test_javascript_unbalanced_delimiters_are_manual(source: str) -> None:
+    """Fichier déjà invalide toléré par le tokenizer : aucun patch sans reparse."""
+    assert manual("app.js", source, 1).reason is ManualReason.INVALID_SYNTAX
 
 
 @pytest.mark.parametrize("suffix", [".js", ".mjs", ".cjs"])

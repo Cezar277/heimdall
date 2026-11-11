@@ -226,7 +226,11 @@ def _check_line(value: object) -> int:
 
 
 def _check_variable(value: object) -> str:
-    if not isinstance(value, str) or _VARIABLE.fullmatch(value) is None:
+    if not isinstance(value, str):
+        raise TemplateError
+    if len(value) > MAX_VARIABLE_CHARS:
+        raise TemplateError
+    if _VARIABLE.fullmatch(value) is None:
         raise TemplateError
     return value
 
@@ -930,9 +934,15 @@ def _with_python_import(source: str, line: int) -> tuple[str, int] | None:
         return None
     index = _python_import_insertion(tree, source.split("\n"))
     # ``split("\n")`` conserve le ``\r`` des lignes CRLF : la ligne insérée
-    # doit le porter aussi, sinon le fichier devient hétérogène.
-    carriage_return = "\r" if "\r\n" in source else ""
+    # doit porter le style de son voisinage, sinon le fichier devient
+    # hétérogène (un ``\r\n`` lointain ne doit pas contaminer une zone LF).
     lines = source.split("\n")
+    neighbours = []
+    if 0 <= index - 1 < len(lines):
+        neighbours.append(lines[index - 1])
+    if 0 <= index < len(lines):
+        neighbours.append(lines[index])
+    carriage_return = "\r" if any(line.endswith("\r") for line in neighbours) else ""
     lines.insert(index, "import os" + carriage_return)
     patched = "\n".join(lines)
     try:
@@ -1435,6 +1445,22 @@ _JS_NON_BINDING_PAREN_KEYWORDS: Final[frozenset[str]] = frozenset(
 _JS_BINDING_KEYWORDS: Final[frozenset[str]] = frozenset(
     {"as", "class", "const", "function", "import", "let", "var"}
 )
+
+
+def _js_delimiters_balanced(tokens: list[_JsToken]) -> bool:
+    """Vrai si les délimiteurs `()[]{}` sont équilibrés (hors chaînes/regex)."""
+    stack: list[str] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for token in tokens:
+        if token.kind != "punct" or token.value is None:
+            continue
+        if token.value in {"(", "[", "{"}:
+            stack.append(token.value)
+        elif token.value in pairs:
+            if not stack or stack[-1] != pairs[token.value]:
+                return False
+            stack.pop()
+    return not stack
 
 
 def _js_delimiters(
@@ -2371,6 +2397,11 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
     try:
         tokens = _tokenize_js(source)
     except _JsSyntax:
+        return _js_failure(file, source, line, variable, ManualReason.INVALID_SYNTAX)
+    if not _js_delimiters_balanced(tokens):
+        # Fichier déjà invalide que le tokenizer tolère (ex. `const x = "S"; }}`) :
+        # aucun patch sans revalidation possible côté tokenizer (asymétrie assumée
+        # avec Python qui reparse via `ast.parse`) — le doute profite au refus.
         return _js_failure(file, source, line, variable, ManualReason.INVALID_SYNTAX)
 
     candidates: list[tuple[int, _JsToken]] = []

@@ -125,7 +125,8 @@ une chaîne JavaScript ordinaire.
 - **Aucune I/O, aucun réseau**, aucune dépendance hors bibliothèque standard
   et `heimdall.scanner.finding` (validation lexicale du chemin).
 - **Injection de code impossible** : le nom de variable doit satisfaire
-  `^[A-Z][A-Z0-9_]{1,63}$` avant d'entrer dans le template.
+  `^[A-Z][A-Z0-9_]{1,63}$` (64 caractères max via `MAX_VARIABLE_CHARS`) avant
+  d'entrer dans le template.
 - **Bornes** : source 1 Mio UTF-8, secret 100 000 caractères, chemin 4096
   caractères. Toute erreur d'API est statique et ne reflète jamais l'entrée.
 - **Pas de fuite par `repr`** : `before` et `after` sont exclus de la
@@ -135,10 +136,12 @@ une chaîne JavaScript ordinaire.
 - **Patch vérifié** : après substitution et ajout éventuel de l'import, le
   texte Python final doit reparser ; sinon aucun patch n'est rendu. Côté
   JavaScript, aucun patch n'est rendu sur un contexte ambigu (concaténation
-  implicite, clé dynamique, directive prologue, `os`/`process` masqué…) : la
-  substitution n'est appliquée qu'à un littéral dont le contexte lexical est
-  sûr, et le tokenizer ne fait pas de reparsing JS (hors bibliothèque standard
-  du projet).
+  implicite, clé dynamique, directive prologue, `os`/`process` masqué…) ni sur
+  un fichier aux délimiteurs déséquilibrés (`_js_delimiters_balanced` → `INVALID_SYNTAX`) :
+  la substitution n'est appliquée qu'à un littéral dont le contexte lexical est
+  sûr, et le tokenizer ne fait pas de reparsing JS complet (hors bibliothèque standard
+  du projet). L'`import os` inséré suit la fin de ligne locale (voisinage),
+  pas un `\r\n` lointain.
 
 La denylist sémantique (`PATH`, `LD_PRELOAD`, `PYTHONPATH`…) et le
 dédoublonnage `_2`/`_3` restent dans #84. L'écriture atomique et la
