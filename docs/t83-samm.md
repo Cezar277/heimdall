@@ -78,7 +78,7 @@ dépôt, aucune connexion réseau utilisée.
 
 | Contrôle | Résultat |
 | --- | --- |
-| `pytest tests/test_remediation_templates.py` | 280 passed |
+| `pytest tests/test_remediation_templates.py` | 282 passed |
 | `pytest tests/test_remediation_templates.py --cov=heimdall.remediation --cov-branch --cov-fail-under=70` | couverture du module : 81 % (seuil critique 70 %) |
 | `pytest --cov=heimdall --cov-branch --cov-fail-under=85` | voir ticket |
 | `ruff check heimdall tests scripts` | succès |
@@ -265,6 +265,11 @@ relecture croisée et la CI distante restent à réaliser ; aucun merge sur
 - Filet large : `build_replacement` convertit toute exception inattendue en
   `manual` (`INVALID_SYNTAX`), `TemplateError` restant levée
   (`test_unexpected_exception_…`).
+- Ban `asdict`/`astuple` étendu aux formes `Attribute`
+  (`dataclasses.asdict(plan)` interdit comme `asdict(plan)`, même test) ;
+  sur-refus `import {env} from "autre-lib"` figé par test dédié
+  (`test_javascript_import_env_from_unrelated_lib_…`, compromis
+  disponibilité/sécurité assumé, `docs/remediation-templates.md:99`).
 
 ## Limites assumées
 
