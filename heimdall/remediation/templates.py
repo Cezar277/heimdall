@@ -532,7 +532,12 @@ def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]
         elif isinstance(node, ast.ImportFrom):
             if node.module == "os" and node.level == 0:
                 for alias in node.names:
-                    if alias.name in {"environ", "getenv"}:
+                    if alias.name == "*":
+                        # ``from os import *`` : ``environ`` et ``getenv`` sont
+                        # liés sans qu'on puisse les énumérer — le doute
+                        # profite au refus plutôt qu'à une liste incomplète.
+                        env_roots.update({"environ", "getenv"})
+                    elif alias.name in {"environ", "getenv"}:
                         env_roots.add(alias.asname or alias.name)
         elif (
             isinstance(node, ast.Assign)
@@ -1639,6 +1644,14 @@ def _js_process_env_key(tokens: list[_JsToken], position: int) -> bool:
         parent = enclosing_map[node]
         if parent is not None:
             start = parent + 1
+        else:
+            # Crochet au niveau d'une instruction : borner la recherche au
+            # délimiteur d'instruction précédent (``;``/``{``/``}``), comme
+            # dans ``_js_computed_process_key``.
+            for boundary in range(node - 1, -1, -1):
+                if tokens[boundary].kind == "punct" and tokens[boundary].value in {";", "{", "}"}:
+                    start = boundary + 1
+                    break
     return _js_env_access_present(tokens, start, end)
 
 
@@ -1925,9 +1938,11 @@ def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
     Couvre les formes directes (``eval("NOM")``), optionnelles
     (``eval?.("NOM")``, ``Function?.("NOM")``) et indirectes (``(0,
     eval)("NOM")``, ``(0, eval)?.("NOM")`` — le chaînage optionnel est
-    normalisé avant le test, comme en ``_js_env_access_present``). Dans
-    chaque cas la valeur d'environnement serait ré-évaluée comme du code :
-    le doute profite au refus.
+    normalisé avant le test, comme en ``_js_env_access_present``) et par
+    indice (``globalThis["eval"]("NOM")`` — voir
+    ``_js_subscript_evaluation_call``). Dans chaque cas la valeur
+    d'environnement serait ré-évaluée comme du code : le doute profite
+    au refus.
     """
     previous = tokens[position - 1] if position > 0 else None
     if previous is None or previous.kind != "punct" or previous.value != "(":
@@ -1939,12 +1954,11 @@ def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
         cursor -= 1
     if cursor >= 0 and tokens[cursor].kind == "ident" and tokens[cursor].value in _JS_EVAL_CALLEES:
         return True
-    closer = cursor
-    if closer >= 0 and tokens[closer].kind == "punct" and tokens[closer].value == ")":
+    if cursor >= 0 and tokens[cursor].kind == "punct" and tokens[cursor].value == ")":
         # Appel indirect : ``(0, eval)("NOM")`` — le ``(`` du littéral ferme
         # un groupe dont le dernier membre est ``, eval``.
         depth = 0
-        opener = closer
+        opener = cursor
         while opener >= 0:
             candidate = tokens[opener]
             if candidate.kind == "punct":
@@ -1958,7 +1972,7 @@ def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
         if opener >= 0:
             inner = [
                 token
-                for token in tokens[opener + 1 : closer]
+                for token in tokens[opener + 1 : cursor]
                 if not (token.kind == "punct" and token.value == "?")
             ]
             if (
@@ -1969,7 +1983,65 @@ def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
                 and inner[-1].value in _JS_EVAL_CALLEES
             ):
                 return True
+    return _js_subscript_evaluation_call(tokens, cursor)
+
+
+def _js_subscript_evaluation_call(tokens: list[_JsToken], cursor: int) -> bool:
+    """Vrai si le callee est une sélection ``["eval"]`` (``globalThis…``).
+
+    ``globalThis["eval"]("NOM")``, ``window["Function"]("NOM")``,
+    ``obj?.["eval"]("NOM")`` — miroir de la garde Python (sélection
+    ``vars(x)["eval"]``). Les maillons sont remontés un par un :
+    ``a["eval"]["x"](...)`` reste ambigu (la valeur transite par ``eval``).
+    """
+    cursor_close = cursor
+    while (
+        cursor_close >= 0
+        and tokens[cursor_close].kind == "punct"
+        and tokens[cursor_close].value == "]"
+    ):
+        opener = _js_matching_opener(tokens, cursor_close)
+        if opener < 0:
+            return False
+        inner = [
+            token
+            for token in tokens[opener + 1 : cursor_close]
+            if not (token.kind == "punct" and token.value == "?")
+        ]
+        if len(inner) == 1 and inner[0].kind == "string" and inner[0].value in _JS_EVAL_CALLEES:
+            return True
+        cursor_close = opener - 1
+        while (
+            cursor_close >= 0
+            and tokens[cursor_close].kind == "punct"
+            and tokens[cursor_close].value in {"?", "."}
+        ):
+            cursor_close -= 1
     return False
+
+
+def _js_matching_opener(tokens: list[_JsToken], closer: int) -> int:
+    """Index du délimiteur ouvrant apparié à ``closer`` (``-1`` si absent)."""
+    pairs = {")": "(", "]": "[", "}": "{"}
+    closing = tokens[closer].value
+    if tokens[closer].kind != "punct" or closing is None:
+        return -1
+    opening = pairs.get(closing)
+    if opening is None:
+        return -1
+    depth = 0
+    opener = closer
+    while opener >= 0:
+        candidate = tokens[opener]
+        if candidate.kind == "punct":
+            if candidate.value == closing:
+                depth += 1
+            elif candidate.value == opening:
+                depth -= 1
+                if depth == 0:
+                    break
+        opener -= 1
+    return opener
 
 
 def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde

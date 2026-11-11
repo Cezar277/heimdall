@@ -264,6 +264,8 @@ def test_python_handles_non_ascii_on_the_same_line() -> None:
         (f'x = getattr(vars(), "{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = vars().get("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = operator.getitem(vars(), "{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import *; x = environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import *; x = getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'from os import environ; x = environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'from os import getenv; x = getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'from os import environ as env; x = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
@@ -326,6 +328,8 @@ def test_python_refuses_environment_key_auto_targeting(source: str) -> None:
         f'import os as o\nx = o.environ["{SECRET}"]\n',
         f'import os as o\nx = o.getenv("{SECRET}")\n',
         f'env = os.environ\nx = env["{SECRET}"]\n',
+        f'from os import *\nx = environ["{SECRET}"]\n',
+        f'from os import *\nx = getenv("{SECRET}")\n',
     ],
 )
 def test_python_refuses_aliased_environment_access(source: str) -> None:
@@ -458,6 +462,9 @@ def test_javascript_regex_with_quotes_does_not_hide_the_real_string() -> None:
         (f'(0,eval)("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'(0, eval)?.("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'(0, Function)?.("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'globalThis["eval"]("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'window["Function"]("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'obj?.["eval"]("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'setTimeout("{SECRET}", 0);\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'setInterval("{SECRET}", 0);\n', ManualReason.AMBIGUOUS_CONTEXT),
     ],
@@ -538,6 +545,13 @@ def test_javascript_allows_independent_key_after_process_mention() -> None:
     assert plan.after == (
         "console.log(process.version);\nconfig={};\nx = config[process.env.APP_KEY];\n"
     )
+
+
+def test_javascript_allows_independent_key_after_process_env_mention() -> None:
+    """Non-régression du sur-refus : ``process.env`` ailleurs ne tache pas."""
+    source = 'console.log(process.env.FOO);\nx = f["APP_KEY"];\n'
+    plan = patch("app.js", source, 2, secret=ENV_NAME)
+    assert plan.after == ("console.log(process.env.FOO);\nx = f[process.env.APP_KEY];\n")
 
 
 @pytest.mark.parametrize(
