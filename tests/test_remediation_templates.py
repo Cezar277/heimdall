@@ -398,6 +398,30 @@ def test_python_refuses_loop_and_out_of_order_aliases(source: str) -> None:
 @pytest.mark.parametrize(
     "source",
     [
+        f'import os\ndef f(env=os.environ):\n    x = env["{SECRET}"]\n',
+        f'import os\nasync def f(env=os.environ):\n    x = env["{SECRET}"]\n',
+        f'import os\ndef f(env=os.environ, /):\n    x = env["{SECRET}"]\n',
+        f'import os\ndef f(*, env=os.environ):\n    x = env["{SECRET}"]\n',
+        f'import os\nf = lambda env=os.environ: env["{SECRET}"]\n',
+        f'import os\ndef f(env=getattr(os, "environ")):\n    x = env["{SECRET}"]\n',
+    ],
+)
+def test_python_refuses_default_argument_aliases(source: str) -> None:
+    """Défaut `def f(env=os.environ)` : le re-ciblage reste refusé."""
+    line = 2 if source.startswith("import os\nf = lambda") else 3
+    assert manual("app.py", source, line).reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+def test_python_allows_independent_key_after_unrelated_default() -> None:
+    """Non-régression : défaut sans `os` ne tache pas la clé suivante."""
+    source = f'def f(env="autre"):\n    x = env["{SECRET}"]\n'
+    plan = patch("app.py", source, 2)
+    assert plan.after == 'import os\ndef f(env="autre"):\n    x = env[os.environ["APP_KEY"]]\n'
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
         'import operator\nx = operator.getitem(locals(), "APP_KEY")\n',
     ],
 )

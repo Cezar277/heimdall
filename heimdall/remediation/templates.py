@@ -540,6 +540,28 @@ def _assignment_target_names(target: ast.AST) -> list[str]:
     return []
 
 
+def _collect_argument_default_aliases(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    os_roots: set[str],
+    env_roots: set[str],
+) -> None:
+    """Lie les arguments dont le défaut lit ``os.environ`` (``def f(env=…)``)."""
+    args = node.args
+    positional = [*args.posonlyargs, *args.args]
+    if args.defaults:
+        offset = len(positional) - len(args.defaults)
+        for pos, default in enumerate(args.defaults):
+            if _python_env_access_in(default, frozenset(os_roots), frozenset(env_roots)):
+                target = positional[offset + pos]
+                if isinstance(target, ast.arg):
+                    env_roots.add(target.arg)
+    for arg, kw_default in zip(args.kwonlyargs, args.kw_defaults, strict=False):
+        if kw_default is not None and _python_env_access_in(
+            kw_default, frozenset(os_roots), frozenset(env_roots)
+        ):
+            env_roots.add(arg.arg)
+
+
 def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]]:  # noqa: PLR0912 - collecteurs bornés
     """Racines (module ``os``, noms ``environ``) tenant compte des imports et alias.
 
@@ -547,10 +569,11 @@ def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]
     environ [as env]`` / ``getenv`` / ``from os import *`` fait des noms liés
     des racines ``environ``. Les affectations simples (``env = os.environ``),
     annotées (``env: dict = os.environ``), multiples (``a = b = os.environ``),
-    dépaquetées (``env, _ = os.environ, 1``), walrus (``(env := os.environ)``)
-    et lieurs ``for``/``with`` (``for env in [os.environ]``) propagent aussi
-    la racine, jusqu'à point fixe (les chaînes hors-ordre se résolvent, le
-    reste profite au refus).
+    dépaquetées (``env, _ = os.environ, 1``), walrus (``(env := os.environ)``),
+    lieurs ``for``/``with`` (``for env in [os.environ]``) et défauts
+    d'arguments (``def f(env=os.environ)``) propagent aussi la racine,
+    jusqu'à point fixe (les chaînes hors-ordre se résolvent, le reste
+    profite au refus).
     """
     os_roots = set(_OS_ROOTS)
     env_roots: set[str] = set()
@@ -600,6 +623,8 @@ def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]
                     and _python_env_access_in(node.type, frozenset(os_roots), frozenset(env_roots))
                 ):
                     env_roots.add(node.name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                _collect_argument_default_aliases(node, os_roots, env_roots)
         if len(env_roots) == before:
             break
     return frozenset(os_roots), frozenset(env_roots)
