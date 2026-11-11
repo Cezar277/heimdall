@@ -58,6 +58,10 @@ MAX_SECRET_CHARS: Final[int] = 100_000
 #: Budget de jetons JavaScript : un fichier de 1 Mio rempli de ``;`` ne doit
 #: pas matérialiser un million d'objets avant le refus manuel.
 MAX_JS_TOKENS: Final[int] = 100_000
+#: Seuil anti-DoS quadratique : au-delà, même équilibré, le fichier est refusé
+#: en `INVALID_SYNTAX` plutôt que balayé (une seule passe à pile suffit en
+#: dessous ; au-dessus, le doute profite au refus, jamais au patch).
+MAX_JS_MASSIVE_DELIMITERS: Final[int] = 1000
 #: Longueur maximale d'un chemin, alignée sur le contrat Finding v1.
 MAX_PATH_CHARS: Final[int] = 4096
 #: Nombre minimal d'arguments pour `setattr(obj, name, ...)` / `delattr(obj, name)`.
@@ -337,7 +341,9 @@ def build_replacement(
         if language is Language.PYTHON:
             return _python_replacement(path, text, line_number, value, name)
         return _javascript_replacement(path, text, line_number, value, name)
-    except (RecursionError, MemoryError):
+    except TemplateError:
+        raise
+    except Exception:
         return _manual(
             file=path,
             source=text,
@@ -2406,25 +2412,15 @@ def _js_destructured_env_aliases(  # noqa: PLR0912 - balayage borné des motifs 
     Balaye les motifs ``{ … } = process`` : toute propriété ``env`` lie soit
     ``env`` (``{env}``, ``{env = d}``) soit son alias local (``{env: e}``,
     ``{env: e = d}``, clé chaîne ``{"env": e}``). Sur-refus documenté : pas
-    d'analyse de flot, le doute profite au refus.
+    d'analyse de flot, le doute profite au refus. Linéaire : appariement
+    pré-calculé en une passe (``_js_delimiters``), sans rescan par ``{``.
     """
     found: set[str] = set()
+    _, matching = _js_delimiters(tokens)
     index = 0
     while index < len(tokens):
         if tokens[index].kind == "punct" and tokens[index].value == "{":
-            depth = 0
-            closer = -1
-            cursor = index
-            while cursor < len(tokens):
-                if tokens[cursor].kind == "punct":
-                    if tokens[cursor].value == "{":
-                        depth += 1
-                    elif tokens[cursor].value == "}":
-                        depth -= 1
-                        if depth == 0:
-                            closer = cursor
-                            break
-                cursor += 1
+            closer = matching.get(index, -1)
             if closer >= 0 and closer + 2 < len(tokens):
                 if (
                     tokens[closer + 1].kind == "punct"
@@ -2469,9 +2465,11 @@ def _js_for_env_aliases(  # noqa: PLR0912, PLR0915 - balayage borné des têtes 
 
     Si la source (après ``of``/``in``) mentionne ``process.env``, les noms liés
     à gauche sont des alias (sur-refus : ``for (const e of [process.env])``
-    lie ``e`` à ``process.env`` quelle que soit la casse du nom).
+    lie ``e`` à ``process.env`` quelle que soit la casse du nom). Linéaire :
+    appariement ``(...)`` pré-calculé (``_js_delimiters``).
     """
     found: set[str] = set()
+    _, matching = _js_delimiters(tokens)
     index = 0
     while index < len(tokens):
         if tokens[index].kind == "ident" and tokens[index].value == "for":
@@ -2481,19 +2479,7 @@ def _js_for_env_aliases(  # noqa: PLR0912, PLR0915 - balayage borné des têtes 
             if tokens[index + 1].kind != "punct" or tokens[index + 1].value != "(":
                 index += 1
                 continue
-            depth = 0
-            closer = -1
-            cursor = index + 1
-            while cursor < len(tokens):
-                if tokens[cursor].kind == "punct":
-                    if tokens[cursor].value == "(":
-                        depth += 1
-                    elif tokens[cursor].value == ")":
-                        depth -= 1
-                        if depth == 0:
-                            closer = cursor
-                            break
-                cursor += 1
+            closer = matching.get(index + 1, -1)
             if closer >= 0:
                 inner = tokens[index + 2 : closer]
                 of_pos = -1
@@ -2559,9 +2545,11 @@ def _js_imported_env_aliases(  # noqa: PLR0912 - balayage borné des imports `{e
 
     Tout ``env`` nommé importé lie ``process.env`` (``node:process``) : par
     prudence le doute profite au refus quelle que soit la source (sur-refus
-    documenté), miroir de la déstructuration.
+    documenté), miroir de la déstructuration. Linéaire : appariement
+    pré-calculé (``_js_delimiters``).
     """
     found: set[str] = set()
+    _, matching = _js_delimiters(tokens)
     index = 0
     while index < len(tokens):
         if tokens[index].kind == "ident" and tokens[index].value == "import":
@@ -2571,19 +2559,7 @@ def _js_imported_env_aliases(  # noqa: PLR0912 - balayage borné des imports `{e
                 and tokens[cursor].kind == "punct"
                 and tokens[cursor].value == "{"
             ):
-                depth = 0
-                closer = -1
-                scan = cursor
-                while scan < len(tokens):
-                    if tokens[scan].kind == "punct":
-                        if tokens[scan].value == "{":
-                            depth += 1
-                        elif tokens[scan].value == "}":
-                            depth -= 1
-                            if depth == 0:
-                                closer = scan
-                                break
-                    scan += 1
+                closer = matching.get(cursor, -1)
                 if closer >= 0:
                     inner = tokens[cursor + 1 : closer]
                     pos = 0
@@ -2786,6 +2762,9 @@ _JS_EVAL_CALLEES: Final[frozenset[str]] = frozenset(
 #: Longueur du suffixe ``, eval`` qui signe un appel indirect ``(0, eval)(...)``.
 _INDIRECT_EVAL_SUFFIX_LEN: Final[int] = 2
 
+#: Longueur du suffixe ``Reflect . apply`` d'un appel indirect ``(0, Reflect.apply)(...)``.
+_REFLECT_INDIRECT_SUFFIX_LEN: Final[int] = 3
+
 
 def _js_code_evaluation_call(
     tokens: list[_JsToken], position: int, eval_aliases: frozenset[str] = _NO_ALIASES
@@ -2849,6 +2828,117 @@ def _js_code_evaluation_call(
     return _js_subscript_evaluation_call(tokens, cursor)
 
 
+def _js_reflect_evaluation_call(  # noqa: PLR0912, PLR0915 - motifs Reflect bornés
+    tokens: list[_JsToken], position: int, eval_aliases: frozenset[str] = _NO_ALIASES
+) -> bool:
+    """Vrai si le littéral transite par ``Reflect.apply/construct(eval, …)``.
+
+    ``Reflect.apply(eval, null, ["NOM"])``, ``Reflect.construct(Function,
+    ["NOM"])`` (et indirect ``(0, Reflect.apply)(eval, …)``) : la valeur
+    d'environnement serait ré-évaluée comme du code via l'args-list. Tout
+    littéral niché dans un tel appel est refusé (sur-refus : pas de dataflow,
+    le doute profite au refus).
+    """
+    enclosing_map, matching = _js_delimiters(tokens)
+    node: int | None = enclosing_map[position]
+    while node is not None:
+        if tokens[node].kind == "punct" and tokens[node].value == "(":
+            cursor = node - 1
+            while (
+                cursor >= 0
+                and tokens[cursor].kind == "punct"
+                and tokens[cursor].value in {"?", "."}
+            ):
+                cursor -= 1
+            is_reflect_call = False
+            if cursor >= 0 and tokens[cursor].kind == "ident":
+                if tokens[cursor].value in {"apply", "construct"}:
+                    receiver = cursor - 1
+                    while (
+                        receiver >= 0
+                        and tokens[receiver].kind == "punct"
+                        and tokens[receiver].value in {"?", "."}
+                    ):
+                        receiver -= 1
+                    if (
+                        receiver >= 0
+                        and tokens[receiver].kind == "punct"
+                        and tokens[receiver].value == "]"
+                    ):
+                        receiver_opener = matching.get(receiver, -1)
+                        if receiver_opener >= 0 and receiver_opener - 1 >= 0:
+                            probe = receiver_opener - 1
+                            while (
+                                probe >= 0
+                                and tokens[probe].kind == "punct"
+                                and tokens[probe].value in {"?", "."}
+                            ):
+                                probe -= 1
+                            if (
+                                probe >= 0
+                                and tokens[probe].kind == "ident"
+                                and tokens[probe].value == "Reflect"
+                            ):
+                                is_reflect_call = True
+                    elif (
+                        receiver >= 0
+                        and tokens[receiver].kind == "ident"
+                        and tokens[receiver].value == "Reflect"
+                    ):
+                        is_reflect_call = True
+                    elif receiver < 0:
+                        is_reflect_call = True
+            elif cursor >= 0 and tokens[cursor].kind == "punct" and tokens[cursor].value == ")":
+                group_opener = matching.get(cursor, -1)
+                if group_opener >= 0:
+                    inner = [
+                        token
+                        for token in tokens[group_opener + 1 : cursor]
+                        if not (token.kind == "punct" and token.value == "?")
+                    ]
+                    if (
+                        len(inner) >= _REFLECT_INDIRECT_SUFFIX_LEN
+                        and inner[-3].kind == "ident"
+                        and inner[-3].value == "Reflect"
+                        and inner[-2].kind == "punct"
+                        and inner[-2].value == "."
+                        and inner[-1].kind == "ident"
+                        and inner[-1].value in {"apply", "construct"}
+                    ):
+                        is_reflect_call = True
+            if is_reflect_call:
+                after = node + 1
+                depth = 0
+                cursor_arg = after
+                first_arg: _JsToken | None = None
+                while cursor_arg < len(tokens):
+                    tok = tokens[cursor_arg]
+                    if tok.kind == "punct":
+                        if tok.value == "(":
+                            depth += 1
+                        elif tok.value == ")":
+                            if depth == 0:
+                                break
+                            depth -= 1
+                        elif tok.value in {"[", "{"}:
+                            depth += 1
+                        elif tok.value in {"]", "}"}:
+                            depth -= 1
+                        elif tok.value == "," and depth == 0:
+                            break
+                    elif depth == 0 and first_arg is None:
+                        first_arg = tok
+                    cursor_arg += 1
+                if (
+                    first_arg is not None
+                    and first_arg.kind == "ident"
+                    and (first_arg.value in _JS_EVAL_CALLEES or first_arg.value in eval_aliases)
+                ):
+                    return True
+        node = enclosing_map[node] if node is not None else None
+    return False
+
+
 def _js_subscript_evaluation_call(tokens: list[_JsToken], cursor: int) -> bool:
     """Vrai si le callee est une sélection ``["eval"]`` (``globalThis…``).
 
@@ -2858,15 +2948,16 @@ def _js_subscript_evaluation_call(tokens: list[_JsToken], cursor: int) -> bool:
     ``a["eval"]["x"](...)`` reste ambigu (la valeur transite par ``eval``).
     Une concaténation de littéraux (``globalThis["ev" + "al"](...)``) est
     repliée avant le test ; plusieurs littéraux non concaténés restent
-    suspects par principe.
+    suspects par principe. Linéaire : appariement pré-calculé.
     """
+    _, matching = _js_delimiters(tokens)
     cursor_close = cursor
     while (
         cursor_close >= 0
         and tokens[cursor_close].kind == "punct"
         and tokens[cursor_close].value == "]"
     ):
-        opener = _js_matching_opener(tokens, cursor_close)
+        opener = matching.get(cursor_close, -1)
         if opener < 0:
             return False
         inner = [
@@ -2935,6 +3026,16 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
         # aucun patch sans revalidation possible côté tokenizer (asymétrie assumée
         # avec Python qui reparse via `ast.parse`) — le doute profite au refus.
         return _js_failure(file, source, line, variable, ManualReason.INVALID_SYNTAX)
+    brace_count = 0
+    bracket_count = 0
+    for tok in tokens:
+        if tok.kind == "punct":
+            if tok.value == "{":
+                brace_count += 1
+            elif tok.value == "[":
+                bracket_count += 1
+            if brace_count > MAX_JS_MASSIVE_DELIMITERS or bracket_count > MAX_JS_MASSIVE_DELIMITERS:
+                return _js_failure(file, source, line, variable, ManualReason.INVALID_SYNTAX)
 
     candidates: list[tuple[int, _JsToken]] = []
     template_seen = False
@@ -3014,6 +3115,12 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
         # (``globalThis["eval"](...)``) et par alias (``const e = eval`` puis
         # ``e("NOM")``) : la valeur d'environnement serait ré-évaluée comme
         # du code source. Le doute profite au refus, jamais au remplacement.
+        return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
+    if _js_reflect_evaluation_call(tokens, position, _js_eval_aliases(tokens)):
+        # ``Reflect.apply(eval, null, ["NOM"])`` /
+        # ``Reflect.construct(Function, ["NOM"])`` (et indirect
+        # ``(0, Reflect.apply)(eval, …)``) : la valeur transite par
+        # l'args-list vers une fonction d'évaluation.
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
     if (
         following is not None

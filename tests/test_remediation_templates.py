@@ -11,6 +11,7 @@ import ast
 import dataclasses
 import json
 import re
+import time
 from pathlib import Path
 from typing import cast
 
@@ -737,6 +738,42 @@ def test_javascript_allows_independent_key_after_process_env_mention() -> None:
 def test_javascript_refuses_directive_prologue(source: str) -> None:
     plan = manual("app.js", source, 1, secret=DIRECTIVE)
     assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        f'x = Reflect.apply(eval, null, ["{SECRET}"]);\n',
+        f'x = Reflect.construct(Function, ["{SECRET}"]);\n',
+        f'x = (0, Reflect.apply)(eval, null, ["{SECRET}"]);\n',
+        'const e = eval;\nx = Reflect.apply(e, null, ["SYNTHETIC_ONLY_VALUE"]);\n',
+    ],
+)
+def test_javascript_refuses_reflect_evaluation_call(source: str) -> None:
+    """`Reflect.apply(eval, …)` / `construct` : la valeur serait ré-évaluée."""
+    line = 2 if source.startswith("const e = ") else 1
+    assert manual("app.js", source, line).reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+def test_javascript_massive_delimiters_are_manual_and_fast() -> None:
+    """DoS quadratique verrouillé : massif → `manual`, < 1 s (pas de timeout)."""
+    for opener, closer in (("{", "}"), ("[", "]")):
+        source = opener * 5000 + closer * 5000 + f'\nx = "{SECRET}";\n'
+        start = time.monotonic()
+        plan = manual("app.js", source, 2)
+        elapsed = time.monotonic() - start
+        assert plan.reason is ManualReason.INVALID_SYNTAX
+        assert elapsed < 1.0
+
+
+def test_unexpected_exception_becomes_manual_but_template_error_raises(monkeypatch) -> None:
+    """Filet large : bug interne → `manual`, erreur d'API → `TemplateError`."""
+    monkeypatch.setattr(templates_module, "_js_env_aliases", lambda _tokens: 1 / 0)
+    plan = build_replacement("app.js", f'const k = "{SECRET}";\n', 1, SECRET, "APP_KEY")
+    assert plan.manual_remediation is True
+    assert plan.reason is ManualReason.INVALID_SYNTAX
+    with pytest.raises(TemplateError):
+        build_replacement("../app.py", "x = 1\n", 1, SECRET, "APP_KEY")
 
 
 def test_javascript_global_process_references_are_not_shadowing() -> None:
