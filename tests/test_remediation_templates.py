@@ -386,6 +386,7 @@ def test_python_refuses_environment_key_auto_targeting(source: str) -> None:
         (f'import os as o\nx = o.environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'import os as o\nx = o.getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'env = os.environ\nx = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'env = __import__("os")\nx = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'env: dict = os.environ\nx = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'a = b = os.environ\nx = b["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'env, _ = os.environ, 1\nx = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
@@ -435,6 +436,13 @@ def test_python_allows_independent_key_after_unrelated_default() -> None:
     source = f'def f(env="autre"):\n    x = env["{SECRET}"]\n'
     plan = patch("app.py", source, 2)
     assert plan.after == 'import os\ndef f(env="autre"):\n    x = env[os.environ["APP_KEY"]]\n'
+
+
+def test_python_dynamic_import_non_os_does_not_alias() -> None:
+    """`__import__("sys")` ne lie pas `os.environ` : pas de sur-refus."""
+    source = f'env = __import__("sys")\nx = env["{SECRET}"]\n'
+    plan = patch("app.py", source, 2)
+    assert plan.after == 'import os\nenv = __import__("sys")\nx = env[os.environ["APP_KEY"]]\n'
 
 
 @pytest.mark.parametrize(
@@ -888,6 +896,14 @@ def test_module_has_no_execution_or_network_dependency() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in forbidden_calls
+
+    forbidden_serializers = {"asdict", "astuple"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id not in forbidden_serializers, (
+                "ne jamais sérialiser ReplacementPlan via asdict/astuple "
+                "(fuite before) : utiliser to_safe_dict()"
+            )
 
 
 # --- Acceptation sur le corpus piège ---------------------------------------

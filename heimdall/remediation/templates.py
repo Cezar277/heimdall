@@ -449,16 +449,27 @@ def _is_os_module(node: ast.AST, os_roots: frozenset[str] = _OS_ROOTS) -> bool:
 
 
 def _python_dynamic_import(node: ast.AST) -> bool:
-    """Vrai pour un appel d'import dynamique potentiellement lié à ``os``.
-
-    ``__import__("os")``, ``importlib.import_module("os")`` : ces formes
-    contournent la simple résolution du nom ``os`` et doivent être traitées
-    comme des racines d'accès à l'environnement.
-    """
+    """Vrai pour un appel d'import dynamique (`__import__`/`import_module`)."""
     function = node.func if isinstance(node, ast.Call) else node
     return (isinstance(function, ast.Name) and function.id in {"__import__", "import_module"}) or (
         isinstance(function, ast.Attribute) and function.attr == "import_module"
     )
+
+
+def _python_dynamic_import_os(node: ast.AST) -> bool:
+    """Vrai si l'import dynamique désigne (peut-être) ``os``.
+
+    ``__import__("os")`` replié (y compris ``"o"+"s"``, `f"os"`) lie
+    ``os`` ; un littéral replié différent (``__import__("sys")``) ne lie pas
+    l'environnement et ne bloque pas l'alias (pas de sur-refus) ; une valeur
+    dynamique inconnue profite au refus.
+    """
+    if not _python_dynamic_import(node) or not isinstance(node, ast.Call) or not node.args:
+        return _python_dynamic_import(node) and not isinstance(node, ast.Call)
+    folded = _const_str_value(node.args[0])
+    if folded is None:
+        return True
+    return folded == "os"
 
 
 def _python_env_access_in(
@@ -493,10 +504,11 @@ def _python_env_access_in(
         if isinstance(current, ast.Attribute):
             stack.append(current.value)
         elif isinstance(current, ast.Call):
-            if _python_dynamic_import(current):
-                # ``__import__("os")`` / ``importlib.import_module("os")`` :
-                # import dynamique, forme d'accès indirect à un module
-                # potentiellement ``os`` — le doute profite au refus.
+            if _python_dynamic_import_os(current):
+                # ``__import__("os")`` replié (ou dynamique inconnu) : import
+                # dynamique, forme d'accès indirect à un module potentiellement
+                # ``os`` — le doute profite au refus. ``__import__("sys")``
+                # replié ne lie pas l'environnement (pas de sur-refus).
                 return True
             stack.append(current.func)
             stack.extend(current.args)
