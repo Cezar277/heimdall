@@ -201,7 +201,7 @@ Puis, depuis l'hôte. La clé ne doit **jamais** apparaître dans `argv`
 (`ps aux`, `/proc/<pid>/cmdline`) ni dans l'historique shell : on la lit sans
 écho, on écrit un fichier d'en-tête `600`, puis `curl -K` lit ce fichier.
 
-```sh
+```bash
 read -rsp "Clé API: " HEIMDALL_API_KEY; echo
 [[ "$HEIMDALL_API_KEY" =~ ^[A-Za-z0-9_-]{43,}$ ]] || {
   echo "clé API invalide" >&2

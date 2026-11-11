@@ -23,8 +23,9 @@ services:
     # Volontairement sans variable : un `user:` variable résolvable en 0
     # (UID 0 dans .env + `docker compose up` direct sans §4)
     # démarrait transitoirement le conteneur en root avant la sortie 1
-    # de l'entrypoint. Le `chown -R 10001:10001 data secrets` du §3 du guide
-    # rend les bind mounts accessibles à cet UID fixe.
+    # de l'entrypoint. Le `sudo chown -R --no-dereference 10001:"$(id -g)"
+    # data secrets` + `750`/`640` du §3 du guide garde le certificat public
+    # lisible hôte et rend les bind mounts accessibles à cet UID fixe.
     user: "10001:10001"
     env_file:
       - .env

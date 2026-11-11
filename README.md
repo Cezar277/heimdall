@@ -204,7 +204,7 @@ Puis, côté serveur, chaque requête porte la clé du projet concerné. La clé
 doit jamais apparaître dans `argv` (`ps`, historique) : utilisez un fichier
 d'en-tête `600` lu par `curl -K`.
 
-```sh
+```bash
 read -rsp "Clé API: " HEIMDALL_API_KEY; echo
 [[ "$HEIMDALL_API_KEY" =~ ^[A-Za-z0-9_-]{43,}$ ]] || {
   echo "clé API invalide" >&2

@@ -597,11 +597,24 @@ class UidGidGuardTests(unittest.TestCase):
         env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         cold = (ROOT / "docs" / "t122-cold-test.md").read_text(encoding="utf-8")
-        for doc in (guide, env_example, readme, cold):
+        compose = COMPOSE.read_text(encoding="utf-8")
+        for doc in (guide, env_example, readme, cold, compose):
             with self.subTest(doc=doc[:40]):
                 self.assertIn('--no-dereference 10001:"$(id -g)"', doc)
                 self.assertNotIn("chown -R 10001:10001", doc)
                 self.assertNotIn("chown -R --no-dereference 10001:10001", doc)
+
+    def test_api_key_blocks_use_bash_fences(self) -> None:
+        """Non-régression remarque 3 (revue 1233dd1) : [[ sous ```bash, jamais ```sh."""
+        for path in (INSTALL_GUIDE, ROOT / "README.md"):
+            with self.subTest(path=str(path)):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("```bash\nread -rsp", text)
+                parts = text.split("```")
+                for i in range(1, len(parts), 2):
+                    code = parts[i]
+                    if code.startswith("sh\n") or code.startswith("sh "):
+                        self.assertNotIn("[[", code, f"bashisme [[ sous ```sh dans {path}")
 
     def test_compose_config_user_resolution_nominal_and_zero(self) -> None:
         """Prouve que même avec HEIMDALL_UID=0, `config` reste en 10001:10001."""
