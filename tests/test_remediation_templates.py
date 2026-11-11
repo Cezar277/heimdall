@@ -8,6 +8,7 @@ n'est utilisé.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import json
 import re
 from pathlib import Path
@@ -111,8 +112,6 @@ def test_templates_are_immutable() -> None:
 
 def test_safe_dict_never_contains_the_secret_or_source() -> None:
     """`to_safe_dict()` sans contenu, `asdict()` interdit (fuite `before`)."""
-    import dataclasses
-
     plan = patch("app.py", f'TOKEN = "{SECRET}"\n', 1)
     safe = plan.to_safe_dict()
     assert "before" not in safe and "after" not in safe
