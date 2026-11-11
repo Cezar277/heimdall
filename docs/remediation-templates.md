@@ -103,7 +103,7 @@ expression et une raison stable (`ManualReason`) :
 | Littéral nommant une entrée d'espace de noms (`vars()["NOM"]`, `locals()["NOM"]`, `globals()["NOM"]`) ou argument d'appel sur récepteur d'espace de noms (`getattr(vars(), "NOM")`, `vars().get("NOM")`, `operator.getitem(locals(), "NOM")`) : le patch lirait la valeur d'environnement à la place de l'entrée locale | `AMBIGUOUS_CONTEXT` |
 | Clé de propriété calculée hors fenêtre littérale bornée (`process["en" + "v"]...`, `process["env"][...]`, `process["env"][(a0, ..., a14, "SECRET")]`, `process?.[...]`) : la fenêtre est désormais bornée par le délimiteur ouvrant englobant le littéral | `AMBIGUOUS_CONTEXT` |
 | Directive prologue JavaScript (`"use strict"`) | `AMBIGUOUS_CONTEXT` |
-| Nom `os` masqué côté Python ou `process` masqué côté JavaScript | `SHADOWED_MODULE` |
+| Nom `os` masqué côté Python (`os = …`, `import sys as os`, `def f(os)`, `os.environ = …`, `del os.environ`) ou `process` masqué côté JavaScript (`process = …`, `process.env = …`, `delete process.env`) | `SHADOWED_MODULE` |
 
 Cas particuliers refusés côté JavaScript : clé d'objet littérale
 (`{"secret": 1}`), nom de méthode ou champ de classe, spécificateur

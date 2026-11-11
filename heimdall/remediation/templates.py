@@ -819,15 +819,38 @@ def _utf8_column_to_char(line: str, column: int) -> int | None:
         return None
 
 
+def _target_is_os_environ(target: ast.AST, os_roots: set[str]) -> bool:
+    """Vrai si la cible écrase ``os.environ`` (pas une clé ``os.environ[…]``)."""
+    if isinstance(target, ast.Starred):
+        return _target_is_os_environ(target.value, os_roots)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(_target_is_os_environ(elt, os_roots) for elt in target.elts)
+    return (
+        isinstance(target, ast.Attribute)
+        and target.attr == "environ"
+        and isinstance(target.value, ast.Name)
+        and target.value.id in os_roots
+    )
+
+
 def _python_os_status(tree: ast.AST, target_line: int) -> tuple[bool, bool]:  # noqa: PLR0912, PLR0915
     """Rend ``(import_os_avant_la_cible, nom_os_masque_ailleurs)``.
 
     Un ``import os`` situé après la ligne cible ne rend pas ``os`` disponible
     au moment de l'exécution : il ne compte pas et un import de tête est ajouté.
+    Toute réassignation ou suppression d'``os.environ``
+    (``os.environ = …``, ``os.environ += …``, ``del os.environ``) masque aussi
+    le module : le patch lirait un objet écrasé au lieu de refuser.
     """
     module_import = False
     shadowed = False
     top_level = set(tree.body) if isinstance(tree, ast.Module) else set()
+    os_roots: set[str] = {"os"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "os":
+                    os_roots.add(alias.asname or "os")
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -849,6 +872,18 @@ def _python_os_status(tree: ast.AST, target_line: int) -> tuple[bool, bool]:  # 
         elif isinstance(node, ast.Name):
             if node.id == "os" and isinstance(node.ctx, (ast.Store, ast.Del)):
                 shadowed = True
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete)):
+            targets: list[ast.AST] = []
+            if isinstance(node, ast.Assign):
+                targets.extend(node.targets)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets.append(node.target)
+            else:
+                targets.extend(node.targets)
+            for target in targets:
+                if _target_is_os_environ(target, os_roots):
+                    shadowed = True
+                    break
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.name == "os":
                 shadowed = True
@@ -1414,6 +1449,8 @@ _CALL_NAME_OFFSET: Final[int] = 2
 _JS_FUNCTION_KEYWORD_LOOKBACK: Final[int] = 2
 #: Recul nécessaire pour reconnaître ``...process`` (rest parameter).
 _JS_ELLIPSIS_LOOKBACK: Final[int] = 3
+#: Recul pour un pré-incrément ``++process`` (deux ponctuations avant).
+_JS_PREFIX_INC_LOOKBACK: Final[int] = 2
 #: Nombre maximal de jetons d'opérateur avant le ``=`` d'une affectation.
 _JS_ASSIGNMENT_LOOKBACK: Final[int] = 3
 
@@ -1715,9 +1752,118 @@ def _js_process_is_binding(  # noqa: PLR0911 - un refus par contexte
     return binding[position]
 
 
+def _js_process_env_access_end(tokens: list[_JsToken], process_index: int) -> int:
+    """Fin exclusive d'un accès direct ``process.env`` / ``process["env"]``.
+
+    Rend `-1` si `process_index` ne désigne pas `process` suivi d'un accès
+    direct à `env` (sans membre supplémentaire `process.env.foo`).
+    """
+    if (
+        process_index < 0
+        or process_index >= len(tokens)
+        or tokens[process_index].kind != "ident"
+        or tokens[process_index].value != "process"
+    ):
+        return -1
+    pos = process_index + 1
+    while pos < len(tokens) and tokens[pos].kind == "punct" and tokens[pos].value in {"?", "."}:
+        pos += 1
+    if pos < len(tokens) and tokens[pos].kind == "ident" and tokens[pos].value == "env":
+        nxt = pos + 1
+        if nxt < len(tokens) and tokens[nxt].kind == "punct":
+            if tokens[nxt].value in {"?", ".", "["}:
+                return -1
+        return nxt
+    if pos < len(tokens) and tokens[pos].kind == "punct" and tokens[pos].value == "[":
+        pos += 1
+        while pos < len(tokens) and tokens[pos].kind == "punct" and tokens[pos].value == "?":
+            pos += 1
+        if (
+            pos < len(tokens)
+            and tokens[pos].kind == "string"
+            and tokens[pos].value == "env"
+            and pos + 1 < len(tokens)
+            and tokens[pos + 1].kind == "punct"
+            and tokens[pos + 1].value == "]"
+        ):
+            nxt = pos + 2
+            if (
+                nxt < len(tokens)
+                and tokens[nxt].kind == "punct"
+                and tokens[nxt].value
+                in {
+                    "?",
+                    ".",
+                    "[",
+                }
+            ):
+                return -1
+            return nxt
+    return -1
+
+
+def _js_process_env_mutated(  # noqa: PLR0911, PLR0912, PLR2004 - motifs d'assignation bornés
+    tokens: list[_JsToken],
+) -> bool:
+    """Vrai si `process.env` est réassigné ou supprimé dans le fichier."""
+    for index, token in enumerate(tokens):
+        if token.kind != "ident" or token.value != "process":
+            continue
+        if index > 0 and tokens[index - 1].kind == "ident" and tokens[index - 1].value == "delete":
+            if _js_process_env_access_end(tokens, index) != -1:
+                return True
+        if (
+            index >= _JS_PREFIX_INC_LOOKBACK
+            and tokens[index - 1].kind == "punct"
+            and tokens[index - 2].kind == "punct"
+            and tokens[index - 1].value in {"+", "-"}
+            and tokens[index - 2].value == tokens[index - 1].value
+        ):
+            if _js_process_env_access_end(tokens, index) != -1:
+                return True
+        end = _js_process_env_access_end(tokens, index)
+        if end == -1 or end >= len(tokens):
+            continue
+        first = tokens[end]
+        second = tokens[end + 1] if end + 1 < len(tokens) else None
+        third = tokens[end + 2] if end + 2 < len(tokens) else None
+        if first.kind != "punct":
+            continue
+        if first.value == "=" and (second is None or second.value not in {"=", ">"}):
+            return True
+        if first.value in {"+", "-"} and second is not None:
+            if second.kind == "punct" and second.value == first.value:
+                return True
+            if second.kind == "punct" and second.value == "=":
+                return True
+        if first.value in {"*", "/", "%", "&", "|", "^"} and second is not None:
+            if second.kind == "punct" and second.value == "=":
+                return True
+            if (
+                second.kind == "punct"
+                and second.value == first.value
+                and third is not None
+                and third.kind == "punct"
+                and third.value == "="
+            ):
+                return True
+        if first.value in {"<", ">"} and second is not None:
+            if (
+                second.kind == "punct"
+                and second.value == first.value
+                and third is not None
+                and third.kind == "punct"
+                and third.value == "="
+            ):
+                return True
+    return False
+
+
 def _javascript_process_shadowed(source: str, tokens: list[_JsToken]) -> bool:
     """Vrai si le fichier peut lier ``process`` ailleurs qu'au global Node."""
     if _js_import_binds_process(tokens):
+        return True
+    if _js_process_env_mutated(tokens):
         return True
     enclosing, matching = _js_delimiters(tokens)
     binding = _js_binding_contexts(tokens, enclosing, matching)

@@ -315,10 +315,15 @@ def test_python_refuses_ambiguous_or_absent_cases(source: str, reason: ManualRea
         f'import sys as os\nKEY = "{SECRET}"\n',
         f'from helpers import os\nKEY = "{SECRET}"\n',
         f'def f(os):\n    return "{SECRET}"\n',
+        f'import os\nos.environ = 1\nKEY = "{SECRET}"\n',
+        f'import os\nos.environ: dict = {{}}\nKEY = "{SECRET}"\n',
+        f'import os\nos.environ += "x"\nKEY = "{SECRET}"\n',
+        f'import os\ndel os.environ\nKEY = "{SECRET}"\n',
+        f'import os as o\no.environ = 1\nKEY = "{SECRET}"\n',
     ],
 )
 def test_python_refuses_shadowed_os(source: str) -> None:
-    line = 2
+    line = 3 if "os.environ" in source or "o.environ" in source else 2
     plan = manual("app.py", source, line)
     assert plan.reason is ManualReason.SHADOWED_MODULE
 
@@ -555,10 +560,16 @@ def test_javascript_refuses_aliased_evaluation_call(source: str) -> None:
         f'process = {{}}; const k = "{SECRET}";\n',
         f'process += 1; const k = "{SECRET}";\n',
         f'process++; const k = "{SECRET}";\n',
+        f'process.env = {{}};\nconst k = "{SECRET}";\n',
+        f'process["env"] = {{}};\nconst k = "{SECRET}";\n',
+        f'delete process.env;\nconst k = "{SECRET}";\n',
+        f'delete process["env"];\nconst k = "{SECRET}";\n',
+        f'process.env++;\nconst k = "{SECRET}";\n',
     ],
 )
 def test_javascript_refuses_shadowed_process(source: str) -> None:
-    plan = manual("app.js", source, 1)
+    line = 2 if "process.env" in source or 'process["env"]' in source else 1
+    plan = manual("app.js", source, line)
     assert plan.reason is ManualReason.SHADOWED_MODULE
 
 
