@@ -468,6 +468,22 @@ def _python_call_env_access(call: ast.Call) -> bool:
     )
 
 
+def _call_mentions_namespace_reader(call: ast.Call) -> bool:
+    """Vrai si l'appel lit (même indirectement) un espace de noms propre.
+
+    ``getattr(vars(), "NOM")``, ``vars().get("NOM")``,
+    ``operator.getitem(vars(), "NOM")`` : le littéral nomme une entrée de
+    l'espace de noms, et le patch lirait la valeur d'environnement à la
+    place. Le doute profite au refus.
+    """
+    for child in ast.walk(call):
+        if isinstance(child, ast.Name) and child.id in _NAMESPACE_READER_FUNCS:
+            return True
+        if isinstance(child, ast.Attribute) and child.attr in _NAMESPACE_READER_FUNCS:
+            return True
+    return False
+
+
 def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     """Vrai si le littéral sert de **nom** de variable d'environnement.
 
@@ -502,6 +518,11 @@ def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> 
             # ``operator.getitem(os.environ, "NOM")``, ``getattr(os, "NOM")`` :
             # la clé devient la valeur.
             return True
+        if isinstance(parent, ast.Call) and _call_mentions_namespace_reader(parent):
+            # ``getattr(vars(), "NOM")``, ``vars().get("NOM")``,
+            # ``operator.getitem(locals(), "NOM")`` : le littéral nomme une
+            # entrée de l'espace de noms lui-même.
+            return True
         child = parent
         parent = parents.get(child)
     return False
@@ -514,33 +535,49 @@ _CODE_EVALUATION_FUNCS: Final[frozenset[str]] = frozenset({"eval", "exec", "comp
 _NAMESPACE_READER_FUNCS: Final[frozenset[str]] = frozenset({"vars", "locals", "globals", "dir"})
 
 
+def _callee_mentions_eval(node: ast.AST) -> bool:
+    """Vrai si le but d'appel désigne (même indirectement) une évaluation.
+
+    Couvre les noms directs (``eval``), attributs (``builtins.eval``),
+    sélections (``vars(x)["eval"]`` — la tranche constante nomme la fonction)
+    et appels intermédiaires (``getattr(x, "eval")``), avec récursion
+    (``getattr(getattr(...), "eval")``). Seule la sous-arborescence du but
+    est inspectée, jamais les arguments : un appel ordinaire ``f("eval",
+    ...)`` ne matche pas.
+    """
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        name = node.id if isinstance(node, ast.Name) else node.attr
+        return name in _CODE_EVALUATION_FUNCS
+    if isinstance(node, ast.Subscript):
+        sl = node.slice
+        if isinstance(sl, ast.Constant) and sl.value in _CODE_EVALUATION_FUNCS:
+            return True
+        return _callee_mentions_eval(node.value)
+    if isinstance(node, ast.Call):
+        function = node.func
+        inner = ""
+        if isinstance(function, ast.Name):
+            inner = function.id
+        elif isinstance(function, ast.Attribute):
+            inner = function.attr
+        if inner in {"getattr", "vars"}:
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
+                if isinstance(argument, ast.Constant) and argument.value in _CODE_EVALUATION_FUNCS:
+                    return True
+        return _callee_mentions_eval(function)
+    return False
+
+
 def _call_resolves_to_eval(call: ast.Call) -> bool:
     """Vrai si l'appel résout (même indirectement) une fonction d'évaluation.
 
-    Couvre les formes directes (``eval``, ``builtins.eval``) et curryfiées
-    (``getattr(__builtins__, "eval")``, ``vars()["eval"]`` appelé) : quand le
-    but de l'appel est lui-même un appel à ``getattr``/``vars`` dont un
-    argument constant nomme une fonction d'évaluation, le littéral passé à
-    l'appel externe serait ré-évalué comme du code. Le doute profite au refus.
+    Couvre les formes directes (``eval``), par attribut (``builtins.eval``),
+    par sélection (``vars(x)["eval"]``) et curryfiées
+    (``getattr(__builtins__, "eval")``) : quand le but de l'appel désigne une
+    fonction d'évaluation, le littéral passé à l'appel serait ré-évalué comme
+    du code. Le doute profite au refus.
     """
-    function = call.func
-    if isinstance(function, ast.Name) and function.id in _CODE_EVALUATION_FUNCS:
-        return True
-    if isinstance(function, ast.Attribute) and function.attr in _CODE_EVALUATION_FUNCS:
-        return True
-    if isinstance(function, ast.Call):
-        inner = function.func
-        inner_name = ""
-        if isinstance(inner, ast.Name):
-            inner_name = inner.id
-        elif isinstance(inner, ast.Attribute):
-            inner_name = inner.attr
-        if inner_name in {"getattr", "vars"}:
-            for argument in (*function.args, *(keyword.value for keyword in function.keywords)):
-                if isinstance(argument, ast.Constant) and argument.value in _CODE_EVALUATION_FUNCS:
-                    return True
-        return _call_resolves_to_eval(function)
-    return False
+    return _callee_mentions_eval(call.func)
 
 
 def _python_code_evaluation_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
@@ -1683,22 +1720,23 @@ def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
     """Vrai si le littéral est le premier argument d'un appel d'évaluation.
 
     Couvre les formes directes (``eval("NOM")``), optionnelles
-    (``eval?.("NOM")``, ``Function?.("NOM")`` — le ``?`` est sauté avant le
-    test) et indirectes (``(0, eval)("NOM")`` — séquence ``,`` + ident +
-    ``)`` + ``(``). Dans chaque cas la valeur d'environnement serait
-    ré-évaluée comme du code : le doute profite au refus.
+    (``eval?.("NOM")``, ``Function?.("NOM")``) et indirectes (``(0,
+    eval)("NOM")``, ``(0, eval)?.("NOM")`` — le chaînage optionnel est
+    normalisé avant le test, comme en ``_js_env_access_present``). Dans
+    chaque cas la valeur d'environnement serait ré-évaluée comme du code :
+    le doute profite au refus.
     """
     previous = tokens[position - 1] if position > 0 else None
     if previous is None or previous.kind != "punct" or previous.value != "(":
         return False
     cursor = position - _CALL_NAME_OFFSET
     while cursor >= 0 and tokens[cursor].kind == "punct" and tokens[cursor].value in {"?", "."}:
-        # Appel optionnel : ``eval?.(`` est tokenizé ``eval ? . (`` — le
-        # ``?.`` ne change pas le callee.
+        # Chaînage optionnel normalisé avant le test : ``eval?.(`` et
+        # ``(0, eval)?.(`` portent le même callee que leurs formes sèches.
         cursor -= 1
     if cursor >= 0 and tokens[cursor].kind == "ident" and tokens[cursor].value in _JS_EVAL_CALLEES:
         return True
-    closer = position - _CALL_NAME_OFFSET
+    closer = cursor
     if closer >= 0 and tokens[closer].kind == "punct" and tokens[closer].value == ")":
         # Appel indirect : ``(0, eval)("NOM")`` — le ``(`` du littéral ferme
         # un groupe dont le dernier membre est ``, eval``.
