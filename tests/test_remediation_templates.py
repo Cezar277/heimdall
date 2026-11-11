@@ -259,6 +259,8 @@ def test_python_handles_non_ascii_on_the_same_line() -> None:
         (f'x = __builtins__.exec("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = getattr(__builtins__, "eval")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = getattr(b, "exec")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = getattr(__builtins__, "ev" + "al")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'x = getattr(x, "e" + "v" + "al")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = vars(__builtins__)["eval"]("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = vars(b)["exec"]("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = getattr(vars(), "{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
@@ -331,6 +333,10 @@ def test_python_refuses_environment_key_auto_targeting(source: str) -> None:
         (f'import os as o\nx = o.environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'import os as o\nx = o.getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'env = os.environ\nx = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'env: dict = os.environ\nx = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'a = b = os.environ\nx = b["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'env, _ = os.environ, 1\nx = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'if (env := os.environ):\n    x = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'from os import *\nx = environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'from os import *\nx = getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'from os import * as o\nx = environ["{SECRET}"]\n', ManualReason.INVALID_SYNTAX),
@@ -481,12 +487,29 @@ def test_javascript_regex_with_quotes_does_not_hide_the_real_string() -> None:
         (f'globalThis["eval"]("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'window["Function"]("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'obj?.["eval"]("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'globalThis["ev" + "al"]("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'window["Fu" + "nction"]("{SECRET}");\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'setTimeout("{SECRET}", 0);\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'setInterval("{SECRET}", 0);\n', ManualReason.AMBIGUOUS_CONTEXT),
     ],
 )
 def test_javascript_refuses_ambiguous_or_absent_cases(source: str, reason: ManualReason) -> None:
     assert manual("app.js", source, 1).reason is reason
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        f'const e = eval;\ne("{SECRET}");\n',
+        f'const F = Function;\nF("{SECRET}");\n',
+        f'const e = eval;\n(0, e)("{SECRET}");\n',
+        f'e = eval;\ne("{SECRET}");\n',
+        f'a = b = eval;\nb("{SECRET}");\n',
+    ],
+)
+def test_javascript_refuses_aliased_evaluation_call(source: str) -> None:
+    """Alias simple d'`eval`/`Function` : l'appel reste refusé (sur-refus acté)."""
+    assert manual("app.js", source, 2).reason is ManualReason.AMBIGUOUS_CONTEXT
 
 
 @pytest.mark.parametrize(

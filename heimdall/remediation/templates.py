@@ -513,14 +513,30 @@ def _call_mentions_namespace_reader(call: ast.Call) -> bool:
     return False
 
 
+def _assignment_target_names(target: ast.AST) -> list[str]:
+    """Noms liés par une cible d'affectation (nom, tuple, annotation)."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _assignment_target_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: list[str] = []
+        for element in target.elts:
+            names.extend(_assignment_target_names(element))
+        return names
+    return []
+
+
 def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]]:
     """Racines (module ``os``, noms ``environ``) tenant compte des imports et alias.
 
     ``import os as o`` fait de ``o`` une racine module ; ``from os import
-    environ [as env]`` / ``getenv`` fait du nom lié une racine ``environ``.
-    Les affectations simples (``env = os.environ``) propagent aussi la racine,
-    en un seul passage dans l'ordre du parcours (les chaînes d'alias
-    ordonnées se résolvent, le reste profite au refus).
+    environ [as env]`` / ``getenv`` / ``from os import *`` fait des noms liés
+    des racines ``environ``. Les affectations simples (``env = os.environ``),
+    annotées (``env: dict = os.environ``), multiples (``a = b = os.environ``),
+    dépaquetées (``env, _ = os.environ, 1``) et walrus (``(env := os.environ)``)
+    propagent aussi la racine, en un seul passage dans l'ordre du parcours
+    (les chaînes d'alias ordonnées se résolvent, le reste profite au refus).
     """
     os_roots = set(_OS_ROOTS)
     env_roots: set[str] = set()
@@ -539,14 +555,37 @@ def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]
                         env_roots.update({"environ", "getenv"})
                     elif alias.name in {"environ", "getenv"}:
                         env_roots.add(alias.asname or alias.name)
-        elif (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and _python_env_access_in(node.value, frozenset(os_roots), frozenset(env_roots))
-        ):
-            env_roots.add(node.targets[0].id)
+        elif isinstance(node, ast.Assign):
+            _collect_assignment_aliases(node.targets, node.value, os_roots, env_roots)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            _collect_assignment_aliases([node.target], node.value, os_roots, env_roots)
+        elif isinstance(node, ast.NamedExpr):
+            _collect_assignment_aliases([node.target], node.value, os_roots, env_roots)
     return frozenset(os_roots), frozenset(env_roots)
+
+
+def _collect_assignment_aliases(
+    targets: list[ast.expr], value: ast.AST, os_roots: set[str], env_roots: set[str]
+) -> None:
+    """Ajoute les cibles liées à une valeur lisant ``os.environ``."""
+    if (
+        len(targets) == 1
+        and isinstance(targets[0], (ast.Tuple, ast.List))
+        and isinstance(value, (ast.Tuple, ast.List))
+        and len(targets[0].elts) == len(value.elts)
+    ):
+        # Dépaquetage positionnel : ``env, _ = os.environ, 1`` ne lie
+        # que ``env`` à l'environnement, pas ``_``.
+        for target_elt, value_elt in zip(targets[0].elts, value.elts, strict=True):
+            for name in _assignment_target_names(target_elt):
+                if _python_env_access_in(value_elt, frozenset(os_roots), frozenset(env_roots)):
+                    env_roots.add(name)
+        return
+    names: list[str] = []
+    for target in targets:
+        names.extend(_assignment_target_names(target))
+    if names and _python_env_access_in(value, frozenset(os_roots), frozenset(env_roots)):
+        env_roots.update(names)
 
 
 def _environment_key_context(
@@ -611,15 +650,53 @@ _CODE_EVALUATION_FUNCS: Final[frozenset[str]] = frozenset({"eval", "exec", "comp
 _NAMESPACE_READER_FUNCS: Final[frozenset[str]] = frozenset({"vars", "locals", "globals", "dir"})
 
 
+def _const_str_value(node: ast.AST) -> str | None:
+    """Valeur d'une constante chaîne, repliée à travers ``+`` (``"ev"+"al"``).
+
+    Ne replie que les concaténations de littéraux : toute autre forme rend
+    ``None`` et le doute profite au refus par l'appelant.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _const_str_value(node.left)
+        right = _const_str_value(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _has_str_addition(node: ast.AST) -> bool:
+    """Vrai si la sous-arborescence mélange concaténation et littéraux."""
+    has_add = False
+    has_str = False
+    for child in ast.walk(node):
+        if isinstance(child, ast.BinOp) and isinstance(child.op, ast.Add):
+            has_add = True
+        elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+            has_str = True
+    return has_add and has_str
+
+
+def _folded_names_eval(node: ast.AST) -> bool:
+    """Constante (repliée) ou concaténation suspecte nommant ``eval``."""
+    folded = _const_str_value(node)
+    if folded is not None:
+        return folded in _CODE_EVALUATION_FUNCS
+    return _has_str_addition(node)
+
+
 def _callee_mentions_eval(node: ast.AST) -> bool:
     """Vrai si le but d'appel désigne (même indirectement) une évaluation.
 
     Couvre les noms directs (``eval``), attributs (``builtins.eval``),
-    sélections (``vars(x)["eval"]`` — la tranche constante nomme la fonction)
-    et appels intermédiaires (``getattr(x, "eval")``), avec récursion
+    sélections (``vars(x)["eval"]`` — la tranche constante nomme la fonction,
+    y compris concaténée ``vars(x)["ev"+"al"]``) et appels intermédiaires
+    (``getattr(x, "eval")``, ``getattr(x, "ev"+"al")``), avec récursion
     (``getattr(getattr(...), "eval")``). Seule la sous-arborescence du but
     est inspectée, jamais les arguments : un appel ordinaire ``f("eval",
-    ...)`` ne matche pas.
+    ...)`` ne matche pas. Une concaténation non repliable à base de chaînes
+    en position de callee reste suspecte : le doute profite au refus.
 
     Itératif (pile explicite) : un but hostile de plusieurs milliers de
     maillons ne doit jamais lever ``RecursionError``.
@@ -632,8 +709,7 @@ def _callee_mentions_eval(node: ast.AST) -> bool:
             if name in _CODE_EVALUATION_FUNCS:
                 return True
         elif isinstance(current, ast.Subscript):
-            sl = current.slice
-            if isinstance(sl, ast.Constant) and sl.value in _CODE_EVALUATION_FUNCS:
+            if _folded_names_eval(current.slice):
                 return True
             stack.append(current.value)
         elif isinstance(current, ast.Call):
@@ -643,17 +719,17 @@ def _callee_mentions_eval(node: ast.AST) -> bool:
                 inner = function.id
             elif isinstance(function, ast.Attribute):
                 inner = function.attr
-            if inner in {"getattr", "vars"}:
-                for argument in (
-                    *current.args,
-                    *(keyword.value for keyword in current.keywords),
-                ):
-                    if (
-                        isinstance(argument, ast.Constant)
-                        and argument.value in _CODE_EVALUATION_FUNCS
-                    ):
-                        return True
+            if inner in {"getattr", "vars"} and any(
+                _folded_names_eval(argument)
+                for argument in (*current.args, *(keyword.value for keyword in current.keywords))
+            ):
+                return True
             stack.append(function)
+        elif isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            if _folded_names_eval(current):
+                return True
+            stack.append(current.left)
+            stack.append(current.right)
     return False
 
 
@@ -1798,6 +1874,13 @@ def _js_computed_process_key(tokens: list[_JsToken], position: int) -> bool:
     return False
 
 
+#: Ensemble vide immuable (défauts de paramètres sûrs).
+_NO_ALIASES: Final[frozenset[str]] = frozenset({})
+
+#: Callees d'évaluation directe dont l'alias simple est suivi.
+_JS_EVAL_ALIASABLE: Final[frozenset[str]] = frozenset({"eval", "Function"})
+
+
 def _js_env_aliases(tokens: list[_JsToken]) -> frozenset[str]:
     """Noms liés à ``process.env`` (``const env = process.env``).
 
@@ -1849,6 +1932,65 @@ def _js_env_aliases(tokens: list[_JsToken]) -> frozenset[str]:
                             and tokens[cursor + 1].value in {"?", "."}
                         )
                     )
+                ):
+                    aliases.add(name)
+                    start = index
+                    while (
+                        start - 2 >= 0
+                        and tokens[start - 1].kind == "punct"
+                        and tokens[start - 1].value == "="
+                        and tokens[start - 2].kind == "ident"
+                    ):
+                        chained = tokens[start - 2].value
+                        if chained is None:
+                            break
+                        aliases.add(chained)
+                        start -= 2
+        index += 1
+    return frozenset(aliases)
+
+
+def _js_eval_aliases(tokens: list[_JsToken]) -> frozenset[str]:
+    """Noms liés à ``eval``/``Function`` (``const e = eval``).
+
+    Même analyse bornée que ``_js_env_aliases`` : une affectation simple
+    ``X = eval`` (ni appel, ni membre) fait de ``X`` un callee
+    d'évaluation. Tout ``X("NOM")`` ultérieur est refusé (sur-refus
+    documenté : pas de dataflow, le doute profite au refus).
+    """
+    aliases: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        name = token.value if token.kind == "ident" else None
+        if (
+            name is not None
+            and index + 1 < len(tokens)
+            and tokens[index + 1].kind == "punct"
+            and tokens[index + 1].value == "="
+        ):
+            before = tokens[index - 1] if index > 0 else None
+            after = tokens[index + 2] if index + 2 < len(tokens) else None
+            plain_assignment = (
+                after is not None and after.kind == "ident" and after.value in _JS_EVAL_ALIASABLE
+            ) and (
+                before is None or not (before.kind == "punct" and before.value in {"!", "<", ">"})
+            )
+            plain_assignment = plain_assignment and not (
+                index + 3 < len(tokens)
+                and tokens[index + 3].kind == "punct"
+                and tokens[index + 3].value in {"=", ">"}
+            )
+            if plain_assignment:
+                cursor = index + 3
+                while (
+                    cursor < len(tokens)
+                    and tokens[cursor].kind == "punct"
+                    and tokens[cursor].value in {"?", "."}
+                ):
+                    cursor += 1
+                if cursor >= len(tokens) or (
+                    tokens[cursor].kind != "punct" or tokens[cursor].value not in {"(", "[", "."}
                 ):
                     aliases.add(name)
                     start = index
@@ -1932,7 +2074,9 @@ _JS_EVAL_CALLEES: Final[frozenset[str]] = frozenset(
 _INDIRECT_EVAL_SUFFIX_LEN: Final[int] = 2
 
 
-def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
+def _js_code_evaluation_call(
+    tokens: list[_JsToken], position: int, eval_aliases: frozenset[str] = _NO_ALIASES
+) -> bool:
     """Vrai si le littéral est le premier argument d'un appel d'évaluation.
 
     Couvre les formes directes (``eval("NOM")``), optionnelles
@@ -1940,9 +2084,11 @@ def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
     eval)("NOM")``, ``(0, eval)?.("NOM")`` — le chaînage optionnel est
     normalisé avant le test, comme en ``_js_env_access_present``) et par
     indice (``globalThis["eval"]("NOM")`` — voir
-    ``_js_subscript_evaluation_call``). Dans chaque cas la valeur
-    d'environnement serait ré-évaluée comme du code : le doute profite
-    au refus.
+    ``_js_subscript_evaluation_call``), par alias simple (``const e =
+    eval`` puis ``e("NOM")``, y compris indirect ``(0, e)("NOM")``) et par
+    indice concaténé (``globalThis["ev" + "al"](...)``). Dans chaque cas la
+    valeur d'environnement serait ré-évaluée comme du code : le doute
+    profite au refus.
     """
     previous = tokens[position - 1] if position > 0 else None
     if previous is None or previous.kind != "punct" or previous.value != "(":
@@ -1952,7 +2098,11 @@ def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
         # Chaînage optionnel normalisé avant le test : ``eval?.(`` et
         # ``(0, eval)?.(`` portent le même callee que leurs formes sèches.
         cursor -= 1
-    if cursor >= 0 and tokens[cursor].kind == "ident" and tokens[cursor].value in _JS_EVAL_CALLEES:
+    if (
+        cursor >= 0
+        and tokens[cursor].kind == "ident"
+        and (tokens[cursor].value in _JS_EVAL_CALLEES or tokens[cursor].value in eval_aliases)
+    ):
         return True
     if cursor >= 0 and tokens[cursor].kind == "punct" and tokens[cursor].value == ")":
         # Appel indirect : ``(0, eval)("NOM")`` — le ``(`` du littéral ferme
@@ -1980,7 +2130,7 @@ def _js_code_evaluation_call(tokens: list[_JsToken], position: int) -> bool:
                 and inner[-2].kind == "punct"
                 and inner[-2].value == ","
                 and inner[-1].kind == "ident"
-                and inner[-1].value in _JS_EVAL_CALLEES
+                and (inner[-1].value in _JS_EVAL_CALLEES or inner[-1].value in eval_aliases)
             ):
                 return True
     return _js_subscript_evaluation_call(tokens, cursor)
@@ -1993,6 +2143,9 @@ def _js_subscript_evaluation_call(tokens: list[_JsToken], cursor: int) -> bool:
     ``obj?.["eval"]("NOM")`` — miroir de la garde Python (sélection
     ``vars(x)["eval"]``). Les maillons sont remontés un par un :
     ``a["eval"]["x"](...)`` reste ambigu (la valeur transite par ``eval``).
+    Une concaténation de littéraux (``globalThis["ev" + "al"](...)``) est
+    repliée avant le test ; plusieurs littéraux non concaténés restent
+    suspects par principe.
     """
     cursor_close = cursor
     while (
@@ -2008,7 +2161,18 @@ def _js_subscript_evaluation_call(tokens: list[_JsToken], cursor: int) -> bool:
             for token in tokens[opener + 1 : cursor_close]
             if not (token.kind == "punct" and token.value == "?")
         ]
-        if len(inner) == 1 and inner[0].kind == "string" and inner[0].value in _JS_EVAL_CALLEES:
+        strings = [token for token in inner if token.kind == "string"]
+        if strings and all(
+            token.kind == "string" or (token.kind == "punct" and token.value == "+")
+            for token in inner
+        ):
+            # Membre unique ou concaténation de littéraux (``"ev" + "al"``) :
+            # la valeur décodée désigne-t-elle une fonction d'évaluation ?
+            if "".join(token.value or "" for token in strings) in _JS_EVAL_CALLEES:
+                return True
+        elif len(strings) > 1:
+            # Plusieurs littéraux non concaténés (``"ev", "al"``) : forme
+            # dissimulée, le doute profite au refus.
             return True
         cursor_close = opener - 1
         while (
@@ -2125,12 +2289,13 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
         and tokens[position - _CALL_NAME_OFFSET].value in {"require", "import"}
     ):
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
-    if _js_code_evaluation_call(tokens, position):
+    if _js_code_evaluation_call(tokens, position, _js_eval_aliases(tokens)):
         # ``eval("NOM")`` / ``Function("NOM")`` / ``compile("NOM")``,
-        # ``setTimeout("NOM", ...)``, formes optionnelles (``eval?.(...)``) et
-        # indirectes (``(0, eval)(...)``) : la valeur d'environnement serait
-        # ré-évaluée comme du code source. Le doute profite au refus, jamais
-        # au remplacement.
+        # ``setTimeout("NOM", ...)``, formes optionnelles (``eval?.(...)``),
+        # indirectes (``(0, eval)(...)``), par indice
+        # (``globalThis["eval"](...)``) et par alias (``const e = eval`` puis
+        # ``e("NOM")``) : la valeur d'environnement serait ré-évaluée comme
+        # du code source. Le doute profite au refus, jamais au remplacement.
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
     if (
         following is not None
