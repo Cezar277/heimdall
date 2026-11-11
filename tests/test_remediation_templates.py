@@ -703,10 +703,23 @@ def test_javascript_refuses_environment_key_auto_targeting(source: str) -> None:
         'import {env as e} from "node:process";\nx = e["APP_KEY"];\n',
         'for (const env of [process.env]) {}\nx = env["APP_KEY"];\n',
         'for (const e of [process.env]) {}\nx = e["APP_KEY"];\n',
+        'import {env} from "autre-lib";\nx = env["APP_KEY"];\n',
     ],
 )
 def test_javascript_refuses_aliased_environment_key(source: str) -> None:
     """Alias de ``process.env`` : le re-ciblage reste refusé (sur-refus acté)."""
+    plan = manual("app.js", source, 2, secret=ENV_NAME)
+    assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+def test_javascript_import_env_from_unrelated_lib_is_sur_refus() -> None:
+    """Sur-refus documenté : `import {env} from \"autre-lib\"` reste `manual`.
+
+    Compromis disponibilité/sécurité assumé : sans dataflow inter-fichiers, tout
+    `env` importé est traité comme `process.env` (fail-closed, jamais de
+    corruption). Voir `docs/remediation-templates.md:99`.
+    """
+    source = 'import {env} from "autre-lib";\nx = env["APP_KEY"];\n'
     plan = manual("app.js", source, 2, secret=ENV_NAME)
     assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
 
@@ -955,6 +968,15 @@ def test_module_has_no_execution_or_network_dependency() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in forbidden_serializers, (
                 "ne jamais sérialiser ReplacementPlan via asdict/astuple "
+                "(fuite before) : utiliser to_safe_dict()"
+            )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in forbidden_serializers
+        ):
+            raise AssertionError(
+                "ne jamais sérialiser ReplacementPlan via dataclasses.asdict/astuple "
                 "(fuite before) : utiliser to_safe_dict()"
             )
 
