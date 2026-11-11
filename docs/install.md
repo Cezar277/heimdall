@@ -405,8 +405,13 @@ test ! -e .env && test ! -e secrets && test ! -e data || {
 # `--no-absolute-filenames` explicite quand supporté (bsdtar), repli GNU tar
 # (retire les `/` initiaux par défaut, jamais -P) ; un seul déchiffrement.
 # Extraction en root : restaure la propriété 10001:groupe-hôte du §3.
-sudo tar --no-absolute-filenames --exclude='.git/*' -xzf "$T" data .env secrets 2>/dev/null \
-  || sudo tar --exclude='.git/*' -xzf "$T" data .env secrets
+# Capacité testée avant (jamais de `2>/dev/null` qui masquerait une archive
+# corrompue ou un disque plein).
+if tar --help | grep -q no-absolute-filenames; then
+  sudo tar --no-absolute-filenames --exclude='.git/*' -xzf "$T" data .env secrets
+else
+  sudo tar --exclude='.git/*' -xzf "$T" data .env secrets
+fi
 # Refuser les liens internes apportés par l'archive (comme au §3).
 test -z "$(find data secrets -type l)" || {
   echo "lien symbolique interne refusé après restauration" >&2

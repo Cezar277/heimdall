@@ -282,6 +282,9 @@ class InstallGuideTests(unittest.TestCase):
         self.assertIn("test ! -e .env && test ! -e secrets && test ! -e data", text)
         self.assertNotIn("test ! -e .env -a ", text)
         self.assertIn("lien symbolique interne refusé après chown", text)
+        # Durcissements revue 6a27d9a : capacité tar testée avant, stderr jamais jeté.
+        self.assertIn("tar --help | grep -q no-absolute-filenames", text)
+        self.assertNotIn('2>/dev/null \\\n  || sudo tar', text)
         self.assertGreaterEqual(text.count("test ! -L data"), 2)
         self.assertGreaterEqual(text.count("set -euo pipefail"), 2)
 
@@ -587,6 +590,18 @@ class UidGidGuardTests(unittest.TestCase):
         self.assertIn('[ "$(id -u)" != "0" ]', guide)
         self.assertNotIn("${HEIMDALL_UID", guide)
         self.assertNotIn("HEIMDALL_UID=$(id -u)", guide)
+
+    def test_chown_scheme_is_consistent_across_docs(self) -> None:
+        """Non-régression remarque 3 (revue 6a27d9a) : même chown partout."""
+        guide = INSTALL_GUIDE.read_text(encoding="utf-8")
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        cold = (ROOT / "docs" / "t122-cold-test.md").read_text(encoding="utf-8")
+        for doc in (guide, env_example, readme, cold):
+            with self.subTest(doc=doc[:40]):
+                self.assertIn('--no-dereference 10001:"$(id -g)"', doc)
+                self.assertNotIn("chown -R 10001:10001", doc)
+                self.assertNotIn("chown -R --no-dereference 10001:10001", doc)
 
     def test_compose_config_user_resolution_nominal_and_zero(self) -> None:
         """Prouve que même avec HEIMDALL_UID=0, `config` reste en 10001:10001."""
