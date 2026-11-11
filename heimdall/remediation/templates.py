@@ -58,6 +58,8 @@ MAX_SECRET_CHARS: Final[int] = 100_000
 MAX_JS_TOKENS: Final[int] = 100_000
 #: Longueur maximale d'un chemin, alignée sur le contrat Finding v1.
 MAX_PATH_CHARS: Final[int] = 4096
+#: Nombre minimal d'arguments pour `setattr(obj, name, ...)` / `delattr(obj, name)`.
+_SETATTR_MIN_ARGS: Final[int] = 2
 
 _VARIABLE: Final[re.Pattern[str]] = re.compile(r"[A-Z][A-Z0-9_]{1,63}")
 
@@ -478,6 +480,13 @@ def _python_env_access_in(
         elif isinstance(current, ast.Subscript):
             stack.append(current.value)
             stack.append(current.slice)
+        elif isinstance(current, (ast.List, ast.Tuple, ast.Set)):
+            stack.extend(current.elts)
+        elif isinstance(current, ast.Dict):
+            stack.extend(k for k in current.keys if k is not None)
+            stack.extend(current.values)
+        elif isinstance(current, ast.Starred):
+            stack.append(current.value)
         elif _is_os_module(current, os_roots):
             return True
     return False
@@ -531,16 +540,17 @@ def _assignment_target_names(target: ast.AST) -> list[str]:
     return []
 
 
-def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]]:
+def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]]:  # noqa: PLR0912 - collecteurs bornés
     """Racines (module ``os``, noms ``environ``) tenant compte des imports et alias.
 
     ``import os as o`` fait de ``o`` une racine module ; ``from os import
     environ [as env]`` / ``getenv`` / ``from os import *`` fait des noms liés
     des racines ``environ``. Les affectations simples (``env = os.environ``),
     annotées (``env: dict = os.environ``), multiples (``a = b = os.environ``),
-    dépaquetées (``env, _ = os.environ, 1``) et walrus (``(env := os.environ)``)
-    propagent aussi la racine, en un seul passage dans l'ordre du parcours
-    (les chaînes d'alias ordonnées se résolvent, le reste profite au refus).
+    dépaquetées (``env, _ = os.environ, 1``), walrus (``(env := os.environ)``)
+    et lieurs ``for``/``with`` (``for env in [os.environ]``) propagent aussi
+    la racine, jusqu'à point fixe (les chaînes hors-ordre se résolvent, le
+    reste profite au refus).
     """
     os_roots = set(_OS_ROOTS)
     env_roots: set[str] = set()
@@ -559,12 +569,39 @@ def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]
                         env_roots.update({"environ", "getenv"})
                     elif alias.name in {"environ", "getenv"}:
                         env_roots.add(alias.asname or alias.name)
-        elif isinstance(node, ast.Assign):
-            _collect_assignment_aliases(node.targets, node.value, os_roots, env_roots)
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            _collect_assignment_aliases([node.target], node.value, os_roots, env_roots)
-        elif isinstance(node, ast.NamedExpr):
-            _collect_assignment_aliases([node.target], node.value, os_roots, env_roots)
+    while True:
+        before = len(env_roots)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                _collect_assignment_aliases(node.targets, node.value, os_roots, env_roots)
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                _collect_assignment_aliases([node.target], node.value, os_roots, env_roots)
+            elif isinstance(node, ast.NamedExpr):
+                _collect_assignment_aliases([node.target], node.value, os_roots, env_roots)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                if _python_env_access_in(node.iter, frozenset(os_roots), frozenset(env_roots)):
+                    for name in _assignment_target_names(node.target):
+                        env_roots.add(name)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None and _python_env_access_in(
+                        item.context_expr, frozenset(os_roots), frozenset(env_roots)
+                    ):
+                        for name in _assignment_target_names(item.optional_vars):
+                            env_roots.add(name)
+            elif isinstance(node, ast.comprehension):
+                if _python_env_access_in(node.iter, frozenset(os_roots), frozenset(env_roots)):
+                    for name in _assignment_target_names(node.target):
+                        env_roots.add(name)
+            elif isinstance(node, ast.ExceptHandler):
+                if (
+                    node.name
+                    and node.type is not None
+                    and _python_env_access_in(node.type, frozenset(os_roots), frozenset(env_roots))
+                ):
+                    env_roots.add(node.name)
+        if len(env_roots) == before:
+            break
     return frozenset(os_roots), frozenset(env_roots)
 
 
@@ -825,12 +862,41 @@ def _target_is_os_environ(target: ast.AST, os_roots: set[str]) -> bool:
         return _target_is_os_environ(target.value, os_roots)
     if isinstance(target, (ast.Tuple, ast.List)):
         return any(_target_is_os_environ(elt, os_roots) for elt in target.elts)
-    return (
-        isinstance(target, ast.Attribute)
-        and target.attr == "environ"
-        and isinstance(target.value, ast.Name)
-        and target.value.id in os_roots
+    if isinstance(target, ast.Attribute):
+        return (
+            target.attr == "environ"
+            and isinstance(target.value, ast.Name)
+            and target.value.id in os_roots
+        )
+    if isinstance(target, ast.Subscript):
+        folded = _const_str_value(target.slice)
+        if folded != "environ":
+            return False
+        return any(
+            isinstance(child, ast.Name) and child.id in os_roots for child in ast.walk(target.value)
+        )
+    return False
+
+
+def _call_mutates_os_environ(node: ast.Call, os_roots: set[str]) -> bool:
+    """Vrai si l'appel mute ``os.environ`` via ``setattr``/`delattr` dynamique."""
+    func = node.func
+    name = ""
+    if isinstance(func, ast.Name):
+        name = func.id
+    elif isinstance(func, ast.Attribute):
+        name = func.attr
+    if name not in {"setattr", "delattr", "__setattr__", "__delattr__"}:
+        return False
+    if len(node.args) < _SETATTR_MIN_ARGS:
+        return False
+    receiver, key = node.args[0], node.args[1]
+    mentions_os = any(
+        isinstance(child, ast.Name) and child.id in os_roots for child in ast.walk(receiver)
     )
+    if not mentions_os:
+        return False
+    return _const_str_value(key) == "environ"
 
 
 def _python_os_status(tree: ast.AST, target_line: int) -> tuple[bool, bool]:  # noqa: PLR0912, PLR0915
@@ -884,6 +950,9 @@ def _python_os_status(tree: ast.AST, target_line: int) -> tuple[bool, bool]:  # 
                 if _target_is_os_environ(target, os_roots):
                     shadowed = True
                     break
+        elif isinstance(node, ast.Call):
+            if _call_mutates_os_environ(node, os_roots):
+                shadowed = True
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.name == "os":
                 shadowed = True
@@ -1859,11 +1928,120 @@ def _js_process_env_mutated(  # noqa: PLR0911, PLR0912, PLR2004 - motifs d'assig
     return False
 
 
+def _js_global_process_mutated(  # noqa: PLR0912 - motifs globaux bornés
+    tokens: list[_JsToken],
+) -> bool:
+    """Vrai si `globalThis.process` (ou `global`/`window`) est réassigné."""
+    globals_objects = {"globalThis", "global", "window", "self"}
+    for index, token in enumerate(tokens):
+        if token.kind != "ident" or token.value not in globals_objects:
+            continue
+        pos = index + 1
+        while pos < len(tokens) and tokens[pos].kind == "punct" and tokens[pos].value in {"?", "."}:
+            pos += 1
+        is_process = False
+        end = -1
+        if pos < len(tokens) and tokens[pos].kind == "ident" and tokens[pos].value == "process":
+            nxt = pos + 1
+            if (
+                nxt < len(tokens)
+                and tokens[nxt].kind == "punct"
+                and tokens[nxt].value
+                in {
+                    "?",
+                    ".",
+                    "[",
+                }
+            ):
+                pass
+            else:
+                is_process = True
+                end = nxt
+        elif pos < len(tokens) and tokens[pos].kind == "punct" and tokens[pos].value == "[":
+            probe = pos + 1
+            while (
+                probe < len(tokens) and tokens[probe].kind == "punct" and tokens[probe].value == "?"
+            ):
+                probe += 1
+            if (
+                probe < len(tokens)
+                and tokens[probe].kind == "string"
+                and tokens[probe].value == "process"
+                and probe + 1 < len(tokens)
+                and tokens[probe + 1].kind == "punct"
+                and tokens[probe + 1].value == "]"
+            ):
+                is_process = True
+                end = probe + 2
+        if not is_process:
+            continue
+        if index > 0 and tokens[index - 1].kind == "ident" and tokens[index - 1].value == "delete":
+            return True
+        if end < len(tokens) and tokens[end].kind == "punct" and tokens[end].value == "=":
+            following = tokens[end + 1] if end + 1 < len(tokens) else None
+            if following is None or not (
+                following.kind == "punct" and following.value in {"=", ">"}
+            ):
+                return True
+    return False
+
+
+def _js_reflect_process_env_mutation(  # noqa: PLR0912 - motifs dynamiques bornés
+    tokens: list[_JsToken],
+) -> bool:
+    """Vrai si `Reflect`/`Object` mute `process.env` dynamiquement."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.kind == "ident" and token.value in {"Reflect", "Object"}:
+            if (
+                index + 2 < len(tokens)
+                and tokens[index + 1].kind == "punct"
+                and tokens[index + 1].value == "."
+                and tokens[index + 2].kind == "ident"
+                and tokens[index + 2].value
+                in {"set", "deleteProperty", "defineProperty", "defineProperties"}
+            ):
+                if (
+                    index + 3 < len(tokens)
+                    and tokens[index + 3].kind == "punct"
+                    and tokens[index + 3].value == "("
+                ):
+                    depth = 0
+                    closer = -1
+                    cursor = index + 3
+                    while cursor < len(tokens):
+                        if tokens[cursor].kind == "punct":
+                            if tokens[cursor].value == "(":
+                                depth += 1
+                            elif tokens[cursor].value == ")":
+                                depth -= 1
+                                if depth == 0:
+                                    closer = cursor
+                                    break
+                        cursor += 1
+                    if closer >= 0:
+                        inner = tokens[index + 4 : closer]
+                        has_process = any(t.kind == "ident" and t.value == "process" for t in inner)
+                        has_env = any(
+                            t.kind in {"ident", "string"} and t.value == "env" for t in inner
+                        )
+                        if has_process and has_env:
+                            return True
+                        index = closer
+        index += 1
+    return False
+
+
 def _javascript_process_shadowed(source: str, tokens: list[_JsToken]) -> bool:
     """Vrai si le fichier peut lier ``process`` ailleurs qu'au global Node."""
     if _js_import_binds_process(tokens):
         return True
     if _js_process_env_mutated(tokens):
+        return True
+    if _js_global_process_mutated(tokens):
+        return True
+    if _js_reflect_process_env_mutation(tokens):
         return True
     enclosing, matching = _js_delimiters(tokens)
     binding = _js_binding_contexts(tokens, enclosing, matching)
@@ -2168,6 +2346,96 @@ def _js_destructured_env_aliases(  # noqa: PLR0912 - balayage borné des motifs 
     return found
 
 
+def _js_for_env_aliases(  # noqa: PLR0912, PLR0915 - balayage borné des têtes `for`
+    tokens: list[_JsToken],
+) -> set[str]:
+    """Alias issus de ``for (const env of/in [process.env])``.
+
+    Si la source (après ``of``/``in``) mentionne ``process.env``, les noms liés
+    à gauche sont des alias (sur-refus : ``for (const e of [process.env])``
+    lie ``e`` à ``process.env`` quelle que soit la casse du nom).
+    """
+    found: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        if tokens[index].kind == "ident" and tokens[index].value == "for":
+            if index + 1 >= len(tokens):
+                index += 1
+                continue
+            if tokens[index + 1].kind != "punct" or tokens[index + 1].value != "(":
+                index += 1
+                continue
+            depth = 0
+            closer = -1
+            cursor = index + 1
+            while cursor < len(tokens):
+                if tokens[cursor].kind == "punct":
+                    if tokens[cursor].value == "(":
+                        depth += 1
+                    elif tokens[cursor].value == ")":
+                        depth -= 1
+                        if depth == 0:
+                            closer = cursor
+                            break
+                cursor += 1
+            if closer >= 0:
+                inner = tokens[index + 2 : closer]
+                of_pos = -1
+                depth2 = 0
+                for pos, tok in enumerate(inner):
+                    if tok.kind == "punct":
+                        if tok.value in {"[", "{", "("}:
+                            depth2 += 1
+                        elif tok.value in {"]", "}", ")"}:
+                            depth2 -= 1
+                    elif tok.kind == "ident" and tok.value in {"of", "in"} and depth2 == 0:
+                        of_pos = pos
+                        break
+                if of_pos >= 0:
+                    left = inner[:of_pos]
+                    right = inner[of_pos + 1 :]
+                    mentions_process_env = any(
+                        rtok.kind == "ident"
+                        and rtok.value == "process"
+                        and _js_process_env_access_end(right, rpos) != -1
+                        for rpos, rtok in enumerate(right)
+                    )
+                    if not mentions_process_env:
+                        mentions_process = any(
+                            c.kind == "ident" and c.value == "process" for c in right
+                        )
+                        mentions_env_key = any(
+                            c.kind in {"ident", "string"} and c.value == "env" for c in left
+                        )
+                        mentions_process_env = mentions_process and mentions_env_key
+                    if mentions_process_env:
+                        for tok in left:
+                            if tok.kind == "ident" and tok.value not in {
+                                "const",
+                                "let",
+                                "var",
+                                "of",
+                                "in",
+                            }:
+                                found.add(tok.value or "")
+                        for lpos, ltok in enumerate(left):
+                            is_env_key = (ltok.kind == "ident" and ltok.value == "env") or (
+                                ltok.kind == "string" and ltok.value == "env"
+                            )
+                            if is_env_key and lpos + 2 < len(left):
+                                if (
+                                    left[lpos + 1].kind == "punct"
+                                    and left[lpos + 1].value == ":"
+                                    and left[lpos + 2].kind == "ident"
+                                    and left[lpos + 2].value is not None
+                                ):
+                                    found.add(left[lpos + 2].value or "")
+                    index = closer
+        index += 1
+    found.discard("")
+    return found
+
+
 def _js_imported_env_aliases(  # noqa: PLR0912 - balayage borné des imports `{env}`
     tokens: list[_JsToken],
 ) -> set[str]:
@@ -2229,14 +2497,16 @@ def _js_env_aliases(tokens: list[_JsToken]) -> frozenset[str]:
     d'une affectation simple ``=`` (ni ``==``, ``=>``, ``<=``... ni membre
     ``process.env.foo``) vers ``process.env`` / ``process?.env`` /
     ``process["env"]`` / ``process?.["env"]``. La déstructuration
-    (``const {env} = process``, ``const {env: e} = process``) et l'import
-    nommé (``import {env[, …]} from …``, ``{env as e}``) lient aussi
-    ``process.env``. Tout ``X["NOM"]`` / ``X.get("NOM")`` ultérieur est refusé
-    (sur-refus documenté) plutôt que de corrompre la clé.
+    (``const {env} = process``, ``const {env: e} = process``), l'import
+    nommé (``import {env[, …]} from …``, ``{env as e}``) et la boucle
+    (``for (const env of [process.env])``) lient aussi ``process.env``. Tout
+    ``X["NOM"]`` / ``X.get("NOM")`` ultérieur est refusé (sur-refus documenté)
+    plutôt que de corrompre la clé.
     """
     aliases: set[str] = set()
     aliases.update(_js_destructured_env_aliases(tokens))
     aliases.update(_js_imported_env_aliases(tokens))
+    aliases.update(_js_for_env_aliases(tokens))
     index = 0
     while index < len(tokens):
         token = tokens[index]

@@ -320,10 +320,20 @@ def test_python_refuses_ambiguous_or_absent_cases(source: str, reason: ManualRea
         f'import os\nos.environ += "x"\nKEY = "{SECRET}"\n',
         f'import os\ndel os.environ\nKEY = "{SECRET}"\n',
         f'import os as o\no.environ = 1\nKEY = "{SECRET}"\n',
+        f'import os\nsetattr(os, "environ", 1)\nKEY = "{SECRET}"\n',
+        f'import os\ndelattr(os, "environ")\nKEY = "{SECRET}"\n',
+        f'import os\nos.__dict__["environ"] = 1\nKEY = "{SECRET}"\n',
     ],
 )
 def test_python_refuses_shadowed_os(source: str) -> None:
-    line = 3 if "os.environ" in source or "o.environ" in source else 2
+    needs_third_line = (
+        "os.environ" in source
+        or "o.environ" in source
+        or "setattr" in source
+        or "delattr" in source
+        or "__dict__" in source
+    )
+    line = 3 if needs_third_line else 2
     plan = manual("app.py", source, line)
     assert plan.reason is ManualReason.SHADOWED_MODULE
 
@@ -371,6 +381,18 @@ def test_python_refuses_aliased_environment_access(source: str, reason: ManualRe
     """Alias d'import ou d'affectation : le re-ciblage reste refusé."""
     plan = manual("app.py", source, 2)
     assert plan.reason is reason
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        f'import os\nfor env in [os.environ]:\n    pass\nx = env["{SECRET}"]\n',
+        f'import os\nb = a\na = os.environ\nx = b["{SECRET}"]\n',
+    ],
+)
+def test_python_refuses_loop_and_out_of_order_aliases(source: str) -> None:
+    """Boucle `for` et chaîne hors-ordre : le re-ciblage reste refusé."""
+    assert manual("app.py", source, 4).reason is ManualReason.AMBIGUOUS_CONTEXT
 
 
 @pytest.mark.parametrize(
@@ -565,10 +587,13 @@ def test_javascript_refuses_aliased_evaluation_call(source: str) -> None:
         f'delete process.env;\nconst k = "{SECRET}";\n',
         f'delete process["env"];\nconst k = "{SECRET}";\n',
         f'process.env++;\nconst k = "{SECRET}";\n',
+        f'Reflect.set(process, "env", {{}});\nconst k = "{SECRET}";\n',
+        f'Reflect.deleteProperty(process, "env");\nconst k = "{SECRET}";\n',
+        f'globalThis.process = {{}};\nconst k = "{SECRET}";\n',
     ],
 )
 def test_javascript_refuses_shadowed_process(source: str) -> None:
-    line = 2 if "process.env" in source or 'process["env"]' in source else 1
+    line = 2 if ("\nconst k" in source or "\nx =" in source) else 1
     plan = manual("app.js", source, line)
     assert plan.reason is ManualReason.SHADOWED_MODULE
 
@@ -607,6 +632,8 @@ def test_javascript_refuses_environment_key_auto_targeting(source: str) -> None:
         'const {env: e} = process;\nx = e["APP_KEY"];\n',
         'import {env} from "node:process";\nx = env["APP_KEY"];\n',
         'import {env as e} from "node:process";\nx = e["APP_KEY"];\n',
+        'for (const env of [process.env]) {}\nx = env["APP_KEY"];\n',
+        'for (const e of [process.env]) {}\nx = e["APP_KEY"];\n',
     ],
 )
 def test_javascript_refuses_aliased_environment_key(source: str) -> None:
