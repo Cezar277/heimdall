@@ -404,10 +404,17 @@ def _is_os_environ(node: ast.AST) -> bool:
     )
 
 
-def _is_os_module(node: ast.AST) -> bool:
-    """Vrai pour ``os`` ou ``os.environ`` : l'objet qui porte les clés."""
+#: Nom de module racine par défaut pour les accès à l'environnement.
+_OS_ROOTS: Final[frozenset[str]] = frozenset({"os"})
+
+#: Ensembles vides (défauts immuables pour les racines d'accès).
+_NO_ROOTS: Final[frozenset[str]] = frozenset()
+
+
+def _is_os_module(node: ast.AST, os_roots: frozenset[str] = _OS_ROOTS) -> bool:
+    """Vrai pour ``os`` (ou un alias d'import) ou ``os.environ``."""
     if isinstance(node, ast.Name):
-        return node.id == "os"
+        return node.id in os_roots
     return _is_os_environ(node)
 
 
@@ -424,46 +431,68 @@ def _python_dynamic_import(node: ast.AST) -> bool:
     )
 
 
-def _python_env_access_in(node: ast.AST) -> bool:
+def _python_env_access_in(
+    node: ast.AST,
+    os_roots: frozenset[str] = _OS_ROOTS,
+    env_roots: frozenset[str] = _NO_ROOTS,
+) -> bool:
     """Vrai si l'expression mentionne une lecture d'``os.environ`` (racine ``os``).
 
     Couvre les formes directes (``os.environ``, ``os.environ.get``, ``os.getenv``,
-    ``operator.getitem``) et les formes indirectionnées : curryfication
-    (``getattr(os.environ, "get")("NOM")``), sous-référence via ``vars`` ou
-    ``getattr`` (``vars(os.environ)["NOM"]``, ``getattr(os, "environ")["NOM"]``),
-    et import dynamique (``__import__("os")``, ``importlib.import_module("os")``).
+    ``operator.getitem``), les alias d'import (``import os as o`` → ``o`` ;
+    ``from os import environ [as env]`` / ``getenv`` → nom lié), les affectations
+    simples (``env = os.environ`` → ``env``) et les formes indirectionnées :
+    curryfication (``getattr(os.environ, "get")("NOM")``), sous-référence via
+    ``vars`` ou ``getattr`` (``vars(os.environ)["NOM"]``,
+    ``getattr(os, "environ")["NOM"]``), et import dynamique
+    (``__import__("os")``, ``importlib.import_module("os")``).
     Dans chaque cas, la clé littérale deviendrait la valeur lue si le patch était
     appliqué : le contexte est donc un re-ciblage.
+
+    Itératif (pile explicite) : une chaîne d'attributs hostile de plusieurs
+    milliers de maillons ne doit jamais lever ``RecursionError`` — le dépôt
+    scanné est non fiable et toute erreur se solde par un refus statique.
     """
-    if _is_os_environ(node):
-        return True
-    if isinstance(node, ast.Attribute):
-        return _python_env_access_in(node.value)
-    if isinstance(node, ast.Call):
-        if _python_dynamic_import(node) or _python_env_access_in(node.func):
-            # ``__import__("os")`` / ``importlib.import_module("os")`` : import
-            # dynamique, forme d'accès indirect à un module potentiellement ``os``
-            # — le doute profite au refus, jamais au remplacement.
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if _is_os_environ(current):
             return True
-        return any(
-            _python_env_access_in(argument)
-            for argument in (*node.args, *(keyword.value for keyword in node.keywords))
-        )
-    if isinstance(node, ast.Subscript):
-        return _python_env_access_in(node.value) or _python_env_access_in(node.slice)
-    return _is_os_module(node)
+        if isinstance(current, ast.Name) and current.id in env_roots:
+            return True
+        if isinstance(current, ast.Attribute):
+            stack.append(current.value)
+        elif isinstance(current, ast.Call):
+            if _python_dynamic_import(current):
+                # ``__import__("os")`` / ``importlib.import_module("os")`` :
+                # import dynamique, forme d'accès indirect à un module
+                # potentiellement ``os`` — le doute profite au refus.
+                return True
+            stack.append(current.func)
+            stack.extend(current.args)
+            stack.extend(keyword.value for keyword in current.keywords)
+        elif isinstance(current, ast.Subscript):
+            stack.append(current.value)
+            stack.append(current.slice)
+        elif _is_os_module(current, os_roots):
+            return True
+    return False
 
 
-def _python_call_env_access(call: ast.Call) -> bool:
+def _python_call_env_access(
+    call: ast.Call,
+    os_roots: frozenset[str] = _OS_ROOTS,
+    env_roots: frozenset[str] = _NO_ROOTS,
+) -> bool:
     """Vrai pour un appel dont le but ou un argument lit via ``os.environ``."""
-    if _python_env_access_in(call.func):
+    if _python_env_access_in(call.func, os_roots, env_roots):
         return True
     if _python_dynamic_import(call):
         # ``__import__("os")``, ``importlib.import_module("os")`` : accès
         # indirect à un module potentiellement ``os`` — le doute profite au refus.
         return True
     return any(
-        _python_env_access_in(argument)
+        _python_env_access_in(argument, os_roots, env_roots)
         for argument in (*call.args, *(keyword.value for keyword in call.keywords))
     )
 
@@ -484,22 +513,64 @@ def _call_mentions_namespace_reader(call: ast.Call) -> bool:
     return False
 
 
-def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+def _python_os_aliases(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]]:
+    """Racines (module ``os``, noms ``environ``) tenant compte des imports et alias.
+
+    ``import os as o`` fait de ``o`` une racine module ; ``from os import
+    environ [as env]`` / ``getenv`` fait du nom lié une racine ``environ``.
+    Les affectations simples (``env = os.environ``) propagent aussi la racine,
+    en un seul passage dans l'ordre du parcours (les chaînes d'alias
+    ordonnées se résolvent, le reste profite au refus).
+    """
+    os_roots = set(_OS_ROOTS)
+    env_roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "os":
+                    os_roots.add(alias.asname or "os")
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "os" and node.level == 0:
+                for alias in node.names:
+                    if alias.name in {"environ", "getenv"}:
+                        env_roots.add(alias.asname or alias.name)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and _python_env_access_in(node.value, frozenset(os_roots), frozenset(env_roots))
+        ):
+            env_roots.add(node.targets[0].id)
+    return frozenset(os_roots), frozenset(env_roots)
+
+
+def _environment_key_context(
+    node: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+    os_roots: frozenset[str] = _OS_ROOTS,
+    env_roots: frozenset[str] = _NO_ROOTS,
+) -> bool:
     """Vrai si le littéral sert de **nom** de variable d'environnement.
 
     Remplacer ``os.environ["APP_KEY"]`` par ``os.environ[os.environ["APP_KEY"]]``
     changerait la clé lue : le patch est refusé plutôt que corrompu. Le cas
     ``os.getenv(...)``/``os.environ.get(...)`` est traité de la même façon, ainsi
-    que les formes indirectionnées (curryfication ``getattr(os.environ, "get")``,
-    sous-référence ``vars(os.environ)``/``getattr(os, "environ")``) et les
-    imports dynamiques (``__import__("os")``, ``importlib.import_module``).
+    que les alias d'import (``import os as o``, ``from os import environ``) et
+    d'affectation (``env = os.environ``), les formes indirectionnées
+    (curryfication ``getattr(os.environ, "get")``, sous-référence
+    ``vars(os.environ)``/``getattr(os, "environ")``) et les imports dynamiques
+    (``__import__("os")``, ``importlib.import_module``).
     """
     child = node
     parent = parents.get(child)
     while parent is not None:
-        if isinstance(parent, ast.Subscript) and _python_env_access_in(parent.value):
+        if isinstance(parent, ast.Subscript) and _python_env_access_in(
+            parent.value, os_roots, env_roots
+        ):
             # ``os.environ["NOM"]``, ``vars(os.environ)["NOM"]``,
-            # ``getattr(os, "environ")["NOM"]`` : la clé devient la valeur.
+            # ``getattr(os, "environ")["NOM"]``, ``environ["NOM"]`` et
+            # ``env["NOM"]`` (alias d'import ou d'affectation) : la clé
+            # devient la valeur.
             return True
         if isinstance(parent, ast.Subscript) and isinstance(parent.value, ast.Call):
             receiver = parent.value.func
@@ -513,10 +584,10 @@ def _environment_key_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> 
                 # le littéral nomme une entrée de l'espace de noms lui-même ;
                 # le patch lirait la valeur d'environnement à la place.
                 return True
-        if isinstance(parent, ast.Call) and _python_call_env_access(parent):
+        if isinstance(parent, ast.Call) and _python_call_env_access(parent, os_roots, env_roots):
             # ``os.environ.get("NOM")``, ``getattr(os.environ, "get")("NOM")``,
-            # ``operator.getitem(os.environ, "NOM")``, ``getattr(os, "NOM")`` :
-            # la clé devient la valeur.
+            # ``operator.getitem(os.environ, "NOM")``, ``getattr(os, "NOM")``,
+            # ``environ.get("NOM")`` (alias) : la clé devient la valeur.
             return True
         if isinstance(parent, ast.Call) and _call_mentions_namespace_reader(parent):
             # ``getattr(vars(), "NOM")``, ``vars().get("NOM")``,
@@ -544,27 +615,40 @@ def _callee_mentions_eval(node: ast.AST) -> bool:
     (``getattr(getattr(...), "eval")``). Seule la sous-arborescence du but
     est inspectée, jamais les arguments : un appel ordinaire ``f("eval",
     ...)`` ne matche pas.
+
+    Itératif (pile explicite) : un but hostile de plusieurs milliers de
+    maillons ne doit jamais lever ``RecursionError``.
     """
-    if isinstance(node, (ast.Name, ast.Attribute)):
-        name = node.id if isinstance(node, ast.Name) else node.attr
-        return name in _CODE_EVALUATION_FUNCS
-    if isinstance(node, ast.Subscript):
-        sl = node.slice
-        if isinstance(sl, ast.Constant) and sl.value in _CODE_EVALUATION_FUNCS:
-            return True
-        return _callee_mentions_eval(node.value)
-    if isinstance(node, ast.Call):
-        function = node.func
-        inner = ""
-        if isinstance(function, ast.Name):
-            inner = function.id
-        elif isinstance(function, ast.Attribute):
-            inner = function.attr
-        if inner in {"getattr", "vars"}:
-            for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
-                if isinstance(argument, ast.Constant) and argument.value in _CODE_EVALUATION_FUNCS:
-                    return True
-        return _callee_mentions_eval(function)
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (ast.Name, ast.Attribute)):
+            name = current.id if isinstance(current, ast.Name) else current.attr
+            if name in _CODE_EVALUATION_FUNCS:
+                return True
+        elif isinstance(current, ast.Subscript):
+            sl = current.slice
+            if isinstance(sl, ast.Constant) and sl.value in _CODE_EVALUATION_FUNCS:
+                return True
+            stack.append(current.value)
+        elif isinstance(current, ast.Call):
+            function = current.func
+            inner = ""
+            if isinstance(function, ast.Name):
+                inner = function.id
+            elif isinstance(function, ast.Attribute):
+                inner = function.attr
+            if inner in {"getattr", "vars"}:
+                for argument in (
+                    *current.args,
+                    *(keyword.value for keyword in current.keywords),
+                ):
+                    if (
+                        isinstance(argument, ast.Constant)
+                        and argument.value in _CODE_EVALUATION_FUNCS
+                    ):
+                        return True
+            stack.append(function)
     return False
 
 
@@ -802,6 +886,7 @@ def _python_replacement(  # noqa: PLR0911, PLR0912, PLR0915 - un refus par garde
         return _python_failure(file, source, line, variable, ManualReason.MULTIPLE_LITERALS)
 
     safe: list[ast.Constant] = []
+    os_roots, env_roots = _python_os_aliases(tree)
     for node in matching:
         parent = parents.get(node)
         unsafe = _ambiguous_parent(node, parent)
@@ -809,7 +894,7 @@ def _python_replacement(  # noqa: PLR0911, PLR0912, PLR0915 - un refus par garde
             return _python_failure(file, source, line, variable, unsafe)
         if _annotation_context(node, parents):
             return _python_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
-        if _environment_key_context(node, parents):
+        if _environment_key_context(node, parents, os_roots, env_roots):
             return _python_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
         if _python_code_evaluation_context(node, parents):
             # ``eval("NOM")`` : la valeur d'env serait ré-évaluée comme du code.
@@ -1669,7 +1754,23 @@ def _js_computed_process_key(tokens: list[_JsToken], position: int) -> bool:
         # arguments d'appel (``f("SECRET")``) et les éléments de tableau
         # (``["SECRET"]``) restent des positions d'expression éligibles au patch.
         return False
-    normalized = _js_normalize_optional_chaining(tokens, 0, opener)
+    start = 0
+    parent = enclosing_map[opener]
+    if parent is not None:
+        # Ancrer sur le délimiteur englobant le crochet (comme
+        # ``_js_process_env_key``) : seule l'expression porteuse compte.
+        start = parent + 1
+    else:
+        # Crochet au niveau d'une instruction : borner la recherche au
+        # délimiteur d'instruction précédent (``;``/``{``/``}``). Un
+        # ``process`` mentionné dans une instruction précédente
+        # (``console.log(process.version);``) ne doit pas faire refuser une
+        # clé indépendante (``config["SECRET"]``).
+        for boundary in range(opener - 1, -1, -1):
+            if tokens[boundary].kind == "punct" and tokens[boundary].value in {";", "{", "}"}:
+                start = boundary + 1
+                break
+    normalized = _js_normalize_optional_chaining(tokens, start, opener)
     for index, token in enumerate(normalized):
         if (
             token.kind == "ident"
@@ -1682,6 +1783,108 @@ def _js_computed_process_key(tokens: list[_JsToken], position: int) -> bool:
             # ``process?.[...]``) : la clé remonte une expression dynamique.
             return True
     return False
+
+
+def _js_env_aliases(tokens: list[_JsToken]) -> frozenset[str]:
+    """Noms liés à ``process.env`` (``const env = process.env``).
+
+    Analyse syntaxique bornée, sans dataflow : un identifiant ``X`` suivi
+    d'une affectation simple ``=`` (ni ``==``, ``=>``, ``<=``... ni membre
+    ``process.env.foo``) vers ``process.env`` / ``process?.env``. Tout
+    ``X["NOM"]`` / ``X.get("NOM")`` ultérieur est refusé (sur-refus
+    documenté) plutôt que de corrompre la clé.
+    """
+    aliases: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        name = token.value if token.kind == "ident" else None
+        if (
+            name is not None
+            and index + 1 < len(tokens)
+            and tokens[index + 1].kind == "punct"
+            and tokens[index + 1].value == "="
+        ):
+            before = tokens[index - 1] if index > 0 else None
+            after = tokens[index + 2] if index + 2 < len(tokens) else None
+            plain_assignment = (
+                after is not None and after.kind == "ident" and after.value == "process"
+            ) and (
+                before is None or not (before.kind == "punct" and before.value in {"!", "<", ">"})
+            )
+            plain_assignment = plain_assignment and not (
+                index + 3 < len(tokens)
+                and tokens[index + 3].kind == "punct"
+                and tokens[index + 3].value in {"=", ">"}
+            )
+            if plain_assignment:
+                cursor = index + 3
+                while (
+                    cursor < len(tokens)
+                    and tokens[cursor].kind == "punct"
+                    and tokens[cursor].value in {"?", "."}
+                ):
+                    cursor += 1
+                if (
+                    cursor < len(tokens)
+                    and tokens[cursor].kind == "ident"
+                    and tokens[cursor].value == "env"
+                    and (
+                        cursor + 1 >= len(tokens)
+                        or not (
+                            tokens[cursor + 1].kind == "punct"
+                            and tokens[cursor + 1].value in {"?", "."}
+                        )
+                    )
+                ):
+                    aliases.add(name)
+                    start = index
+                    while (
+                        start - 2 >= 0
+                        and tokens[start - 1].kind == "punct"
+                        and tokens[start - 1].value == "="
+                        and tokens[start - 2].kind == "ident"
+                    ):
+                        chained = tokens[start - 2].value
+                        if chained is None:
+                            break
+                        aliases.add(chained)
+                        start -= 2
+        index += 1
+    return frozenset(aliases)
+
+
+def _js_env_alias_key(tokens: list[_JsToken], position: int, env_aliases: frozenset[str]) -> bool:
+    """Vrai si le littéral est lu via un alias de ``process.env``.
+
+    ``env["NOM"]`` / ``env?.["NOM"]`` (récepteur direct) et ``env.get("NOM")``
+    / ``env?.get("NOM")`` (méthode sur alias) : dans chaque cas la clé
+    deviendrait la valeur lue. Le doute profite au refus.
+    """
+    if not env_aliases:
+        return False
+    previous = tokens[position - 1] if position > 0 else None
+    if previous is None or previous.kind != "punct" or previous.value not in {"[", "("}:
+        return False
+    cursor = position - _CALL_NAME_OFFSET
+    while cursor >= 0 and tokens[cursor].kind == "punct" and tokens[cursor].value in {"?", "."}:
+        cursor -= 1
+    if cursor < 0 or tokens[cursor].kind != "ident":
+        return False
+    if previous.value == "[":
+        return tokens[cursor].value in env_aliases
+    if tokens[cursor].value in env_aliases:
+        # Appel direct de l'objet : ``env("NOM")`` — invalide à l'exécution
+        # mais statiquement ambigu.
+        return True
+    receiver = cursor - 1
+    while (
+        receiver >= 0 and tokens[receiver].kind == "punct" and tokens[receiver].value in {"?", "."}
+    ):
+        receiver -= 1
+    return (
+        receiver >= 0 and tokens[receiver].kind == "ident" and tokens[receiver].value in env_aliases
+    )
 
 
 def _js_standalone_string(tokens: list[_JsToken], position: int) -> bool:
@@ -1806,6 +2009,10 @@ def _javascript_replacement(  # noqa: PLR0911, PLR0912 - un refus par garde
     if _js_computed_process_key(tokens, position):
         # Clé de propriété calculée (``process["en" + "v"]…``) : la fenêtre
         # littérale seule ne prouve pas la clé ``env`` — le doute profite au refus.
+        return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
+    if _js_env_alias_key(tokens, position, _js_env_aliases(tokens)):
+        # Clé lue via un alias (``env["NOM"]``, ``env.get("NOM")`` avec
+        # ``const env = process.env``) : la clé deviendrait la valeur lue.
         return _js_failure(file, source, line, variable, ManualReason.AMBIGUOUS_CONTEXT)
     if _js_standalone_string(tokens, position):
         # Directive prologue (``"use strict"``) : remplacer le littéral ferait

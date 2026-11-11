@@ -264,6 +264,11 @@ def test_python_handles_non_ascii_on_the_same_line() -> None:
         (f'x = getattr(vars(), "{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = vars().get("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = operator.getitem(vars(), "{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import environ; x = environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import getenv; x = getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import environ as env; x = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'import os as o; x = o.environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'import os as o; x = o.getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = vars()["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = locals()["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
         (f'x = getattr(os.environ, "get")("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
@@ -309,6 +314,39 @@ def test_python_refuses_environment_key_auto_targeting(source: str) -> None:
     """Un indice ``os.environ`` déjà assaini ne doit pas être re-ciblé."""
     plan = manual("app.py", source, 1, secret=ENV_NAME)
     assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        f'from os import environ\nx = environ["{SECRET}"]\n',
+        f'from os import getenv\nx = getenv("{SECRET}")\n',
+        f'from os import environ as env\nx = env["{SECRET}"]\n',
+        f'from os import environ as env\nx = env.get("{SECRET}")\n',
+        f'import os as o\nx = o.environ["{SECRET}"]\n',
+        f'import os as o\nx = o.getenv("{SECRET}")\n',
+        f'env = os.environ\nx = env["{SECRET}"]\n',
+    ],
+)
+def test_python_refuses_aliased_environment_access(source: str) -> None:
+    """Alias d'import ou d'affectation : le re-ciblage reste refusé."""
+    plan = manual("app.py", source, 2)
+    assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+def test_python_deep_attribute_chain_is_manual_without_recursion_error() -> None:
+    """Une chaîne d'attributs hostile ne doit jamais lever ``RecursionError``."""
+    source = "import os\nx = os" + ".attr" * 1500 + f'["{SECRET}"]\n'
+    plan = manual("app.py", source, 2)
+    assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+def test_python_deeply_nested_getattr_is_manual_without_recursion_error() -> None:
+    """Des ``getattr`` imbriqués hostiles restent un refus statique."""
+    source = "x = " + "getattr(" * 800 + '"e"' + ")" * 800 + "\n"
+    plan = build_replacement("app.py", source, 1, SECRET, "APP_KEY")
+    assert plan.manual_remediation is True
+    assert plan.after == plan.before == source
 
 
 def test_python_environment_key_guard_does_not_refuse_other_subscripts() -> None:
@@ -477,6 +515,29 @@ def test_javascript_refuses_shadowed_process(source: str) -> None:
 def test_javascript_refuses_environment_key_auto_targeting(source: str) -> None:
     plan = manual("app.js", source, 1, secret=ENV_NAME)
     assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'const env = process.env;\nx = env["APP_KEY"];\n',
+        'env = process.env;\nx = env["APP_KEY"];\n',
+        'const env = process.env;\nx = env.get("APP_KEY");\n',
+    ],
+)
+def test_javascript_refuses_aliased_environment_key(source: str) -> None:
+    """Alias de ``process.env`` : le re-ciblage reste refusé (sur-refus acté)."""
+    plan = manual("app.js", source, 2, secret=ENV_NAME)
+    assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+
+
+def test_javascript_allows_independent_key_after_process_mention() -> None:
+    """Un ``process`` d'une instruction précédente ne tache pas la suivante."""
+    source = 'console.log(process.version);\nconfig={};\nx = config["APP_KEY"];\n'
+    plan = patch("app.js", source, 3, secret=ENV_NAME)
+    assert plan.after == (
+        "console.log(process.version);\nconfig={};\nx = config[process.env.APP_KEY];\n"
+    )
 
 
 @pytest.mark.parametrize(
