@@ -103,13 +103,14 @@ expression et une raison stable (`ManualReason`) :
 | Littéral nommant une entrée d'espace de noms (`vars()["NOM"]`, `locals()["NOM"]`, `globals()["NOM"]`) ou argument d'appel sur récepteur d'espace de noms (`getattr(vars(), "NOM")`, `vars().get("NOM")`, `operator.getitem(locals(), "NOM")`) : le patch lirait la valeur d'environnement à la place de l'entrée locale | `AMBIGUOUS_CONTEXT` |
 | Clé de propriété calculée hors fenêtre littérale bornée (`process["en" + "v"]...`, `process["env"][...]`, `process["env"][(a0, ..., a14, "SECRET")]`, `process?.[...]`) : la fenêtre est désormais bornée par le délimiteur ouvrant englobant le littéral | `AMBIGUOUS_CONTEXT` |
 | Directive prologue JavaScript (`"use strict"`) | `AMBIGUOUS_CONTEXT` |
-| Nom `os` masqué côté Python (`os = …`, `import sys as os`, `def f(os)`, `os.environ = …`, `del os.environ`, `setattr(os, "environ", …)`, `os.__dict__["environ"] = …`) ou `process` masqué côté JavaScript (`process = …`, `process.env = …`, `delete process.env`, `Reflect.set(process, "env", …)`, `globalThis.process = …`) | `SHADOWED_MODULE` |
+| Nom `os` masqué côté Python (`os = …`, `import sys as os`, `def f(os)`, `os.environ = …`, `del os.environ`, `setattr(os, "environ", …)`, `os.__dict__["environ"] = …`) ou `process` masqué côté JavaScript (`process = …`, `process.env = …`, `delete process.env`, `Reflect.set(process, "env", …)`, `globalThis.process = …`, `with (process)` / `with (obj)`) | `SHADOWED_MODULE` |
 
 Cas particuliers refusés côté JavaScript : clé d'objet littérale
 (`{"secret": 1}`), nom de méthode ou champ de classe, spécificateur
-`import`/`from`, `require(...)`. Un nom `process` lié localement (paramètre,
+`import`/`from`, `require(...)`, instruction `with` (`with (process)`,
+interdit en strict mode). Un nom `process` lié localement (paramètre,
 `var`/`let`/`const`, fonction/classe, import, déstructuration, `catch`,
-affectation) provoque aussi `SHADOWED_MODULE` : le patch ne doit jamais lire un
+affectation, `with`) provoque aussi `SHADOWED_MODULE` : le patch ne doit jamais lire un
 objet qui n'est pas le global Node. Côté Python : f-string, concaténation,
 docstring, annotation, motif `case`, littéral multiligne.
 

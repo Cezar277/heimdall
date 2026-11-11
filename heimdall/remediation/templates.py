@@ -2068,6 +2068,11 @@ def _javascript_process_shadowed(source: str, tokens: list[_JsToken]) -> bool:
         return True
     if _js_reflect_process_env_mutation(tokens):
         return True
+    for index, token in enumerate(tokens):
+        if token.kind == "ident" and token.value == "with":
+            if index + 1 < len(tokens) and tokens[index + 1].kind == "punct":
+                if tokens[index + 1].value == "(":
+                    return True
     enclosing, matching = _js_delimiters(tokens)
     binding = _js_binding_contexts(tokens, enclosing, matching)
     return any(

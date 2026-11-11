@@ -614,6 +614,8 @@ def test_javascript_refuses_aliased_evaluation_call(source: str) -> None:
         f'Reflect.set(process, "env", {{}});\nconst k = "{SECRET}";\n',
         f'Reflect.deleteProperty(process, "env");\nconst k = "{SECRET}";\n',
         f'globalThis.process = {{}};\nconst k = "{SECRET}";\n',
+        f'with (process) {{ const k = "{SECRET}"; }}\n',
+        f'with (obj) {{ const k = "{SECRET}"; }}\n',
     ],
 )
 def test_javascript_refuses_shadowed_process(source: str) -> None:
