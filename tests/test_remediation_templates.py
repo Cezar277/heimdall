@@ -319,22 +319,38 @@ def test_python_refuses_environment_key_auto_targeting(source: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "source",
+    ("source", "reason"),
     [
-        f'from os import environ\nx = environ["{SECRET}"]\n',
-        f'from os import getenv\nx = getenv("{SECRET}")\n',
-        f'from os import environ as env\nx = env["{SECRET}"]\n',
-        f'from os import environ as env\nx = env.get("{SECRET}")\n',
-        f'import os as o\nx = o.environ["{SECRET}"]\n',
-        f'import os as o\nx = o.getenv("{SECRET}")\n',
-        f'env = os.environ\nx = env["{SECRET}"]\n',
-        f'from os import *\nx = environ["{SECRET}"]\n',
-        f'from os import *\nx = getenv("{SECRET}")\n',
+        (f'from os import environ\nx = environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import getenv\nx = getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import environ as env\nx = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (
+            f'from os import environ as env\nx = env.get("{SECRET}")\n',
+            ManualReason.AMBIGUOUS_CONTEXT,
+        ),
+        (f'import os as o\nx = o.environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'import os as o\nx = o.getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'env = os.environ\nx = env["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import *\nx = environ["{SECRET}"]\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import *\nx = getenv("{SECRET}")\n', ManualReason.AMBIGUOUS_CONTEXT),
+        (f'from os import * as o\nx = environ["{SECRET}"]\n', ManualReason.INVALID_SYNTAX),
     ],
 )
-def test_python_refuses_aliased_environment_access(source: str) -> None:
+def test_python_refuses_aliased_environment_access(source: str, reason: ManualReason) -> None:
     """Alias d'import ou d'affectation : le re-ciblage reste refusé."""
     plan = manual("app.py", source, 2)
+    assert plan.reason is reason
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'import operator\nx = operator.getitem(locals(), "APP_KEY")\n',
+    ],
+)
+def test_python_refuses_namespace_reader_call_on_separate_line(source: str) -> None:
+    """`operator.getitem(locals(), ...)` multiligne : refusé, pas re-ciblé."""
+    plan = manual("app.py", source, 2, secret=ENV_NAME)
     assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
 
 
