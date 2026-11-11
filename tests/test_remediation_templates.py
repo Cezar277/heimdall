@@ -413,6 +413,23 @@ def test_python_refuses_loop_and_out_of_order_aliases(source: str) -> None:
     assert manual("app.py", source, 4).reason is ManualReason.AMBIGUOUS_CONTEXT
 
 
+def test_python_deep_concatenation_is_manual_without_recursion_error() -> None:
+    """Concaténation hostile profonde : `manual`, jamais `RecursionError`."""
+    concat = '"ev"' + '+"al"' * 3000
+    source = f'x = getattr(__builtins__, {concat})("{SECRET}")\n'
+    plan = manual("app.py", source, 1)
+    assert plan.reason is ManualReason.AMBIGUOUS_CONTEXT
+    assert plan.after == plan.before == source
+
+
+def test_python_deep_subscript_target_is_manual_without_recursion_error() -> None:
+    """Cible `os.__dict__[...]` profonde : `manual`, jamais d'exception."""
+    concat = '"e"' + '+"n"' * 3000
+    source = f'import os\nos.__dict__[{concat}] = 1\nx = "{SECRET}"\n'
+    plan = manual("app.py", source, 3)
+    assert plan.reason is ManualReason.SHADOWED_MODULE
+
+
 @pytest.mark.parametrize(
     "source",
     [

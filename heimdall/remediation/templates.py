@@ -333,9 +333,19 @@ def build_replacement(
             language=None,
             reason=ManualReason.UNSUPPORTED_LANGUAGE,
         )
-    if language is Language.PYTHON:
-        return _python_replacement(path, text, line_number, value, name)
-    return _javascript_replacement(path, text, line_number, value, name)
+    try:
+        if language is Language.PYTHON:
+            return _python_replacement(path, text, line_number, value, name)
+        return _javascript_replacement(path, text, line_number, value, name)
+    except (RecursionError, MemoryError):
+        return _manual(
+            file=path,
+            source=text,
+            line=line_number,
+            variable=name,
+            language=language,
+            reason=ManualReason.INVALID_SYNTAX,
+        )
 
 
 def plan_for_finding(finding: Finding, source: str, secret: str, variable: str) -> ReplacementPlan:
@@ -564,16 +574,17 @@ def _call_mentions_namespace_reader(call: ast.Call) -> bool:
 
 def _assignment_target_names(target: ast.AST) -> list[str]:
     """Noms liés par une cible d'affectation (nom, tuple, annotation)."""
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, ast.Starred):
-        return _assignment_target_names(target.value)
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names: list[str] = []
-        for element in target.elts:
-            names.extend(_assignment_target_names(element))
-        return names
-    return []
+    names: list[str] = []
+    stack: list[ast.AST] = [target]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ast.Name):
+            names.append(current.id)
+        elif isinstance(current, ast.Starred):
+            stack.append(current.value)
+        elif isinstance(current, (ast.Tuple, ast.List)):
+            stack.extend(current.elts)
+    return names
 
 
 def _collect_argument_default_aliases(
@@ -757,25 +768,54 @@ def _const_str_value(node: ast.AST) -> str | None:
 
     Replie ``"ev"+"al"`` et ``f"eval"`` sans interpolation ; toute autre forme
     (interpolation, appel, nom) rend ``None`` et le doute profite au refus
-    par l'appelant.
+    par l'appelant. Itératif (pile explicite) : une concaténation hostile de
+    plusieurs milliers de maillons ne doit jamais lever ``RecursionError``.
     """
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.JoinedStr):
-        parts: list[str] = []
-        for value in node.values:
-            if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                parts.append(value.value)
+    stack: list[tuple[ast.AST, bool]] = [(node, False)]
+    values: dict[int, str | None] = {}
+    while stack:
+        current, processed = stack.pop()
+        if isinstance(current, ast.Constant) and isinstance(current.value, str):
+            values[id(current)] = current.value
+        elif isinstance(current, ast.JoinedStr):
+            parts: list[str] = []
+            ok = True
+            for value in current.values:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    parts.append(value.value)
+                else:
+                    ok = False
+                    break
+            values[id(current)] = "".join(parts) if ok else None
+        elif isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            if not processed:
+                stack.append((current, True))
+                stack.append((current.right, False))
+                stack.append((current.left, False))
             else:
-                # Interpolation (``f"ev{'al'}"``) : valeur dynamique, non repliable.
-                return None
-        return "".join(parts)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _const_str_value(node.left)
-        right = _const_str_value(node.right)
-        if left is not None and right is not None:
-            return left + right
-    return None
+                left = values.get(id(current.left))
+                right = values.get(id(current.right))
+                if left is not None and right is not None:
+                    values[id(current)] = left + right
+                else:
+                    values[id(current)] = None
+        else:
+            values[id(current)] = None
+    return values.get(id(node))
+
+
+def _has_str_concat(node: ast.AST) -> bool:
+    """Vrai si la sous-arborescence contient ``+`` et un littéral chaîne."""
+    has_add = False
+    has_str = False
+    for child in ast.walk(node):
+        if isinstance(child, ast.BinOp) and isinstance(child.op, ast.Add):
+            has_add = True
+        elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+            has_str = True
+        if has_add and has_str:
+            return True
+    return False
 
 
 def _has_str_addition(node: ast.AST) -> bool:
@@ -795,6 +835,8 @@ def _has_str_addition(node: ast.AST) -> bool:
 
 def _folded_names_eval(node: ast.AST) -> bool:
     """Constante (repliée) ou concaténation/f-string suspecte nommant ``eval``."""
+    if _has_str_concat(node):
+        return True
     folded = _const_str_value(node)
     if folded is not None:
         return folded in _CODE_EVALUATION_FUNCS
@@ -919,23 +961,31 @@ def _utf8_column_to_char(line: str, column: int) -> int | None:
 
 def _target_is_os_environ(target: ast.AST, os_roots: set[str]) -> bool:
     """Vrai si la cible écrase ``os.environ`` (pas une clé ``os.environ[…]``)."""
-    if isinstance(target, ast.Starred):
-        return _target_is_os_environ(target.value, os_roots)
-    if isinstance(target, (ast.Tuple, ast.List)):
-        return any(_target_is_os_environ(elt, os_roots) for elt in target.elts)
-    if isinstance(target, ast.Attribute):
-        return (
-            target.attr == "environ"
-            and isinstance(target.value, ast.Name)
-            and target.value.id in os_roots
-        )
-    if isinstance(target, ast.Subscript):
-        folded = _const_str_value(target.slice)
-        if folded != "environ":
-            return False
-        return any(
-            isinstance(child, ast.Name) and child.id in os_roots for child in ast.walk(target.value)
-        )
+    stack: list[ast.AST] = [target]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ast.Starred):
+            stack.append(current.value)
+        elif isinstance(current, (ast.Tuple, ast.List)):
+            stack.extend(current.elts)
+        elif isinstance(current, ast.Attribute):
+            if (
+                current.attr == "environ"
+                and isinstance(current.value, ast.Name)
+                and current.value.id in os_roots
+            ):
+                return True
+        elif isinstance(current, ast.Subscript):
+            if _has_str_concat(current.slice):
+                return True
+            folded = _const_str_value(current.slice)
+            if folded != "environ":
+                continue
+            if any(
+                isinstance(child, ast.Name) and child.id in os_roots
+                for child in ast.walk(current.value)
+            ):
+                return True
     return False
 
 
