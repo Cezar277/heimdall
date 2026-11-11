@@ -184,14 +184,18 @@ class InstallGuideTests(unittest.TestCase):
     def test_guide_covers_the_cold_start_path(self) -> None:
         text = INSTALL_GUIDE.read_text(encoding="utf-8")
         for expected in (
-            '[[ "$(id -u)" != 0 ]]',
+            '[ "$(id -u)" != "0" ]',
             "git checkout t41-audit",
             "git status --porcelain",
             "git archive HEAD",
             "set -euo pipefail",
             "git fetch origin",
             "10001:10001",
-            "sudo chown -R --no-dereference 10001:10001 data secrets",
+            'sudo chown -R --no-dereference 10001:"$(id -g)" data secrets',
+            "sudo chmod 750 data secrets",
+            "sudo chmod 640 secrets/vault_tls_cert.pem",
+            "test -r secrets/vault_tls_cert.pem",
+            "sudo tar --exclude='data/vault.db-*'",
             "docker compose stop vault || exit 1",
             "basicConstraints=critical,CA:FALSE",
             ".env.??????",
@@ -242,7 +246,7 @@ class InstallGuideTests(unittest.TestCase):
         self.assertIn("`chown` préserve les bits", text)
         self.assertNotIn("data secrets\nchmod 700 data secrets", text)
         # Durcissements revue 6b748c0 : liens internes, restauration confinée.
-        self.assertIn("--no-dereference 10001:10001 data secrets", text)
+        self.assertIn('--no-dereference 10001:"$(id -g)" data secrets', text)
         self.assertIn('test -z "$(find data secrets -type l)"', text)
         self.assertIn('tar -tzf "$T"', text)
         self.assertIn("--exclude='.git/*'", text)
@@ -426,7 +430,7 @@ class ReadmeQuickstartTests(unittest.TestCase):
         self.assertIn("docs/install.md §4", text)
         self.assertIn("jamais en root hôte", text)
         self.assertIn('user: "10001:10001"', text)
-        self.assertIn("sudo chown -R --no-dereference 10001:10001 data secrets", text)
+        self.assertIn('sudo chown -R --no-dereference 10001:"$(id -g)"', text)
         self.assertNotIn("HEIMDALL_UID", text)
 
 
@@ -579,8 +583,8 @@ class UidGidGuardTests(unittest.TestCase):
         self.assertNotIn("HEIMDALL_GID", serialized)
         guide = INSTALL_GUIDE.read_text(encoding="utf-8")
         self.assertIn("10001:10001", guide)
-        self.assertIn("sudo chown -R --no-dereference 10001:10001 data secrets", guide)
-        self.assertIn('[[ "$(id -u)" != 0 ]]', guide)
+        self.assertIn('sudo chown -R --no-dereference 10001:"$(id -g)" data secrets', guide)
+        self.assertIn('[ "$(id -u)" != "0" ]', guide)
         self.assertNotIn("${HEIMDALL_UID", guide)
         self.assertNotIn("HEIMDALL_UID=$(id -u)", guide)
 

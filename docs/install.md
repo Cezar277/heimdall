@@ -89,24 +89,32 @@ openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
   -addext "basicConstraints=critical,CA:FALSE"
 chmod 600 secrets/vault_tls_cert.pem secrets/vault_tls_key.pem
 # Le conteneur tourne en 10001:10001 figé (docker-compose.yml, pas de variable
-# UID/GID) : transférer la propriété des bind mounts à cet UID fixe.
+# UID/GID) : transférer la propriété, mais garder l'hôte lecteur du certificat
+# public (curl §5) via le groupe hôte + 640. La clé privée reste 600
+# (conteneur seul). `data/` reste inscriptible conteneur uniquement ;
+# la sauvegarde §8 utilise `sudo tar` (root lit tout, hôte non).
 # Requiert sudo/root une seule fois ; `.env` reste possédé par l'hôte (lu par
 # Compose côté hôte, pas besoin de chown).
-# `chown` préserve les bits (700 posés ci-dessus) : pas de second `chmod` —
-# un `chmod` sans sudo échouerait ici en EPERM (non-propriétaire).
+# `chown` préserve les bits : pas de second `chmod` sans sudo (EPERM).
 # Refuser tout lien interne avant le chown (le `test ! -L` ci-dessus ne couvre
-# que la racine) et ne jamais déréférencer : sans `-h`, un `data/lien ->
-# /victime` ferait chmoder la cible en root.
+# que la racine) et ne jamais déréférencer.
 test -z "$(find data secrets -type l)" || {
   echo "lien symbolique interne refusé dans data/ ou secrets/" >&2
   exit 1
 }
-sudo chown -R --no-dereference 10001:10001 data secrets
+sudo chown -R --no-dereference 10001:"$(id -g)" data secrets
+sudo chmod 750 data secrets
+sudo chmod 640 secrets/vault_tls_cert.pem
+sudo chmod 600 secrets/vault_tls_key.pem
 # Re-vérification après chown : un lien planté entre les deux ne doit pas
-# survivre dans le bind mount (le --no-dereference protège la cible, pas la
-# présence du lien).
+# survivre dans le bind mount.
 test -z "$(find data secrets -type l)" || {
   echo "lien symbolique interne refusé après chown" >&2
+  exit 1
+}
+# Fail-fast : l'hôte doit lire le certificat public pour curl §5.
+test -r secrets/vault_tls_cert.pem || {
+  echo "certificat illisible côté hôte (groupe ?)" >&2
   exit 1
 }
 ```
@@ -118,11 +126,12 @@ test -z "$(find data secrets -type l)" || {
 - `HEIMDALL_VAULT_API_KEY_PEPPER` : pepper d'authentification, distinct de la
   clé maîtresse et de la KEK.
 - `HEIMDALL_UID` / `HEIMDALL_GID` : supprimés — le conteneur tourne en
-  `10001:10001` figé (`docker-compose.yml`, `Dockerfile:43-57`). Rendre
-  `data/` et `secrets/` accessibles via `sudo chown -R --no-dereference
-  10001:10001 data secrets` (ci-dessus, après refus des liens internes).
-  L'entrypoint refuse toujours `euid == 0` ou `egid == 0` en défense en
-  profondeur (ex. `docker compose run --user 0`).
+  `10001:10001` figé (`docker-compose.yml`, `Dockerfile:43-57`). Propriété
+  `10001:groupe-hôte` + `750`/`640` (certificat public lisible pour curl §5,
+  clé privée `600`) via `sudo chown -R --no-dereference 10001:"$(id -g)"`
+  (ci-dessus, après refus des liens internes). Sauvegarde via `sudo tar`
+  (§8). L'entrypoint refuse toujours `euid == 0` ou `egid == 0` en défense
+  en profondeur (ex. `docker compose run --user 0`).
 
 > **Sauvegarde.** Sauvegardez `.env` et `secrets/` dans un coffre séparé. Sans
 > eux, la base `data/vault.db` est définitivement illisible.
@@ -136,7 +145,7 @@ en `0`, l'entrypoint refuse `euid == 0 || egid == 0` en défense en profondeur
 (ex. `docker compose run --user 0`).
 
 ```sh
-[[ "$(id -u)" != 0 ]] || {
+[ "$(id -u)" != "0" ] || {
   echo "installation en root refusée : utiliser un compte non privilégié" >&2
   exit 1
 }
@@ -345,7 +354,8 @@ test ! -e "$F" || {
   echo "archive déjà existante : $F (attendre la prochaine minute)" >&2
   exit 1
 }
-tar --exclude='data/vault.db-*' -czf - data .env secrets \
+# `data/` est 750 propriétaire 10001 : seul root peut tout lire pour tar.
+sudo tar --exclude='data/vault.db-*' -czf - data .env secrets \
   | gpg --symmetric --cipher-algo AES256 --output "$F"
 chmod 600 "$F"
 trap - EXIT INT TERM HUP
@@ -394,8 +404,9 @@ test ! -e .env && test ! -e secrets && test ! -e data || {
 }
 # `--no-absolute-filenames` explicite quand supporté (bsdtar), repli GNU tar
 # (retire les `/` initiaux par défaut, jamais -P) ; un seul déchiffrement.
-tar --no-absolute-filenames --exclude='.git/*' -xzf "$T" data .env secrets 2>/dev/null \
-  || tar --exclude='.git/*' -xzf "$T" data .env secrets
+# Extraction en root : restaure la propriété 10001:groupe-hôte du §3.
+sudo tar --no-absolute-filenames --exclude='.git/*' -xzf "$T" data .env secrets 2>/dev/null \
+  || sudo tar --exclude='.git/*' -xzf "$T" data .env secrets
 # Refuser les liens internes apportés par l'archive (comme au §3).
 test -z "$(find data secrets -type l)" || {
   echo "lien symbolique interne refusé après restauration" >&2
@@ -431,7 +442,7 @@ et les valeurs sont perdues.
 | `Connection refused` | Conteneur arrêté ou port 8443 occupé | `docker compose ps`, `ss -ltnp \| grep 8443`, `docker compose logs vault` |
 | `TLS obligatoire en production` | `secrets/vault_tls_cert.pem` ou `vault_tls_key.pem` absent | Régénérer les fichiers de l'étape 3 |
 | `HEIMDALL_VAULT_API_KEY_PEPPER est obligatoire` | `.env` absent, vide ou non chargé | `test ! -e .env`, `install -m 600 .env.example .env`, remplir via §3, `docker compose up -d` |
-| `Permission denied` sur `/data` | `data/` non possédé par `10001:10001` | `test -z "$(find data secrets -type l)"`, `sudo chown -R --no-dereference 10001:10001 data secrets` |
+| `Permission denied` sur `/data` | `data/` non possédé par `10001:groupe-hôte` | `test -z "$(find data secrets -type l)"`, `sudo chown -R --no-dereference 10001:"$(id -g)" data secrets`, `sudo chmod 750 data secrets`, `test -r secrets/vault_tls_cert.pem` |
 | `refus: le conteneur Vault ne doit pas tourner en root` | surcharge `--user 0` manuelle | Ne jamais surcharger `user:` (figé à `10001:10001` dans le compose) |
 | `data/ et secrets/ ne doivent pas être des liens symboliques` | Un lien a été créé avant l'installation | Supprimer le lien et recréer un répertoire réel (`rm data && mkdir data`, idem `secrets`) |
 | `docker compose config --quiet` échoue | `.env` ou secrets manquants | Créer les fichiers de l'étape 3 |
