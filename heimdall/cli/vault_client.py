@@ -57,6 +57,14 @@ _PROJECT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,63
 _ENV_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _SECRET_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 
+
+def preview_name(name: object) -> str:
+    """Reflet borné et sûr d'un nom de secret (jamais de reflet pour un non-str)."""
+    return name[:32] if isinstance(name, str) else type(name).__name__
+
+
+_preview_name = preview_name
+
 # Denylist robuste : source unique = heimdall.remediation.naming
 # (importée ci-dessus ; mêmes objets, pas de copie qui divergerait).
 _MAX_SECRETS_PER_PULL: Final[int] = 1024
@@ -207,7 +215,7 @@ def _read_input_secrets(input_file: Path) -> dict[str, str]:
 
 def _filter_secrets(
     secrets: dict[str, str],
-    names: list[str] | None,
+    names: list[str] | None = None,
 ) -> dict[str, str]:
     """Filtre les secrets par nom et valide leur forme contractuelle.
 
@@ -220,12 +228,6 @@ def _filter_secrets(
     for key, value in secrets.items():
         if key not in target_names:
             continue
-        if not _SECRET_NAME_PATTERN.match(key):
-            typer.echo(
-                f"Avertissement : nom de secret ignoré (format invalide) : {key[:32]!r}",
-                err=True,
-            )
-            continue
         if is_dangerous_env_var(key):
             # Même refus que pull/run : un nom interdit à l'injection ne doit
             # jamais être stocké (secret empoisonné, rotation crue mais
@@ -233,10 +235,17 @@ def _filter_secrets(
             # pull/run sortent en 1 car le refus y intervient dans le pipeline
             # de récupération (voir docs/t35-samm.md §6).
             typer.echo(
-                f"Erreur de sécurité : le secret {key[:32]!r} est une variable système interdite.",
+                f"Erreur de sécurité : le secret {preview_name(key)!r} "
+                "est une variable système interdite.",
                 err=True,
             )
             raise typer.Exit(code=2)
+        if not isinstance(key, str) or not _SECRET_NAME_PATTERN.match(key):
+            typer.echo(
+                f"Avertissement : nom de secret ignoré (format invalide) : {preview_name(key)!r}",
+                err=True,
+            )
+            continue
         filtered[key] = value
     return filtered
 
@@ -257,13 +266,13 @@ def _push_single_secret(
         # Reflet borné et échappé : `_push_single_secret` peut être appelée
         # directement (défense en profondeur) avant tout contrôle de format.
         # Un nom non-str n'est jamais reflété : seul son type est affiché.
-        shown = name[:32] if isinstance(name, str) else type(name).__name__
         typer.echo(
-            f"Erreur de sécurité : le secret {shown!r} est une variable système interdite.",
+            f"Erreur de sécurité : le secret {preview_name(name)!r} "
+            "est une variable système interdite.",
             err=True,
         )
         raise typer.Exit(code=2)
-    name_preview = f"{name[:32]!r}"
+    name_preview = f"{preview_name(name)!r}"
     try:
         client.create_secret(proj, env, name, value)
         typer.echo(f"Secret {name_preview} poussé vers le Vault ({proj}/{env}) [statut: vaulte].")
@@ -498,18 +507,19 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
     retrieved: dict[str, str] = {}
     total_chars = 0
     for name in target_names:
-        if not _SECRET_NAME_PATTERN.match(name):
-            typer.echo(
-                f"Avertissement : nom de secret ignoré (format invalide) : {name[:32]!r}",
-                err=True,
-            )
-            continue
         if is_dangerous_env_var(name):
             typer.echo(
-                f"Erreur de sécurité : le secret {name[:32]!r} est une variable système interdite.",
+                f"Erreur de sécurité : le secret {preview_name(name)!r} "
+                "est une variable système interdite.",
                 err=True,
             )
             raise typer.Exit(code=1)
+        if not isinstance(name, str) or not _SECRET_NAME_PATTERN.match(name):
+            typer.echo(
+                f"Avertissement : nom de secret ignoré (format invalide) : {preview_name(name)!r}",
+                err=True,
+            )
+            continue
         try:
             record = client.get_secret(proj, env, name)
             val = record.get("value")
@@ -854,6 +864,7 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
 __all__ = [
     "RUN_CONTEXT_SETTINGS",
     "is_dangerous_env_var",
+    "preview_name",
     "vault_pull",
     "vault_push",
     "vault_run",

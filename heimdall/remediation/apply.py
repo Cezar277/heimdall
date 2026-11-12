@@ -26,13 +26,22 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
 from heimdall.mcp.paths import PathEscape, confine
 from heimdall.remediation.templates import ReplacementPlan
-from heimdall.vault.atomic import _open_file_read_fd, backup_file, write_file_atomic
+from heimdall.vault.atomic import (
+    _get_git_toplevel,
+    _open_file_read_fd,
+    backup_file,
+    is_git_ignored,
+    is_git_tracked,
+    write_file_atomic,
+)
 
 #: Lecture bornée : même plafond que le scanner et les plans (1 Mio).
 _MAX_READ_BYTES: Final[int] = 1_048_576
@@ -94,6 +103,44 @@ def _read_current_secure(path: Path) -> tuple[str, int]:
     return text, stat.S_IMODE(status.st_mode)
 
 
+def _check_backup_git_status(backup: Path) -> None:
+    """Avertit si la sauvegarde .bak contenant un secret risque d'être committée.
+
+    Aligné sur la politique de sécurité de ``heimdall vault pull --backup`` :
+    - Fichier suivi par Git : avertissement fort pour éviter la fuite de secrets.
+    - Fichier ignoré (.gitignore) : rien à signaler.
+    - Statut indéterminé (hors dépôt ou git indisponible) : avertissement explicite.
+    - Présent dans un dépôt mais non ignoré : avertissement invitant à l'ignorer.
+    Aucune règle .gitignore n'est écrite silencieusement.
+    """
+    if is_git_tracked(backup):
+        msg = (
+            f"ATTENTION : Le fichier {backup} est suivi par Git ! "
+            f"Exécutez 'git rm --cached {backup}' et ajoutez-le à .gitignore "
+            "pour éviter toute fuite."
+        )
+        sys.stderr.write(msg + "\n")
+        warnings.warn(msg, UserWarning, stacklevel=3)
+    elif is_git_ignored(backup):
+        pass
+    elif _get_git_toplevel(backup) is None:
+        msg = (
+            f"Avertissement : statut Git indéterminé pour '{backup}' "
+            "(hors dépôt ou git indisponible) : impossible de vérifier "
+            "qu'il ne sera pas committé. Ajoutez-le à .gitignore et "
+            "vérifiez avec 'git status'."
+        )
+        sys.stderr.write(msg + "\n")
+        warnings.warn(msg, UserWarning, stacklevel=3)
+    else:
+        msg = (
+            f"Avertissement : Le fichier {backup} n'est pas ignoré par Git. "
+            f"Pensez à ajouter '{backup}' dans .gitignore."
+        )
+        sys.stderr.write(msg + "\n")
+        warnings.warn(msg, UserWarning, stacklevel=3)
+
+
 def apply_replacement(root: Path, plan: ReplacementPlan) -> AppliedPatch:
     """Applique un plan validé sous ``root`` ; lève ``ApplyError`` sinon.
 
@@ -121,6 +168,7 @@ def apply_replacement(root: Path, plan: ReplacementPlan) -> AppliedPatch:
             raise ApplyError from None
         if backup is None:
             raise ApplyError
+        _check_backup_git_status(backup)
         try:
             write_file_atomic(confined.absolute, plan.after, mode=mode)
         except ValueError:

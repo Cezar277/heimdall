@@ -5,6 +5,15 @@ Tickets : [#84](https://github.com/Cezar277/heimdall/issues/84),
 [#86](https://github.com/Cezar277/heimdall/issues/86), parent
 [#30](https://github.com/Cezar277/heimdall/issues/30).
 
+> **Exception validée au contrat « un sous-ticket par PR » (ticket parent #30)** :
+> Le regroupement de #84 (validation des noms), #85 (application atomique) et
+> #86 (garde de chemin et tests) au sein d'une seule PR est une exception validée
+> sous le ticket parent #30. Elle est justifiée techniquement par le partage
+> direct du module `heimdall.remediation`, de la garde de chemin unique `confine`
+> et des structures de données partagées, évitant du code mort intermédiaire ou
+> des bifurcations transitoires. Cette exception est circonscrite à ce triptyque
+> et ne constitue pas un précédent pour les autres sous-tickets.
+
 `heimdall.remediation.naming` valide les noms de variables proposés par le
 LLM (entrée non fiable) et dédoublonne (`_2`, `_3`…). `heimdall.remediation.apply`
 applique un `ReplacementPlan` sur disque de façon atomique, sous garde de
@@ -48,11 +57,14 @@ undo_apply(Path("dépôt"), receipt)  # restaure la sauvegarde
 - Sauvegarde préalable (`<fichier>.bak`, mode `0600` — elle contient le
   secret en clair), puis écriture via `vault.atomic.write_file_atomic`
   (temporaire + `fsync` + `os.replace` atomique, aucun fichier à moitié écrit).
-- **Nettoyage obligatoire** : `apply_replacement` ne vérifie pas le statut Git
-  de `<fichier>.bak` (ni n'ajoute de règle `.gitignore`, contrairement à
-  `heimdall vault pull --backup`). Avant tout commit, supprimer les `.bak`
-  créés (ou `undo_apply`, puis suppression) et vérifier `git status` ; ne
-  jamais committer un `*.bak` contenant un secret.
+- **Garde Git et nettoyage obligatoire** : `apply_replacement` contrôle à
+  l'exécution le statut Git de `<fichier>.bak` via `is_git_tracked` et
+  `is_git_ignored` (politique alignée sur `heimdall vault pull --backup`) :
+  avertissement immédiat sur `stderr` si le `.bak` est suivi par Git, s'il
+  n'est pas ignoré ou si le statut est indéterminé, sans écrire de règle
+  `.gitignore` silencieuse. Avant tout commit, supprimer les `.bak` créés (ou
+  `undo_apply`, puis suppression) et vérifier `git status` ; ne jamais
+  committer un `*.bak` contenant un secret.
 - `AppliedPatch.backup` est relatif à la racine (jamais de chemin absolu dans
   les logs). `undo_apply` valide le reçu (`backup` attendu, `mode` entier
   `0..0o777`) avant toute écriture.

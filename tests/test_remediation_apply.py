@@ -239,3 +239,53 @@ def test_apply_rejects_bad_types(tmp_path: Path) -> None:
     with pytest.raises(ApplyError):
         undo_apply(tmp_path, "not-a-receipt")  # type: ignore[arg-type]
     assert isinstance(receipt, AppliedPatch)
+
+
+def test_apply_backup_warns_when_bak_tracked_by_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Un fichier .bak suivi par Git déclenche un avertissement runtime explicite."""
+    target = tmp_path / "app.py"
+    source = f'KEY = "{SECRET}"\n'
+    _write(target, source)
+    plan = _plan(source)
+
+    monkeypatch.setattr(apply_module, "is_git_tracked", lambda path: True)
+    receipt = apply_replacement(tmp_path, plan)
+    assert isinstance(receipt, AppliedPatch)
+    err = capsys.readouterr().err
+    assert "ATTENTION : Le fichier" in err
+    assert "est suivi par Git !" in err
+    assert "app.py.bak" in err
+
+
+def test_apply_backup_quiet_when_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Un fichier .bak ignoré par Git ne produit aucun avertissement."""
+    target = tmp_path / "app.py"
+    source = f'KEY = "{SECRET}"\n'
+    _write(target, source)
+    plan = _plan(source)
+
+    monkeypatch.setattr(apply_module, "is_git_tracked", lambda path: False)
+    monkeypatch.setattr(apply_module, "is_git_ignored", lambda path: True)
+    receipt = apply_replacement(tmp_path, plan)
+    assert isinstance(receipt, AppliedPatch)
+    assert capsys.readouterr().err == ""
+
+
+def test_apply_backup_warns_indeterminate_git_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Hors dépôt Git, un avertissement de statut indéterminé est émis."""
+    target = tmp_path / "app.py"
+    source = f'KEY = "{SECRET}"\n'
+    _write(target, source)
+    plan = _plan(source)
+
+    receipt = apply_replacement(tmp_path, plan)
+    assert isinstance(receipt, AppliedPatch)
+    err = capsys.readouterr().err
+    assert "Avertissement : statut Git indéterminé pour" in err
+    assert "app.py.bak" in err
