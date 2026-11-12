@@ -186,4 +186,3 @@ poetry run mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts/reg
 poetry run python docs/security/check_model.py
 # OK: 48 STRIDE scenarios, valid scores, 10 linked risks/requirements, local links
 ```
-
