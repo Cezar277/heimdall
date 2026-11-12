@@ -17,6 +17,9 @@ Confinement et sécurité :
 - Lectures bornées (1 Mio) et sans suivi de liens symboliques.
 - Noms de variables validés via ``heimdall.remediation.naming.validate_variable_name``
   (grammaire fermée, denylist système, rejet des sauts de ligne et injections).
+- Clés existantes relues depuis .env re-validées (rejet fail-closed des variables dangereuses).
+- Négation '!' dans .gitignore respectée : le dernier motif gagne (sémantique gitignore).
+- Motif .gitignore validé (rejet de négation, métacaractères et sauts de ligne).
 - Valeurs de variables formatées via ``heimdall.vault.atomic.format_env_value``
   (échappement des guillemets doubles, dollars, backticks, backslashes).
 - Messages d'erreur statiques : aucune fuite de valeur de secret dans les exceptions.
@@ -25,6 +28,7 @@ Confinement et sécurité :
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import sys
 import warnings
@@ -33,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from heimdall.mcp.paths import PathEscape, confine
+from heimdall.mcp.paths import ConfinedPath, PathEscape, confine, is_rel_path
 from heimdall.remediation.naming import validate_variable_name
 from heimdall.remediation.templates import TemplateError
 from heimdall.vault.atomic import (
@@ -61,6 +65,9 @@ _SECURE_ENV_MODE: Final[int] = 0o600
 
 #: Mode par défaut pour .gitignore et .env.example (0644).
 _DEFAULT_FILE_MODE: Final[int] = 0o644
+
+#: Taille exacte attendue pour une paire (clé, valeur).
+_SECRET_PAIR_LENGTH: Final[int] = 2
 
 
 class EnvRemediationError(Exception):
@@ -105,6 +112,63 @@ class EnvRemediationReceipt:
             f"git_tracked={self.git_tracked!r}, "
             f"git_ignored={self.git_ignored!r})"
         )
+
+
+def _confine_and_check_no_symlink(
+    root: Path,
+    rel_path: str,
+    name_for_msg: str = "fichier",
+) -> ConfinedPath:
+    """Valide le type du chemin, confine sous root et refuse les liens symboliques."""
+    if not isinstance(rel_path, str):
+        raise EnvRemediationError(f"chemin {name_for_msg} invalide (non-str)")
+
+    try:
+        raw_path = root / rel_path
+    except (TypeError, ValueError):
+        raise EnvRemediationError(f"chemin {name_for_msg} invalide") from None
+
+    if os.path.islink(raw_path):
+        raise EnvRemediationError(f"accès refusé : {name_for_msg} est un lien symbolique")
+
+    try:
+        confined = confine(root, rel_path)
+    except PathEscape:
+        raise EnvRemediationError from None
+
+    if os.path.islink(confined.absolute):
+        raise EnvRemediationError(f"accès refusé : {name_for_msg} est un lien symbolique")
+
+    return confined
+
+
+def _validate_gitignore_pattern(pattern: str) -> str:
+    """Valide et assainit le motif destiné à .gitignore.
+
+    Refuse fail-closed toute entrée malveillante ou ambiguë :
+    - Non-str -> EnvRemediationError
+    - Négation '!' -> EnvRemediationError
+    - Commentaire '#' -> EnvRemediationError
+    - Globbing dangereux '*' ou '?' -> EnvRemediationError
+    - Sauts de ligne '\\n', '\\r' -> EnvRemediationError
+    - Motif vide ou ne respectant pas is_rel_path -> EnvRemediationError
+    """
+    if not isinstance(pattern, str):
+        raise EnvRemediationError("motif .gitignore invalide : non-str")
+
+    clean = pattern.strip()
+    if not clean or "\n" in pattern or "\r" in pattern:
+        raise EnvRemediationError("motif .gitignore invalide : motif vide ou saut de ligne")
+
+    if clean.startswith("!") or clean.startswith("#") or "*" in clean or "?" in clean:
+        raise EnvRemediationError(
+            "motif .gitignore invalide : négation, commentaire ou métacaractère interdit"
+        )
+
+    if not is_rel_path(clean):
+        raise EnvRemediationError("motif .gitignore invalide : chemin relatif invalide")
+
+    return clean
 
 
 def _read_text_secure(path: Path) -> tuple[str, int]:
@@ -170,6 +234,8 @@ def _extract_and_validate_names(  # noqa: PLR0912
     elif isinstance(variables, Iterable):
         for item in variables:
             if isinstance(item, tuple):
+                if not item:
+                    raise EnvRemediationError("tuple de variable vide")
                 raw_names.append(item[0])
             else:
                 raw_names.append(item)
@@ -214,20 +280,44 @@ def _parse_example_lines(content: str) -> tuple[set[str], list[str]]:
     return names, lines
 
 
-def _is_env_covered_in_gitignore(content: str) -> bool:
-    """Vérifie si une règle non commentée dans .gitignore couvre déjà .env."""
-    lines = content.splitlines()
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#") or line.startswith("!"):
-            continue
-        # Motifs standards couvrant .env
-        if line in (".env", "/.env", "*.env", ".env*", "/.env*"):
+def _pattern_matches_target(rule: str, target: str) -> bool:
+    """Vérifie si une règle positive simple de gitignore correspond à la cible."""
+    if rule in (target, f"/{target}"):
+        return True
+    target_name = Path(target).name
+    if rule in (target_name, f"/{target_name}"):
+        return True
+    if target_name == ".env" or target_name.endswith(".env"):
+        if rule in ("*.env", ".env*", "/*.env*", "/*.env"):
             return True
     return False
 
 
-def ensure_gitignore_ignores_env(  # noqa: PLR0912
+def _is_env_covered_in_gitignore(content: str, pattern: str = ".env") -> bool:
+    """Vérifie si une règle non commentée dans .gitignore couvre déjà le motif.
+
+    Prend en compte l'ordre séquentiel des règles et les négations '!' :
+    la dernière règle applicable l'emporte (sémantique gitignore conforme).
+    """
+    clean_target = pattern.strip() if isinstance(pattern, str) else ".env"
+    if not clean_target:
+        clean_target = ".env"
+
+    covered = False
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("!"):
+            negated = line[1:].strip()
+            if _pattern_matches_target(negated, clean_target):
+                covered = False
+        elif _pattern_matches_target(line, clean_target):
+            covered = True
+    return covered
+
+
+def ensure_gitignore_ignores_env(
     root: Path,
     gitignore_path: str = ".gitignore",
     pattern: str = ".env",
@@ -235,30 +325,19 @@ def ensure_gitignore_ignores_env(  # noqa: PLR0912
     """Ajoute de façon idempotente la règle d'exclusion de .env dans .gitignore.
 
     - Confine gitignore_path sous root.
-    - Si .gitignore existe, vérifie si une règle non commentée exclut déjà le motif.
-    - Si déjà présent : retourne False sans modifier le fichier (idempotence stricte).
-    - Si absent : ajoute '.env\\n' (en préservant le contenu existant et les sauts de ligne)
+    - Valide strictement le motif pattern (refuse fail-closed '!', '*', etc.).
+    - Si .gitignore existe, vérifie si une règle non commentée exclut déjà le motif
+      en tenant compte des négations '!' et de l'ordre d'évaluation gitignore.
+    - Si déjà couvert : retourne False sans modifier le fichier (idempotence stricte).
+    - Si non couvert : ajoute '<pattern>\\n' (en préservant le contenu existant)
       et écrit atomiquement.
     - Retourne True si le fichier a été modifié ou créé.
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
-    raw_path = root / gitignore_path
-    if os.path.islink(raw_path):
-        raise EnvRemediationError("écriture refusée : .gitignore est un lien symbolique")
-    raw_path = root / gitignore_path
-    if os.path.islink(raw_path):
-        raise EnvRemediationError("planification refusée : .gitignore est un lien symbolique")
-    try:
-        confined = confine(root, gitignore_path)
-    except PathEscape:
-        raise EnvRemediationError from None
 
-    if os.path.islink(confined.absolute):
-        raise EnvRemediationError("planification refusée : .gitignore est un lien symbolique")
-
-    if os.path.islink(confined.absolute):
-        raise EnvRemediationError("écriture refusée : .gitignore est un lien symbolique")
+    clean_pattern = _validate_gitignore_pattern(pattern)
+    confined = _confine_and_check_no_symlink(root, gitignore_path, ".gitignore")
 
     existing_content = ""
     mode = _DEFAULT_FILE_MODE
@@ -269,12 +348,8 @@ def ensure_gitignore_ignores_env(  # noqa: PLR0912
     except EnvRemediationError:
         raise
 
-    if _is_env_covered_in_gitignore(existing_content):
+    if _is_env_covered_in_gitignore(existing_content, pattern=clean_pattern):
         return False
-
-    clean_pattern = pattern.strip()
-    if not clean_pattern or "\n" in clean_pattern or "\r" in clean_pattern:
-        clean_pattern = ".env"
 
     if existing_content and not existing_content.endswith("\n"):
         new_content = f"{existing_content}\n{clean_pattern}\n"
@@ -313,17 +388,7 @@ def update_env_example(
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
     validated_names = _extract_and_validate_names(variables)
-
-    raw_path = root / example_path
-    if os.path.islink(raw_path):
-        raise EnvRemediationError("écriture refusée : .env.example est un lien symbolique")
-    try:
-        confined = confine(root, example_path)
-    except PathEscape:
-        raise EnvRemediationError from None
-
-    if os.path.islink(confined.absolute):
-        raise EnvRemediationError("écriture refusée : .env.example est un lien symbolique")
+    confined = _confine_and_check_no_symlink(root, example_path, ".env.example")
 
     existing_content = ""
     mode = _DEFAULT_FILE_MODE
@@ -371,12 +436,18 @@ def update_env_file(  # noqa: PLR0912, PLR0915
 
     Chaque clé est validée via validate_variable_name.
     Chaque valeur est échappée via format_env_value (prévention d'injection shell).
+    Les clés pré-existantes dans .env sont également re-validées (rejet fail-closed).
     Le volume total des secrets est borné à 1 Mio.
 
     Retourne le chemin absolu confiné du fichier écrit.
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
+
+    if isinstance(secrets, (str, bytes)):
+        raise EnvRemediationError(
+            "secrets invalides : format attendu dictionnaire ou liste de paires"
+        )
 
     if isinstance(secrets, Mapping):
         pairs = list(secrets.items())
@@ -393,30 +464,27 @@ def update_env_file(  # noqa: PLR0912, PLR0915
 
     validated_dict: dict[str, str] = {}
     total_chars = 0
-    for key, val in pairs:
-        if not isinstance(key, str) or not isinstance(val, str):
-            raise EnvRemediationError("clé ou valeur de secret invalide (non-str)")
-        try:
-            clean_key = validate_variable_name(key)
-        except (TemplateError, ValueError, TypeError):
-            raise EnvRemediationError from None
-
-        total_chars += len(val)
-        if total_chars > _MAX_TOTAL_SECRET_CHARS:
-            raise EnvRemediationError("volume total des secrets supérieur à 1 Mio")
-
-        validated_dict[clean_key] = val
-
-    raw_path = root / env_path
-    if os.path.islink(raw_path):
-        raise EnvRemediationError("écriture refusée : .env est un lien symbolique")
     try:
-        confined = confine(root, env_path)
-    except PathEscape:
-        raise EnvRemediationError from None
+        for item in pairs:
+            if not isinstance(item, tuple) or len(item) != _SECRET_PAIR_LENGTH:
+                raise EnvRemediationError("secret invalide : format attendu tuple (clé, valeur)")
+            key, val = item
+            if not isinstance(key, str) or not isinstance(val, str):
+                raise EnvRemediationError("clé ou valeur de secret invalide (non-str)")
+            try:
+                clean_key = validate_variable_name(key)
+            except (TemplateError, ValueError, TypeError):
+                raise EnvRemediationError("clé de secret invalide") from None
 
-    if os.path.islink(confined.absolute):
-        raise EnvRemediationError("écriture refusée : .env est un lien symbolique")
+            total_chars += len(val)
+            if total_chars > _MAX_TOTAL_SECRET_CHARS:
+                raise EnvRemediationError("volume total des secrets supérieur à 1 Mio")
+
+            validated_dict[clean_key] = val
+    except (ValueError, TypeError) as exc:
+        raise EnvRemediationError("structure de secrets invalide") from exc
+
+    confined = _confine_and_check_no_symlink(root, env_path, ".env")
 
     # Lecture sécurisée du .env existant si présent pour fusionner
     merged_secrets: dict[str, str] = {}
@@ -426,7 +494,17 @@ def update_env_file(  # noqa: PLR0912, PLR0915
         existing_env = parse_env_file(confined.absolute)
         if existing_env is None:
             raise EnvRemediationError("impossible de lire le fichier .env existant")
-        merged_secrets.update(existing_env)
+
+        for existing_k, existing_v in existing_env.items():
+            if not isinstance(existing_k, str) or not isinstance(existing_v, str):
+                raise EnvRemediationError("clé ou valeur invalide dans le fichier .env existant")
+            try:
+                clean_k = validate_variable_name(existing_k)
+            except (TemplateError, ValueError, TypeError):
+                raise EnvRemediationError(
+                    "clé existante invalide ou dangereuse dans .env"
+                ) from None
+            merged_secrets[clean_k] = existing_v
 
     merged_secrets.update(validated_dict)
 
@@ -454,29 +532,22 @@ def check_env_git_status(
     (is_tracked, is_ignored, warning_message, remediation_command)
 
     Si .env est suivi par Git (is_tracked == True) :
-    - remediation_command = f"git rm --cached {rel_path}"
+    - remediation_command = f"git rm --cached {shlex.quote(rel_path)}"
     - warning_message contient l'avertissement explicite.
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
-    raw_path = root / env_path
-    if os.path.islink(raw_path):
-        raise EnvRemediationError("écriture refusée : .env est un lien symbolique")
-    try:
-        confined = confine(root, env_path)
-    except PathEscape:
-        raise EnvRemediationError from None
-
-    if os.path.islink(confined.absolute):
-        raise EnvRemediationError("écriture refusée : .env est un lien symbolique")
+    confined = _confine_and_check_no_symlink(root, env_path, ".env")
 
     tracked = is_git_tracked(confined.absolute)
     ignored = is_git_ignored(confined.absolute)
 
+    quoted_rel = shlex.quote(confined.relative)
+
     if tracked:
-        cmd = f"git rm --cached {confined.relative}"
+        cmd = f"git rm --cached {quoted_rel}"
         warn = (
-            f"ATTENTION : Le fichier {confined.relative} est suivi par Git ! "
+            f"ATTENTION : Le fichier {quoted_rel} est suivi par Git ! "
             f"Exécutez '{cmd}' et ajoutez-le à .gitignore pour éviter toute fuite."
         )
         return True, ignored, warn, cmd
@@ -513,17 +584,7 @@ def plan_env_example_change(
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
     validated_names = _extract_and_validate_names(variables)
-
-    raw_path = root / example_path
-    if os.path.islink(raw_path):
-        raise EnvRemediationError("écriture refusée : .env.example est un lien symbolique")
-    try:
-        confined = confine(root, example_path)
-    except PathEscape:
-        raise EnvRemediationError from None
-
-    if os.path.islink(confined.absolute):
-        raise EnvRemediationError("écriture refusée : .env.example est un lien symbolique")
+    confined = _confine_and_check_no_symlink(root, example_path, ".env.example")
 
     existing_content = ""
     try:
@@ -564,16 +625,9 @@ def plan_gitignore_change(
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
-    raw_path = root / gitignore_path
-    if os.path.islink(raw_path):
-        raise EnvRemediationError("planification refusée : .gitignore est un lien symbolique")
-    try:
-        confined = confine(root, gitignore_path)
-    except PathEscape:
-        raise EnvRemediationError from None
 
-    if os.path.islink(confined.absolute):
-        raise EnvRemediationError("planification refusée : .gitignore est un lien symbolique")
+    clean_pattern = _validate_gitignore_pattern(pattern)
+    confined = _confine_and_check_no_symlink(root, gitignore_path, ".gitignore")
 
     existing_content = ""
     try:
@@ -583,12 +637,8 @@ def plan_gitignore_change(
     except EnvRemediationError:
         raise
 
-    if _is_env_covered_in_gitignore(existing_content):
+    if _is_env_covered_in_gitignore(existing_content, pattern=clean_pattern):
         return None
-
-    clean_pattern = pattern.strip()
-    if not clean_pattern or "\n" in clean_pattern or "\r" in clean_pattern:
-        clean_pattern = ".env"
 
     if existing_content and not existing_content.endswith("\n"):
         after_content = f"{existing_content}\n{clean_pattern}\n"
@@ -621,6 +671,12 @@ def remediate_environment(  # noqa: PLR0913
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
+    if not isinstance(env_path, str):
+        raise EnvRemediationError("chemin env invalide (non-str)")
+    if not isinstance(example_path, str):
+        raise EnvRemediationError("chemin exemple invalide (non-str)")
+    if not isinstance(gitignore_path, str):
+        raise EnvRemediationError("chemin gitignore invalide (non-str)")
 
     # 1. Mise à jour de .env.example (valeurs vides obligatoires)
     added_to_example = update_env_example(root, secrets, example_path=example_path)

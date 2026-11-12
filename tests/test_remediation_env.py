@@ -527,3 +527,135 @@ def test_remediate_environment_warns_stderr_when_untracked(tmp_path: Path) -> No
         )
     assert receipt.git_tracked is False
     assert receipt.warning is not None
+
+
+# ==============================================================================
+# 9. Tests correctifs et durcissements post-revue (clés existantes, négation gitignore, etc.)
+# ==============================================================================
+
+
+@pytest.mark.parametrize(
+    "dangerous_key",
+    [
+        "LD_PRELOAD",
+        "lower_case_var",
+        'FOO" BAR',
+        "PATH",
+        "PYTHONPATH",
+    ],
+)
+def test_env_file_merge_with_dangerous_existing_key_raises_fail_closed(
+    tmp_path: Path, dangerous_key: str
+) -> None:
+    """Un .env pré-existant contenant une clé invalide ou dangereuse est refusé fail-closed."""
+    env_file = tmp_path / ".env"
+    env_file.write_text(f'{dangerous_key}="injected_payload"\n', encoding="utf-8")
+    with pytest.raises(EnvRemediationError, match="clé existante invalide ou dangereuse dans .env"):
+        update_env_file(tmp_path, {"SAFE_KEY": "safe_val"})
+
+
+def test_gitignore_negation_overrides_earlier_ignore_and_is_corrected(git_repo: Path) -> None:
+    """.gitignore contenant .env puis !.env : check_env_git_status et ensure corrigent."""
+    gitignore = git_repo / ".gitignore"
+    gitignore.write_text(".env\n!.env\n", encoding="utf-8")
+    env_file = git_repo / ".env"
+    env_file.write_text("API_KEY=val\n", encoding="utf-8")
+
+    # git_status doit détecter que .env n'est pas ignoré à cause de la négation !.env
+    tracked, ignored, warn, cmd = check_env_git_status(git_repo)
+    assert ignored is False
+
+    # ensure_gitignore_ignores_env doit détecter que .env n'est pas couvert et ajouter la règle
+    updated = ensure_gitignore_ignores_env(git_repo)
+    assert updated is True
+
+    # Le nouveau contenu a .env à la fin, neutralisant la négation précédente
+    new_content = gitignore.read_text(encoding="utf-8")
+    assert new_content.endswith(".env\n")
+
+    # Maintenant, .env est correctement ignoré
+    tracked2, ignored2, warn2, cmd2 = check_env_git_status(git_repo)
+    assert ignored2 is True
+
+
+@pytest.mark.parametrize(
+    "bad_pattern",
+    [
+        "!.env",
+        "*",
+        "?",
+        "*.env",
+        ".env\ninjected",
+        "# comment",
+        "",
+        "   ",
+        "../escape/.env",
+    ],
+)
+def test_gitignore_malicious_pattern_rejected_fail_closed(tmp_path: Path, bad_pattern: str) -> None:
+    """Un motif malveillant ou ambigu passé à ensure/plan lève EnvRemediationError."""
+    with pytest.raises(EnvRemediationError, match="motif .gitignore invalide"):
+        ensure_gitignore_ignores_env(tmp_path, pattern=bad_pattern)
+
+    with pytest.raises(EnvRemediationError, match="motif .gitignore invalide"):
+        plan_gitignore_change(tmp_path, pattern=bad_pattern)
+
+
+def test_env_operations_reject_invalid_input_types_fail_closed(tmp_path: Path) -> None:
+    """Entrées mal typées lèvent EnvRemediationError, jamais ValueError ni TypeError."""
+    # update_env_file avec liste de str au lieu de tuples
+    with pytest.raises(EnvRemediationError):
+        update_env_file(tmp_path, ["AB", "CD"])  # type: ignore[list-item]
+
+    # update_env_file avec str direct
+    with pytest.raises(EnvRemediationError):
+        update_env_file(tmp_path, "NOT_A_DICT")  # type: ignore[arg-type]
+
+    # update_env_file avec tuples de longueur != 2
+    with pytest.raises(EnvRemediationError):
+        update_env_file(tmp_path, [("KEY", "VAL", "EXTRA")])  # type: ignore[list-item]
+
+    # example_path=123 (non-str)
+    with pytest.raises(EnvRemediationError, match="non-str"):
+        update_env_example(tmp_path, ["KEY"], example_path=123)  # type: ignore[arg-type]
+
+    with pytest.raises(EnvRemediationError, match="non-str"):
+        plan_env_example_change(tmp_path, ["KEY"], example_path=123)  # type: ignore[arg-type]
+
+    # env_path=None (non-str)
+    with pytest.raises(EnvRemediationError, match="non-str"):
+        update_env_file(tmp_path, {"KEY": "VAL"}, env_path=None)  # type: ignore[arg-type]
+
+    with pytest.raises(EnvRemediationError, match="non-str"):
+        check_env_git_status(tmp_path, env_path=123)  # type: ignore[arg-type]
+
+    # gitignore_path=123 (non-str)
+    with pytest.raises(EnvRemediationError, match="non-str"):
+        ensure_gitignore_ignores_env(tmp_path, gitignore_path=123)  # type: ignore[arg-type]
+
+    with pytest.raises(EnvRemediationError, match="non-str"):
+        plan_gitignore_change(tmp_path, gitignore_path=123)  # type: ignore[arg-type]
+
+
+def test_env_path_with_spaces_properly_quoted_in_git_rm_command(git_repo: Path) -> None:
+    """Chemin env contenant des espaces : git_rm_command est correctement quotée."""
+    space_dir = git_repo / "a b"
+    space_dir.mkdir()
+    space_env = space_dir / ".env"
+    space_env.write_text("TOKEN=secret\n", encoding="utf-8")
+
+    git_bin = shutil.which("git")
+    if git_bin:
+        subprocess.run(  # noqa: S603
+            [git_bin, "add", "-f", "a b/.env"],
+            cwd=git_repo,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    tracked, ignored, warn, cmd = check_env_git_status(git_repo, env_path="a b/.env")
+    assert tracked is True
+    assert cmd == "git rm --cached 'a b/.env'"
+    assert warn is not None
+    assert "'a b/.env'" in warn

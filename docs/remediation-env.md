@@ -62,7 +62,7 @@ from heimdall.remediation import remediate_environment
 
 root = Path("/chemin/vers/depot")
 secrets = {
-    "APP_API_KEY": "sk_live_synthetic_secret_value",
+    "APP_API_KEY": "EXAMPLE_SYNTHETIC_VALUE_123",
     "DB_PASSWORD": "synthetic_password_456",
 }
 
