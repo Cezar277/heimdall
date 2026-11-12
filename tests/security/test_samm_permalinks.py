@@ -323,3 +323,75 @@ def test_t84_t85_t86_samm_permalinks_integrity_and_header_sync() -> None:
         assert symbol in target_line, (
             f"Dérive de ligne à {rel_path}:{line_no} — attendu '{symbol}', trouvé : {target_line!r}"
         )
+
+
+FICHE_T31 = REPO / "docs" / "t31-samm.md"
+
+
+def test_t31_samm_permalinks_integrity_and_header_sync() -> None:
+    """Preuves SAMM #31 : permaliens vivants, dépôt exact et en-tête synchrone."""
+    texte = FICHE_T31.read_text(encoding="utf-8")
+    liens = repin.extraire(texte)
+    assert liens, "la fiche de preuves t31 ne contient aucun permalien"
+
+    # 1. Vérification du dépôt et de la présence des fichiers
+    for lien in liens:
+        assert (lien.owner, lien.repo) == DEPOT_ATTENDU, lien.complet
+        assert repin.revision_connue(lien.sha, REPO), (
+            f"révision inconnue : {lien.sha} — re-pinner sur la révision finale"
+        )
+        assert repin.fichier_present(lien.sha, lien.path, REPO), (
+            f"fichier absent à la révision {lien.sha} : {lien.path}"
+        )
+
+    # 2. Synchronisation de l'en-tête et du tableau
+    header_commit = re.search(r"commit d'implémentation\*\*\s*\[`([0-9a-f]{40})`\]", texte)
+    assert header_commit is not None, "SHA du commit d'implémentation absent de l'en-tête"
+    base_tree = re.search(
+        r"Base des liens :\s*`https://github\.com/Cezar277/heimdall/tree/([0-9a-f]{40})/?`",
+        texte,
+    )
+    assert base_tree is not None, "SHA de base tree absent de l'en-tête"
+    sha_entete = header_commit.group(1)
+    assert sha_entete == base_tree.group(1), (
+        f"Incohérence en-tête : commit ({sha_entete}) != tree ({base_tree.group(1)})"
+    )
+
+    table_shas = {lien.sha for lien in liens}
+    assert table_shas == {sha_entete}, (
+        f"Dérive de permaliens : tableau ({table_shas}) != en-tête ({sha_entete})"
+    )
+
+    # 3. Procédure de re-pin déclarée
+    assert "scripts/repin_samm.py" in texte
+    assert "--fiche docs/t31-samm.md" in texte
+    assert "--sha" in texte
+    assert "--check" in texte
+
+    # 4. Cohérence des ancres symboliques à la révision d'implémentation
+    expected_symbols = {
+        ("heimdall/remediation/env.py", 60): "_SECURE_ENV_MODE",
+        ("heimdall/remediation/env.py", 66): "EnvRemediationError",
+        ("heimdall/remediation/env.py", 77): "EnvRemediationReceipt",
+        ("heimdall/remediation/env.py", 96): "__repr__",
+        ("heimdall/remediation/env.py", 110): "_read_text_secure",
+        ("heimdall/remediation/env.py", 157): "_extract_and_validate_names",
+        ("heimdall/remediation/env.py", 203): "_parse_example_lines",
+        ("heimdall/remediation/env.py", 217): "_is_env_covered_in_gitignore",
+        ("heimdall/remediation/env.py", 230): "ensure_gitignore_ignores_env",
+        ("heimdall/remediation/env.py", 294): "update_env_example",
+        ("heimdall/remediation/env.py", 361): "update_env_file",
+        ("heimdall/remediation/env.py", 447): "check_env_git_status",
+        ("heimdall/remediation/env.py", 503): "plan_env_example_change",
+        ("heimdall/remediation/env.py", 555): "plan_gitignore_change",
+        ("heimdall/remediation/env.py", 603): "remediate_environment",
+    }
+    for (rel_path, line_no), symbol in expected_symbols.items():
+        code, content = repin._git("cat-file", "-p", f"{sha_entete}:{rel_path}", cwd=REPO)
+        assert code == 0, f"impossible d'extraire {rel_path} à {sha_entete}"
+        lines = content.splitlines()
+        assert 1 <= line_no <= len(lines), f"{rel_path}:{line_no} hors limites"
+        target_line = lines[line_no - 1]
+        assert symbol in target_line, (
+            f"Dérive de ligne à {rel_path}:{line_no} — attendu '{symbol}', trouvé : {target_line!r}"
+        )
