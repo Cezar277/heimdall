@@ -287,23 +287,26 @@ def _pattern_matches_target(rule: str, target: str) -> bool:
         return True
 
     target_name = Path(target).name
-    is_env_like = target_name == ".env" or target_name.endswith(".env")
+    is_root = "/" not in target.strip("/")
+    ends_with_dot_env = target_name == ".env" or target_name.endswith(".env")
+    starts_with_dot_env = target_name.startswith(".env")
 
-    # Règle ancrée à la racine (/...) qui ne correspond pas exactement à target :
-    # elle ne couvre JAMAIS une cible en sous-dossier (sémantique gitignore réelle).
+    # Règle ancrée à la racine (/...) : ne couvre JAMAIS une cible en sous-dossier
     if rule.startswith("/"):
-        if "/" in target.strip("/"):
+        if not is_root:
             return False
-        # Cible à la racine (ex. ".env") : /.env, /*.env, /*.env*
-        return is_env_like and rule in (
-            f"/{target_name}",
-            f"/{target_name}*",
-            "/*.env",
-            "/*.env*",
+        return (
+            rule == f"/{target_name}"
+            or (ends_with_dot_env and rule in ("/*.env", "/.env"))
+            or (starts_with_dot_env and rule in ("/*.env*", "/.env*"))
         )
 
     # Règle non-ancrée (sans slash de tête) :
-    return rule == target_name or (is_env_like and rule in ("*.env", ".env*"))
+    return (
+        rule == target_name
+        or (rule == "*.env" and ends_with_dot_env)
+        or (rule == ".env*" and starts_with_dot_env)
+    )
 
 
 def _is_env_covered_in_gitignore(content: str, pattern: str = ".env") -> bool:
@@ -484,6 +487,10 @@ def update_env_file(  # noqa: PLR0912, PLR0915
             key, val = item
             if not isinstance(key, str) or not isinstance(val, str):
                 raise EnvRemediationError("clé ou valeur de secret invalide (non-str)")
+            if "\n" in val or "\r" in val or "\0" in val:
+                raise EnvRemediationError(
+                    "valeur de secret invalide : saut de ligne ou octet nul interdit"
+                )
             try:
                 clean_key = validate_variable_name(key)
             except (TemplateError, ValueError, TypeError):
@@ -511,6 +518,10 @@ def update_env_file(  # noqa: PLR0912, PLR0915
         for existing_k, existing_v in existing_env.items():
             if not isinstance(existing_k, str) or not isinstance(existing_v, str):
                 raise EnvRemediationError("clé ou valeur invalide dans le fichier .env existant")
+            if "\n" in existing_v or "\r" in existing_v or "\0" in existing_v:
+                raise EnvRemediationError(
+                    "valeur existante invalide dans .env : saut de ligne ou octet nul interdit"
+                )
             try:
                 clean_k = validate_variable_name(existing_k)
             except (TemplateError, ValueError, TypeError):
@@ -703,11 +714,22 @@ def remediate_environment(  # noqa: PLR0913
     confined_example = _confine_and_check_no_symlink(root, example_path, ".env.example")
     confined_gitignore = _confine_and_check_no_symlink(root, gitignore_path, ".gitignore")
 
+    if isinstance(secrets, (str, bytes)):
+        raise EnvRemediationError(
+            "secrets invalides : format attendu dictionnaire ou liste de paires"
+        )
+    if isinstance(secrets, Mapping):
+        materialized_secrets: list[tuple[str, str]] = list(secrets.items())
+    elif isinstance(secrets, Iterable):
+        materialized_secrets = list(secrets)
+    else:
+        raise EnvRemediationError("secrets invalides : type non supporté")
+
     # 1. Mise à jour de .env.example (valeurs vides obligatoires)
-    added_to_example = update_env_example(root, secrets, example_path=example_path)
+    added_to_example = update_env_example(root, materialized_secrets, example_path=example_path)
 
     # 2. Mise à jour ou création de .env en mode 0600
-    update_env_file(root, secrets, env_path=env_path)
+    update_env_file(root, materialized_secrets, env_path=env_path)
 
     # 3. Ajout de .env au .gitignore si absent (idempotent)
     gitignore_updated = ensure_gitignore_ignores_env(
@@ -720,7 +742,7 @@ def remediate_environment(  # noqa: PLR0913
         sys.stderr.write(warn + "\n")
         warnings.warn(warn, UserWarning, stacklevel=2)
 
-    all_names = _extract_and_validate_names(secrets)
+    all_names = _extract_and_validate_names(materialized_secrets)
 
     return EnvRemediationReceipt(
         env_file=confined_env.relative,

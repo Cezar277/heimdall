@@ -715,3 +715,56 @@ def test_env_file_cumulative_volume_limit_enforced_on_merge(tmp_path: Path) -> N
     chunk_new = "y" * 600_000
     with pytest.raises(EnvRemediationError, match="volume total des secrets supérieur à 1 Mio"):
         update_env_file(tmp_path, {"NEW_SECRET": chunk_new})
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "a\nEVIL=1",
+        "a\rb",
+        "a\x00b",
+        "a\r\nEVIL=1",
+    ],
+)
+def test_env_file_rejects_newlines_and_nul_bytes_in_secret_values(
+    tmp_path: Path, bad_value: str
+) -> None:
+    """Valeur contenant un saut de ligne ou octet nul est rejetée sans écriture dans .env."""
+    env_file = tmp_path / ".env"
+    with pytest.raises(EnvRemediationError, match="saut de ligne ou octet nul interdit"):
+        update_env_file(tmp_path, {"APP_KEY": bad_value})
+    assert not env_file.exists()
+
+
+def test_gitignore_dot_env_star_does_not_cover_a_dot_env(git_repo: Path) -> None:
+    """.gitignore contenant .env* seul ne couvre pas a.env : ensure ajoute la règle."""
+    gitignore = git_repo / ".gitignore"
+    gitignore.write_text(".env*\n", encoding="utf-8")
+    a_env = git_repo / "a.env"
+    a_env.write_text("SECRET=val\n", encoding="utf-8")
+
+    # check_env_git_status doit détecter que a.env n'est pas ignoré par .env*
+    tracked, ignored, warn, cmd = check_env_git_status(git_repo, env_path="a.env")
+    assert ignored is False
+
+    # ensure_gitignore_ignores_env doit ajouter a.env
+    updated = ensure_gitignore_ignores_env(git_repo, pattern="a.env")
+    assert updated is True
+
+    content = gitignore.read_text(encoding="utf-8")
+    assert "a.env" in content
+
+
+def test_remediate_environment_accepts_generators_and_iterators(tmp_path: Path) -> None:
+    """remediate_environment matérialise secrets et fonctionne avec des générateurs/itérateurs."""
+    gen = ((k, v) for k, v in [("APP_KEY", "value_1"), ("DB_PASS", "value_2")])
+    receipt = remediate_environment(tmp_path, gen, warn_stderr=False)
+    assert receipt.variables == ("APP_KEY", "DB_PASS")
+    assert receipt.env_created_or_updated is True
+    assert (tmp_path / ".env").exists()
+    assert (tmp_path / ".env.example").exists()
+
+    # Itérateur simple
+    it = iter([("ANOTHER_KEY", "value_3")])
+    receipt2 = remediate_environment(tmp_path, it, warn_stderr=False)
+    assert "ANOTHER_KEY" in receipt2.variables
