@@ -961,3 +961,95 @@ def test_env_example_rejects_line_without_equals(tmp_path: Path) -> None:
         plan_env_example_change(tmp_path, ["APP_KEY"])
 
     assert example_file.read_text(encoding="utf-8") == "HELLO WORLD\n"
+
+
+def test_env_example_comment_with_secret_is_purged_and_masked(tmp_path: Path) -> None:
+    """.env.example pollué par commentaire (# APP_KEY=h****k) : purge et before masqué."""
+    example_file = tmp_path / ".env.example"
+    polluted_secret = "h****k_super_secret_value_12345"  # noqa: S105
+    example_file.write_text(f"# APP_KEY={polluted_secret}\n", encoding="utf-8")
+
+    plan = plan_env_example_change(tmp_path, ["APP_KEY"])
+    assert plan is not None
+    rel_path, before, after = plan
+    assert rel_path == ".env.example"
+    # Le secret en clair ne doit JAMAIS apparaître dans before ni dans after
+    assert polluted_secret not in before
+    assert polluted_secret not in after
+    # before masque la valeur avec ***
+    assert "# APP_KEY=***\n" in before
+    # after purge la valeur en laissant NOM= sans secret
+    assert "# APP_KEY=\n" in after
+    assert "APP_KEY=\n" in after
+
+    changed = update_env_example(tmp_path, ["APP_KEY"])
+    assert "APP_KEY" in changed
+
+    content = example_file.read_text(encoding="utf-8")
+    assert polluted_secret not in content
+    assert "# APP_KEY=\n" in content
+    assert "APP_KEY=\n" in content
+
+
+@pytest.mark.parametrize(
+    "invalid_env_path",
+    [
+        ".environment",
+        ".envstuff",
+        ".env.bak",
+        ".env.old",
+        ".env.backup",
+        ".env~",
+        ".env.swp",
+        ".env.tmp",
+        "prod.env.bak",
+    ],
+)
+def test_env_paths_reject_environment_and_backup_suffixes(
+    tmp_path: Path, invalid_env_path: str
+) -> None:
+    """Les chemins sur-approximés (.environment) et de sauvegarde (.env.bak) sont rejetés."""
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        update_env_file(tmp_path, {"KEY": "val"}, env_path=invalid_env_path)
+
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        update_env_example(tmp_path, ["KEY"], example_path=invalid_env_path)
+
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        check_env_git_status(tmp_path, env_path=invalid_env_path)
+
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        ensure_gitignore_ignores_env(tmp_path, pattern=invalid_env_path)
+
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        plan_gitignore_change(tmp_path, pattern=invalid_env_path)
+
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        remediate_environment(tmp_path, {"KEY": "val"}, env_path=invalid_env_path)
+
+
+def test_env_file_rejects_line_without_equals(tmp_path: Path) -> None:
+    """.env existant avec une ligne sans '=' (ex. HELLO WORLD) : rejet fail-closed."""
+    env_file = tmp_path / ".env"
+    initial_content = "EXISTING=1\nHELLO WORLD\nANOTHER=2\n"
+    env_file.write_text(initial_content, encoding="utf-8")
+    env_file.chmod(0o600)
+
+    with pytest.raises(EnvRemediationError, match="ligne invalide dans le fichier .env existant"):
+        update_env_file(tmp_path, {"NEW_KEY": "val"})
+
+    # Le contenu existant ne doit pas avoir été écrasé silencieusement
+    assert env_file.read_text(encoding="utf-8") == initial_content
+
+
+def test_env_file_rejects_line_with_empty_key(tmp_path: Path) -> None:
+    """.env existant avec une ligne ayant une clé vide (=valeur) : rejet fail-closed."""
+    env_file = tmp_path / ".env"
+    initial_content = "=value_without_key\n"
+    env_file.write_text(initial_content, encoding="utf-8")
+    env_file.chmod(0o600)
+
+    with pytest.raises(EnvRemediationError, match="ligne invalide dans le fichier .env existant"):
+        update_env_file(tmp_path, {"NEW_KEY": "val"})
+
+    assert env_file.read_text(encoding="utf-8") == initial_content

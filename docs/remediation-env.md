@@ -20,8 +20,11 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
 - **Zéro fuite** : même si un dictionnaire complet `{nom: valeur}` est fourni en entrée,
   les valeurs sont **systématiquement ignorées**. Seuls les noms validés sont écrits.
 - **Idempotence** : une variable déjà déclarée n'est pas dupliquée.
-- **Préservation** : les commentaires `#`, sauts de lignes et variables préexistantes
-  sont scrupuleusement conservés.
+- **Préservation et purge des commentaires** : les commentaires `#` sont préservés,
+  mais toute affectation ou valeur après `=` dans un commentaire (ex. `# APP_KEY=h****k`)
+  est **systématiquement purgée** en `# NOM=\n` (et masquée par `***` dans les diffs
+  `plan_env_example_change`), garantissant l'invariant 8 (zéro secret dans `.env.example`
+  ni dans les diffs affichés).
 
 ### 1.2. `.env` avec permissions strictes 0600 (T31.2)
 - **Secrets locaux en clair** : contient les associations `NOM="valeur"`.
@@ -34,6 +37,9 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
 - **Écriture atomique** : passage par `vault.atomic.write_file_atomic`
   (fichier temporaire + `fsync` + `os.replace` atomique) garantissant qu'aucun
   fichier partiel n'est créé en cas d'interruption.
+- **Validation fail-closed du `.env` pré-existant** : toute ligne non vide et non commentée
+  sans caractère `=` (ex. `HELLO WORLD`, payload altéré) ou avec clé vide est rejetée
+  avec `EnvRemediationError`, interdisant tout abandon silencieux lors de la fusion.
 
 ### 1.3. Ajout idempotent au `.gitignore` (T31.3)
 - **Protection anti-commit** : s'assure que `.env` ne sera pas indexé par Git.
@@ -49,6 +55,18 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
 - **Recommandation de remédiation** : proposition immédiate de la commande
   `git rm --cached .env` pour retirer le fichier de l'index sans détruire sa version sur disque.
 - **Critère d'acceptation validé** : `git status` ne montre jamais `.env`.
+
+### 1.5. Grammaire stricte des chemins d'environnement et rejet des faux positifs
+Pour éviter tout élargissement de surface d'écriture ou écrasement de fichiers hors cible :
+- **Formes acceptées strictement** :
+  - Le nom exact `.env`
+  - Les préfixes normalisés `.env.` (ex. `.env.example`, `.env.local`, `.env.production`)
+  - Les préfixes normalisés `.env_` (ex. `.env_local`, `.env_test`)
+  - Les suffixes d'environnement `.env` (ex. `prod.env`, `config/staging.env`, `a.env`)
+- **Rejets fail-closed (lèvent `EnvRemediationError`)** :
+  - Extensions de sauvegarde et fichiers temporaires : `.env.bak`, `.env.old`, `.env.backup`, `.env~`, `.env.swp`, `.env.tmp`, `prod.env.bak`
+  - Faux positifs de préfixe : `.environment`, `.envstuff`
+  - Fichiers source ou arbitraires : `src/app.py`, `main.rs`, `.gitignore`
 
 ---
 
@@ -128,12 +146,14 @@ if gitignore_diff:
 
 | Menace | Risque | Atténuation Heimdall |
 | --- | --- | --- |
-| **Information Disclosure** | Fuite de secret dans `.env.example` committé dans Git | `update_env_example` n'écrit jamais de valeur, uniquement `NOM=\n`. Les valeurs fournies en entrée sont ignorées. |
+| **Information Disclosure** | Fuite de secret dans `.env.example` committé dans Git | `update_env_example` n'écrit jamais de valeur, uniquement `NOM=\n`. Les valeurs d'entrée sont ignorées et les commentaires pollués (`# NOM=val`) sont purgés (`# NOM=`) et masqués (`***`) dans les diffs (invariant 8). |
 | **Information Disclosure** | Lecture locale de `.env` par un utilisateur non privilégié | `.env` créé avec `os.open(..., 0o600)` et `os.fchmod`. Mode 0600 vérifié par `check_file_mode_600`. |
 | **Information Disclosure** | Commit accidentel du secret via `git add .` | `.env` ajouté à `.gitignore`. Alerte et suggestion `git rm --cached .env` si le fichier était déjà suivi. |
 | **Tampering** | Injection de variables ou corruption via retours à la ligne | Validation stricte des noms via `validate_variable_name` (`^[A-Z][A-Z0-9_]{1,63}$`, denylist système). |
+| **Tampering** | Perte silencieuse de lignes ou payload altéré dans `.env` | Contrôle strict de la syntaxe du `.env` pré-existant : rejet fail-closed (`EnvRemediationError`) de toute ligne sans `=` ou à clé vide. |
 | **Tampering** | Exécution de commande shell si `.env` est sourcé | Échappement des caractères spéciaux (`\`, `"`, `$`, `` ` ``) via `format_env_value`. |
 | **Elevation of Privilege** | Path traversal (`../`, chemin absolu, symlink sortant) | Confinement de tous les chemins via `mcp.paths.confine`. Liens symboliques refusés fail-closed. |
+| **Elevation of Privilege** | Élargissement de surface sur fichiers arbitraires ou de sauvegarde | Grammaire d'environnement stricte (`_is_env_like_path`) rejetant `.environment`, `.env.bak`, `.env.old`, `src/app.py`. |
 | **Denial of Service** | DoS mémoire par passage d'un volume démesuré | Bornes strictes : 1024 variables max, volume cumulé plafonné à 1 Mio, lecture bornée à 1 Mio. |
 | **Denial of Service** | Inflation infinie du fichier `.gitignore` | Idempotence stricte : contrôle des motifs avant tout ajout, aucun doublon. |
 

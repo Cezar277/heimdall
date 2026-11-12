@@ -81,6 +81,17 @@ _MASKED_VALUE: Final[str] = "***"
 #: Taille exacte attendue pour une paire (clé, valeur).
 _SECRET_PAIR_LENGTH: Final[int] = 2
 
+#: Extensions de sauvegarde ou fichiers temporaires rejetés fail-closed.
+_REJECTED_ENV_SUFFIXES: Final[tuple[str, ...]] = (
+    ".bak",
+    ".backup",
+    ".old",
+    ".orig",
+    "~",
+    ".swp",
+    ".tmp",
+)
+
 
 class EnvRemediationError(Exception):
     """Échec d'opération d'environnement : entrée invalide ou écriture impossible."""
@@ -160,12 +171,28 @@ def _confine_and_check_no_symlink(
 def _is_env_like_path(rel_path: str) -> bool:
     """Vrai si le nom de fichier ressemble à un fichier d'environnement.
 
-    Accepte ``.env``, les préfixes ``.env*`` (``.env.example``, ``.env.local``)
-    et les suffixes ``*.env`` (``a.env``, ``config/prod.env``). Refuse les
-    chemins arbitraires comme ``src/app.py`` (anti-ignore/écrasement de source).
+    Accepte :
+    - le nom exact ``.env``
+    - les préfixes normalisés ``.env.`` (ex. ``.env.example``, ``.env.local``)
+    - les préfixes normalisés ``.env_`` (ex. ``.env_test``)
+    - les suffixes ``.env`` (ex. ``prod.env``, ``config/a.env``).
+
+    Refuse fail-closed :
+    - les extensions de sauvegarde ou temporaires (``.env.bak``, ``.env.old``, etc.)
+    - les faux positifs de préfixe (``.environment``, ``.envstuff``)
+    - les sources ou fichiers arbitraires (``src/app.py``, ``.gitignore``).
     """
     name = Path(rel_path).name
-    return name == ".env" or name.startswith(".env") or name.endswith(".env")
+    if not name:
+        return False
+    if any(name.endswith(suffix) for suffix in _REJECTED_ENV_SUFFIXES):
+        return False
+    return (
+        name == ".env"
+        or name.startswith(".env.")
+        or name.startswith(".env_")
+        or name.endswith(".env")
+    )
 
 
 def _validate_env_like_path(rel_path: str, name_for_msg: str) -> str:
@@ -332,6 +359,17 @@ def _extract_and_validate_names(  # noqa: PLR0912
     return validated
 
 
+def _sanitize_example_comment_line(raw_line: str, *, mask_values: bool) -> str:
+    """Assainit une ligne de commentaire en purgeant toute valeur après '='."""
+    if "=" not in raw_line:
+        return raw_line
+    head, _, val = raw_line.partition("=")
+    if not val.strip():
+        return f"{head.rstrip()}="
+    rendered_val = _MASKED_VALUE if mask_values else ""
+    return f"{head.rstrip()}={rendered_val}"
+
+
 def _build_sanitized_example_content(
     content: str,
     target_names: list[str],
@@ -355,8 +393,11 @@ def _build_sanitized_example_content(
 
     for raw_line in content.splitlines():
         stripped = raw_line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped:
             new_lines.append(raw_line)
+            continue
+        if stripped.startswith("#"):
+            new_lines.append(_sanitize_example_comment_line(raw_line, mask_values=mask_values))
             continue
         if "=" in stripped:
             key, _, val = stripped.partition("=")
@@ -616,6 +657,20 @@ def update_env_file(  # noqa: PLR0912, PLR0915
     if confined.absolute.exists():
         if os.path.islink(confined.absolute):
             raise EnvRemediationError("écriture refusée : .env est un lien symbolique")
+
+        raw_existing, _ = _read_text_secure(confined.absolute)
+        for raw_line in raw_existing.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise EnvRemediationError(
+                    "ligne invalide dans le fichier .env existant : '=' attendu"
+                )
+            key_part, _, _ = line.partition("=")
+            if not key_part.strip():
+                raise EnvRemediationError("ligne invalide dans le fichier .env existant : clé vide")
+
         existing_env = parse_env_file(confined.absolute)
         if existing_env is None:
             raise EnvRemediationError("impossible de lire le fichier .env existant")
