@@ -198,4 +198,5 @@ def deduplicate_variable_name(desired: str, taken: Iterable[str]) -> str:
         if candidate in used or is_dangerous_env_var(candidate):
             continue
         return candidate
+    raise TemplateError  # exit guaranteed
     raise TemplateError  # Inatteignable : la borne de longueur garantit la sortie
