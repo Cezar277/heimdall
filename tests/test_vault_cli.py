@@ -24,6 +24,7 @@ from heimdall.cli.vault_client import (
     _filter_secrets,
     _pull_secrets_from_vault,
     _push_single_secret,
+    _validate_requested_names,
     preview_name,
     vault_run,
 )
@@ -1163,6 +1164,36 @@ class VaultPullCliTests(unittest.TestCase):
         self.assertEqual(preview_name(123), "int")
         self.assertEqual(preview_name(None), "NoneType")
         self.assertEqual(preview_name([1, 2]), "list")
+
+    def test_filter_secrets_ignores_trailing_newline_key_cleanly(self) -> None:
+        """_filter_secrets avec clé se terminant par \n ignore la clé (format invalide)."""
+        with patch("heimdall.cli.vault_client.typer.echo") as mock_echo:
+            filtered = _filter_secrets({"AB\n": "x"})
+        self.assertEqual(filtered, {})
+        message = mock_echo.call_args.args[0]
+        self.assertIn("Avertissement", message)
+        self.assertIn("format invalide", message)
+
+    def test_pull_secrets_ignores_trailing_newline_name_cleanly(self) -> None:
+        """La boucle pull avec nom se terminant par \n ignore le nom (format invalide)."""
+        client = MagicMock()
+        with patch("heimdall.cli.vault_client.typer.echo") as mock_echo:
+            res = _pull_secrets_from_vault(client, "demo", "dev", ["AB\n"])
+        self.assertEqual(res, {})
+        message = mock_echo.call_args.args[0]
+        self.assertIn("Avertissement", message)
+        self.assertIn("format invalide", message)
+        client.get_secret.assert_not_called()
+
+    def test_validate_requested_names_rejects_trailing_newline_and_non_str(self) -> None:
+        """_validate_requested_names refuse 'AB\n' et les non-str en Exit(1) sans TypeError."""
+        with self.assertRaises(Exit) as ctx:
+            _validate_requested_names(["AB\n"])
+        self.assertEqual(ctx.exception.exit_code, 1)
+
+        with self.assertRaises(Exit) as ctx:
+            _validate_requested_names([123])  # type: ignore[list-item]
+        self.assertEqual(ctx.exception.exit_code, 1)
 
     def test_pull_rejects_newline_in_secret_value(self) -> None:
         """Refus strict d'écrire un secret contenant un saut de ligne dans .env (§HIGH 2)."""

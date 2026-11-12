@@ -43,6 +43,9 @@ _GRAMMAR_CASES: tuple[object, ...] = (
     "APPÉ",
     "A\nB",
     "A\tB",
+    "AB\n",
+    "AB\r\n",
+    "AB\r",
     " APP",
     "APP ",
     "A" * 65,
@@ -69,6 +72,24 @@ def test_grammars_agree_everywhere(value: object) -> None:
         _accepts(_VAULT_PATTERN, value),
     }
     assert results in ({True}, {False})
+
+
+def test_fullmatch_strictly_rejects_trailing_newline_everywhere() -> None:
+    """Démontre que fullmatch() est requis : match() avec $ accepterait 'AB\\n'."""
+    # .match() avec motif terminant par $ tolère le \n final en Python :
+    assert _VAULT_CLI_PATTERN.match("AB\n") is not None
+    # Mais tous les call-sites utilisent fullmatch() : refus strict de \n final
+    for pattern in (
+        naming_module._VARIABLE,
+        _TEMPLATES_VARIABLE,
+        _REVIEW_VARIABLE,
+        _VAULT_CLI_PATTERN,
+        _VAULT_PATTERN,
+    ):
+        assert pattern.fullmatch("AB\n") is None
+        assert pattern.fullmatch("AB\r\n") is None
+    with pytest.raises(TemplateError):
+        validate_variable_name("AB\n")
 
 
 @pytest.mark.parametrize(

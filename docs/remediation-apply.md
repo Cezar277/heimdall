@@ -60,7 +60,8 @@ undo_apply(Path("dépôt"), receipt)  # restaure la sauvegarde
 - **Garde Git et nettoyage obligatoire** : `apply_replacement` contrôle à
   l'exécution le statut Git de `<fichier>.bak` via `is_git_tracked` et
   `is_git_ignored` (politique alignée sur `heimdall vault pull --backup`) :
-  avertissement immédiat sur `stderr` si le `.bak` est suivi par Git, s'il
+  avertissement immédiat sur `stderr` (mentionnant le chemin relatif, sans
+  divulguer le layout absolu du filesystem) si le `.bak` est suivi par Git, s'il
   n'est pas ignoré ou si le statut est indéterminé, sans écrire de règle
   `.gitignore` silencieuse. Avant tout commit, supprimer les `.bak` créés (ou
   `undo_apply`, puis suppression) et vérifier `git status` ; ne jamais

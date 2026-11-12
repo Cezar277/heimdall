@@ -103,9 +103,11 @@ def _read_current_secure(path: Path) -> tuple[str, int]:
     return text, stat.S_IMODE(status.st_mode)
 
 
-def _check_backup_git_status(backup: Path) -> None:
+def _check_backup_git_status(backup: Path, relative_name: str) -> None:
     """Avertit si la sauvegarde .bak contenant un secret risque d'être committée.
 
+    Le message n'affiche que le chemin relatif (aligné sur AppliedPatch.backup,
+    sans divulgation de layout FS local absolu).
     Aligné sur la politique de sécurité de ``heimdall vault pull --backup`` :
     - Fichier suivi par Git : avertissement fort pour éviter la fuite de secrets.
     - Fichier ignoré (.gitignore) : rien à signaler.
@@ -115,8 +117,8 @@ def _check_backup_git_status(backup: Path) -> None:
     """
     if is_git_tracked(backup):
         msg = (
-            f"ATTENTION : Le fichier {backup} est suivi par Git ! "
-            f"Exécutez 'git rm --cached {backup}' et ajoutez-le à .gitignore "
+            f"ATTENTION : Le fichier {relative_name} est suivi par Git ! "
+            f"Exécutez 'git rm --cached {relative_name}' et ajoutez-le à .gitignore "
             "pour éviter toute fuite."
         )
         sys.stderr.write(msg + "\n")
@@ -125,7 +127,7 @@ def _check_backup_git_status(backup: Path) -> None:
         pass
     elif _get_git_toplevel(backup) is None:
         msg = (
-            f"Avertissement : statut Git indéterminé pour '{backup}' "
+            f"Avertissement : statut Git indéterminé pour '{relative_name}' "
             "(hors dépôt ou git indisponible) : impossible de vérifier "
             "qu'il ne sera pas committé. Ajoutez-le à .gitignore et "
             "vérifiez avec 'git status'."
@@ -134,8 +136,8 @@ def _check_backup_git_status(backup: Path) -> None:
         warnings.warn(msg, UserWarning, stacklevel=3)
     else:
         msg = (
-            f"Avertissement : Le fichier {backup} n'est pas ignoré par Git. "
-            f"Pensez à ajouter '{backup}' dans .gitignore."
+            f"Avertissement : Le fichier {relative_name} n'est pas ignoré par Git. "
+            f"Pensez à ajouter '{relative_name}' dans .gitignore."
         )
         sys.stderr.write(msg + "\n")
         warnings.warn(msg, UserWarning, stacklevel=3)
@@ -168,7 +170,8 @@ def apply_replacement(root: Path, plan: ReplacementPlan) -> AppliedPatch:
             raise ApplyError from None
         if backup is None:
             raise ApplyError
-        _check_backup_git_status(backup)
+        backup_rel = f"{confined.relative}.bak"
+        _check_backup_git_status(backup, backup_rel)
         try:
             write_file_atomic(confined.absolute, plan.after, mode=mode)
         except ValueError:
@@ -179,7 +182,7 @@ def apply_replacement(root: Path, plan: ReplacementPlan) -> AppliedPatch:
         raise ApplyError from None
     return AppliedPatch(
         file=confined.relative,
-        backup=f"{confined.relative}.bak",
+        backup=backup_rel,
         mode=mode,
         after=plan.after,
     )

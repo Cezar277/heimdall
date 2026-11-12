@@ -63,8 +63,6 @@ def preview_name(name: object) -> str:
     return name[:32] if isinstance(name, str) else type(name).__name__
 
 
-_preview_name = preview_name
-
 # Denylist robuste : source unique = heimdall.remediation.naming
 # (importée ci-dessus ; mêmes objets, pas de copie qui divergerait).
 _MAX_SECRETS_PER_PULL: Final[int] = 1024
@@ -155,11 +153,11 @@ def _validate_project_and_env(project: str | None, env: str) -> str:
     except VaultClientError as exc:
         typer.echo(f"Erreur de configuration : {exc}", err=True)
         raise typer.Exit(code=2) from None
-    if not _PROJECT_ID_PATTERN.match(proj):
-        typer.echo(f"Identifiant de projet invalide : {proj[:32]!r}", err=True)
+    if not _PROJECT_ID_PATTERN.fullmatch(proj):
+        typer.echo(f"Identifiant de projet invalide : {preview_name(proj)!r}", err=True)
         raise typer.Exit(code=2)
-    if not _ENV_ID_PATTERN.match(env):
-        typer.echo(f"Identifiant d'environnement invalide : {env[:32]!r}", err=True)
+    if not _ENV_ID_PATTERN.fullmatch(env):
+        typer.echo(f"Identifiant d'environnement invalide : {preview_name(env)!r}", err=True)
         raise typer.Exit(code=2)
     return proj
 
@@ -176,9 +174,9 @@ def _validate_requested_names(names: list[str] | None) -> None:
     if not names:
         return
     for name in names:
-        if not _SECRET_NAME_PATTERN.match(name):
+        if not isinstance(name, str) or not _SECRET_NAME_PATTERN.fullmatch(name):
             typer.echo(
-                f"Erreur : nom de secret invalide demandé : {name[:32]!r} "
+                f"Erreur : nom de secret invalide demandé : {preview_name(name)!r} "
                 "(format requis : ^[A-Z][A-Z0-9_]{1,63}$).",
                 err=True,
             )
@@ -240,7 +238,7 @@ def _filter_secrets(
                 err=True,
             )
             raise typer.Exit(code=2)
-        if not isinstance(key, str) or not _SECRET_NAME_PATTERN.match(key):
+        if not isinstance(key, str) or not _SECRET_NAME_PATTERN.fullmatch(key):
             typer.echo(
                 f"Avertissement : nom de secret ignoré (format invalide) : {preview_name(key)!r}",
                 err=True,
@@ -307,9 +305,9 @@ def _push_single_secret(
         # L'identifiant a déjà été validé en amont (patterns CLI) : cette
         # branche est de la défense en profondeur. La valeur n'est jamais
         # reflétée (message statique, invariant 8).
-        if not _SECRET_NAME_PATTERN.match(name):
+        if not isinstance(name, str) or not _SECRET_NAME_PATTERN.fullmatch(name):
             typer.echo(
-                f"Erreur : nom de secret invalide : {name[:32]!r} "
+                f"Erreur : nom de secret invalide : {preview_name(name)!r} "
                 "(format requis : ^[A-Z][A-Z0-9_]{1,63}$).",
                 err=True,
             )
@@ -514,7 +512,7 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
                 err=True,
             )
             raise typer.Exit(code=1)
-        if not isinstance(name, str) or not _SECRET_NAME_PATTERN.match(name):
+        if not isinstance(name, str) or not _SECRET_NAME_PATTERN.fullmatch(name):
             typer.echo(
                 f"Avertissement : nom de secret ignoré (format invalide) : {preview_name(name)!r}",
                 err=True,

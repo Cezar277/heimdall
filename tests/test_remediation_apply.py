@@ -254,9 +254,8 @@ def test_apply_backup_warns_when_bak_tracked_by_git(
     receipt = apply_replacement(tmp_path, plan)
     assert isinstance(receipt, AppliedPatch)
     err = capsys.readouterr().err
-    assert "ATTENTION : Le fichier" in err
-    assert "est suivi par Git !" in err
-    assert "app.py.bak" in err
+    assert "ATTENTION : Le fichier app.py.bak est suivi par Git !" in err
+    assert str(tmp_path) not in err
 
 
 def test_apply_backup_quiet_when_ignored(
@@ -278,7 +277,7 @@ def test_apply_backup_quiet_when_ignored(
 def test_apply_backup_warns_indeterminate_git_status(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Hors dépôt Git, un avertissement de statut indéterminé est émis."""
+    """Hors dépôt Git, un avertissement de statut indéterminé relatif est émis."""
     target = tmp_path / "app.py"
     source = f'KEY = "{SECRET}"\n'
     _write(target, source)
@@ -287,5 +286,5 @@ def test_apply_backup_warns_indeterminate_git_status(
     receipt = apply_replacement(tmp_path, plan)
     assert isinstance(receipt, AppliedPatch)
     err = capsys.readouterr().err
-    assert "Avertissement : statut Git indéterminé pour" in err
-    assert "app.py.bak" in err
+    assert "Avertissement : statut Git indéterminé pour 'app.py.bak'" in err
+    assert str(tmp_path) not in err
