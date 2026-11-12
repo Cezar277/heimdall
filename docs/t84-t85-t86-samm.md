@@ -19,9 +19,9 @@ tests), parent [#30](https://github.com/Cezar277/heimdall/issues/30).
 
 Les références ci-dessous sont des **permaliens GitHub épinglés au SHA du
 commit d'implémentation**
-[`30fd0b06686e52034375b125a21cc84d9ade62db`](https://github.com/Cezar277/heimdall/commit/30fd0b06686e52034375b125a21cc84d9ade62db),
+[`1692ead9101994b21460adbb0657461b60d49b24`](https://github.com/Cezar277/heimdall/commit/1692ead9101994b21460adbb0657461b60d49b24),
 jamais à une branche. Base des liens :
-`https://github.com/Cezar277/heimdall/tree/30fd0b06686e52034375b125a21cc84d9ade62db/`
+`https://github.com/Cezar277/heimdall/tree/1692ead9101994b21460adbb0657461b60d49b24/`
 
 ## T30.2 — Validation du nom de variable (#84)
 
@@ -37,10 +37,10 @@ jamais à une branche. Base des liens :
 | Exigence / menace | Implémentation | Preuve hors ligne |
 | --- | --- | --- |
 | Aucun fichier à moitié écrit : temporaire + `fsync` + `os.replace` atomique (réutilise `vault.atomic.write_file_atomic`, jamais recopié) | [`apply.py#L176`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L176) (`write_file_atomic`) | `test_apply_leaves_no_temp_or_partial_file_on_write_error` (`os.replace` simulé en panne : original intact, aucun `.tmp.*` résiduel) |
-| Snapshot revérifié avant écriture (fichier modifié depuis le plan → refus, pas d'écrasement) | [`apply.py#L165`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L165) (`apply_replacement`, comparaison `current != plan.before`) | `test_apply_refuses_stale_snapshot`, `test_apply_refuses_missing_file`, `test_apply_refuses_manual_plan` |
-| Sauvegarde préalable (`<fichier>.bak`, mode `0600` car elle contient le secret) + garde Git runtime + annulation | [`apply.py#L168`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L168) (`backup_file`), [`#L106`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L106) (`_check_backup_git_status` via `is_git_tracked`/`is_git_ignored`), [`#L191`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L191) (`undo_apply`, contrôle snapshot inverse) | `test_apply_patches_and_preserves_mode_and_backup`, `test_apply_backup_warns_*`, `test_undo_restores_backup_and_second_undo_fails`, `test_undo_refuses_*` |
+| Snapshot revérifié avant écriture (fichier modifié depuis le plan → refus, pas d'écrasement) | [`apply.py#L164-L166`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L164-L166) (`apply_replacement`, comparaison `current != plan.before`) | `test_apply_refuses_stale_snapshot`, `test_apply_refuses_missing_file`, `test_apply_refuses_manual_plan` |
+| Sauvegarde préalable (`<fichier>.bak`, mode `0600` car elle contient le secret) + garde Git runtime + annulation | [`apply.py#L168`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L168) (`backup_file`), [`#L106`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L106) / [`#L174`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L174) (`_check_backup_git_status` via `is_git_tracked`/`is_git_ignored`), [`#L191`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L191) et [`#L208-L211`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L208-L211) (`undo_apply`, contrôles snapshot inverse et mode) | `test_apply_patches_and_preserves_mode_and_backup`, `test_apply_backup_warns_*`, `test_undo_restores_backup_and_second_undo_fails`, `test_undo_refuses_*` |
 | Permissions d'origine conservées (pas le `0600` des secrets) | [`apply.py#L71`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L71) (`_read_current_secure` lit le mode ; `write_file_atomic(..., mode=mode)`) | `test_apply_patches_and_preserves_mode_and_backup` (`0o640` conservé, sauvegarde en `0600`) |
-| Erreurs statiques sans reflet (`ApplyError` unique) ; `repr()` sans secret | [`apply.py#L53`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L53) (`ApplyError`), [`#L61`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L61) (`AppliedPatch`, `after` en `repr=False`) | `SECRET not in repr(receipt)` dans les tests d'acceptation, `test_apply_rejects_bad_types` |
+| Erreurs statiques sans reflet (`ApplyError` unique) ; `repr()` sans secret | [`apply.py#L53`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L53) (`ApplyError`), [`#L61-L68`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/apply.py#L61-L68) (`AppliedPatch`, `after` en `repr=False`), [`templates.py#L191-L198`](https://github.com/Cezar277/heimdall/blob/1692ead9101994b21460adbb0657461b60d49b24/heimdall/remediation/templates.py#L191-L198) (`ReplacementPlan.__repr__` sans secret) | `SECRET not in repr(receipt)` dans les tests d'acceptation, `test_apply_rejects_bad_types` |
 
 ## T30.4 — Garde de chemin et tests (#86)
 
@@ -75,3 +75,17 @@ n'est modifié.
   échoue sur le contrôle snapshot plutôt que de détruire une preuve).
 - Dépassement de `MAX_VARIABLE_CHARS` par suffixe `_N` : refus
   (`TemplateError`), jamais de troncature silencieuse.
+
+## Procédure de re-pin au merge
+
+Lors du merge de la PR #222 sur `main`, les commits intermédiaires peuvent être squashés.
+Pour garantir la pérennité et la vérifiabilité des preuves SAMM sans aucun lien mort :
+1. Ré-épingler la fiche sur le SHA final :
+   ```sh
+   python scripts/repin_samm.py --fiche docs/t84-t85-t86-samm.md --sha <sha-final>
+   ```
+2. Contrôler mécaniquement l'intégrité des permaliens :
+   ```sh
+   python scripts/repin_samm.py --fiche docs/t84-t85-t86-samm.md --check
+   ```
+
