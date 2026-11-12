@@ -282,15 +282,28 @@ def _parse_example_lines(content: str) -> tuple[set[str], list[str]]:
 
 def _pattern_matches_target(rule: str, target: str) -> bool:
     """Vérifie si une règle positive simple de gitignore correspond à la cible."""
+    # Match exact : target ou /target (ex. config/.env ou /config/.env)
     if rule in (target, f"/{target}"):
         return True
+
     target_name = Path(target).name
-    if rule in (target_name, f"/{target_name}"):
-        return True
-    if target_name == ".env" or target_name.endswith(".env"):
-        if rule in ("*.env", ".env*", "/*.env*", "/*.env"):
-            return True
-    return False
+    is_env_like = target_name == ".env" or target_name.endswith(".env")
+
+    # Règle ancrée à la racine (/...) qui ne correspond pas exactement à target :
+    # elle ne couvre JAMAIS une cible en sous-dossier (sémantique gitignore réelle).
+    if rule.startswith("/"):
+        if "/" in target.strip("/"):
+            return False
+        # Cible à la racine (ex. ".env") : /.env, /*.env, /*.env*
+        return is_env_like and rule in (
+            f"/{target_name}",
+            f"/{target_name}*",
+            "/*.env",
+            "/*.env*",
+        )
+
+    # Règle non-ancrée (sans slash de tête) :
+    return rule == target_name or (is_env_like and rule in ("*.env", ".env*"))
 
 
 def _is_env_covered_in_gitignore(content: str, pattern: str = ".env") -> bool:
@@ -508,8 +521,16 @@ def update_env_file(  # noqa: PLR0912, PLR0915
 
     merged_secrets.update(validated_dict)
 
+    # Vérification stricte du volume cumulé total après fusion (anti-DoS)
+    total_merged_chars = sum(len(v) for v in merged_secrets.values())
+    if total_merged_chars > _MAX_TOTAL_SECRET_CHARS:
+        raise EnvRemediationError("volume total des secrets supérieur à 1 Mio")
+
     lines = [f"{k}={format_env_value(v)}" for k, v in merged_secrets.items()]
     content = "\n".join(lines) + "\n"
+
+    if len(content.encode("utf-8")) > _MAX_READ_BYTES:
+        raise EnvRemediationError("volume total des secrets supérieur à 1 Mio")
 
     try:
         write_file_atomic(confined.absolute, content, mode=_SECURE_ENV_MODE)
@@ -678,6 +699,10 @@ def remediate_environment(  # noqa: PLR0913
     if not isinstance(gitignore_path, str):
         raise EnvRemediationError("chemin gitignore invalide (non-str)")
 
+    confined_env = _confine_and_check_no_symlink(root, env_path, ".env")
+    confined_example = _confine_and_check_no_symlink(root, example_path, ".env.example")
+    confined_gitignore = _confine_and_check_no_symlink(root, gitignore_path, ".gitignore")
+
     # 1. Mise à jour de .env.example (valeurs vides obligatoires)
     added_to_example = update_env_example(root, secrets, example_path=example_path)
 
@@ -685,7 +710,6 @@ def remediate_environment(  # noqa: PLR0913
     update_env_file(root, secrets, env_path=env_path)
 
     # 3. Ajout de .env au .gitignore si absent (idempotent)
-    confined_env = confine(root, env_path)
     gitignore_updated = ensure_gitignore_ignores_env(
         root, gitignore_path=gitignore_path, pattern=confined_env.relative
     )
@@ -697,8 +721,6 @@ def remediate_environment(  # noqa: PLR0913
         warnings.warn(warn, UserWarning, stacklevel=2)
 
     all_names = _extract_and_validate_names(secrets)
-    confined_example = confine(root, example_path)
-    confined_gitignore = confine(root, gitignore_path)
 
     return EnvRemediationReceipt(
         env_file=confined_env.relative,

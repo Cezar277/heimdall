@@ -659,3 +659,59 @@ def test_env_path_with_spaces_properly_quoted_in_git_rm_command(git_repo: Path) 
     assert cmd == "git rm --cached 'a b/.env'"
     assert warn is not None
     assert "'a b/.env'" in warn
+
+
+def test_gitignore_anchored_wildcard_does_not_cover_subdir_env(git_repo: Path) -> None:
+    """.gitignore avec /*.env ne couvre pas config/.env : ensure ajoute la règle."""
+    gitignore = git_repo / ".gitignore"
+    gitignore.write_text("/*.env\n", encoding="utf-8")
+    config_dir = git_repo / "config"
+    config_dir.mkdir()
+    config_env = config_dir / ".env"
+    config_env.write_text("API_KEY=val\n", encoding="utf-8")
+
+    # check_env_git_status doit détecter que config/.env n'est pas ignoré par /*.env
+    tracked, ignored, warn, cmd = check_env_git_status(git_repo, env_path="config/.env")
+    assert ignored is False
+
+    # ensure_gitignore_ignores_env doit détecter l'absence de couverture et ajouter config/.env
+    updated = ensure_gitignore_ignores_env(git_repo, pattern="config/.env")
+    assert updated is True
+
+    # Le motif config/.env est maintenant présent
+    content = gitignore.read_text(encoding="utf-8")
+    assert "config/.env" in content
+
+
+def test_remediate_environment_rejects_path_traversal_and_symlink_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """remediate_environment avec traversée ou symlink lève EnvRemediationError."""
+    # Chemin traversant
+    with pytest.raises(EnvRemediationError):
+        remediate_environment(tmp_path, {"API_KEY": "secret"}, env_path="../evil")
+
+    with pytest.raises(EnvRemediationError):
+        remediate_environment(tmp_path, {"API_KEY": "secret"}, example_path="../evil.example")
+
+    with pytest.raises(EnvRemediationError):
+        remediate_environment(tmp_path, {"API_KEY": "secret"}, gitignore_path="../evil.gitignore")
+
+    # Symlink sur .env
+    real_file = tmp_path / "real_file.txt"
+    real_file.write_text("foo", encoding="utf-8")
+    sym_env = tmp_path / ".env"
+    sym_env.symlink_to(real_file)
+    with pytest.raises(EnvRemediationError, match="lien symbolique"):
+        remediate_environment(tmp_path, {"API_KEY": "secret"})
+
+
+def test_env_file_cumulative_volume_limit_enforced_on_merge(tmp_path: Path) -> None:
+    """.env existant de 600 Ko + nouveaux secrets de 600 Ko : lève EnvRemediationError."""
+    env_file = tmp_path / ".env"
+    chunk_existing = "x" * 600_000
+    env_file.write_text(f"EXISTING_SECRET={chunk_existing}\n", encoding="utf-8")
+
+    chunk_new = "y" * 600_000
+    with pytest.raises(EnvRemediationError, match="volume total des secrets supérieur à 1 Mio"):
+        update_env_file(tmp_path, {"NEW_SECRET": chunk_new})
