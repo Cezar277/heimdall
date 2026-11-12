@@ -438,6 +438,7 @@ retourne 400.
 | --- | --- |
 | `vaulte -> rote` | 200 avec `previous_status: vaulte`, `status: rote` |
 | Transition interdite, réflexive ou cible inconnue | 400 `bad_request` statique |
+| Compare-and-set perdant (état changé sous nos pieds) | 400 `bad_request` statique |
 | Secret absent | 404 `not_found` |
 | Clé absente, invalide ou révoquée | 401 `unauthorized` |
 | Clé d'un autre projet | 403 `forbidden` |
@@ -451,23 +452,34 @@ absente) ; `GET .../state` continue d'exposer `status: rote` sans valeur.
 Chaque transition acceptée est journalisée dans la table SQLite
 `secret_transitions` (ou dans le journal borné du backend mémoire) avec
 `occurred_at`, `project_id`, `env`, `name`, `actor`, `previous_status` et
-`new_status`. L'acteur est l'identifiant interne de la clé authentifiée
-(`key_<32 hexadécimaux>`), normalisé strictement ; toute autre valeur devient
-`unknown`, donc une entrée arbitraire du client ne peut jamais être persistée.
-Le journal ne contient ni valeur de secret, ni empreinte, ni clé brute. La mise
-à jour de `secrets.status` et l'insertion du journal partagent la même
-transaction (`BEGIN IMMEDIATE`, compare-and-set sur l'ancien état) : deux
-transitions concurrentes ne peuvent pas réussir toutes les deux, et aucune
-transition acceptée ne peut manquer au journal. La table n'a pas de clé
-étrangère vers `secrets`, afin que l'historique reste consultable après
-suppression ; sa rétention est bornée à `MAX_SECRET_TRANSITIONS` (10 000
-entrées les plus récentes). Aucune route HTTP n'expose ce journal : il est
-réservé aux stores et aux outils internes.
+`new_status`. L'horodatage est toujours généré côté serveur : aucun appelant ne
+peut fournir `occurred_at` ni forger la chronologie. L'acteur est l'identifiant
+interne de la clé authentifiée (`key_<32 hexadécimaux>`), normalisé
+strictement ; toute autre valeur devient `unknown`, donc une entrée arbitraire
+du client ne peut jamais être persistée. Le journal ne contient ni valeur de
+secret, ni empreinte, ni clé brute. La mise à jour de `secrets.status` et
+l'insertion du journal partagent la même transaction (`BEGIN IMMEDIATE`,
+compare-and-set sur l'ancien état) : deux transitions concurrentes ne peuvent
+pas réussir toutes les deux, et aucune transition acceptée ne peut manquer au
+journal. Un compare-and-set perdant (`rowcount != 1`) lève
+`TransitionConcurrencyError`, convertie en 400 statique sans fuite. La table
+n'a pas de clé étrangère vers `secrets`, afin que l'historique reste
+consultable après suppression ; sa rétention est bornée **par projet** à
+`MAX_SECRET_TRANSITIONS` (10 000 entrées les plus récentes). Une inondation
+d'un projet ne peut donc pas évincer le journal d'un autre projet, et chaque
+purge locale émet un avertissement d'exploitation. Aucune route HTTP n'expose
+ce journal : il est réservé aux stores et aux outils internes.
 
-Preuves : `tests/test_vault_transitions_api.py` (deux backends, authentification,
-matrice, terminalité, journal, atomicité, concurrence, rétention, absence de
-valeur/empreinte), `tests/contracts/test_vault_openapi.py` (contrat) et
-`tests/test_vault_integration_testclient.py` (schéma runtime).
+La lecture d'une valeur (`GET /api/v1/secrets/{project}/{env}/{name}`)
+canonicalise le statut persisté avant la garde : un statut corrompu (casse,
+espaces, état inconnu) retourne 404, comme `rote`, sans jamais restituer
+l'ancienne valeur.
+
+Preuves : `tests/test_vault_transitions_api.py` (deux backends,
+authentification, matrice, terminalité, journal, atomicité, concurrence, CAS
+perdant, horodatage serveur, isolation et rétention par projet, statut corrompu,
+absence de valeur/empreinte), `tests/contracts/test_vault_openapi.py` (contrat)
+et `tests/test_vault_integration_testclient.py` (schéma runtime).
 
 ## Rejeu de requête (#114)
 

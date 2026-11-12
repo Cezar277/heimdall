@@ -159,19 +159,27 @@ contrat des états persistés :
   ni empreinte, ni acteur n'est exposé. Le schéma OpenAPI `SecretStatus`
   (`vaulte`/`rote`) reste inchangé ; les cinq états sont déclarés séparément
   dans `SecretLifecycleState` pour le corps de requête.
-- **Journal** : table `secret_transitions` (SQLite) et `deque` bornée (mémoire)
-  avec `occurred_at`, identité, acteur, `previous_status`, `new_status`.
-  L'UPDATE conditionnel de `secrets.status` et l'INSERT du journal partagent la
-  même transaction `BEGIN IMMEDIATE` : une transition acceptée ne peut pas
-  manquer au journal, et deux transitions concurrentes ne peuvent pas réussir
-  toutes les deux. L'acteur est normalisé sur `^key_[0-9a-f]{32}$` ; toute
-  autre valeur devient `unknown`, donc aucune donnée arbitraire ou sensible
-  n'est persistée. La rétention est bornée à `MAX_SECRET_TRANSITIONS`
-  (10 000). L'absence de clé étrangère vers `secrets` conserve l'historique
-  après suppression. Aucune route HTTP n'expose le journal.
+- **Journal** : table `secret_transitions` (SQLite) et journal par projet
+  (mémoire) avec `occurred_at`, identité, acteur, `previous_status`,
+  `new_status`. L'horodatage est toujours généré côté serveur par
+  `get_iso_timestamp()` ; aucun paramètre d'API ne permet de le fournir ou de
+  le forger. L'UPDATE conditionnel de `secrets.status` et l'INSERT du journal
+  partagent la même transaction `BEGIN IMMEDIATE` : une transition acceptée ne
+  peut pas manquer au journal, et deux transitions concurrentes ne peuvent pas
+  réussir toutes les deux. Un compare-and-set perdant (`rowcount != 1`) lève
+  `TransitionConcurrencyError`, mappée en 400 statique par la route, comme les
+  transitions interdites. L'acteur est normalisé sur `^key_[0-9a-f]{32}$` ;
+  toute autre valeur devient `unknown`, donc aucune donnée arbitraire ou
+  sensible n'est persistée. La rétention est bornée **par projet** à
+  `MAX_SECRET_TRANSITIONS` (10 000) : une inondation d'un projet ne peut pas
+  évincer le journal d'un autre, et chaque purge locale émet un avertissement
+  d'exploitation. L'absence de clé étrangère vers `secrets` conserve
+  l'historique après suppression. Aucune route HTTP n'expose le journal.
 - **Après `rote`** : l'état est terminal (toute transition retourne 400). La
   lecture de l'ancienne valeur via `GET /api/v1/secrets/{project}/{env}/{name}`
-  retourne 404 ; `GET .../state` continue d'exposer `rote` sans valeur.
+  retourne 404 ; `GET .../state` continue d'exposer `rote` sans valeur. Le
+  statut lu est canonicalisé avant la garde : une valeur corrompue en base
+  (casse, espaces, état inconnu) retourne 404 sans restituer la valeur.
 
 La vérification exhaustive des 20 transitions interdites contre l'API HTTP
 reste portée par #118 ; #117 pose la route, l'application de la matrice et le
