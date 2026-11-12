@@ -259,6 +259,38 @@ class SecretHmacCryptoTests(TestCase):
         with self.assertRaises(ValueError):
             verify_secret_hmac(key, valeur, expected, aad=b"")
 
+    def test_verify_secret_hmac_and_cipher_matching_with_corrupted_fingerprint(self) -> None:
+        """verify_secret_hmac et is_secret_value_matching renvoient False sur empreinte corrompue.
+
+        Tranché (décision d'architecture) : longueur != 64, majuscules, non-hex ou types invalides
+        retournent False sans exception (prédicat booléen pur).
+        """
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        val = "test-secret-value-check"
+        valid_fp = cipher.compute_secret_hmac(val)
+
+        corrupted_cases = [
+            "invalid_len",
+            "a" * 63,
+            "a" * 65,
+            "",
+            valid_fp.upper(),  # majuscules
+            "g" * 64,          # non-hex minuscules
+            "Z" * 64,          # non-hex majuscules
+            "0123456789abcdef" * 3 + "xyz!",  # symboles hors hex
+            12345,             # non-str int
+            None,              # None
+            b"0" * 64,         # bytes
+        ]
+
+        for bad_fp in corrupted_cases:
+            with self.subTest(bad_fp=bad_fp):
+                self.assertFalse(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, val, bad_fp))  # type: ignore[arg-type]
+                self.assertFalse(cipher.verify_secret_hmac(val, bad_fp))  # type: ignore[arg-type]
+                self.assertFalse(cipher.is_secret_value_matching(val, bad_fp))  # type: ignore[arg-type]
+                aad = VaultCipher.aad("p", "prod", "S")
+                self.assertFalse(cipher.is_secret_value_matching(val, bad_fp, aad=aad))  # type: ignore[arg-type]
+
     def test_compute_secret_hmac_surrogate_unicode_error(self) -> None:
         """Une chaîne avec surrogate isolé non encodable lève ValueError générique."""
         with self.assertRaises(ValueError):
@@ -634,25 +666,140 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             self.assertEqual(len(sql_matches), 1)
             self.assertEqual(sql_matches[0]["name"], "LEGACY_SQL")
 
+    async def test_nfc_parity_creation_and_verification_memory_and_sqlite(self) -> None:
+        """Parité NFC création vs vérification (anti-faux négatif, Invariant 1).
+
+        Scénario bot : secret créé en forme décomposée (NFD ex. 'cafe\\u0301'),
+        recherche / vérification avec forme composée (NFC ex. 'caf\\u00e9'), et inversement.
+        L'empreinte et le déchiffrement doivent tous deux répondre True en mémoire et SQLite.
+        """
+        nfd_cafe = "cafe\u0301"
+        nfc_cafe = "caf\u00e9"
+        nfd_resume = "re\u0301sume\u0301"
+        nfc_resume = "résumé"
+
+        # 1. InMemorySecretStore
+        mem_cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        mem_store = InMemorySecretStore(cipher=mem_cipher)
+
+        # Création en NFD -> vérification en NFC
+        await mem_store.create("demo", "prod", "CAFE_NFD", nfd_cafe)
+        await mem_store.create("demo", "prod", "RESUME_NFD", nfd_resume)
+
+        self.assertTrue(
+            await mem_store.is_secret_value_matching("demo", "prod", "CAFE_NFD", nfc_cafe)
+        )
+        self.assertTrue(
+            await mem_store.is_secret_value_matching("demo", "prod", "RESUME_NFD", nfc_resume)
+        )
+        cafe_matches = await mem_store.find_secrets_matching_value("demo", nfc_cafe)
+        self.assertEqual({m["name"] for m in cafe_matches}, {"CAFE_NFD"})
+
+        # Création en NFC -> vérification en NFD
+        await mem_store.create("demo", "prod", "CAFE_NFC", nfc_cafe)
+        await mem_store.create("demo", "prod", "RESUME_NFC", nfc_resume)
+
+        self.assertTrue(
+            await mem_store.is_secret_value_matching("demo", "prod", "CAFE_NFC", nfd_cafe)
+        )
+        self.assertTrue(
+            await mem_store.is_secret_value_matching("demo", "prod", "RESUME_NFC", nfd_resume)
+        )
+        # find_secrets_matching_value trouve les deux variantes canoniques
+        all_cafe = await mem_store.find_secrets_matching_value("demo", nfd_cafe)
+        self.assertEqual({m["name"] for m in all_cafe}, {"CAFE_NFD", "CAFE_NFC"})
+
+        # 2. SqliteSecretStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            sql_store = SqliteSecretStore(db_path, sql_cipher)
+
+            # Création en NFD -> vérification en NFC
+            await sql_store.create("demo", "prod", "CAFE_NFD", nfd_cafe)
+            await sql_store.create("demo", "prod", "RESUME_NFD", nfd_resume)
+
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("demo", "prod", "CAFE_NFD", nfc_cafe)
+            )
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("demo", "prod", "RESUME_NFD", nfc_resume)
+            )
+            matches_sql_nfc = await sql_store.find_secrets_matching_value("demo", nfc_cafe)
+            self.assertEqual({m["name"] for m in matches_sql_nfc}, {"CAFE_NFD"})
+
+            # Création en NFC -> vérification en NFD
+            await sql_store.create("demo", "prod", "CAFE_NFC", nfc_cafe)
+            await sql_store.create("demo", "prod", "RESUME_NFC", nfc_resume)
+
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("demo", "prod", "CAFE_NFC", nfd_cafe)
+            )
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("demo", "prod", "RESUME_NFC", nfd_resume)
+            )
+            matches_sql_nfd = await sql_store.find_secrets_matching_value("demo", nfd_cafe)
+            self.assertEqual({m["name"] for m in matches_sql_nfd}, {"CAFE_NFD", "CAFE_NFC"})
+
     async def test_corrupted_fingerprint_in_database_handled_safely(self) -> None:
-        """Une empreinte corrompue en base bascule sur le repli sans planter."""
+        """Une empreinte corrompue bascule sur le repli déchiffrement sans faux négatif."""
+        corrupted_fps = [
+            "corrupted_non_hex_short_string",
+            "A" * 64,  # majuscules
+            "g" * 64,  # non-hex
+            "0" * 63,  # longueur 63
+            "0" * 65,  # longueur 65
+        ]
+
+        # 1. SqliteSecretStore
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "vault.db"
             cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
             store = SqliteSecretStore(db_path, cipher)
-            await store.create("p", "prod", "CORRUPT", "real_value")
 
-            with db_session(db_path) as conn:
-                conn.execute(
-                    "UPDATE secrets SET fingerprint = ? WHERE project_id = ? AND name = ?",
-                    ("corrupted_non_hex_short_string", "p", "CORRUPT"),
+            for i, bad_fp in enumerate(corrupted_fps):
+                name = f"CORRUPT_SQL_{i}"
+                await store.create("p", "prod", name, "real_value")
+                with db_session(db_path) as conn:
+                    conn.execute(
+                        "UPDATE secrets SET fingerprint = ? WHERE project_id = ? AND name = ?",
+                        (bad_fp, "p", name),
+                    )
+
+                # Avec la bonne valeur : repli déchiffrement répond True (anti-faux négatif)
+                self.assertTrue(
+                    await store.is_secret_value_matching("p", "prod", name, "real_value")
+                )
+                # Avec une mauvaise valeur : répond False
+                self.assertFalse(
+                    await store.is_secret_value_matching("p", "prod", name, "wrong_value")
                 )
 
-            self.assertTrue(
-                await store.is_secret_value_matching("p", "prod", "CORRUPT", "real_value")
-            )
             matches = await store.find_secrets_matching_value("p", "real_value")
-            self.assertEqual(len(matches), 1)
+            self.assertEqual(len(matches), len(corrupted_fps))
+            wrong_matches = await store.find_secrets_matching_value("p", "wrong_value")
+            self.assertEqual(len(wrong_matches), 0)
+
+        # 2. InMemorySecretStore (parité stricte)
+        mem_cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        mem_store = InMemorySecretStore(cipher=mem_cipher)
+        for i, bad_fp in enumerate(corrupted_fps):
+            name = f"CORRUPT_MEM_{i}"
+            await mem_store.create("p", "prod", name, "real_value")
+            async with mem_store._lock:
+                mem_store._secrets[("p", "prod", name)]["fingerprint"] = bad_fp
+
+            self.assertTrue(
+                await mem_store.is_secret_value_matching("p", "prod", name, "real_value")
+            )
+            self.assertFalse(
+                await mem_store.is_secret_value_matching("p", "prod", name, "wrong_value")
+            )
+
+        mem_matches = await mem_store.find_secrets_matching_value("p", "real_value")
+        self.assertEqual(len(mem_matches), len(corrupted_fps))
+        mem_wrong = await mem_store.find_secrets_matching_value("p", "wrong_value")
+        self.assertEqual(len(mem_wrong), 0)
 
     async def test_find_secrets_matching_value_returns_only_metadata(self) -> None:
         """find_secrets_matching_value ne retourne JAMAIS la valeur ni l'empreinte."""

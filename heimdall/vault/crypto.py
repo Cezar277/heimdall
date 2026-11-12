@@ -371,8 +371,20 @@ def verify_secret_hmac(
     sans jamais déchiffrer ni exposer l'empreinte au client.
     Laisse propager ValueError et TypeError en cas d'entrée invalide (clé faible,
     valeur vide ou AAD vide), parité avec ``compute_secret_hmac``.
+
+    Décision d'architecture (contrat de vérification booléenne) : si ``expected_hmac``
+    est malformée (longueur != 64, majuscules, caractères non-hexadécimaux ou type non str),
+    la fonction retourne ``False`` en tant que prédicat cryptographique sûr : aucune valeur
+    secrète ne peut correspondre à une empreinte invalide. À la différence des stores
+    (``InMemorySecretStore``, ``SqliteSecretStore``) qui disposent du ciphertext pour
+    opérer un repli transparent par déchiffrement en cas d'empreinte corrompue en base,
+    l'API directe du cipher opère sans accès au store et conclut à la non-correspondance.
     """
-    if not isinstance(expected_hmac, str) or len(expected_hmac) != _SHA256_HEX_LEN:
+    if (
+        not isinstance(expected_hmac, str)
+        or len(expected_hmac) != _SHA256_HEX_LEN
+        or not all(c in "0123456789abcdef" for c in expected_hmac)
+    ):
         return False
     computed = compute_secret_hmac(server_key, value, aad=aad)
     return constant_time_equal(computed, expected_hmac)
@@ -1047,6 +1059,13 @@ class VaultCipher:
         que la détection reste valide et immunisée contre la rotation de KEK.
         Si un AAD est fourni, la vérification est liée à ce seul AAD (aucun repli
         vers une empreinte brute non liée).
+
+        Décision d'architecture (contrat de vérification booléenne) : si
+        ``expected_fingerprint`` est malformée (longueur != 64, majuscules,
+        caractères non-hexadécimaux ou type non str), la méthode retourne ``False``.
+        Une empreinte corrompue ne peut mathématiquement correspondre à aucun secret.
+        Pour les stores de données, le repli déchiffrement transparent s'applique
+        lors d'une altération en base afin d'interdire tout faux négatif (invariant 1).
         """
         if not isinstance(value, (str, bytes, bytearray)):
             raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
@@ -1061,6 +1080,7 @@ class VaultCipher:
         if (
             not isinstance(expected_fingerprint, str)
             or len(expected_fingerprint) != _SHA256_HEX_LEN
+            or not all(c in "0123456789abcdef" for c in expected_fingerprint)
         ):
             return False
         if aad is not None:

@@ -61,24 +61,27 @@ branche `116-t402-empreinte-hmac-avec-clé-serveur`. Cette fiche fournit les cou
 - [x] **Vérification HMAC fail-closed** : `verify_secret_hmac` propage `ValueError` et `TypeError` sur entrées invalides (clé trop courte, valeur vide, AAD vide), aligné sur `compute_secret_hmac` et `is_secret_value_matching` (aucun faux négatif masqué en `False`).
 - [x] **Support des octets bruts non-UTF8** : manipulation directe de `bytes` dans les stores et le cipher sans appel à `decode("utf-8")`, supprimant tout risque d'`UnicodeDecodeError` inattendue.
 - [x] **Continuité HMAC immédiate en rotation KEK** : `rotate_kek` refuse fail-closed immédiatement (`VaultCipherError`) si la clé HMAC change ou tente un basculement de mode sur store non vide (mémoire et SQLite sous transaction `_write_transaction`).
+- [x] **Parité Unicode NFC création / vérification** : normalisation canonique garantie à la création (`value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")`) pour `encrypt_envelope` et `fingerprint`, neutralisant tout risque de faux négatif silencieux lors de variations NFD/NFC (Invariant 1).
+- [x] **Décision d'architecture format d'empreinte attendue** : `verify_secret_hmac` et `is_secret_value_matching` renvoient `False` (prédicat booléen) sur format corrompu/non-hex/majuscule sans exception, tandis que les stores opèrent un repli déchiffrement transparent pour interdire tout faux négatif en cas de corruption de la base.
 
 ## 3. Preuve à garder pour le rapport
 
-Exécution de la suite complète du sous-ticket #116 (51 tests unitaires et d'intégration) :
+Exécution de la suite complète du sous-ticket #116 (53 tests unitaires et d'intégration) :
 
 ```sh
-poetry run pytest tests/test_vault_secret_hmac.py -v
+poetry run pytest tests/test_vault_secret_hmac.py -vv
 ```
 
 Extrait du journal de test :
 
 ```text
 ============================= test session starts ==============================
-platform linux -- Python 3.14.7, pytest-9.2.0, pluggy-1.6.0
+platform linux -- Python 3.14.7, pytest-9.2.0, pluggy-1.6.0 -- /home/epita/Documents/S7/heimdall/.venv/bin/python
+cachedir: .pytest_cache
 rootdir: /home/epita/Documents/S7/heimdall
 configfile: pyproject.toml
 plugins: cov-7.1.0, platformdirs-4.12.4, anyio-4.15.1
-collected 51 items
+collected 53 items
 
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_candidate_value_empty_parity_cipher PASSED [  1%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_secret_hmac_exact_formula PASSED [  3%]
@@ -88,16 +91,17 @@ tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_secret_hmac
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_secret_hmac_rejects_empty_aad_explicitly PASSED [ 11%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_secret_hmac_supports_nfc_canonicalization PASSED [ 13%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_secret_hmac_surrogate_unicode_error PASSED [ 15%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_secret_hmac_with_and_without_aad PASSED [ 17%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_find_secrets_by_fingerprint_validates_format PASSED [ 19%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_generate_server_hmac_key PASSED [ 21%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_is_secret_value_matching_rejects_non_string_bytes_types PASSED [ 23%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_normalize_server_hmac_key_rejects_subtle_weak_patterns PASSED [ 25%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_normalize_server_hmac_key_rejects_trivial_or_repetitive_keys PASSED [ 27%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_validate_server_hmac_key_rejects_overlong_keys PASSED [ 29%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_vault_cipher_factories_propagate_server_hmac_key_without_exposure PASSED [ 31%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_vault_cipher_methods PASSED [ 33%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_and_matching_empty_aad_parity PASSED [ 35%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_secret_hmac_with_and_without_aad PASSED [ 16%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_find_secrets_by_fingerprint_validates_format PASSED [ 18%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_generate_server_hmac_key PASSED [ 20%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_is_secret_value_matching_rejects_non_string_bytes_types PASSED [ 22%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_normalize_server_hmac_key_rejects_subtle_weak_patterns PASSED [ 24%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_normalize_server_hmac_key_rejects_trivial_or_repetitive_keys PASSED [ 26%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_validate_server_hmac_key_rejects_overlong_keys PASSED [ 28%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_vault_cipher_factories_propagate_server_hmac_key_without_exposure PASSED [ 30%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_vault_cipher_methods PASSED [ 32%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_and_matching_empty_aad_parity PASSED [ 33%]
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_and_cipher_matching_with_corrupted_fingerprint PASSED [ 35%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_constant_time PASSED [ 37%]
 tests/test_vault_secret_hmac.py::KeySeparationTests::test_server_hmac_key_matches_master_key_detects_collision PASSED [ 39%]
 tests/test_vault_secret_hmac.py::KeySeparationTests::test_vault_cipher_default_fingerprint_key_is_distinct_from_kek PASSED [ 41%]
@@ -105,34 +109,35 @@ tests/test_vault_secret_hmac.py::KeySeparationTests::test_vault_cipher_key_reuse
 tests/test_vault_secret_hmac.py::KeySeparationTests::test_vault_cipher_rejects_server_hmac_key_equal_to_kek PASSED [ 45%]
 tests/test_vault_secret_hmac.py::KeySeparationTests::test_vault_cipher_server_hmac_key_property_removed PASSED [ 47%]
 tests/test_vault_secret_hmac.py::KeySeparationTests::test_vault_settings_enforces_key_separation PASSED [ 49%]
-tests/test_vault_secret_hmac.py::KeySeparationTests::test_vault_settings_rejects_encoded_forms_of_keys PASSED [ 51%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_candidate_value_empty_parity_stores PASSED [ 53%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_cipher_is_secret_value_matching_in_derived_mode_raises_error PASSED [ 55%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_cipher_is_secret_value_matching_rejects_raw_fp_when_aad_is_provided PASSED [ 57%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_clear_resets_canary_and_allows_recreation_under_new_explicit_key PASSED [ 59%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_corrupted_fingerprint_in_database_handled_safely PASSED [ 61%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_database_find_secrets_by_fingerprint_uses_index PASSED [ 63%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_derived_to_explicit_mode_transition_fails_closed_without_migration PASSED [ 65%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_divergent_canary_during_creation_raises_vault_cipher_error_and_rolls_back PASSED [ 67%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_explicit_server_hmac_key_change_fails_closed PASSED [ 69%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_fails_closed_on_key_change_or_derived_mode PASSED [ 71%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_matching_value_returns_only_metadata PASSED [ 73%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_in_memory_create_with_changed_server_hmac_key_fails_closed PASSED [ 75%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_in_memory_store_detects_leaked_production_value PASSED [ 77%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_leak_detection_post_kek_rotation_in_derived_mode_fails_closed PASSED [ 79%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_leak_detection_post_kek_rotation_in_explicit_mode_remains_true PASSED [ 81%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_legacy_secrets_without_fingerprint_parity_sqlite_and_memory PASSED [ 83%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_raw_non_utf8_bytes_leak_detection_parity PASSED [ 85%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_rotate_kek_with_divergent_hmac_key_fails_closed_immediately PASSED [ 87%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_sqlite_create_with_changed_server_hmac_key_fails_closed PASSED [ 89%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_sqlite_store_detects_leaked_production_value PASSED [ 91%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_stores_reject_empty_identity_triplet PASSED [ 93%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_stores_reject_invalid_candidate_value_types PASSED [ 95%]
-tests/test_vault_secret_hmac.py::FingerprintNeverReturnedToClientTests::test_api_responses_never_expose_fingerprint PASSED [ 97%]
-tests/test_vault_secret_hmac.py::FingerprintNeverReturnedToClientTests::test_no_http_route_exposes_fingerprint_or_leak_detection PASSED [ 99%]
+tests/test_vault_secret_hmac.py::KeySeparationTests::test_vault_settings_rejects_encoded_forms_of_keys PASSED [ 50%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_candidate_value_empty_parity_stores PASSED [ 52%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_cipher_is_secret_value_matching_in_derived_mode_raises_error PASSED [ 54%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_cipher_is_secret_value_matching_rejects_raw_fp_when_aad_is_provided PASSED [ 56%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_clear_resets_canary_and_allows_recreation_under_new_explicit_key PASSED [ 58%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_corrupted_fingerprint_in_database_handled_safely PASSED [ 60%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_database_find_secrets_by_fingerprint_uses_index PASSED [ 62%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_derived_to_explicit_mode_transition_fails_closed_without_migration PASSED [ 64%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_divergent_canary_during_creation_raises_vault_cipher_error_and_rolls_back PASSED [ 66%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_explicit_server_hmac_key_change_fails_closed PASSED [ 67%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_fails_closed_on_key_change_or_derived_mode PASSED [ 69%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_matching_value_returns_only_metadata PASSED [ 71%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_in_memory_create_with_changed_server_hmac_key_fails_closed PASSED [ 73%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_in_memory_store_detects_leaked_production_value PASSED [ 75%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_leak_detection_post_kek_rotation_in_derived_mode_fails_closed PASSED [ 77%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_leak_detection_post_kek_rotation_in_explicit_mode_remains_true PASSED [ 79%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_legacy_secrets_without_fingerprint_parity_sqlite_and_memory PASSED [ 81%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_nfc_parity_creation_and_verification_memory_and_sqlite PASSED [ 83%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_raw_non_utf8_bytes_leak_detection_parity PASSED [ 84%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_rotate_kek_with_divergent_hmac_key_fails_closed_immediately PASSED [ 86%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_sqlite_create_with_changed_server_hmac_key_fails_closed PASSED [ 88%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_sqlite_store_detects_leaked_production_value PASSED [ 90%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_stores_reject_empty_identity_triplet PASSED [ 92%]
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_stores_reject_invalid_candidate_value_types PASSED [ 94%]
+tests/test_vault_secret_hmac.py::FingerprintNeverReturnedToClientTests::test_api_responses_never_expose_fingerprint PASSED [ 96%]
+tests/test_vault_secret_hmac.py::FingerprintNeverReturnedToClientTests::test_no_http_route_exposes_fingerprint_or_leak_detection PASSED [ 98%]
 tests/test_vault_secret_hmac.py::KeyLeakHuntTests::test_server_hmac_key_is_never_leaked_in_repr_or_serialization PASSED [100%]
 
-============================== 51 passed in 0.90s ==============================
+==================== 53 passed, 11 subtests passed in 0.97s ====================
 ```
 
 ## 4. STRIDE et invariants
@@ -149,6 +154,8 @@ tests/test_vault_secret_hmac.py::KeyLeakHuntTests::test_server_hmac_key_is_never
 | **Invariant 1** — Changement non synchronisé de la clé HMAC serveur en lecture et recherche | En cas de changement de `HEIMDALL_VAULT_SERVER_HMAC_KEY` (rotation ou redéploiement non migré), les lectures par empreinte et `find_secrets_by_fingerprint` échouent immédiatement fail-closed (`VaultCipherError`) au lieu de renvoyer `False` ou `[]` (« non compromis »), prévenant tout faux négatif silencieux. | `tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_explicit_server_hmac_key_change_fails_closed`, `::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_fails_closed_on_key_change_or_derived_mode` |
 | **Invariant 1 & 5** — Invalidation post-rotation en mode dérivé (anti-fail-open) | Sans clé explicite (`server_hmac_key=None`), l'empreinte dérive de la KEK. Comme la rotation de KEK ne modifie pas les empreintes au repos (afin de préserver le non-déchiffrement des valeurs), toute vérification future recalcule une empreinte avec la nouvelle KEK qui ne correspondrait plus. Pour empêcher tout faux négatif de fuite (fail-open), les méthodes de détection de fuite (`is_secret_value_matching`, `find_secrets_matching_value`, `find_secrets_by_fingerprint`) échouent fail-closed avec `VaultCipherError` en mode dérivé. En mode clé explicite, la détection reste pérenne et valide post-rotation. | `tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_leak_detection_post_kek_rotation_in_derived_mode_fails_closed`, `::ProductionLeakDetectionTests::test_leak_detection_post_kek_rotation_in_explicit_mode_remains_true` |
 | **Invariant 1 & 5** — Rotation KEK avec clé HMAC divergente (anti-échec retardé) | `rotate_kek` (en mémoire et SQLite via `_check_rotate_kek_hmac_continuity` sous `_write_transaction`) contrôle immédiatement la continuité de la clé HMAC serveur via son canari cryptographique dès qu'au moins un secret est présent. Toute tentative de faire pivoter la KEK vers un chiffreur avec une clé HMAC distincte ou de basculer entre mode dérivé et explicite est rejetée immédiatement (`VaultCipherError`), interdisant tout réenveloppement invalide de DEK. | `tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_rotate_kek_with_divergent_hmac_key_fails_closed_immediately` |
+| **Invariant 1** — Parité Unicode NFC création / vérification (anti-faux négatif) | La création dans `InMemorySecretStore.create` et `SqliteSecretStore._create` calcule `value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")` et utilise `value_bytes` de manière identique pour `encrypt_envelope` et `fingerprint`. La vérification normalise également le candidat en NFC. Ainsi, une valeur enregistrée sous forme NFD (ex. `cafe\u0301`) est reconnue de manière déterministe par une recherche NFC (`caf\u00e9`), et inversement, interdisant tout faux négatif silencieux. | `tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_nfc_parity_creation_and_verification_memory_and_sqlite` |
+| **Invariant 1** — Résilience aux empreintes malformées ou corrompues | Décision d'architecture : sur l'API directe du cipher (`verify_secret_hmac`, `VaultCipher.is_secret_value_matching`), toute empreinte attendue malformée (longueur $\ne 64$, majuscules, symboles non-hex) retourne `False` (prédicat cryptographique pur, aucun secret ne correspondant à un format invalide). Au niveau des stores (`InMemorySecretStore`, `SqliteSecretStore`), une empreinte stockée altérée/corrompue bascule automatiquement sur le repli transparent par déchiffrement en temps constant pour garantir qu'un secret compromis est toujours détecté (aucun faux négatif silencieux). | `tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_and_cipher_matching_with_corrupted_fingerprint`, `::ProductionLeakDetectionTests::test_corrupted_fingerprint_in_database_handled_safely` |
 | **Invariant 5** — Séparation des clés cryptographiques | La clé HMAC serveur est strictement distincte de la KEK de chiffrement, de la clé maîtresse et du pepper d'authentification API, y compris sous des formes encodées (base64, hexadécimal). `server_hmac_key_matches_master_key` et le validateur de settings Pydantic rejettent au démarrage toute tentative de réutilisation d'entropie (fail-closed). | `tests/test_vault_secret_hmac.py::KeySeparationTests::test_server_hmac_key_matches_master_key_detects_collision`, `::KeySeparationTests::test_vault_settings_rejects_encoded_forms_of_keys` |
 | **Tampering & Timing attacks** — Comparaison en temps constant | Les vérifications d'empreinte (`verify_secret_hmac`, `is_secret_value_matching`, `constant_time_equal`) utilisent `hmac.compare_digest` pour interdire toute attaque par canal auxiliaire temporel. | `tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_constant_time` |
 | **Robustesse / Anti-Fail-Open** — Entrées invalides et propagation d'erreurs | `verify_secret_hmac` laisse propager `ValueError` et `TypeError` en cas de clé trop courte, valeur vide ou AAD vide (au lieu de les masquer en `False`), garantissant qu'aucune anomalie d'appelant ne produit un faux négatif silencieux. Les octets bruts non-UTF8 sont traités sans risque d'`UnicodeDecodeError`. | `tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_constant_time`, `::ProductionLeakDetectionTests::test_raw_non_utf8_bytes_leak_detection_parity` |
@@ -161,7 +168,7 @@ Environnement : Linux, Python 3.14.7, venv Poetry local.
 
 ```sh
 poetry run pytest tests/test_vault_secret_hmac.py -v
-# 51 passed in 0.90s
+# 53 passed in 0.95s
 
 poetry run pytest tests/test_vault_*.py tests/test_crypto_confinement.py -q
 # 100% passed

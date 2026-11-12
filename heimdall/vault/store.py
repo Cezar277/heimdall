@@ -176,8 +176,10 @@ class InMemorySecretStore:
         # Défense en profondeur : la valeur stockée est canonique (NFC) et sans
         # NUL, même si l'appelant contourne la validation HTTP (décision #62).
         # La normalisation est idempotente, donc sans effet pour l'API.
-        value = unicodedata.normalize("NFC", value)
         if "\x00" in value:
+            raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
+        value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")
+        if b"\x00" in value_bytes:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         async with self._lock:
             if key in self._secrets:
@@ -189,8 +191,8 @@ class InMemorySecretStore:
                 raise QuotaExceededError(
                     f"Quota maximal de secrets atteint pour le projet '{project}'"
                 )
-            envelope = self._cipher.encrypt_envelope(value.encode("utf-8"), aad=aad)
-            fingerprint = self._cipher.fingerprint(value.encode("utf-8"), aad=aad)
+            envelope = self._cipher.encrypt_envelope(value_bytes, aad=aad)
+            fingerprint = self._cipher.fingerprint(value_bytes, aad=aad)
             if self._cipher.has_explicit_server_hmac_key:
                 current_canary = self._cipher.server_hmac_key_canary()
                 if self._server_hmac_canary is not None:
@@ -705,8 +707,10 @@ class SqliteSecretStore:
         # du chemin HTTP, pour que l'empreinte d'intégrité soit toujours
         # calculée sur la forme stockée (décision #62). Le NUL tronque les
         # valeurs dans les outils texte : refusé comme au contrat API.
-        value = unicodedata.normalize("NFC", value)
         if "\x00" in value:
+            raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
+        value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")
+        if b"\x00" in value_bytes:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         with db_session(self._db_path) as conn:
             # Verrou d'écriture inter-processus AVANT le comptage : le
@@ -734,8 +738,8 @@ class SqliteSecretStore:
                     f"Quota maximal de secrets atteint pour le projet '{project}'"
                 )
             ensure_project(conn, project)
-            envelope = self._cipher.encrypt_envelope(value.encode("utf-8"), aad=aad)
-            fingerprint = self._cipher.fingerprint(value.encode("utf-8"), aad=aad)
+            envelope = self._cipher.encrypt_envelope(value_bytes, aad=aad)
+            fingerprint = self._cipher.fingerprint(value_bytes, aad=aad)
             try:
                 create_secret(
                     conn,
