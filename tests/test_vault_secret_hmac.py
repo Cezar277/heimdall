@@ -520,6 +520,33 @@ class KeySeparationTests(TestCase):
                 server_hmac_key=b64_pepper,
             )
 
+    def test_compute_and_verify_secret_hmac_reject_forbidden_keys(self) -> None:
+        """compute_secret_hmac et verify_secret_hmac refusent toute réutilisation d'entropie."""
+        kek = _VALID_KEK
+        value = "secret_to_hash"
+
+        # 1. compute_secret_hmac avec KEK directe dans forbidden_keys -> ValueError
+        with self.assertRaises(ValueError) as ctx:
+            compute_secret_hmac(kek, value, forbidden_keys=(kek,))
+        self.assertIn("ne peut pas réutiliser l'entropie", str(ctx.exception))
+
+        # 2. verify_secret_hmac avec KEK directe dans forbidden_keys -> ValueError
+        dummy_fp = "a" * 64
+        with self.assertRaises(ValueError) as ctx_v:
+            verify_secret_hmac(kek, value, dummy_fp, forbidden_keys=(kek,))
+        self.assertIn("ne peut pas réutiliser l'entropie", str(ctx_v.exception))
+
+        # 3. Forme encodée de la clé interdite (hex) -> refusée également
+        hex_kek = kek.encode("utf-8").hex()
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(hex_kek, value, forbidden_keys=(kek,))
+
+        # 4. Clé distincte -> acceptée
+        fp = compute_secret_hmac(_VALID_SERVER_HMAC_KEY, value, forbidden_keys=(kek,))
+        self.assertTrue(
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, value, fp, forbidden_keys=(kek,))
+        )
+
 
 class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
     """Vérification de détection : la valeur en prod est-elle celle qui a fuité ?"""

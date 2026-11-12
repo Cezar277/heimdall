@@ -342,6 +342,7 @@ def compute_secret_hmac(
     value: str | bytes,
     *,
     aad: bytes | str | None = None,
+    forbidden_keys: tuple[str | bytes, ...] | list[str | bytes] | str | bytes | None = None,
 ) -> str:
     """Calcule l'empreinte HMAC-SHA256 non réversible d'un secret avec la clé serveur (ticket #116).
 
@@ -350,14 +351,43 @@ def compute_secret_hmac(
     Permet de déterminer si une valeur en production correspond à une valeur ayant
     fuité, sans jamais stocker ni renvoyer cette valeur au client.
 
+    Avertissement de sécurité (Invariant 5 - Séparation des clés) :
+    Ne JAMAIS passer directement la KEK ou la clé maîtresse en tant que ``server_key``.
+    Cette fonction utilitaire pure accepte toute clé conforme à la politique de complexité.
+    Les composants internes et appelants de production doivent privilégier
+    ``VaultCipher.compute_secret_hmac`` qui applique systématiquement la garde de séparation
+    cryptographique fail-closed (``server_hmac_key_matches_master_key``).
+    Le paramètre optionnel ``forbidden_keys`` permet de fournir explicitement des clés
+    dont l'entropie ne doit pas être réutilisée (ex. la KEK du chiffreur).
+
+    Décision d'architecture (contrat de valeur vide) :
+    Une valeur de secret vide lève ``ValueError`` (fail-closed), car aucun secret vide ne peut
+    être créé ni indexé dans le Vault. À l'inverse, les prédicats de détection de fuite
+    (``is_secret_value_matching``, ``find_secrets_matching_value``) retournent ``False`` ou ``[]``
+    sur candidat vide, aucun secret en base ne pouvant correspondre.
+
     Paramètres :
     - ``server_key`` : Clé HMAC du serveur (au moins 32 octets / 256 bits), distincte
       de la clé maîtresse de chiffrement.
     - ``value`` : Valeur secrète (chaîne ou octets). Si chaîne, normalisée en Unicode NFC.
     - ``aad`` : Contexte d'authentification optionnel lié au triplet (project, env, name).
       Si fourni, préfixé avec un octet NUL pour lier l'empreinte au triplet spécifique.
+    - ``forbidden_keys`` : Clé ou séquence de clés interdites (ex. KEK / master key). Si fourni,
+      la fonction refuse fail-closed (``ValueError``) toute réutilisation d'entropie.
     """
     key_bytes = _normalize_server_hmac_key(server_key)
+    if forbidden_keys is not None:
+        forbidden_seq = (
+            (forbidden_keys,)
+            if isinstance(forbidden_keys, (str, bytes, bytearray))
+            else tuple(forbidden_keys)
+        )
+        for forbidden in forbidden_seq:
+            if server_hmac_key_matches_master_key(forbidden, key_bytes):
+                raise ValueError(
+                    "La clé HMAC serveur ne peut pas réutiliser l'entropie d'une clé interdite "
+                    "(KEK ou clé maîtresse, Invariant 5)."
+                )
     value_bytes = canonicalize_secret_value(value)
     if not value_bytes:
         raise ValueError("La valeur du secret ne peut pas être vide.")
@@ -379,21 +409,26 @@ def verify_secret_hmac(
     expected_hmac: str,
     *,
     aad: bytes | str | None = None,
+    forbidden_keys: tuple[str | bytes, ...] | list[str | bytes] | str | bytes | None = None,
 ) -> bool:
     """Vérifie en temps constant si une valeur candidate correspond à l'empreinte HMAC.
 
     Ticket #116 : permet de vérifier si la valeur en production est encore celle qui a fuité,
     sans jamais déchiffrer ni exposer l'empreinte au client.
-    Laisse propager ValueError et TypeError en cas d'entrée invalide (clé faible,
-    valeur vide ou AAD vide), parité avec ``compute_secret_hmac``.
 
-    Décision d'architecture (contrat de vérification booléenne) : si ``expected_hmac``
-    est malformée (longueur != 64, majuscules, caractères non-hexadécimaux ou type non str),
-    la fonction retourne ``False`` en tant que prédicat cryptographique sûr : aucune valeur
-    secrète ne peut correspondre à une empreinte invalide. À la différence des stores
-    (``InMemorySecretStore``, ``SqliteSecretStore``) qui disposent du ciphertext pour
-    opérer un repli transparent par déchiffrement en cas d'empreinte corrompue en base,
-    l'API directe du cipher opère sans accès au store et conclut à la non-correspondance.
+    Avertissement de sécurité (Invariant 5 - Séparation des clés) :
+    Ne JAMAIS passer la KEK ou la clé maîtresse en tant que ``server_key``. Passer par
+    ``VaultCipher.verify_secret_hmac`` ou renseigner ``forbidden_keys`` pour interdire
+    fail-closed toute collision d'entropie avec la clé de chiffrement.
+
+    Décision d'architecture (contrat de vérification booléenne et valeur vide) :
+    - Si ``expected_hmac`` est malformée (longueur != 64, majuscules, non-hex), retourne ``False``.
+    - Laisse propager ``ValueError`` et ``TypeError`` sur entrées invalides (clé faible,
+      valeur vide ou AAD vide) pour le calcul cryptographique direct, parité avec
+      ``compute_secret_hmac``.
+      Pour la détection de fuite applicative, ``VaultCipher.is_secret_value_matching`` et les stores
+      interceptent le candidat vide pour retourner directement ``False`` / ``[]`` (aucun secret ne
+      pouvant correspondre).
     """
     if (
         not isinstance(expected_hmac, str)
@@ -401,7 +436,7 @@ def verify_secret_hmac(
         or not all(c in "0123456789abcdef" for c in expected_hmac)
     ):
         return False
-    computed = compute_secret_hmac(server_key, value, aad=aad)
+    computed = compute_secret_hmac(server_key, value, aad=aad, forbidden_keys=forbidden_keys)
     return constant_time_equal(computed, expected_hmac)
 
 
@@ -1048,8 +1083,14 @@ class VaultCipher:
 
         Formule : ``hmac.new(cle_serveur, valeur, sha256).hexdigest()``.
         Empreinte stable et non réversible, jamais renvoyée au client.
+        Garantit la séparation des clés en interdisant la réutilisation de la KEK.
         """
-        return compute_secret_hmac(self._fingerprint_key, value, aad=aad)
+        return compute_secret_hmac(
+            self._fingerprint_key,
+            value,
+            aad=aad,
+            forbidden_keys=(self._key,),
+        )
 
     def verify_secret_hmac(
         self,
@@ -1059,7 +1100,13 @@ class VaultCipher:
         aad: bytes | str | None = None,
     ) -> bool:
         """Vérifie en temps constant si la valeur correspond à l'empreinte HMAC (ticket #116)."""
-        return verify_secret_hmac(self._fingerprint_key, value, expected_hmac, aad=aad)
+        return verify_secret_hmac(
+            self._fingerprint_key,
+            value,
+            expected_hmac,
+            aad=aad,
+            forbidden_keys=(self._key,),
+        )
 
     def is_secret_value_matching(
         self,
