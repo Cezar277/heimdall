@@ -170,7 +170,7 @@ def generate_server_hmac_key() -> str:
     return secrets.token_urlsafe(_KEY_SIZE_BYTES)
 
 
-def _to_raw_server_hmac_bytes(key: str | bytes | None) -> bytes:
+def _to_raw_server_hmac_bytes(key: str | bytes | bytearray | None) -> bytes:
     if key is None:
         raise ValueError(
             "La clé HMAC serveur est obligatoire. Aucun repli silencieux sur un secret par défaut."
@@ -223,7 +223,7 @@ def _validate_key_complexity(key_bytes: bytes) -> None:
         )
 
 
-def validate_server_hmac_key(key: str | bytes | None) -> bytes:
+def validate_server_hmac_key(key: str | bytes | bytearray | None) -> bytes:
     """Valide et normalise la clé HMAC serveur en octets (ticket #116).
 
     Exige au moins 32 octets (256 bits), au plus 512 octets (borne maximale),
@@ -240,8 +240,10 @@ def validate_server_hmac_key(key: str | bytes | None) -> bytes:
 _normalize_server_hmac_key = validate_server_hmac_key
 
 
-def _extract_key_variants(raw: str | bytes) -> list[bytes]:
+def _extract_key_variants(raw: str | bytes | bytearray) -> list[bytes]:
     """Extrait les représentations brutes, base64 décodées et hexadécimales d'une clé."""
+    if not isinstance(raw, (str, bytes, bytearray)):
+        raise TypeError("La clé doit être de type str, bytes ou bytearray.")
     variants: list[bytes] = []
     if isinstance(raw, str):
         try:
@@ -266,14 +268,18 @@ def _extract_key_variants(raw: str | bytes) -> list[bytes]:
 
 
 def server_hmac_key_matches_master_key(
-    master_or_kek: str | bytes,
-    server_hmac_key: str | bytes,
+    master_or_kek: str | bytes | bytearray,
+    server_hmac_key: str | bytes | bytearray,
 ) -> bool:
     """Détecte la réutilisation de la clé maîtresse ou KEK comme clé HMAC serveur (Invariant 5).
 
     Compare en temps constant la clé maîtresse ou la KEK (brute, normalisée, décodée)
     et la clé HMAC serveur pour s'assurer que les deux clés sont strictement distinctes.
     """
+    if not isinstance(master_or_kek, (str, bytes, bytearray)):
+        raise TypeError("La clé maîtresse ou KEK doit être de type str, bytes ou bytearray.")
+    if not isinstance(server_hmac_key, (str, bytes, bytearray)):
+        raise TypeError("La clé HMAC serveur doit être de type str, bytes ou bytearray.")
     raw_hmac = (
         server_hmac_key.encode("utf-8")
         if isinstance(server_hmac_key, str)
@@ -377,12 +383,17 @@ def compute_secret_hmac(
     """
     key_bytes = _normalize_server_hmac_key(server_key)
     if forbidden_keys is not None:
-        forbidden_seq = (
-            (forbidden_keys,)
-            if isinstance(forbidden_keys, (str, bytes, bytearray))
-            else tuple(forbidden_keys)
-        )
+        if isinstance(forbidden_keys, (str, bytes, bytearray)):
+            forbidden_seq: tuple[str | bytes | bytearray, ...] = (forbidden_keys,)
+        elif isinstance(forbidden_keys, (list, tuple, set)):
+            forbidden_seq = tuple(forbidden_keys)
+        else:
+            raise TypeError(
+                "forbidden_keys doit être une clé (str, bytes) ou une séquence de clés."
+            )
         for forbidden in forbidden_seq:
+            if not isinstance(forbidden, (str, bytes, bytearray)):
+                raise TypeError("Chaque clé interdite doit être de type str, bytes ou bytearray.")
             if server_hmac_key_matches_master_key(forbidden, key_bytes):
                 raise ValueError(
                     "La clé HMAC serveur ne peut pas réutiliser l'entropie d'une clé interdite "

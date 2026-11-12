@@ -955,6 +955,14 @@ class SqliteSecretStore:
         fingerprint: str,
         env: str | None = None,
     ) -> list[dict[str, str]]:
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != _FINGERPRINT_HEX_LEN
+            or not all(c in "0123456789abcdef" for c in fingerprint)
+        ):
+            raise ValueError(
+                "L'empreinte HMAC doit être une chaîne hexadécimale de 64 caractères minuscules."
+            )
         if not self._cipher.has_explicit_server_hmac_key:
             raise VaultCipherError(
                 "La recherche par empreinte exige une clé HMAC serveur explicite "

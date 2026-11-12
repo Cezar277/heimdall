@@ -28,6 +28,7 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from heimdall.vault import app as vault_app
 from heimdall.vault.app import (
     VaultSettings,
     create_app,
@@ -38,6 +39,7 @@ from heimdall.vault.crypto import (
     MAX_SERVER_HMAC_KEY_BYTES,
     VaultCipher,
     VaultCipherError,
+    _extract_key_variants,
     _normalize_server_hmac_key,
     compute_secret_hmac,
     generate_encryption_key,
@@ -546,6 +548,33 @@ class KeySeparationTests(TestCase):
         self.assertTrue(
             verify_secret_hmac(_VALID_SERVER_HMAC_KEY, value, fp, forbidden_keys=(kek,))
         )
+
+    def test_key_separation_type_safety_rejects_non_string_bytes_types(self) -> None:
+        """server_hmac_key_matches_master_key et forbidden_keys lèvent TypeError sur int."""
+        # int ne doit pas être converti via bytes(int) (prévention DoS mémoire et bypass)
+        with self.assertRaises(TypeError):
+            server_hmac_key_matches_master_key(12345, _VALID_SERVER_HMAC_KEY)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            server_hmac_key_matches_master_key(_VALID_KEK, 12345)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            _extract_key_variants(12345)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            _extract_key_variants(None)  # type: ignore[arg-type]
+
+        # compute_secret_hmac et verify_secret_hmac avec forbidden_keys invalide
+        with self.assertRaises(TypeError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", forbidden_keys=12345)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", forbidden_keys=[12345])  # type: ignore[list-item]
+        with self.assertRaises(TypeError):
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", "a" * 64, forbidden_keys=12345)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", "a" * 64, forbidden_keys=[12345])  # type: ignore[list-item]
+
+        # bytearray est accepté sans TypeError
+        ba_kek = bytearray(_VALID_KEK.encode("utf-8"))
+        self.assertTrue(server_hmac_key_matches_master_key(ba_kek, _VALID_KEK))
+        self.assertEqual(len(_extract_key_variants(ba_kek)), len(_extract_key_variants(_VALID_KEK)))
 
 
 class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
@@ -1171,6 +1200,47 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             with self.assertRaises(VaultCipherError):
                 await sql_store.find_secrets_by_fingerprint("demo", fingerprint)
 
+    async def test_find_secrets_by_fingerprint_exception_precedence_parity_memory_and_sqlite(
+        self,
+    ) -> None:
+        """Parité de précédence d'exception : format (ValueError) avant canari."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        malformed_cases = ["", "short", "a" * 63, "a" * 65, "G" * 64, 12345]  # type: ignore[list-item]
+
+        # 1. Mémoire legacy-only (sans canari)
+        mem_store = InMemorySecretStore(cipher=cipher)
+        await mem_store.create("demo", "prod", "LEGACY_MEM", "legacy_val")
+        mem_store._secrets[("demo", "prod", "LEGACY_MEM")]["fingerprint"] = ""
+        mem_store._server_hmac_canary = None
+
+        # 2. SQLite legacy-only (sans canari)
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            await sql_store.create("demo", "prod", "LEGACY_SQL", "legacy_val")
+            with db_session(db_path) as conn:
+                conn.execute("DELETE FROM server_hmac_canary")
+                conn.execute(
+                    "UPDATE secrets SET fingerprint = '' WHERE project_id = ?",
+                    ("demo",),
+                )
+
+            # Test de chaque cas malformé : TOUS lèvent ValueError (pas VaultCipherError)
+            for bad_fp in malformed_cases:
+                with self.subTest(bad_fp=bad_fp, store="memory"):
+                    with self.assertRaises(ValueError):
+                        await mem_store.find_secrets_by_fingerprint("demo", bad_fp)  # type: ignore[arg-type]
+                with self.subTest(bad_fp=bad_fp, store="sqlite"):
+                    with self.assertRaises(ValueError):
+                        await sql_store.find_secrets_by_fingerprint("demo", bad_fp)  # type: ignore[arg-type]
+
+            # Cas valide mais base legacy : les 2 lèvent VaultCipherError (pas ValueError)
+            valid_fp = "a" * 64
+            with self.assertRaises(VaultCipherError):
+                await mem_store.find_secrets_by_fingerprint("demo", valid_fp)
+            with self.assertRaises(VaultCipherError):
+                await sql_store.find_secrets_by_fingerprint("demo", valid_fp)
+
     async def test_stores_reject_empty_identity_triplet(self) -> None:
         """Les stores refusent un triplet d'identité vide avec ValueError."""
         cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
@@ -1600,6 +1670,10 @@ class KeyLeakHuntTests(TestCase):
 
         cipher = VaultCipher(b"K" * 32, server_hmac_key=canary)
         self.assertNotIn(canary, repr(cipher))
+
+    def test_app_does_not_contain_dead_server_hmac_min_constant(self) -> None:
+        """La constante morte _MIN_SERVER_HMAC_KEY_BYTES est bien supprimée d'app.py."""
+        self.assertFalse(hasattr(vault_app, "_MIN_SERVER_HMAC_KEY_BYTES"))
 
 
 class SammProofLineIntegrityTests(TestCase):

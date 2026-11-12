@@ -135,7 +135,6 @@ project_api_key_header = vault_auth.project_api_key_header
 verify_api_key = vault_auth.verify_api_key
 ProjectId = vault_auth.ProjectId
 _MAX_BODY_SIZE: int = 1_048_576  # 1 Mio (1 048 576 octets)
-_MIN_SERVER_HMAC_KEY_BYTES: int = 32  # 256 bits pour la clé HMAC serveur (ticket #116)
 
 logger = logging.getLogger("heimdall.vault.app")
 
