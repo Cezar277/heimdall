@@ -235,3 +235,91 @@ def test_the_repin_never_rewrites_a_permalink_to_a_symlink(tmp_path: Path) -> No
     reecrit = repin.reecrire(texte, sha, racine)
     assert f"blob/{historique}/lien.py" in reecrit
     assert f"blob/{sha}/cible.py" in reecrit
+
+
+FICHE_T84 = REPO / "docs" / "t84-t85-t86-samm.md"
+
+
+def test_t84_t85_t86_samm_permalinks_integrity_and_header_sync() -> None:
+    """Preuves SAMM #84/#85/#86 : permaliens vivants, dépôt exact et en-tête synchrone.
+
+    Vérifie :
+    1. Aucun permalien mort (dépôt Cezar277/heimdall, commit connu, fichier présent).
+    2. Synchronisation stricte entre le commit d'implémentation annoncé en en-tête
+       et les permaliens du tableau (interdit la dérive 30fd0b0 vs 1692ead).
+    3. Présence de la procédure de re-pin au merge (`scripts/repin_samm.py`).
+    4. Exactitude des ancres de lignes vis-à-vis des symboles implémentés à cette révision.
+    """
+    texte = FICHE_T84.read_text(encoding="utf-8")
+    liens = repin.extraire(texte)
+    assert liens, "la fiche de preuves t84-t85-t86 ne contient aucun permalien"
+
+    # 1. Vérification du dépôt et de la présence des fichiers
+    for lien in liens:
+        assert (lien.owner, lien.repo) == DEPOT_ATTENDU, lien.complet
+        assert repin.revision_connue(lien.sha, REPO), (
+            f"révision inconnue : {lien.sha} — re-pinner sur la révision finale"
+        )
+        assert repin.fichier_present(lien.sha, lien.path, REPO), (
+            f"fichier absent à la révision {lien.sha} : {lien.path}"
+        )
+
+    # 2. Synchronisation de l'en-tête et du tableau
+    header_commit = re.search(r"commit d'implémentation\*\*\s*\[`([0-9a-f]{40})`\]", texte)
+    assert header_commit is not None, "SHA du commit d'implémentation absent de l'en-tête"
+    base_tree = re.search(
+        r"Base des liens :\s*`https://github\.com/Cezar277/heimdall/tree/([0-9a-f]{40})/?`",
+        texte,
+    )
+    assert base_tree is not None, "SHA de base tree absent de l'en-tête"
+    sha_entete = header_commit.group(1)
+    assert sha_entete == base_tree.group(1), (
+        f"Incohérence en-tête : commit ({sha_entete}) != tree ({base_tree.group(1)})"
+    )
+
+    table_shas = {lien.sha for lien in liens}
+    assert table_shas == {sha_entete}, (
+        f"Dérive de permaliens : tableau ({table_shas}) != en-tête ({sha_entete})"
+    )
+
+    # 3. Procédure de re-pin déclarée
+    assert "scripts/repin_samm.py" in texte
+    assert "--fiche docs/t84-t85-t86-samm.md" in texte
+    assert "--sha" in texte
+    assert "--check" in texte
+
+    # 4. Cohérence des ancres symboliques à la révision d'implémentation
+    expected_symbols = {
+        ("heimdall/remediation/naming.py", 20): "_VARIABLE",
+        ("heimdall/remediation/naming.py", 23): "_MAX_NAME_LENGTH",
+        ("heimdall/remediation/naming.py", 30): "DANGEROUS_ENV_EXACT",
+        ("heimdall/remediation/naming.py", 115): "DANGEROUS_ENV_PREFIXES",
+        ("heimdall/remediation/naming.py", 162): "is_dangerous_env_var",
+        ("heimdall/remediation/naming.py", 172): "validate_variable_name",
+        ("heimdall/remediation/naming.py", 188): "deduplicate_variable_name",
+        ("heimdall/cli/vault_client.py", 31): "is_dangerous_env_var",
+        ("heimdall/cli/vault_client.py", 61): "preview_name",
+        ("heimdall/remediation/apply.py", 53): "ApplyError",
+        ("heimdall/remediation/apply.py", 61): "AppliedPatch",
+        ("heimdall/remediation/apply.py", 71): "_read_current_secure",
+        ("heimdall/remediation/apply.py", 106): "_check_backup_git_status",
+        ("heimdall/remediation/apply.py", 161): "confine",
+        ("heimdall/remediation/apply.py", 165): "plan.before",
+        ("heimdall/remediation/apply.py", 168): "backup_file",
+        ("heimdall/remediation/apply.py", 174): "_check_backup_git_status",
+        ("heimdall/remediation/apply.py", 176): "write_file_atomic",
+        ("heimdall/remediation/apply.py", 191): "undo_apply",
+        ("heimdall/remediation/apply.py", 205): "confine",
+        ("heimdall/remediation/apply.py", 208): "receipt.backup",
+        ("heimdall/remediation/templates.py", 70): "_VARIABLE",
+        ("heimdall/remediation/templates.py", 191): "__repr__",
+    }
+    for (rel_path, line_no), symbol in expected_symbols.items():
+        code, content = repin._git("cat-file", "-p", f"{sha_entete}:{rel_path}", cwd=REPO)
+        assert code == 0, f"impossible d'extraire {rel_path} à {sha_entete}"
+        lines = content.splitlines()
+        assert 1 <= line_no <= len(lines), f"{rel_path}:{line_no} hors limites"
+        target_line = lines[line_no - 1]
+        assert symbol in target_line, (
+            f"Dérive de ligne à {rel_path}:{line_no} — attendu '{symbol}', trouvé : {target_line!r}"
+        )

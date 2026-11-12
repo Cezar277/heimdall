@@ -5,8 +5,8 @@ Ticket : [#83](https://github.com/Cezar277/heimdall/issues/83), parent
 
 `heimdall.remediation.templates` transforme **en mémoire** une ligne source
 contenant un secret en lecture de variable d'environnement. Il n'écrit aucun
-fichier : l'application atomique du patch est le ticket #85 et la garde de
-chemin runtime le ticket #86.
+fichier : l'application atomique du patch et la garde de chemin runtime sont
+décrites dans `remediation-apply.md` (tickets #85 et #86).
 
 ## API
 
@@ -150,9 +150,9 @@ une chaîne JavaScript ordinaire.
   inséré suit la fin de ligne locale (voisinage),
   pas un `\r\n` lointain.
 
-La denylist sémantique (`PATH`, `LD_PRELOAD`, `PYTHONPATH`…) et le
-dédoublonnage `_2`/`_3` restent dans #84. L'écriture atomique et la
-vérification de chemin à l'usage restent dans #85/#86.
+La validation des noms (denylist système, dédoublonnage `_2`/`_3`),
+l'écriture atomique et la vérification de chemin à l'usage sont décrites dans
+`remediation-apply.md` (tickets #84/#85/#86).
 
 ## Tests
 
