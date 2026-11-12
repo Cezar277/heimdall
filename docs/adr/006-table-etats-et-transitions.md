@@ -166,7 +166,13 @@ contrat des états persistés :
   le forger. L'UPDATE conditionnel de `secrets.status` et l'INSERT du journal
   partagent la même transaction `BEGIN IMMEDIATE` : une transition acceptée ne
   peut pas manquer au journal, et deux transitions concurrentes ne peuvent pas
-  réussir toutes les deux. Un compare-and-set perdant (`rowcount != 1`) lève
+  réussir toutes les deux. **Cette garantie d'atomicité (état + journal) et de
+  compare-and-set est portée par le backend SQLite** (backend de production) ;
+  le backend mémoire, réservé aux tests et au développement mono-processus, n'emprunte
+  aucune transaction partagée : il repose sur le verrou de l'instance et un
+  journal borné, sans transaction ni CAS inter-processus. L'atomicité
+  inter-processus et le CAS ne sont donc garantis que par le backend SQLite.
+  Un compare-and-set perdant (`rowcount != 1`) lève
   `TransitionConcurrencyError`, mappée en 400 statique par la route, comme les
   transitions interdites. L'acteur est normalisé sur `^key_[0-9a-f]{32}$` ;
   toute autre valeur devient `unknown`, donc aucune donnée arbitraire ou

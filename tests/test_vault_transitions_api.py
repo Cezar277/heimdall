@@ -31,7 +31,7 @@ import heimdall.vault.database as database_module
 import heimdall.vault.store as store_module
 from heimdall.vault.app import VaultSettings, create_app
 from heimdall.vault.crypto import VaultCipher, generate_api_key
-from heimdall.vault.database import TransitionConcurrencyError
+from heimdall.vault.database import DEFAULT_TRANSITION_LIST_LIMIT, TransitionConcurrencyError
 from heimdall.vault.store import InMemorySecretStore, SqliteSecretStore
 from heimdall.vault.transitions import InvalidTransitionError
 
@@ -105,6 +105,19 @@ def _transitions(client: TestClient, name: str = _NAME) -> list[dict[str, str]]:
             (_PROJECT, _ENV, name),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+async def _list_journal_entries(
+    store: InMemorySecretStore | SqliteSecretStore,
+    project: str,
+    env: str,
+    name: str,
+    limit: int = DEFAULT_TRANSITION_LIST_LIMIT,
+) -> list[dict[str, str]]:
+    """Lit le journal via les helpers privés des deux backends (diagnostics tests)."""
+    if isinstance(store, InMemorySecretStore):
+        return await store._list_transitions(project, env, name, limit)
+    return store._list_transitions(project, env, name, limit)
 
 
 def test_valid_transition_changes_state_and_returns_metadata_only(vault: TestClient) -> None:
@@ -276,7 +289,7 @@ def test_actor_is_normalized_and_never_taken_from_request() -> None:
         )
         assert record is not None
         assert record["actor"] == "unknown"
-        entries = await store.list_transitions(_PROJECT, _ENV, _NAME)
+        entries = await store._list_transitions(_PROJECT, _ENV, _NAME)
         assert entries[0]["actor"] == "unknown"
         assert "forged" not in str(entries)
 
@@ -340,10 +353,10 @@ def test_sqlite_journal_is_bounded(
             (_PROJECT, _ENV, "DEMO_1", "unknown", "vaulte", "rote"),
             (_PROJECT, _ENV, "DEMO_2", "unknown", "vaulte", "rote"),
         ]
-        assert await store.list_transitions(_PROJECT, _ENV, "DEMO_1") != []
-        assert await store.list_transitions(_PROJECT, _ENV, "DEMO_0") == []
+        assert store._list_transitions(_PROJECT, _ENV, "DEMO_1") != []
+        assert store._list_transitions(_PROJECT, _ENV, "DEMO_0") == []
         await store.clear()
-        assert await store.list_transitions(_PROJECT, _ENV, "DEMO_1") == []
+        assert store._list_transitions(_PROJECT, _ENV, "DEMO_1") == []
 
     asyncio.run(scenario())
 
@@ -392,6 +405,12 @@ def test_journal_maintenance_helpers_are_private_test_only() -> None:
     assert not hasattr(database_module, "delete_all_secret_transitions")
     assert database_module._list_secret_transitions.__name__.startswith("_")
     assert database_module._delete_all_secret_transitions.__name__.startswith("_")
+    # Les stores ne doivent exposer aucun lecteur/effaceur de journal public :
+    # la frontière « test-only » est matérialisée par le préfixe privé.
+    assert not hasattr(InMemorySecretStore, "list_transitions")
+    assert not hasattr(SqliteSecretStore, "list_transitions")
+    assert InMemorySecretStore._list_transitions.__name__.startswith("_")
+    assert SqliteSecretStore._list_transitions.__name__.startswith("_")
 
 
 def test_journal_listing_is_bounded() -> None:
@@ -401,7 +420,7 @@ def test_journal_listing_is_bounded() -> None:
         await store.transition(_PROJECT, _ENV, _NAME, "rote")
         for limit in (0, -1, 1_001, True):
             with pytest.raises(ValueError, match="hors bornes"):
-                await store.list_transitions(_PROJECT, _ENV, _NAME, limit)
+                await store._list_transitions(_PROJECT, _ENV, _NAME, limit)
 
     asyncio.run(scenario())
 
@@ -479,14 +498,14 @@ def test_journal_retention_is_isolated_by_project(
                 assert await store.transition(_PROJECT, _ENV, name, "rote") is not None
 
             # Les deux entrées de « other » survivent à l'inondation de « demo ».
-            assert len(await store.list_transitions("other", _ENV, "OTHER_0")) == 1
-            assert len(await store.list_transitions("other", _ENV, "OTHER_1")) == 1
+            assert len(await _list_journal_entries(store, "other", _ENV, "OTHER_0")) == 1
+            assert len(await _list_journal_entries(store, "other", _ENV, "OTHER_1")) == 1
             # La borne s'applique au projet « demo » lui-même.
-            assert await store.list_transitions(_PROJECT, _ENV, "DEMO_0") == []
-            assert len(await store.list_transitions(_PROJECT, _ENV, "DEMO_2")) == 1
+            assert await _list_journal_entries(store, _PROJECT, _ENV, "DEMO_0") == []
+            assert len(await _list_journal_entries(store, _PROJECT, _ENV, "DEMO_2")) == 1
             # Aucune lecture croisée : « demo » ne voit pas le journal de « other ».
-            assert await store.list_transitions(_PROJECT, _ENV, "OTHER_0") == []
-            assert await store.list_transitions("other", _ENV, "DEMO_2") == []
+            assert await _list_journal_entries(store, _PROJECT, _ENV, "OTHER_0") == []
+            assert await _list_journal_entries(store, "other", _ENV, "DEMO_2") == []
 
         await memory.clear()
         await sqlite.clear()
@@ -584,7 +603,8 @@ def test_occurred_at_cannot_be_forged(
         result = await store.transition(_PROJECT, _ENV, _NAME, "rote")
         assert result is not None
         assert result["occurred_at"] == fixed_timestamp
-        entries = await store.list_transitions(_PROJECT, _ENV, _NAME)
+        # ``SqliteSecretStore._list_transitions`` est un helper privé synchrone.
+        entries = store._list_transitions(_PROJECT, _ENV, _NAME)
         assert entries[0]["occurred_at"] == fixed_timestamp
 
     asyncio.run(scenario())

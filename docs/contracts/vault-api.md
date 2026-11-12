@@ -461,7 +461,16 @@ secret, ni empreinte, ni clé brute. La mise à jour de `secrets.status` et
 l'insertion du journal partagent la même transaction (`BEGIN IMMEDIATE`,
 compare-and-set sur l'ancien état) : deux transitions concurrentes ne peuvent
 pas réussir toutes les deux, et aucune transition acceptée ne peut manquer au
-journal. Un compare-and-set perdant (`rowcount != 1`) lève
+journal. **Cette garantie d'atomicité (état + journal) et de compare-and-set
+est portée par le backend SQLite** (backend de production) ; le backend **mémoire**
+(tests et développement, strictement mono-processus) n'emprunte aucune
+transaction partagée : il s'appuie sur le verrou `asyncio.Lock` de l'instance
+et le `deque(maxlen=...)` du journal, sans transaction ni compare-and-set
+inter-processus. L'atomicité inter-processus et le CAS ne sont donc garantis que
+par le backend SQLite ; le backend mémoire est réservé aux tests et au
+développement.
+
+Un compare-and-set perdant (`rowcount != 1`) lève
 `TransitionConcurrencyError`, convertie en 400 statique sans fuite. La table
 n'a pas de clé étrangère vers `secrets`, afin que l'historique reste
 consultable après suppression ; sa rétention est bornée **par projet** à
@@ -469,9 +478,11 @@ consultable après suppression ; sa rétention est bornée **par projet** à
 d'un projet ne peut donc pas évincer le journal d'un autre projet, et chaque
 purge locale (SQLite via `logger.warning`, mémoire via `logger.warning` dans le
 `deque` borné) émet un avertissement d'exploitation. Aucune route HTTP n'expose
-ce journal : les helpers de lecture (`database._list_secret_transitions`) et de
-reset (`database._delete_all_secret_transitions`) sont privés, réservés aux
-stores et aux diagnostics de tests.
+ce journal : les helpers de lecture (`database._list_secret_transitions`, ainsi
+que les méthodes privées des stores `InMemorySecretStore._list_transitions` et
+`SqliteSecretStore._list_transitions`) et de reset
+(`database._delete_all_secret_transitions`) sont privés, réservés aux stores et
+aux diagnostics de tests.
 
 La lecture d'une valeur (`GET /api/v1/secrets/{project}/{env}/{name}`)
 canonicalise le statut persisté avant la garde : un statut corrompu (casse,

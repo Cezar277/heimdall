@@ -271,6 +271,13 @@ class InMemorySecretStore:
         matrice #115 est appliquée avant toute mutation ; seule une cible
         persistable (``vaulte``/``rote``) est écrite. Le journal est borné par
         projet et ne contient ni valeur, ni empreinte, ni clé API brute.
+
+        L'atomicité états + journal est portée ici par le ``asyncio.Lock`` de
+        l'instance et le ``deque(maxlen=...)`` du journal : le backend mémoire
+        n'emprunte aucune transaction partagée et ne garantit aucune atomicité
+        inter-processus (ni compare-and-set). Il est réservé aux tests et au
+        développement mono-processus ; le backend SQLite (``BEGIN IMMEDIATE``)
+        est le backend de production et garantit l'atomicité et le CAS.
         """
         target = canonicalize_state(target_status)
         async with self._lock:
@@ -323,18 +330,18 @@ class InMemorySecretStore:
                 "occurred_at": occurred_at,
             }
 
-    async def list_transitions(
+    async def _list_transitions(
         self,
         project: str,
         env: str,
         name: str,
         limit: int = DEFAULT_TRANSITION_LIST_LIMIT,
     ) -> list[dict[str, str]]:
-        """Lecture interne/test-only du journal, jamais exposée par HTTP.
+        """Lecture interne **test-only** du journal, jamais exposée par HTTP.
 
-        Aucune route de production ne doit appeler cette méthode : elle sert
-        aux stores et aux diagnostics de tests, avec un filtre projet et une
-        limite bornée.
+        Le préfixe privé matérialise l'interdiction de tout branchement HTTP :
+        aucune route n'appelle ce helper, il est réservé aux diagnostics de
+        tests. Filtre projet et limite bornée (1..1000) sont appliqués.
         """
         validate_transition_list_limit(limit)
         async with self._lock:
@@ -637,6 +644,11 @@ class SqliteSecretStore:
         l'UPDATE et l'INSERT du journal : la transition est atomique entre
         workers, et un état modifié concurrentement fait échouer le
         compare-and-set plutôt que de produire un journal incohérent.
+
+        Cette garantie d'atomicité inter-processus et de compare-and-set est
+        portée par le backend SQLite (backend de production) ; elle n'est pas
+        applicable au backend mémoire, qui reste mono-processus et réservé aux
+        tests et au développement.
         """
         return await asyncio.to_thread(
             self._transition,
@@ -665,30 +677,19 @@ class SqliteSecretStore:
                 actor=actor,
             )
 
-    async def list_transitions(
+    def _list_transitions(
         self,
         project: str,
         env: str,
         name: str,
         limit: int = DEFAULT_TRANSITION_LIST_LIMIT,
     ) -> list[dict[str, str]]:
-        """Lecture interne/test-only du journal borné (SQLite), sans route HTTP."""
-        validate_transition_list_limit(limit)
-        return await asyncio.to_thread(
-            self._list_transitions,
-            project,
-            env,
-            name,
-            limit,
-        )
+        """Lecture interne **test-only** du journal borné (SQLite), sans route HTTP.
 
-    def _list_transitions(
-        self,
-        project: str,
-        env: str,
-        name: str,
-        limit: int,
-    ) -> list[dict[str, str]]:
+        Le préfixe privé matérialise l'interdiction de tout branchement HTTP :
+        aucune route n'appelle ce helper, il est réservé aux diagnostics de
+        tests. Filtre projet et limite bornée (1..1000) sont appliqués.
+        """
         with db_session(self._db_path) as conn:
             return _list_secret_transitions(conn, project, env, name, limit)
 
