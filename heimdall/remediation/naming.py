@@ -1,0 +1,201 @@
+"""Validation des noms de variables d'environnement (T30.2, #84).
+
+Le nom est proposé par le LLM : c'est une entrée **non fiable** qui finira
+dans du code et dans un fichier ``.env``. Toute entrée passe donc par
+:func:`validate_variable_name` (grammaire fermée + denylist système) avant
+usage, et les doublons sont levés par :func:`deduplicate_variable_name`
+(suffixes ``_2``, ``_3``…).
+
+Ce module est la **source unique** de la politique de nommage côté
+remédiation : ``cli/vault_client.py`` délègue sa denylist ici (mêmes
+constantes, même fonction) au lieu de la dupliquer.
+"""
+
+from __future__ import annotations
+
+import itertools
+from collections.abc import Iterable
+from typing import Final
+
+from heimdall.remediation.templates import _VARIABLE, MAX_VARIABLE_CHARS, TemplateError
+
+#: Longueur maximale d'un nom : un suffixe ``_N`` doit encore tenir dedans.
+_MAX_NAME_LENGTH: Final[int] = MAX_VARIABLE_CHARS
+
+#: Noms exacts refusés : variables système/shell dont l'écrasement détournerait
+#: l'exécution des processus enfants (voir ticket #84).
+DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset(
+    {
+        "PATH",
+        "SHELL",
+        "IFS",
+        "BASH_ENV",
+        "BASHOPTS",
+        "SHELLOPTS",
+        "ENV",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS3",
+        "PS4",
+        "PROMPT_COMMAND",
+        "ZDOTDIR",
+        "GLIBC_TUNABLES",
+        "GCONV_PATH",
+        "LOCPATH",
+        "NLSPATH",
+        "HOSTALIASES",
+        "CORE_PAGER",
+        "PAGER",
+        "MANPAGER",
+        "LESSOPEN",
+        "LESSCLOSE",
+        "EDITOR",
+        "VISUAL",
+        "SUDO_ASKPASS",
+        "SSH_ASKPASS",
+        "SSH_ASKPASS_REQUIRE",
+        "SSH_AUTH_SOCK",
+        "SSH_ORIGINAL_COMMAND",
+        "KUBECONFIG",
+        "GOBIN",
+        "GOCACHE",
+        "GOFLAGS",
+        "GOMODCACHE",
+        "GOPATH",
+        "GOROOT",
+        "GOTOOLCHAIN",
+        "CC",
+        "CXX",
+        "CPP",
+        "CFLAGS",
+        "CPPFLAGS",
+        "CXXFLAGS",
+        "LDFLAGS",
+        "MAKEFLAGS",
+        "MFLAGS",
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        # Comportement du shell enfant (LOW) : un Vault compromis ne doit pas
+        # détourner les `cd`/globs/historique des scripts enfants de `run`.
+        # La racine de confiance reste l'allowlist locale (seuls les noms listés
+        # localement sont demandés) ; la denylist n'est qu'une défense en
+        # profondeur. Tout nom listé localement (--name/.env.example/.env) est
+        # une entrée de confiance : ne pas y inscrire de variable système.
+        "CDPATH",
+        "GLOBIGNORE",
+        "HISTFILE",
+        "MAILCAPS",
+        # État du shell/environnement d'exécution (LOW) : chemins terminfo et
+        # cible venv — détournement des enfants via TERMINFO/TERMPATH/VIRTUAL_ENV.
+        "TERMINFO",
+        "TERMPATH",
+        "VIRTUAL_ENV",
+        "INPUTRC",
+        "TERM",
+        "TZ",
+        "TERMCAP",
+        "LUA_PATH",
+        "LUA_CPATH",
+        "LUA_INIT",
+    }
+)
+
+#: Préfixes refusés : familles d'outils, runtimes et chargeurs dynamiques dont
+#: la redéfinition détournerait les enfants (compilateurs, paquets, credentials).
+DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
+    "LD_",
+    "DYLD_",
+    "PYTHON",
+    "NODE_",
+    "NPM_",
+    "YARN_",
+    "PNPM_",
+    "RUBY",
+    "PERL",
+    "GIT_",
+    "BASH_",
+    "PROMPT_",
+    "SYSTEMD_",
+    "JAVA_",
+    "JDK_",
+    "_JAVA_",
+    "MAVEN_",
+    "GRADLE_",
+    "DOTNET_",
+    "COMPOSE_",
+    "DOCKER_",
+    "AWS_",
+    "TF_",
+    "KUBE_",
+    "HELM_",
+    "XDG_",
+    "CARGO_",
+    "RUSTUP_",
+    "RUSTC_",
+    "OPENSSL_",
+    "MALLOC_",
+    # Shadowing credential/processus : un Vault compromis ne doit pas
+    # écraser la credential du fils via `{**os.environ, **injected}`.
+    "HEIMDALL_",
+    # Gestionnaires de runtimes/paquets (LOW) : redirection d'installations
+    # ou d'interpréteurs via l'enfant (BUN_/DENO_/UV_/PIP_/BUNDLE_/GEM_/CONDA_).
+    "BUN_",
+    "DENO_",
+    "UV_",
+    "PIP_",
+    "BUNDLE_",
+    "GEM_",
+    "CONDA_",
+)
+
+
+def is_dangerous_env_var(name: str) -> bool:
+    """Vrai si un nom de variable est dangereux pour l'exécution d'un processus."""
+    upper = name.upper()
+    if upper in DANGEROUS_ENV_EXACT:
+        return True
+    return any(upper.startswith(prefix) for prefix in DANGEROUS_ENV_PREFIXES)
+
+
+def validate_variable_name(name: object) -> str:
+    """Valide un nom proposé (LLM : entrée non fiable) ; lève ``TemplateError`` sinon.
+
+    Grammaire fermée ``^[A-Z][A-Z0-9_]{1,63}$`` (donc sans retour à la ligne
+    ni injection ``.env`` possible) + denylist système. Erreur statique,
+    jamais de reflet de l'entrée.
+    """
+    if not isinstance(name, str):
+        raise TemplateError
+    if _VARIABLE.fullmatch(name) is None:
+        raise TemplateError
+    if is_dangerous_env_var(name):
+        raise TemplateError
+    return name
+
+
+def deduplicate_variable_name(desired: str, taken: Iterable[str]) -> str:
+    """Rend un nom validé unique en ajoutant ``_2``, ``_3``… si besoin.
+
+    ``desired`` est d'abord validé (donc un nom dangereux ou mal formé est
+    rejeté, jamais « corrigé » en un autre nom). La recherche est bornée par
+    la longueur maximale : un suffixe qui dépasserait lève ``TemplateError``.
+    """
+    base = validate_variable_name(desired)
+    used = set(taken)
+    if base not in used:
+        return base
+    for n in itertools.count(2):
+        candidate = f"{base}_{n}"
+        if len(candidate) > _MAX_NAME_LENGTH:
+            raise TemplateError
+        if candidate in used or is_dangerous_env_var(candidate):
+            continue
+        return candidate
+    raise TemplateError  # Inatteignable : la borne de longueur garantit la sortie

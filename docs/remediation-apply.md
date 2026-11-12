@@ -1,0 +1,83 @@
+# Validation, application atomique et garde de chemin — T30.2/T30.3/T30.4 (#84/#85/#86)
+
+Tickets : [#84](https://github.com/Cezar277/heimdall/issues/84),
+[#85](https://github.com/Cezar277/heimdall/issues/85),
+[#86](https://github.com/Cezar277/heimdall/issues/86), parent
+[#30](https://github.com/Cezar277/heimdall/issues/30).
+
+`heimdall.remediation.naming` valide les noms de variables proposés par le
+LLM (entrée non fiable) et dédoublonne (`_2`, `_3`…). `heimdall.remediation.apply`
+applique un `ReplacementPlan` sur disque de façon atomique, sous garde de
+chemin anti-traversée.
+
+## Validation des noms (T30.2, #84)
+
+```python
+from heimdall.remediation import deduplicate_variable_name, validate_variable_name
+
+name = validate_variable_name(proposal)  # lève TemplateError si invalide
+final = deduplicate_variable_name(name, taken)  # {"APP_KEY"} -> "APP_KEY_2"
+```
+
+- Grammaire fermée `^[A-Z][A-Z0-9_]{1,63}$` (identique aux grammaires
+  historiques de `templates`, de la CLI `review` et du client Vault —
+  un test fige leur équivalence) : pas de retour à la ligne, donc pas
+  d'injection de lignes dans le `.env`.
+- Denylist système (`PATH`, `LD_PRELOAD`, `PYTHONPATH`, préfixes `LD_`,
+  `PYTHON`, `HEIMDALL_`…) : source unique ici, réutilisée par
+  `heimdall vault` (`cli/vault_client.py` délègue à ce module, sans copie
+  qui divergerait).
+- `deduplicate_variable_name` refuse (`TemplateError`) plutôt que tronquer
+  quand aucun suffixe ne tient dans 64 caractères.
+
+## Application atomique (T30.3, #85)
+
+```python
+from pathlib import Path
+from heimdall.remediation import apply_replacement, undo_apply
+
+receipt = apply_replacement(Path("dépôt"), plan)  # lève ApplyError sinon
+# ...
+undo_apply(Path("dépôt"), receipt)  # restaure la sauvegarde
+```
+
+- Le fichier courant est relu sans suivre les liens (`O_NOFOLLOW`, fichier
+  régulier, borne 1 Mio, UTF-8 strict) puis comparé à `plan.before` :
+  un fichier modifié depuis le plan (**STALE**) n'est jamais écrasé.
+- Sauvegarde préalable (`<fichier>.bak`, mode `0600` — elle contient le
+  secret), puis écriture via `vault.atomic.write_file_atomic` (temporaire +
+  `fsync` + `os.replace` atomique, aucun fichier à moitié écrit).
+- Les permissions d'origine sont conservées (`fchmod` explicite, pas le
+  `0600` par défaut des secrets du Vault).
+- `undo_apply` ne restaure que si le fichier vaut encore `receipt.after`
+  (sinon `ApplyError`, sans toucher au fichier) ; la sauvegarde est
+  conservée, un second `undo` échoue donc sur le contrôle snapshot.
+- `AppliedPatch` n'embarque ni `before` (secret) ni contenu sensible :
+  `repr()` sûr, comme `ReplacementPlan`.
+
+## Garde de chemin (T30.4, #86)
+
+`apply_replacement` / `undo_apply` confinent `plan.file` avec
+`mcp.paths.confine` (la garde unique du ticket #27.3.1 : `resolve()` +
+`is_relative_to`, refus des absolus et des liens sortants), réutilisée
+telle quelle, jamais recopiée. Sont refusés (`ApplyError`, rien n'est
+écrit) : `../`, chemins absolus, liens symboliques sortants.
+
+## Sécurité
+
+- **Aucune exécution** du code scanné, aucun réseau, aucun shell.
+- **Aucune fuite** : messages d'erreur statiques (`ApplyError` unique, sans
+  reflet de l'entrée), `repr()` sans secret, sauvegarde en `0600`.
+- **Fail-closed partout** : plan manuel, fichier absent/modifié/déjà
+  restauré, garde de chemin, écriture impossible → `ApplyError`, le
+  fichier d'origine reste intact (vérifié : pas de `.tmp.*` résiduel).
+
+## Tests
+
+```bash
+.venv/bin/pytest -q tests/test_remediation_naming.py tests/test_remediation_apply.py
+```
+
+`tests/test_remediation_naming.py` (T30.2) et
+`tests/test_remediation_apply.py` (T30.3/#86) travaillent sur `tmp_path`
+uniquement ; valeurs toutes synthétiques.
