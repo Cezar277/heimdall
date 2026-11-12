@@ -1992,19 +1992,22 @@ def transition_secret(  # noqa: PLR0913
     }
 
 
-def list_secret_transitions(
+def _list_secret_transitions(
     conn: sqlite3.Connection,
     project_id: str,
     env: str,
     name: str,
     limit: int = DEFAULT_TRANSITION_LIST_LIMIT,
 ) -> list[dict[str, str]]:
-    """Liste les transitions d'un secret, de la plus ancienne à la plus récente.
+    """Lecture interne/test-only du journal, de la plus ancienne à la plus récente.
 
     Aucune valeur, empreinte ou clé brute n'est exposée : uniquement l'acteur
     interne normalisé, l'horodatage et les états canoniques. La limite est
     bornée (1..1000) pour empêcher une lecture non bornée du journal. Le filtre
     ``project_id`` empêche toute lecture inter-projets.
+
+    Cette fonction n'est branchée sur aucune route HTTP : elle sert aux stores
+    et aux diagnostics de tests. Le préfixe privé matérialise cette frontière.
     """
     validate_transition_list_limit(limit)
     rows = conn.execute(
@@ -2018,7 +2021,14 @@ def list_secret_transitions(
     return [dict(row) for row in rows]
 
 
-def delete_all_secret_transitions(conn: sqlite3.Connection) -> int:
-    """Supprime tout le journal de transitions (réinitialisation de tests)."""
+def _delete_all_secret_transitions(conn: sqlite3.Connection) -> int:
+    """Réinitialisation **test-only** de tout le journal de transitions.
+
+    Le préfixe privé et cette documentation matérialisent l'interdiction de
+    tout branchement HTTP : une suppression globale du journal détruirait la
+    traçabilité (répudiation) de tous les projets. Seul le reset de tests
+    ``SqliteSecretStore._clear()`` appelle cette fonction ; aucune route
+    publique ne doit l'importer ni l'exposer.
+    """
     cursor = conn.execute("DELETE FROM secret_transitions")
     return cursor.rowcount

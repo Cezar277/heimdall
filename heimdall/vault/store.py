@@ -47,9 +47,10 @@ from heimdall.vault.database import (
     PERSISTED_STATUSES,
     DatabaseUnavailableError,
     KekVersionError,
+    _delete_all_secret_transitions,
+    _list_secret_transitions,
     count_secrets,
     create_secret,
-    delete_all_secret_transitions,
     delete_all_secrets,
     delete_secret,
     ensure_project,
@@ -57,7 +58,6 @@ from heimdall.vault.database import (
     get_secret,
     init_db,
     list_secret_page,
-    list_secret_transitions,
     normalize_transition_actor,
     rotate_secrets_kek,
     transition_secret,
@@ -292,6 +292,16 @@ class InMemorySecretStore:
             if journal is None:
                 journal = deque(maxlen=MAX_SECRET_TRANSITIONS)
                 self._transitions[project] = journal
+            if journal.maxlen is not None and len(journal) >= journal.maxlen:
+                # Alerte d'exploitation alignée sur le backend SQLite : une
+                # inondation locale au projet évince l'entrée la plus ancienne
+                # sans journaliser de valeur, d'empreinte ou de clé.
+                logger.warning(
+                    "Rétention du journal de transitions : %d entrée(s) purgée(s) "
+                    "pour le projet %s.",
+                    1,
+                    project,
+                )
             journal.append(
                 {
                     "project": project,
@@ -320,7 +330,12 @@ class InMemorySecretStore:
         name: str,
         limit: int = DEFAULT_TRANSITION_LIST_LIMIT,
     ) -> list[dict[str, str]]:
-        """Liste les transitions d'un secret, de la plus ancienne à la plus récente."""
+        """Lecture interne/test-only du journal, jamais exposée par HTTP.
+
+        Aucune route de production ne doit appeler cette méthode : elle sert
+        aux stores et aux diagnostics de tests, avec un filtre projet et une
+        limite bornée.
+        """
         validate_transition_list_limit(limit)
         async with self._lock:
             return [
@@ -330,6 +345,7 @@ class InMemorySecretStore:
             ][:limit]
 
     async def clear(self) -> None:
+        """Réinitialisation **test-only** du store (jamais exposée par HTTP)."""
         async with self._lock:
             self._secrets.clear()
             self._project_counts.clear()
@@ -581,12 +597,13 @@ class SqliteSecretStore:
         }
 
     async def clear(self) -> None:
+        """Réinitialisation **test-only** du store (jamais exposée par HTTP)."""
         await asyncio.to_thread(self._clear)
 
     def _clear(self) -> None:
         with db_session(self._db_path) as conn:
             delete_all_secrets(conn)
-            delete_all_secret_transitions(conn)
+            _delete_all_secret_transitions(conn)
 
     async def delete(self, project: str, env: str, name: str) -> bool:
         """Supprime sous transaction SQLite, partagée entre workers."""
@@ -655,7 +672,7 @@ class SqliteSecretStore:
         name: str,
         limit: int = DEFAULT_TRANSITION_LIST_LIMIT,
     ) -> list[dict[str, str]]:
-        """Liste le journal borné des transitions d'un secret (SQLite)."""
+        """Lecture interne/test-only du journal borné (SQLite), sans route HTTP."""
         validate_transition_list_limit(limit)
         return await asyncio.to_thread(
             self._list_transitions,
@@ -673,7 +690,7 @@ class SqliteSecretStore:
         limit: int,
     ) -> list[dict[str, str]]:
         with db_session(self._db_path) as conn:
-            return list_secret_transitions(conn, project, env, name, limit)
+            return _list_secret_transitions(conn, project, env, name, limit)
 
     async def rotate_kek(
         self,

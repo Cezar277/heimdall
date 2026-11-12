@@ -15,6 +15,7 @@ Preuves couvertes :
 
 import asyncio
 import inspect
+import logging
 import sqlite3
 import threading
 from collections import deque
@@ -345,6 +346,52 @@ def test_sqlite_journal_is_bounded(
         assert await store.list_transitions(_PROJECT, _ENV, "DEMO_1") == []
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_journal_purge_emits_warning_without_secret(
+    backend: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Une éviction mémoire ou SQLite alerte sans journaliser de secret."""
+    monkeypatch.setattr(store_module, "MAX_SECRET_TRANSITIONS", 2)
+    monkeypatch.setattr(database_module, "MAX_SECRET_TRANSITIONS", 2)
+
+    async def scenario() -> None:
+        store: InMemorySecretStore | SqliteSecretStore
+        if backend == "memory":
+            store = InMemorySecretStore()
+        else:
+            store = SqliteSecretStore(tmp_path / "vault.db", VaultCipher.generate())
+        for index in range(3):
+            name = f"DEMO_{index}"
+            await store.create(_PROJECT, _ENV, name, _CANARY)
+            assert await store.transition(_PROJECT, _ENV, name, "rote") is not None
+        await store.clear()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+
+    purge_records = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "Rétention du journal de transitions" in record.getMessage()
+    ]
+    assert len(purge_records) == 1
+    assert _PROJECT in purge_records[0].getMessage()
+    assert _CANARY not in caplog.text
+    assert "key_" not in caplog.text
+
+
+def test_journal_maintenance_helpers_are_private_test_only() -> None:
+    """Le journal ne doit être lisible/supprimable que par des helpers privés."""
+    assert not hasattr(database_module, "list_secret_transitions")
+    assert not hasattr(database_module, "delete_all_secret_transitions")
+    assert database_module._list_secret_transitions.__name__.startswith("_")
+    assert database_module._delete_all_secret_transitions.__name__.startswith("_")
 
 
 def test_journal_listing_is_bounded() -> None:

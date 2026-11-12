@@ -467,8 +467,11 @@ n'a pas de clé étrangère vers `secrets`, afin que l'historique reste
 consultable après suppression ; sa rétention est bornée **par projet** à
 `MAX_SECRET_TRANSITIONS` (10 000 entrées les plus récentes). Une inondation
 d'un projet ne peut donc pas évincer le journal d'un autre projet, et chaque
-purge locale émet un avertissement d'exploitation. Aucune route HTTP n'expose
-ce journal : il est réservé aux stores et aux outils internes.
+purge locale (SQLite via `logger.warning`, mémoire via `logger.warning` dans le
+`deque` borné) émet un avertissement d'exploitation. Aucune route HTTP n'expose
+ce journal : les helpers de lecture (`database._list_secret_transitions`) et de
+reset (`database._delete_all_secret_transitions`) sont privés, réservés aux
+stores et aux diagnostics de tests.
 
 La lecture d'une valeur (`GET /api/v1/secrets/{project}/{env}/{name}`)
 canonicalise le statut persisté avant la garde : un statut corrompu (casse,
