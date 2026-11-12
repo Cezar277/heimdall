@@ -35,27 +35,42 @@ import copy
 import logging
 import sqlite3
 import unicodedata
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 from heimdall.vault.crypto import VaultCipher, VaultCipherError
 from heimdall.vault.database import (
+    DEFAULT_TRANSITION_LIST_LIMIT,
     MAX_KEK_VERSION,
+    MAX_SECRET_TRANSITIONS,
+    PERSISTED_STATUSES,
     DatabaseUnavailableError,
     KekVersionError,
     count_secrets,
     create_secret,
+    delete_all_secret_transitions,
     delete_all_secrets,
     delete_secret,
     ensure_project,
+    get_iso_timestamp,
     get_secret,
     init_db,
     list_secret_page,
+    list_secret_transitions,
+    normalize_transition_actor,
     rotate_secrets_kek,
+    transition_secret,
     validate_kek_version,
     validate_secret_page_bounds,
+    validate_transition_list_limit,
 )
 from heimdall.vault.database import runtime_db_session as db_session
+from heimdall.vault.transitions import (
+    InvalidTransitionError,
+    canonicalize_state,
+    validate_transition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +158,10 @@ class InMemorySecretStore:
     ) -> None:
         self._secrets: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._project_counts: dict[str, int] = {}
+        # Journal borné PAR PROJET des transitions d'état (#117), le plus
+        # ancien en tête. Une inondation dans un projet ne peut pas évincer le
+        # journal d'un autre projet.
+        self._transitions: dict[str, deque[dict[str, str]]] = {}
         # Cache de l'ordre (env, name) par projet, invalidé à chaque mutation.
         self._sorted_keys_by_project: dict[str, list[tuple[str, str, str]]] = {}
         self._lock = asyncio.Lock()
@@ -237,11 +256,85 @@ class InMemorySecretStore:
                 for key in keys[offset : offset + limit]
             ]
 
+    async def transition(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        target_status: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, str] | None:
+        """Change l'état d'un secret et journalise la transition (#117).
+
+        L'état source est lu dans le store, jamais fourni par le client. La
+        matrice #115 est appliquée avant toute mutation ; seule une cible
+        persistable (``vaulte``/``rote``) est écrite. Le journal est borné par
+        projet et ne contient ni valeur, ni empreinte, ni clé API brute.
+        """
+        target = canonicalize_state(target_status)
+        async with self._lock:
+            record = self._secrets.get((project, env, name))
+            if record is None:
+                return None
+            previous = canonicalize_state(record.get("status"))
+            validate_transition(previous, target)
+            if target not in PERSISTED_STATUSES:
+                raise InvalidTransitionError(
+                    previous,
+                    target,
+                    "État cible non persistable dans le Vault.",
+                )
+            occurred_at = get_iso_timestamp()
+            safe_actor = normalize_transition_actor(actor)
+            record["status"] = target
+            journal = self._transitions.get(project)
+            if journal is None:
+                journal = deque(maxlen=MAX_SECRET_TRANSITIONS)
+                self._transitions[project] = journal
+            journal.append(
+                {
+                    "project": project,
+                    "env": env,
+                    "name": name,
+                    "actor": safe_actor,
+                    "occurred_at": occurred_at,
+                    "previous_status": previous,
+                    "status": target,
+                }
+            )
+            return {
+                "project": project,
+                "env": env,
+                "name": name,
+                "previous_status": previous,
+                "status": target,
+                "actor": safe_actor,
+                "occurred_at": occurred_at,
+            }
+
+    async def list_transitions(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        limit: int = DEFAULT_TRANSITION_LIST_LIMIT,
+    ) -> list[dict[str, str]]:
+        """Liste les transitions d'un secret, de la plus ancienne à la plus récente."""
+        validate_transition_list_limit(limit)
+        async with self._lock:
+            return [
+                dict(entry)
+                for entry in self._transitions.get(project, ())
+                if entry["env"] == env and entry["name"] == name
+            ][:limit]
+
     async def clear(self) -> None:
         async with self._lock:
             self._secrets.clear()
             self._project_counts.clear()
             self._sorted_keys_by_project.clear()
+            self._transitions.clear()
 
     async def rotate_kek(
         self,
@@ -493,6 +586,7 @@ class SqliteSecretStore:
     def _clear(self) -> None:
         with db_session(self._db_path) as conn:
             delete_all_secrets(conn)
+            delete_all_secret_transitions(conn)
 
     async def delete(self, project: str, env: str, name: str) -> bool:
         """Supprime sous transaction SQLite, partagée entre workers."""
@@ -510,6 +604,76 @@ class SqliteSecretStore:
     def _list_page(self, project: str, limit: int, offset: int) -> list[dict[str, str]]:
         with db_session(self._db_path) as conn:
             return list_secret_page(conn, project, limit, offset)
+
+    async def transition(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        target_status: str,
+        *,
+        actor: str | None = None,
+    ) -> dict[str, str] | None:
+        """Change l'état d'un secret et journalise la transition (#117, SQLite).
+
+        L'état source est relu dans la même transaction ``BEGIN IMMEDIATE`` que
+        l'UPDATE et l'INSERT du journal : la transition est atomique entre
+        workers, et un état modifié concurrentement fait échouer le
+        compare-and-set plutôt que de produire un journal incohérent.
+        """
+        return await asyncio.to_thread(
+            self._transition,
+            project,
+            env,
+            name,
+            target_status,
+            actor,
+        )
+
+    def _transition(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        target_status: str,
+        actor: str | None,
+    ) -> dict[str, str] | None:
+        with db_session(self._db_path) as conn:
+            return transition_secret(
+                conn,
+                project,
+                env,
+                name,
+                target_status,
+                actor=actor,
+            )
+
+    async def list_transitions(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        limit: int = DEFAULT_TRANSITION_LIST_LIMIT,
+    ) -> list[dict[str, str]]:
+        """Liste le journal borné des transitions d'un secret (SQLite)."""
+        validate_transition_list_limit(limit)
+        return await asyncio.to_thread(
+            self._list_transitions,
+            project,
+            env,
+            name,
+            limit,
+        )
+
+    def _list_transitions(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        limit: int,
+    ) -> list[dict[str, str]]:
+        with db_session(self._db_path) as conn:
+            return list_secret_transitions(conn, project, env, name, limit)
 
     async def rotate_kek(
         self,

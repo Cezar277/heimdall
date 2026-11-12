@@ -255,6 +255,70 @@ paths:
           $ref: '#/components/responses/Unavailable'
         default:
           $ref: '#/components/responses/UnexpectedError'
+  /api/v1/secrets/{project}/{env}/{name}/transition:
+    parameters:
+      - $ref: '#/components/parameters/Project'
+      - $ref: '#/components/parameters/Environment'
+      - $ref: '#/components/parameters/Name'
+    post:
+      tags: [Secrets]
+      operationId: transitionSecret
+      summary: Changer l'état d'un secret
+      description: >-
+        Même contrôle d'accès que la lecture et la suppression. Le client ne
+        fournit QUE l'état cible ; l'état source est toujours lu côté serveur.
+        La matrice #115 est appliquée fail-closed : toute transition non
+        autorisée, réflexive ou fondée sur un état inconnu retourne 400 avec un
+        message statique. Seuls les états persistables vaulte et rote peuvent
+        être écrits, donc la seule transition API actuellement acceptée est
+        vaulte vers rote. La transition et son entrée de journal (acteur,
+        horodatage, ancien état, nouvel état) sont atomiques. La réponse ne
+        contient jamais la valeur, l'empreinte, la clé ni l'acteur. Après
+        passage à rote, la lecture de l'ancienne valeur retourne 404.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SecretTransitionRequest'
+            example:
+              target_status: rote
+      responses:
+        '200':
+          description: >-
+            Transition acceptée : ancien et nouvel états canoniques, sans
+            valeur ni secret.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretTransitionResult'
+              example:
+                project: demo
+                env: dev
+                name: DEMO_PASSWORD
+                previous_status: vaulte
+                status: rote
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
   /api/v1/health:
     get:
       tags: [Health]
@@ -476,6 +540,34 @@ components:
       type: string
       enum: [vaulte, rote]
       description: États persistés ; detecte, confirme et faux_positif restent côté client.
+    SecretLifecycleState:
+      type: string
+      enum: [detecte, confirme, vaulte, rote, faux_positif]
+      description: >-
+        États formels du cycle de vie (#115). Seuls vaulte et rote sont
+        persistables dans le Vault ; les autres cibles sont refusées 400.
+    SecretTransitionRequest:
+      type: object
+      additionalProperties: false
+      required: [target_status]
+      properties:
+        target_status:
+          $ref: '#/components/schemas/SecretLifecycleState'
+    SecretTransitionResult:
+      type: object
+      additionalProperties: false
+      required: [project, env, name, previous_status, status]
+      properties:
+        project:
+          $ref: '#/components/schemas/ProjectId'
+        env:
+          $ref: '#/components/schemas/EnvironmentId'
+        name:
+          $ref: '#/components/schemas/SecretName'
+        previous_status:
+          $ref: '#/components/schemas/SecretStatus'
+        status:
+          $ref: '#/components/schemas/SecretStatus'
     SecretValue:
       type: string
       minLength: 1
