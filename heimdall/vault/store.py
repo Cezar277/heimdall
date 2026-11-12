@@ -38,7 +38,12 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from heimdall.vault.crypto import VaultCipher, VaultCipherError, constant_time_equal
+from heimdall.vault.crypto import (
+    VaultCipher,
+    VaultCipherError,
+    canonicalize_secret_value,
+    constant_time_equal,
+)
 from heimdall.vault.database import (
     MAX_KEK_VERSION,
     DatabaseUnavailableError,
@@ -273,7 +278,7 @@ class InMemorySecretStore:
         project: str,
         env: str,
         name: str,
-        candidate_value: str,
+        candidate_value: str | bytes,
     ) -> bool:
         """Vérifie en temps constant si candidate_value correspond au secret stocké.
 
@@ -295,11 +300,7 @@ class InMemorySecretStore:
                 "la KEK, la rotation de clé invalide les empreintes."
             )
         aad = VaultCipher.aad(project, env, name)
-        candidate_val_bytes = (
-            unicodedata.normalize("NFC", candidate_value).encode("utf-8")
-            if isinstance(candidate_value, str)
-            else bytes(candidate_value)
-        )
+        candidate_val_bytes = canonicalize_secret_value(candidate_value)
         candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
         async with self._lock:
             if self._server_hmac_canary is not None:
@@ -333,7 +334,7 @@ class InMemorySecretStore:
     async def find_secrets_matching_value(
         self,
         project: str,
-        candidate_value: str,
+        candidate_value: str | bytes,
         env: str | None = None,
     ) -> list[dict[str, str]]:
         """Trouve les métadonnées des secrets d'un projet correspondant à candidate_value.
@@ -353,11 +354,7 @@ class InMemorySecretStore:
                 "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
                 "la KEK, la rotation de clé invalide les empreintes."
             )
-        candidate_val_bytes = (
-            unicodedata.normalize("NFC", candidate_value).encode("utf-8")
-            if isinstance(candidate_value, str)
-            else bytes(candidate_value)
-        )
+        candidate_val_bytes = canonicalize_secret_value(candidate_value)
         results: list[dict[str, str]] = []
         async with self._lock:
             if self._server_hmac_canary is not None and not constant_time_equal(
@@ -436,13 +433,13 @@ class InMemorySecretStore:
                         "Les empreintes stockées sont invalidées (refus fail-closed pour interdire "
                         "tout faux négatif)."
                     )
-            elif any(
-                str(r.get("fingerprint") or "") for r in self._secrets.values()
-            ):
+            elif self._secrets:
                 raise VaultCipherError(
-                    "Le store contient des empreintes générées en mode dérivé "
-                    "(sans canari explicite). La recherche par empreinte sous clé explicite "
-                    "est refusée (fail-closed). Une migration des empreintes est requise."
+                    "Le store contient des secrets créés sans canari explicite "
+                    "(mode dérivé ou lignes héritées sans empreinte). La recherche "
+                    "par empreinte sous clé explicite est indéfinie pour ces lignes "
+                    "et refusée (fail-closed) pour interdire tout faux négatif. "
+                    "Une migration des empreintes est requise."
                 )
             results = [
                 {
@@ -770,7 +767,7 @@ class SqliteSecretStore:
         project: str,
         env: str,
         name: str,
-        candidate_value: str,
+        candidate_value: str | bytes,
     ) -> bool:
         """Vérifie en temps constant si candidate_value correspond au secret stocké.
 
@@ -803,7 +800,7 @@ class SqliteSecretStore:
         project: str,
         env: str,
         name: str,
-        candidate_value: str,
+        candidate_value: str | bytes,
     ) -> bool:
         if not isinstance(candidate_value, (str, bytes, bytearray)):
             raise TypeError("La valeur candidate doit être de type str ou bytes.")
@@ -812,11 +809,7 @@ class SqliteSecretStore:
         if not candidate_value:
             return False
         aad = VaultCipher.aad(project, env, name)
-        candidate_val_bytes = (
-            unicodedata.normalize("NFC", candidate_value).encode("utf-8")
-            if isinstance(candidate_value, str)
-            else bytes(candidate_value)
-        )
+        candidate_val_bytes = canonicalize_secret_value(candidate_value)
         candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
         with db_session(self._db_path) as conn:
             persisted_canary = get_server_hmac_canary(conn)
@@ -854,7 +847,7 @@ class SqliteSecretStore:
     async def find_secrets_matching_value(
         self,
         project: str,
-        candidate_value: str,
+        candidate_value: str | bytes,
         env: str | None = None,
     ) -> list[dict[str, str]]:
         """Trouve les métadonnées des secrets d'un projet correspondant à candidate_value.
@@ -884,18 +877,14 @@ class SqliteSecretStore:
     def _find_secrets_matching_value(
         self,
         project: str,
-        candidate_value: str,
+        candidate_value: str | bytes,
         env: str | None = None,
     ) -> list[dict[str, str]]:
         if not isinstance(candidate_value, (str, bytes, bytearray)):
             raise TypeError("La valeur candidate doit être de type str ou bytes.")
         if not candidate_value:
             return []
-        candidate_val_bytes = (
-            unicodedata.normalize("NFC", candidate_value).encode("utf-8")
-            if isinstance(candidate_value, str)
-            else bytes(candidate_value)
-        )
+        candidate_val_bytes = canonicalize_secret_value(candidate_value)
         with db_session(self._db_path) as conn:
             persisted_canary = get_server_hmac_canary(conn)
             if persisted_canary is not None and not constant_time_equal(
@@ -986,15 +975,14 @@ class SqliteSecretStore:
                     )
             else:
                 cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT 1 FROM secrets "
-                    "WHERE fingerprint IS NOT NULL AND fingerprint != '' LIMIT 1"
-                )
+                cursor.execute("SELECT 1 FROM secrets LIMIT 1")
                 if cursor.fetchone() is not None:
                     raise VaultCipherError(
-                        "La base de données contient des empreintes générées en mode dérivé "
-                        "(sans canari explicite). La recherche par empreinte sous clé explicite "
-                        "est refusée (fail-closed). Une migration des empreintes est requise."
+                        "La base de données contient des secrets créés sans canari explicite "
+                        "(mode dérivé ou lignes héritées sans empreinte). La recherche par "
+                        "empreinte sous clé explicite est indéfinie pour ces lignes et refusée "
+                        "(fail-closed) pour interdire tout faux négatif. Une migration des "
+                        "empreintes est requise."
                     )
             return find_secrets_by_fingerprint(conn, project, fingerprint, env=env)
 

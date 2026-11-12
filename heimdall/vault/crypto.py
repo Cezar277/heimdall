@@ -313,6 +313,30 @@ def server_hmac_key_matches_master_key(
     return False
 
 
+def canonicalize_secret_value(value: str | bytes | bytearray) -> bytes:
+    """Canonicalise une valeur secrète en octets UTF-8 NFC (ticket #116).
+
+    Les chaînes sont normalisées en NFC puis encodées en UTF-8. Les octets
+    UTF-8 valides sont décodés, normalisés en NFC puis ré-encodés : un candidat
+    ``bytes`` en forme décomposée (NFD) produit ainsi la même empreinte que sa
+    forme ``str`` équivalente. Les octets non-UTF8 (données binaires brutes)
+    sont conservés tels quels pour rester compatibles avec les secrets binaires.
+    """
+    if not isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("La valeur du secret doit être de type str ou bytes.")
+    if isinstance(value, str):
+        try:
+            return unicodedata.normalize("NFC", value).encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("La valeur du secret doit être encodable en UTF-8.") from None
+    raw = bytes(value)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    return unicodedata.normalize("NFC", text).encode("utf-8")
+
+
 def compute_secret_hmac(
     server_key: str | bytes,
     value: str | bytes,
@@ -334,19 +358,9 @@ def compute_secret_hmac(
       Si fourni, préfixé avec un octet NUL pour lier l'empreinte au triplet spécifique.
     """
     key_bytes = _normalize_server_hmac_key(server_key)
-    if not isinstance(value, (str, bytes, bytearray)):
-        raise TypeError("La valeur du secret doit être de type str ou bytes.")
-    if isinstance(value, str):
-        if not value:
-            raise ValueError("La valeur du secret ne peut pas être vide.")
-        try:
-            value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")
-        except UnicodeEncodeError:
-            raise ValueError("La valeur du secret doit être encodable en UTF-8.") from None
-    else:
-        value_bytes = bytes(value)
-        if not value_bytes:
-            raise ValueError("La valeur du secret ne peut pas être vide.")
+    value_bytes = canonicalize_secret_value(value)
+    if not value_bytes:
+        raise ValueError("La valeur du secret ne peut pas être vide.")
 
     if aad is not None:
         aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
@@ -1090,12 +1104,7 @@ class VaultCipher:
             aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
             if not aad_bytes:
                 raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
-            val_bytes = (
-                unicodedata.normalize("NFC", value).encode("utf-8")
-                if isinstance(value, str)
-                else bytes(value)
-            )
-            candidate_fp = self.fingerprint(val_bytes, aad=aad_bytes)
+            candidate_fp = self.fingerprint(canonicalize_secret_value(value), aad=aad_bytes)
             return constant_time_equal(candidate_fp, expected_fingerprint)
         direct_fp = self.compute_secret_hmac(value)
         return constant_time_equal(direct_fp, expected_fingerprint)

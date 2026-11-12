@@ -17,6 +17,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import importlib.util
+import re
+import sys
 import tempfile
 import unicodedata
 from pathlib import Path
@@ -757,6 +760,75 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             matches_sql_nfd = await sql_store.find_secrets_matching_value("demo", nfd_cafe)
             self.assertEqual({m["name"] for m in matches_sql_nfd}, {"CAFE_NFD", "CAFE_NFC"})
 
+    async def test_nfc_parity_bytes_candidates_memory_and_sqlite(self) -> None:
+        """Parité str/bytes : un candidat bytes UTF-8 NFD égale la forme NFC stockée."""
+        nfc_cafe = "caf\u00e9"
+        nfd_bytes = "cafe\u0301".encode("utf-8")
+        self.assertNotEqual(nfd_bytes, nfc_cafe.encode("utf-8"))
+
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        aad = VaultCipher.aad("demo", "prod", "CAFE")
+
+        # 1. Cipher : avec et sans AAD, le candidat bytes NFD correspond au HMAC calculé
+        # depuis la forme str NFC.
+        fp_with_aad = cipher.compute_secret_hmac(nfc_cafe, aad=aad)
+        self.assertTrue(
+            cipher.is_secret_value_matching(nfd_bytes, fp_with_aad, aad=aad)
+        )
+        fp_without_aad = cipher.compute_secret_hmac(nfc_cafe)
+        self.assertTrue(cipher.is_secret_value_matching(nfd_bytes, fp_without_aad))
+
+        # 2. Mémoire : création NFC, vérification et recherche avec bytes NFD.
+        mem_store = InMemorySecretStore(cipher=cipher)
+        await mem_store.create("demo", "prod", "CAFE", nfc_cafe)
+        self.assertTrue(
+            await mem_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_bytes)
+        )
+        mem_matches = await mem_store.find_secrets_matching_value("demo", nfd_bytes)
+        self.assertEqual([m["name"] for m in mem_matches], ["CAFE"])
+
+        # 3. SQLite : parité stricte.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            await sql_store.create("demo", "prod", "CAFE", nfc_cafe)
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_bytes)
+            )
+            sql_matches = await sql_store.find_secrets_matching_value("demo", nfd_bytes)
+            self.assertEqual([m["name"] for m in sql_matches], ["CAFE"])
+
+        # 4. Parité sur les lignes héritées sans empreinte (repli déchiffrement transparent)
+        mem_store._secrets[("demo", "prod", "CAFE")]["fingerprint"] = ""
+        self.assertTrue(
+            await mem_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_bytes)
+        )
+        mem_legacy_matches = await mem_store.find_secrets_matching_value("demo", nfd_bytes)
+        self.assertEqual([m["name"] for m in mem_legacy_matches], ["CAFE"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            await sql_store.create("demo", "prod", "CAFE", nfc_cafe)
+            with db_session(db_path) as conn:
+                conn.execute(
+                    "UPDATE secrets SET fingerprint = '' WHERE project_id = ? AND name = ?",
+                    ("demo", "CAFE"),
+                )
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_bytes)
+            )
+            sql_legacy_matches = await sql_store.find_secrets_matching_value("demo", nfd_bytes)
+            self.assertEqual([m["name"] for m in sql_legacy_matches], ["CAFE"])
+
+        # 5. Direct verify_secret_hmac API
+        self.assertTrue(cipher.verify_secret_hmac(nfd_bytes, fp_with_aad, aad=aad))
+        self.assertTrue(cipher.verify_secret_hmac(nfd_bytes, fp_without_aad))
+        self.assertTrue(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, nfd_bytes, fp_without_aad))
+        self.assertTrue(
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, nfd_bytes, fp_with_aad, aad=aad)
+        )
+
     async def test_corrupted_fingerprint_in_database_handled_safely(self) -> None:
         """Une empreinte corrompue bascule sur le repli déchiffrement sans faux négatif."""
         corrupted_fps = [
@@ -1042,6 +1114,35 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             )
             with self.assertRaises(VaultCipherError):
                 await sql_store2.find_secrets_by_fingerprint("demo", fp)
+
+    async def test_find_secrets_by_fingerprint_fails_closed_on_legacy_only_store(self) -> None:
+        """Base 100 % héritée (fingerprint vide) : refus fail-closed, jamais [] silencieux."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        fingerprint = "a" * 64
+
+        # 1. Mémoire : store vide -> [], puis store non vide sans canari ni empreinte -> refus.
+        mem_store = InMemorySecretStore(cipher=cipher)
+        self.assertEqual(await mem_store.find_secrets_by_fingerprint("demo", fingerprint), [])
+        await mem_store.create("demo", "prod", "LEGACY_MEM", "legacy_val")
+        mem_store._secrets[("demo", "prod", "LEGACY_MEM")]["fingerprint"] = ""
+        mem_store._server_hmac_canary = None
+        with self.assertRaises(VaultCipherError):
+            await mem_store.find_secrets_by_fingerprint("demo", fingerprint)
+
+        # 2. SQLite : base vide -> [], puis lignes héritées sans canari -> refus.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            self.assertEqual(await sql_store.find_secrets_by_fingerprint("demo", fingerprint), [])
+            await sql_store.create("demo", "prod", "LEGACY_SQL", "legacy_val")
+            with db_session(db_path) as conn:
+                conn.execute("DELETE FROM server_hmac_canary")
+                conn.execute(
+                    "UPDATE secrets SET fingerprint = '' WHERE project_id = ?",
+                    ("demo",),
+                )
+            with self.assertRaises(VaultCipherError):
+                await sql_store.find_secrets_by_fingerprint("demo", fingerprint)
 
     async def test_stores_reject_empty_identity_triplet(self) -> None:
         """Les stores refusent un triplet d'identité vide avec ValueError."""
@@ -1472,3 +1573,97 @@ class KeyLeakHuntTests(TestCase):
 
         cipher = VaultCipher(b"K" * 32, server_hmac_key=canary)
         self.assertNotIn(canary, repr(cipher))
+
+
+class SammProofLineIntegrityTests(TestCase):
+    """Vérification mécanique de l'intégrité des preuves et permaliens SAMM (#116)."""
+
+    def test_t116_samm_sheet_permalinks_and_line_references_valid(self) -> None:
+        """Chaque permalien de docs/t116-samm.md pointe vers une tranche de code existante."""
+        repo_root = Path(__file__).resolve().parents[1]
+        samm_path = repo_root / "docs" / "t116-samm.md"
+        self.assertTrue(samm_path.exists(), "La fiche docs/t116-samm.md est introuvable.")
+        content = samm_path.read_text(encoding="utf-8")
+
+        pattern = re.compile(
+            r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)"
+            r"/blob/(?P<sha>[0-9a-f]{40})/(?P<path>[^#\s\)]+)#L(?P<start>\d+)(?:-L(?P<end>\d+))?"
+        )
+        matches = list(pattern.finditer(content))
+        self.assertGreaterEqual(
+            len(matches), 20, "La fiche SAMM doit contenir au moins 20 permaliens."
+        )
+
+        for m in matches:
+            owner, repo, _sha, rel_path = (
+                m.group("owner"),
+                m.group("repo"),
+                m.group("sha"),
+                m.group("path"),
+            )
+            start = int(m.group("start"))
+            end = int(m.group("end") or start)
+
+            self.assertEqual(
+                (owner, repo), ("Cezar277", "heimdall"), f"Dépôt invalide: {owner}/{repo}"
+            )
+            target_file = repo_root / rel_path
+            self.assertTrue(target_file.exists(), f"Fichier cité inexistant : {rel_path}")
+
+            file_lines = target_file.read_text(encoding="utf-8").splitlines()
+            total_lines = len(file_lines)
+            self.assertGreaterEqual(start, 1, f"Ligne de début < 1 pour {rel_path}")
+            self.assertLessEqual(
+                end, total_lines, f"Ligne de fin {end} > {total_lines} pour {rel_path}"
+            )
+            self.assertLessEqual(
+                start, end, f"Ligne de début > fin ({start} > {end}) pour {rel_path}"
+            )
+
+        # Contrôle de présence des symboles clés dans les tranches citées
+        checks = [
+            ("heimdall/vault/crypto.py", "def compute_secret_hmac"),
+            ("heimdall/vault/crypto.py", "def verify_secret_hmac"),
+            ("heimdall/vault/crypto.py", "def canonicalize_secret_value"),
+            ("heimdall/vault/crypto.py", "def validate_server_hmac_key"),
+            ("heimdall/vault/crypto.py", "def server_hmac_key_canary"),
+            ("heimdall/vault/store.py", "def _check_creation_canary"),
+            ("heimdall/vault/store.py", "def _check_rotate_hmac_continuity"),
+            ("heimdall/vault/store.py", "async def find_secrets_by_fingerprint"),
+            ("heimdall/vault/database.py", "def _check_rotate_kek_hmac_continuity"),
+            ("heimdall/vault/database.py", "def find_secrets_by_fingerprint"),
+        ]
+        for path_sub, symbol in checks:
+            found = False
+            for m in matches:
+                if m.group("path") == path_sub:
+                    start = int(m.group("start"))
+                    end = int(m.group("end") or start)
+                    slice_text = "\n".join(
+                        (repo_root / path_sub).read_text(encoding="utf-8").splitlines()[
+                            start - 1 : end
+                        ]
+                    )
+                    if symbol in slice_text:
+                        found = True
+                        break
+            self.assertTrue(
+                found, f"Symbole '{symbol}' non trouvé dans les tranches citées de {path_sub}"
+            )
+
+        # Contrôle par le script officiel de vérification des permaliens SAMM
+        repin_script = repo_root / "scripts" / "repin_samm.py"
+        self.assertTrue(repin_script.exists())
+        spec = importlib.util.spec_from_file_location("repin_samm", repin_script)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        repin_module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = repin_module
+        spec.loader.exec_module(repin_module)
+        check_func = getattr(repin_module, "main", None)
+        assert callable(check_func)
+        self.assertEqual(
+            check_func(["--check", "--fiche", str(samm_path)]),
+            0,
+            "scripts/repin_samm.py --check a échoué sur docs/t116-samm.md",
+        )
