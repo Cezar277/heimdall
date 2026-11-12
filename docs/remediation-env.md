@@ -23,8 +23,9 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
 - **Préservation et purge des commentaires** : les commentaires `#` sont préservés,
   mais toute affectation ou valeur après `=` dans un commentaire (ex. `# APP_KEY=h****k`)
   est **systématiquement purgée** en `# NOM=\n` (et masquée par `***` dans les diffs
-  `plan_env_example_change`), garantissant l'invariant 8 (zéro secret dans `.env.example`
-  ni dans les diffs affichés).
+  `plan_env_example_change`). Les commentaires libres sans `=` sont conservés par conception
+  sur disque pour maintenir la documentation humaine du template, et sont systématiquement
+  masqués par `***` dans le `before` affiché pour garantir l'invariant 8 (aucun secret en clair).
 
 ### 1.2. `.env` avec permissions strictes 0600 (T31.2)
 - **Secrets locaux en clair** : contient les associations `NOM="valeur"`.
@@ -40,6 +41,8 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
 - **Validation fail-closed du `.env` pré-existant** : toute ligne non vide et non commentée
   sans caractère `=` (ex. `HELLO WORLD`, payload altéré) ou avec clé vide est rejetée
   avec `EnvRemediationError`, interdisant tout abandon silencieux lors de la fusion.
+- **Syntaxe stricte dotenv (rejet de `export`)** : la syntaxe shell bash `export VAR=val`
+  est explicitement rejetée fail-closed (`EnvRemediationError`) sur `.env` et `.env.example`.
 
 ### 1.3. Ajout idempotent au `.gitignore` (T31.3)
 - **Protection anti-commit** : s'assure que `.env` ne sera pas indexé par Git.
@@ -67,6 +70,8 @@ Pour éviter tout élargissement de surface d'écriture ou écrasement de fichie
   - Extensions de sauvegarde et fichiers temporaires : `.env.bak`, `.env.old`, `.env.backup`, `.env~`, `.env.swp`, `.env.tmp`, `prod.env.bak`
   - Faux positifs de préfixe : `.environment`, `.envstuff`
   - Fichiers source ou arbitraires : `src/app.py`, `main.rs`, `.gitignore`
+  - Métacaractères de globbing gitignore : `*`, `?`, `[`, `]`, `{`, `}`, `\` (chemins littéraux stricts exigés)
+  - Syntaxe bash `export VAR=val` : rejetée au profit de la syntaxe dotenv standard `VAR=val`
 
 ---
 
@@ -146,14 +151,14 @@ if gitignore_diff:
 
 | Menace | Risque | Atténuation Heimdall |
 | --- | --- | --- |
-| **Information Disclosure** | Fuite de secret dans `.env.example` committé dans Git | `update_env_example` n'écrit jamais de valeur, uniquement `NOM=\n`. Les valeurs d'entrée sont ignorées et les commentaires pollués (`# NOM=val`) sont purgés (`# NOM=`) et masqués (`***`) dans les diffs (invariant 8). |
+| **Information Disclosure** | Fuite de secret dans `.env.example` committé dans Git | `update_env_example` n'écrit jamais de valeur, uniquement `NOM=\n`. Les valeurs d'entrée sont ignorées, les commentaires pollués (`# NOM=val`) sont purgés (`# NOM=`) et tous les commentaires sont masqués (`***`) dans le `before` des diffs (invariant 8). |
 | **Information Disclosure** | Lecture locale de `.env` par un utilisateur non privilégié | `.env` créé avec `os.open(..., 0o600)` et `os.fchmod`. Mode 0600 vérifié par `check_file_mode_600`. |
 | **Information Disclosure** | Commit accidentel du secret via `git add .` | `.env` ajouté à `.gitignore`. Alerte et suggestion `git rm --cached .env` si le fichier était déjà suivi. |
-| **Tampering** | Injection de variables ou corruption via retours à la ligne | Validation stricte des noms via `validate_variable_name` (`^[A-Z][A-Z0-9_]{1,63}$`, denylist système). |
+| **Tampering** | Injection de variables ou corruption via retours à la ligne | Validation stricte des noms via `validate_variable_name` (`^[A-Z][A-Z0-9_]{1,63}$`, denylist système, rejet de `export`). |
 | **Tampering** | Perte silencieuse de lignes ou payload altéré dans `.env` | Contrôle strict de la syntaxe du `.env` pré-existant : rejet fail-closed (`EnvRemediationError`) de toute ligne sans `=` ou à clé vide. |
 | **Tampering** | Exécution de commande shell si `.env` est sourcé | Échappement des caractères spéciaux (`\`, `"`, `$`, `` ` ``) via `format_env_value`. |
 | **Elevation of Privilege** | Path traversal (`../`, chemin absolu, symlink sortant) | Confinement de tous les chemins via `mcp.paths.confine`. Liens symboliques refusés fail-closed. |
-| **Elevation of Privilege** | Élargissement de surface sur fichiers arbitraires ou de sauvegarde | Grammaire d'environnement stricte (`_is_env_like_path`) rejetant `.environment`, `.env.bak`, `.env.old`, `src/app.py`. |
+| **Elevation of Privilege** | Élargissement de surface sur fichiers arbitraires ou de sauvegarde | Grammaire d'environnement stricte (`_is_env_like_path`) rejetant `.environment`, `.env.bak`, `.env.old`, `src/app.py`, et refus des métacaractères `[]/{}` dans gitignore. |
 | **Denial of Service** | DoS mémoire par passage d'un volume démesuré | Bornes strictes : 1024 variables max, volume cumulé plafonné à 1 Mio, lecture bornée à 1 Mio. |
 | **Denial of Service** | Inflation infinie du fichier `.gitignore` | Idempotence stricte : contrôle des motifs avant tout ajout, aucun doublon. |
 

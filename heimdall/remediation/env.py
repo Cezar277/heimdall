@@ -92,6 +92,17 @@ _REJECTED_ENV_SUFFIXES: Final[tuple[str, ...]] = (
     ".tmp",
 )
 
+#: Métacaractères et caractères de globbing interdits dans un motif gitignore.
+_GITIGNORE_FORBIDDEN_CHARS: Final[tuple[str, ...]] = (
+    "*",
+    "?",
+    "[",
+    "]",
+    "{",
+    "}",
+    "\\",
+)
+
 
 class EnvRemediationError(Exception):
     """Échec d'opération d'environnement : entrée invalide ou écriture impossible."""
@@ -234,7 +245,11 @@ def _validate_gitignore_pattern(pattern: str) -> str:
     if not clean or "\n" in pattern or "\r" in pattern:
         raise EnvRemediationError("motif .gitignore invalide : motif vide ou saut de ligne")
 
-    if clean.startswith("!") or clean.startswith("#") or "*" in clean or "?" in clean:
+    if (
+        clean.startswith("!")
+        or clean.startswith("#")
+        or any(char in clean for char in _GITIGNORE_FORBIDDEN_CHARS)
+    ):
         raise EnvRemediationError(
             "motif .gitignore invalide : négation, commentaire ou métacaractère interdit"
         )
@@ -360,14 +375,32 @@ def _extract_and_validate_names(  # noqa: PLR0912
 
 
 def _sanitize_example_comment_line(raw_line: str, *, mask_values: bool) -> str:
-    """Assainit une ligne de commentaire en purgeant toute valeur après '='."""
-    if "=" not in raw_line:
+    """Assainit une ligne de commentaire.
+
+    - Si la ligne contient '=', la valeur après '=' est purgée en NOM= (ou
+      masquée en NOM=*** si mask_values est vrai).
+    - Si la ligne est un commentaire nu sans '=', le texte est conservé sur
+      disque par conception (documentation et structure préservées), mais
+      systématiquement masqué par '***' dans le before de diff (mask_values=True)
+      pour garantir l'invariant 8 (aucun secret exposé en clair dans les diffs).
+    """
+    if "=" in raw_line:
+        head, _, val = raw_line.partition("=")
+        if not val.strip():
+            return f"{head.rstrip()}="
+        rendered_val = _MASKED_VALUE if mask_values else ""
+        return f"{head.rstrip()}={rendered_val}"
+
+    if mask_values:
+        stripped = raw_line.strip()
+        body = stripped.lstrip("#").strip()
+        if body:
+            prefix_len = len(raw_line) - len(raw_line.lstrip())
+            indent = raw_line[:prefix_len]
+            return f"{indent}# {_MASKED_VALUE}"
         return raw_line
-    head, _, val = raw_line.partition("=")
-    if not val.strip():
-        return f"{head.rstrip()}="
-    rendered_val = _MASKED_VALUE if mask_values else ""
-    return f"{head.rstrip()}={rendered_val}"
+
+    return raw_line
 
 
 def _build_sanitized_example_content(

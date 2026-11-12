@@ -590,6 +590,10 @@ def test_gitignore_negation_overrides_earlier_ignore_and_is_corrected(git_repo: 
         "",
         "   ",
         "../escape/.env",
+        "[a].env",
+        "test[0-9].env",
+        "{a,b}.env",
+        "\\.env",
     ],
 )
 def test_gitignore_malicious_pattern_rejected_fail_closed(tmp_path: Path, bad_pattern: str) -> None:
@@ -1053,3 +1057,51 @@ def test_env_file_rejects_line_with_empty_key(tmp_path: Path) -> None:
         update_env_file(tmp_path, {"NEW_KEY": "val"})
 
     assert env_file.read_text(encoding="utf-8") == initial_content
+
+
+def test_env_example_bare_comment_with_secret_is_masked_in_before(tmp_path: Path) -> None:
+    """.env.example avec commentaire nu sans '=' : masqué dans before, préservé sur disque."""
+    example_file = tmp_path / ".env.example"
+    bare_secret_comment = "z****k_super_secret_token_9999"  # noqa: S105
+    example_file.write_text(f"# note ... {bare_secret_comment}\n", encoding="utf-8")
+
+    plan = plan_env_example_change(tmp_path, ["APP_KEY"])
+    assert plan is not None
+    rel_path, before, after = plan
+    assert rel_path == ".env.example"
+    # Le secret en clair dans le commentaire nu ne doit JAMAIS apparaître dans before
+    assert bare_secret_comment not in before
+    # before masque le commentaire nu avec ***
+    assert "# ***\n" in before
+    # after conserve le commentaire nu textuel par conception et ajoute la nouvelle clé
+    assert f"# note ... {bare_secret_comment}\n" in after
+    assert "APP_KEY=\n" in after
+
+    # update_env_example conserve le commentaire textuel par conception (revue humaine T32)
+    changed = update_env_example(tmp_path, ["APP_KEY"])
+    assert "APP_KEY" in changed
+    disk_content = example_file.read_text(encoding="utf-8")
+    assert f"# note ... {bare_secret_comment}\n" in disk_content
+    assert "APP_KEY=\n" in disk_content
+
+
+def test_env_operations_reject_export_prefix_syntax(tmp_path: Path) -> None:
+    """La syntaxe bash 'export VAR=val' est rejetée fail-closed (.env et .env.example)."""
+    # 1. Dans .env existant
+    env_file = tmp_path / ".env"
+    env_file.write_text("export DBPASS=secret123\n", encoding="utf-8")
+    env_file.chmod(0o600)
+
+    with pytest.raises(EnvRemediationError, match="clé existante invalide ou dangereuse dans .env"):
+        update_env_file(tmp_path, {"NEW_VAR": "val"})
+
+    # 2. Dans .env.example existant lors de update_env_example
+    example_file = tmp_path / ".env.example"
+    example_file.write_text("export API_KEY=\n", encoding="utf-8")
+
+    with pytest.raises(EnvRemediationError, match="clé invalide dans .env.example"):
+        update_env_example(tmp_path, ["NEW_VAR"])
+
+    # 3. Dans .env.example existant lors de plan_env_example_change
+    with pytest.raises(EnvRemediationError, match="clé invalide dans .env.example"):
+        plan_env_example_change(tmp_path, ["NEW_VAR"])
