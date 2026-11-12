@@ -234,8 +234,10 @@ def _extract_and_validate_names(  # noqa: PLR0912
     elif isinstance(variables, Iterable):
         for item in variables:
             if isinstance(item, tuple):
-                if not item:
-                    raise EnvRemediationError("tuple de variable vide")
+                if len(item) != _SECRET_PAIR_LENGTH:
+                    raise EnvRemediationError(
+                        "format de tuple de variable invalide : attendu paire (clé, valeur)"
+                    )
                 raw_names.append(item[0])
             else:
                 raw_names.append(item)
@@ -278,6 +280,55 @@ def _parse_example_lines(content: str) -> tuple[set[str], list[str]]:
         if key:
             names.add(key)
     return names, lines
+
+
+def _build_sanitized_example_content(
+    content: str,
+    target_names: list[str],
+) -> tuple[str, list[str]]:
+    """Génère le contenu assaini de .env.example en purgeant toute valeur préexistante.
+
+    INVARIANT DE SÉCURITÉ : .env.example ne contient JAMAIS de secret (invariant 8).
+    Toute valeur préexistante (ex. NOM=secret, NOM="val", NOM=v # com) est purgée
+    en NOM= sans valeur.
+    Les nouvelles variables sont ajoutées à la suite sous forme NOM=.
+    Retourne le contenu assaini final et la liste des variables modifiées ou ajoutées.
+    """
+    existing_keys: set[str] = set()
+    modified_keys: list[str] = []
+    new_lines: list[str] = []
+
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(raw_line)
+            continue
+        if "=" in stripped:
+            key, _, val = stripped.partition("=")
+            clean_key = key.strip()
+            try:
+                valid_key = validate_variable_name(clean_key)
+            except (TemplateError, ValueError, TypeError):
+                raise EnvRemediationError("clé invalide dans .env.example") from None
+            existing_keys.add(valid_key)
+            new_lines.append(f"{valid_key}=")
+            if val.strip():
+                modified_keys.append(valid_key)
+        else:
+            new_lines.append(raw_line)
+
+    added_keys: list[str] = []
+    for k in target_names:
+        if k not in existing_keys:
+            existing_keys.add(k)
+            new_lines.append(f"{k}=")
+            added_keys.append(k)
+
+    if not new_lines:
+        return "", []
+
+    new_content = "\n".join(new_lines) + "\n"
+    return new_content, modified_keys + added_keys
 
 
 def _pattern_matches_target(rule: str, target: str) -> bool:
@@ -415,28 +466,17 @@ def update_env_example(
     except EnvRemediationError:
         raise
 
-    existing_names, _ = _parse_example_lines(existing_content)
-    new_names = [name for name in validated_names if name not in existing_names]
+    new_content, changed_names = _build_sanitized_example_content(existing_content, validated_names)
 
-    if not new_names:
+    if not changed_names and new_content == existing_content:
         return []
-
-    lines_to_add = [f"{name}=" for name in new_names]
-    addition = "\n".join(lines_to_add) + "\n"
-
-    if existing_content and not existing_content.endswith("\n"):
-        new_content = f"{existing_content}\n{addition}"
-    elif existing_content:
-        new_content = f"{existing_content}{addition}"
-    else:
-        new_content = addition
 
     try:
         write_file_atomic(confined.absolute, new_content, mode=mode)
     except (ValueError, OSError):
         raise EnvRemediationError from None
 
-    return new_names
+    return changed_names
 
 
 def update_env_file(  # noqa: PLR0912, PLR0915
@@ -626,21 +666,12 @@ def plan_env_example_change(
     except EnvRemediationError:
         raise
 
-    existing_names, _ = _parse_example_lines(existing_content)
-    new_names = [name for name in validated_names if name not in existing_names]
+    after_content, changed_names = _build_sanitized_example_content(
+        existing_content, validated_names
+    )
 
-    if not new_names:
+    if not changed_names and after_content == existing_content:
         return None
-
-    lines_to_add = [f"{name}=" for name in new_names]
-    addition = "\n".join(lines_to_add) + "\n"
-
-    if existing_content and not existing_content.endswith("\n"):
-        after_content = f"{existing_content}\n{addition}"
-    elif existing_content:
-        after_content = f"{existing_content}{addition}"
-    else:
-        after_content = addition
 
     return confined.relative, existing_content, after_content
 

@@ -768,3 +768,53 @@ def test_remediate_environment_accepts_generators_and_iterators(tmp_path: Path) 
     it = iter([("ANOTHER_KEY", "value_3")])
     receipt2 = remediate_environment(tmp_path, it, warn_stderr=False)
     assert "ANOTHER_KEY" in receipt2.variables
+
+
+def test_env_example_purges_preexisting_secret_values(tmp_path: Path) -> None:
+    """.env.example pré-rempli APP_KEY=h****k : purge en APP_KEY= et plan retourne un diff."""
+    example_file = tmp_path / ".env.example"
+    example_file.write_text("APP_KEY=h****k\n", encoding="utf-8")
+
+    # plan_env_example_change doit détecter le changement et retourner un diff
+    plan = plan_env_example_change(tmp_path, ["APP_KEY"])
+    assert plan is not None
+    rel_path, before, after = plan
+    assert rel_path == ".env.example"
+    assert "APP_KEY=h****k" in before
+    assert after == "APP_KEY=\n"
+
+    # update_env_example purge la valeur
+    changed = update_env_example(tmp_path, ["APP_KEY"])
+    assert "APP_KEY" in changed
+
+    content = example_file.read_text(encoding="utf-8")
+    assert content == "APP_KEY=\n"
+    assert "h****k" not in content
+
+
+@pytest.mark.parametrize(
+    "polluted_line",
+    [
+        'APP_KEY="v1"\n',
+        "APP_KEY = v2 # commentaire\n",
+    ],
+)
+def test_env_example_purges_various_polluted_formats(tmp_path: Path, polluted_line: str) -> None:
+    """.env.example avec APP_KEY="v1" ou APP_KEY = v2 # com : élimine la valeur."""
+    example_file = tmp_path / ".env.example"
+    example_file.write_text(polluted_line, encoding="utf-8")
+
+    changed = update_env_example(tmp_path, ["APP_KEY"])
+    assert "APP_KEY" in changed
+
+    content = example_file.read_text(encoding="utf-8")
+    assert content == "APP_KEY=\n"
+
+
+def test_extract_and_validate_names_rejects_malformed_tuples(tmp_path: Path) -> None:
+    """_extract_and_validate_names refuse les tuples de taille != 2 fail-closed."""
+    with pytest.raises(EnvRemediationError, match="format de tuple de variable invalide"):
+        update_env_example(tmp_path, [("A", "B", "C")])  # type: ignore[arg-type]
+
+    with pytest.raises(EnvRemediationError, match="format de tuple de variable invalide"):
+        update_env_example(tmp_path, [("A",)])  # type: ignore[arg-type]
