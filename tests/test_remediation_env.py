@@ -838,3 +838,126 @@ def test_default_files_world_writable_modes_are_hardened(tmp_path: Path) -> None
     for path in (example_file, gitignore_file):
         mode = stat.S_IMODE(path.stat().st_mode)
         assert mode == 0o644, f"mode non durci : {oct(mode)}"
+
+
+@pytest.mark.parametrize("special_mode", [0o4755, 0o2755, 0o1755])
+@pytest.mark.skipif(os.name != "posix", reason="modes POSIX uniquement")
+def test_default_files_special_mode_bits_are_hardened(tmp_path: Path, special_mode: int) -> None:
+    """.env.example/.gitignore avec setuid/setgid/sticky : mode ramené à 0644."""
+    example_file = tmp_path / ".env.example"
+    gitignore_file = tmp_path / ".gitignore"
+    example_file.write_text("APP_KEY=\n", encoding="utf-8")
+    gitignore_file.write_text("# existant\n", encoding="utf-8")
+    example_file.chmod(special_mode)
+    gitignore_file.chmod(special_mode)
+
+    update_env_example(tmp_path, ["APP_KEY", "DB_PASS"])
+    ensure_gitignore_ignores_env(tmp_path)
+
+    for path in (example_file, gitignore_file):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o644, f"mode non durci : {oct(mode)}"
+
+
+def test_remediate_environment_rejects_conflicting_paths_without_writing(
+    tmp_path: Path,
+) -> None:
+    """env_path/example_path/gitignore_path confondus : rejet avant toute écriture."""
+    secrets = {"API_KEY": "secret"}
+
+    def assert_no_writes() -> None:
+        assert not (tmp_path / ".env").exists()
+        assert not (tmp_path / ".env.example").exists()
+        assert not (tmp_path / ".gitignore").exists()
+
+    with pytest.raises(EnvRemediationError, match="chemins d'environnement confondus"):
+        remediate_environment(tmp_path, secrets, env_path=".env.example")
+    assert_no_writes()
+
+    with pytest.raises(EnvRemediationError, match="chemins d'environnement confondus"):
+        remediate_environment(tmp_path, secrets, env_path=".env", example_path=".env")
+    assert_no_writes()
+
+    with pytest.raises(EnvRemediationError, match="chemins d'environnement confondus"):
+        remediate_environment(tmp_path, secrets, example_path=".env")
+    assert_no_writes()
+
+
+def test_remediate_environment_rejects_gitignore_as_env_path(tmp_path: Path) -> None:
+    """.gitignore ne peut pas servir de .env : les règles existantes sont préservées."""
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("*.pyc\n", encoding="utf-8")
+
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        remediate_environment(tmp_path, {"API_KEY": "secret"}, env_path=".gitignore")
+
+    assert gitignore.read_text(encoding="utf-8") == "*.pyc\n"
+    assert not (tmp_path / ".env").exists()
+    assert not (tmp_path / ".env.example").exists()
+
+
+def test_gitignore_rejects_non_env_pattern(tmp_path: Path) -> None:
+    """Un motif arbitraire (src/app.py) ne peut pas être ajouté au .gitignore."""
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        ensure_gitignore_ignores_env(tmp_path, pattern="src/app.py")
+
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        plan_gitignore_change(tmp_path, pattern="src/app.py")
+
+    assert not (tmp_path / ".gitignore").exists()
+
+
+def test_remediate_environment_rejects_non_env_path_without_writing(tmp_path: Path) -> None:
+    """env_path arbitraire (src/app.py) : rejet avant écriture de secret."""
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        remediate_environment(tmp_path, {"API_KEY": "secret"}, env_path="src/app.py")
+
+    assert not (tmp_path / "src").exists()
+    assert not (tmp_path / ".env").exists()
+    assert not (tmp_path / ".env.example").exists()
+    assert not (tmp_path / ".gitignore").exists()
+
+
+def test_env_paths_reject_arbitrary_relative_files(tmp_path: Path) -> None:
+    """Les entrées publiques refusent un chemin relatif qui n'est pas un .env."""
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        update_env_file(tmp_path, {"KEY": "val"}, env_path="src/app.py")
+
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        update_env_example(tmp_path, ["KEY"], example_path="src/app.py")
+
+    with pytest.raises(EnvRemediationError, match="fichier d'environnement attendu"):
+        check_env_git_status(tmp_path, env_path="src/app.py")
+
+
+def test_confinement_rejects_absolute_path_without_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un chemin absolu est refusé sans aucun stat hors racine (oracle d'existence)."""
+    calls: list[object] = []
+    real_islink = os.path.islink
+
+    def spy(path: object) -> bool:
+        calls.append(path)
+        return real_islink(str(path))
+
+    monkeypatch.setattr(os.path, "islink", spy)
+
+    with pytest.raises(EnvRemediationError, match="chemin .env invalide"):
+        update_env_file(tmp_path, {"KEY": "val"}, env_path="/etc/.env")
+
+    assert calls == []
+
+
+def test_env_example_rejects_line_without_equals(tmp_path: Path) -> None:
+    """Une ligne non commentée sans '=' est refusée, jamais recopiée verbatim."""
+    example_file = tmp_path / ".env.example"
+    example_file.write_text("HELLO WORLD\n", encoding="utf-8")
+
+    with pytest.raises(EnvRemediationError, match="ligne invalide"):
+        update_env_example(tmp_path, ["APP_KEY"])
+
+    with pytest.raises(EnvRemediationError, match="ligne invalide"):
+        plan_env_example_change(tmp_path, ["APP_KEY"])
+
+    assert example_file.read_text(encoding="utf-8") == "HELLO WORLD\n"

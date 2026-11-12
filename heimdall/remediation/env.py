@@ -19,11 +19,16 @@ Confinement et sécurité :
   (grammaire fermée, denylist système, rejet des sauts de ligne et injections).
 - Clés existantes relues depuis .env re-validées (rejet fail-closed des variables dangereuses).
 - Négation '!' dans .gitignore respectée : le dernier motif gagne (sémantique gitignore).
-- Motif .gitignore validé (rejet de négation, métacaractères et sauts de ligne).
+- Motif .gitignore validé (rejet de négation, métacaractères et sauts de ligne)
+  et limité à une cible de forme .env (pas d'ignore arbitraire de source).
+- Chemins env/example/gitignore distincts après confinement (rejet des collisions)
+  et de forme .env/.gitignore (pas d'écriture dans un fichier arbitraire).
+- Lignes non commentées sans '=' rejetées dans .env.example (pas de recopie verbatim).
 - Valeurs de variables formatées via ``heimdall.vault.atomic.format_env_value``
   (échappement des guillemets doubles, dollars, backticks, backslashes).
 - ``.env.example`` et ``.gitignore`` : mode 0644 par défaut ; les bits d'écriture
-  groupe/monde d'un fichier préexistant sont retirés (anti-tampering local).
+  groupe/monde et setuid/setgid/sticky d'un fichier préexistant sont retirés
+  (anti-tampering local).
 - Diffs ``.env.example`` : valeurs préexistantes masquées (``***``), jamais
   exposées en clair (invariant 8).
 - Messages d'erreur statiques : aucune fuite de valeur de secret dans les exceptions.
@@ -130,11 +135,14 @@ def _confine_and_check_no_symlink(
     if not isinstance(rel_path, str):
         raise EnvRemediationError(f"chemin {name_for_msg} invalide (non-str)")
 
-    try:
-        raw_path = root / rel_path
-    except (TypeError, ValueError):
-        raise EnvRemediationError(f"chemin {name_for_msg} invalide") from None
+    # Validation grammaticale AVANT tout accès disque : un chemin absolu ou
+    # traversant ne doit jamais être staté (oracle d'existence hors racine).
+    if not is_rel_path(rel_path):
+        raise EnvRemediationError(f"chemin {name_for_msg} invalide")
 
+    # ``confine`` résout les liens : le contrôle du chemin brut est conservé
+    # pour refuser un symlink final (le chemin résolu, lui, n'est plus un lien).
+    raw_path = root / rel_path
     if os.path.islink(raw_path):
         raise EnvRemediationError(f"accès refusé : {name_for_msg} est un lien symbolique")
 
@@ -149,6 +157,37 @@ def _confine_and_check_no_symlink(
     return confined
 
 
+def _is_env_like_path(rel_path: str) -> bool:
+    """Vrai si le nom de fichier ressemble à un fichier d'environnement.
+
+    Accepte ``.env``, les préfixes ``.env*`` (``.env.example``, ``.env.local``)
+    et les suffixes ``*.env`` (``a.env``, ``config/prod.env``). Refuse les
+    chemins arbitraires comme ``src/app.py`` (anti-ignore/écrasement de source).
+    """
+    name = Path(rel_path).name
+    return name == ".env" or name.startswith(".env") or name.endswith(".env")
+
+
+def _validate_env_like_path(rel_path: str, name_for_msg: str) -> str:
+    """Valide qu'un chemin désigne un fichier d'environnement, pas une source."""
+    if not isinstance(rel_path, str):
+        raise EnvRemediationError(f"chemin {name_for_msg} invalide (non-str)")
+    if not _is_env_like_path(rel_path):
+        raise EnvRemediationError(
+            f"chemin {name_for_msg} invalide : fichier d'environnement attendu"
+        )
+    return rel_path
+
+
+def _validate_gitignore_path(rel_path: str) -> str:
+    """Valide qu'un chemin désigne bien un fichier ``.gitignore``."""
+    if not isinstance(rel_path, str):
+        raise EnvRemediationError("chemin .gitignore invalide (non-str)")
+    if Path(rel_path).name != ".gitignore":
+        raise EnvRemediationError("chemin .gitignore invalide : nom .gitignore attendu")
+    return rel_path
+
+
 def _validate_gitignore_pattern(pattern: str) -> str:
     """Valide et assainit le motif destiné à .gitignore.
 
@@ -159,6 +198,7 @@ def _validate_gitignore_pattern(pattern: str) -> str:
     - Globbing dangereux '*' ou '?' -> EnvRemediationError
     - Sauts de ligne '\\n', '\\r' -> EnvRemediationError
     - Motif vide ou ne respectant pas is_rel_path -> EnvRemediationError
+    - Chemin qui ne ressemble pas à un fichier d'environnement -> EnvRemediationError
     """
     if not isinstance(pattern, str):
         raise EnvRemediationError("motif .gitignore invalide : non-str")
@@ -174,6 +214,9 @@ def _validate_gitignore_pattern(pattern: str) -> str:
 
     if not is_rel_path(clean):
         raise EnvRemediationError("motif .gitignore invalide : chemin relatif invalide")
+
+    if not _is_env_like_path(clean):
+        raise EnvRemediationError("motif .gitignore invalide : fichier d'environnement attendu")
 
     return clean
 
@@ -229,11 +272,12 @@ def _harden_default_file_mode(mode: int) -> int:
     """Retire les droits d'écriture groupe/monde des fichiers non sensibles.
 
     Un ``.env.example`` ou ``.gitignore`` préexistant en 0777 resterait
-    modifiable par un autre utilisateur local (tampering). Si des bits
-    d'écriture groupe/monde sont présents, on retombe sur le mode par défaut
-    0644 ; sinon le mode existant est préservé.
+    modifiable par un autre utilisateur local (tampering). Les bits setuid,
+    setgid et sticky sont également retirés. Si l'un de ces bits est présent,
+    on retombe sur le mode par défaut 0644 ; sinon le mode existant est
+    préservé.
     """
-    if mode & 0o022:
+    if mode & 0o7022:
         return _DEFAULT_FILE_MODE
     return mode
 
@@ -329,7 +373,7 @@ def _build_sanitized_example_content(
                 rendered_value = ""
             new_lines.append(f"{valid_key}={rendered_value}")
         else:
-            new_lines.append(raw_line)
+            raise EnvRemediationError("ligne invalide dans .env.example : '=' attendu")
 
     added_keys: list[str] = []
     for k in target_names:
@@ -417,6 +461,7 @@ def ensure_gitignore_ignores_env(
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
 
+    _validate_gitignore_path(gitignore_path)
     clean_pattern = _validate_gitignore_pattern(pattern)
     confined = _confine_and_check_no_symlink(root, gitignore_path, ".gitignore")
 
@@ -470,6 +515,7 @@ def update_env_example(
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
+    _validate_env_like_path(example_path, ".env.example")
     validated_names = _extract_and_validate_names(variables)
     confined = _confine_and_check_no_symlink(root, example_path, ".env.example")
 
@@ -517,6 +563,7 @@ def update_env_file(  # noqa: PLR0912, PLR0915
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
+    _validate_env_like_path(env_path, ".env")
 
     if isinstance(secrets, (str, bytes)):
         raise EnvRemediationError(
@@ -627,6 +674,7 @@ def check_env_git_status(
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
+    _validate_env_like_path(env_path, ".env")
     confined = _confine_and_check_no_symlink(root, env_path, ".env")
 
     tracked = is_git_tracked(confined.absolute)
@@ -675,6 +723,7 @@ def plan_env_example_change(
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
+    _validate_env_like_path(example_path, ".env.example")
     validated_names = _extract_and_validate_names(variables)
     confined = _confine_and_check_no_symlink(root, example_path, ".env.example")
 
@@ -714,6 +763,7 @@ def plan_gitignore_change(
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
 
+    _validate_gitignore_path(gitignore_path)
     clean_pattern = _validate_gitignore_pattern(pattern)
     confined = _confine_and_check_no_symlink(root, gitignore_path, ".gitignore")
 
@@ -766,9 +816,21 @@ def remediate_environment(  # noqa: PLR0913
     if not isinstance(gitignore_path, str):
         raise EnvRemediationError("chemin gitignore invalide (non-str)")
 
+    _validate_env_like_path(env_path, ".env")
+    _validate_env_like_path(example_path, ".env.example")
+    _validate_gitignore_path(gitignore_path)
+
     confined_env = _confine_and_check_no_symlink(root, env_path, ".env")
     confined_example = _confine_and_check_no_symlink(root, example_path, ".env.example")
     confined_gitignore = _confine_and_check_no_symlink(root, gitignore_path, ".gitignore")
+
+    env_paths = (
+        confined_env.relative,
+        confined_example.relative,
+        confined_gitignore.relative,
+    )
+    if len(set(env_paths)) != len(env_paths):
+        raise EnvRemediationError("chemins d'environnement confondus")
 
     if isinstance(secrets, (str, bytes)):
         raise EnvRemediationError(
