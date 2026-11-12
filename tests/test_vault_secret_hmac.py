@@ -60,8 +60,8 @@ from heimdall.vault.store import (
 )
 
 # Clés de test robustes et diversifiées (satisfaisant les contrôles d'entropie)
-_VALID_SERVER_HMAC_KEY = "s3rv3r_hm4c_k3y_s3cur3_v4ult_t0k3n_256!"
-_VALID_ALT_HMAC_KEY = "4lt3rn4t1v3_hm4c_s3rv3r_k3y_d1st1nct_t0k3n"
+_VALID_SERVER_HMAC_KEY = "k7_H9mP2xW4vL1zR8yB3qT6nF0sV5jC8dE4uA1gX7oZ"
+_VALID_ALT_HMAC_KEY = "m3_Q8vK1zT6nF0sV5jC8dE4uA1gX7oZ2xW4vL9yB3rP"
 _VALID_KEK = generate_encryption_key()
 _VALID_PEPPER = "p3pp3r_s3rv3r_s3cur3_t0k3n_256_b1ts_v4ult"
 _VALID_MASTER_KEY = "m4st3r_p4ssphr4s3_s3cur3_v4ult_k3y_t0k3n"
@@ -195,21 +195,37 @@ class SecretHmacCryptoTests(TestCase):
         self.assertIn("generate_server_hmac_key()", str(ctx3.exception))
 
     def test_normalize_server_hmac_key_rejects_subtle_weak_patterns(self) -> None:
-        """Refuse les clés subtilement faibles (période > 4, diversité < 16, entropie < 3.5)."""
-        # Période 8 avec 8 symboles distincts ("ABCDEFGH" * 4 = 32 octets)
+        """Refuse les clés subtilement faibles (période, diversité < 24, entropie < 4.0)."""
+        # Tests limites demandés par la revue :
+        # 1. Période 8 avec 8 symboles distincts ("ABCDEFGH" * 4 = 32 octets)
         with self.assertRaises(ValueError) as ctx1:
             _normalize_server_hmac_key("ABCDEFGH" * 4)
         self.assertIn("generate_server_hmac_key()", str(ctx1.exception))
 
-        # Motif périodique de 10 caractères avec diversité insuffisante ("0123456789" * 3 + "01")
+        # 2. Période 8 avec 8 chiffres distincts ("01234567" * 4 = 32 octets)
         with self.assertRaises(ValueError) as ctx2:
-            _normalize_server_hmac_key("0123456789" * 3 + "01")
+            _normalize_server_hmac_key("01234567" * 4)
         self.assertIn("generate_server_hmac_key()", str(ctx2.exception))
 
-        # Motif de période 16
+        # 3. Motif périodique de 10 caractères avec diversité insuffisante ("0123456789" * 3 + "01")
         with self.assertRaises(ValueError) as ctx3:
-            _normalize_server_hmac_key("abcdefghijklmnop" * 2)
+            _normalize_server_hmac_key("0123456789" * 3 + "01")
         self.assertIn("generate_server_hmac_key()", str(ctx3.exception))
+
+        # 4. Motif de période 16 avec 16 symboles distincts ("abcdefghijklmnop" * 2 = 32 octets)
+        with self.assertRaises(ValueError) as ctx4:
+            _normalize_server_hmac_key("abcdefghijklmnop" * 2)
+        self.assertIn("generate_server_hmac_key()", str(ctx4.exception))
+
+        # 5. Motif hexadécimal de 16 symboles distincts ("0123456789abcdef" * 2 = 32 octets)
+        with self.assertRaises(ValueError) as ctx5:
+            _normalize_server_hmac_key("0123456789abcdef" * 2)
+        self.assertIn("generate_server_hmac_key()", str(ctx5.exception))
+
+        # 6. Non-périodique mais diversité < 24 ("0123456789abcdef0123456789abcdeg" = 17 symboles)
+        with self.assertRaises(ValueError) as ctx6:
+            _normalize_server_hmac_key("0123456789abcdef0123456789abcdeg")
+        self.assertIn("generate_server_hmac_key()", str(ctx6.exception))
 
     def test_candidate_value_empty_parity_cipher(self) -> None:
         """Une valeur candidate vide retourne False en toute circonstance (avec ou sans AAD)."""
@@ -801,6 +817,71 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
         mem_wrong = await mem_store.find_secrets_matching_value("p", "wrong_value")
         self.assertEqual(len(mem_wrong), 0)
 
+    async def test_malformed_fingerprint_parity_cipher_returns_false_stores_fallback_decrypt(
+        self,
+    ) -> None:
+        """Verrouille le contrat de parité cipher/stores sur empreinte malformée.
+
+        Décision d'architecture (anti-faux négatif, Invariant 1) :
+        - Sur l'API directe du cipher, une empreinte attendue malformée (longueur != 64,
+          majuscules, non-hex) retourne False (prédicat booléen pur, aucune exception).
+        - Sur les stores (mémoire et SQLite), une empreinte corrompue en base déclenche
+          le repli transparent par déchiffrement en temps constant : si la valeur candidate
+          correspond au secret réel, le store retourne True (invariant 1 : aucun faux négatif).
+          Si la valeur candidate ne correspond pas, le store retourne False.
+        """
+        val = "super_secret_payload_value_123"
+        bad_fingerprints = [
+            "corrupted_non_hex_short_string",
+            "A" * 64,  # majuscules
+            "g" * 64,  # non-hex minuscules
+            "0" * 63,  # longueur 63
+            "0" * 65,  # longueur 65
+            "!",  # symbole
+        ]
+
+        # 1. Vérification côté cipher direct
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        for bad_fp in bad_fingerprints:
+            # Le cipher ne lève PAS mais retourne False (contrat de vérification booléenne)
+            self.assertFalse(cipher.is_secret_value_matching(val, bad_fp))
+            aad = VaultCipher.aad("p", "prod", "S")
+            self.assertFalse(cipher.is_secret_value_matching(val, bad_fp, aad=aad))
+            self.assertFalse(cipher.verify_secret_hmac(val, bad_fp))
+
+        # 2. Vérification côté InMemorySecretStore (parité de repli déchiffrement)
+        mem_store = InMemorySecretStore(cipher=cipher)
+        for i, bad_fp in enumerate(bad_fingerprints):
+            name = f"MEM_CORRUPT_{i}"
+            await mem_store.create("p", "prod", name, val)
+            async with mem_store._lock:
+                mem_store._secrets[("p", "prod", name)]["fingerprint"] = bad_fp
+
+            # Repli déchiffrement : True pour la bonne valeur, False pour une mauvaise
+            self.assertTrue(await mem_store.is_secret_value_matching("p", "prod", name, val))
+            self.assertFalse(
+                await mem_store.is_secret_value_matching("p", "prod", name, "wrong_value")
+            )
+
+        # 3. Vérification côté SqliteSecretStore (parité de repli déchiffrement)
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            for i, bad_fp in enumerate(bad_fingerprints):
+                name = f"SQL_CORRUPT_{i}"
+                await sql_store.create("p", "prod", name, val)
+                with db_session(db_path) as conn:
+                    conn.execute(
+                        "UPDATE secrets SET fingerprint = ? WHERE project_id = ? AND name = ?",
+                        (bad_fp, "p", name),
+                    )
+
+                # Repli déchiffrement : True pour la bonne valeur, False pour une mauvaise
+                self.assertTrue(await sql_store.is_secret_value_matching("p", "prod", name, val))
+                self.assertFalse(
+                    await sql_store.is_secret_value_matching("p", "prod", name, "wrong_value")
+                )
+
     async def test_find_secrets_matching_value_returns_only_metadata(self) -> None:
         """find_secrets_matching_value ne retourne JAMAIS la valeur ni l'empreinte."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1377,7 +1458,7 @@ class KeyLeakHuntTests(TestCase):
 
     def test_server_hmac_key_is_never_leaked_in_repr_or_serialization(self) -> None:
         """repr/model_dump/model_dump_json n'exposent jamais la clé HMAC serveur."""
-        canary = "HMAC_CANARY_UNIQUE_SECRET_VAL_12345!"
+        canary = "HMAC_CANARY_UNIQUE_SECRET_VAL_12345_xyz!"
         settings = VaultSettings(
             kek=_VALID_KEK,
             api_key_pepper=_VALID_PEPPER,

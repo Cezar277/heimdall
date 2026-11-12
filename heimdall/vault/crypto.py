@@ -75,8 +75,8 @@ _TAG_SIZE_BYTES: int = 16  # étiquette d'authentification GCM, en fin de cipher
 _MIN_PEPPER_BYTES: int = 32
 MAX_SERVER_HMAC_KEY_BYTES: int = 512  # Borne maximale pour la clé HMAC serveur (ticket #116)
 _SHA256_HEX_LEN: int = 64  # Longueur en caractères hexadécimaux d'un SHA-256 (ticket #116)
-_MIN_DISTINCT_SERVER_HMAC_KEY_BYTES: int = 16  # Diversité minimale pour clé HMAC (ticket #116)
-_MIN_SERVER_HMAC_KEY_SHANNON_ENTROPY: float = 3.5  # Seuil d'entropie de Shannon minimale
+_MIN_DISTINCT_SERVER_HMAC_KEY_BYTES: int = 24  # Diversité minimale durcie (>= 24 symboles)
+_MIN_SERVER_HMAC_KEY_SHANNON_ENTROPY: float = 4.0  # Seuil d'entropie de Shannon durci (ticket #116)
 
 
 def _shannon_entropy(data: bytes) -> float:
@@ -203,7 +203,8 @@ def _validate_key_complexity(key_bytes: bytes) -> None:
         )
     if len(set(key_bytes)) < _MIN_DISTINCT_SERVER_HMAC_KEY_BYTES:
         raise ValueError(
-            "La clé HMAC serveur est trop simple ou répétitive (diversité insuffisante) : "
+            "La clé HMAC serveur est trop simple ou répétitive (diversité insuffisante : "
+            f"au moins {_MIN_DISTINCT_SERVER_HMAC_KEY_BYTES} symboles distincts requis) : "
             "utiliser generate_server_hmac_key() comme seule voie supportée pour "
             "générer une clé aléatoire cryptographiquement sûre de 256 bits."
         )
@@ -226,8 +227,8 @@ def validate_server_hmac_key(key: str | bytes | None) -> bytes:
     """Valide et normalise la clé HMAC serveur en octets (ticket #116).
 
     Exige au moins 32 octets (256 bits), au plus 512 octets (borne maximale),
-    au moins 16 symboles distincts, aucune période répétitive et une entropie
-    de Shannon >= 3.5 bits/octet. Ces contrôles neutralisent les attaques par
+    au moins 24 symboles distincts, aucune période répétitive et une entropie
+    de Shannon >= 4.0 bits/octet. Ces contrôles neutralisent les attaques par
     dictionnaire et les ralentissements par clés géantes.
     Seule la fonction ``generate_server_hmac_key()`` est supportée.
     """
