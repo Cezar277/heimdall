@@ -22,6 +22,10 @@ Confinement et sécurité :
 - Motif .gitignore validé (rejet de négation, métacaractères et sauts de ligne).
 - Valeurs de variables formatées via ``heimdall.vault.atomic.format_env_value``
   (échappement des guillemets doubles, dollars, backticks, backslashes).
+- ``.env.example`` et ``.gitignore`` : mode 0644 par défaut ; les bits d'écriture
+  groupe/monde d'un fichier préexistant sont retirés (anti-tampering local).
+- Diffs ``.env.example`` : valeurs préexistantes masquées (``***``), jamais
+  exposées en clair (invariant 8).
 - Messages d'erreur statiques : aucune fuite de valeur de secret dans les exceptions.
 """
 
@@ -65,6 +69,9 @@ _SECURE_ENV_MODE: Final[int] = 0o600
 
 #: Mode par défaut pour .gitignore et .env.example (0644).
 _DEFAULT_FILE_MODE: Final[int] = 0o644
+
+#: Marqueur constant des valeurs masquées dans les diffs (aucune valeur réelle).
+_MASKED_VALUE: Final[str] = "***"
 
 #: Taille exacte attendue pour une paire (clé, valeur).
 _SECRET_PAIR_LENGTH: Final[int] = 2
@@ -218,6 +225,19 @@ def _read_text_secure(path: Path) -> tuple[str, int]:
     return text, stat.S_IMODE(status.st_mode)
 
 
+def _harden_default_file_mode(mode: int) -> int:
+    """Retire les droits d'écriture groupe/monde des fichiers non sensibles.
+
+    Un ``.env.example`` ou ``.gitignore`` préexistant en 0777 resterait
+    modifiable par un autre utilisateur local (tampering). Si des bits
+    d'écriture groupe/monde sont présents, on retombe sur le mode par défaut
+    0644 ; sinon le mode existant est préservé.
+    """
+    if mode & 0o022:
+        return _DEFAULT_FILE_MODE
+    return mode
+
+
 def _extract_and_validate_names(  # noqa: PLR0912
     variables: str | Iterable[str] | Mapping[str, str] | Iterable[tuple[str, str]],
 ) -> list[str]:
@@ -268,23 +288,11 @@ def _extract_and_validate_names(  # noqa: PLR0912
     return validated
 
 
-def _parse_example_lines(content: str) -> tuple[set[str], list[str]]:
-    """Extrait les noms existants et les lignes d'un .env.example."""
-    names: set[str] = set()
-    lines = content.splitlines()
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key = line.partition("=")[0].strip()
-        if key:
-            names.add(key)
-    return names, lines
-
-
 def _build_sanitized_example_content(
     content: str,
     target_names: list[str],
+    *,
+    mask_values: bool = False,
 ) -> tuple[str, list[str]]:
     """Génère le contenu assaini de .env.example en purgeant toute valeur préexistante.
 
@@ -292,6 +300,9 @@ def _build_sanitized_example_content(
     Toute valeur préexistante (ex. NOM=secret, NOM="val", NOM=v # com) est purgée
     en NOM= sans valeur.
     Les nouvelles variables sont ajoutées à la suite sous forme NOM=.
+    Si ``mask_values`` est vrai, une valeur préexistante non vide est remplacée
+    par le marqueur constant ``***`` au lieu d'être supprimée : utilisé pour
+    produire un ``before`` de diff qui ne révèle jamais le secret d'origine.
     Retourne le contenu assaini final et la liste des variables modifiées ou ajoutées.
     """
     existing_keys: set[str] = set()
@@ -311,9 +322,12 @@ def _build_sanitized_example_content(
             except (TemplateError, ValueError, TypeError):
                 raise EnvRemediationError("clé invalide dans .env.example") from None
             existing_keys.add(valid_key)
-            new_lines.append(f"{valid_key}=")
             if val.strip():
                 modified_keys.append(valid_key)
+                rendered_value = _MASKED_VALUE if mask_values else ""
+            else:
+                rendered_value = ""
+            new_lines.append(f"{valid_key}={rendered_value}")
         else:
             new_lines.append(raw_line)
 
@@ -415,6 +429,8 @@ def ensure_gitignore_ignores_env(
     except EnvRemediationError:
         raise
 
+    mode = _harden_default_file_mode(mode)
+
     if _is_env_covered_in_gitignore(existing_content, pattern=clean_pattern):
         return False
 
@@ -465,6 +481,8 @@ def update_env_example(
         pass
     except EnvRemediationError:
         raise
+
+    mode = _harden_default_file_mode(mode)
 
     new_content, changed_names = _build_sanitized_example_content(existing_content, validated_names)
 
@@ -651,6 +669,8 @@ def plan_env_example_change(
     """Calcule le diff (chemin_relatif, avant, après) pour .env.example sans modifier le disque.
 
     Utilisable par la CLI review pour construire un TextChange pour affichage diff.
+    ``avant`` est toujours assaini : toute valeur préexistante est remplacée par
+    le marqueur ``***`` (invariant 8), jamais exposée en clair dans le diff.
     Retourne None si aucune variable nouvelle n'est à ajouter.
     """
     if not isinstance(root, Path):
@@ -673,7 +693,12 @@ def plan_env_example_change(
     if not changed_names and after_content == existing_content:
         return None
 
-    return confined.relative, existing_content, after_content
+    # Invariant 8 : le diff ne doit jamais exposer une valeur préexistante.
+    # ``before`` est donc assaini et les valeurs polluées sont remplacées par
+    # un marqueur constant, jamais par leur contenu réel.
+    before_content, _ = _build_sanitized_example_content(existing_content, [], mask_values=True)
+
+    return confined.relative, before_content, after_content
 
 
 def plan_gitignore_change(

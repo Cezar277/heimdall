@@ -771,17 +771,19 @@ def test_remediate_environment_accepts_generators_and_iterators(tmp_path: Path) 
 
 
 def test_env_example_purges_preexisting_secret_values(tmp_path: Path) -> None:
-    """.env.example pré-rempli APP_KEY=h****k : purge en APP_KEY= et plan retourne un diff."""
+    """.env.example pollué : purge en APP_KEY= et diff masqué sans valeur en clair."""
     example_file = tmp_path / ".env.example"
-    example_file.write_text("APP_KEY=h****k\n", encoding="utf-8")
+    example_file.write_text(f"APP_KEY={SECRET_VAL}\n", encoding="utf-8")
 
-    # plan_env_example_change doit détecter le changement et retourner un diff
+    # plan_env_example_change détecte le changement sans exposer la valeur.
     plan = plan_env_example_change(tmp_path, ["APP_KEY"])
     assert plan is not None
     rel_path, before, after = plan
     assert rel_path == ".env.example"
-    assert "APP_KEY=h****k" in before
+    assert before == "APP_KEY=***\n"
     assert after == "APP_KEY=\n"
+    assert SECRET_VAL not in before
+    assert SECRET_VAL not in after
 
     # update_env_example purge la valeur
     changed = update_env_example(tmp_path, ["APP_KEY"])
@@ -789,7 +791,7 @@ def test_env_example_purges_preexisting_secret_values(tmp_path: Path) -> None:
 
     content = example_file.read_text(encoding="utf-8")
     assert content == "APP_KEY=\n"
-    assert "h****k" not in content
+    assert SECRET_VAL not in content
 
 
 @pytest.mark.parametrize(
@@ -818,3 +820,21 @@ def test_extract_and_validate_names_rejects_malformed_tuples(tmp_path: Path) -> 
 
     with pytest.raises(EnvRemediationError, match="format de tuple de variable invalide"):
         update_env_example(tmp_path, [("A",)])  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="modes POSIX uniquement")
+def test_default_files_world_writable_modes_are_hardened(tmp_path: Path) -> None:
+    """.env.example/.gitignore en 0777 ne restent pas modifiables par autrui."""
+    example_file = tmp_path / ".env.example"
+    gitignore_file = tmp_path / ".gitignore"
+    example_file.write_text("APP_KEY=\n", encoding="utf-8")
+    gitignore_file.write_text("# existant\n", encoding="utf-8")
+    example_file.chmod(0o777)
+    gitignore_file.chmod(0o777)
+
+    update_env_example(tmp_path, ["APP_KEY", "DB_PASS"])
+    ensure_gitignore_ignores_env(tmp_path)
+
+    for path in (example_file, gitignore_file):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o644, f"mode non durci : {oct(mode)}"
