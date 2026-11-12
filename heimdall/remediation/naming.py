@@ -22,6 +22,9 @@ from heimdall.remediation.templates import _VARIABLE, MAX_VARIABLE_CHARS, Templa
 #: Longueur maximale d'un nom : un suffixe ``_N`` doit encore tenir dedans.
 _MAX_NAME_LENGTH: Final[int] = MAX_VARIABLE_CHARS
 
+#: Nombre maximal de noms existants lus lors d'une déduplication.
+_MAX_TAKEN: Final[int] = 10_000
+
 #: Noms exacts refusés : variables système/shell dont l'écrasement détournerait
 #: l'exécution des processus enfants (voir ticket #84).
 DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset(
@@ -156,8 +159,10 @@ DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
 )
 
 
-def is_dangerous_env_var(name: str) -> bool:
-    """Vrai si un nom de variable est dangereux pour l'exécution d'un processus."""
+def is_dangerous_env_var(name: object) -> bool:
+    """Vrai si un nom de variable est dangereux (fail-closed : non-str = dangereux)."""
+    if not isinstance(name, str):
+        return True
     upper = name.upper()
     if upper in DANGEROUS_ENV_EXACT:
         return True
@@ -184,19 +189,22 @@ def deduplicate_variable_name(desired: str, taken: Iterable[str]) -> str:
     """Rend un nom validé unique en ajoutant ``_2``, ``_3``… si besoin.
 
     ``desired`` est d'abord validé (donc un nom dangereux ou mal formé est
-    rejeté, jamais « corrigé » en un autre nom). La recherche est bornée par
-    la longueur maximale : un suffixe qui dépasserait lève ``TemplateError``.
+    rejeté, jamais « corrigé » en un autre nom). ``taken`` est lu au plus
+    ``_MAX_TAKEN + 1`` éléments (un générateur infini ne bloque pas) et la
+    recherche est bornée : au-delà, ``TemplateError``.
     """
     base = validate_variable_name(desired)
-    used = set(taken)
+    names = list(itertools.islice(taken, _MAX_TAKEN + 1))
+    if len(names) > _MAX_TAKEN:
+        raise TemplateError
+    used = set(names)
     if base not in used:
         return base
-    for n in itertools.count(2):
+    for n in range(2, len(used) + 3):
         candidate = f"{base}_{n}"
         if len(candidate) > _MAX_NAME_LENGTH:
             raise TemplateError
         if candidate in used or is_dangerous_env_var(candidate):
             continue
         return candidate
-    raise TemplateError  # exit guaranteed
-    raise TemplateError  # Inatteignable : la borne de longueur garantit la sortie
+    raise TemplateError

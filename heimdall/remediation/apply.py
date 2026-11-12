@@ -32,10 +32,13 @@ from typing import Final
 
 from heimdall.mcp.paths import PathEscape, confine
 from heimdall.remediation.templates import ReplacementPlan
-from heimdall.vault.atomic import backup_file, write_file_atomic
+from heimdall.vault.atomic import _open_file_read_fd, backup_file, write_file_atomic
 
 #: Lecture bornée : même plafond que le scanner et les plans (1 Mio).
 _MAX_READ_BYTES: Final[int] = 1_048_576
+
+#: Mode POSIX valide d'un fichier (bits rwx utilisateur/groupe/autres).
+_MAX_MODE: Final[int] = 0o777
 
 
 class ApplyError(Exception):
@@ -50,29 +53,23 @@ class AppliedPatch:
     """Reçu d'une application réussie ; sans le secret (ni ``before``)."""
 
     file: str
+    #: Chemin de la sauvegarde, relatif à la racine (jamais absolu).
     backup: str
     mode: int
     after: str = field(repr=False)
 
 
 def _read_current_secure(path: Path) -> tuple[str, int]:
-    """Lit un fichier régulier sans suivre les liens (mode + contenu).
+    """Lit un fichier régulier sans suivre aucun lien (mode + contenu).
 
-    Copie locale de la stratégie de ``vault.atomic.read_file_secure_no_follow``
-    (``O_NOFOLLOW``, régulier, borne, UTF-8 strict), qui retourne en plus le
-    mode du fichier pour le conserver à l'écriture. Toute anomalie vaut
-    ``ApplyError`` statique.
+    Garde unique ``vault.atomic._open_file_read_fd`` : parents ouverts
+    composant par composant (``openat`` + ``O_NOFOLLOW``), cible en
+    ``O_NONBLOCK`` (pas de blocage sur FIFO). Le mode est lu par ``fstat``
+    pour le conserver à l'écriture. Toute anomalie vaut ``ApplyError`` statique.
     """
     try:
-        if os.path.islink(path):
-            raise ApplyError
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        descriptor = os.open(path, flags)
-    except OSError:
+        descriptor = _open_file_read_fd(path)
+    except (ValueError, OSError):
         raise ApplyError from None
     try:
         status = os.fstat(descriptor)
@@ -134,7 +131,7 @@ def apply_replacement(root: Path, plan: ReplacementPlan) -> AppliedPatch:
         raise ApplyError from None
     return AppliedPatch(
         file=confined.relative,
-        backup=backup.as_posix(),
+        backup=f"{confined.relative}.bak",
         mode=mode,
         after=plan.after,
     )
@@ -157,11 +154,11 @@ def undo_apply(root: Path, receipt: AppliedPatch) -> None:
             confined = confine(root, receipt.file)
         except PathEscape:
             raise ApplyError from None
-        backup_path = Path(receipt.backup)
-        if backup_path.parent != confined.absolute.parent:
+        if receipt.backup != f"{confined.relative}.bak":
             raise ApplyError
-        if backup_path.name != confined.absolute.name + ".bak":
+        if type(receipt.mode) is not int or not 0 <= receipt.mode <= _MAX_MODE:
             raise ApplyError
+        backup_path = confined.absolute.with_name(f"{confined.absolute.name}.bak")
         current, _ = _read_current_secure(confined.absolute)
         if current != receipt.after:
             raise ApplyError

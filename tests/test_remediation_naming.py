@@ -6,6 +6,8 @@ par le LLM est traité comme une entrée non fiable.
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 from heimdall.cli.review import _VARIABLE as _REVIEW_VARIABLE
@@ -155,3 +157,25 @@ def test_deduplicate_overflow_is_fail_closed() -> None:
     """Base de 64 caractères : aucun suffixe ne tient, refus plutôt que troncature."""
     with pytest.raises(TemplateError):
         deduplicate_variable_name("A" * 64, {"A" * 64})
+
+
+@pytest.mark.parametrize("name", [None, 123, b"APP", ["APP"]])
+def test_is_dangerous_env_var_fail_closed_on_non_str(name: object) -> None:
+    assert is_dangerous_env_var(name) is True
+
+
+def test_deduplicate_refuses_infinite_taken_without_hanging() -> None:
+    with pytest.raises(TemplateError):
+        deduplicate_variable_name("APP_KEY", itertools.repeat("APP_KEY"))
+
+
+def test_deduplicate_refuses_huge_taken() -> None:
+    huge = [f"OTHER_{index}" for index in range(10_001)]
+    with pytest.raises(TemplateError):
+        deduplicate_variable_name("APP_KEY", huge)
+
+
+def test_deduplicate_gives_up_when_all_candidates_are_dangerous() -> None:
+    """``AWS`` est un nom valide, mais ``AWS_n`` tombe sous le préfixe ``AWS_``."""
+    with pytest.raises(TemplateError):
+        deduplicate_variable_name("AWS", {"AWS"})

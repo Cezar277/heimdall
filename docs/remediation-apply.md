@@ -41,12 +41,21 @@ receipt = apply_replacement(Path("dépôt"), plan)  # lève ApplyError sinon
 undo_apply(Path("dépôt"), receipt)  # restaure la sauvegarde
 ```
 
-- Le fichier courant est relu sans suivre les liens (`O_NOFOLLOW`, fichier
-  régulier, borne 1 Mio, UTF-8 strict) puis comparé à `plan.before` :
+- Le fichier courant est relu par la garde unique `vault.atomic` (parents
+  ouverts composant par composant avec `O_NOFOLLOW`, cible en `O_NONBLOCK`,
+  fichier régulier, borne 1 Mio, UTF-8 strict) puis comparé à `plan.before` :
   un fichier modifié depuis le plan (**STALE**) n'est jamais écrasé.
 - Sauvegarde préalable (`<fichier>.bak`, mode `0600` — elle contient le
-  secret), puis écriture via `vault.atomic.write_file_atomic` (temporaire +
-  `fsync` + `os.replace` atomique, aucun fichier à moitié écrit).
+  secret en clair), puis écriture via `vault.atomic.write_file_atomic`
+  (temporaire + `fsync` + `os.replace` atomique, aucun fichier à moitié écrit).
+- **Nettoyage obligatoire** : `apply_replacement` ne vérifie pas le statut Git
+  de `<fichier>.bak` (ni n'ajoute de règle `.gitignore`, contrairement à
+  `heimdall vault pull --backup`). Avant tout commit, supprimer les `.bak`
+  créés (ou `undo_apply`, puis suppression) et vérifier `git status` ; ne
+  jamais committer un `*.bak` contenant un secret.
+- `AppliedPatch.backup` est relatif à la racine (jamais de chemin absolu dans
+  les logs). `undo_apply` valide le reçu (`backup` attendu, `mode` entier
+  `0..0o777`) avant toute écriture.
 - Les permissions d'origine sont conservées (`fchmod` explicite, pas le
   `0600` par défaut des secrets du Vault).
 - `undo_apply` ne restaure que si le fichier vaut encore `receipt.after`

@@ -20,6 +20,7 @@ from heimdall.remediation import (
     build_replacement,
     undo_apply,
 )
+from heimdall.remediation import apply as apply_module
 from heimdall.remediation.templates import ReplacementPlan
 
 SECRET = "SYNTHETIC_ONLY_VALUE"  # noqa: S105 - valeur synthétique de test
@@ -45,7 +46,7 @@ def test_apply_patches_and_preserves_mode_and_backup(tmp_path: Path) -> None:
     assert isinstance(receipt, AppliedPatch)
     assert target.read_text(encoding="utf-8") == plan.after
     assert stat.S_IMODE(target.stat().st_mode) == 0o640
-    backup = Path(receipt.backup)
+    backup = tmp_path / receipt.backup
     assert backup.is_file()
     assert backup.read_text(encoding="utf-8") == source
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
@@ -127,7 +128,7 @@ def test_undo_refuses_missing_backup_or_modified_file(tmp_path: Path) -> None:
     source = f'KEY = "{SECRET}"\n'
     _write(target, source)
     receipt = apply_replacement(tmp_path, _plan(source))
-    Path(receipt.backup).unlink()
+    (tmp_path / receipt.backup).unlink()
     with pytest.raises(ApplyError):
         undo_apply(tmp_path, receipt)
     assert target.read_text(encoding="utf-8") == receipt.after
@@ -155,6 +156,76 @@ def test_confine_rejects_traversal_and_absolute(tmp_path: Path, evil: str) -> No
     """Garde T27.3.1 réutilisée telle quelle (aucune copie locale)."""
     with pytest.raises(PathEscape):
         confine(tmp_path, evil)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO POSIX uniquement")
+def test_read_refuses_fifo_without_blocking(tmp_path: Path) -> None:
+    """Une FIFO ne doit ni bloquer la lecture (O_NONBLOCK) ni être acceptée."""
+    plan = _plan(f'KEY = "{SECRET}"\n')
+    os.mkfifo(tmp_path / "app.py")
+    with pytest.raises(ApplyError):
+        apply_replacement(tmp_path, plan)
+
+
+def test_read_refuses_parent_swapped_after_confine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un parent échangé contre un symlink entre confine() et open() est refusé."""
+    source = f'KEY = "{SECRET}"\n'
+    root = tmp_path / "repo"
+    _write(root / "nested" / "app.py", source)
+    outside = tmp_path / "outside"
+    _write(outside / "app.py", source)
+    plan = _plan(source, file="nested/app.py")
+
+    real_confine = apply_module.confine
+
+    def _confine_then_swap(base: Path, untrusted: object) -> object:
+        confined = real_confine(base, untrusted)
+        (base / "nested").rename(base / "nested_moved")
+        (base / "nested").symlink_to(outside, target_is_directory=True)
+        return confined
+
+    monkeypatch.setattr(apply_module, "confine", _confine_then_swap)
+    with pytest.raises(ApplyError):
+        apply_replacement(root, plan)
+    assert (outside / "app.py").read_text(encoding="utf-8") == source
+
+
+@pytest.mark.parametrize(
+    ("backup", "mode"),
+    [
+        ("/abs/outside.bak", 0o640),
+        ("../escape.bak", 0o640),
+        ("app.py.bak", True),
+        ("app.py.bak", -1),
+        ("app.py.bak", 0o1777),
+        ("app.py.bak", "640"),
+    ],
+)
+def test_undo_rejects_forged_receipt_without_writing(
+    tmp_path: Path, backup: str, mode: object
+) -> None:
+    source = f'KEY = "{SECRET}"\n'
+    _write(tmp_path / "app.py", source)
+    receipt = apply_replacement(tmp_path, _plan(source))
+    forged = AppliedPatch(
+        file="app.py",
+        backup=backup,
+        mode=mode,  # type: ignore[arg-type]
+        after=receipt.after,
+    )
+    with pytest.raises(ApplyError):
+        undo_apply(tmp_path, forged)
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == receipt.after
+
+
+def test_receipt_backup_is_relative(tmp_path: Path) -> None:
+    source = f'KEY = "{SECRET}"\n'
+    _write(tmp_path / "nested" / "app.py", source)
+    receipt = apply_replacement(tmp_path, _plan(source, file="nested/app.py"))
+    assert receipt.backup == "nested/app.py.bak"
+    assert str(tmp_path) not in repr(receipt)
 
 
 def test_apply_rejects_bad_types(tmp_path: Path) -> None:

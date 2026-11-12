@@ -256,8 +256,10 @@ def _push_single_secret(
     if is_dangerous_env_var(name):
         # Reflet borné et échappé : `_push_single_secret` peut être appelée
         # directement (défense en profondeur) avant tout contrôle de format.
+        # Un nom non-str n'est jamais reflété : seul son type est affiché.
+        shown = name[:32] if isinstance(name, str) else type(name).__name__
         typer.echo(
-            f"Erreur de sécurité : le secret {name[:32]!r} est une variable système interdite.",
+            f"Erreur de sécurité : le secret {shown!r} est une variable système interdite.",
             err=True,
         )
         raise typer.Exit(code=2)
