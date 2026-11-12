@@ -88,4 +88,3 @@ Pour garantir la pérennité et la vérifiabilité des preuves SAMM sans aucun l
    ```sh
    python scripts/repin_samm.py --fiche docs/t84-t85-t86-samm.md --check
    ```
-
