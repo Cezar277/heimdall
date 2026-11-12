@@ -1637,6 +1637,13 @@ def _register_routes(app: FastAPI) -> None:  # noqa: PLR0915
                 status_code=404,
                 detail="Ressource introuvable",
             ) from None
+        if current_status not in ("vaulte", "rote"):
+            # Le Vault ne persiste que ces deux états : tout autre état
+            # canonique (détecté, confirmé, faux positif) est une corruption.
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            )
         if current_status == "rote":
             # Un secret roté ne restitue jamais l'ancienne valeur (contrat
             # openapi.yaml) : même réponse 404 que pour un secret absent, sans
@@ -1717,6 +1724,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: PLR0915
                 status_code=404,
                 detail="Ressource introuvable",
             ) from None
+        if current_status not in ("vaulte", "rote"):
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            )
         return SecretMetadata(
             project=record["project"],
             env=record["env"],

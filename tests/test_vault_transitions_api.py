@@ -20,7 +20,7 @@ import threading
 from collections import deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
@@ -472,7 +472,6 @@ def test_transition_secret_rejects_lost_compare_and_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Force ``rowcount != 1`` : la transition lève sans écrire de journal."""
-    from contextlib import contextmanager
 
     class _FakeCursor:
         def __init__(self, row: dict[str, str] | None = None, rowcount: int = 0) -> None:
