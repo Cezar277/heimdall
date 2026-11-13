@@ -20,18 +20,18 @@ remplace pas la revue de code.
 > fichiers #118 :
 >
 > ```text
-> $ git diff --stat origin/117-t403-api-de-transition..HEAD
->  README.md                                  |   1 +
->  docs/adr/006-table-etats-et-transitions.md |   7 +-
->  docs/contracts/vault-traceability.md       |   1 +
->  docs/t118-samm.md                          | 165 +++++++
->  tests/test_vault_transitions_forbidden.py  | 714 +++++++++++++++++++++++++++++
->  5 files changed, 885 insertions(+), 3 deletions(-)
+> $ git diff --name-only origin/117-t403-api-de-transition..HEAD
+> README.md
+> docs/adr/006-table-etats-et-transitions.md
+> docs/contracts/vault-traceability.md
+> docs/t118-samm.md
+> tests/test_vault_transitions_forbidden.py
 > ```
 >
-> Aucun fichier de production n'est modifié par #118. Le diff contre `main`
-> contient en plus #117, qui doit être fusionné en amont (le maintainer est le
-> seul habilité à merger, cf. CONTRIBUTING §6).
+> Aucun fichier de production n'est modifié par #118 : ni `heimdall/**`,
+> ni `openapi.yaml`, ni `schemas/**`. Le diff contre `main` contient en plus
+> #117, qui doit être fusionné en amont (le maintainer est le seul habilité à
+> merger, cf. CONTRIBUTING §6).
 
 ## 1. Exigences du ticket et preuves
 
