@@ -32,6 +32,7 @@ from heimdall.remediation import (
     update_env_example,
     update_env_file,
 )
+from heimdall.remediation import env as env_module
 
 SECRET_VAL = "SYNTHETIC_TEST_SECRET_VALUE_123"  # noqa: S105
 SECRET_VAL_2 = "ANOTHER_SYNTHETIC_SECRET_VAL_456"  # noqa: S105
@@ -1059,30 +1060,135 @@ def test_env_file_rejects_line_with_empty_key(tmp_path: Path) -> None:
     assert env_file.read_text(encoding="utf-8") == initial_content
 
 
-def test_env_example_bare_comment_with_secret_is_masked_in_before(tmp_path: Path) -> None:
-    """.env.example avec commentaire nu sans '=' : masqué dans before, préservé sur disque."""
+@pytest.mark.parametrize(
+    "bare_secret_comment",
+    [
+        "# note ... z****k_super_secret_token_9999",
+        "# token: ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        "# note ... AKIAIOSFODNN7EXAMPLE",
+        "# note ... a1b2c3d4e5f6g7h8",
+        "# See https://user:pass@example.com",
+    ],
+)
+def test_env_example_bare_comment_with_secret_is_purged_and_masked(
+    tmp_path: Path, bare_secret_comment: str
+) -> None:
+    """.env.example avec commentaire nu sans '=' : purgé sur disque et masqué dans les diffs."""
     example_file = tmp_path / ".env.example"
-    bare_secret_comment = "z****k_super_secret_token_9999"  # noqa: S105
-    example_file.write_text(f"# note ... {bare_secret_comment}\n", encoding="utf-8")
+    example_file.write_text(f"{bare_secret_comment}\n", encoding="utf-8")
 
     plan = plan_env_example_change(tmp_path, ["APP_KEY"])
     assert plan is not None
     rel_path, before, after = plan
     assert rel_path == ".env.example"
-    # Le secret en clair dans le commentaire nu ne doit JAMAIS apparaître dans before
+    # Le secret en clair dans le commentaire nu ne doit JAMAIS apparaître
+    # ni dans before ni dans after
     assert bare_secret_comment not in before
-    # before masque le commentaire nu avec ***
+    assert bare_secret_comment not in after
+    # before et after masquent le commentaire nu avec ***
     assert "# ***\n" in before
-    # after conserve le commentaire nu textuel par conception et ajoute la nouvelle clé
-    assert f"# note ... {bare_secret_comment}\n" in after
+    assert "# ***\n" in after
     assert "APP_KEY=\n" in after
 
-    # update_env_example conserve le commentaire textuel par conception (revue humaine T32)
+    # update_env_example purge le commentaire nu sur disque (invariant 8)
     changed = update_env_example(tmp_path, ["APP_KEY"])
     assert "APP_KEY" in changed
     disk_content = example_file.read_text(encoding="utf-8")
-    assert f"# note ... {bare_secret_comment}\n" in disk_content
+    assert bare_secret_comment not in disk_content
+    assert "# ***\n" in disk_content
     assert "APP_KEY=\n" in disk_content
+
+
+def test_env_example_comment_with_url_query_secret_is_purged(tmp_path: Path) -> None:
+    """Un secret dans la requête d'une URL de commentaire est purgé après '='."""
+    example_file = tmp_path / ".env.example"
+    secret = "abcdef123456"  # noqa: S105
+    example_file.write_text(f"# See https://example.com/?api_key={secret}\n", encoding="utf-8")
+
+    plan = plan_env_example_change(tmp_path, ["APP_KEY"])
+    assert plan is not None
+    _, before, after = plan
+    assert secret not in before
+    assert secret not in after
+    assert "api_key=***" in before
+    assert "api_key=\n" in after
+
+    changed = update_env_example(tmp_path, ["APP_KEY"])
+    assert "APP_KEY" in changed
+    content = example_file.read_text(encoding="utf-8")
+    assert secret not in content
+    assert "api_key=\n" in content
+
+
+@pytest.mark.parametrize(
+    "doc_comment",
+    [
+        "# Configuration principale",
+        "# Base de données",
+        "# See https://example.com/docs",
+        "# API endpoint: https://example.com/v1",
+        "# Token d'authentification à générer",
+        "# npm_install instructions",
+        "# version 1.2.3-beta+build.123",
+    ],
+)
+def test_env_example_preserves_ordinary_documentation_comments(
+    tmp_path: Path, doc_comment: str
+) -> None:
+    """Les commentaires de documentation sans secret ne sont pas purgés."""
+    example_file = tmp_path / ".env.example"
+    example_file.write_text(f"{doc_comment}\n", encoding="utf-8")
+
+    changed = update_env_example(tmp_path, ["APP_KEY"])
+    assert "APP_KEY" in changed
+
+    content = example_file.read_text(encoding="utf-8")
+    assert doc_comment in content
+    assert "# ***" not in content
+    assert "APP_KEY=\n" in content
+
+
+def test_env_file_reads_single_snapshot_no_toctou(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """.env n'est lu qu'une fois : aucun second snapshot divergent ne peut être fusionné."""
+    env_file = tmp_path / ".env"
+    env_file.write_text('SAFE_KEY="val1"\n', encoding="utf-8")
+    env_file.chmod(0o600)
+
+    real_read = env_module._read_text_secure
+    calls: list[Path] = []
+
+    def read_once_then_diverge(path: Path) -> tuple[str, int]:
+        calls.append(path)
+        if len(calls) == 1:
+            return real_read(path)
+        return 'SAFE_KEY="tampered"\n', 0o600
+
+    monkeypatch.setattr(env_module, "_read_text_secure", read_once_then_diverge)
+
+    update_env_file(tmp_path, {"NEW_KEY": "new_val"})
+
+    assert len(calls) == 1
+    content = env_file.read_text(encoding="utf-8")
+    assert 'SAFE_KEY="val1"' in content
+    assert 'NEW_KEY="new_val"' in content
+    assert "tampered" not in content
+
+
+def test_env_path_with_spaces_properly_quoted_in_git_not_ignored_warning(git_repo: Path) -> None:
+    """check_env_git_status avec env_path non ignoré : warning avec forme quotée."""
+    space_dir = git_repo / "a b"
+    space_dir.mkdir()
+    space_env = space_dir / ".env"
+    space_env.write_text("TOKEN=secret\n", encoding="utf-8")
+
+    tracked, ignored, warn, cmd = check_env_git_status(git_repo, env_path="a b/.env")
+    assert tracked is False
+    assert ignored is False
+    assert cmd is None
+    assert warn is not None
+    assert "'a b/.env'" in warn
 
 
 def test_env_operations_reject_export_prefix_syntax(tmp_path: Path) -> None:

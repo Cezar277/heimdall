@@ -37,6 +37,7 @@ Confinement et sécurité :
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import stat
 import sys
@@ -46,17 +47,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from heimdall.mcp.masking import mask_text, shannon_entropy
 from heimdall.mcp.paths import ConfinedPath, PathEscape, confine, is_rel_path
 from heimdall.remediation.naming import validate_variable_name
 from heimdall.remediation.templates import TemplateError
 from heimdall.vault.atomic import (
+    _decode_env_value,
     _get_git_toplevel,
     _open_file_read_fd,
     check_file_mode_600,
     format_env_value,
     is_git_ignored,
     is_git_tracked,
-    parse_env_file,
     write_file_atomic,
 )
 
@@ -374,15 +376,87 @@ def _extract_and_validate_names(  # noqa: PLR0912
     return validated
 
 
+#: Jeton de commentaire : lettres, chiffres et symboles usuels des secrets.
+_COMMENT_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_\-+./*~=]+")
+
+#: Version ou date documentaire (ex. 1.2.3-beta+build.123) : jamais un secret.
+_VERSION_LIKE_TOKEN: Final[re.Pattern[str]] = re.compile(
+    r"(?i)^v?\d+(?:\.\d+)+(?:[-+][A-Za-z0-9.+-]+)?$"
+)
+
+#: URL complète, retirée avant le filet d'entropie pour ne pas purger la documentation.
+_URL_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]{1,16}://\S+")
+
+#: Userinfo d'URL (``https://user:pass@hôte`` ou ``https://<jeton>@hôte``).
+_URL_USERINFO_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.\-]{1,16}://(?P<userinfo>[^/@\s]+)@"
+)
+
+#: Longueur minimale d'un jeton nu pour le contrôle d'entropie.
+_MIN_ENTROPY_TOKEN_LEN: Final[int] = 16
+
+#: Seuil d'entropie de Shannon (bits/caractère), aligné sur le masquage central.
+_COMMENT_ENTROPY_THRESHOLD: Final[float] = 3.5
+
+
+def _is_documentation_token(token: str) -> bool:
+    """Vrai pour une URL, un chemin ou une version : bruit documentaire, pas un secret."""
+    return (
+        "://" in token
+        or token.startswith(("//", "./", "../", "/"))
+        or ("." in token and "/" in token)
+        or _VERSION_LIKE_TOKEN.match(token) is not None
+    )
+
+
+def _comment_contains_potential_secret(raw_line: str) -> bool:
+    """Détecte si un commentaire (# ...) contient un secret potentiel.
+
+    Trois filets complémentaires, sans jamais recopier le contenu dans un diff :
+    1. les credentials d'URL (userinfo ``https://user:pass@hôte``) ;
+    2. les motifs déjà reconnus par le masquage central (#16/#22) : affectations,
+       préfixes de jetons connus, en-têtes d'autorisation, jetons denses ;
+    3. un jeton nu long et à haute entropie (ex. ``# note ... <jeton aléatoire>``),
+       en excluant les URL, chemins et versions qui relèvent de la documentation.
+    """
+    stripped = raw_line.strip()
+    if not stripped.startswith("#"):
+        return False
+    body = stripped.lstrip("#").strip()
+    if not body:
+        return False
+
+    if _URL_USERINFO_PATTERN.search(body):
+        return True
+
+    # Les URL ordinaires (documentation, endpoint) sont retirées avant le
+    # masquage central : leurs chemins denses ne sont pas des secrets.
+    without_urls = _URL_PATTERN.sub(" ", body)
+    if mask_text(without_urls)[1] > 0:
+        return True
+
+    for token in _COMMENT_TOKEN_PATTERN.findall(without_urls):
+        if (
+            len(token) >= _MIN_ENTROPY_TOKEN_LEN
+            and shannon_entropy(token) >= _COMMENT_ENTROPY_THRESHOLD
+            and any(c.isdigit() or c in "_-+/*~" for c in token)
+            and not _is_documentation_token(token)
+        ):
+            return True
+
+    return False
+
+
 def _sanitize_example_comment_line(raw_line: str, *, mask_values: bool) -> str:
-    """Assainit une ligne de commentaire.
+    """Assainit une ligne de commentaire (# ...) dans .env.example.
 
     - Si la ligne contient '=', la valeur après '=' est purgée en NOM= (ou
       masquée en NOM=*** si mask_values est vrai).
-    - Si la ligne est un commentaire nu sans '=', le texte est conservé sur
-      disque par conception (documentation et structure préservées), mais
-      systématiquement masqué par '***' dans le before de diff (mask_values=True)
-      pour garantir l'invariant 8 (aucun secret exposé en clair dans les diffs).
+    - Si la ligne est un commentaire nu sans '=' contenant un secret potentiel ou
+      une valeur à haute entropie, elle est systématiquement purgée et masquée par '***'
+      sur disque et dans les diffs (before et after) pour garantir l'invariant 8
+      (zéro secret dans .env.example versionné ni dans les diffs affichés).
+    - Les commentaires ordinaires de documentation sans secret sont préservés.
     """
     if "=" in raw_line:
         head, _, val = raw_line.partition("=")
@@ -391,14 +465,10 @@ def _sanitize_example_comment_line(raw_line: str, *, mask_values: bool) -> str:
         rendered_val = _MASKED_VALUE if mask_values else ""
         return f"{head.rstrip()}={rendered_val}"
 
-    if mask_values:
-        stripped = raw_line.strip()
-        body = stripped.lstrip("#").strip()
-        if body:
-            prefix_len = len(raw_line) - len(raw_line.lstrip())
-            indent = raw_line[:prefix_len]
-            return f"{indent}# {_MASKED_VALUE}"
-        return raw_line
+    if _comment_contains_potential_secret(raw_line):
+        prefix_len = len(raw_line) - len(raw_line.lstrip())
+        indent = raw_line[:prefix_len]
+        return f"{indent}# {_MASKED_VALUE}"
 
     return raw_line
 
@@ -617,6 +687,45 @@ def update_env_example(
     return changed_names
 
 
+def _parse_env_strict(raw_content: str) -> dict[str, str]:
+    """Parse le contenu brut d'un .env existant en mémoire avec validation stricte (anti-TOCTOU).
+
+    Contrat fail-closed :
+    - Ignore les lignes vides et les commentaires (#...).
+    - Lève EnvRemediationError si une ligne non vide/non commentée ne contient pas '='.
+    - Lève EnvRemediationError si la clé est vide ou invalide (denylist, syntaxe, export).
+    - Décode la valeur via _decode_env_value.
+    - Lève EnvRemediationError si la valeur contient un saut de ligne ou octet nul interdit.
+    - Aucune seconde lecture disque nécessaire (anti-TOCTOU, I/O unique).
+    """
+    secrets: dict[str, str] = {}
+    for raw_line in raw_content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise EnvRemediationError("ligne invalide dans le fichier .env existant : '=' attendu")
+        key_part, _, val_part = line.partition("=")
+        clean_key = key_part.strip()
+        if not clean_key:
+            raise EnvRemediationError("ligne invalide dans le fichier .env existant : clé vide")
+        try:
+            valid_key = validate_variable_name(clean_key)
+        except (TemplateError, ValueError, TypeError):
+            raise EnvRemediationError("clé existante invalide ou dangereuse dans .env") from None
+
+        decoded_val = _decode_env_value(val_part)
+        if "\n" in decoded_val or "\r" in decoded_val or "\0" in decoded_val:
+            raise EnvRemediationError(
+                "valeur existante invalide dans .env : saut de ligne ou octet nul interdit"
+            )
+        secrets[valid_key] = decoded_val
+    return secrets
+
+
+parse_env_strict = _parse_env_strict
+
+
 def update_env_file(  # noqa: PLR0912, PLR0915
     root: Path,
     secrets: Mapping[str, str] | Iterable[tuple[str, str]],
@@ -691,37 +800,10 @@ def update_env_file(  # noqa: PLR0912, PLR0915
         if os.path.islink(confined.absolute):
             raise EnvRemediationError("écriture refusée : .env est un lien symbolique")
 
+        # Lecture unique : le contenu validé en mémoire est la seule source de
+        # vérité. Aucune seconde lecture ne peut fusionner un snapshot divergent.
         raw_existing, _ = _read_text_secure(confined.absolute)
-        for raw_line in raw_existing.splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                raise EnvRemediationError(
-                    "ligne invalide dans le fichier .env existant : '=' attendu"
-                )
-            key_part, _, _ = line.partition("=")
-            if not key_part.strip():
-                raise EnvRemediationError("ligne invalide dans le fichier .env existant : clé vide")
-
-        existing_env = parse_env_file(confined.absolute)
-        if existing_env is None:
-            raise EnvRemediationError("impossible de lire le fichier .env existant")
-
-        for existing_k, existing_v in existing_env.items():
-            if not isinstance(existing_k, str) or not isinstance(existing_v, str):
-                raise EnvRemediationError("clé ou valeur invalide dans le fichier .env existant")
-            if "\n" in existing_v or "\r" in existing_v or "\0" in existing_v:
-                raise EnvRemediationError(
-                    "valeur existante invalide dans .env : saut de ligne ou octet nul interdit"
-                )
-            try:
-                clean_k = validate_variable_name(existing_k)
-            except (TemplateError, ValueError, TypeError):
-                raise EnvRemediationError(
-                    "clé existante invalide ou dangereuse dans .env"
-                ) from None
-            merged_secrets[clean_k] = existing_v
+        merged_secrets = _parse_env_strict(raw_existing)
 
     merged_secrets.update(validated_dict)
 
@@ -783,7 +865,7 @@ def check_env_git_status(
 
     if _get_git_toplevel(confined.absolute) is None:
         warn = (
-            f"Avertissement : statut Git indéterminé pour '{confined.relative}' "
+            f"Avertissement : statut Git indéterminé pour {quoted_rel} "
             "(hors dépôt ou git indisponible) : impossible de vérifier "
             "qu'il ne sera pas committé. Ajoutez-le à .gitignore et "
             "vérifiez avec 'git status'."
@@ -791,8 +873,8 @@ def check_env_git_status(
         return False, False, warn, None
 
     warn = (
-        f"Avertissement : Le fichier {confined.relative} n'est pas ignoré par Git. "
-        f"Pensez à ajouter '{confined.relative}' dans .gitignore."
+        f"Avertissement : Le fichier {quoted_rel} n'est pas ignoré par Git. "
+        f"Pensez à ajouter {quoted_rel} dans .gitignore."
     )
     return False, False, warn, None
 

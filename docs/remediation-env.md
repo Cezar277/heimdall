@@ -20,12 +20,13 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
 - **Zéro fuite** : même si un dictionnaire complet `{nom: valeur}` est fourni en entrée,
   les valeurs sont **systématiquement ignorées**. Seuls les noms validés sont écrits.
 - **Idempotence** : une variable déjà déclarée n'est pas dupliquée.
-- **Préservation et purge des commentaires** : les commentaires `#` sont préservés,
+- **Préservation et purge des commentaires** : les commentaires `#` de documentation sont préservés,
   mais toute affectation ou valeur après `=` dans un commentaire (ex. `# APP_KEY=h****k`)
-  est **systématiquement purgée** en `# NOM=\n` (et masquée par `***` dans les diffs
-  `plan_env_example_change`). Les commentaires libres sans `=` sont conservés par conception
-  sur disque pour maintenir la documentation humaine du template, et sont systématiquement
-  masqués par `***` dans le `before` affiché pour garantir l'invariant 8 (aucun secret en clair).
+  ou tout commentaire nu contenant un secret potentiel (motif reconnu par le masquage
+  central #16/#22, préfixe de jeton connu, jeton dense ou valeur à haute entropie,
+  ex. `# note ... z****k`) est **systématiquement purgé et masqué** par `***` sur disque
+  et dans les diffs `plan_env_example_change` (before et after), garantissant l'invariant 8
+  strict (zéro secret dans `.env.example` versionné ni dans les diffs affichés).
 
 ### 1.2. `.env` avec permissions strictes 0600 (T31.2)
 - **Secrets locaux en clair** : contient les associations `NOM="valeur"`.
@@ -41,6 +42,9 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
 - **Validation fail-closed du `.env` pré-existant** : toute ligne non vide et non commentée
   sans caractère `=` (ex. `HELLO WORLD`, payload altéré) ou avec clé vide est rejetée
   avec `EnvRemediationError`, interdisant tout abandon silencieux lors de la fusion.
+- **Lecture unique anti-TOCTOU** : le `.env` existant est lu **une seule fois** puis parsé
+  strictement en mémoire (`_parse_env_strict`) ; aucune seconde lecture disque ne peut
+  fusionner un snapshot divergent.
 - **Syntaxe stricte dotenv (rejet de `export`)** : la syntaxe shell bash `export VAR=val`
   est explicitement rejetée fail-closed (`EnvRemediationError`) sur `.env` et `.env.example`.
 
@@ -151,11 +155,11 @@ if gitignore_diff:
 
 | Menace | Risque | Atténuation Heimdall |
 | --- | --- | --- |
-| **Information Disclosure** | Fuite de secret dans `.env.example` committé dans Git | `update_env_example` n'écrit jamais de valeur, uniquement `NOM=\n`. Les valeurs d'entrée sont ignorées, les commentaires pollués (`# NOM=val`) sont purgés (`# NOM=`) et tous les commentaires sont masqués (`***`) dans le `before` des diffs (invariant 8). |
+| **Information Disclosure** | Fuite de secret dans `.env.example` committé dans Git | `update_env_example` n'écrit jamais de valeur, uniquement `NOM=\n`. Les valeurs d'entrée sont ignorées, les commentaires pollués (`# NOM=val`) sont purgés (`# NOM=`) et les commentaires libres contenant un secret ou une haute entropie sont purgés et masqués (`***`) sur disque et dans les diffs (invariant 8). |
 | **Information Disclosure** | Lecture locale de `.env` par un utilisateur non privilégié | `.env` créé avec `os.open(..., 0o600)` et `os.fchmod`. Mode 0600 vérifié par `check_file_mode_600`. |
 | **Information Disclosure** | Commit accidentel du secret via `git add .` | `.env` ajouté à `.gitignore`. Alerte et suggestion `git rm --cached .env` si le fichier était déjà suivi. |
 | **Tampering** | Injection de variables ou corruption via retours à la ligne | Validation stricte des noms via `validate_variable_name` (`^[A-Z][A-Z0-9_]{1,63}$`, denylist système, rejet de `export`). |
-| **Tampering** | Perte silencieuse de lignes ou payload altéré dans `.env` | Contrôle strict de la syntaxe du `.env` pré-existant : rejet fail-closed (`EnvRemediationError`) de toute ligne sans `=` ou à clé vide. |
+| **Tampering** | Perte silencieuse de lignes ou payload altéré dans `.env` | Contrôle strict de la syntaxe du `.env` pré-existant : rejet fail-closed (`EnvRemediationError`) de toute ligne sans `=` ou à clé vide, sur une lecture unique en mémoire (anti-TOCTOU, aucun second snapshot fusionné). |
 | **Tampering** | Exécution de commande shell si `.env` est sourcé | Échappement des caractères spéciaux (`\`, `"`, `$`, `` ` ``) via `format_env_value`. |
 | **Elevation of Privilege** | Path traversal (`../`, chemin absolu, symlink sortant) | Confinement de tous les chemins via `mcp.paths.confine`. Liens symboliques refusés fail-closed. |
 | **Elevation of Privilege** | Élargissement de surface sur fichiers arbitraires ou de sauvegarde | Grammaire d'environnement stricte (`_is_env_like_path`) rejetant `.environment`, `.env.bak`, `.env.old`, `src/app.py`, et refus des métacaractères `[]/{}` dans gitignore. |
