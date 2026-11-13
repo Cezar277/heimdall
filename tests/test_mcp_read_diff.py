@@ -205,6 +205,17 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.assertEqual(payload["files"][0]["redactions"], 2)
         self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
+    def test_json_quoted_password_is_masked_end_to_end(self) -> None:
+        """E-03 : une clé JSON entre guillemets ne fuit plus dans le diff."""
+        self.write("config.json", '{"password": "hunter2!hunter"}\n')
+        self.stage("config.json")
+        payload = self.call_read_diff()
+        content = json.dumps(payload)
+        self.assertNotIn("hunter2!hunter", content)
+        self.assertIn("<REDACTED:generic_secret:len=14>", content)
+        self.assertEqual(payload["files"][0]["redactions"], 1)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
     def test_generic_key_names_are_masked_end_to_end(self) -> None:
         """`KEY=hunter2`, `AWS_KEY=...`, `MYKEY=ab12` : bout en bout.
 

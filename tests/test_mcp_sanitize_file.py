@@ -105,6 +105,14 @@ class SanitizeFileToolTests(FileRepoTestCase):
             with self.subTest(**arguments):
                 self.assertNotIn(jeton, str(self.read(arguments)))
 
+    def test_json_quoted_password_is_masked_end_to_end(self) -> None:
+        """E-03 : une clé JSON entre guillemets ne part plus en clair au LLM."""
+        self.write("config.json", '{"password": "hunter2!hunter"}\n')
+        payload = self.read({"path": "config.json"})
+        self.assertNotIn("hunter2!hunter", payload["content"])
+        self.assertIn("<REDACTED:generic_secret:len=14>", payload["content"])
+        self.assertEqual(payload["redactions"], 1)
+
     def test_long_quoted_value_is_masked_not_windowed(self) -> None:
         """Régression de revue : plus de fenêtre AVANT le masquage.
 
@@ -257,6 +265,26 @@ class SanitizeFileToolTests(FileRepoTestCase):
         ):
             with self.subTest(path=path):
                 self.write(path, "TOKEN=factice\n")
+                payload = self.read({"path": path})
+                self.assertEqual(payload["error"]["code"], "FORBIDDEN_PATH")
+
+    def test_credential_files_are_forbidden(self) -> None:
+        """F-09 : les fichiers de credentials ne sont jamais lus, même masqués."""
+        for path in (
+            ".netrc",
+            ".pgpass",
+            "id_rsa",
+            "id_ed25519",
+            "server.pem",
+            "private.key",
+            ".npmrc",
+            ".pypirc",
+            "credentials",
+            ".docker/config.json",
+            ".kube/config",
+        ):
+            with self.subTest(path=path):
+                self.write(path, "mot-de-passe-factice\n")
                 payload = self.read({"path": path})
                 self.assertEqual(payload["error"]["code"], "FORBIDDEN_PATH")
 

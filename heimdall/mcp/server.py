@@ -69,6 +69,26 @@ MAX_SANITIZE_LINES: Final[int] = 400
 MAX_FILE_BYTES: Final[int] = 1024 * 1024
 MAX_CONTENT_CHARS: Final[int] = 100_000
 
+# Fichiers de credentials refusés par `sanitize_file` (audit F-09), en plus de
+# `.git/` et `.env*` : un faux positif de lecture coûte un fichier de contexte,
+# une lecture de `.netrc`/clé privée coûte un secret envoyé au LLM.
+_FORBIDDEN_FILENAMES: Final[frozenset[str]] = frozenset(
+    {".netrc", ".pgpass", ".npmrc", ".pypirc", "credentials"}
+)
+
+# Clés privées et trousseaux : le suffixe suffit, quelle que soit la casse.
+_FORBIDDEN_SUFFIXES: Final[tuple[str, ...]] = (".pem", ".key")
+
+# Préfixes de clés SSH : `id_rsa.pub` est public, mais le sur-blocage est
+# bénin et une clé privée sans suffixe ne doit pas passer par variante.
+_FORBIDDEN_PREFIXES: Final[tuple[str, ...]] = ("id_rsa", "id_ed25519")
+
+# Configurations qui contiennent des identifiants de registre / cluster.
+_FORBIDDEN_CONFIG_PATHS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {(".docker", "config.json"), (".kube", "config")}
+)
+_CONFIG_PATH_SEGMENTS: Final[int] = 2
+
 
 # `O_NONBLOCK` n'existe pas sur Windows : repli à 0 (aucun effet) pour
 # rester importable partout. Sur POSIX il est indispensable : sans lui,
@@ -430,7 +450,7 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
 
 
 def is_forbidden_path(relative: str) -> bool:
-    """Segments que le contrat interdit de lire : ``.git/`` et ``.env*``.
+    """Segments que le contrat interdit de lire, élargis par l'audit F-09.
 
     Décidé sur le chemin **canonique** renvoyé par la garde, pas sur
     l'entrée : ``./.git`` ou ``sous/.././.git`` arrivent ici déjà
@@ -445,14 +465,29 @@ def is_forbidden_path(relative: str) -> bool:
     l'exige le contrat (`.env*`, §4.2) : sur-bloquer `.envelope` est un
     faux positif bénin assumé, laisser passer `.env-backup` serait un
     contournement de l'interdit (sauvegardes !).
+
+    F-09 : la liste couvre aussi les fichiers de credentials usuels
+    (`.netrc`, `.pgpass`, `id_rsa`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`,
+    `.docker/config.json`, `.kube/config`, `credentials`). Le masquage de
+    E-03 reste une seconde barrière, pas une autorisation de lecture.
     """
-    for segment in relative.split("/"):
-        lowered = segment.lower()
-        if lowered == ".git":
+    segments = relative.split("/")
+    lowered = [segment.lower() for segment in segments]
+    for segment in lowered:
+        if segment == ".git":
             return True
-        if lowered.startswith(".env"):
+        if segment.startswith(".env"):
             return True
-    return False
+        if segment in _FORBIDDEN_FILENAMES:
+            return True
+        if segment.endswith(_FORBIDDEN_SUFFIXES):
+            return True
+        if segment.startswith(_FORBIDDEN_PREFIXES):
+            return True
+    return (
+        len(lowered) >= _CONFIG_PATH_SEGMENTS
+        and (lowered[-2], lowered[-1]) in _FORBIDDEN_CONFIG_PATHS
+    )
 
 
 def _absent_or_internal(error: OSError) -> ToolFailure:

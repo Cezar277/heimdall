@@ -329,8 +329,46 @@ class ForbiddenPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(server.is_forbidden_path(path))
 
+    def test_credential_files_are_forbidden(self) -> None:
+        """F-09 : `.netrc`, clés SSH/PEM, configs Docker/Kube, etc."""
+        for path in (
+            ".netrc",
+            "home/.netrc",
+            ".pgpass",
+            "postgres/.pgpass",
+            "id_rsa",
+            "id_rsa.pub",
+            "sub/id_ed25519",
+            "server.pem",
+            "certs/SERVER.PEM",
+            "private.key",
+            ".npmrc",
+            ".pypirc",
+            "credentials",
+            "aws/credentials",
+            ".docker/config.json",
+            "sub/.docker/config.json",
+            ".kube/config",
+            "prod/.kube/config",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(server.is_forbidden_path(path))
+
     def test_lookalikes_are_allowed(self) -> None:
-        for path in (".gitignore", ".github/a", "git/x", "my.env/file", "a.envb/c"):
+        for path in (
+            ".gitignore",
+            ".github/a",
+            "git/x",
+            "my.env/file",
+            "a.envb/c",
+            "netrc.txt",
+            "credentials.md",
+            "server.pem.txt",
+            "keys/readme.txt",
+            ".docker/config.yml",
+            ".kube/other",
+            ".npmrc.example",
+        ):
             with self.subTest(path=path):
                 self.assertFalse(server.is_forbidden_path(path))
 

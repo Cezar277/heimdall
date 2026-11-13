@@ -186,6 +186,21 @@ imbriqué) : garde-fou temporel anti-ReDoS en test. Le scanner #22 est livré
 avec ses propres signatures et exclusions ; `_looks_like_secret` reste un filet
 conservateur indépendant, car `mask_text` couvre aussi des champs que le
 scanner ne produit pas.
+
+**Correctif E-03 (audit)** : les guillemets autour de la clé sont optionnels
+(`{"password": "…"}`, `'api_key': '…'`, dict Python), les valeurs quotées
+doubles et simples sont jugées séparément (une apostrophe reste dans une
+chaîne double, un guillemet double dans une chaîne simple), `=>` est accepté,
+et une valeur non quotée à nom évocateur est masquée jusqu'à la fin de ligne
+(espaces, `,`, `;` inclus) — `password = my secret pass phrase 42` ne laisse
+plus sa queue en clair. Les formes hors affectation sont couvertes : balise
+XML sensible (`<password>…</password>`), `define('DB_PASSWORD', '…')`,
+`.netrc` (`password …`), `-u user:pass` et `--password <val>`/`--password=<val>`.
+Le filtre anti-bruit refuse les annotations (`api_key: str`), littéraux
+(`session = None`) et appels de fonction ; les clés JSON usuelles
+(`"author"`, `"tokenizer"`) restent lisibles. Preuve : les 11 cas de l'audit
+rejoués dans `tests/test_mcp_masking.py`.
+
 Limites honnêtes : un jeton **sans préfixe connu, noyé dans 100 Ko de
 remplissage**, reste indétectable par fenêtre ; un SHA de commit copié en
 clair est masqué (faux positif bénin assumé) ; une valeur courte (< 16
@@ -400,7 +415,7 @@ entier, plus `g.bin` tronqué qui cassait l'aller-retour vers
 un nom tronqué. Preuve : `heimdall/mcp/gitdiff.py`
 (`parse_diff`, `DiffEntry`, `staged_diff`, `_binary_path`).
 
-### 11. `.git`/`.env` insensibles à la casse, binaires et tailles
+### 11. `.git`/`.env`/credentials insensibles à la casse, binaires et tailles
 
 Segments comparés en minuscules (`.GIT` ouvre le même dossier sur FS
 insensible à la casse). Binaire (octet nul cherché sur **tout le contenu
@@ -408,6 +423,17 @@ lu**, borné à 1 Mo + 1 octet — pas seulement les 8 premiers Kio comme
 l'écrivait une ancienne version de ce paragraphe), > 1 Mo (`TOO_LARGE`,
 double garde : avant **et** après lecture), absent/dossier (`NOT_FOUND`),
 `start_line` hors bornes (extrait vide, `end_line: 0`, rien d'inventé).
+
+**F-09 (audit)** : `is_forbidden_path` refuse aussi les fichiers de
+credentials au-delà de `.git`/`.env*` — `.netrc`, `.pgpass`, `id_rsa*`,
+`id_ed25519*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `credentials`,
+`.docker/config.json` et `.kube/config`, casse ignorée. Le masquage E-03
+reste une seconde barrière, jamais une autorisation de lecture ; les
+ressemblances (`netrc.txt`, `credentials.md`, `server.pem.txt`) restent
+lisibles. Preuve :
+`tests/test_mcp_units.py::ForbiddenPathTests` et
+`tests/test_mcp_sanitize_file.py::SanitizeFileToolTests`
+(`test_credential_files_are_forbidden`).
 
 **`NOT_FOUND` réservé à l'absence** (`ENOENT`/`ENOTDIR`) : une permission
 refusée (`EACCES`/`EPERM`, `lstat` comme `open`), un nom trop long ou toute
@@ -469,7 +495,7 @@ renseigner la feuille SAMM avec liens permanents au SHA :
 | entrées refusées, échecs en enveloppe (outil inconnu inclus) | `heimdall/mcp/server.py` (`_ToolBoundary`, `tool_handler`), `heimdall/mcp/errors.py` |
 | git confiné, diff typé, binaire hors racine/cwd | `heimdall/mcp/gitdiff.py` (`DIFF_ARGUMENTS`, `confined_environment`, `parse_diff`, `GitAccess.__init__`) |
 | canal stdio jamais hérité par git, plafond de découverte | `heimdall/mcp/gitdiff.py` (`GitAccess.execute`, `GitAccess.staged_diff`, `confined_environment`), `tests/security/test_prompt_injection.py` (`_fixed_argv_violations`) |
-| masquage avant sérialisation, compteurs vrais, quotée sans borne haute | `heimdall/mcp/masking.py` (`mask_text`, `_KNOWN_PREFIXES`, `_QUOTED_ASSIGNMENT`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`) |
+| masquage avant sérialisation, compteurs vrais, quotée sans borne haute | `heimdall/mcp/masking.py` (`mask_text`, `_KNOWN_PREFIXES`, `_QUOTED_ASSIGNMENT`, `_EVOCATIVE_UNQUOTED_VALUE`), `heimdall/mcp/server.py` (`_masked_files`, `_masked_line`, `is_forbidden_path`), `tests/test_mcp_masking.py` |
 | garde unique, TOCTOU réduite, FIFO refusés, `NOT_FOUND` réservé à l'absence | `heimdall/mcp/paths.py` (`confine`), `heimdall/mcp/server.py` (`_read_extract`) |
 | coupe sur lignes complètes | `heimdall/mcp/gitdiff.py` (`staged_diff`) |
 | format de diff non compris → `truncated`, jamais du silence | `heimdall/mcp/gitdiff.py` (`_COMBINED_HUNK_HEADER`, `_DiffParser._hunk_header`, `_DiffParser._feed` pour `diff --*` inconnu) |
