@@ -385,13 +385,14 @@ def test_t31_samm_permalinks_integrity_and_header_sync() -> None:
         ("heimdall/remediation/env.py", 672): "_build_sanitized_example_content",
         ("heimdall/remediation/env.py", 738): "_pattern_matches_target",
         ("heimdall/remediation/env.py", 767): "_is_env_covered_in_gitignore",
-        ("heimdall/remediation/env.py", 791): "ensure_gitignore_ignores_env",
-        ("heimdall/remediation/env.py", 843): "update_env_example",
-        ("heimdall/remediation/env.py", 986): "update_env_file",
-        ("heimdall/remediation/env.py", 1047): "check_env_git_status",
-        ("heimdall/remediation/env.py", 1097): "plan_env_example_change",
-        ("heimdall/remediation/env.py", 1138): "plan_gitignore_change",
-        ("heimdall/remediation/env.py", 1176): "remediate_environment",
+        ("heimdall/remediation/env.py", 831): "ensure_gitignore_ignores_env",
+        ("heimdall/remediation/env.py", 885): "update_env_example",
+        ("heimdall/remediation/env.py", 1014): "_prepare_env_file_content",
+        ("heimdall/remediation/env.py", 1055): "update_env_file",
+        ("heimdall/remediation/env.py", 1083): "check_env_git_status",
+        ("heimdall/remediation/env.py", 1133): "plan_env_example_change",
+        ("heimdall/remediation/env.py", 1174): "plan_gitignore_change",
+        ("heimdall/remediation/env.py", 1212): "remediate_environment",
     }
     for (rel_path, line_no), symbol in expected_symbols.items():
         code, content = repin._git("cat-file", "-p", f"{sha_entete}:{rel_path}", cwd=REPO)

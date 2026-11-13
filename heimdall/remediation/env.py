@@ -776,16 +776,56 @@ def _is_env_covered_in_gitignore(content: str, pattern: str = ".env") -> bool:
 
     covered = False
     for raw_line in content.splitlines():
-        line = raw_line.strip()
+        # Git ignore les espaces de fin non échappés, jamais les espaces/tabs de tête :
+        # " .env" ou "\t.env" désigne littéralement un fichier nommé " .env" / "\t.env".
+        line = raw_line.rstrip("\r\n").rstrip(" ")
         if not line or line.startswith("#"):
             continue
         if line.startswith("!"):
-            negated = line[1:].strip()
+            negated = line[1:]
             if _pattern_matches_target(negated, clean_target):
                 covered = False
         elif _pattern_matches_target(line, clean_target):
             covered = True
     return covered
+
+
+def _write_text_atomic_checked(target: Path, content: str, mode: int) -> None:
+    """Écrit atomiquement ``content`` sur ``target`` via EnvRemediationError."""
+    try:
+        write_file_atomic(target, content, mode=mode)
+    except (ValueError, OSError):
+        raise EnvRemediationError from None
+
+
+def _prepare_gitignore_update(gitignore_file: Path, clean_pattern: str) -> tuple[str, int] | None:
+    """Prépare en mémoire l'ajout idempotent de ``clean_pattern`` à ``.gitignore``.
+
+    Retourne ``(nouveau_contenu, mode)`` si une mise à jour est nécessaire, ou ``None`` si
+    le motif est déjà couvert.
+    """
+    existing_content = ""
+    mode = _DEFAULT_FILE_MODE
+    try:
+        existing_content, mode = _read_text_secure(gitignore_file)
+    except FileNotFoundError:
+        pass
+    except EnvRemediationError:
+        raise
+
+    mode = _harden_default_file_mode(mode)
+
+    if _is_env_covered_in_gitignore(existing_content, pattern=clean_pattern):
+        return None
+
+    if existing_content and not existing_content.endswith("\n"):
+        new_content = f"{existing_content}\n{clean_pattern}\n"
+    elif existing_content:
+        new_content = f"{existing_content}{clean_pattern}\n"
+    else:
+        new_content = f"{clean_pattern}\n"
+
+    return new_content, mode
 
 
 def ensure_gitignore_ignores_env(
@@ -811,10 +851,23 @@ def ensure_gitignore_ignores_env(
     clean_pattern = _validate_gitignore_pattern(pattern)
     confined = _confine_and_check_no_symlink(root, gitignore_path, ".gitignore")
 
+    prepared = _prepare_gitignore_update(confined.absolute, clean_pattern)
+    if prepared is None:
+        return False
+
+    new_content, mode = prepared
+    _write_text_atomic_checked(confined.absolute, new_content, mode)
+    return True
+
+
+def _prepare_env_example_update(
+    example_file: Path, validated_names: list[str]
+) -> tuple[str | None, int, list[str]]:
+    """Prépare en mémoire la mise à jour assainie de ``.env.example``."""
     existing_content = ""
     mode = _DEFAULT_FILE_MODE
     try:
-        existing_content, mode = _read_text_secure(confined.absolute)
+        existing_content, mode = _read_text_secure(example_file)
     except FileNotFoundError:
         pass
     except EnvRemediationError:
@@ -822,22 +875,11 @@ def ensure_gitignore_ignores_env(
 
     mode = _harden_default_file_mode(mode)
 
-    if _is_env_covered_in_gitignore(existing_content, pattern=clean_pattern):
-        return False
+    new_content, changed_names = _build_sanitized_example_content(existing_content, validated_names)
+    if not changed_names and new_content == existing_content:
+        return None, mode, []
 
-    if existing_content and not existing_content.endswith("\n"):
-        new_content = f"{existing_content}\n{clean_pattern}\n"
-    elif existing_content:
-        new_content = f"{existing_content}{clean_pattern}\n"
-    else:
-        new_content = f"{clean_pattern}\n"
-
-    try:
-        write_file_atomic(confined.absolute, new_content, mode=mode)
-    except (ValueError, OSError):
-        raise EnvRemediationError from None
-
-    return True
+    return new_content, mode, changed_names
 
 
 def update_env_example(
@@ -867,27 +909,13 @@ def update_env_example(
     validated_names = _extract_and_validate_names(variables)
     confined = _confine_and_check_no_symlink(root, example_path, ".env.example")
 
-    existing_content = ""
-    mode = _DEFAULT_FILE_MODE
-    try:
-        existing_content, mode = _read_text_secure(confined.absolute)
-    except FileNotFoundError:
-        pass
-    except EnvRemediationError:
-        raise
-
-    mode = _harden_default_file_mode(mode)
-
-    new_content, changed_names = _build_sanitized_example_content(existing_content, validated_names)
-
-    if not changed_names and new_content == existing_content:
+    new_content, mode, changed_names = _prepare_env_example_update(
+        confined.absolute, validated_names
+    )
+    if new_content is None:
         return []
 
-    try:
-        write_file_atomic(confined.absolute, new_content, mode=mode)
-    except (ValueError, OSError):
-        raise EnvRemediationError from None
-
+    _write_text_atomic_checked(confined.absolute, new_content, mode)
     return changed_names
 
 
@@ -983,6 +1011,47 @@ def _validate_and_materialize_secrets(
     return validated_dict
 
 
+def _prepare_env_file_content(
+    env_file: Path,
+    validated_dict: dict[str, str],
+) -> str:
+    """Lit .env existant (lecture unique), fusionne et valide le volume final (<= 1 Mio)."""
+    merged_secrets: dict[str, str] = {}
+    if env_file.exists():
+        if os.path.islink(env_file):
+            raise EnvRemediationError("écriture refusée : .env est un lien symbolique")
+
+        # Lecture unique : le contenu validé en mémoire est la seule source de
+        # vérité. Aucune seconde lecture ne peut fusionner un snapshot divergent.
+        raw_existing, _ = _read_text_secure(env_file)
+        merged_secrets = _parse_env_strict(raw_existing)
+
+    merged_secrets.update(validated_dict)
+
+    # Vérification stricte du volume cumulé total après fusion (anti-DoS)
+    total_merged_chars = sum(len(v) for v in merged_secrets.values())
+    if total_merged_chars > _MAX_TOTAL_SECRET_CHARS:
+        raise EnvRemediationError("volume total des secrets supérieur à 1 Mio")
+
+    lines = [f"{k}={format_env_value(v)}" for k, v in merged_secrets.items()]
+    content = "\n".join(lines) + "\n"
+
+    if len(content.encode("utf-8")) > _MAX_READ_BYTES:
+        raise EnvRemediationError("volume total des secrets supérieur à 1 Mio")
+
+    return content
+
+
+def _write_prepared_env_file(env_file: Path, content: str) -> Path:
+    """Écrit atomiquement le contenu .env déjà préparé en mode 0600 et le vérifie."""
+    _write_text_atomic_checked(env_file, content, _SECURE_ENV_MODE)
+
+    if not check_file_mode_600(env_file):
+        raise EnvRemediationError("permissions invalides : .env n'est pas en mode 0600")
+
+    return env_file
+
+
 def update_env_file(
     root: Path,
     secrets: Mapping[str, str] | Iterable[tuple[str, str]],
@@ -1006,42 +1075,9 @@ def update_env_file(
     _validate_env_like_path(env_path, ".env", expect_template=False)
 
     validated_dict = _validate_and_materialize_secrets(secrets)
-
     confined = _confine_and_check_no_symlink(root, env_path, ".env")
-
-    # Lecture sécurisée du .env existant si présent pour fusionner
-    merged_secrets: dict[str, str] = {}
-    if confined.absolute.exists():
-        if os.path.islink(confined.absolute):
-            raise EnvRemediationError("écriture refusée : .env est un lien symbolique")
-
-        # Lecture unique : le contenu validé en mémoire est la seule source de
-        # vérité. Aucune seconde lecture ne peut fusionner un snapshot divergent.
-        raw_existing, _ = _read_text_secure(confined.absolute)
-        merged_secrets = _parse_env_strict(raw_existing)
-
-    merged_secrets.update(validated_dict)
-
-    # Vérification stricte du volume cumulé total après fusion (anti-DoS)
-    total_merged_chars = sum(len(v) for v in merged_secrets.values())
-    if total_merged_chars > _MAX_TOTAL_SECRET_CHARS:
-        raise EnvRemediationError("volume total des secrets supérieur à 1 Mio")
-
-    lines = [f"{k}={format_env_value(v)}" for k, v in merged_secrets.items()]
-    content = "\n".join(lines) + "\n"
-
-    if len(content.encode("utf-8")) > _MAX_READ_BYTES:
-        raise EnvRemediationError("volume total des secrets supérieur à 1 Mio")
-
-    try:
-        write_file_atomic(confined.absolute, content, mode=_SECURE_ENV_MODE)
-    except (ValueError, OSError):
-        raise EnvRemediationError from None
-
-    if not check_file_mode_600(confined.absolute):
-        raise EnvRemediationError("permissions invalides : .env n'est pas en mode 0600")
-
-    return confined.absolute
+    content = _prepare_env_file_content(confined.absolute, validated_dict)
+    return _write_prepared_env_file(confined.absolute, content)
 
 
 def check_env_git_status(
@@ -1104,7 +1140,7 @@ def plan_env_example_change(
     Utilisable par la CLI review pour construire un TextChange pour affichage diff.
     ``avant`` est toujours assaini : toute valeur préexistante est remplacée par
     le marqueur ``***`` (invariant 8), jamais exposée en clair dans le diff.
-    Retourne None si aucune variable nouvelle n'est à ajouter.
+    Retourne None si aucun ajout ni purge ne modifie le fichier.
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
@@ -1217,19 +1253,34 @@ def remediate_environment(  # noqa: PLR0913
     if len(set(env_paths)) != len(env_paths):
         raise EnvRemediationError("chemins d'environnement confondus")
 
-    # Validation complète des noms, valeurs (\n/\r/\0) et bornes AVANT toute écriture disque.
+    # Validation complète des noms, valeurs (\n/\r/\0), bornes et relecture/fusion
+    # des fichiers pré-existants EN MÉMOIRE AVANT toute écriture disque :
+    # si .env ou .env.example ou .gitignore échoue (syntaxe invalide, quota > 1 Mio),
+    # aucun des trois fichiers n'est créé ni modifié.
     validated_secrets = _validate_and_materialize_secrets(secrets)
+    clean_pattern = _validate_gitignore_pattern(confined_env.relative)
+
+    prepared_example_content, example_mode, added_to_example = _prepare_env_example_update(
+        confined_example.absolute, list(validated_secrets.keys())
+    )
+    prepared_env_content = _prepare_env_file_content(confined_env.absolute, validated_secrets)
+    prepared_gitignore = _prepare_gitignore_update(confined_gitignore.absolute, clean_pattern)
 
     # 1. Mise à jour de .env.example (valeurs vides obligatoires)
-    added_to_example = update_env_example(root, validated_secrets, example_path=example_path)
+    if prepared_example_content is not None:
+        _write_text_atomic_checked(
+            confined_example.absolute, prepared_example_content, example_mode
+        )
 
     # 2. Mise à jour ou création de .env en mode 0600
-    update_env_file(root, validated_secrets, env_path=env_path)
+    _write_prepared_env_file(confined_env.absolute, prepared_env_content)
 
     # 3. Ajout de .env au .gitignore si absent (idempotent)
-    gitignore_updated = ensure_gitignore_ignores_env(
-        root, gitignore_path=gitignore_path, pattern=confined_env.relative
-    )
+    gitignore_updated = False
+    if prepared_gitignore is not None:
+        gitignore_content, gitignore_mode = prepared_gitignore
+        _write_text_atomic_checked(confined_gitignore.absolute, gitignore_content, gitignore_mode)
+        gitignore_updated = True
 
     # 4. Contrôle du suivi Git de .env
     tracked, ignored, warn, rm_cmd = check_env_git_status(root, env_path=env_path)

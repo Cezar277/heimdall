@@ -1382,3 +1382,68 @@ def test_remediate_environment_validates_secrets_before_any_disk_write(tmp_path:
         remediate_environment(tmp_path, {"APP_KEY": "x" * 1_048_577})
 
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("leading_ws_line", [" .env\n", "\t.env\n"])
+def test_gitignore_leading_whitespace_not_treated_as_covering_env(
+    git_repo: Path, leading_ws_line: str
+) -> None:
+    """Une entrée .gitignore avec espace ou tabulation de tête ne couvre PAS .env."""
+    gitignore = git_repo / ".gitignore"
+    gitignore.write_text(leading_ws_line, encoding="utf-8")
+
+    git_bin = shutil.which("git")
+    if git_bin:
+        before = subprocess.run(  # noqa: S603
+            [git_bin, "check-ignore", "-q", ".env"],
+            cwd=git_repo,
+            check=False,
+        )
+        assert before.returncode != 0
+
+    changed = ensure_gitignore_ignores_env(git_repo)
+    assert changed is True
+    assert ".env\n" in gitignore.read_text(encoding="utf-8")
+
+    if git_bin:
+        after = subprocess.run(  # noqa: S603
+            [git_bin, "check-ignore", "-q", ".env"],
+            cwd=git_repo,
+            check=False,
+        )
+        assert after.returncode == 0
+
+    assert ensure_gitignore_ignores_env(git_repo) is False
+
+
+def test_remediate_environment_existing_env_error_leaves_other_files_untouched(
+    tmp_path: Path,
+) -> None:
+    """Échec sur .env pré-existant : zéro écriture sur .env.example ni .gitignore."""
+    env_file = tmp_path / ".env"
+    example_file = tmp_path / ".env.example"
+    gitignore_file = tmp_path / ".gitignore"
+
+    # 1. Ligne invalide dans .env pré-existant (absence de '=')
+    env_file.write_text("HELLO WORLD\n", encoding="utf-8")
+    env_file.chmod(0o600)
+
+    with pytest.raises(EnvRemediationError, match="'=' attendu"):
+        remediate_environment(tmp_path, {"APP_KEY": "safe_val"})
+
+    assert not example_file.exists()
+    assert not gitignore_file.exists()
+    assert env_file.read_text(encoding="utf-8") == "HELLO WORLD\n"
+
+    # 2. Volume fusionné > 1 Mio (900 Ko existant + 900 Ko nouveau) avec .env.example déjà présent
+    existing_payload = f'OLD_SECRET="{"a" * 900_000}"\n'
+    env_file.write_text(existing_payload, encoding="utf-8")
+    env_file.chmod(0o600)
+    example_file.write_text("OLD_SECRET=\n", encoding="utf-8")
+
+    with pytest.raises(EnvRemediationError, match="volume total"):
+        remediate_environment(tmp_path, {"NEW_SECRET": "b" * 900_000})
+
+    assert example_file.read_text(encoding="utf-8") == "OLD_SECRET=\n"
+    assert not gitignore_file.exists()
+    assert env_file.read_text(encoding="utf-8") == existing_payload
