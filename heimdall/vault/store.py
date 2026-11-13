@@ -463,6 +463,11 @@ class InMemorySecretStore:
             self._server_hmac_canary = None
 
     def _check_rotate_hmac_continuity(self, new_cipher: VaultCipher) -> None:
+        if not self._secrets and self._server_hmac_canary is None:
+            # Store vierge (jamais de create) ou vidé par clear() : aucune
+            # empreinte ni canari n'existe, la rotation est libre et le
+            # contrôle de continuité ne s'applique pas.
+            return
         if self._server_hmac_canary is not None:
             if not new_cipher.has_explicit_server_hmac_key:
                 raise VaultCipherError(
@@ -499,9 +504,15 @@ class InMemorySecretStore:
             validate_kek_version(target_kek_version, label="Numéro de version cible")
 
         async with self._lock:
+            # Continuité HMAC contrôlée AVANT le retour store vide : un canari
+            # persistant (survivant au delete() du dernier secret, seul
+            # clear() l'efface) impose un échec immédiat, pas un échec différé
+            # au prochain create (revue LOW #116). Le cas « vierge ou vidé par
+            # clear() » (aucun secret, aucun canari) reste exempté dans
+            # _check_rotate_hmac_continuity.
+            self._check_rotate_hmac_continuity(new_cipher)
             if not self._secrets:
                 return 0
-            self._check_rotate_hmac_continuity(new_cipher)
             for r in self._secrets.values():
                 v = r.get("kek_version")
                 if v is not None and (

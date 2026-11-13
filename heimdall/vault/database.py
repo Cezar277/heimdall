@@ -1713,8 +1713,17 @@ def _check_rotate_kek_hmac_continuity(
     """Vérifie la continuité de clé HMAC serveur lors de rotate_secrets_kek (ticket #116)."""
     from heimdall.vault.crypto import VaultCipherError  # noqa: PLC0415
 
+    cursor = conn.execute("SELECT 1 FROM secrets LIMIT 1")
+    has_secrets = cursor.fetchone() is not None
     persisted_canary = get_server_hmac_canary(conn)
+    if persisted_canary is None and not has_secrets:
+        # Base vierge (aucun secret, aucun canari) : la rotation est libre et
+        # le contrôle de continuité ne s'applique pas.
+        return
     if persisted_canary is not None:
+        # Un canari persistant survit au delete() du dernier secret : le
+        # contrôle reste immédiat même base vide, sans différer l'échec au
+        # prochain create (revue LOW #116).
         if not new_cipher.has_explicit_server_hmac_key:
             raise VaultCipherError(
                 "La rotation de KEK vers un chiffreur en mode dérivé "
@@ -1757,6 +1766,9 @@ def rotate_secrets_kek(
     - Échoue fail-closed si un secret hérité (#25/#62) sans enveloppe de DEK est rencontré.
     - Si la base est vide (aucun secret), retourne (0, 1) sans modifier la base,
       target_kek_version étant ignorée car aucune version n'est persistée (#71 LOW 2).
+      Exception : un canari HMAC persistant (survivant au delete() du dernier
+      secret) impose le contrôle de continuité avant ce retour, fail-closed
+      immédiat (revue LOW #116).
 
     Returns:
         tuple[int, int]: Un tuple (nombre_de_secrets_reenveloppes, nouvelle_version_kek).
@@ -1769,6 +1781,12 @@ def rotate_secrets_kek(
         validate_kek_version(target_kek_version, label="Numéro de version cible")
 
     with _write_transaction(conn):
+        # Continuité HMAC contrôlée AVANT le retour base vide : un canari
+        # persistant (survivant au delete() du dernier secret) impose un
+        # échec immédiat, pas un échec différé au prochain create (revue LOW
+        # #116). Le cas « base vierge » (aucun secret, aucun canari) reste
+        # exempté dans _check_rotate_kek_hmac_continuity.
+        _check_rotate_kek_hmac_continuity(conn, new_cipher)
         cursor = conn.execute(
             "SELECT id, project_id, env, name, encrypted_dek, kek_version "
             "FROM secrets ORDER BY id ASC"
@@ -1779,8 +1797,6 @@ def rotate_secrets_kek(
             # target_kek_version est ignorée pour ne pas faire croire à l'appelant
             # qu'une version non persistée est active (#71 LOW 2).
             return 0, 1
-
-        _check_rotate_kek_hmac_continuity(conn, new_cipher)
 
         for r in secrets_to_rotate:
             v = r["kek_version"]

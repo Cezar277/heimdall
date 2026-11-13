@@ -88,6 +88,39 @@ def _shannon_entropy(data: bytes) -> float:
     return -sum((c / length) * math.log2(c / length) for c in counts.values())
 
 
+# Garde anti-phrase humaine (revue LOW #116) : une phrase naturelle de 32+ octets
+# peut franchir les seuils de diversité (24 symboles) et d'entropie brute
+# (Shannon >= 4.0) tout en ne portant que 60-80 bits effectifs (mots de
+# dictionnaire), restant attaquable hors ligne avec un dump SQLite et le canari
+# public. On refuse toute clé d'au moins _HUMAN_PHRASE_MIN_CHARS caractères dont
+# la part de minuscules ASCII et d'espaces atteint _HUMAN_PHRASE_MAX_WORD_RATIO.
+# generate_server_hmac_key() produit du base64url (environ 40 % de minuscules en
+# moyenne sur 43 octets) : atteindre 85 % exigerait un événement à plus de 5
+# sigma, donc aucun faux positif n'est possible sur la seule voie supportée.
+# Les seuils de diversité/entropie ne sont PAS relevables davantage : sur des
+# clés base64url de 43 octets, exiger 28 symboles distincts rejetterait ~3.7 %
+# des clés légitimes et Shannon >= 4.5 en rejetterait ~0.5 %, alors qu'une clé
+# produite par generate_server_hmac_key() doit toujours passer sa propre garde.
+_HUMAN_PHRASE_MIN_CHARS: int = 32
+_HUMAN_PHRASE_MAX_WORD_RATIO: float = 0.85
+
+
+def _looks_like_human_phrase(key_bytes: bytes) -> bool:
+    """Détecte une clé qui est en réalité une phrase naturelle (mots + espaces).
+
+    La détection ignore la casse par composition NFKD (accents retirés) et ne
+    s'applique qu'aux clés textuelles d'au moins 32 caractères normalisés ;
+    les octets binaires non UTF-8 sont réduits par ``errors="ignore"`` et
+    restent du ressort des gardes de diversité et d'entropie.
+    """
+    normalized = unicodedata.normalize("NFKD", key_bytes.decode("utf-8", errors="ignore"))
+    stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    if len(stripped) < _HUMAN_PHRASE_MIN_CHARS:
+        return False
+    word_chars = sum(1 for ch in stripped if ch.isascii() and (ch.islower() or ch == " "))
+    return word_chars / len(stripped) >= _HUMAN_PHRASE_MAX_WORD_RATIO
+
+
 # Une DEK fait 256 bits, comme la KEK : l'AES-256-GCM exige une clé de 32 octets.
 _DEK_SIZE_BYTES: int = 32
 
@@ -221,16 +254,32 @@ def _validate_key_complexity(key_bytes: bytes) -> None:
             "utiliser generate_server_hmac_key() comme seule voie supportée pour "
             "générer une clé aléatoire cryptographiquement sûre de 256 bits."
         )
+    if _looks_like_human_phrase(key_bytes):
+        raise ValueError(
+            "La clé HMAC serveur ressemble à une phrase naturelle et ne porte pas "
+            "256 bits effectifs (mots de dictionnaire attaquables hors ligne) : "
+            "utiliser generate_server_hmac_key() comme seule voie supportée pour "
+            "générer une clé aléatoire cryptographiquement sûre de 256 bits."
+        )
 
 
 def validate_server_hmac_key(key: str | bytes | bytearray | None) -> bytes:
     """Valide et normalise la clé HMAC serveur en octets (ticket #116).
 
     Exige au moins 32 octets (256 bits), au plus 512 octets (borne maximale),
-    au moins 24 symboles distincts, aucune période répétitive et une entropie
-    de Shannon >= 4.0 bits/octet. Ces contrôles neutralisent les attaques par
+    au moins 24 symboles distincts, aucune période répétitive, une entropie
+    de Shannon >= 4.0 bits/octet et aucun aspect de phrase naturelle (garde
+    anti-phrase humaine). Ces contrôles neutralisent les attaques par
     dictionnaire et les ralentissements par clés géantes.
-    Seule la fonction ``generate_server_hmac_key()`` est supportée.
+
+    Portée exacte de la garantie (revue LOW #116) : la neutralisation
+    dictionnaire/arc-en-ciel avec 256 bits effectifs n'est **prouvée** que pour
+    une clé produite par ``generate_server_hmac_key()`` (CSPRNG, base64url).
+    Pour une clé fournie par l'opérateur, ces contrôles sont une défense en
+    profondeur heuristique (échec fail-closed sur tout motif connu-faible) ;
+    ils ne peuvent pas prouver l'entropie d'une clé arbitraire — c'est
+    pourquoi les seuils ne sont pas relevés davantage (voir les constantes
+    ``_HUMAN_PHRASE_*``) et pourquoi la voie supportée reste la génération.
     """
     key_bytes = _to_raw_server_hmac_bytes(key)
     _validate_key_complexity(key_bytes)
@@ -899,7 +948,26 @@ class VaultCipher:
         À appeler **une seule fois au démarrage** : la dérivation est coûteuse
         (64 Mio, 3 itérations) et la KEK obtenue reste en mémoire pour la durée
         de vie du processus.
+
+        Invariant 5 (revue LOW #116) : la clé HMAC serveur doit être distincte
+        de la clé maîtresse elle-même, pas seulement de la KEK dérivée — le
+        contrôle interne de ``__init__`` ne compare que KEK dérivée vs HMAC,
+        or la KEK dérivée diffère toujours de la clé maîtresse. Le contrôle
+        master vs HMAC est donc fait ici, fail-closed avant toute dérivation.
+        En production, la clé passe par ``VaultSettings``
+        (``validate_server_hmac_key_distinct``) via
+        ``_resolve_vault_cipher`` ; cet appel direct reste encadré pour l'usage
+        librairie.
         """
+        if server_hmac_key is not None and server_hmac_key_matches_master_key(
+            master_key, server_hmac_key
+        ):
+            raise ValueError(
+                "La clé HMAC serveur doit être distincte de la clé maîtresse : "
+                "réutiliser l'entropie maîtresse pour l'empreinte annule la "
+                "séparation des clés (invariant 5). Utiliser "
+                "generate_server_hmac_key() comme seule voie supportée."
+            )
         return cls(
             derive_kek_from_master_key(master_key, salt),
             server_hmac_key=server_hmac_key,

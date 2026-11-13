@@ -232,6 +232,40 @@ class SecretHmacCryptoTests(TestCase):
             _normalize_server_hmac_key("0123456789abcdef0123456789abcdeg")
         self.assertIn("generate_server_hmac_key()", str(ctx6.exception))
 
+    def test_normalize_server_hmac_key_rejects_human_passphrase_phrases(self) -> None:
+        """Refuse une phrase naturelle de 32+ octets malgré diversité et Shannon suffisants.
+
+        Revue LOW #116 : la phrase ci-dessous franchit les anciens seuils (24
+        symboles distincts, Shannon >= 4.0) tout en ne portant que ~60-80 bits
+        effectifs (mots de dictionnaire) : attaquable hors ligne avec un dump
+        SQLite et le canari public. Le garde anti-phrase la refuse fail-closed.
+        """
+        # 1. Phrase anglaise (xkcd) de 65 octets, 24 symboles distincts, Shannon ~4.12
+        with self.assertRaises(ValueError) as ctx1:
+            _normalize_server_hmac_key(
+                "Correct Horse Battery Staple is a famous xkcd passphrase example."
+            )
+        self.assertIn("phrase naturelle", str(ctx1.exception))
+
+        # 2. Phrase française avec accents (NFKD + espaces), 25 symboles, Shannon ~4.13
+        with self.assertRaises(ValueError) as ctx2:
+            _normalize_server_hmac_key(
+                "Le canari public et le dump SQLite suffisent à attaquer cette "
+                "phrase hors ligne, hélas."
+            )
+        self.assertIn("phrase naturelle", str(ctx2.exception))
+
+        # 3. Phrase basse-casse sans ponctuation excédant 32 caractères normalisés
+        with self.assertRaises(ValueError) as ctx3:
+            _normalize_server_hmac_key(
+                "the quick brown fox jumps over the lazy dog and walks away quietly"
+            )
+        self.assertIn("phrase naturelle", str(ctx3.exception))
+
+        # Aucun faux positif sur la voie supportée : clé de test et clé générée
+        _normalize_server_hmac_key(_VALID_SERVER_HMAC_KEY)
+        _normalize_server_hmac_key(generate_server_hmac_key())
+
     def test_candidate_value_empty_parity_cipher(self) -> None:
         """Une valeur candidate vide retourne False en toute circonstance (avec ou sans AAD)."""
         cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
@@ -296,12 +330,12 @@ class SecretHmacCryptoTests(TestCase):
             "a" * 65,
             "",
             valid_fp.upper(),  # majuscules
-            "g" * 64,          # non-hex minuscules
-            "Z" * 64,          # non-hex majuscules
+            "g" * 64,  # non-hex minuscules
+            "Z" * 64,  # non-hex majuscules
             "0123456789abcdef" * 3 + "xyz!",  # symboles hors hex
-            12345,             # non-str int
-            None,              # None
-            b"0" * 64,         # bytes
+            12345,  # non-str int
+            None,  # None
+            b"0" * 64,  # bytes
         ]
 
         for bad_fp in corrupted_cases:
@@ -446,6 +480,32 @@ class KeySeparationTests(TestCase):
         with self.assertRaises(ValueError) as ctx:
             VaultCipher(kek, server_hmac_key=kek)
         self.assertIn("distincte", str(ctx.exception))
+
+    def test_from_master_key_rejects_server_hmac_key_equal_to_master_key(self) -> None:
+        """from_master_key refuse la clé HMAC réutilisant l'entropie maîtresse.
+
+        Invariant 5, revue LOW #116 : ``from_master_key(master, salt,
+        server_hmac_key=master)`` dérive KEK=Argon2id(master) ; le contrôle
+        interne KEK vs HMAC passait (KEK != master) alors que l'empreinte
+        réutilisait directement l'entropie maîtresse. La garde master vs HMAC
+        est désormais faite dans ``from_master_key``, fail-closed avant toute
+        dérivation.
+        """
+        salt = base64.urlsafe_b64encode(b"S" * 16).decode("ascii")
+        with self.assertRaises(ValueError) as ctx:
+            VaultCipher.from_master_key(_VALID_MASTER_KEY, salt, server_hmac_key=_VALID_MASTER_KEY)
+        self.assertIn("distincte de la clé maîtresse", str(ctx.exception))
+
+        # Variante encodée (base64 de la clé maîtresse) également refusée
+        encoded_master = base64.urlsafe_b64encode(_VALID_MASTER_KEY.encode("utf-8")).decode("ascii")
+        with self.assertRaises(ValueError):
+            VaultCipher.from_master_key(_VALID_MASTER_KEY, salt, server_hmac_key=encoded_master)
+
+        # Une clé HMAC distincte reste acceptée (pas de faux positif) : dérivation complète
+        cipher = VaultCipher.from_master_key(
+            _VALID_MASTER_KEY, salt, server_hmac_key=_VALID_SERVER_HMAC_KEY
+        )
+        self.assertTrue(cipher.has_explicit_server_hmac_key)
 
     def test_vault_cipher_default_fingerprint_key_is_distinct_from_kek(self) -> None:
         """Sans server_hmac_key explicite, la sous-clé HKDF dérivée est distincte de la KEK."""
@@ -828,18 +888,14 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
         # 1. Cipher : avec et sans AAD, le candidat bytes NFD correspond au HMAC calculé
         # depuis la forme str NFC.
         fp_with_aad = cipher.compute_secret_hmac(nfc_cafe, aad=aad)
-        self.assertTrue(
-            cipher.is_secret_value_matching(nfd_bytes, fp_with_aad, aad=aad)
-        )
+        self.assertTrue(cipher.is_secret_value_matching(nfd_bytes, fp_with_aad, aad=aad))
         fp_without_aad = cipher.compute_secret_hmac(nfc_cafe)
         self.assertTrue(cipher.is_secret_value_matching(nfd_bytes, fp_without_aad))
 
         # 2. Mémoire : création NFC, vérification et recherche avec bytes NFD.
         mem_store = InMemorySecretStore(cipher=cipher)
         await mem_store.create("demo", "prod", "CAFE", nfc_cafe)
-        self.assertTrue(
-            await mem_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_bytes)
-        )
+        self.assertTrue(await mem_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_bytes))
         mem_matches = await mem_store.find_secrets_matching_value("demo", nfd_bytes)
         self.assertEqual([m["name"] for m in mem_matches], ["CAFE"])
 
@@ -856,9 +912,7 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
 
         # 4. Parité sur les lignes héritées sans empreinte (repli déchiffrement transparent)
         mem_store._secrets[("demo", "prod", "CAFE")]["fingerprint"] = ""
-        self.assertTrue(
-            await mem_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_bytes)
-        )
+        self.assertTrue(await mem_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_bytes))
         mem_legacy_matches = await mem_store.find_secrets_matching_value("demo", nfd_bytes)
         self.assertEqual([m["name"] for m in mem_legacy_matches], ["CAFE"])
 
@@ -881,9 +935,7 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
         self.assertTrue(cipher.verify_secret_hmac(nfd_bytes, fp_with_aad, aad=aad))
         self.assertTrue(cipher.verify_secret_hmac(nfd_bytes, fp_without_aad))
         self.assertTrue(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, nfd_bytes, fp_without_aad))
-        self.assertTrue(
-            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, nfd_bytes, fp_with_aad, aad=aad)
-        )
+        self.assertTrue(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, nfd_bytes, fp_with_aad, aad=aad))
 
     async def test_corrupted_fingerprint_in_database_handled_safely(self) -> None:
         """Une empreinte corrompue bascule sur le repli déchiffrement sans faux négatif."""
@@ -1568,6 +1620,57 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
                 await sql_store_der.rotate_kek(c1)
             self.assertIn("explicite", str(ctx_sql_der_exp.exception))
 
+    async def test_rotate_kek_on_store_emptied_by_delete_still_checks_canary(self) -> None:
+        """rotate_kek sur store vidé par delete() (canari persistant) échoue immédiatement.
+
+        Revue LOW #116 : contrairement à ``clear()``, ``delete()`` du dernier
+        secret conserve le canari : la rotation divergente doit lever
+        sur-le-champ (fail-closed immédiat), et non différer l'échec au
+        prochain ``create``.
+        """
+        c1 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        c_alt = VaultCipher(b"N" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY)
+        c_derived = VaultCipher(b"D" * 32, server_hmac_key=None)
+
+        # 1. InMemorySecretStore vidé par delete() : canari conservé en mémoire
+        mem_store = InMemorySecretStore(cipher=c1)
+        await mem_store.create("proj", "prod", "K1", "v1")
+        self.assertTrue(await mem_store.delete("proj", "prod", "K1"))
+        self.assertEqual(mem_store._secrets, {})
+        self.assertIsNotNone(mem_store._server_hmac_canary)
+
+        with self.assertRaises(VaultCipherError) as ctx_mem_alt:
+            await mem_store.rotate_kek(c_alt)
+        self.assertIn("diffère", str(ctx_mem_alt.exception))
+
+        with self.assertRaises(VaultCipherError) as ctx_mem_der:
+            await mem_store.rotate_kek(c_derived)
+        self.assertIn("dérivé", str(ctx_mem_der.exception))
+
+        # Store intact : cipher non swappé malgré le store vide
+        self.assertIs(mem_store._cipher, c1)
+
+        # 2. SqliteSecretStore vidé par delete() : canari persisté en base
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, c1)
+            await sql_store.create("proj", "prod", "K1", "v1")
+            self.assertTrue(await sql_store.delete("proj", "prod", "K1"))
+
+            with db_session(db_path) as conn:
+                self.assertIsNotNone(get_server_hmac_canary(conn))
+
+            with self.assertRaises(VaultCipherError) as ctx_sql_alt:
+                await sql_store.rotate_kek(c_alt)
+            self.assertIn("diffère", str(ctx_sql_alt.exception))
+
+            with self.assertRaises(VaultCipherError) as ctx_sql_der:
+                await sql_store.rotate_kek(c_derived)
+            self.assertIn("dérivé", str(ctx_sql_der.exception))
+
+            # Store intact : cipher non swappé malgré la base vide
+            self.assertIs(sql_store._cipher, c1)
+
 
 class FingerprintNeverReturnedToClientTests(TestCase):
     """Vérification stricte de la checklist : l'empreinte n'est JAMAIS renvoyée au client."""
@@ -1741,9 +1844,9 @@ class SammProofLineIntegrityTests(TestCase):
                     start = int(m.group("start"))
                     end = int(m.group("end") or start)
                     slice_text = "\n".join(
-                        (repo_root / path_sub).read_text(encoding="utf-8").splitlines()[
-                            start - 1 : end
-                        ]
+                        (repo_root / path_sub)
+                        .read_text(encoding="utf-8")
+                        .splitlines()[start - 1 : end]
                     )
                     if symbol in slice_text:
                         found = True
