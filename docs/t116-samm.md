@@ -123,7 +123,7 @@ tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_validate_server_hma
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_vault_cipher_factories_propagate_server_hmac_key_without_exposure PASSED [ 26%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_vault_cipher_methods PASSED [ 28%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_and_matching_empty_aad_parity PASSED [ 29%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_and_cipher_matching_with_corrupted_fingerprint 
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_and_cipher_matching_with_corrupted_fingerprint
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_and_cipher_matching_with_corrupted_fingerprint PASSED [ 31%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_constant_time PASSED [ 32%]
 tests/test_vault_secret_hmac.py::KeySeparationTests::test_compute_and_verify_secret_hmac_reject_forbidden_keys PASSED [ 34%]
@@ -145,7 +145,7 @@ tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_database_fin
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_derived_to_explicit_mode_transition_fails_closed_without_migration PASSED [ 59%]
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_divergent_canary_during_creation_raises_vault_cipher_error_and_rolls_back PASSED [ 60%]
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_explicit_server_hmac_key_change_fails_closed PASSED [ 62%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_exception_precedence_parity_memory_and_sqlite 
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_exception_precedence_parity_memory_and_sqlite
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_exception_precedence_parity_memory_and_sqlite PASSED [ 64%]
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_fails_closed_on_key_change_or_derived_mode PASSED [ 65%]
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_fails_closed_on_legacy_only_store PASSED [ 67%]
