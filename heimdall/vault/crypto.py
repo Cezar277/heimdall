@@ -116,10 +116,19 @@ _HUMAN_PHRASE_MIN_CHARS: int = 32
 _HUMAN_PHRASE_MAX_WORD_RATIO: float = 0.85
 _CAMEL_WORDS_MIN_COUNT: int = 4
 _CAMEL_WORDS_PATTERN: re.Pattern[str] = re.compile(r"[A-Z][a-z]{2,}")
+_HUMAN_PHRASE_SEPARATORS: str = " -_.:,;!?/"
+_NATURAL_WORD_MIN_LEN: int = 2
+
+
+def _is_natural_word(w: str) -> bool:
+    """Indique si un tronçon ressemble à un mot de langue naturelle (lettres, casse cohérente)."""
+    if len(w) < _NATURAL_WORD_MIN_LEN or not w.isalpha():
+        return False
+    return w.islower() or w.isupper() or w.istitle()
 
 
 def _looks_like_human_phrase(key_bytes: bytes) -> bool:
-    """Détecte une clé qui est en réalité une phrase naturelle (mots + espaces, CamelCase).
+    """Détecte une clé qui est en réalité une phrase naturelle (espaces, ponctuation, CamelCase).
 
     La détection ignore la casse par composition NFKD (accents retirés) et ne
     s'applique qu'aux clés textuelles d'au moins 32 caractères normalisés ;
@@ -131,23 +140,38 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
     if len(stripped) < _HUMAN_PHRASE_MIN_CHARS:
         return False
     total = len(stripped)
-    lowercase_or_space = sum(
-        1 for ch in stripped if ch.isascii() and (ch.islower() or ch == " ")
+    lowercase_or_sep = sum(
+        1
+        for ch in stripped
+        if ch.isascii() and (ch.islower() or ch in _HUMAN_PHRASE_SEPARATORS)
     )
-    if lowercase_or_space / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
+    if lowercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
         return True
-    uppercase = sum(1 for ch in stripped if ch.isascii() and ch.isupper())
-    if uppercase / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
+    uppercase_or_sep = sum(
+        1
+        for ch in stripped
+        if ch.isascii() and (ch.isupper() or ch in _HUMAN_PHRASE_SEPARATORS)
+    )
+    if uppercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
         return True
-    if any(ch.isspace() for ch in stripped):
+    if any(ch in _HUMAN_PHRASE_SEPARATORS for ch in stripped):
         word_chars = sum(
-            1 for ch in stripped if ch.isascii() and (ch.isalnum() or ch.isspace())
+            1
+            for ch in stripped
+            if ch.isascii() and (ch.isalnum() or ch in _HUMAN_PHRASE_SEPARATORS)
         )
-        if word_chars / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
+        words = [w for w in re.split(r"[\s\-_.:,;!?/]+", stripped) if w]
+        natural_words = [w for w in words if _is_natural_word(w)]
+        if (
+            len(natural_words) >= _CAMEL_WORDS_MIN_COUNT
+            and word_chars / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
+        ):
             return True
     camel_words = _CAMEL_WORDS_PATTERN.findall(stripped)
     camel_len = sum(len(w) for w in camel_words) + sum(
-        1 for ch in stripped if ch.isascii() and ch.isdigit()
+        1
+        for ch in stripped
+        if ch.isascii() and (ch.isdigit() or ch in _HUMAN_PHRASE_SEPARATORS)
     )
     return (
         len(camel_words) >= _CAMEL_WORDS_MIN_COUNT
@@ -370,17 +394,16 @@ def server_hmac_key_matches_master_key(
         raise TypeError("La clé maîtresse ou KEK doit être de type str, bytes ou bytearray.")
     if not isinstance(server_hmac_key, (str, bytes, bytearray)):
         raise TypeError("La clé HMAC serveur doit être de type str, bytes ou bytearray.")
-    raw_hmac = (
-        server_hmac_key.encode("utf-8")
-        if isinstance(server_hmac_key, str)
-        else bytes(server_hmac_key)
-    )
-    raw_master = (
-        master_or_kek.encode("utf-8") if isinstance(master_or_kek, str) else bytes(master_or_kek)
-    )
-    if constant_time_equal(raw_hmac, raw_master):
-        return True
+    # 1. Comparaison en temps constant de toutes les variantes (brute, base64, hex)
+    # AVANT normalisation, afin de ne pas masquer une collision sur HMAC faible (revue LOW #116).
+    master_variants = _extract_key_variants(master_or_kek)
+    hmac_raw_variants = _extract_key_variants(server_hmac_key)
+    for cand in master_variants:
+        for var in hmac_raw_variants:
+            if constant_time_equal(cand, var):
+                return True
 
+    # 2. Normalisation de la clé HMAC serveur et comparaisons complémentaires
     try:
         norm_hmac = _normalize_server_hmac_key(server_hmac_key)
     except ValueError:
@@ -398,10 +421,8 @@ def server_hmac_key_matches_master_key(
     except ValueError:
         pass
 
-    candidates = _extract_key_variants(master_or_kek)
     hmac_variants = _extract_key_variants(norm_hmac)
-
-    for cand in candidates:
+    for cand in master_variants:
         for var in hmac_variants:
             if constant_time_equal(cand, var):
                 return True

@@ -306,6 +306,18 @@ class SecretHmacCryptoTests(TestCase):
             validate_server_hmac_key("TheQuickBrownFoxJumpsOverTheLazyDogAndMore")
         self.assertIn("phrase naturelle", str(ctx10.exception))
 
+        # 11. Phrase avec ponctuation séparatrice (revue LOW #116 : 53 chars, Shannon ~4.15)
+        with self.assertRaises(ValueError) as ctx11:
+            validate_server_hmac_key("Correct-Horse-Battery-Staple-Extra-Word-Plus-More-12!")
+        self.assertIn("phrase naturelle", str(ctx11.exception))
+
+        # 12. Phrase séparée par des points ou underscores
+        with self.assertRaises(ValueError) as ctx12:
+            validate_server_hmac_key(
+                "Correct.Horse.123.Battery.456.Staple.789.Word.More.Extra.Plus!"
+            )
+        self.assertIn("phrase naturelle", str(ctx12.exception))
+
         # Vérifier que validate_server_hmac_key lève également sur la phrase en capitales
         with self.assertRaises(ValueError) as ctx_v:
             validate_server_hmac_key(
@@ -579,6 +591,17 @@ class KeySeparationTests(TestCase):
         kek_bytes = b"K" * 32
         self.assertTrue(server_hmac_key_matches_master_key(kek_bytes, kek_bytes))
         self.assertFalse(server_hmac_key_matches_master_key(kek_bytes, _VALID_SERVER_HMAC_KEY))
+
+        # Revue LOW #116 : HMAC faible égale à master détectée avant normalisation
+        weak_master = b"W" * 32
+        weak_b64 = base64.b64encode(weak_master).decode("ascii")  # "V1dX..." (répétitif -> faible)
+        weak_hex = weak_master.hex()  # "5757..." (répétitif -> faible)
+        self.assertTrue(server_hmac_key_matches_master_key(weak_master, weak_b64))
+        self.assertTrue(server_hmac_key_matches_master_key(weak_master, weak_hex))
+        self.assertTrue(server_hmac_key_matches_master_key(weak_b64, weak_master))
+        # Clé HMAC faible distincte -> retourne False sans lever
+        self.assertFalse(server_hmac_key_matches_master_key(weak_master, "short"))
+        self.assertFalse(server_hmac_key_matches_master_key(weak_master, "A" * 32))
 
     def test_vault_cipher_key_reuses_server_hmac_key_method(self) -> None:
         """VaultCipher expose key_reuses_server_hmac_key pour encapsulation propre."""
@@ -2056,7 +2079,7 @@ class KeyLeakHuntTests(TestCase):
 
     def test_server_hmac_key_is_never_leaked_in_repr_or_serialization(self) -> None:
         """repr/model_dump/model_dump_json n'exposent jamais la clé HMAC serveur."""
-        canary = "HMAC_CANARY_UNIQUE_SECRET_VAL_12345_xyz!"
+        canary = generate_server_hmac_key()
         settings = VaultSettings(
             kek=_VALID_KEK,
             api_key_pepper=_VALID_PEPPER,
