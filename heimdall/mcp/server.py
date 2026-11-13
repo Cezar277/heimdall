@@ -76,22 +76,31 @@ _FORBIDDEN_FILENAMES: Final[frozenset[str]] = frozenset(
     {".netrc", ".pgpass", ".npmrc", ".pypirc", "credentials"}
 )
 
-# Variantes de sauvegarde des fichiers ci-dessus : `.netrc.backup`,
-# `.pgpass~`, `.npmrc-backup`, `.pypirc.old`… Un éditeur ou une rotation
-# laisse souvent la copie à côté de l'original ; l'égalité exacte laissait
-# ces copies lisibles (revue). Le préfixe est volontairement large (faux
-# positif bénin) ; `netrc.txt` et `credentials.md`, qui ne sont pas des
-# préfixes de ces noms, restent lisibles.
-_FORBIDDEN_BASENAME_PREFIXES: Final[tuple[str, ...]] = (
-    ".netrc",
-    ".pgpass",
-    ".npmrc",
-    ".pypirc",
+# Suffixes qu'un éditeur ou une rotation ajoute à une copie de fichier.
+# Retirés en boucle avant comparaison : `server.pem.bak` → `server.pem`,
+# `.netrc.backup` → `.netrc`, `credentials-backup` → `credentials`. Les
+# extensions de documentation (`.md`, `.txt`) n'en font pas partie :
+# `credentials.md` et `server.pem.txt` restent lisibles.
+_BACKUP_SUFFIXES: Final[tuple[str, ...]] = (
+    "~",
+    ".bak",
+    ".backup",
+    ".old",
+    ".orig",
+    ".save",
+    ".swp",
+    "-bak",
+    "-backup",
+    "-old",
+    "_bak",
+    "_backup",
+    "_old",
 )
 
 # `credentials` est un nom nu trop général pour un préfixe large :
-# `credentials.md` est de la documentation. On énumère les extensions et
-# suffixes de sauvegarde qui, eux, contiennent des credentials.
+# `credentials.md` est de la documentation. On énumère les extensions qui,
+# elles, contiennent des credentials ; les suffixes de sauvegarde sont
+# retirés avant comparaison par `_strip_backup_suffixes`.
 _CREDENTIALS_VARIANTS: Final[tuple[str, ...]] = tuple(
     f"credentials{suffix}"
     for suffix in (
@@ -103,12 +112,7 @@ _CREDENTIALS_VARIANTS: Final[tuple[str, ...]] = tuple(
         ".toml",
         ".cfg",
         ".conf",
-        ".bak",
-        ".backup",
-        ".old",
-        ".orig",
-        ".save",
-        "~",
+        ".xml",
     )
 )
 
@@ -488,6 +492,35 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
     return {"ping": ping, "read_diff": read_diff, "sanitize_file": sanitize_file}
 
 
+def _strip_backup_suffixes(segment: str) -> str:
+    """Retire les suffixes de sauvegarde, en boucle.
+
+    `.netrc.backup.old` doit redevenir `.netrc` ; une seule passe laisserait
+    `.netrc.backup`, qui n'est pas égal à `.netrc`. La borne de longueur
+    évite de réduire un nom à la chaîne vide.
+    """
+    while True:
+        for suffix in _BACKUP_SUFFIXES:
+            if segment.endswith(suffix) and len(segment) > len(suffix):
+                segment = segment[: -len(suffix)]
+                break
+        else:
+            return segment
+
+
+def _is_forbidden_segment(segment: str) -> bool:
+    """Un segment (déjà en minuscules) désigne-t-il un fichier interdit ?"""
+    normalized = _strip_backup_suffixes(segment)
+    return (
+        normalized == ".git"
+        or normalized.startswith(".env")
+        or normalized in _FORBIDDEN_FILENAMES
+        or normalized in _CREDENTIALS_VARIANTS
+        or normalized.endswith(_FORBIDDEN_SUFFIXES)
+        or normalized.startswith(_FORBIDDEN_PREFIXES)
+    )
+
+
 def is_forbidden_path(relative: str) -> bool:
     """Segments que le contrat interdit de lire, élargis par l'audit F-09.
 
@@ -509,23 +542,16 @@ def is_forbidden_path(relative: str) -> bool:
     (`.netrc`, `.pgpass`, `id_rsa`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`,
     `.docker/config.json`, `.kube/config`, `credentials`) **et leurs
     variantes de sauvegarde** (`.netrc.backup`, `credentials.json`,
-    `.docker/config.json.bak`…). Le masquage de E-03 reste une seconde
-    barrière, pas une autorisation de lecture.
+    `server.pem.bak`, `private.key.old`, `.docker/config.json.bak`…). Le
+    masquage de E-03 reste une seconde barrière, pas une autorisation de
+    lecture.
     """
     segments = relative.split("/")
     lowered = [segment.lower() for segment in segments]
-    forbidden_segment = any(
-        segment == ".git"
-        or segment.startswith(".env")
-        or segment in _FORBIDDEN_FILENAMES
-        or segment.startswith(_FORBIDDEN_BASENAME_PREFIXES)
-        or segment in _CREDENTIALS_VARIANTS
-        or segment.endswith(_FORBIDDEN_SUFFIXES)
-        or segment.startswith(_FORBIDDEN_PREFIXES)
-        for segment in lowered
-    )
+    forbidden_segment = any(_is_forbidden_segment(segment) for segment in lowered)
     forbidden_config = any(
-        segment == directory and lowered[index + 1].startswith(basename)
+        _strip_backup_suffixes(segment) == directory
+        and _strip_backup_suffixes(lowered[index + 1]).startswith(basename)
         for index, segment in enumerate(lowered[:-1])
         for directory, basename in _FORBIDDEN_CONFIG_PATHS
     )

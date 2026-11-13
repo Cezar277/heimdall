@@ -216,6 +216,22 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.assertEqual(payload["files"][0]["redactions"], 1)
         self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
+    def test_unclosed_quoted_password_is_masked_end_to_end(self) -> None:
+        """Revue (MEDIUM) : un guillemet fermant manquant ne laisse pas le secret.
+
+        Une ligne de diff tronquée ou une coquille suffisait à envoyer
+        `password="hunter2!hunter` en clair dans la réponse sérialisée.
+        """
+        self.write("config.py", 'password="hunter2!hunter\nMODE="read"\n')
+        self.stage("config.py")
+        payload = self.call_read_diff()
+        content = json.dumps(payload)
+        self.assertNotIn("hunter2!hunter", content)
+        self.assertIn("<REDACTED:generic_secret:len=14>", content)
+        self.assertIn("read", content, "une valeur fermée et non secrète reste lisible")
+        self.assertEqual(payload["files"][0]["redactions"], 1)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
     def test_generic_key_names_are_masked_end_to_end(self) -> None:
         """`KEY=hunter2`, `AWS_KEY=...`, `MYKEY=ab12` : bout en bout.
 

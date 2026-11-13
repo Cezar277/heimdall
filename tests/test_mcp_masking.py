@@ -50,6 +50,53 @@ class AuditE03MaskingProofTests(unittest.TestCase):
                 self.assertNotIn(secret, masked)
                 self.assertIn("<REDACTED:generic_secret:", masked)
 
+    def test_unclosed_quoted_value_is_masked_to_end_of_line(self) -> None:
+        """Revue (MEDIUM) : `password="hunter2!hunter` fuyait sans guillemet final.
+
+        Une ligne de diff tronquée, une coquille ou une valeur multiligne
+        suffisait : les règles citées exigent le guillemet fermant et la
+        règle non quotée refuse les valeurs commençant par un guillemet.
+        Le rattrapage masque jusqu'à la fin de ligne (commentaire ` #` exclu).
+        """
+        for line, secret in (
+            ('password="hunter2!hunter', "hunter2!hunter"),
+            ("password = 'abc12345", "abc12345"),
+            ("api_key = 'abcd1234efgh", "abcd1234efgh"),
+            ('password="hunter2!hunter # rotation', "hunter2!hunter"),
+            ('DB_PASSWORD="p@ss;word1234', "p@ss;word1234"),
+            ('TOKEN="x1', "x1"),
+            ('--password "hunter2!hunter', "hunter2!hunter"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:", masked)
+
+    def test_unclosed_quoted_ordinary_code_stays_readable(self) -> None:
+        """Le rattrapage ne masque pas un type, un littéral ou une valeur vide."""
+        for line in (
+            "api_key: str",
+            "session = None",
+            'password=""',
+            "password='",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(masking.mask_text(line), (line, 0))
+
+    def test_define_with_unquoted_arguments_is_masked(self) -> None:
+        """`define(DB_PASSWORD, S3cr3tValue99)` : nom et valeur nus sont valides."""
+        for line, secret in (
+            ("define(DB_PASSWORD, 'S3cr3tValue99');", "S3cr3tValue99"),
+            ('define(DB_PASSWORD, "S3cr3tValue99");', "S3cr3tValue99"),
+            ("define(DB_PASSWORD, S3cr3tValue99);", "S3cr3tValue99"),
+            ("define('DB_PASSWORD', S3cr3tValue99);", "S3cr3tValue99"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+
     def test_passphrase_without_digit_is_masked(self) -> None:
         """Un mot de passe multi-mots sans chiffre reste un secret."""
         for line in (
@@ -94,6 +141,8 @@ class AuditE03MaskingProofTests(unittest.TestCase):
             '{"author": "Martin"}',
             '{"key": "production"}',
             '{"version": "1.2.3"}',
+            "define('DB_NAME', 'production');",
+            "define('WP_DEBUG', true);",
         ):
             with self.subTest(line=line):
                 self.assertEqual(masking.mask_text(line), (line, 0))

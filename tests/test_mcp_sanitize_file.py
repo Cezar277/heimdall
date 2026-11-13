@@ -113,6 +113,15 @@ class SanitizeFileToolTests(FileRepoTestCase):
         self.assertIn("<REDACTED:generic_secret:len=14>", payload["content"])
         self.assertEqual(payload["redactions"], 1)
 
+    def test_unclosed_quoted_password_is_masked_end_to_end(self) -> None:
+        """Revue (MEDIUM) : guillemet fermant absent, secret quand même masqué."""
+        self.write("conf.py", 'password="hunter2!hunter\n')
+        payload = self.read({"path": "conf.py"})
+        self.assertNotIn("hunter2!hunter", payload["content"])
+        self.assertIn("<REDACTED:generic_secret:len=14>", payload["content"])
+        self.assertEqual(payload["redactions"], 1)
+        self.assertEqual(mcp_contract.errors("SanitizeFileResult", payload), [])
+
     def test_long_quoted_value_is_masked_not_windowed(self) -> None:
         """Régression de revue : plus de fenêtre AVANT le masquage.
 
@@ -287,6 +296,10 @@ class SanitizeFileToolTests(FileRepoTestCase):
             ".npmrc-backup",
             "credentials.json",
             "credentials.txt",
+            "credentials-backup",
+            "credentials_backup",
+            "server.pem.bak",
+            "private.key.old",
             ".docker/config.json.bak",
             ".kube/config.old",
         ):

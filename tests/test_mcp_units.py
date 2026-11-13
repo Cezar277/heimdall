@@ -362,6 +362,7 @@ class ForbiddenPathTests(unittest.TestCase):
         """
         for path in (
             ".netrc.backup",
+            ".netrc.backup.old",
             ".netrc~",
             ".pgpass.bak",
             ".pgpass~",
@@ -372,6 +373,10 @@ class ForbiddenPathTests(unittest.TestCase):
             "credentials.yaml",
             "credentials.txt",
             "credentials.bak",
+            "credentials-backup",
+            "credentials_backup",
+            "credentials-old",
+            "credentials_old",
             ".docker/config.json.bak",
             ".docker/config.json.old",
             ".kube/config.bak",
@@ -380,14 +385,27 @@ class ForbiddenPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(server.is_forbidden_path(path))
 
-    def test_npmrc_example_is_overblocked(self) -> None:
-        """`.npmrc.example` commence par `.npmrc` : sur-blocage bénin assumé.
+    def test_pem_key_backup_variants_are_forbidden(self) -> None:
+        """Revue (MEDIUM) : `server.pem.bak` reste une clé privée.
 
-        Un gabarit peut contenir un vrai jeton recopié par erreur ; le
-        préfixe large (comme `.env*`) ferme cette porte plutôt que de
-        deviner si le fichier est encore un exemple.
+        Le suffixe était testé sur le nom brut, donc toute copie
+        (`server.pem.bak`, `private.key.old`, `server.pem~`) passait. Le nom
+        est désormais normalisé avant comparaison ; `server.pem.txt` reste
+        une ressemblance inoffensive et lisible.
         """
-        self.assertTrue(server.is_forbidden_path(".npmrc.example"))
+        for path in (
+            "server.pem.bak",
+            "server.pem.backup",
+            "server.pem~",
+            "server.pem.old",
+            "private.key.old",
+            "private.key.bak",
+            "private.key~",
+            "certs/server.pem.save",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(server.is_forbidden_path(path))
+        self.assertFalse(server.is_forbidden_path("server.pem.txt"))
 
     def test_lookalikes_are_allowed(self) -> None:
         for path in (
@@ -402,6 +420,7 @@ class ForbiddenPathTests(unittest.TestCase):
             "keys/readme.txt",
             ".docker/config.yml",
             ".kube/other",
+            ".npmrc.example",
         ):
             with self.subTest(path=path):
                 self.assertFalse(server.is_forbidden_path(path))
@@ -1405,7 +1424,6 @@ class MaskingRulesTests(unittest.TestCase):
         for line in (
             'MYDATA="x1"',
             'key = "ab"',
-            'TOKEN="x1',
             "TOKEN=",
         ):
             with self.subTest(line=line):

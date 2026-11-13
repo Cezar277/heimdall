@@ -191,10 +191,13 @@ scanner ne produit pas.
 (`{"password": "…"}`, `'api_key': '…'`, dict Python), les valeurs quotées
 doubles et simples sont jugées séparément (une apostrophe reste dans une
 chaîne double, un guillemet double dans une chaîne simple), `=>` est accepté,
-et une valeur non quotée à nom évocateur est masquée jusqu'à la fin de ligne
-(espaces, `,`, `;` inclus) — `password = my secret pass phrase 42` ne laisse
-plus sa queue en clair. Les formes hors affectation sont couvertes : balise
-XML sensible (`<password>…</password>`), `define('DB_PASSWORD', '…')`,
+une valeur quotée non refermée (`password="hunter2!hunter`, ligne tronquée ou
+coquille) est masquée jusqu'à la fin de ligne, et une valeur non quotée à nom
+évocateur est masquée jusqu'à la fin de ligne (espaces, `,`, `;` inclus) —
+`password = my secret pass phrase 42` ne laisse plus sa queue en clair. Les
+formes hors affectation sont couvertes : balise XML sensible
+(`<password>…</password>`), `define('DB_PASSWORD', '…')` (nom et valeur nus
+acceptés),
 `.netrc` (`password …`), `-u user:pass` et `--password <val>`/`--password=<val>`.
 Le filtre anti-bruit refuse les annotations (`api_key: str`), littéraux
 (`session = None`) et appels de fonction ; les clés JSON usuelles
@@ -428,8 +431,9 @@ double garde : avant **et** après lecture), absent/dossier (`NOT_FOUND`),
 credentials au-delà de `.git`/`.env*` — `.netrc`, `.pgpass`, `id_rsa*`,
 `id_ed25519*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `credentials`,
 `.docker/config.json` et `.kube/config`, casse ignorée. Les variantes de
-sauvegarde sont refusées par préfixe ou extension (`.netrc.backup`,
-`.pgpass~`, `.npmrc-backup`, `credentials.json`, `.docker/config.json.bak`,
+sauvegarde sont refusées après normalisation du nom (`.netrc.backup`,
+`.pgpass~`, `.npmrc-backup`, `credentials.json`, `credentials-backup`,
+`server.pem.bak`, `private.key.old`, `.docker/config.json.bak`,
 `.kube/config.old`…), car une copie reste un secret. Le masquage E-03
 reste une seconde barrière, jamais une autorisation de lecture ; les
 ressemblances (`netrc.txt`, `credentials.md`, `server.pem.txt`,

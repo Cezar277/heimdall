@@ -131,6 +131,20 @@ _EVOCATIVE_UNQUOTED_VALUE: Final[re.Pattern[str]] = re.compile(
     r"(?P<value>[^\n]+?)(?=[ \t]+#|\n|$)"
 )
 
+# Valeur quotée NON REFERMÉE : `password="hunter2!hunter` (ligne de diff
+# tronquée, coquille, multiligne). Les règles citées exigent le guillemet
+# fermant, et la règle non quotée refuse explicitement les valeurs commençant
+# par un guillemet : le secret partait en clair (revue). Le guillemet ouvrant
+# est exclu du span, la valeur va jusqu'à la fin de ligne ou au commentaire
+# ` #`, et le jugement reste `_looks_like_secret`. Si un guillemet fermant
+# non échappé est trouvé, `_unclosed_quoted_spans` rend la main aux règles
+# citées (pas de double masquage).
+_UNCLOSED_QUOTED_VALUE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"\s*(?:=>|[:=])\s*"
+    r"(?P<quote>[\"'])(?P<value>[^\n]*?)(?=[ \t]+#|\n|$)"
+)
+
 # Balise XML sensible : `<password>…</password>`, `<api_key>…</api_key>`.
 # Le nom de la balise est jugé par `_SECRET_KEY` (voir `_iter_matches`), la
 # valeur masquée est l'intérieur seulement.
@@ -140,12 +154,15 @@ _XML_SENSITIVE_ELEMENT: Final[re.Pattern[str]] = re.compile(
     r"</(?P=tag)\s*>"
 )
 
-# `define('DB_PASSWORD', 'S3cr3tValue99')` (PHP/Ruby).
+# `define('DB_PASSWORD', 'S3cr3tValue99')` (PHP/Ruby). Nom ET valeur peuvent
+# être nus (`define(DB_PASSWORD, S3cr3tValue99)`) : PHP les accepte comme
+# constantes, et la valeur reste un secret. Guillemets optionnels mais
+# symétriques ; le jugement final reste `_looks_like_secret`.
 _DEFINE_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
-    r"define\(\s*(?P<keyquote>[\"'])"
+    r"define\(\s*(?P<keyquote>[\"']?)"
     r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
     r"(?P=keyquote)\s*,\s*"
-    r"(?P<valuequote>[\"'])"
+    r"(?P<valuequote>[\"']?)"
     r"(?P<value>(?:[^\\\n]|\\.)*?)"
     r"(?P=valuequote)\s*\)"
 )
@@ -164,6 +181,16 @@ _CLI_SECRET_OPTION: Final[re.Pattern[str]] = re.compile(
     r"(?:\s*=\s*|\s+)"
     r"(?:(?P<quote>[\"'])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=quote)"
     r"|(?P<value>[^\s\"']+))"
+)
+
+# Option CLI à valeur quotée non refermée : `--password "hunter2!hunter`.
+# La branche citée ci-dessus exige le guillemet fermant ; sans cette règle,
+# la valeur partait en clair. Même filtrage de fermeture que
+# `_UNCLOSED_QUOTED_VALUE`.
+_CLI_UNCLOSED_QUOTED_OPTION: Final[re.Pattern[str]] = re.compile(
+    r"(?<![\w-])--(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})"
+    r"(?:\s*=\s*|\s+)"
+    r"(?P<quote>[\"'])(?P<value>[^\n]*?)(?=[ \t]+#|\n|$)"
 )
 
 # `curl -u admin:Sup3rS3cret` : identifiants passés en argument CLI, hors URL.
@@ -566,6 +593,33 @@ def _evocative_unquoted_span(match: re.Match[str]) -> _Match:
     return _Match(start, start + len(value), _secret_type(match.group("key"), value), len(value))
 
 
+def _unclosed_quoted_spans(match: re.Match[str]) -> list[_Match]:
+    """Valeur après guillemet ouvrant, si la ligne ne referme pas la citation.
+
+    Un guillemet fermant non échappé est cherché dans la valeur (les `\\"`
+    comptent comme échappés). S'il existe, les règles citées s'en chargent et
+    cette règle de rattrapage ne produit aucun span : pas de double masquage
+    ni de commentaire avalé. Sinon, un nom évocateur suffit à masquer jusqu'à
+    la fin de la valeur, commentaire ` #` exclu.
+    """
+    value = match.group("value")
+    quote = match.group("quote")
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == quote:
+            return []
+        index += 1
+    value = value.rstrip()
+    if not value or not _looks_like_secret(match.group("key"), value):
+        return []
+    start = match.start("value")
+    return [_Match(start, start + len(value), _secret_type(match.group("key"), value), len(value))]
+
+
 def _xml_sensitive_spans(match: re.Match[str]) -> list[_Match]:
     """`<password>…</password>` : seule la valeur intérieure est masquée."""
     key = match.group("tag")
@@ -703,6 +757,11 @@ def _iter_matches(text: str) -> list[_Match]:
         ],
         [
             span
+            for match in _UNCLOSED_QUOTED_VALUE.finditer(text)
+            for span in _unclosed_quoted_spans(match)
+        ],
+        [
+            span
             for match in _XML_SENSITIVE_ELEMENT.finditer(text)
             for span in _xml_sensitive_spans(match)
         ],
@@ -712,6 +771,11 @@ def _iter_matches(text: str) -> list[_Match]:
             span
             for match in _CLI_SECRET_OPTION.finditer(text)
             for span in _cli_secret_option_spans(match)
+        ],
+        [
+            span
+            for match in _CLI_UNCLOSED_QUOTED_OPTION.finditer(text)
+            for span in _unclosed_quoted_spans(match)
         ],
         [
             span
