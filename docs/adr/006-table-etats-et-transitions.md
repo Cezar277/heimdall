@@ -188,8 +188,9 @@ contrat des états persistés :
   (casse, espaces, état inconnu) retourne 404 sans restituer la valeur.
 
 La vérification exhaustive des 20 transitions interdites contre l'API HTTP
-reste portée par #118 ; #117 pose la route, l'application de la matrice et le
-journal atomique.
+est portée et prouvée par #118 (`tests/test_vault_transitions_forbidden.py`,
+141 tests paramétrés, `docs/t118-samm.md`) ; #117 pose la route, l'application
+de la matrice et le journal atomique.
 
 ## Conséquences et limites
 
@@ -198,4 +199,4 @@ journal atomique.
 - **Découpage des sous-tickets (socle vs application)** :
   - Le ticket **#115** livre le socle formel contractuel, les tables immuables et la bibliothèque de validation logicielle (`validate_transition`, `canonicalize_state`).
   - Le ticket **#117** branche ce socle dans l'endpoint FastAPI `/api/v1/secrets/.../transition` et dans les mutateurs du store Vault, avec le journal atomique des transitions (voir §8).
-  - La vérification automatisée de bout en bout des 20 transitions interdites contre l'API HTTP du Vault est portée par le sous-ticket **#118**.
+  - La vérification automatisée de bout en bout des 20 transitions interdites contre l'API HTTP du Vault est livrée et prouvée par le sous-ticket **#118** (`tests/test_vault_transitions_forbidden.py` : 141 tests paramétrés couvrant la matrice, les deux stores et l'API HTTP, avec une couverture mesurée à 100 % de la machine d'états ; voir `docs/t118-samm.md`).

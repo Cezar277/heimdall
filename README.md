@@ -423,6 +423,7 @@ Exécuter `python -m pytest tests/test_trap_acceptance.py -s -rx` ; la CLI
 .venv/bin/python -m pytest tests/test_cli_scan.py -q   # CLI scan (#29)
 .venv/bin/python -m pytest tests/test_vault_crypto.py -q               # Vault (AES-256-GCM, nonce unique)
 .venv/bin/python -m pytest tests/test_vault_falsification.py -q           # Vault (falsification AES-GCM)
+.venv/bin/python -m pytest tests/test_vault_transitions_forbidden.py -q  # transitions interdites (#118)
 .venv/bin/ruff check heimdall tests
 .venv/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py
 .venv/bin/bandit -r heimdall -q

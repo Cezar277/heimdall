@@ -149,9 +149,13 @@ def test_pins_directs_pyproject_synchronises_avec_le_lock() -> None:
     for group in project["optional-dependencies"].values():
         requirements.extend(group)
 
+    # Les extras PEP 508 (`coverage[toml]`) font partie de la spécification :
+    # ils ne changent ni le nom du paquet ni la version à comparer.
+    exigence = r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==([^;\s]+)"
+
     declared: dict[str, str] = {}
     for requirement in requirements:
-        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^;\s]+)", requirement)
+        match = re.match(exigence, requirement)
         assert match, f"dépendance directe non épinglée par == : {requirement}"
         name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
         assert name not in declared or declared[name] == match.group(2), (
@@ -163,7 +167,7 @@ def test_pins_directs_pyproject_synchronises_avec_le_lock() -> None:
     locked = {
         re.sub(r"[-_.]+", "-", name).lower(): version
         for name, version in re.findall(
-            r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\;]+)",
+            r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==([^\s\\;]+)",
             lock_text,
             re.MULTILINE,
         )

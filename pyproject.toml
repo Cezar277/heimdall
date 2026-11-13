@@ -43,6 +43,12 @@ dev = [
   "bandit==1.9.4",
   "setuptools==84.2.1",     # backend de build, installé depuis le lock en CI
   "pytest-cov==7.1.0",      # couverture + seuil CI (#20), aligné sur tests/security
+  # `coverage` est importé DIRECTEMENT par la suite #118 (mesure in-process de
+  # la couverture de la machine d'états, `coverage.Coverage(data_file=None)`).
+  # Sans déclaration directe, il ne résout que transitivement via pytest-cov :
+  # la version pourrait dériver et la preuve « 100 % » ne serait plus
+  # reproductible à l'identique. Pin exact, aligné sur requirements.lock.
+  "coverage[toml]==7.16.2",
   "pip-audit==2.10.1",      # audit CVE des dépendances en CI (#20), réseau documenté README
   # TestClient de Starlette (T255) : starlette 1.7 exige httpx2 pour son
   # `starlette.testclient` (le repli sur httpx est déprécié). Dépendance directe
