@@ -39,7 +39,12 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from heimdall.vault.crypto import VaultCipher, VaultCipherError
+from heimdall.vault.crypto import (
+    VaultCipher,
+    VaultCipherError,
+    canonicalize_secret_value,
+    constant_time_equal,
+)
 from heimdall.vault.database import (
     DEFAULT_TRANSITION_LIST_LIMIT,
     MAX_KEK_VERSION,
@@ -54,12 +59,17 @@ from heimdall.vault.database import (
     delete_all_secrets,
     delete_secret,
     ensure_project,
+    find_secrets_by_fingerprint,
     get_iso_timestamp,
     get_secret,
+    get_secret_metadata,
+    get_server_hmac_canary,
     init_db,
     list_secret_page,
+    list_secrets,
     normalize_transition_actor,
     rotate_secrets_kek,
+    set_server_hmac_canary,
     transition_secret,
     validate_kek_version,
     validate_secret_page_bounds,
@@ -76,6 +86,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_SECRETS: int = 10_000
 _DEFAULT_MAX_SECRETS_PER_PROJECT: int = 1_000
+_FINGERPRINT_HEX_LEN: int = 64  # Longueur en caractères hexadécimaux d'un SHA-256 (ticket #116)
 
 
 class QuotaExceededError(Exception):
@@ -169,6 +180,7 @@ class InMemorySecretStore:
         self._max_secrets_per_project = max_secrets_per_project
         self._cipher = cipher if cipher is not None else VaultCipher.generate()
         self._kek_version: int = 1
+        self._server_hmac_canary: str | None = None
 
     @property
     def kek_version(self) -> int:
@@ -188,8 +200,12 @@ class InMemorySecretStore:
         # Défense en profondeur : la valeur stockée est canonique (NFC) et sans
         # NUL, même si l'appelant contourne la validation HTTP (décision #62).
         # La normalisation est idempotente, donc sans effet pour l'API.
-        value = unicodedata.normalize("NFC", value)
         if "\x00" in value:
+            raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
+        value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")
+        if not value_bytes:
+            raise ValueError("La valeur du secret ne peut pas être vide.")
+        if b"\x00" in value_bytes:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         async with self._lock:
             if key in self._secrets:
@@ -201,7 +217,28 @@ class InMemorySecretStore:
                 raise QuotaExceededError(
                     f"Quota maximal de secrets atteint pour le projet '{project}'"
                 )
-            envelope = self._cipher.encrypt_envelope(value.encode("utf-8"), aad=aad)
+            envelope = self._cipher.encrypt_envelope(value_bytes, aad=aad)
+            fingerprint = self._cipher.fingerprint(value_bytes, aad=aad)
+            if self._cipher.has_explicit_server_hmac_key:
+                current_canary = self._cipher.server_hmac_key_canary()
+                if self._server_hmac_canary is not None:
+                    if not constant_time_equal(self._server_hmac_canary, current_canary):
+                        raise VaultCipherError(
+                            "La clé HMAC serveur a changé depuis l'enregistrement (fail-closed)."
+                        )
+                else:
+                    if self._secrets:
+                        raise VaultCipherError(
+                            "Le store contient déjà des secrets créés sans clé HMAC explicite "
+                            "(mode dérivé). Le passage au mode clé HMAC explicite nécessite "
+                            "une migration des empreintes."
+                        )
+                    self._server_hmac_canary = current_canary
+            elif self._server_hmac_canary is not None:
+                raise VaultCipherError(
+                    "Le store a été initialisé avec une clé HMAC explicite. "
+                    "L'écriture en mode dérivé est interdite sans migration."
+                )
             record = {
                 "project": project,
                 "env": env,
@@ -210,6 +247,7 @@ class InMemorySecretStore:
                 "encrypted_value": envelope.encrypted_value,
                 "encrypted_dek": envelope.encrypted_dek,
                 "kek_version": self._kek_version,
+                "fingerprint": fingerprint,
             }
             self._secrets[key] = record
             self._project_counts[project] = project_count + 1
@@ -255,6 +293,188 @@ class InMemorySecretStore:
                 }
                 for key in keys[offset : offset + limit]
             ]
+
+    async def is_secret_value_matching(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        candidate_value: str | bytes | bytearray,
+    ) -> bool:
+        """Vérifie en temps constant si candidate_value correspond au secret stocké.
+
+        Permet de savoir si la valeur en production est encore celle qui a fuité,
+        sans jamais déchiffrer ni renvoyer l'empreinte au client (ticket #116).
+        Exige une clé HMAC serveur explicite (non dérivée de la KEK) pour rester
+        valide et immunisée contre la rotation de KEK.
+        """
+        if not isinstance(candidate_value, (str, bytes, bytearray)):
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
+        if not project or not env or not name:
+            raise ValueError("Le triplet d'identité (project, env, name) ne peut pas être vide.")
+        if not candidate_value:
+            return False
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
+        aad = VaultCipher.aad(project, env, name)
+        candidate_val_bytes = canonicalize_secret_value(candidate_value)
+        candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
+        async with self._lock:
+            if self._server_hmac_canary is not None:
+                if not constant_time_equal(
+                    self._server_hmac_canary, self._cipher.server_hmac_key_canary()
+                ):
+                    raise VaultCipherError(
+                        "La clé HMAC serveur a été modifiée depuis l'enregistrement des secrets. "
+                        "Les empreintes stockées sont invalidées (refus fail-closed pour interdire "
+                        "tout faux négatif)."
+                    )
+            record = self._secrets.get((project, env, name))
+            if record is None:
+                return False
+            stored_fp = str(record.get("fingerprint") or "")
+            if len(stored_fp) == _FINGERPRINT_HEX_LEN and all(
+                c in "0123456789abcdef" for c in stored_fp
+            ):
+                if self._server_hmac_canary is None:
+                    raise VaultCipherError(
+                        "L'empreinte du secret a été générée en mode dérivé "
+                        "(sans canari explicite). La vérification sous clé explicite "
+                        "est refusée (fail-closed) pour interdire tout faux négatif. "
+                        "Une migration des empreintes est requise."
+                    )
+                return constant_time_equal(candidate_fp, stored_fp)
+            decrypted = _decrypt_record(record, self._cipher, project, env, name)
+            decrypted_val_bytes = unicodedata.normalize("NFC", decrypted["value"]).encode("utf-8")
+            return constant_time_equal(candidate_val_bytes, decrypted_val_bytes)
+
+    async def find_secrets_matching_value(
+        self,
+        project: str,
+        candidate_value: str | bytes | bytearray,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Trouve les métadonnées des secrets d'un projet correspondant à candidate_value.
+
+        Permet de détecter quels secrets en production sont compromis par une fuite.
+        Retourne uniquement les métadonnées (project, env, name, status), JAMAIS
+        la valeur ni l'empreinte (ticket #116).
+        Exige une clé HMAC serveur explicite (non dérivée de la KEK).
+        """
+        if not isinstance(candidate_value, (str, bytes, bytearray)):
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
+        if not candidate_value:
+            return []
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
+        candidate_val_bytes = canonicalize_secret_value(candidate_value)
+        results: list[dict[str, str]] = []
+        async with self._lock:
+            if self._server_hmac_canary is not None and not constant_time_equal(
+                self._server_hmac_canary, self._cipher.server_hmac_key_canary()
+            ):
+                raise VaultCipherError(
+                    "La clé HMAC serveur a été modifiée depuis l'enregistrement des secrets. "
+                    "Les empreintes stockées sont invalidées (refus fail-closed pour interdire "
+                    "tout faux négatif)."
+                )
+            for (p, e, n), record in self._secrets.items():
+                if p != project:
+                    continue
+                if env is not None and e != env:
+                    continue
+                aad = VaultCipher.aad(p, e, n)
+                candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
+                stored_fp = str(record.get("fingerprint") or "")
+                matched = False
+                if len(stored_fp) == _FINGERPRINT_HEX_LEN and all(
+                    c in "0123456789abcdef" for c in stored_fp
+                ):
+                    if self._server_hmac_canary is None:
+                        raise VaultCipherError(
+                            "Des empreintes de secrets ont été générées en mode dérivé "
+                            "(sans canari explicite). La détection sous clé explicite est "
+                            "refusée (fail-closed) pour interdire tout faux négatif. "
+                            "Une migration des empreintes est requise."
+                        )
+                    matched = constant_time_equal(candidate_fp, stored_fp)
+                else:
+                    decrypted = _decrypt_record(record, self._cipher, p, e, n)
+                    decrypted_val_bytes = (
+                        unicodedata.normalize("NFC", decrypted["value"]).encode("utf-8")
+                    )
+                    matched = constant_time_equal(candidate_val_bytes, decrypted_val_bytes)
+                if matched:
+                    results.append(
+                        {
+                            "project": p,
+                            "env": e,
+                            "name": n,
+                            "status": str(record.get("status", "vaulte")),
+                        }
+                    )
+        return sorted(results, key=lambda r: (r["env"], r["name"]))
+
+    async def find_secrets_by_fingerprint(
+        self,
+        project: str,
+        fingerprint: str,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Recherche les secrets par empreinte HMAC sans déchiffrement (ticket #116)."""
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != _FINGERPRINT_HEX_LEN
+            or not all(c in "0123456789abcdef" for c in fingerprint)
+        ):
+            raise ValueError(
+                "L'empreinte HMAC doit être une chaîne hexadécimale de 64 caractères minuscules."
+            )
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La recherche par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
+        async with self._lock:
+            if self._server_hmac_canary is not None:
+                if not constant_time_equal(
+                    self._server_hmac_canary, self._cipher.server_hmac_key_canary()
+                ):
+                    raise VaultCipherError(
+                        "La clé HMAC serveur a été modifiée depuis l'enregistrement des secrets. "
+                        "Les empreintes stockées sont invalidées (refus fail-closed pour interdire "
+                        "tout faux négatif)."
+                    )
+            elif self._secrets:
+                raise VaultCipherError(
+                    "Le store contient des secrets créés sans canari explicite "
+                    "(mode dérivé ou lignes héritées sans empreinte). La recherche "
+                    "par empreinte sous clé explicite est indéfinie pour ces lignes "
+                    "et refusée (fail-closed) pour interdire tout faux négatif. "
+                    "Une migration des empreintes est requise."
+                )
+            results = [
+                {
+                    "project": str(record["project"]),
+                    "env": str(record["env"]),
+                    "name": str(record["name"]),
+                    "status": str(record["status"]),
+                }
+                for (p, e, _n), record in self._secrets.items()
+                if p == project
+                and (env is None or e == env)
+                and constant_time_equal(str(record.get("fingerprint") or ""), fingerprint)
+            ]
+            return sorted(results, key=lambda r: (r["env"], r["name"]))
 
     async def transition(
         self,
@@ -357,7 +577,35 @@ class InMemorySecretStore:
             self._secrets.clear()
             self._project_counts.clear()
             self._sorted_keys_by_project.clear()
+            self._server_hmac_canary = None
             self._transitions.clear()
+
+    def _check_rotate_hmac_continuity(self, new_cipher: VaultCipher) -> None:
+        if not self._secrets and self._server_hmac_canary is None:
+            # Store vierge (jamais de create) ou vidé par clear() : aucune
+            # empreinte ni canari n'existe, la rotation est libre et le
+            # contrôle de continuité ne s'applique pas.
+            return
+        if self._server_hmac_canary is not None:
+            if not new_cipher.has_explicit_server_hmac_key:
+                raise VaultCipherError(
+                    "La rotation de KEK vers un chiffreur en mode dérivé est interdite "
+                    "sur un store contenant des secrets sous clé explicite (refus fail-closed). "
+                    "Une migration des empreintes est requise."
+                )
+            if not constant_time_equal(
+                self._server_hmac_canary, new_cipher.server_hmac_key_canary()
+            ):
+                raise VaultCipherError(
+                    "La clé HMAC serveur du nouveau chiffreur diffère de la clé "
+                    "enregistrée pour ce store (refus fail-closed immédiat). "
+                    "Une migration des empreintes est requise."
+                )
+        elif new_cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "Le store contient des secrets créés en mode dérivé. La rotation vers "
+                "un chiffreur avec clé HMAC explicite nécessite une migration des empreintes."
+            )
 
     async def rotate_kek(
         self,
@@ -374,6 +622,13 @@ class InMemorySecretStore:
             validate_kek_version(target_kek_version, label="Numéro de version cible")
 
         async with self._lock:
+            # Continuité HMAC contrôlée AVANT le retour store vide : un canari
+            # persistant (survivant au delete() du dernier secret, seul
+            # clear() l'efface) impose un échec immédiat, pas un échec différé
+            # au prochain create (revue LOW #116). Le cas « vierge ou vidé par
+            # clear() » (aucun secret, aucun canari) reste exempté dans
+            # _check_rotate_hmac_continuity.
+            self._check_rotate_hmac_continuity(new_cipher)
             if not self._secrets:
                 return 0
             for r in self._secrets.values():
@@ -385,9 +640,7 @@ class InMemorySecretStore:
 
             current_max = max(
                 (
-                    r["kek_version"]
-                    if r.get("kek_version") is not None
-                    else 1
+                    r["kek_version"] if r.get("kek_version") is not None else 1
                     for r in self._secrets.values()
                 ),
                 default=1,
@@ -396,7 +649,7 @@ class InMemorySecretStore:
                 if target_kek_version <= current_max:
                     raise ValueError(
                         "Le numéro de version cible doit être strictement supérieur "
-                    "à la version actuelle."
+                        "à la version actuelle."
                     )
                 new_version = target_kek_version
             else:
@@ -547,20 +800,52 @@ class SqliteSecretStore:
     async def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         return await asyncio.to_thread(self._create, project, env, name, value)
 
+    def _check_creation_canary(self, conn: sqlite3.Connection) -> None:
+        persisted_canary = get_server_hmac_canary(conn)
+        if self._cipher.has_explicit_server_hmac_key:
+            current_canary = self._cipher.server_hmac_key_canary()
+            if persisted_canary is not None:
+                if not constant_time_equal(persisted_canary, current_canary):
+                    raise VaultCipherError(
+                        "La clé HMAC serveur (HEIMDALL_VAULT_SERVER_HMAC_KEY) a été modifiée "
+                        "depuis l'enregistrement des secrets en base. Les empreintes stockées "
+                        "sont invalidées (refus fail-closed pour interdire tout faux négatif). "
+                        "Une migration des empreintes est requise."
+                    )
+            else:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM secrets LIMIT 1")
+                if cursor.fetchone() is not None:
+                    raise VaultCipherError(
+                        "La base de données contient déjà des secrets créés sans clé HMAC "
+                        "explicite (mode dérivé). Le passage au mode clé HMAC explicite "
+                        "nécessite une migration des empreintes."
+                    )
+        elif persisted_canary is not None:
+            raise VaultCipherError(
+                "La base de données a été initialisée avec une clé HMAC explicite. "
+                "L'écriture en mode dérivé est interdite sans migration."
+            )
+
     def _create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         aad = VaultCipher.aad(project, env, name)
         # Défense en profondeur : valeur canonique (NFC) et sans NUL même hors
         # du chemin HTTP, pour que l'empreinte d'intégrité soit toujours
         # calculée sur la forme stockée (décision #62). Le NUL tronque les
         # valeurs dans les outils texte : refusé comme au contrat API.
-        value = unicodedata.normalize("NFC", value)
         if "\x00" in value:
+            raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
+        value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")
+        if not value_bytes:
+            raise ValueError("La valeur du secret ne peut pas être vide.")
+        if b"\x00" in value_bytes:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         with db_session(self._db_path) as conn:
             # Verrou d'écriture inter-processus AVANT le comptage : le
             # quota et l'insertion forment une seule transaction atomique,
             # même entre workers partageant le fichier SQLite.
             conn.execute("BEGIN IMMEDIATE")
+            self._check_creation_canary(conn)
             # Vérification de non-obsolescence de la KEK (ticket #71 MEDIUM) :
             # si une rotation externe (ex. via CLI) a incrémenté la version en base
             # au-delà de celle chargée en mémoire par ce worker, refuser fail-closed
@@ -581,8 +866,8 @@ class SqliteSecretStore:
                     f"Quota maximal de secrets atteint pour le projet '{project}'"
                 )
             ensure_project(conn, project)
-            envelope = self._cipher.encrypt_envelope(value.encode("utf-8"), aad=aad)
-            fingerprint = self._cipher.fingerprint(value.encode("utf-8"), aad=aad)
+            envelope = self._cipher.encrypt_envelope(value_bytes, aad=aad)
+            fingerprint = self._cipher.fingerprint(value_bytes, aad=aad)
             try:
                 create_secret(
                     conn,
@@ -596,12 +881,258 @@ class SqliteSecretStore:
                 )
             except sqlite3.IntegrityError:
                 raise KeyError("Secret déjà existant") from None
+            if self._cipher.has_explicit_server_hmac_key:
+                # Hors du try « secret déjà existant » : un conflit d'écriture
+                # sur le canari ne doit jamais être requalifié en faux 409
+                # (revue LOW #116). L'insertion est atomique côté database.py ;
+                # cette garde reste une défense en profondeur.
+                try:
+                    set_server_hmac_canary(conn, self._cipher.server_hmac_key_canary())
+                except ValueError as exc:
+                    raise VaultCipherError(str(exc)) from exc
+                except sqlite3.IntegrityError as exc:
+                    raise VaultCipherError(
+                        "Conflit d'écriture sur le canari de la clé HMAC serveur ; "
+                        "réessayer la création (invariant 5)."
+                    ) from exc
         return {
             "project": project,
             "env": env,
             "name": name,
             "status": "vaulte",
         }
+
+    async def is_secret_value_matching(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        candidate_value: str | bytes | bytearray,
+    ) -> bool:
+        """Vérifie en temps constant si candidate_value correspond au secret stocké.
+
+        Permet de savoir si la valeur en production est encore celle qui a fuité,
+        sans jamais déchiffrer ni renvoyer l'empreinte au client (ticket #116).
+        Exige une clé HMAC serveur explicite (non dérivée de la KEK).
+        """
+        if not isinstance(candidate_value, (str, bytes, bytearray)):
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
+        if not project or not env or not name:
+            raise ValueError("Le triplet d'identité (project, env, name) ne peut pas être vide.")
+        if not candidate_value:
+            return False
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
+        return await asyncio.to_thread(
+            self._is_secret_value_matching,
+            project,
+            env,
+            name,
+            candidate_value,
+        )
+
+    def _is_secret_value_matching(
+        self,
+        project: str,
+        env: str,
+        name: str,
+        candidate_value: str | bytes | bytearray,
+    ) -> bool:
+        if not isinstance(candidate_value, (str, bytes, bytearray)):
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
+        if not project or not env or not name:
+            raise ValueError("Le triplet d'identité (project, env, name) ne peut pas être vide.")
+        if not candidate_value:
+            return False
+        aad = VaultCipher.aad(project, env, name)
+        candidate_val_bytes = canonicalize_secret_value(candidate_value)
+        candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
+        with db_session(self._db_path) as conn:
+            persisted_canary = get_server_hmac_canary(conn)
+            if persisted_canary is not None and not constant_time_equal(
+                persisted_canary, self._cipher.server_hmac_key_canary()
+            ):
+                raise VaultCipherError(
+                    "La clé HMAC serveur (HEIMDALL_VAULT_SERVER_HMAC_KEY) a été modifiée depuis "
+                    "l'enregistrement des secrets en base. Les empreintes stockées sont invalidées "
+                    "(refus fail-closed pour interdire tout faux négatif). Une migration des "
+                    "empreintes est requise."
+                )
+            record = get_secret_metadata(conn, project, env, name)
+            if record is None:
+                return False
+            stored_fp = str(record.get("fingerprint") or "")
+            if len(stored_fp) == _FINGERPRINT_HEX_LEN and all(
+                c in "0123456789abcdef" for c in stored_fp
+            ):
+                if persisted_canary is None:
+                    raise VaultCipherError(
+                        "L'empreinte du secret a été générée en mode dérivé "
+                        "(sans canari explicite). La vérification sous clé explicite "
+                        "est refusée (fail-closed) pour interdire tout faux négatif. "
+                        "Une migration des empreintes est requise."
+                    )
+                return constant_time_equal(candidate_fp, stored_fp)
+            full_record = get_secret(conn, project, env, name)
+            if full_record is None:
+                return False
+            decrypted = _decrypt_record(full_record, self._cipher, project, env, name)
+            decrypted_val_bytes = unicodedata.normalize("NFC", decrypted["value"]).encode("utf-8")
+            return constant_time_equal(candidate_val_bytes, decrypted_val_bytes)
+
+    async def find_secrets_matching_value(
+        self,
+        project: str,
+        candidate_value: str | bytes | bytearray,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Trouve les métadonnées des secrets d'un projet correspondant à candidate_value.
+
+        Permet de détecter quels secrets en production sont compromis par une fuite.
+        Retourne uniquement les métadonnées (project, env, name, status), JAMAIS
+        la valeur ni l'empreinte (ticket #116).
+        Exige une clé HMAC serveur explicite (non dérivée de la KEK).
+        """
+        if not isinstance(candidate_value, (str, bytes, bytearray)):
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
+        if not candidate_value:
+            return []
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La détection de fuite par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
+        return await asyncio.to_thread(
+            self._find_secrets_matching_value,
+            project,
+            candidate_value,
+            env,
+        )
+
+    def _find_secrets_matching_value(
+        self,
+        project: str,
+        candidate_value: str | bytes | bytearray,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        if not isinstance(candidate_value, (str, bytes, bytearray)):
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
+        if not candidate_value:
+            return []
+        candidate_val_bytes = canonicalize_secret_value(candidate_value)
+        with db_session(self._db_path) as conn:
+            persisted_canary = get_server_hmac_canary(conn)
+            if persisted_canary is not None and not constant_time_equal(
+                persisted_canary, self._cipher.server_hmac_key_canary()
+            ):
+                raise VaultCipherError(
+                    "La clé HMAC serveur (HEIMDALL_VAULT_SERVER_HMAC_KEY) a été modifiée depuis "
+                    "l'enregistrement des secrets en base. Les empreintes stockées sont invalidées "
+                    "(refus fail-closed pour interdire tout faux négatif). Une migration des "
+                    "empreintes est requise."
+                )
+            secrets_list = list_secrets(conn, project, env=env)
+            results: list[dict[str, str]] = []
+            for item in secrets_list:
+                p, e, n = item["project_id"], item["env"], item["name"]
+                stored_fp = str(item.get("fingerprint") or "")
+                matched = False
+                if len(stored_fp) == _FINGERPRINT_HEX_LEN and all(
+                    c in "0123456789abcdef" for c in stored_fp
+                ):
+                    if persisted_canary is None:
+                        raise VaultCipherError(
+                            "Des empreintes de secrets ont été générées en mode dérivé "
+                            "(sans canari explicite). La détection sous clé explicite est "
+                            "refusée (fail-closed) pour interdire tout faux négatif. "
+                            "Une migration des empreintes est requise."
+                        )
+                    aad = VaultCipher.aad(p, e, n)
+                    candidate_fp = self._cipher.fingerprint(candidate_val_bytes, aad=aad)
+                    matched = constant_time_equal(candidate_fp, stored_fp)
+                else:
+                    # Repli transparent pour les secrets hérités sans empreinte (ticket #25/#62)
+                    full_record = get_secret(conn, p, e, n)
+                    if full_record is not None:
+                        decrypted = _decrypt_record(full_record, self._cipher, p, e, n)
+                        decrypted_val_bytes = (
+                            unicodedata.normalize("NFC", decrypted["value"]).encode("utf-8")
+                        )
+                        matched = constant_time_equal(candidate_val_bytes, decrypted_val_bytes)
+                if matched:
+                    results.append(
+                        {
+                            "project": p,
+                            "env": e,
+                            "name": n,
+                            "status": str(item.get("status", "vaulte")),
+                        }
+                    )
+            return results
+
+    async def find_secrets_by_fingerprint(
+        self,
+        project: str,
+        fingerprint: str,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Recherche les secrets par empreinte HMAC sans déchiffrement (ticket #116)."""
+        return await asyncio.to_thread(
+            self._find_secrets_by_fingerprint,
+            project,
+            fingerprint,
+            env,
+        )
+
+    def _find_secrets_by_fingerprint(
+        self,
+        project: str,
+        fingerprint: str,
+        env: str | None = None,
+    ) -> list[dict[str, str]]:
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != _FINGERPRINT_HEX_LEN
+            or not all(c in "0123456789abcdef" for c in fingerprint)
+        ):
+            raise ValueError(
+                "L'empreinte HMAC doit être une chaîne hexadécimale de 64 caractères minuscules."
+            )
+        if not self._cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La recherche par empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
+        with db_session(self._db_path) as conn:
+            persisted_canary = get_server_hmac_canary(conn)
+            if persisted_canary is not None:
+                if not constant_time_equal(
+                    persisted_canary, self._cipher.server_hmac_key_canary()
+                ):
+                    raise VaultCipherError(
+                        "La clé HMAC serveur (HEIMDALL_VAULT_SERVER_HMAC_KEY) a été modifiée "
+                        "depuis l'enregistrement des secrets en base. Les empreintes stockées "
+                        "sont invalidées (refus fail-closed pour interdire tout faux négatif). "
+                        "Une migration des empreintes est requise."
+                    )
+            else:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM secrets LIMIT 1")
+                if cursor.fetchone() is not None:
+                    raise VaultCipherError(
+                        "La base de données contient des secrets créés sans canari explicite "
+                        "(mode dérivé ou lignes héritées sans empreinte). La recherche par "
+                        "empreinte sous clé explicite est indéfinie pour ces lignes et refusée "
+                        "(fail-closed) pour interdire tout faux négatif. Une migration des "
+                        "empreintes est requise."
+                    )
+            return find_secrets_by_fingerprint(conn, project, fingerprint, env=env)
 
     async def clear(self) -> None:
         """Réinitialisation **test-only** du store (jamais exposée par HTTP)."""
@@ -610,6 +1141,7 @@ class SqliteSecretStore:
     def _clear(self) -> None:
         with db_session(self._db_path) as conn:
             delete_all_secrets(conn)
+            conn.execute("DELETE FROM server_hmac_canary")
             _delete_all_secret_transitions(conn)
 
     async def delete(self, project: str, env: str, name: str) -> bool:

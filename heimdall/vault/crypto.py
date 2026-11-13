@@ -52,11 +52,15 @@ pas rendre illisibles les blobs existants ; les deux modes sont exclusifs.
 """
 
 import base64
+import collections
 import hashlib
 import hmac
+import math
 import os
+import re
 import secrets
 import unicodedata
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import argon2.low_level
@@ -71,6 +75,141 @@ _TAG_SIZE_BYTES: int = 16  # étiquette d'authentification GCM, en fin de cipher
 # Défense en profondeur : un pepper plus court que 256 bits réduit la
 # résistance hors ligne si les empreintes stockées et le pepper fuient.
 _MIN_PEPPER_BYTES: int = 32
+MAX_SERVER_HMAC_KEY_BYTES: int = 512  # Borne maximale pour la clé HMAC serveur (ticket #116)
+_SHA256_HEX_LEN: int = 64  # Longueur en caractères hexadécimaux d'un SHA-256 (ticket #116)
+_MIN_DISTINCT_SERVER_HMAC_KEY_BYTES: int = 24  # Diversité minimale durcie (>= 24 symboles)
+_MIN_SERVER_HMAC_KEY_SHANNON_ENTROPY: float = 4.0  # Seuil d'entropie de Shannon durci (ticket #116)
+
+
+def _shannon_entropy(data: bytes) -> float:
+    """Calcule l'entropie de Shannon en bits par octet d'un bloc binaire."""
+    if not data:
+        return 0.0
+    length = len(data)
+    counts = collections.Counter(data)
+    return -sum((c / length) * math.log2(c / length) for c in counts.values())
+
+
+# Garde anti-phrase humaine (revue #116) : une phrase naturelle de 32+ octets
+# peut franchir les seuils de diversité (24 symboles) et d'entropie brute
+# (Shannon >= 4.0) tout en ne portant que 60-80 bits effectifs (mots de
+# dictionnaire), restant attaquable hors ligne avec un dump SQLite et le canari
+# public. Cinq signatures sont refusées sur une clé de 32+ caractères
+# normalisés :
+#   1. minuscules ASCII + espaces >= 85 % (phrases basse-casse, avec ou sans
+#      espaces, y compris les phrases à chiffres type "password123 ...") ;
+#   2. majuscules ASCII >= 85 % (phrases capitales sans séparateur) ;
+#   3. si la clé contient un blanc, caractères ASCII alphanumériques + blancs
+#      >= 85 % (phrases capitales, à casse mixte ou à chiffres type
+#      "password123 ..." séparées par des espaces, que la règle 1 ne
+#      comptabilise pas) ;
+#   4. lettres ASCII >= 85 % (phrases CamelCase sans séparateur type
+#      "CorrectHorseBatteryStaple...", y compris avec suffixe chiffré, que les
+#      règles 1 et 2 ne voient pas en raison du mélange majuscules/minuscules) ;
+#   5. mots CamelCase répétés (>= 4 mots [A-Z][a-z]{2,}) représentant avec
+#      chiffres associés >= 85 % de la clé (phrases CamelCase avec chiffres
+#      intercalés sans espaces).
+# Les règles 1 à 3 s'appliquent après une normalisation défensive qui remplace
+# tout caractère non alphanumérique ASCII par un blanc (revue LOW #116 #226) :
+# la liste fermée " -_.:,;!?/" n'étant pas exhaustive, une phrase de
+# dictionnaire séparée par "#", "@", "&", ... ne doit pas échapper à la garde
+# sous prétexte que son séparateur n'est pas listé. La règle 3 compte un mot
+# dès que son squelette alphabétique porte >= 2 lettres (insensible à la casse
+# et aux substitutions leet par chiffres), pour refuser aussi les phrases à
+# casse mixte et à leetspeak type "C0rr3ct#H0rs3#...".
+# generate_server_hmac_key() régénère en boucle jusqu'à conformité avec
+# validate_server_hmac_key() : les clés produites par la voie officielle sont
+# toujours garanties valides et portent 256 bits effectifs réels.
+_HUMAN_PHRASE_MIN_CHARS: int = 32
+_HUMAN_PHRASE_MAX_WORD_RATIO: float = 0.85
+_CAMEL_WORDS_MIN_COUNT: int = 4
+_CAMEL_WORD_MIN_LEN: int = 3
+_NATURAL_WORD_MIN_LEN: int = 2
+_ALTERNATING_CASE_MIN_RATIO: float = 0.75
+_ALTERNATING_CASE_MIN_ALPHA_RATIO: float = 0.80
+
+
+def _extract_camel_words(text: str) -> list[str]:
+    """Extrait les mots CamelCase (1 majuscule suivie d'au moins 2 minuscules, Unicode inclus)."""
+    words: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i].isupper():
+            j = i + 1
+            while j < n and text[j].islower():
+                j += 1
+            if j - i >= _CAMEL_WORD_MIN_LEN:
+                words.append(text[i:j])
+                i = j
+                continue
+        i += 1
+    return words
+
+
+def _looks_like_human_phrase(key_bytes: bytes) -> bool:
+    """Détecte une clé qui est en réalité une phrase naturelle (espaces, ponctuation, CamelCase).
+
+    La détection ignore la casse et les diacritiques via NFKD et s'applique
+    aux clés textuelles d'au moins 32 caractères normalisés (ASCII comme
+    alphabets Unicode : latin, cyrillique, grec, etc.) ; les octets binaires
+    non UTF-8 sont réduits par ``errors="ignore"`` et restent du ressort des
+    gardes de diversité et d'entropie.
+    """
+    normalized = unicodedata.normalize("NFKD", key_bytes.decode("utf-8", errors="ignore"))
+    stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    cleaned = "".join(" " if ch.isspace() else ch for ch in stripped)
+    if len(cleaned) < _HUMAN_PHRASE_MIN_CHARS:
+        return False
+    # Normalisation défensive des séparateurs (revues LOW #116 #226) : tout
+    # caractère non alphanumérique (ASCII comme Unicode) est réduit à un blanc
+    # générique avant toutes les règles (y compris CamelCase et casse alternée),
+    # afin qu'aucune phrase naturelle (latine, cyrillique, grecque, etc.) ni
+    # aucun séparateur hors liste ("#", "@", "&", ...) ne contourne la garde.
+    normalized_text = re.sub(r" +", " ", "".join(ch if ch.isalnum() else " " for ch in cleaned))
+    total = len(normalized_text)
+    lowercase_or_sep = sum(1 for ch in normalized_text if ch.islower() or ch == " ")
+    uppercase_or_sep = sum(1 for ch in normalized_text if ch.isupper() or ch == " ")
+    if (
+        lowercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
+        or uppercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
+    ):
+        return True
+    if " " in normalized_text:
+        word_chars = sum(1 for ch in normalized_text if ch.isalnum() or ch == " ")
+        words = [w for w in normalized_text.split(" ") if w]
+        # Squelette alphabétique >= 2 lettres par mot : insensible à la casse et
+        # aux substitutions leet par chiffres ("C0rr3ct" -> "Crrct"), pour ne pas
+        # contourner la garde par un mélange majuscules/minuscules ou de chiffres.
+        natural_words = [
+            w for w in words if sum(1 for c in w if c.isalpha()) >= _NATURAL_WORD_MIN_LEN
+        ]
+        if (
+            len(natural_words) >= _CAMEL_WORDS_MIN_COUNT
+            and word_chars / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
+        ):
+            return True
+    camel_words = _extract_camel_words(normalized_text)
+    camel_len = sum(len(w) for w in camel_words) + sum(
+        1 for ch in normalized_text if ch.isdigit() or ch == " "
+    )
+    if (
+        len(camel_words) >= _CAMEL_WORDS_MIN_COUNT
+        and camel_len / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
+    ):
+        return True
+    letters = [ch for ch in normalized_text if ch.isalpha()]
+    if (
+        len(letters) >= _HUMAN_PHRASE_MIN_CHARS
+        and len(letters) / total >= _ALTERNATING_CASE_MIN_ALPHA_RATIO
+    ):
+        transitions = sum(
+            1 for i in range(len(letters) - 1) if letters[i].islower() != letters[i + 1].islower()
+        )
+        if transitions / (len(letters) - 1) >= _ALTERNATING_CASE_MIN_RATIO:
+            return True
+    return False
+
 
 # Une DEK fait 256 bits, comme la KEK : l'AES-256-GCM exige une clé de 32 octets.
 _DEK_SIZE_BYTES: int = 32
@@ -143,6 +282,344 @@ def generate_api_key() -> str:
 def generate_api_key_pepper() -> str:
     """Génère un pepper éphémère indépendant avec 256 bits d'entropie."""
     return secrets.token_urlsafe(_KEY_SIZE_BYTES)
+
+
+def generate_server_hmac_key() -> str:
+    """Génère une clé HMAC serveur aléatoire avec au moins 256 bits d'entropie (ticket #116).
+
+    À utiliser comme clé HMAC serveur dédiée pour le calcul des empreintes de secrets,
+    distincte de la KEK et de la clé maîtresse de chiffrement. Garantit que la clé
+    produite satisfait immédiatement ``validate_server_hmac_key``.
+    """
+    while True:
+        candidate = secrets.token_urlsafe(_KEY_SIZE_BYTES)
+        try:
+            validate_server_hmac_key(candidate)
+            return candidate
+        except ValueError:
+            continue
+
+
+def _to_raw_server_hmac_bytes(key: str | bytes | bytearray | None) -> bytes:
+    if key is None:
+        raise ValueError(
+            "La clé HMAC serveur est obligatoire. Aucun repli silencieux sur un secret par défaut."
+        )
+    if isinstance(key, str):
+        if not key or not key.strip():
+            raise ValueError("La clé HMAC serveur ne peut pas être vide ou blanche.")
+        try:
+            return key.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("La clé HMAC serveur doit être encodable en UTF-8.") from None
+    if isinstance(key, (bytes, bytearray)):
+        key_bytes = bytes(key)
+        if not key_bytes or not key_bytes.strip():
+            raise ValueError("La clé HMAC serveur ne peut pas être vide ou blanche.")
+        return key_bytes
+    raise ValueError("Clé HMAC serveur invalide : chaîne ou octets attendus.")
+
+
+def _validate_key_complexity(key_bytes: bytes) -> None:
+    if len(key_bytes) < _MIN_PEPPER_BYTES:
+        raise ValueError(
+            f"La clé HMAC serveur doit comporter au moins {_MIN_PEPPER_BYTES} octets "
+            "(256 bits) pour une résistance hors ligne suffisante."
+        )
+    if len(key_bytes) > MAX_SERVER_HMAC_KEY_BYTES:
+        raise ValueError(
+            f"La clé HMAC serveur ne doit pas dépasser {MAX_SERVER_HMAC_KEY_BYTES} octets "
+            "(longueur excessive)."
+        )
+    if len(set(key_bytes)) < _MIN_DISTINCT_SERVER_HMAC_KEY_BYTES:
+        raise ValueError(
+            "La clé HMAC serveur est trop simple ou répétitive (diversité insuffisante : "
+            f"au moins {_MIN_DISTINCT_SERVER_HMAC_KEY_BYTES} symboles distincts requis — "
+            "les clés hexadécimales à 16 symboles max sont refusées par construction) : "
+            "utiliser generate_server_hmac_key() comme seule voie supportée pour "
+            "générer une clé aléatoire cryptographiquement sûre de 256 bits."
+        )
+    for period in range(1, len(key_bytes) // 2 + 1):
+        if all(key_bytes[i] == key_bytes[i % period] for i in range(len(key_bytes))):
+            raise ValueError(
+                "La clé HMAC serveur ne peut pas être un motif périodique répétitif : "
+                "utiliser generate_server_hmac_key() comme seule voie supportée pour "
+                "générer une clé aléatoire cryptographiquement sûre de 256 bits."
+            )
+    if _shannon_entropy(key_bytes) < _MIN_SERVER_HMAC_KEY_SHANNON_ENTROPY:
+        raise ValueError(
+            "La clé HMAC serveur a une entropie insuffisante : "
+            "utiliser generate_server_hmac_key() comme seule voie supportée pour "
+            "générer une clé aléatoire cryptographiquement sûre de 256 bits."
+        )
+    if _looks_like_human_phrase(key_bytes):
+        raise ValueError(
+            "La clé HMAC serveur ressemble à une phrase naturelle et ne porte pas "
+            "256 bits effectifs (mots de dictionnaire attaquables hors ligne) : "
+            "utiliser generate_server_hmac_key() comme seule voie supportée pour "
+            "générer une clé aléatoire cryptographiquement sûre de 256 bits."
+        )
+
+
+def validate_server_hmac_key(key: str | bytes | bytearray | None) -> bytes:
+    """Valide et normalise la clé HMAC serveur en octets (ticket #116).
+
+    Exige au moins 32 octets (256 bits), au plus 512 octets (borne maximale),
+    au moins 24 symboles distincts, aucune période répétitive, une entropie
+    de Shannon >= 4.0 bits/octet et aucun aspect de phrase naturelle (garde
+    anti-phrase humaine). Ces contrôles neutralisent les attaques par
+    dictionnaire et les ralentissements par clés géantes.
+
+    Format accepté : les clés encodées en hexadécimal (alphabet de 16
+    symboles maximum < 24) sont **refusées par construction** ; utiliser
+    ``generate_server_hmac_key()`` (jeton base64url à ≥ 24 symboles distincts).
+
+    Portée exacte de la garantie (revue LOW #116) : la neutralisation
+    dictionnaire/arc-en-ciel avec 256 bits effectifs n'est **prouvée** que pour
+    une clé produite par ``generate_server_hmac_key()`` (CSPRNG, base64url).
+    Pour une clé fournie par l'opérateur, ces contrôles sont une défense en
+    profondeur heuristique (échec fail-closed sur tout motif connu-faible) ;
+    ils ne peuvent pas prouver l'entropie d'une clé arbitraire — c'est
+    pourquoi les seuils ne sont pas relevés davantage (voir les constantes
+    ``_HUMAN_PHRASE_*``) et pourquoi la voie supportée reste la génération.
+    """
+    key_bytes = _to_raw_server_hmac_bytes(key)
+    _validate_key_complexity(key_bytes)
+    return key_bytes
+
+
+_normalize_server_hmac_key = validate_server_hmac_key
+
+
+def _extract_key_variants(raw: str | bytes | bytearray) -> list[bytes]:
+    """Extrait les représentations brutes, base64 décodées et hexadécimales d'une clé."""
+    if not isinstance(raw, (str, bytes, bytearray)):
+        raise TypeError("La clé doit être de type str, bytes ou bytearray.")
+    variants: list[bytes] = []
+    if isinstance(raw, str):
+        try:
+            raw_bytes: bytes | None = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            raw_bytes = None
+    else:
+        raw_bytes = bytes(raw)
+
+    if raw_bytes is not None:
+        variants.append(raw_bytes)
+        try:
+            padding = b"=" * (-len(raw_bytes) % 4)
+            variants.append(base64.b64decode(raw_bytes + padding, altchars=b"-_", validate=True))
+        except ValueError:
+            pass
+        try:
+            variants.append(bytes.fromhex(raw_bytes.decode("utf-8", errors="ignore")))
+        except ValueError:
+            pass
+    return variants
+
+
+def server_hmac_key_matches_master_key(
+    master_or_kek: str | bytes | bytearray,
+    server_hmac_key: str | bytes | bytearray,
+) -> bool:
+    """Détecte la réutilisation de la clé maîtresse ou KEK comme clé HMAC serveur (Invariant 5).
+
+    Compare en temps constant la clé maîtresse ou la KEK (brute, normalisée, décodée)
+    et la clé HMAC serveur pour s'assurer que les deux clés sont strictement distinctes.
+    """
+    if not isinstance(master_or_kek, (str, bytes, bytearray)):
+        raise TypeError("La clé maîtresse ou KEK doit être de type str, bytes ou bytearray.")
+    if not isinstance(server_hmac_key, (str, bytes, bytearray)):
+        raise TypeError("La clé HMAC serveur doit être de type str, bytes ou bytearray.")
+    # 1. Comparaison en temps constant de toutes les variantes (brute, base64, hex)
+    # AVANT normalisation, afin de ne pas masquer une collision sur HMAC faible (revue LOW #116).
+    master_variants = _extract_key_variants(master_or_kek)
+    hmac_raw_variants = _extract_key_variants(server_hmac_key)
+    for cand in master_variants:
+        for var in hmac_raw_variants:
+            if constant_time_equal(cand, var):
+                return True
+
+    # 2. Normalisation de la clé HMAC serveur et comparaisons complémentaires
+    try:
+        norm_hmac = _normalize_server_hmac_key(server_hmac_key)
+    except ValueError:
+        return False
+
+    master_str = (
+        master_or_kek
+        if isinstance(master_or_kek, str)
+        else bytes(master_or_kek).decode("utf-8", errors="ignore")
+    )
+    hmac_str = norm_hmac.decode("utf-8", errors="ignore")
+    try:
+        if kek_matches_pepper(master_str, hmac_str):
+            return True
+    except ValueError:
+        pass
+
+    hmac_variants = _extract_key_variants(norm_hmac)
+    for cand in master_variants:
+        for var in hmac_variants:
+            if constant_time_equal(cand, var):
+                return True
+
+    return False
+
+
+def canonicalize_secret_value(value: str | bytes | bytearray) -> bytes:
+    """Canonicalise une valeur secrète en octets UTF-8 NFC (ticket #116).
+
+    Les chaînes sont normalisées en NFC puis encodées en UTF-8. Les octets
+    UTF-8 valides sont décodés, normalisés en NFC puis ré-encodés : un candidat
+    ``bytes`` en forme décomposée (NFD) produit ainsi la même empreinte que sa
+    forme ``str`` équivalente. Les octets non-UTF8 (données binaires brutes)
+    sont conservés tels quels pour rester compatibles avec les secrets binaires.
+    """
+    if not isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("La valeur du secret doit être de type str ou bytes.")
+    if isinstance(value, str):
+        try:
+            return unicodedata.normalize("NFC", value).encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("La valeur du secret doit être encodable en UTF-8.") from None
+    raw = bytes(value)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    return unicodedata.normalize("NFC", text).encode("utf-8")
+
+
+def _normalize_aad_bytes(aad: str | bytes | bytearray) -> bytes:
+    """Valide et convertit un contexte AAD en ``bytes`` (refuse int/memoryview)."""
+    if not isinstance(aad, (str, bytes, bytearray)):
+        raise TypeError("Le contexte AAD doit être de type str, bytes ou bytearray.")
+    return aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
+
+
+def compute_secret_hmac(
+    server_key: str | bytes | bytearray,
+    value: str | bytes | bytearray,
+    *,
+    aad: bytes | str | bytearray | None = None,
+    forbidden_keys: (
+        Sequence[str | bytes | bytearray]
+        | set[str | bytes | bytearray]
+        | str
+        | bytes
+        | bytearray
+        | None
+    ) = None,
+) -> str:
+    """Calcule l'empreinte HMAC-SHA256 non réversible d'un secret avec la clé serveur (ticket #116).
+
+    Formule exacte : ``hmac.new(cle_serveur, valeur, sha256).hexdigest()``.
+
+    Permet de déterminer si une valeur en production correspond à une valeur ayant
+    fuité, sans jamais stocker ni renvoyer cette valeur au client.
+
+    Avertissement de sécurité (Invariant 5 - Séparation des clés) :
+    Cette fonction utilitaire pure ne peut PAS appliquer l'invariant 5 par défaut :
+    elle n'a aucune connaissance de la KEK ou de la clé maîtresse de l'appelant.
+    Ne JAMAIS passer directement la KEK ou la clé maîtresse en tant que ``server_key``.
+    La seule voie supportée en production est ``VaultCipher.compute_secret_hmac``, qui
+    injecte systématiquement sa KEK dans ``forbidden_keys`` et refuse fail-closed toute
+    réutilisation d'entropie (``server_hmac_key_matches_master_key``). Un appelant qui
+    utilise la fonction nue DOIT fournir lui-même ``forbidden_keys`` ; ce contrat de
+    primitive bas niveau est verrouillé par test (décision d'architecture revue #116).
+
+    Décision d'architecture (contrat de valeur vide) :
+    Une valeur de secret vide lève ``ValueError`` (fail-closed), car aucun secret vide ne peut
+    être créé ni indexé dans le Vault. À l'inverse, les prédicats de détection de fuite
+    (``is_secret_value_matching``, ``find_secrets_matching_value``) retournent ``False`` ou ``[]``
+    sur candidat vide, aucun secret en base ne pouvant correspondre.
+
+    Paramètres :
+    - ``server_key`` : Clé HMAC du serveur (au moins 32 octets / 256 bits), distincte
+      de la clé maîtresse de chiffrement.
+    - ``value`` : Valeur secrète (chaîne ou octets). Si chaîne, normalisée en Unicode NFC.
+    - ``aad`` : Contexte d'authentification optionnel lié au triplet (project, env, name).
+      Si fourni, préfixé avec un octet NUL pour lier l'empreinte au triplet spécifique.
+    - ``forbidden_keys`` : Clé ou séquence de clés interdites (ex. KEK / master key). Si fourni,
+      la fonction refuse fail-closed (``ValueError``) toute réutilisation d'entropie.
+    """
+    key_bytes = _normalize_server_hmac_key(server_key)
+    if forbidden_keys is not None:
+        if isinstance(forbidden_keys, (str, bytes, bytearray)):
+            forbidden_seq: tuple[str | bytes | bytearray, ...] = (forbidden_keys,)
+        elif isinstance(forbidden_keys, (list, tuple, set)):
+            forbidden_seq = tuple(forbidden_keys)
+        else:
+            raise TypeError(
+                "forbidden_keys doit être une clé (str, bytes, bytearray) "
+                "ou une collection de clés."
+            )
+        for forbidden in forbidden_seq:
+            if not isinstance(forbidden, (str, bytes, bytearray)):
+                raise TypeError("Chaque clé interdite doit être de type str, bytes ou bytearray.")
+            if server_hmac_key_matches_master_key(forbidden, key_bytes):
+                raise ValueError(
+                    "La clé HMAC serveur ne peut pas réutiliser l'entropie d'une clé interdite "
+                    "(KEK ou clé maîtresse, Invariant 5)."
+                )
+    value_bytes = canonicalize_secret_value(value)
+    if not value_bytes:
+        raise ValueError("La valeur du secret ne peut pas être vide.")
+
+    if aad is not None:
+        aad_bytes = _normalize_aad_bytes(aad)
+        if not aad_bytes:
+            raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
+        message = aad_bytes + b"\x00" + value_bytes
+    else:
+        message = value_bytes
+
+    return hmac.new(key_bytes, message, hashlib.sha256).hexdigest()
+
+
+def verify_secret_hmac(
+    server_key: str | bytes | bytearray,
+    value: str | bytes | bytearray,
+    expected_hmac: str,
+    *,
+    aad: bytes | str | bytearray | None = None,
+    forbidden_keys: (
+        Sequence[str | bytes | bytearray]
+        | set[str | bytes | bytearray]
+        | str
+        | bytes
+        | bytearray
+        | None
+    ) = None,
+) -> bool:
+    """Vérifie en temps constant si une valeur candidate correspond à l'empreinte HMAC.
+
+    Ticket #116 : permet de vérifier si la valeur en production est encore celle qui a fuité,
+    sans jamais déchiffrer ni exposer l'empreinte au client.
+
+    Avertissement de sécurité (Invariant 5 - Séparation des clés) :
+    Ne JAMAIS passer la KEK ou la clé maîtresse en tant que ``server_key``. Passer par
+    ``VaultCipher.verify_secret_hmac`` ou renseigner ``forbidden_keys`` pour interdire
+    fail-closed toute collision d'entropie avec la clé de chiffrement.
+
+    Décision d'architecture (contrat de vérification booléenne et valeur vide) :
+    - Si ``expected_hmac`` est malformée (longueur != 64, majuscules, non-hex), retourne ``False``.
+    - Laisse propager ``ValueError`` et ``TypeError`` sur entrées invalides (clé faible,
+      valeur vide ou AAD vide) pour le calcul cryptographique direct, parité avec
+      ``compute_secret_hmac``.
+      Pour la détection de fuite applicative, ``VaultCipher.is_secret_value_matching`` et les stores
+      interceptent le candidat vide pour retourner directement ``False`` / ``[]`` (aucun secret ne
+      pouvant correspondre).
+    """
+    if (
+        not isinstance(expected_hmac, str)
+        or len(expected_hmac) != _SHA256_HEX_LEN
+        or not all(c in "0123456789abcdef" for c in expected_hmac)
+    ):
+        return False
+    computed = compute_secret_hmac(server_key, value, aad=aad, forbidden_keys=forbidden_keys)
+    return constant_time_equal(computed, expected_hmac)
 
 
 def constant_time_equal(left: str | bytes, right: str | bytes) -> bool:
@@ -406,9 +883,7 @@ def decode_encoded_key(encoded: str | bytes) -> bytes:
     except Exception:
         raise ValueError("KEK invalide : encodage base64 incorrect.") from None
     if len(key) != _KEY_SIZE_BYTES:
-        raise ValueError(
-            f"KEK invalide : {_KEY_SIZE_BYTES} octets décodés requis."
-        )
+        raise ValueError(f"KEK invalide : {_KEY_SIZE_BYTES} octets décodés requis.")
     return key
 
 
@@ -508,42 +983,117 @@ class VaultCipher:
       valeur, ce que la rotation interdit explicitement.
     """
 
-    def __init__(self, key: bytes) -> None:
+    def __init__(
+        self,
+        key: bytes,
+        *,
+        server_hmac_key: str | bytes | bytearray | None = None,
+    ) -> None:
         if not isinstance(key, (bytes, bytearray)) or len(key) != _KEY_SIZE_BYTES:
-            raise ValueError(
-                f"KEK invalide : {_KEY_SIZE_BYTES} octets exactement sont requis."
-            )
+            raise ValueError(f"KEK invalide : {_KEY_SIZE_BYTES} octets exactement sont requis.")
         self._key = bytes(key)
         self._aead = AESGCM(self._key)
-        self._fingerprint_key = HKDF(
-            algorithm=hashes.SHA256(),
-            length=_KEY_SIZE_BYTES,
-            salt=None,
-            info=_FINGERPRINT_HKDF_INFO,
-        ).derive(self._key)
+        if server_hmac_key is not None:
+            if self.key_reuses_server_hmac_key(server_hmac_key):
+                raise ValueError(
+                    "La clé HMAC serveur doit être distincte de la KEK / clé maîtresse."
+                )
+            norm_hmac = _normalize_server_hmac_key(server_hmac_key)
+            self._fingerprint_key = norm_hmac
+            self._has_explicit_server_hmac_key = True
+        else:
+            self._fingerprint_key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=_KEY_SIZE_BYTES,
+                salt=None,
+                info=_FINGERPRINT_HKDF_INFO,
+            ).derive(self._key)
+            self._has_explicit_server_hmac_key = False
 
     def __repr__(self) -> str:
         return "VaultCipher(<REDACTED>)"
 
+    @property
+    def has_explicit_server_hmac_key(self) -> bool:
+        """Indique si la clé HMAC serveur est explicite (non dérivée de la KEK)."""
+        return self._has_explicit_server_hmac_key
+
+    def key_reuses_server_hmac_key(self, server_hmac_key: str | bytes | bytearray) -> bool:
+        """Détecte si la KEK de ce chiffreur réutilise l'entropie de la clé HMAC serveur.
+
+        Vérifie la KEK brute et ses représentations encodées (invariant 5), sans
+        jamais exposer ni la KEK ni la clé HMAC.
+        """
+        return server_hmac_key_matches_master_key(self._key, server_hmac_key)
+
+    def server_hmac_key_canary(self) -> str:
+        """Retourne une empreinte publique non réversible de la clé HMAC active.
+
+        Dérivée par HMAC-SHA256 avec la clé d'empreinte active sur une constante
+        de domaine dédiée, cette valeur publique permet aux stores de détecter
+        tout changement de clé HMAC serveur (rotation non migrée ou ré-instanciation)
+        et d'échouer fail-closed pour interdire tout faux négatif de compromission.
+        Ce canari est cryptographiquement sûr pour toute clé de 256 bits issue
+        de ``generate_server_hmac_key()`` (résistance absolue aux pré-images).
+        """
+        return hmac.new(
+            self._fingerprint_key,
+            b"heimdall-vault-server-hmac-canary-v1",
+            hashlib.sha256,
+        ).hexdigest()
+
     @classmethod
-    def generate(cls) -> "VaultCipher":
+    def generate(cls, *, server_hmac_key: str | bytes | bytearray | None = None) -> "VaultCipher":
         """Génère une KEK éphémère (mémoire uniquement, hors production)."""
-        return cls(secrets.token_bytes(_KEY_SIZE_BYTES))
+        return cls(secrets.token_bytes(_KEY_SIZE_BYTES), server_hmac_key=server_hmac_key)
 
     @classmethod
-    def from_encoded_key(cls, encoded: str | bytes) -> "VaultCipher":
+    def from_encoded_key(
+        cls,
+        encoded: str | bytes,
+        *,
+        server_hmac_key: str | bytes | bytearray | None = None,
+    ) -> "VaultCipher":
         """Décode une KEK base64 URL-safe (ou standard) de 32 octets."""
-        return cls(decode_encoded_key(encoded))
+        return cls(decode_encoded_key(encoded), server_hmac_key=server_hmac_key)
 
     @classmethod
-    def from_master_key(cls, master_key: str | bytes, salt: str | bytes) -> "VaultCipher":
+    def from_master_key(
+        cls,
+        master_key: str | bytes,
+        salt: str | bytes,
+        *,
+        server_hmac_key: str | bytes | bytearray | None = None,
+    ) -> "VaultCipher":
         """Dérive la KEK avec Argon2id puis construit le chiffreur (ticket #262).
 
         À appeler **une seule fois au démarrage** : la dérivation est coûteuse
         (64 Mio, 3 itérations) et la KEK obtenue reste en mémoire pour la durée
         de vie du processus.
+
+        Invariant 5 (revue LOW #116) : la clé HMAC serveur doit être distincte
+        de la clé maîtresse elle-même, pas seulement de la KEK dérivée — le
+        contrôle interne de ``__init__`` ne compare que KEK dérivée vs HMAC,
+        or la KEK dérivée diffère toujours de la clé maîtresse. Le contrôle
+        master vs HMAC est donc fait ici, fail-closed avant toute dérivation.
+        En production, la clé passe par ``VaultSettings``
+        (``validate_server_hmac_key_distinct``) via
+        ``_resolve_vault_cipher`` ; cet appel direct reste encadré pour l'usage
+        librairie.
         """
-        return cls(derive_kek_from_master_key(master_key, salt))
+        if server_hmac_key is not None and server_hmac_key_matches_master_key(
+            master_key, server_hmac_key
+        ):
+            raise ValueError(
+                "La clé HMAC serveur doit être distincte de la clé maîtresse : "
+                "réutiliser l'entropie maîtresse pour l'empreinte annule la "
+                "séparation des clés (invariant 5). Utiliser "
+                "generate_server_hmac_key() comme seule voie supportée."
+            )
+        return cls(
+            derive_kek_from_master_key(master_key, salt),
+            server_hmac_key=server_hmac_key,
+        )
 
     def key_reuses_pepper(self, pepper: str) -> bool:
         """Détecte si la KEK de ce chiffreur réutilise l'entropie du pepper.
@@ -611,9 +1161,7 @@ class VaultCipher:
         if not isinstance(plaintext, (bytes, bytearray)):
             raise TypeError("La valeur à chiffrer doit être de type bytes.")
         if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
-            raise ValueError(
-                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
-            )
+            raise ValueError(f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis.")
         return _encrypt_token(AESGCM(bytes(dek)), bytes(plaintext), aad)
 
     @staticmethod
@@ -625,9 +1173,7 @@ class VaultCipher:
     ) -> bytes:
         """Déchiffre une valeur avec sa DEK ; toute altération lève ``VaultCipherError``."""
         if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
-            raise ValueError(
-                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
-            )
+            raise ValueError(f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis.")
         return _decrypt_token(AESGCM(bytes(dek)), token, aad)
 
     def wrap_dek(self, dek: bytes | bytearray, *, aad: bytes = b"") -> str:
@@ -638,9 +1184,7 @@ class VaultCipher:
         comme une valeur, ni déplacée vers un autre secret.
         """
         if not isinstance(dek, (bytes, bytearray)) or len(dek) != _DEK_SIZE_BYTES:
-            raise ValueError(
-                f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis."
-            )
+            raise ValueError(f"DEK invalide : {_DEK_SIZE_BYTES} octets exactement sont requis.")
         return self.encrypt(bytes(dek), aad=_DEK_WRAP_AAD_PREFIX + bytes(aad))
 
     def unwrap_dek(self, encrypted_dek: str, *, aad: bytes = b"") -> bytes:
@@ -711,14 +1255,34 @@ class VaultCipher:
         finally:
             dek[:] = b"\x00" * len(dek)
 
-    def fingerprint(self, plaintext: bytes, *, aad: bytes = b"") -> str:
-        """Empreinte HMAC-SHA256 non réversible et liée au triplet d'identité.
+    def fingerprint(
+        self,
+        plaintext: str | bytes | bytearray,
+        *,
+        aad: str | bytes | bytearray | None = None,
+    ) -> str:
+        """Empreinte HMAC-SHA256 non réversible et liée optionnellement au triplet.
 
-        Utilise la sous-clé HKDF dédiée (jamais la KEK, invariant 5) et intègre
-        l'AAD ``(project, env, name)`` au message : deux valeurs identiques
-        stockées sous des triplets distincts produisent des empreintes
-        distinctes, donc non corrélables depuis la seule base. Déterministe pour
-        un même ``(KEK, aad, valeur)``.
+        Utilise la clé d'empreinte active (sous-clé HKDF dérivée ou clé serveur
+        explicite — jamais la KEK directe, invariant 5). Aligné sur les deux
+        domaines cryptographiques de ``compute_secret_hmac`` :
+
+        - ``aad=None`` : empreinte brute sur la valeur canonisée NFC seule (sans
+          préfixe NUL) ; compatible avec ``is_secret_value_matching(v, fp)``.
+        - ``aad`` non vide : préfixé ``aad_bytes + b"\\x00" + value_bytes`` pour
+          lier l'empreinte au triplet ``(project, env, name)`` ; un ``aad`` vide
+          (``b""`` / ``""``) lève ``ValueError`` (fail-closed, aucun 3e domaine).
+        - Une valeur vide (``""``, ``b""``, ``bytearray(b"")``) lève
+          ``ValueError`` (parité avec ``compute_secret_hmac`` et le contrat
+          des stores : aucun secret vide ne peut être créé ni indexé).
+
+        La valeur (``str``, ``bytes`` ou ``bytearray``) est canonisée en NFC
+        (``canonicalize_secret_value``, ticket #116) et ``aad`` validé en
+        ``str | bytes | bytearray`` au même titre que ``compute_secret_hmac`` :
+        un appelant librairie passant une chaîne ou des octets en forme
+        décomposée (NFD) obtient la même empreinte que sa forme NFC — aucun
+        faux négatif silencieux de détection. Les octets non-UTF8 restent pris
+        tels quels (secrets binaires).
 
         Note d'architecture (#71) : cette empreinte est un auxiliaire pré-rotation
         calculé lors de l'insertion initiale. Lors d'une rotation de KEK par
@@ -727,8 +1291,107 @@ class VaultCipher:
         L'empreinte reste donc volontairement inchangée et ne doit pas servir de
         contrôle d'intégrité post-rotation.
         """
-        message = bytes(aad) + b"\x00" + bytes(plaintext)
+        value_bytes = canonicalize_secret_value(plaintext)
+        if not value_bytes:
+            raise ValueError("La valeur du secret ne peut pas être vide.")
+        if aad is None:
+            message = value_bytes
+        else:
+            aad_bytes = _normalize_aad_bytes(aad)
+            if not aad_bytes:
+                raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
+            message = aad_bytes + b"\x00" + value_bytes
         return hmac.new(self._fingerprint_key, message, hashlib.sha256).hexdigest()
+
+    def compute_secret_hmac(
+        self,
+        value: str | bytes | bytearray,
+        *,
+        aad: bytes | str | bytearray | None = None,
+    ) -> str:
+        """Calcule l'empreinte HMAC-SHA256 avec la clé serveur dédiée (ticket #116).
+
+        Formule : ``hmac.new(cle_serveur, valeur, sha256).hexdigest()``.
+        Empreinte stable et non réversible, jamais renvoyée au client.
+        Garantit la séparation des clés en interdisant la réutilisation de la KEK.
+        """
+        return compute_secret_hmac(
+            self._fingerprint_key,
+            value,
+            aad=aad,
+            forbidden_keys=(self._key,),
+        )
+
+    def verify_secret_hmac(
+        self,
+        value: str | bytes | bytearray,
+        expected_hmac: str,
+        *,
+        aad: bytes | str | bytearray | None = None,
+    ) -> bool:
+        """Vérifie en temps constant si la valeur correspond à l'empreinte HMAC (ticket #116)."""
+        return verify_secret_hmac(
+            self._fingerprint_key,
+            value,
+            expected_hmac,
+            aad=aad,
+            forbidden_keys=(self._key,),
+        )
+
+    def is_secret_value_matching(
+        self,
+        value: str | bytes | bytearray,
+        expected_fingerprint: str,
+        *,
+        aad: bytes | str | bytearray | None = None,
+    ) -> bool:
+        """Vérifie en temps constant si la valeur correspond à l'empreinte stockée.
+
+        Exige une clé HMAC serveur explicite (non dérivée de la KEK) pour garantir
+        que la détection reste valide et immunisée contre la rotation de KEK.
+        Si un AAD est fourni, la vérification est liée à ce seul AAD (aucun repli
+        vers une empreinte brute non liée).
+
+        Décision d'architecture (contrat de vérification booléenne) : si
+        ``expected_fingerprint`` est malformée (longueur != 64, majuscules,
+        caractères non-hexadécimaux ou type non str), la méthode retourne ``False``.
+        Une empreinte corrompue ne peut mathématiquement correspondre à aucun secret.
+        Pour les stores de données, le repli déchiffrement transparent s'applique
+        lors d'une altération en base afin d'interdire tout faux négatif (invariant 1).
+
+        Avertissement de domaine (empreintes stockées vs brutes, revue LOW #116) :
+        Sans ``aad``, la comparaison porte exclusivement sur l'empreinte HMAC brute non
+        liée (``compute_secret_hmac(value)``). Les empreintes persistées en base étant
+        systématiquement liées à l'identité du secret (``aad=VaultCipher.aad(...)``),
+        passer une empreinte stockée sans fournir son ``aad`` retourne toujours ``False``
+        (séparation cryptographique des domaines interdisant toute confusion de contexte).
+        Pour vérifier une empreinte issue du stockage, fournir obligatoirement le paramètre
+        ``aad``.
+        """
+        if not isinstance(value, (str, bytes, bytearray)):
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
+        if not self._has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La vérification d'empreinte exige une clé HMAC serveur explicite "
+                "(HEIMDALL_VAULT_SERVER_HMAC_KEY distincte de la KEK). En mode dérivé de "
+                "la KEK, la rotation de clé invalide les empreintes."
+            )
+        if not value:
+            return False
+        if (
+            not isinstance(expected_fingerprint, str)
+            or len(expected_fingerprint) != _SHA256_HEX_LEN
+            or not all(c in "0123456789abcdef" for c in expected_fingerprint)
+        ):
+            return False
+        if aad is not None:
+            aad_bytes = _normalize_aad_bytes(aad)
+            if not aad_bytes:
+                raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
+            candidate_fp = self.fingerprint(canonicalize_secret_value(value), aad=aad_bytes)
+            return constant_time_equal(candidate_fp, expected_fingerprint)
+        direct_fp = self.compute_secret_hmac(value)
+        return constant_time_equal(direct_fp, expected_fingerprint)
 
 
 def encrypt_at_rest(plaintext: bytes, key_id: str) -> bytes:

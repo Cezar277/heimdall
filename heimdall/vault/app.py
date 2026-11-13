@@ -107,6 +107,8 @@ from heimdall.vault.crypto import (
     generate_api_key,
     generate_api_key_pepper,
     kek_matches_pepper,
+    server_hmac_key_matches_master_key,
+    validate_server_hmac_key,
 )
 from heimdall.vault.database import (
     _MAX_SECRET_PAGE_OFFSET,
@@ -283,9 +285,7 @@ def _reject_kek_equal_to_pepper(derived_kek: bytes, pepper: str) -> None:
     """
     pepper_bytes = pepper.encode("utf-8")
     derived_b64 = base64.urlsafe_b64encode(derived_kek).decode("ascii")
-    if constant_time_equal(derived_kek, pepper_bytes) or kek_matches_pepper(
-        derived_b64, pepper
-    ):
+    if constant_time_equal(derived_kek, pepper_bytes) or kek_matches_pepper(derived_b64, pepper):
         raise ValueError(
             "La KEK dérivée de la clé maîtresse et le pepper d'authentification "
             "doivent être distincts (invariant 5)."
@@ -312,12 +312,21 @@ def _resolve_vault_cipher(
     même si les deux secrets sont fournis séparément, une collision fortuite
     ou une configuration volontairement fautive est refusée fail-closed.
 
+    La clé maîtresse est également comparée à la clé HMAC serveur AVANT la KDF
+    (invariant 5) : ``VaultCipher.__init__`` ne voit que la KEK dérivée, toujours
+    distincte de la maîtresse, donc ce contrôle ne peut pas y être délégué. Il
+    protège les configurations construites hors validation pydantic
+    (``model_construct``, mutation, futur refactor).
+
     La clé maîtresse reste portée par ``VaultSettings`` et l'environnement pour
     la durée du processus ; la dérivation ne prétend pas l'effacer. Seule la KEK
     dérivée est conservée par ``VaultCipher`` et utilisée par les routes.
     """
     if settings.kek is not None:
-        return VaultCipher.from_encoded_key(settings.kek)
+        return VaultCipher.from_encoded_key(
+            settings.kek,
+            server_hmac_key=settings.server_hmac_key,
+        )
     if settings.master_key is not None:
         salt = settings.kek_salt
         if salt is None:
@@ -334,10 +343,16 @@ def _resolve_vault_cipher(
                 "La clé maîtresse et le pepper d'authentification doivent être "
                 "distincts (invariant 5)."
             )
+        if settings.server_hmac_key is not None and server_hmac_key_matches_master_key(
+            settings.master_key, settings.server_hmac_key
+        ):
+            raise ValueError(
+                "La clé maîtresse et la clé HMAC serveur doivent être distinctes (invariant 5)."
+            )
         derived_kek = derive_kek_from_master_key(settings.master_key, salt)
         if pepper is not None:
             _reject_kek_equal_to_pepper(derived_kek, pepper)
-        return VaultCipher(derived_kek)
+        return VaultCipher(derived_kek, server_hmac_key=settings.server_hmac_key)
     if backend == "sqlite":
         raise ValueError(
             "HEIMDALL_VAULT_KEK (mode historique) ou le couple "
@@ -346,14 +361,14 @@ def _resolve_vault_cipher(
             "d'authentification. Aucune KEK éphémère n'est générée pour des données "
             "persistées."
         )
-    return VaultCipher.generate()
+    return VaultCipher.generate(server_hmac_key=settings.server_hmac_key)
 
 
 def _validate_explicit_secret_store_configuration(
     settings: "VaultSettings",
     secret_store: "InMemorySecretStore | SqliteSecretStore",
 ) -> None:
-    """Refuse la réutilisation du pepper par la KEK **réelle** du store explicite.
+    """Refuse la réutilisation du pepper et de la clé maîtresse par le store explicite.
 
     Avec un store explicite, ``_resolve_vault_cipher`` n'est pas appelé : la KEK
     qui chiffre réellement les secrets est celle portée par le chiffreur du
@@ -363,7 +378,20 @@ def _validate_explicit_secret_store_configuration(
     chemin reste réservé aux tests ; la production HTTP passe toujours par
     ``_resolve_vault_cipher``. Les contrôles bon marché restent dans
     ``VaultSettings`` (paire maître/sel, ``master_key != pepper``).
+
+    La collision clé maîtresse vs clé HMAC serveur est contrôlée ici aussi, et
+    avant le retour anticipé sur l'absence de pepper : un ``secret_store``
+    explicite court-circuite la dérivation, donc ``_resolve_vault_cipher`` ne
+    peut pas porter cette garde (revue MEDIUM #116).
     """
+    if (
+        settings.master_key is not None
+        and settings.server_hmac_key is not None
+        and server_hmac_key_matches_master_key(settings.master_key, settings.server_hmac_key)
+    ):
+        raise ValueError(
+            "La clé maîtresse et la clé HMAC serveur doivent être distinctes (invariant 5)."
+        )
     if settings.api_key_pepper is None:
         return
     cipher = getattr(secret_store, "_cipher", None)
@@ -376,8 +404,13 @@ def _validate_explicit_secret_store_configuration(
         )
     if cipher.key_reuses_pepper(settings.api_key_pepper):
         raise ValueError(
-            "La KEK du store et le pepper d'authentification doivent être "
-            "distincts (invariant 5)."
+            "La KEK du store et le pepper d'authentification doivent être distincts (invariant 5)."
+        )
+    if settings.server_hmac_key is not None and cipher.key_reuses_server_hmac_key(
+        settings.server_hmac_key
+    ):
+        raise ValueError(
+            "La KEK du store et la clé HMAC serveur doivent être distinctes (invariant 5)."
         )
 
 
@@ -662,7 +695,8 @@ class VaultSettings(BaseSettings):
     )
     api_key_pepper: str | None = Field(
         default=None,
-        repr=False, exclude=True,  # jamais dans model_dump()/model_dump_json()
+        repr=False,
+        exclude=True,  # jamais dans model_dump()/model_dump_json()
         description=(
             "Pepper serveur distinct de la KEK pour hachage HMAC-SHA256 (ticket #64). "
             "Doit comporter au moins 32 octets (256 bits). "
@@ -671,6 +705,17 @@ class VaultSettings(BaseSettings):
             "avec avertissement (aucune valeur publique par défaut, aucune portabilité "
             "des empreintes entre déploiements). "
             "Jamais consigné dans les journaux d'audit ni retourné au client."
+        ),
+    )
+    server_hmac_key: str | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,  # jamais dans model_dump()/model_dump_json()
+        description=(
+            "Clé HMAC serveur distincte de la KEK / clé maîtresse pour le calcul des "
+            "empreintes de secrets (ticket #116). Doit comporter au moins 32 octets (256 bits). "
+            "Configurable via HEIMDALL_VAULT_SERVER_HMAC_KEY. Si absente, une sous-clé HKDF "
+            "dédiée dérivée de la KEK est utilisée. Jamais renvoyée au client ni journalisée."
         ),
     )
     storage_backend: Literal["memory", "sqlite"] | None = Field(
@@ -684,7 +729,8 @@ class VaultSettings(BaseSettings):
     )
     kek: str | None = Field(
         default=None,
-        repr=False, exclude=True,  # jamais dans model_dump()/model_dump_json()
+        repr=False,
+        exclude=True,  # jamais dans model_dump()/model_dump_json()
         description=(
             "MODE HISTORIQUE : KEK AES-256 encodée base64 (32 octets), utilisée "
             "directement sans dérivation, distincte du pepper d'authentification. "
@@ -697,7 +743,8 @@ class VaultSettings(BaseSettings):
     )
     master_key: str | None = Field(
         default=None,
-        repr=False, exclude=True,  # jamais dans model_dump()/model_dump_json()
+        repr=False,
+        exclude=True,  # jamais dans model_dump()/model_dump_json()
         description=(
             "Clé maîtresse du serveur (phrase de passe UTF-8 d'au moins 16 octets), "
             "matière première de la KEK dérivée par Argon2id (ticket #262). "
@@ -708,7 +755,8 @@ class VaultSettings(BaseSettings):
     )
     kek_salt: str | None = Field(
         default=None,
-        repr=False, exclude=True,  # public mais jamais sérialisé par défense
+        repr=False,
+        exclude=True,  # public mais jamais sérialisé par défense
         description=(
             "Sel public Argon2id de 16 octets encodé base64 URL-safe (ticket #262), "
             "persisté à côté de HEIMDALL_VAULT_MASTER_KEY et stable entre les "
@@ -953,6 +1001,39 @@ class VaultSettings(BaseSettings):
             )
         return self
 
+    @field_validator("server_hmac_key")
+    @classmethod
+    def validate_server_hmac_key(cls, value: str | None) -> str | None:
+        """Valide la clé HMAC serveur : au moins 32 octets (256 bits), max 512, non triviale."""
+        if value is None:
+            return None
+        validate_server_hmac_key(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_server_hmac_key_distinct(self) -> "VaultSettings":
+        """La clé HMAC serveur doit être distincte de la KEK, clé maîtresse et pepper."""
+        hmac_k = self.server_hmac_key
+        if hmac_k is None:
+            return self
+        if self.master_key is not None and server_hmac_key_matches_master_key(
+            self.master_key, hmac_k
+        ):
+            raise ValueError(
+                "La clé maîtresse et la clé HMAC serveur doivent être distinctes (invariant 5)."
+            )
+        if self.kek is not None and server_hmac_key_matches_master_key(self.kek, hmac_k):
+            raise ValueError(
+                "La KEK de chiffrement et la clé HMAC serveur doivent être distinctes."
+            )
+        if self.api_key_pepper is not None and server_hmac_key_matches_master_key(
+            self.api_key_pepper, hmac_k
+        ):
+            raise ValueError(
+                "Le pepper d'authentification et la clé HMAC serveur doivent être distincts."
+            )
+        return self
+
     @field_validator("db_path")
     @classmethod
     def validate_db_path(cls, value: str) -> str:
@@ -1118,9 +1199,7 @@ class BodySizeLimitMiddleware:
 
         raw_headers = scope.get("headers", [])
         has_transfer_encoding = any(k.lower() == b"transfer-encoding" for k, _ in raw_headers)
-        content_lengths = [
-            val for key, val in raw_headers if key.lower() == b"content-length"
-        ]
+        content_lengths = [val for key, val in raw_headers if key.lower() == b"content-length"]
 
         # Rejet HTTP smuggling : coexistence de Transfer-Encoding et Content-Length
         # interdite (RFC 9112 §4.2)
@@ -1257,9 +1336,7 @@ async def _resolve_request_key_hash(request: Request) -> str | None:
             registry.key_id_for_hash(vault_auth.DUMMY_HASH)
             request.state.audit_key_id_checked = True
         return None
-    registered_project, _ = await vault_auth.find_api_key_project_cached(
-        request, candidate_hash
-    )
+    registered_project, _ = await vault_auth.find_api_key_project_cached(request, candidate_hash)
     if registered_project is None:
         if registry is not None:
             registry.key_id_for_hash(vault_auth.DUMMY_HASH)
@@ -1701,10 +1778,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: PLR0915
                 status_code=401,
                 detail="Authentification requise",
             )
-        if (
-            authenticated_project is not None
-            and authenticated_project != project
-        ):
+        if authenticated_project is not None and authenticated_project != project:
             raise StarletteHTTPException(
                 status_code=403,
                 detail="Accès interdit",
@@ -1909,9 +1983,7 @@ def create_app(
         app.state.audit_log = InMemoryAuditLog()
 
     if api_key_hashes is not None and api_keys is not None:
-        raise ValueError(
-            "Spécifiez 'api_key_hashes' ou 'api_keys', pas les deux simultanément."
-        )
+        raise ValueError("Spécifiez 'api_key_hashes' ou 'api_keys', pas les deux simultanément.")
 
     raw_hashes = api_key_hashes if api_key_hashes is not None else api_keys
     validated_hashes: dict[str, str] = {}

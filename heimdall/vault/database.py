@@ -52,6 +52,7 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
 """
 
 import errno
+import hmac
 import logging
 import os
 import re
@@ -87,6 +88,7 @@ class _SessionConnection(sqlite3.Connection):
     """
 
     _heimdall_session: bool = False
+
 
 SecretStatus = Literal["vaulte", "rote"]
 PERSISTED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
@@ -132,8 +134,6 @@ class KekConcurrencyError(RuntimeError):
 
 class TransitionConcurrencyError(RuntimeError):
     """Transition perdante : l'état source a changé pendant l'écriture."""
-
-
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
 _SECURE_DIR_MODE: int = 0o700
@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS secrets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_secrets_project_env_name ON secrets(project_id, env, name);
+CREATE INDEX IF NOT EXISTS idx_secrets_project_fingerprint ON secrets(project_id, fingerprint);
 
 -- Admissions de rate-limiting en fenêtre glissante (tickets #63/#111).
 -- Les noms de budgets par clé sont des empreintes HMAC, jamais les clés brutes.
@@ -232,6 +233,14 @@ CREATE TABLE IF NOT EXISTS rate_limit_buckets (
     name TEXT PRIMARY KEY,
     count INTEGER NOT NULL,
     reset_at REAL NOT NULL
+);
+
+-- Enregistrement du canari de clé HMAC serveur (ticket #116).
+-- Détecte tout changement de HEIMDALL_VAULT_SERVER_HMAC_KEY et échoue fail-closed
+-- pour empêcher un faux négatif silencieux sur les empreintes existantes.
+CREATE TABLE IF NOT EXISTS server_hmac_canary (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    canary TEXT NOT NULL
 );
 
 -- Journal d'audit chaîné (ticket #113). Aucune valeur de secret, aucune clé
@@ -1162,9 +1171,7 @@ def _ensure_secret_envelope_column(conn: sqlite3.Connection) -> None:
     restent lisibles via le repli KEK direct de `SqliteSecretStore`, et aucune
     donnée existante n'est réécrite ni supprimée.
     """
-    columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
-    }
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()}
     if "encrypted_dek" in columns:
         return
     try:
@@ -1173,9 +1180,7 @@ def _ensure_secret_envelope_column(conn: sqlite3.Connection) -> None:
         # Course entre deux workers au démarrage : un autre processus a pu
         # ajouter la colonne entre le PRAGMA et l'ALTER. On ne masque l'erreur
         # que si la colonne est réellement présente ; sinon elle est remontée.
-        columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
-        }
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()}
         if "encrypted_dek" not in columns:
             raise
 
@@ -1186,9 +1191,7 @@ def _ensure_secret_kek_version_column(conn: sqlite3.Connection) -> None:
     La migration est idempotente et purement additive : la valeur par défaut
     est 1 pour toutes les lignes existantes.
     """
-    columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
-    }
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()}
     if "kek_version" in columns:
         return
     try:
@@ -1197,11 +1200,62 @@ def _ensure_secret_kek_version_column(conn: sqlite3.Connection) -> None:
             "CHECK (kek_version >= 1)"
         )
     except sqlite3.OperationalError:
-        columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()
-        }
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(secrets);").fetchall()}
         if "kek_version" not in columns:
             raise
+
+
+def _ensure_server_hmac_canary_table(conn: sqlite3.Connection) -> None:
+    """Crée la table server_hmac_canary si elle n'existe pas (idempotent, ticket #116)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS server_hmac_canary (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            canary TEXT NOT NULL
+        );
+        """
+    )
+
+
+def get_server_hmac_canary(conn: sqlite3.Connection) -> str | None:
+    """Lit le canari de clé HMAC serveur persisté en base sans écriture DDL (ticket #116).
+
+    Sonde le catalogue ``sqlite_master`` pour retourner ``None`` sans tenter de
+    ``CREATE TABLE`` si la table ``server_hmac_canary`` est absente (base
+    héritée ou montage en lecture seule), sans dépendre du libellé d'erreur
+    SQLite. Toute autre ``sqlite3.OperationalError`` est propagée (fail-closed).
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'server_hmac_canary';"
+    ).fetchone()
+    if exists is None:
+        return None
+    cursor = conn.execute("SELECT canary FROM server_hmac_canary WHERE id = 1;")
+    row = cursor.fetchone()
+    return str(row[0]) if row else None
+
+
+def set_server_hmac_canary(conn: sqlite3.Connection, canary: str) -> None:
+    """Enregistre le canari de clé HMAC serveur si absent (ticket #116).
+
+    Vérifie la cohérence si un canari existe déjà pour interdire toute
+    cohabitation silencieuse. L'écriture est atomique (``INSERT OR IGNORE``
+    suivi d'une relecture comparée en temps constant) : un conflit de course
+    avec un autre écrivain ne produit jamais d'``IntegrityError`` pouvant être
+    requalifié en doublon de secret, et une clé HMAC divergente est détectée
+    fail-closed (revue LOW #116).
+    """
+    _ensure_server_hmac_canary_table(conn)
+    conn.execute(
+        "INSERT OR IGNORE INTO server_hmac_canary (id, canary) VALUES (1, ?);",
+        (canary,),
+    )
+    cursor = conn.execute("SELECT canary FROM server_hmac_canary WHERE id = 1;")
+    row = cursor.fetchone()
+    if row is None or not hmac.compare_digest(str(row[0]), canary):
+        raise ValueError(
+            "La clé HMAC serveur a changé par rapport au canari persistant en base."
+        )
 
 
 def init_db(db_path: Path | str | None = None) -> None:
@@ -1523,6 +1577,42 @@ def list_secrets(
     return [dict(row) for row in cursor.fetchall()]
 
 
+_HEX_64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def find_secrets_by_fingerprint(
+    conn: sqlite3.Connection,
+    project_id: str,
+    fingerprint: str,
+    env: str | None = None,
+) -> list[dict[str, str]]:
+    """Trouve les métadonnées des secrets d'un projet correspondant à une empreinte HMAC.
+
+    Permet de vérifier si une valeur ayant fuité est encore présente en production
+    sans jamais déchiffrer les valeurs ni exposer l'empreinte au client (ticket #116).
+    Retourne uniquement les métadonnées publiques (project, env, name, status).
+    """
+    if not isinstance(fingerprint, str) or not _HEX_64_PATTERN.match(fingerprint):
+        raise ValueError(
+            "L'empreinte HMAC doit être une chaîne hexadécimale de 64 caractères minuscules."
+        )
+    if env is not None:
+        query = (
+            "SELECT project_id AS project, env, name, status "
+            "FROM secrets WHERE project_id = ? AND env = ? AND fingerprint = ? "
+            "ORDER BY name ASC"
+        )
+        cursor = conn.execute(query, (project_id, env, fingerprint))
+    else:
+        query = (
+            "SELECT project_id AS project, env, name, status "
+            "FROM secrets WHERE project_id = ? AND fingerprint = ? "
+            "ORDER BY env ASC, name ASC"
+        )
+        cursor = conn.execute(query, (project_id, fingerprint))
+    return [dict(row) for row in cursor.fetchall()]
+
+
 _MAX_SECRET_PAGE_LIMIT = 101
 _MAX_SECRET_PAGE_OFFSET = 1_000_000
 
@@ -1612,7 +1702,6 @@ def update_secret(  # noqa: PLR0913
         raise ValueError("Statut de secret invalide.")
 
     with _write_transaction(conn):
-
         if kek_version is not None:
             validate_kek_version(kek_version)
         row = conn.execute(
@@ -1691,7 +1780,6 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
     validate_kek_version(kek_version)
 
     with _write_transaction(conn):
-
         # Lire la version courante et imposer la monotonie.
         row = conn.execute(
             "SELECT kek_version FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
@@ -1730,6 +1818,45 @@ def reenvelope_secret(  # noqa: PLR0913, PLR0917
         return True
 
 
+def _check_rotate_kek_hmac_continuity(
+    conn: sqlite3.Connection,
+    new_cipher: "VaultCipher",
+) -> None:
+    """Vérifie la continuité de clé HMAC serveur lors de rotate_secrets_kek (ticket #116)."""
+    from heimdall.vault.crypto import VaultCipherError  # noqa: PLC0415
+
+    cursor = conn.execute("SELECT 1 FROM secrets LIMIT 1")
+    has_secrets = cursor.fetchone() is not None
+    persisted_canary = get_server_hmac_canary(conn)
+    if persisted_canary is None and not has_secrets:
+        # Base vierge (aucun secret, aucun canari) : la rotation est libre et
+        # le contrôle de continuité ne s'applique pas.
+        return
+    if persisted_canary is not None:
+        # Un canari persistant survit au delete() du dernier secret : le
+        # contrôle reste immédiat même base vide, sans différer l'échec au
+        # prochain create (revue LOW #116).
+        if not new_cipher.has_explicit_server_hmac_key:
+            raise VaultCipherError(
+                "La rotation de KEK vers un chiffreur en mode dérivé "
+                "est interdite sur une base contenant des secrets sous clé "
+                "explicite (refus fail-closed). Une migration des "
+                "empreintes est requise."
+            )
+        if not hmac.compare_digest(persisted_canary, new_cipher.server_hmac_key_canary()):
+            raise VaultCipherError(
+                "La clé HMAC serveur du nouveau chiffreur diffère de la clé "
+                "enregistrée en base (refus fail-closed immédiat). "
+                "Une migration des empreintes est requise."
+            )
+    elif new_cipher.has_explicit_server_hmac_key:
+        raise VaultCipherError(
+            "La base de données contient des secrets créés en mode dérivé. "
+            "La rotation vers un chiffreur avec clé HMAC explicite "
+            "nécessite une migration des empreintes."
+        )
+
+
 def rotate_secrets_kek(
     conn: sqlite3.Connection,
     old_cipher: "VaultCipher",
@@ -1751,6 +1878,9 @@ def rotate_secrets_kek(
     - Échoue fail-closed si un secret hérité (#25/#62) sans enveloppe de DEK est rencontré.
     - Si la base est vide (aucun secret), retourne (0, 1) sans modifier la base,
       target_kek_version étant ignorée car aucune version n'est persistée (#71 LOW 2).
+      Exception : un canari HMAC persistant (survivant au delete() du dernier
+      secret) impose le contrôle de continuité avant ce retour, fail-closed
+      immédiat (revue LOW #116).
 
     Returns:
         tuple[int, int]: Un tuple (nombre_de_secrets_reenveloppes, nouvelle_version_kek).
@@ -1763,6 +1893,12 @@ def rotate_secrets_kek(
         validate_kek_version(target_kek_version, label="Numéro de version cible")
 
     with _write_transaction(conn):
+        # Continuité HMAC contrôlée AVANT le retour base vide : un canari
+        # persistant (survivant au delete() du dernier secret) impose un
+        # échec immédiat, pas un échec différé au prochain create (revue LOW
+        # #116). Le cas « base vierge » (aucun secret, aucun canari) reste
+        # exempté dans _check_rotate_kek_hmac_continuity.
+        _check_rotate_kek_hmac_continuity(conn, new_cipher)
         cursor = conn.execute(
             "SELECT id, project_id, env, name, encrypted_dek, kek_version "
             "FROM secrets ORDER BY id ASC"
@@ -1782,10 +1918,7 @@ def rotate_secrets_kek(
                 raise KekVersionError("Version de KEK illisible en base.")
 
         current_max = max(
-            (
-                r["kek_version"] if r["kek_version"] is not None else 1
-                for r in secrets_to_rotate
-            ),
+            (r["kek_version"] if r["kek_version"] is not None else 1 for r in secrets_to_rotate),
             default=1,
         )
         if target_kek_version is not None:
