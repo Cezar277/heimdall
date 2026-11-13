@@ -1333,3 +1333,39 @@ def test_env_example_short_alpha_prose_comment_preserved_as_documented_limit(
     assert "h****r" not in after
     assert update_env_example(tmp_path, ["APP_KEY"]) == ["#comment:1"]
     assert example_file.read_text(encoding="utf-8") == "# ***\nAPP_KEY=\n"
+
+
+@pytest.mark.parametrize(
+    "whitespace_env_path",
+    [
+        " .env",
+        " foo.env",
+        "\t.env",
+        ".env ",
+        "config/ .env",
+    ],
+)
+def test_env_paths_and_gitignore_pattern_reject_leading_or_trailing_whitespace(
+    tmp_path: Path, whitespace_env_path: str
+) -> None:
+    """Les espaces/tabulations de tête ou de fin sont rejetés fail-closed (pas de strip)."""
+    with pytest.raises(EnvRemediationError, match="espaces de tête ou de fin"):
+        remediate_environment(tmp_path, {"API_KEY": "val"}, env_path=whitespace_env_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+    with pytest.raises(EnvRemediationError, match="espaces de bord"):
+        ensure_gitignore_ignores_env(tmp_path, pattern=whitespace_env_path)
+
+    assert not (tmp_path / ".gitignore").exists()
+
+
+def test_validate_env_like_path_rejects_traversal_and_check_git_status_rejects_template(
+    tmp_path: Path,
+) -> None:
+    """_validate_env_like_path rejette '../.env' et check_env_git_status rejette '.env.example'."""
+    with pytest.raises(EnvRemediationError, match="invalide"):
+        env_module._validate_env_like_path("../.env", ".env")
+
+    with pytest.raises(EnvRemediationError, match="gabarit"):
+        check_env_git_status(tmp_path, env_path=".env.example")

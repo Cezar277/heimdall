@@ -205,7 +205,7 @@ def _is_env_like_path(rel_path: str) -> bool:
     - les sources ou fichiers arbitraires (``src/app.py``, ``.gitignore``).
     """
     name = Path(rel_path).name
-    if not name:
+    if not name or name != name.strip():
         return False
     if any(name.endswith(suffix) for suffix in _REJECTED_ENV_SUFFIXES):
         return False
@@ -237,6 +237,12 @@ def _validate_env_like_path(
     """
     if not isinstance(rel_path, str):
         raise EnvRemediationError(f"chemin {name_for_msg} invalide (non-str)")
+    if rel_path != rel_path.strip() or Path(rel_path).name != Path(rel_path).name.strip():
+        raise EnvRemediationError(
+            f"chemin {name_for_msg} invalide : espaces de tête ou de fin interdits"
+        )
+    if not is_rel_path(rel_path):
+        raise EnvRemediationError(f"chemin {name_for_msg} invalide")
     if not _is_env_like_path(rel_path):
         raise EnvRemediationError(
             f"chemin {name_for_msg} invalide : fichier d'environnement attendu"
@@ -257,6 +263,8 @@ def _validate_gitignore_path(rel_path: str) -> str:
     """Valide qu'un chemin désigne bien un fichier ``.gitignore``."""
     if not isinstance(rel_path, str):
         raise EnvRemediationError("chemin .gitignore invalide (non-str)")
+    if rel_path != rel_path.strip() or not is_rel_path(rel_path):
+        raise EnvRemediationError("chemin .gitignore invalide")
     if Path(rel_path).name != ".gitignore":
         raise EnvRemediationError("chemin .gitignore invalide : nom .gitignore attendu")
     return rel_path
@@ -267,6 +275,7 @@ def _validate_gitignore_pattern(pattern: str) -> str:
 
     Refuse fail-closed toute entrée malveillante ou ambiguë :
     - Non-str -> EnvRemediationError
+    - Espaces de tête ou de fin -> EnvRemediationError (aucun strip() silencieux)
     - Négation '!' -> EnvRemediationError
     - Commentaire '#' -> EnvRemediationError
     - Globbing dangereux '*' ou '?' -> EnvRemediationError
@@ -277,26 +286,33 @@ def _validate_gitignore_pattern(pattern: str) -> str:
     if not isinstance(pattern, str):
         raise EnvRemediationError("motif .gitignore invalide : non-str")
 
-    clean = pattern.strip()
-    if not clean or "\n" in pattern or "\r" in pattern:
-        raise EnvRemediationError("motif .gitignore invalide : motif vide ou saut de ligne")
+    if (
+        not pattern
+        or pattern != pattern.strip()
+        or Path(pattern).name != Path(pattern).name.strip()
+        or "\n" in pattern
+        or "\r" in pattern
+    ):
+        raise EnvRemediationError(
+            "motif .gitignore invalide : motif vide, espaces de bord ou saut de ligne"
+        )
 
     if (
-        clean.startswith("!")
-        or clean.startswith("#")
-        or any(char in clean for char in _GITIGNORE_FORBIDDEN_CHARS)
+        pattern.startswith("!")
+        or pattern.startswith("#")
+        or any(char in pattern for char in _GITIGNORE_FORBIDDEN_CHARS)
     ):
         raise EnvRemediationError(
             "motif .gitignore invalide : négation, commentaire ou métacaractère interdit"
         )
 
-    if not is_rel_path(clean):
+    if not is_rel_path(pattern):
         raise EnvRemediationError("motif .gitignore invalide : chemin relatif invalide")
 
-    if not _is_env_like_path(clean):
+    if not _is_env_like_path(pattern):
         raise EnvRemediationError("motif .gitignore invalide : fichier d'environnement attendu")
 
-    return clean
+    return pattern
 
 
 def _read_text_secure(path: Path) -> tuple[str, int]:
@@ -1031,7 +1047,7 @@ def check_env_git_status(
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
-    _validate_env_like_path(env_path, ".env")
+    _validate_env_like_path(env_path, ".env", expect_template=False)
     confined = _confine_and_check_no_symlink(root, env_path, ".env")
 
     tracked = is_git_tracked(confined.absolute)
