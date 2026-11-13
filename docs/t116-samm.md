@@ -106,7 +106,7 @@ plugins: cov-7.1.0, platformdirs-4.12.4, anyio-4.15.1
 collecting ... collected 65 items
 
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_candidate_value_empty_parity_cipher PASSED [  1%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_raises_while_predicates_return_false_contract_parity 
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_raises_while_predicates_return_false_contract_parity
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_raises_while_predicates_return_false_contract_parity PASSED [  3%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_secret_hmac_exact_formula PASSED [  4%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_compute_secret_hmac_input_validation PASSED [  6%]
@@ -126,7 +126,7 @@ tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_validate_server_hma
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_vault_cipher_factories_propagate_server_hmac_key_without_exposure PASSED [ 27%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_vault_cipher_methods PASSED [ 29%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_and_matching_empty_aad_parity PASSED [ 30%]
-tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_and_cipher_matching_with_corrupted_fingerprint 
+tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_and_cipher_matching_with_corrupted_fingerprint
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_and_cipher_matching_with_corrupted_fingerprint PASSED [ 32%]
 tests/test_vault_secret_hmac.py::SecretHmacCryptoTests::test_verify_secret_hmac_constant_time PASSED [ 33%]
 tests/test_vault_secret_hmac.py::KeySeparationTests::test_compute_and_verify_secret_hmac_reject_forbidden_keys PASSED [ 35%]
@@ -148,7 +148,7 @@ tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_database_fin
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_derived_to_explicit_mode_transition_fails_closed_without_migration PASSED [ 60%]
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_divergent_canary_during_creation_raises_vault_cipher_error_and_rolls_back PASSED [ 61%]
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_explicit_server_hmac_key_change_fails_closed PASSED [ 63%]
-tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_exception_precedence_parity_memory_and_sqlite 
+tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_exception_precedence_parity_memory_and_sqlite
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_exception_precedence_parity_memory_and_sqlite PASSED [ 64%]
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_fails_closed_on_key_change_or_derived_mode PASSED [ 66%]
 tests/test_vault_secret_hmac.py::ProductionLeakDetectionTests::test_find_secrets_by_fingerprint_fails_closed_on_legacy_only_store PASSED [ 67%]
