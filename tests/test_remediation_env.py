@@ -1314,12 +1314,12 @@ def test_env_example_short_bare_comment_only_purge_reports_update(tmp_path: Path
 def test_env_example_short_alpha_prose_comment_preserved_as_documented_limit(
     tmp_path: Path,
 ) -> None:
-    """Limite documentée : la prose alphabétique multi-mots courte est préservée pour T32."""
+    """Limite documentée : '# my hunter' (prose alpha courte) n'est ni détecté ni signalé."""
     example_file = tmp_path / ".env.example"
-    initial = "# my sample\nAPP_KEY=\n"
+    initial = "# my hunter\nAPP_KEY=\n"
     example_file.write_text(initial, encoding="utf-8")
 
-    # Prose alpha multi-mots courte sans mot-clé évocateur ni entropie : préservée
+    # Prose alpha multi-mots courte sans mot-clé évocateur ni entropie : non détectée ni signalée
     assert plan_env_example_change(tmp_path, ["APP_KEY"]) is None
     assert update_env_example(tmp_path, ["APP_KEY"]) == []
     assert example_file.read_text(encoding="utf-8") == initial
@@ -1369,3 +1369,16 @@ def test_validate_env_like_path_rejects_traversal_and_check_git_status_rejects_t
 
     with pytest.raises(EnvRemediationError, match="gabarit"):
         check_env_git_status(tmp_path, env_path=".env.example")
+
+
+def test_remediate_environment_validates_secrets_before_any_disk_write(tmp_path: Path) -> None:
+    """remediate_environment valide noms, valeurs (\\n/\\r/\\0) et bornes avant toute écriture."""
+    with pytest.raises(EnvRemediationError, match="saut de ligne"):
+        remediate_environment(tmp_path, {"APP_KEY": "a\nEVIL=1"})
+
+    assert list(tmp_path.iterdir()) == []
+
+    with pytest.raises(EnvRemediationError, match="volume total"):
+        remediate_environment(tmp_path, {"APP_KEY": "x" * 1_048_577})
+
+    assert list(tmp_path.iterdir()) == []

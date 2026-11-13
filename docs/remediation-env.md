@@ -29,8 +29,8 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
   `>= 16` car.) est purgé et masqué par `***` sur disque et dans les diffs
   `plan_env_example_change` (`before` et `after`). Limite assumée : la prose
   alphabétique multi-mots courte sans `=`, userinfo, préfixe connu ni mot-clé
-  évocateur est conservée par conception pour la lisibilité et soumise à la revue
-  humaine T32.
+  évocateur (ex. `# my hunter`) est conservée par conception pour la lisibilité :
+  elle n'est ni détectée, ni purgée, ni signalée par `plan_env_example_change`.
 
 ### 1.2. `.env` avec permissions strictes 0600 (T31.2)
 - **Secrets locaux en clair** : contient les associations `NOM="valeur"`.

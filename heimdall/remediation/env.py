@@ -612,8 +612,9 @@ def _is_allowlisted_doc_comment(raw_line: str) -> bool:
     mots-clés évocateurs suivis d'une valeur.
 
     Limite assumée : la prose alphabétique multi-mots courte (< 16 car./mot, sans
-    ``=``, userinfo, préfixe connu ni mot-clé évocateur) est conservée par
-    conception comme documentation et reste soumise à la revue humaine T32.
+    ``=``, userinfo, préfixe connu ni mot-clé évocateur, ex. ``# my hunter``)
+    n'est ni détectée, ni purgée, ni signalée dans ``plan_env_example_change``
+    (elle est conservée par conception pour préserver la documentation).
     """
     stripped = raw_line.strip()
     if not stripped.startswith("#"):
@@ -651,7 +652,7 @@ def _sanitize_example_comment_line(raw_line: str, *, mask_values: bool) -> str:
       (zéro secret dans .env.example versionné ni dans les diffs affichés).
     - Les commentaires ordinaires en prose alphabétique multi-mots courte
       (sans secret détectable ni mot-clé évocateur) sont préservés par conception
-      et relus en revue humaine T32.
+      (non détectés et non signalés).
     """
     if "=" in raw_line:
         head, _, val = raw_line.partition("=")
@@ -929,28 +930,26 @@ def _parse_env_strict(raw_content: str) -> dict[str, str]:
 parse_env_strict = _parse_env_strict
 
 
-def update_env_file(  # noqa: PLR0912, PLR0915
-    root: Path,
+def _validate_secret_pair(item: object) -> tuple[str, str]:
+    """Valide une paire (clé, valeur) de secret et retourne (clé_normalisée, valeur)."""
+    if not isinstance(item, tuple) or len(item) != _SECRET_PAIR_LENGTH:
+        raise EnvRemediationError("secret invalide : format attendu tuple (clé, valeur)")
+    key, val = item
+    if not isinstance(key, str) or not isinstance(val, str):
+        raise EnvRemediationError("clé ou valeur de secret invalide (non-str)")
+    if "\n" in val or "\r" in val or "\0" in val:
+        raise EnvRemediationError("valeur de secret invalide : saut de ligne ou octet nul interdit")
+    try:
+        clean_key = validate_variable_name(key)
+    except (TemplateError, ValueError, TypeError):
+        raise EnvRemediationError("clé de secret invalide") from None
+    return clean_key, val
+
+
+def _validate_and_materialize_secrets(
     secrets: Mapping[str, str] | Iterable[tuple[str, str]],
-    env_path: str = ".env",
-) -> Path:
-    """Met à jour ou crée le fichier .env avec les permissions strictes 0600.
-
-    INVARIANT DE SÉCURITÉ : le fichier .env contient des secrets en clair.
-    Il DOIT être créé et conservé avec le mode POSIX 0600 (os.open(..., 0o600)).
-    Toute tentative d'accès via un lien symbolique est refusée fail-closed.
-
-    Chaque clé est validée via validate_variable_name.
-    Chaque valeur est échappée via format_env_value (prévention d'injection shell).
-    Les clés pré-existantes dans .env sont également re-validées (rejet fail-closed).
-    Le volume total des secrets est borné à 1 Mio.
-
-    Retourne le chemin absolu confiné du fichier écrit.
-    """
-    if not isinstance(root, Path):
-        raise EnvRemediationError("racine invalide")
-    _validate_env_like_path(env_path, ".env", expect_template=False)
-
+) -> dict[str, str]:
+    """Valide et matérialise de façon bornée les paires (clé, valeur) en mémoire."""
     if isinstance(secrets, (str, bytes)):
         raise EnvRemediationError(
             "secrets invalides : format attendu dictionnaire ou liste de paires"
@@ -973,27 +972,40 @@ def update_env_file(  # noqa: PLR0912, PLR0915
     total_chars = 0
     try:
         for item in pairs:
-            if not isinstance(item, tuple) or len(item) != _SECRET_PAIR_LENGTH:
-                raise EnvRemediationError("secret invalide : format attendu tuple (clé, valeur)")
-            key, val = item
-            if not isinstance(key, str) or not isinstance(val, str):
-                raise EnvRemediationError("clé ou valeur de secret invalide (non-str)")
-            if "\n" in val or "\r" in val or "\0" in val:
-                raise EnvRemediationError(
-                    "valeur de secret invalide : saut de ligne ou octet nul interdit"
-                )
-            try:
-                clean_key = validate_variable_name(key)
-            except (TemplateError, ValueError, TypeError):
-                raise EnvRemediationError("clé de secret invalide") from None
-
+            clean_key, val = _validate_secret_pair(item)
             total_chars += len(val)
             if total_chars > _MAX_TOTAL_SECRET_CHARS:
                 raise EnvRemediationError("volume total des secrets supérieur à 1 Mio")
-
             validated_dict[clean_key] = val
     except (ValueError, TypeError) as exc:
         raise EnvRemediationError("structure de secrets invalide") from exc
+
+    return validated_dict
+
+
+def update_env_file(
+    root: Path,
+    secrets: Mapping[str, str] | Iterable[tuple[str, str]],
+    env_path: str = ".env",
+) -> Path:
+    """Met à jour ou crée le fichier .env avec les permissions strictes 0600.
+
+    INVARIANT DE SÉCURITÉ : le fichier .env contient des secrets en clair.
+    Il DOIT être créé et conservé avec le mode POSIX 0600 (os.open(..., 0o600)).
+    Toute tentative d'accès via un lien symbolique est refusée fail-closed.
+
+    Chaque clé est validée via validate_variable_name.
+    Chaque valeur est échappée via format_env_value (prévention d'injection shell).
+    Les clés pré-existantes dans .env sont également re-validées (rejet fail-closed).
+    Le volume total des secrets est borné à 1 Mio.
+
+    Retourne le chemin absolu confiné du fichier écrit.
+    """
+    if not isinstance(root, Path):
+        raise EnvRemediationError("racine invalide")
+    _validate_env_like_path(env_path, ".env", expect_template=False)
+
+    validated_dict = _validate_and_materialize_secrets(secrets)
 
     confined = _confine_and_check_no_symlink(root, env_path, ".env")
 
@@ -1205,29 +1217,14 @@ def remediate_environment(  # noqa: PLR0913
     if len(set(env_paths)) != len(env_paths):
         raise EnvRemediationError("chemins d'environnement confondus")
 
-    if isinstance(secrets, (str, bytes)):
-        raise EnvRemediationError(
-            "secrets invalides : format attendu dictionnaire ou liste de paires"
-        )
-    if isinstance(secrets, Mapping):
-        materialized_secrets: list[tuple[str, str]] = list(
-            itertools.islice(secrets.items(), _MAX_VARIABLES_COUNT + 1)
-        )
-    elif isinstance(secrets, Iterable):
-        materialized_secrets = list(itertools.islice(secrets, _MAX_VARIABLES_COUNT + 1))
-    else:
-        raise EnvRemediationError("secrets invalides : type non supporté")
-
-    if len(materialized_secrets) > _MAX_VARIABLES_COUNT:
-        raise EnvRemediationError(
-            f"trop de secrets : {len(materialized_secrets)} dépasse {_MAX_VARIABLES_COUNT}"
-        )
+    # Validation complète des noms, valeurs (\n/\r/\0) et bornes AVANT toute écriture disque.
+    validated_secrets = _validate_and_materialize_secrets(secrets)
 
     # 1. Mise à jour de .env.example (valeurs vides obligatoires)
-    added_to_example = update_env_example(root, materialized_secrets, example_path=example_path)
+    added_to_example = update_env_example(root, validated_secrets, example_path=example_path)
 
     # 2. Mise à jour ou création de .env en mode 0600
-    update_env_file(root, materialized_secrets, env_path=env_path)
+    update_env_file(root, validated_secrets, env_path=env_path)
 
     # 3. Ajout de .env au .gitignore si absent (idempotent)
     gitignore_updated = ensure_gitignore_ignores_env(
@@ -1240,7 +1237,7 @@ def remediate_environment(  # noqa: PLR0913
         sys.stderr.write(warn + "\n")
         warnings.warn(warn, UserWarning, stacklevel=2)
 
-    all_names = _extract_and_validate_names(materialized_secrets)
+    all_names = list(validated_secrets.keys())
 
     return EnvRemediationReceipt(
         env_file=confined_env.relative,
