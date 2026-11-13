@@ -506,7 +506,12 @@ class TestForbiddenTransitionApi:
         assert response.json() == _BAD_REQUEST
         assert response.headers["Cache-Control"] == "no-store"
         # Aucun reflet de l'état demandé ni du secret dans la réponse.
-        assert target not in response.text
+        # Le non-reflet de l'état se mesure sur le corps JSON : les noms d'état
+        # sont des mots courts qu'une recherche en sous-chaîne sur la réponse
+        # entière confondrait avec un autre mot ("rote" dans "protégé") ; le
+        # canari, lui, est un jeton unique — il est cherché partout, en-têtes
+        # compris.
+        assert target not in json.dumps(response.json())
         assert _CANARY not in response.text
 
         # Aucun effet de bord : l'état et le journal sont inchangés.
@@ -554,7 +559,7 @@ class TestForbiddenTransitionApi:
         response = vault_client.post(_TRANSITION, json={"target_status": "revoked"})
         assert response.status_code == 400
         assert response.json() == _BAD_REQUEST
-        assert "revoked" not in response.text
+        assert "revoked" not in json.dumps(response.json())
         assert vault_client.get(_STATE).json()["status"] == "vaulte"
         assert _journal(vault_client) == []
 
