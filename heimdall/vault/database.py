@@ -1129,21 +1129,24 @@ def get_server_hmac_canary(conn: sqlite3.Connection) -> str | None:
 def set_server_hmac_canary(conn: sqlite3.Connection, canary: str) -> None:
     """Enregistre le canari de clé HMAC serveur si absent (ticket #116).
 
-    Vérifie la cohérence si un canari existe déjà pour interdire toute cohabitation silencieuse.
+    Vérifie la cohérence si un canari existe déjà pour interdire toute
+    cohabitation silencieuse. L'écriture est atomique (``INSERT OR IGNORE``
+    suivi d'une relecture comparée en temps constant) : un conflit de course
+    avec un autre écrivain ne produit jamais d'``IntegrityError`` pouvant être
+    requalifié en doublon de secret, et une clé HMAC divergente est détectée
+    fail-closed (revue LOW #116).
     """
     _ensure_server_hmac_canary_table(conn)
-    cursor = conn.execute("SELECT canary FROM server_hmac_canary WHERE id = 1;")
-    row = cursor.fetchone()
-    if row is not None:
-        if not hmac.compare_digest(str(row[0]), canary):
-            raise ValueError(
-                "La clé HMAC serveur a changé par rapport au canari persistant en base."
-            )
-        return
     conn.execute(
-        "INSERT INTO server_hmac_canary (id, canary) VALUES (1, ?);",
+        "INSERT OR IGNORE INTO server_hmac_canary (id, canary) VALUES (1, ?);",
         (canary,),
     )
+    cursor = conn.execute("SELECT canary FROM server_hmac_canary WHERE id = 1;")
+    row = cursor.fetchone()
+    if row is None or not hmac.compare_digest(str(row[0]), canary):
+        raise ValueError(
+            "La clé HMAC serveur a changé par rapport au canari persistant en base."
+        )
 
 
 def init_db(db_path: Path | str | None = None) -> None:

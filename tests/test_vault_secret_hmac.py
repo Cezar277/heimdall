@@ -19,11 +19,13 @@ import hashlib
 import hmac
 import importlib.util
 import re
+import sqlite3
 import sys
 import tempfile
 import unicodedata
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -262,9 +264,44 @@ class SecretHmacCryptoTests(TestCase):
             )
         self.assertIn("phrase naturelle", str(ctx3.exception))
 
-        # Aucun faux positif sur la voie supportée : clé de test et clé générée
+        # 4. Phrase en capitales avec espaces (revue MEDIUM #116) : la règle
+        #    basse-casse ne la voyait pas, l'entropie effective reste ~60-80 bits.
+        with self.assertRaises(ValueError) as ctx4:
+            _normalize_server_hmac_key(
+                "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG AND WALKS AWAY QUIETLY"
+            )
+        self.assertIn("phrase naturelle", str(ctx4.exception))
+
+        # 5. Phrase en capitales sans séparateur (règle majuscules)
+        with self.assertRaises(ValueError) as ctx5:
+            _normalize_server_hmac_key("THEQUICKBROWNFOXJUMPSOVERTHELAZYDOGANDWALKSAWAYQUIETLY")
+        self.assertIn("phrase naturelle", str(ctx5.exception))
+
+        # 6. Phrase à casse mixte séparée par des espaces (règle 3)
+        with self.assertRaises(ValueError) as ctx6:
+            _normalize_server_hmac_key(
+                "This Is A Very Long Mixed Case Human Phrase Used As A Secret Key"
+            )
+        self.assertIn("phrase naturelle", str(ctx6.exception))
+
+        # 7. Phrase à chiffres séparés par des espaces (chiffres comptés par la règle 3)
+        with self.assertRaises(ValueError) as ctx7:
+            _normalize_server_hmac_key(
+                "123 the quick brown fox jumps over 456 lazy dogs 789 and 0"
+            )
+        self.assertIn("phrase naturelle", str(ctx7.exception))
+
+        # Vérifier que validate_server_hmac_key lève également sur la phrase en capitales
+        with self.assertRaises(ValueError) as ctx_v:
+            validate_server_hmac_key(
+                "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG AND WALKS AWAY QUIETLY"
+            )
+        self.assertIn("phrase naturelle", str(ctx_v.exception))
+
+        # Aucun faux positif sur la voie supportée : clé de test et clés générées
         _normalize_server_hmac_key(_VALID_SERVER_HMAC_KEY)
-        _normalize_server_hmac_key(generate_server_hmac_key())
+        for _ in range(64):
+            _normalize_server_hmac_key(generate_server_hmac_key())
 
     def test_candidate_value_empty_parity_cipher(self) -> None:
         """Une valeur candidate vide retourne False en toute circonstance (avec ou sans AAD)."""
@@ -676,6 +713,36 @@ class KeySeparationTests(TestCase):
             verify_secret_hmac(_VALID_SERVER_HMAC_KEY, value, fp, forbidden_keys=(kek,))
         )
 
+    def test_compute_secret_hmac_naked_primitive_contract_is_documented(self) -> None:
+        """Verrouille le contrat de la primitive nue (revue LOW #116).
+
+        Décision d'architecture : ``compute_secret_hmac`` est une primitive bas
+        niveau qui ne peut pas deviner la KEK/maîtresse de l'appelant. La seule
+        voie supportée en production est ``VaultCipher.compute_secret_hmac``
+        (qui injecte toujours sa KEK dans ``forbidden_keys``). Un appelant qui
+        utilise la fonction nue DOIT fournir ``forbidden_keys`` ; sans cela, le
+        calcul reste possible mais l'invariant 5 n'est pas vérifiable.
+        """
+        value = "naked_primitive_value"
+        kek = _VALID_KEK
+
+        # 1. Comportement documenté de la primitive nue : calcul accepté…
+        fp = compute_secret_hmac(kek, value)
+        self.assertRegex(fp, r"^[0-9a-f]{64}$")
+
+        # 2. …mais dès que l'appelant déclare l'entropie interdite, refus fail-closed.
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(kek, value, forbidden_keys=kek)
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(kek, value, forbidden_keys=[b"autre", kek])
+
+        # 3. La voie supportée injecte systématiquement la KEK du chiffreur.
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        self.assertEqual(
+            cipher.compute_secret_hmac(value),
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, value),
+        )
+
     def test_key_separation_type_safety_rejects_non_string_bytes_types(self) -> None:
         """server_hmac_key_matches_master_key et forbidden_keys lèvent TypeError sur int."""
         # int ne doit pas être converti via bytes(int) (prévention DoS mémoire et bypass)
@@ -702,6 +769,48 @@ class KeySeparationTests(TestCase):
         ba_kek = bytearray(_VALID_KEK.encode("utf-8"))
         self.assertTrue(server_hmac_key_matches_master_key(ba_kek, _VALID_KEK))
         self.assertEqual(len(_extract_key_variants(ba_kek)), len(_extract_key_variants(_VALID_KEK)))
+
+    def test_resolve_vault_cipher_with_model_construct_rejects_master_hmac_collision(
+        self,
+    ) -> None:
+        """_resolve_vault_cipher refuse master_key == server_hmac_key même via model_construct."""
+        settings = VaultSettings.model_construct(
+            master_key=_VALID_MASTER_KEY,
+            kek_salt="s" * 22,
+            api_key_pepper=_VALID_PEPPER,
+            server_hmac_key=_VALID_MASTER_KEY,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            vault_app._resolve_vault_cipher(settings, "sqlite")
+        self.assertIn("distinctes (invariant 5)", str(ctx.exception))
+
+        # Forme encodée également refusée
+        encoded_master = base64.b64encode(_VALID_MASTER_KEY.encode("utf-8")).decode("ascii")
+        settings_enc = VaultSettings.model_construct(
+            master_key=_VALID_MASTER_KEY,
+            kek_salt="s" * 22,
+            api_key_pepper=_VALID_PEPPER,
+            server_hmac_key=encoded_master,
+        )
+        with self.assertRaises(ValueError) as ctx_enc:
+            vault_app._resolve_vault_cipher(settings_enc, "sqlite")
+        self.assertIn("distinctes (invariant 5)", str(ctx_enc.exception))
+
+    def test_validate_explicit_secret_store_configuration_rejects_master_hmac_collision(
+        self,
+    ) -> None:
+        """_validate_explicit_secret_store_configuration refuse master_key == server_hmac_key."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        store = InMemorySecretStore(cipher)
+        settings = VaultSettings.model_construct(
+            master_key=_VALID_MASTER_KEY,
+            kek_salt="s" * 22,
+            api_key_pepper=None,
+            server_hmac_key=_VALID_MASTER_KEY,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            vault_app._validate_explicit_secret_store_configuration(settings, store)
+        self.assertIn("distinctes (invariant 5)", str(ctx.exception))
 
 
 class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
@@ -1404,6 +1513,43 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             # Vérifier qu'aucun secret n'a été inséré
             with db_session(db_path) as conn:
                 self.assertIsNone(get_secret_metadata(conn, "proj", "prod", "SECRET_KEY"))
+
+    async def test_sqlite_create_canary_race_does_not_mask_as_secret_duplicate(
+        self,
+    ) -> None:
+        """Un conflit ou divergence sur le canari ne produit jamais d'erreur 409 doublon."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            c1 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+            c2 = VaultCipher(b"K" * 32, server_hmac_key=_VALID_ALT_HMAC_KEY)
+
+            # 1. Un canari identique déjà présent (course entre 2 requêtes concurrentes) :
+            #    l'insertion est idempotente et la création réussit normalement.
+            with db_session(db_path) as conn:
+                ensure_project(conn, "proj")
+                set_server_hmac_canary(conn, c1.server_hmac_key_canary())
+
+            store_c1 = SqliteSecretStore(db_path, c1)
+            created = await store_c1.create("proj", "prod", "SEC_1", "val1")
+            self.assertEqual(created["status"], "vaulte")
+
+            # 2. Un canari divergent présent lors de la création lève VaultCipherError,
+            #    JAMAIS KeyError("Secret déjà existant") (qui serait mappé en HTTP 409).
+            store_c2 = SqliteSecretStore(db_path, c2)
+            with self.assertRaises(VaultCipherError) as ctx:
+                await store_c2.create("proj", "prod", "SEC_2", "val2")
+            self.assertIn("clé hmac serveur", str(ctx.exception).lower())
+
+            # 3. Une collision IntegrityError sur le canari dans _create lève VaultCipherError,
+            #    JAMAIS KeyError (prévention faux 409).
+            with patch(
+                "heimdall.vault.store.set_server_hmac_canary",
+                side_effect=sqlite3.IntegrityError("canary lock"),
+            ):
+                with self.assertRaises(VaultCipherError) as ctx_race:
+                    await store_c1.create("proj", "prod", "SEC_RACE", "val_race")
+                self.assertIn("conflit d'écriture sur le canari", str(ctx_race.exception).lower())
 
     def test_database_find_secrets_by_fingerprint_uses_index(self) -> None:
         """find_secrets_by_fingerprint retourne les métadonnées sans déchiffrer."""

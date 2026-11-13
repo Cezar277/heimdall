@@ -759,13 +759,22 @@ class SqliteSecretStore:
                     kek_version=self._kek_version,
                     fingerprint=fingerprint,
                 )
-                if self._cipher.has_explicit_server_hmac_key:
-                    try:
-                        set_server_hmac_canary(conn, self._cipher.server_hmac_key_canary())
-                    except ValueError as exc:
-                        raise VaultCipherError(str(exc)) from exc
             except sqlite3.IntegrityError:
                 raise KeyError("Secret déjà existant") from None
+            if self._cipher.has_explicit_server_hmac_key:
+                # Hors du try « secret déjà existant » : un conflit d'écriture
+                # sur le canari ne doit jamais être requalifié en faux 409
+                # (revue LOW #116). L'insertion est atomique côté database.py ;
+                # cette garde reste une défense en profondeur.
+                try:
+                    set_server_hmac_canary(conn, self._cipher.server_hmac_key_canary())
+                except ValueError as exc:
+                    raise VaultCipherError(str(exc)) from exc
+                except sqlite3.IntegrityError as exc:
+                    raise VaultCipherError(
+                        "Conflit d'écriture sur le canari de la clé HMAC serveur ; "
+                        "réessayer la création (invariant 5)."
+                    ) from exc
         return {
             "project": project,
             "env": env,

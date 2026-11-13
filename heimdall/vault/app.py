@@ -305,6 +305,12 @@ def _resolve_vault_cipher(
     même si les deux secrets sont fournis séparément, une collision fortuite
     ou une configuration volontairement fautive est refusée fail-closed.
 
+    La clé maîtresse est également comparée à la clé HMAC serveur AVANT la KDF
+    (invariant 5) : ``VaultCipher.__init__`` ne voit que la KEK dérivée, toujours
+    distincte de la maîtresse, donc ce contrôle ne peut pas y être délégué. Il
+    protège les configurations construites hors validation pydantic
+    (``model_construct``, mutation, futur refactor).
+
     La clé maîtresse reste portée par ``VaultSettings`` et l'environnement pour
     la durée du processus ; la dérivation ne prétend pas l'effacer. Seule la KEK
     dérivée est conservée par ``VaultCipher`` et utilisée par les routes.
@@ -330,6 +336,12 @@ def _resolve_vault_cipher(
                 "La clé maîtresse et le pepper d'authentification doivent être "
                 "distincts (invariant 5)."
             )
+        if settings.server_hmac_key is not None and server_hmac_key_matches_master_key(
+            settings.master_key, settings.server_hmac_key
+        ):
+            raise ValueError(
+                "La clé maîtresse et la clé HMAC serveur doivent être distinctes (invariant 5)."
+            )
         derived_kek = derive_kek_from_master_key(settings.master_key, salt)
         if pepper is not None:
             _reject_kek_equal_to_pepper(derived_kek, pepper)
@@ -349,7 +361,7 @@ def _validate_explicit_secret_store_configuration(
     settings: "VaultSettings",
     secret_store: "InMemorySecretStore | SqliteSecretStore",
 ) -> None:
-    """Refuse la réutilisation du pepper par la KEK **réelle** du store explicite.
+    """Refuse la réutilisation du pepper et de la clé maîtresse par le store explicite.
 
     Avec un store explicite, ``_resolve_vault_cipher`` n'est pas appelé : la KEK
     qui chiffre réellement les secrets est celle portée par le chiffreur du
@@ -359,7 +371,20 @@ def _validate_explicit_secret_store_configuration(
     chemin reste réservé aux tests ; la production HTTP passe toujours par
     ``_resolve_vault_cipher``. Les contrôles bon marché restent dans
     ``VaultSettings`` (paire maître/sel, ``master_key != pepper``).
+
+    La collision clé maîtresse vs clé HMAC serveur est contrôlée ici aussi, et
+    avant le retour anticipé sur l'absence de pepper : un ``secret_store``
+    explicite court-circuite la dérivation, donc ``_resolve_vault_cipher`` ne
+    peut pas porter cette garde (revue MEDIUM #116).
     """
+    if (
+        settings.master_key is not None
+        and settings.server_hmac_key is not None
+        and server_hmac_key_matches_master_key(settings.master_key, settings.server_hmac_key)
+    ):
+        raise ValueError(
+            "La clé maîtresse et la clé HMAC serveur doivent être distinctes (invariant 5)."
+        )
     if settings.api_key_pepper is None:
         return
     cipher = getattr(secret_store, "_cipher", None)

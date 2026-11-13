@@ -88,15 +88,24 @@ def _shannon_entropy(data: bytes) -> float:
     return -sum((c / length) * math.log2(c / length) for c in counts.values())
 
 
-# Garde anti-phrase humaine (revue LOW #116) : une phrase naturelle de 32+ octets
+# Garde anti-phrase humaine (revue #116) : une phrase naturelle de 32+ octets
 # peut franchir les seuils de diversité (24 symboles) et d'entropie brute
 # (Shannon >= 4.0) tout en ne portant que 60-80 bits effectifs (mots de
 # dictionnaire), restant attaquable hors ligne avec un dump SQLite et le canari
-# public. On refuse toute clé d'au moins _HUMAN_PHRASE_MIN_CHARS caractères dont
-# la part de minuscules ASCII et d'espaces atteint _HUMAN_PHRASE_MAX_WORD_RATIO.
-# generate_server_hmac_key() produit du base64url (environ 40 % de minuscules en
-# moyenne sur 43 octets) : atteindre 85 % exigerait un événement à plus de 5
-# sigma, donc aucun faux positif n'est possible sur la seule voie supportée.
+# public. Trois signatures sont refusées sur une clé de 32+ caractères
+# normalisés :
+#   1. minuscules ASCII + espaces >= 85 % (phrases basse-casse, avec ou sans
+#      espaces, y compris les phrases à chiffres type "password123 ...") ;
+#   2. majuscules ASCII >= 85 % (phrases capitales sans séparateur) ;
+#   3. si la clé contient un blanc, caractères ASCII alphanumériques + blancs
+#      >= 85 % (phrases capitales, à casse mixte ou à chiffres type
+#      "password123 ..." séparées par des espaces, que la règle 1 ne
+#      comptabilise pas).
+# generate_server_hmac_key() produit du base64url sans blanc (caractère absent
+# de l'alphabet) : les règles 1 et 2 y sont des événements à plus de 5 sigma
+# (environ 40 % de minuscules et 40 % de majuscules par tirage) et la règle 3
+# ne s'applique jamais : aucun faux positif n'est possible sur la seule voie
+# supportée.
 # Les seuils de diversité/entropie ne sont PAS relevables davantage : sur des
 # clés base64url de 43 octets, exiger 28 symboles distincts rejetterait ~3.7 %
 # des clés légitimes et Shannon >= 4.5 en rejetterait ~0.5 %, alors qu'une clé
@@ -117,8 +126,22 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
     stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     if len(stripped) < _HUMAN_PHRASE_MIN_CHARS:
         return False
-    word_chars = sum(1 for ch in stripped if ch.isascii() and (ch.islower() or ch == " "))
-    return word_chars / len(stripped) >= _HUMAN_PHRASE_MAX_WORD_RATIO
+    total = len(stripped)
+    lowercase_or_space = sum(
+        1 for ch in stripped if ch.isascii() and (ch.islower() or ch == " ")
+    )
+    if lowercase_or_space / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
+        return True
+    uppercase = sum(1 for ch in stripped if ch.isascii() and ch.isupper())
+    if uppercase / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
+        return True
+    if any(ch.isspace() for ch in stripped):
+        word_chars = sum(
+            1 for ch in stripped if ch.isascii() and (ch.isalnum() or ch.isspace())
+        )
+        if word_chars / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
+            return True
+    return False
 
 
 # Une DEK fait 256 bits, comme la KEK : l'AES-256-GCM exige une clé de 32 octets.
@@ -407,13 +430,14 @@ def compute_secret_hmac(
     fuité, sans jamais stocker ni renvoyer cette valeur au client.
 
     Avertissement de sécurité (Invariant 5 - Séparation des clés) :
+    Cette fonction utilitaire pure ne peut PAS appliquer l'invariant 5 par défaut :
+    elle n'a aucune connaissance de la KEK ou de la clé maîtresse de l'appelant.
     Ne JAMAIS passer directement la KEK ou la clé maîtresse en tant que ``server_key``.
-    Cette fonction utilitaire pure accepte toute clé conforme à la politique de complexité.
-    Les composants internes et appelants de production doivent privilégier
-    ``VaultCipher.compute_secret_hmac`` qui applique systématiquement la garde de séparation
-    cryptographique fail-closed (``server_hmac_key_matches_master_key``).
-    Le paramètre optionnel ``forbidden_keys`` permet de fournir explicitement des clés
-    dont l'entropie ne doit pas être réutilisée (ex. la KEK du chiffreur).
+    La seule voie supportée en production est ``VaultCipher.compute_secret_hmac``, qui
+    injecte systématiquement sa KEK dans ``forbidden_keys`` et refuse fail-closed toute
+    réutilisation d'entropie (``server_hmac_key_matches_master_key``). Un appelant qui
+    utilise la fonction nue DOIT fournir lui-même ``forbidden_keys`` ; ce contrat de
+    primitive bas niveau est verrouillé par test (décision d'architecture revue #116).
 
     Décision d'architecture (contrat de valeur vide) :
     Une valeur de secret vide lève ``ValueError`` (fail-closed), car aucun secret vide ne peut
