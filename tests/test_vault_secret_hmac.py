@@ -185,6 +185,29 @@ class SecretHmacCryptoTests(TestCase):
         with self.assertRaises(ValueError):
             compute_secret_hmac("short_key_16_bytes!", "valid_value")
 
+    def test_compute_and_verify_secret_hmac_supports_bytearray_types(self) -> None:
+        """compute_secret_hmac et verify_secret_hmac acceptent bytearray pour clé, valeur et AAD."""
+        key_str = _VALID_SERVER_HMAC_KEY
+        key_ba = bytearray(key_str.encode("utf-8"))
+        val_str = "secret_to_hash_bytearray"
+        val_ba = bytearray(val_str.encode("utf-8"))
+        aad_str = "aad_context_42"
+        aad_ba = bytearray(aad_str.encode("utf-8"))
+
+        # 1. Calcul avec bytearray identique au calcul avec str/bytes
+        fp_str = compute_secret_hmac(key_str, val_str, aad=aad_str)
+        fp_ba = compute_secret_hmac(key_ba, val_ba, aad=aad_ba)
+        self.assertEqual(fp_ba, fp_str)
+
+        # 2. verify_secret_hmac accepte également bytearray
+        self.assertTrue(verify_secret_hmac(key_ba, val_ba, fp_str, aad=aad_ba))
+
+        # 3. Rejet fail-closed sur type non supporté (int, etc.)
+        with self.assertRaises(TypeError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, 12345)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(12345, val_str)  # type: ignore[arg-type]
+
     def test_normalize_server_hmac_key_rejects_trivial_or_repetitive_keys(self) -> None:
         """Refuse les clés de faible entropie (répétitives ou périodiques)."""
         # Caractère unique répété
@@ -242,95 +265,52 @@ class SecretHmacCryptoTests(TestCase):
         effectifs (mots de dictionnaire) : attaquable hors ligne avec un dump
         SQLite et le canari public. Le garde anti-phrase la refuse fail-closed.
         """
-        # 1. Phrase anglaise (xkcd) de 65 octets, 24 symboles distincts, Shannon ~4.12
-        with self.assertRaises(ValueError) as ctx1:
-            _normalize_server_hmac_key(
-                "Correct Horse Battery Staple is a famous xkcd passphrase example."
-            )
-        self.assertIn("phrase naturelle", str(ctx1.exception))
-
-        # 2. Phrase française avec accents (NFKD + espaces), 25 symboles, Shannon ~4.13
-        with self.assertRaises(ValueError) as ctx2:
-            _normalize_server_hmac_key(
+        weak_phrases = [
+            # 1. Phrase anglaise (xkcd) de 65 octets, 24 symboles distincts, Shannon ~4.12
+            "Correct Horse Battery Staple is a famous xkcd passphrase example.",
+            # 2. Phrase française avec accents (NFKD + espaces), 25 symboles, Shannon ~4.13
+            (
                 "Le canari public et le dump SQLite suffisent à attaquer cette "
                 "phrase hors ligne, hélas."
-            )
-        self.assertIn("phrase naturelle", str(ctx2.exception))
-
-        # 3. Phrase basse-casse sans ponctuation excédant 32 caractères normalisés
-        with self.assertRaises(ValueError) as ctx3:
-            _normalize_server_hmac_key(
-                "the quick brown fox jumps over the lazy dog and walks away quietly"
-            )
-        self.assertIn("phrase naturelle", str(ctx3.exception))
-
-        # 4. Phrase en capitales avec espaces (revue MEDIUM #116) : la règle
-        #    basse-casse ne la voyait pas, l'entropie effective reste ~60-80 bits.
-        with self.assertRaises(ValueError) as ctx4:
-            _normalize_server_hmac_key(
-                "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG AND WALKS AWAY QUIETLY"
-            )
-        self.assertIn("phrase naturelle", str(ctx4.exception))
-
-        # 5. Phrase en capitales sans séparateur (règle majuscules)
-        with self.assertRaises(ValueError) as ctx5:
-            _normalize_server_hmac_key("THEQUICKBROWNFOXJUMPSOVERTHELAZYDOGANDWALKSAWAYQUIETLY")
-        self.assertIn("phrase naturelle", str(ctx5.exception))
-
-        # 6. Phrase à casse mixte séparée par des espaces (règle 3)
-        with self.assertRaises(ValueError) as ctx6:
-            _normalize_server_hmac_key(
-                "This Is A Very Long Mixed Case Human Phrase Used As A Secret Key"
-            )
-        self.assertIn("phrase naturelle", str(ctx6.exception))
-
-        # 7. Phrase à chiffres séparés par des espaces (chiffres comptés par la règle 3)
-        with self.assertRaises(ValueError) as ctx7:
-            _normalize_server_hmac_key(
-                "123 the quick brown fox jumps over 456 lazy dogs 789 and 0"
-            )
-        self.assertIn("phrase naturelle", str(ctx7.exception))
-
-        # 8. Phrase CamelCase sans séparateur (revue LOW #116 : 45 chars, Shannon > 4.0)
-        with self.assertRaises(ValueError) as ctx8:
-            validate_server_hmac_key("CorrectHorseBatteryStapleExtraWordPlusMore123")
-        self.assertIn("phrase naturelle", str(ctx8.exception))
-
-        # 9. Phrase CamelCase avec chiffres sans espaces (variante avec chiffres sans espaces)
-        with self.assertRaises(ValueError) as ctx9:
-            validate_server_hmac_key("CorrectHorse123Battery456Staple789Word000More111")
-        self.assertIn("phrase naturelle", str(ctx9.exception))
-
-        # 10. Phrase CamelCase pure sans chiffres avec diversité de symboles suffisante
-        with self.assertRaises(ValueError) as ctx10:
-            validate_server_hmac_key("TheQuickBrownFoxJumpsOverTheLazyDogAndMore")
-        self.assertIn("phrase naturelle", str(ctx10.exception))
-
-        # 11. Phrase avec ponctuation séparatrice (revue LOW #116 : 53 chars, Shannon ~4.15)
-        with self.assertRaises(ValueError) as ctx11:
-            validate_server_hmac_key("Correct-Horse-Battery-Staple-Extra-Word-Plus-More-12!")
-        self.assertIn("phrase naturelle", str(ctx11.exception))
-
-        # 12. Phrase séparée par des points ou underscores
-        with self.assertRaises(ValueError) as ctx12:
-            validate_server_hmac_key(
-                "Correct.Horse.123.Battery.456.Staple.789.Word.More.Extra.Plus!"
-            )
-        self.assertIn("phrase naturelle", str(ctx12.exception))
-
-        # 13. Phrase à casse alternée avec séparateurs (revue LOW #116 : 56 chars, Shannon ~4.74)
-        with self.assertRaises(ValueError) as ctx13:
-            validate_server_hmac_key(
-                "cOrReCt-hOrSe-BaTtErY-sTaPlE-eXtRa-WoRdS-1234-ABCD-xyzQ!"
-            )
-        self.assertIn("phrase naturelle", str(ctx13.exception))
-
-        # 14. Variante à casse alternée sans séparateurs (revue LOW #116 : 59 chars, Shannon ≈ 5.0)
-        with self.assertRaises(ValueError) as ctx14:
-            validate_server_hmac_key(
-                "cOrReCtHoRsEBaTtErYsTaPlEeXtRaWoRdS1234ABCDxyzQ!PlusMore456"
-            )
-        self.assertIn("phrase naturelle", str(ctx14.exception))
+            ),
+            # 3. Phrase basse-casse sans ponctuation excédant 32 caractères normalisés
+            "the quick brown fox jumps over the lazy dog and walks away quietly",
+            # 4. Phrase en capitales avec espaces (revue MEDIUM #116)
+            "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG AND WALKS AWAY QUIETLY",
+            # 5. Phrase en capitales sans séparateur (règle majuscules)
+            "THEQUICKBROWNFOXJUMPSOVERTHELAZYDOGANDWALKSAWAYQUIETLY",
+            # 6. Phrase à casse mixte séparée par des espaces (règle 3)
+            "This Is A Very Long Mixed Case Human Phrase Used As A Secret Key",
+            # 7. Phrase à chiffres séparés par des espaces (chiffres comptés par la règle 3)
+            "123 the quick brown fox jumps over 456 lazy dogs 789 and 0",
+            # 8. Phrase CamelCase sans séparateur (revue LOW #116 : 45 chars, Shannon > 4.0)
+            "CorrectHorseBatteryStapleExtraWordPlusMore123",
+            # 9. Phrase CamelCase avec chiffres sans espaces (variante avec chiffres sans espaces)
+            "CorrectHorse123Battery456Staple789Word000More111",
+            # 10. Phrase CamelCase pure sans chiffres avec diversité de symboles suffisante
+            "TheQuickBrownFoxJumpsOverTheLazyDogAndMore",
+            # 11. Phrase avec ponctuation séparatrice (revue LOW #116 : 53 chars, Shannon ~4.15)
+            "Correct-Horse-Battery-Staple-Extra-Word-Plus-More-12!",
+            # 12. Phrase séparée par des points ou underscores
+            "Correct.Horse.123.Battery.456.Staple.789.Word.More.Extra.Plus!",
+            # 13. Phrase à casse alternée avec séparateurs (revue LOW #116 : 56 chars, Shannon ~4.7)
+            "cOrReCt-hOrSe-BaTtErY-sTaPlE-eXtRa-WoRdS-1234-ABCD-xyzQ!",
+            # 14. Variante à casse alternée sans séparateurs (revue LOW #116 : 59 chars)
+            "cOrReCtHoRsEBaTtErYsTaPlEeXtRaWoRdS1234ABCDxyzQ!PlusMore456",
+            # 15. Phrase avec tabulations et ponctuation (revue LOW #116 : >=32 chars)
+            "correct\thorse\tbattery\tstaple\textra\twords\t1234-ABCD-xyzQ!0123456789",
+            # 16. Phrase avec espace insécable (\u00a0) et ponctuation (revue LOW #116)
+            "correct\u00a0horse\u00a0battery\u00a0staple\u00a0extra\u00a0words\u00a01234-ABCD-xyzQ!0123456789",
+            # 17. Phrase basse-casse pure avec tabulations sans ponctuation (revue LOW #116)
+            "correct\thorse\tbattery\tstaple\textra\twords\t1234567890abcdef",
+            # 18. Phrase basse-casse pure avec espace insécable sans ponctuation (revue LOW #116)
+            "correct\u00a0horse\u00a0battery\u00a0staple\u00a0extra\u00a0words\u00a01234567890abcdef",
+        ]
+        for phrase in weak_phrases:
+            with self.subTest(phrase=phrase):
+                with self.assertRaises(ValueError) as ctx:
+                    validate_server_hmac_key(phrase)
+                self.assertIn("phrase naturelle", str(ctx.exception))
 
         # Vérifier que validate_server_hmac_key lève également sur la phrase en capitales
         with self.assertRaises(ValueError) as ctx_v:

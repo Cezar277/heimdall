@@ -118,7 +118,7 @@ _CAMEL_WORDS_MIN_COUNT: int = 4
 _CAMEL_WORDS_PATTERN: re.Pattern[str] = re.compile(r"[A-Z][a-z]{2,}")
 _HUMAN_PHRASE_SEPARATORS: str = " -_.:,;!?/"
 _NATURAL_WORD_MIN_LEN: int = 2
-_ALTERNATING_CASE_MIN_RATIO: float = 0.70
+_ALTERNATING_CASE_MIN_RATIO: float = 0.75
 _ALTERNATING_CASE_MIN_ALPHA_RATIO: float = 0.80
 
 
@@ -137,17 +137,18 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
     """
     normalized = unicodedata.normalize("NFKD", key_bytes.decode("utf-8", errors="ignore"))
     stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    if len(stripped) < _HUMAN_PHRASE_MIN_CHARS:
+    cleaned = "".join(" " if ch.isspace() else ch for ch in stripped)
+    if len(cleaned) < _HUMAN_PHRASE_MIN_CHARS:
         return False
-    total = len(stripped)
+    total = len(cleaned)
     lowercase_or_sep = sum(
         1
-        for ch in stripped
+        for ch in cleaned
         if ch.isascii() and (ch.islower() or ch in _HUMAN_PHRASE_SEPARATORS)
     )
     uppercase_or_sep = sum(
         1
-        for ch in stripped
+        for ch in cleaned
         if ch.isascii() and (ch.isupper() or ch in _HUMAN_PHRASE_SEPARATORS)
     )
     if (
@@ -155,23 +156,23 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
         or uppercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
     ):
         return True
-    if any(ch in _HUMAN_PHRASE_SEPARATORS for ch in stripped):
+    if any(ch in _HUMAN_PHRASE_SEPARATORS for ch in cleaned):
         word_chars = sum(
             1
-            for ch in stripped
+            for ch in cleaned
             if ch.isascii() and (ch.isalnum() or ch in _HUMAN_PHRASE_SEPARATORS)
         )
-        words = [w for w in re.split(r"[\s\-_.:,;!?/]+", stripped) if w]
+        words = [w for w in re.split(r"[\s\-_.:,;!?/]+", cleaned) if w]
         natural_words = [w for w in words if _is_natural_word(w)]
         if (
             len(natural_words) >= _CAMEL_WORDS_MIN_COUNT
             and word_chars / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
         ):
             return True
-    camel_words = _CAMEL_WORDS_PATTERN.findall(stripped)
+    camel_words = _CAMEL_WORDS_PATTERN.findall(cleaned)
     camel_len = sum(len(w) for w in camel_words) + sum(
         1
-        for ch in stripped
+        for ch in cleaned
         if ch.isascii() and (ch.isdigit() or ch in _HUMAN_PHRASE_SEPARATORS)
     )
     if (
@@ -179,7 +180,7 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
         and camel_len / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
     ):
         return True
-    letters = [ch for ch in stripped if ch.isascii() and ch.isalpha()]
+    letters = [ch for ch in cleaned if ch.isascii() and ch.isalpha()]
     if (
         len(letters) >= _HUMAN_PHRASE_MIN_CHARS
         and len(letters) / total >= _ALTERNATING_CASE_MIN_ALPHA_RATIO
@@ -468,10 +469,10 @@ def canonicalize_secret_value(value: str | bytes | bytearray) -> bytes:
 
 
 def compute_secret_hmac(
-    server_key: str | bytes,
-    value: str | bytes,
+    server_key: str | bytes | bytearray,
+    value: str | bytes | bytearray,
     *,
-    aad: bytes | str | None = None,
+    aad: bytes | str | bytearray | None = None,
     forbidden_keys: (
         Sequence[str | bytes | bytearray]
         | set[str | bytes | bytearray]
@@ -548,11 +549,11 @@ def compute_secret_hmac(
 
 
 def verify_secret_hmac(
-    server_key: str | bytes,
-    value: str | bytes,
+    server_key: str | bytes | bytearray,
+    value: str | bytes | bytearray,
     expected_hmac: str,
     *,
-    aad: bytes | str | None = None,
+    aad: bytes | str | bytearray | None = None,
     forbidden_keys: (
         Sequence[str | bytes | bytearray]
         | set[str | bytes | bytearray]
@@ -1245,9 +1246,9 @@ class VaultCipher:
 
     def compute_secret_hmac(
         self,
-        value: str | bytes,
+        value: str | bytes | bytearray,
         *,
-        aad: bytes | str | None = None,
+        aad: bytes | str | bytearray | None = None,
     ) -> str:
         """Calcule l'empreinte HMAC-SHA256 avec la clé serveur dédiée (ticket #116).
 
@@ -1264,10 +1265,10 @@ class VaultCipher:
 
     def verify_secret_hmac(
         self,
-        value: str | bytes,
+        value: str | bytes | bytearray,
         expected_hmac: str,
         *,
-        aad: bytes | str | None = None,
+        aad: bytes | str | bytearray | None = None,
     ) -> bool:
         """Vérifie en temps constant si la valeur correspond à l'empreinte HMAC (ticket #116)."""
         return verify_secret_hmac(
@@ -1280,10 +1281,10 @@ class VaultCipher:
 
     def is_secret_value_matching(
         self,
-        value: str | bytes,
+        value: str | bytes | bytearray,
         expected_fingerprint: str,
         *,
-        aad: bytes | str | None = None,
+        aad: bytes | str | bytearray | None = None,
     ) -> bool:
         """Vérifie en temps constant si la valeur correspond à l'empreinte stockée.
 
