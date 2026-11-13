@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from heimdall.vault import app as vault_app
+from heimdall.vault import crypto as vault_crypto
 from heimdall.vault.app import (
     VaultSettings,
     create_app,
@@ -369,6 +370,28 @@ class SecretHmacCryptoTests(TestCase):
         _normalize_server_hmac_key(_VALID_SERVER_HMAC_KEY)
         for _ in range(64):
             _normalize_server_hmac_key(generate_server_hmac_key())
+
+    def test_validate_server_hmac_key_rejects_camel_and_alternating_unlisted_separators(
+        self,
+    ) -> None:
+        """Alignement des règles CamelCase et casse alternée sur normalized_ascii.
+
+        Vérifie que ``CorrectHorseBatteryStapleExtraWords1234#ABCD`` (sans
+        espaces, séparateur ``#``) et la variante à casse alternée sans espaces
+        sont rejetés sur le domaine normalisé ``normalized_ascii`` et que la
+        constante fermée morte ``_HUMAN_PHRASE_SEPARATORS`` a été supprimée.
+        """
+        self.assertFalse(hasattr(vault_crypto, "_HUMAN_PHRASE_SEPARATORS"))
+        for key in (
+            "CorrectHorseBatteryStapleExtraWords1234#ABCD",
+            "cOrReCtHoRsEBaTtErYsTaPlEeXtRaWoRdS#1234!A",
+            "cOrReCtHoRsEBaTtErYsTaPlEeXtRa##1234!AxyZq98",
+        ):
+            with self.subTest(key=key):
+                self.assertGreaterEqual(len(set(key)), 24)
+                with self.assertRaises(ValueError) as ctx:
+                    validate_server_hmac_key(key)
+                self.assertIn("phrase naturelle", str(ctx.exception))
 
     def test_cipher_fingerprint_canonicalizes_nfc_like_compute_secret_hmac(self) -> None:
         """VaultCipher.fingerprint canonise en NFC, parité avec compute_secret_hmac.
@@ -1282,6 +1305,93 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
         self.assertTrue(cipher.verify_secret_hmac(nfd_bytes, fp_without_aad))
         self.assertTrue(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, nfd_bytes, fp_without_aad))
         self.assertTrue(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, nfd_bytes, fp_with_aad, aad=aad))
+
+    async def test_stores_accept_bytearray_candidate_value_parity(self) -> None:
+        """Parité str | bytes | bytearray sur is_secret_value_matching / find_secrets_matching."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        ascii_val = "v_secret_bytearray_prod_123"
+        ascii_ba = bytearray(ascii_val.encode("utf-8"))
+        wrong_ba = bytearray(b"other_secret_value")
+        nfc_cafe = "caf\u00e9"
+        nfd_ba = bytearray("cafe\u0301".encode("utf-8"))
+
+        # 1. InMemorySecretStore
+        mem_store = InMemorySecretStore(cipher=cipher)
+        await mem_store.create("demo", "prod", "ASCII_KEY", ascii_val)
+        await mem_store.create("demo", "prod", "CAFE", nfc_cafe)
+
+        self.assertTrue(
+            await mem_store.is_secret_value_matching("demo", "prod", "ASCII_KEY", ascii_ba)
+        )
+        self.assertFalse(
+            await mem_store.is_secret_value_matching("demo", "prod", "ASCII_KEY", wrong_ba)
+        )
+        self.assertFalse(
+            await mem_store.is_secret_value_matching("demo", "prod", "ASCII_KEY", bytearray())
+        )
+        self.assertTrue(await mem_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_ba))
+        self.assertEqual(
+            [m["name"] for m in await mem_store.find_secrets_matching_value("demo", ascii_ba)],
+            ["ASCII_KEY"],
+        )
+        self.assertEqual(
+            [m["name"] for m in await mem_store.find_secrets_matching_value("demo", nfd_ba)],
+            ["CAFE"],
+        )
+        self.assertEqual(await mem_store.find_secrets_matching_value("demo", bytearray()), [])
+
+        # Repli déchiffrement ligne héritée (sans empreinte) en mémoire
+        mem_store._secrets[("demo", "prod", "ASCII_KEY")]["fingerprint"] = ""
+        self.assertTrue(
+            await mem_store.is_secret_value_matching("demo", "prod", "ASCII_KEY", ascii_ba)
+        )
+        self.assertEqual(
+            [m["name"] for m in await mem_store.find_secrets_matching_value("demo", ascii_ba)],
+            ["ASCII_KEY"],
+        )
+
+        # 2. SqliteSecretStore
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            sql_store = SqliteSecretStore(db_path, cipher)
+            await sql_store.create("demo", "prod", "ASCII_KEY", ascii_val)
+            await sql_store.create("demo", "prod", "CAFE", nfc_cafe)
+
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("demo", "prod", "ASCII_KEY", ascii_ba)
+            )
+            self.assertFalse(
+                await sql_store.is_secret_value_matching("demo", "prod", "ASCII_KEY", wrong_ba)
+            )
+            self.assertFalse(
+                await sql_store.is_secret_value_matching("demo", "prod", "ASCII_KEY", bytearray())
+            )
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("demo", "prod", "CAFE", nfd_ba)
+            )
+            self.assertEqual(
+                [m["name"] for m in await sql_store.find_secrets_matching_value("demo", ascii_ba)],
+                ["ASCII_KEY"],
+            )
+            self.assertEqual(
+                [m["name"] for m in await sql_store.find_secrets_matching_value("demo", nfd_ba)],
+                ["CAFE"],
+            )
+            self.assertEqual(await sql_store.find_secrets_matching_value("demo", bytearray()), [])
+
+            # Repli déchiffrement ligne héritée SQLite
+            with db_session(db_path) as conn:
+                conn.execute(
+                    "UPDATE secrets SET fingerprint = '' WHERE project_id = ? AND name = ?",
+                    ("demo", "ASCII_KEY"),
+                )
+            self.assertTrue(
+                await sql_store.is_secret_value_matching("demo", "prod", "ASCII_KEY", ascii_ba)
+            )
+            self.assertEqual(
+                [m["name"] for m in await sql_store.find_secrets_matching_value("demo", ascii_ba)],
+                ["ASCII_KEY"],
+            )
 
     async def test_corrupted_fingerprint_in_database_handled_safely(self) -> None:
         """Une empreinte corrompue bascule sur le repli déchiffrement sans faux négatif."""

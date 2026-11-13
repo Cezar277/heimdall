@@ -124,7 +124,6 @@ _HUMAN_PHRASE_MIN_CHARS: int = 32
 _HUMAN_PHRASE_MAX_WORD_RATIO: float = 0.85
 _CAMEL_WORDS_MIN_COUNT: int = 4
 _CAMEL_WORDS_PATTERN: re.Pattern[str] = re.compile(r"[A-Z][a-z]{2,}")
-_HUMAN_PHRASE_SEPARATORS: str = " -_.:,;!?/"
 _NATURAL_WORD_MIN_LEN: int = 2
 _ALTERNATING_CASE_MIN_RATIO: float = 0.75
 _ALTERNATING_CASE_MIN_ALPHA_RATIO: float = 0.80
@@ -143,10 +142,10 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
     cleaned = "".join(" " if ch.isspace() else ch for ch in stripped)
     if len(cleaned) < _HUMAN_PHRASE_MIN_CHARS:
         return False
-    # Normalisation défensive des séparateurs (revue LOW #116 #226) : la liste
-    # _HUMAN_PHRASE_SEPARATORS est une liste fermée, contournable par tout
-    # séparateur hors liste ("#", "@", "&", ...). Tout non-alphanumérique ASCII
-    # est donc réduit à un blanc générique avant les règles de ratios.
+    # Normalisation défensive des séparateurs (revue LOW #116 #226) : une liste
+    # fermée de séparateurs est contournable par tout symbole hors liste ("#",
+    # "@", "&", ...). Tout non-alphanumérique ASCII est donc réduit à un blanc
+    # générique avant toutes les règles (y compris CamelCase et casse alternée).
     normalized_ascii = re.sub(r"[^A-Za-z0-9 ]+", " ", cleaned)
     total = len(normalized_ascii)
     lowercase_or_sep = sum(
@@ -184,18 +183,18 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
             and word_chars / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
         ):
             return True
-    camel_words = _CAMEL_WORDS_PATTERN.findall(cleaned)
+    camel_words = _CAMEL_WORDS_PATTERN.findall(normalized_ascii)
     camel_len = sum(len(w) for w in camel_words) + sum(
         1
-        for ch in cleaned
-        if ch.isascii() and (ch.isdigit() or ch in _HUMAN_PHRASE_SEPARATORS)
+        for ch in normalized_ascii
+        if ch.isascii() and (ch.isdigit() or ch == " ")
     )
     if (
         len(camel_words) >= _CAMEL_WORDS_MIN_COUNT
         and camel_len / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
     ):
         return True
-    letters = [ch for ch in cleaned if ch.isascii() and ch.isalpha()]
+    letters = [ch for ch in normalized_ascii if ch.isascii() and ch.isalpha()]
     if (
         len(letters) >= _HUMAN_PHRASE_MIN_CHARS
         and len(letters) / total >= _ALTERNATING_CASE_MIN_ALPHA_RATIO

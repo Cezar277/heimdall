@@ -299,7 +299,7 @@ class InMemorySecretStore:
         project: str,
         env: str,
         name: str,
-        candidate_value: str | bytes,
+        candidate_value: str | bytes | bytearray,
     ) -> bool:
         """Vérifie en temps constant si candidate_value correspond au secret stocké.
 
@@ -309,7 +309,7 @@ class InMemorySecretStore:
         valide et immunisée contre la rotation de KEK.
         """
         if not isinstance(candidate_value, (str, bytes, bytearray)):
-            raise TypeError("La valeur candidate doit être de type str ou bytes.")
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
         if not project or not env or not name:
             raise ValueError("Le triplet d'identité (project, env, name) ne peut pas être vide.")
         if not candidate_value:
@@ -355,7 +355,7 @@ class InMemorySecretStore:
     async def find_secrets_matching_value(
         self,
         project: str,
-        candidate_value: str | bytes,
+        candidate_value: str | bytes | bytearray,
         env: str | None = None,
     ) -> list[dict[str, str]]:
         """Trouve les métadonnées des secrets d'un projet correspondant à candidate_value.
@@ -366,7 +366,7 @@ class InMemorySecretStore:
         Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
         if not isinstance(candidate_value, (str, bytes, bytearray)):
-            raise TypeError("La valeur candidate doit être de type str ou bytes.")
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
         if not candidate_value:
             return []
         if not self._cipher.has_explicit_server_hmac_key:
@@ -907,7 +907,7 @@ class SqliteSecretStore:
         project: str,
         env: str,
         name: str,
-        candidate_value: str | bytes,
+        candidate_value: str | bytes | bytearray,
     ) -> bool:
         """Vérifie en temps constant si candidate_value correspond au secret stocké.
 
@@ -916,7 +916,7 @@ class SqliteSecretStore:
         Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
         if not isinstance(candidate_value, (str, bytes, bytearray)):
-            raise TypeError("La valeur candidate doit être de type str ou bytes.")
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
         if not project or not env or not name:
             raise ValueError("Le triplet d'identité (project, env, name) ne peut pas être vide.")
         if not candidate_value:
@@ -940,10 +940,10 @@ class SqliteSecretStore:
         project: str,
         env: str,
         name: str,
-        candidate_value: str | bytes,
+        candidate_value: str | bytes | bytearray,
     ) -> bool:
         if not isinstance(candidate_value, (str, bytes, bytearray)):
-            raise TypeError("La valeur candidate doit être de type str ou bytes.")
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
         if not project or not env or not name:
             raise ValueError("Le triplet d'identité (project, env, name) ne peut pas être vide.")
         if not candidate_value:
@@ -987,7 +987,7 @@ class SqliteSecretStore:
     async def find_secrets_matching_value(
         self,
         project: str,
-        candidate_value: str | bytes,
+        candidate_value: str | bytes | bytearray,
         env: str | None = None,
     ) -> list[dict[str, str]]:
         """Trouve les métadonnées des secrets d'un projet correspondant à candidate_value.
@@ -998,7 +998,7 @@ class SqliteSecretStore:
         Exige une clé HMAC serveur explicite (non dérivée de la KEK).
         """
         if not isinstance(candidate_value, (str, bytes, bytearray)):
-            raise TypeError("La valeur candidate doit être de type str ou bytes.")
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
         if not candidate_value:
             return []
         if not self._cipher.has_explicit_server_hmac_key:
@@ -1017,11 +1017,11 @@ class SqliteSecretStore:
     def _find_secrets_matching_value(
         self,
         project: str,
-        candidate_value: str | bytes,
+        candidate_value: str | bytes | bytearray,
         env: str | None = None,
     ) -> list[dict[str, str]]:
         if not isinstance(candidate_value, (str, bytes, bytearray)):
-            raise TypeError("La valeur candidate doit être de type str ou bytes.")
+            raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")
         if not candidate_value:
             return []
         candidate_val_bytes = canonicalize_secret_value(candidate_value)
