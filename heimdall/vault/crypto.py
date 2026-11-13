@@ -482,6 +482,13 @@ def canonicalize_secret_value(value: str | bytes | bytearray) -> bytes:
     return unicodedata.normalize("NFC", text).encode("utf-8")
 
 
+def _normalize_aad_bytes(aad: str | bytes | bytearray) -> bytes:
+    """Valide et convertit un contexte AAD en ``bytes`` (refuse int/memoryview)."""
+    if not isinstance(aad, (str, bytes, bytearray)):
+        raise TypeError("Le contexte AAD doit être de type str, bytes ou bytearray.")
+    return aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
+
+
 def compute_secret_hmac(
     server_key: str | bytes | bytearray,
     value: str | bytes | bytearray,
@@ -552,7 +559,7 @@ def compute_secret_hmac(
         raise ValueError("La valeur du secret ne peut pas être vide.")
 
     if aad is not None:
-        aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
+        aad_bytes = _normalize_aad_bytes(aad)
         if not aad_bytes:
             raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
         message = aad_bytes + b"\x00" + value_bytes
@@ -1239,7 +1246,12 @@ class VaultCipher:
         finally:
             dek[:] = b"\x00" * len(dek)
 
-    def fingerprint(self, plaintext: bytes, *, aad: bytes = b"") -> str:
+    def fingerprint(
+        self,
+        plaintext: str | bytes | bytearray,
+        *,
+        aad: str | bytes | bytearray = b"",
+    ) -> str:
         """Empreinte HMAC-SHA256 non réversible et liée au triplet d'identité.
 
         Utilise la clé d'empreinte active (sous-clé HKDF dérivée ou clé serveur
@@ -1249,11 +1261,13 @@ class VaultCipher:
         non corrélables depuis la seule base. Déterministe pour un même
         ``(clé d'empreinte, aad, valeur)``.
 
-        La valeur est canonisée en NFC (``canonicalize_secret_value``, ticket
-        #116) au même titre que ``compute_secret_hmac`` : un appelant librairie
-        passant des octets en forme décomposée (NFD) obtient la même empreinte
-        que sa forme NFC — aucun faux négatif silencieux de détection. Les
-        octets non-UTF8 restent pris tels quels (secrets binaires).
+        La valeur (``str``, ``bytes`` ou ``bytearray``) est canonisée en NFC
+        (``canonicalize_secret_value``, ticket #116) et ``aad`` validé en
+        ``str | bytes | bytearray`` au même titre que ``compute_secret_hmac`` :
+        un appelant librairie passant une chaîne ou des octets en forme
+        décomposée (NFD) obtient la même empreinte que sa forme NFC — aucun
+        faux négatif silencieux de détection. Les octets non-UTF8 restent pris
+        tels quels (secrets binaires).
 
         Note d'architecture (#71) : cette empreinte est un auxiliaire pré-rotation
         calculé lors de l'insertion initiale. Lors d'une rotation de KEK par
@@ -1262,7 +1276,8 @@ class VaultCipher:
         L'empreinte reste donc volontairement inchangée et ne doit pas servir de
         contrôle d'intégrité post-rotation.
         """
-        message = bytes(aad) + b"\x00" + canonicalize_secret_value(plaintext)
+        aad_bytes = _normalize_aad_bytes(aad)
+        message = aad_bytes + b"\x00" + canonicalize_secret_value(plaintext)
         return hmac.new(self._fingerprint_key, message, hashlib.sha256).hexdigest()
 
     def compute_secret_hmac(
@@ -1347,9 +1362,7 @@ class VaultCipher:
         ):
             return False
         if aad is not None:
-            if not isinstance(aad, (str, bytes, bytearray)):
-                raise TypeError("Le contexte AAD doit être de type str, bytes ou bytearray.")
-            aad_bytes = aad.encode("utf-8") if isinstance(aad, str) else bytes(aad)
+            aad_bytes = _normalize_aad_bytes(aad)
             if not aad_bytes:
                 raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
             candidate_fp = self.fingerprint(canonicalize_secret_value(value), aad=aad_bytes)

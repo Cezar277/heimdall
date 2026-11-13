@@ -210,6 +210,49 @@ class SecretHmacCryptoTests(TestCase):
         with self.assertRaises(ValueError):
             compute_secret_hmac(12345, val_str)  # type: ignore[arg-type]
 
+    def test_compute_and_verify_secret_hmac_reject_non_str_bytes_bytearray_aad(self) -> None:
+        """Refuse aad=int/memoryview (anti-bytes(int)) tout en acceptant str/bytes/bytearray."""
+        fp_nul = compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "secret_val", aad=b"\x00" * 3)
+        fp_ctx = compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "secret_val", aad="ctx")
+        self.assertEqual(
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "secret_val", aad=bytearray(b"ctx")),
+            fp_ctx,
+        )
+        self.assertTrue(
+            verify_secret_hmac(
+                _VALID_SERVER_HMAC_KEY, "secret_val", fp_ctx, aad=bytearray(b"ctx")
+            )
+        )
+
+        # aad=3 ou memoryview ne doit jamais être converti en bytes(3) (b"\x00\x00\x00")
+        for bad_aad in (3, 123, memoryview(b"ctx"), memoryview(b"\x00" * 3)):
+            with self.subTest(bad_aad=bad_aad):
+                with self.assertRaises(TypeError):
+                    compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "secret_val", aad=bad_aad)  # type: ignore[arg-type]
+                with self.assertRaises(TypeError):
+                    verify_secret_hmac(
+                        _VALID_SERVER_HMAC_KEY,
+                        "secret_val",
+                        fp_nul,
+                        aad=bad_aad,  # type: ignore[arg-type]
+                    )
+
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        for bad_aad in (123, memoryview(b"ctx")):
+            with self.subTest(cipher_bad_aad=bad_aad):
+                with self.assertRaises(TypeError):
+                    cipher.compute_secret_hmac("secret_val", aad=bad_aad)  # type: ignore[arg-type]
+                with self.assertRaises(TypeError):
+                    cipher.verify_secret_hmac("secret_val", fp_ctx, aad=bad_aad)  # type: ignore[arg-type]
+                with self.assertRaises(TypeError):
+                    cipher.is_secret_value_matching(
+                        "secret_val",
+                        fp_ctx,
+                        aad=bad_aad,  # type: ignore[arg-type]
+                    )
+                with self.assertRaises(TypeError):
+                    cipher.fingerprint("secret_val", aad=bad_aad)  # type: ignore[arg-type]
+
     def test_normalize_server_hmac_key_rejects_trivial_or_repetitive_keys(self) -> None:
         """Refuse les clés de faible entropie (répétitives ou périodiques)."""
         # Caractère unique répété
@@ -435,6 +478,24 @@ class SecretHmacCryptoTests(TestCase):
                 bytes(aad) + b"\x00" + binary,
                 hashlib.sha256,
             ).hexdigest(),
+        )
+
+    def test_cipher_fingerprint_accepts_str_bytes_bytearray_and_str_aad_parity(self) -> None:
+        """Parité str | bytes | bytearray sur VaultCipher.fingerprint() et aad."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        self.assertEqual(cipher.fingerprint("str"), cipher.fingerprint(b"str"))
+        self.assertEqual(cipher.fingerprint("str"), cipher.fingerprint(bytearray(b"str")))
+
+        expected_ctx = cipher.compute_secret_hmac("caf\u00e9", aad="ctx")
+        self.assertEqual(cipher.fingerprint("caf\u00e9", aad="ctx"), expected_ctx)
+        self.assertEqual(cipher.fingerprint("cafe\u0301", aad="ctx"), expected_ctx)
+        self.assertEqual(
+            cipher.fingerprint(bytearray("cafe\u0301".encode("utf-8")), aad=bytearray(b"ctx")),
+            expected_ctx,
+        )
+        self.assertEqual(
+            cipher.fingerprint(b"caf\xc3\xa9", aad=b"ctx"),
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "caf\u00e9", aad="ctx"),
         )
 
     def test_candidate_value_empty_parity_cipher(self) -> None:
