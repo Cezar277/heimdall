@@ -16,10 +16,11 @@ ticket ; elle ne remplace pas la revue de code.
 > **Base de la PR** : la preuve porte sur le chemin *opérationnel* (route HTTP
 > + stores du Vault), introduit par le sous-ticket #117 (§8 de l'ADR-006). La
 > branche #118 est donc empilée sur `117-t403-api-de-transition` : elle en est
-> un **fast-forward strict** jusqu'à `e8f63eb` (aucun commit de fusion avec
-> `main`, aucune divergence d'historique), et la **base de la PR
+> un **fast-forward strict** jusqu'à `e8f63eb`, puis un **unique commit de
+> fusion** avec la branche #117 (`4a49890`, tests uniquement) — **aucun commit
+> de fusion avec `main`**, aucune divergence d'historique. La **base de la PR
 > [#225](https://github.com/Cezar277/heimdall/pull/225) est la branche #117** —
-> le diff affiché par GitHub (base commune `e8f63eb` → tête de branche) ne
+> le diff affiché par GitHub (base commune = tête de la branche #117) ne
 > contient donc que les fichiers #118 :
 >
 > ```text
@@ -31,10 +32,9 @@ ticket ; elle ne remplace pas la revue de code.
 > tests/test_vault_transitions_forbidden.py
 > ```
 >
-> La branche #117 a reçu depuis un commit **de tests uniquement** (`4a49890` :
-> cible et acteur hostiles), qui appartient à #117 et ne fait pas partie du
-> diff de #118 : la base commune des deux branches reste `e8f63eb`, et le diff
-> de la PR reste celui des 5 fichiers ci-dessus.
+> Le commit de fusion avec #117 n'apporte que les **tests** de cible et
+> d'acteur hostiles (`4a49890`) : il appartient à #117, n'est pas dans le diff
+> de #118 et ne modifie aucun fichier de production.
 >
 > Aucun fichier de production n'est modifié par #118 : ni `heimdall/**`,
 > ni `openapi.yaml`, ni `schemas/**`. Le diff contre `main` contient en plus
@@ -192,7 +192,7 @@ Révisions à re-pinner après la fusion : `30201593c50a869492c8dd0cc9811acbb20c
 
 | Remarque | Correctif | Preuve |
 |---|---|---|
-| **[LOW] PR empilée : le diff contre `main` embarquait le chemin opérationnel #117**, alors que la description annonçait « aucun code de production modifié » | La **base de la PR #225 est la branche #117** (`117-t403-api-de-transition`) : le diff affiché par GitHub part de la base commune `e8f63eb` et ne contient plus que les 5 fichiers #118, aucun fichier de production (ni `heimdall/**`, ni `openapi.yaml`, ni `schemas/**`). La branche #118 est un fast-forward strict de `e8f63eb`, **sans commit de fusion avec `main`**. | § « Base de la PR » ci-dessus ; `git diff --name-only "$(git merge-base origin/117-t403-api-de-transition HEAD)"..HEAD` |
+| **[LOW] PR empilée : le diff contre `main` embarquait le chemin opérationnel #117**, alors que la description annonçait « aucun code de production modifié » | La **base de la PR #225 est la branche #117** (`117-t403-api-de-transition`) : le diff affiché par GitHub part de la base commune et ne contient plus que les 5 fichiers #118, aucun fichier de production (ni `heimdall/**`, ni `openapi.yaml`, ni `schemas/**`). La branche #118 est un fast-forward strict de `e8f63eb` puis un unique commit de fusion avec #117 (`4a49890`, tests uniquement), **sans commit de fusion avec `main`**. | § « Base de la PR » ci-dessus ; `git diff --name-only "$(git merge-base origin/117-t403-api-de-transition HEAD)"..HEAD` |
 | **[LOW] Assertion de non-reflet fragile en sous-chaîne** (`assert target not in response.text`) : les noms d'état sont des mots courts qu'une recherche sur la réponse entière confond avec un autre mot (« rote » dans « protégé ») | Le non-reflet de l'état demandé est mesuré sur le **corps JSON** (`target not in json.dumps(response.json())`). La garantie principale reste l'**égalité stricte** au payload contractuel `{"code": "bad_request", "message": "Requête invalide"}`. Le canari, jeton unique, reste cherché dans toute la réponse, en-têtes compris. | `::TestForbiddenTransitionApi::test_forbidden_transition_is_refused_without_side_effect` (18 cas), `::test_unknown_target_state_is_refused` |
 | **[Tests manquants signalés]** — cible hostile de type secret en API, acteur `\n`/SQL : **hors périmètre de #118**, à traiter dans #117 | Non ajoutés ici (la revue l'exclut explicitement du périmètre de #118) ; **traités dans #117** (commit `4a49890`) : `tests/test_vault_transitions_api.py::test_hostile_target_status_is_400_static_without_reflection` (4 cibles × 2 backends) et `::test_hostile_actor_is_normalized_to_unknown_and_never_persisted` (4 acteurs). Aucun code de production modifié. | § 6 de `docs/t117-samm.md` |
 

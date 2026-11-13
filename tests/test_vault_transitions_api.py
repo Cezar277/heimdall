@@ -210,6 +210,34 @@ def test_invalid_transition_body_is_400_without_reflection(
     assert _transitions(vault) == []
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "sk_live_51H8xkZK2eZvKYloR0000SECRETvalue",
+        "0" * 64,
+        "AKIAIOSFODNN7EXAMPLE",
+        "key_" + "0" * 32,
+    ],
+)
+def test_hostile_target_status_is_400_static_without_reflection(
+    vault: TestClient, target: str
+) -> None:
+    """Une cible qui *ressemble* à un secret ou à une clé est refusée sans être reflétée.
+
+    Ces valeurs ne sont pas des états du cycle de vie : elles doivent être
+    refusées en 400 statique, sans reflet de l'entrée ni de la valeur du
+    secret, et sans effet de bord (état et journal inchangés).
+    """
+    _create(vault)
+    response = vault.post(_TRANSITION, json={"target_status": target})
+    assert response.status_code == 400
+    assert response.json() == _BAD_REQUEST
+    assert target not in response.text
+    assert _CANARY not in response.text
+    assert vault.get(_STATE).json()["status"] == "vaulte"
+    assert _transitions(vault) == []
+
+
 def test_authentication_and_project_isolation_precede_any_write(vault: TestClient) -> None:
     _create(vault)
     owner_key = vault.headers["X-Heimdall-API-Key"]
@@ -292,6 +320,40 @@ def test_actor_is_normalized_and_never_taken_from_request() -> None:
         entries = await store._list_transitions(_PROJECT, _ENV, _NAME)
         assert entries[0]["actor"] == "unknown"
         assert "forged" not in str(entries)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "actor",
+    [
+        "forged\nactor_not_a_key",
+        "'; DROP TABLE secret_transitions; --",
+        "actor' OR '1'='1",
+        _CANARY,
+    ],
+)
+def test_hostile_actor_is_normalized_to_unknown_and_never_persisted(actor: str) -> None:
+    """Un acteur hostile (saut de ligne, injection SQL, clé brute) retombe sur ``unknown``.
+
+    L'acteur interne est toujours normalisé avant écriture : seule la forme
+    ``key_<32 hex>`` est acceptée, tout le reste devient ``unknown``. Ni la
+    valeur du secret ni l'acteur forgé ne doivent atteindre le journal.
+    """
+
+    async def scenario() -> None:
+        store = InMemorySecretStore()
+        await store.create(_PROJECT, _ENV, _NAME, _CANARY)
+        record = await store.transition(_PROJECT, _ENV, _NAME, "rote", actor=actor)
+        assert record is not None
+        assert record["actor"] == "unknown"
+        entries = await store._list_transitions(_PROJECT, _ENV, _NAME)
+        assert entries[0]["actor"] == "unknown"
+        journal = str(entries)
+        assert _CANARY not in journal
+        assert "forged" not in journal
+        assert "DROP TABLE" not in journal
+        assert "1'='1" not in journal
 
     asyncio.run(scenario())
 
