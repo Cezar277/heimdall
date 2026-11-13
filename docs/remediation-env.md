@@ -21,14 +21,16 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
   les valeurs sont **systématiquement ignorées**. Seuls les noms validés sont écrits.
 - **Idempotence** : une variable déjà déclarée n'est pas dupliquée.
 - **Préservation et purge des commentaires** : les commentaires `#` respectant la liste
-  blanche documentaire stricte (prose multi-mots, URL sans userinfo, versions) sont
-  préservés, mais toute affectation ou valeur après `=` dans un commentaire (ex.
-  `# APP_KEY=h****k`) et tout commentaire nu non allowlisté (jeton isolé comme
-  `# hunter2`, mot-clé évocateur suivi d'une valeur, motif reconnu par le masquage
-  central #16/#22, jeton dense ou valeur à haute entropie) est **systématiquement
-  purgé et masqué** par `***` sur disque et dans les diffs `plan_env_example_change`
-  (before et after), garantissant l'invariant 8 strict (zéro secret dans
-  `.env.example` versionné ni dans les diffs affichés).
+  blanche documentaire (prose alphabétique multi-mots courte `< 16` car./mot, URL sans
+  userinfo, versions) sont préservés, tandis que toute affectation ou valeur après `=`
+  dans un commentaire (ex. `# APP_KEY=h****k`) et tout commentaire nu non allowlisté
+  (jeton isolé comme `# hunter2`, mot-clé évocateur suivi d'une valeur, motif reconnu
+  par le masquage central #16/#22, jeton dense, alphanumérique ou à haute entropie
+  `>= 16` car.) est purgé et masqué par `***` sur disque et dans les diffs
+  `plan_env_example_change` (`before` et `after`). Limite assumée : la prose
+  alphabétique multi-mots courte sans `=`, userinfo, préfixe connu ni mot-clé
+  évocateur est conservée par conception pour la lisibilité et soumise à la revue
+  humaine T32.
 
 ### 1.2. `.env` avec permissions strictes 0600 (T31.2)
 - **Secrets locaux en clair** : contient les associations `NOM="valeur"`.

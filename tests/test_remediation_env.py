@@ -1285,9 +1285,9 @@ def test_env_example_short_bare_comment_only_purge_reports_update(tmp_path: Path
     assert before == "# ***\nAPP_KEY=\n"
     assert after == "# ***\nAPP_KEY=\n"
 
-    # 2. update_env_example retourne une liste non vide et purge sur disque
+    # 2. update_env_example retourne les marqueurs #comment:N et purge sur disque
     changed = update_env_example(tmp_path, ["APP_KEY"])
-    assert changed
+    assert changed == ["#comment:1"]
     disk_content = example_file.read_text(encoding="utf-8")
     assert "hunter2" not in disk_content
     assert disk_content == "# ***\nAPP_KEY=\n"
@@ -1309,3 +1309,27 @@ def test_env_example_short_bare_comment_only_purge_reports_update(tmp_path: Path
         warn_stderr=False,
     )
     assert receipt_second.example_created_or_updated is False
+
+
+def test_env_example_short_alpha_prose_comment_preserved_as_documented_limit(
+    tmp_path: Path,
+) -> None:
+    """Limite documentée : la prose alphabétique multi-mots courte est préservée pour T32."""
+    example_file = tmp_path / ".env.example"
+    initial = "# my sample\nAPP_KEY=\n"
+    example_file.write_text(initial, encoding="utf-8")
+
+    # Prose alpha multi-mots courte sans mot-clé évocateur ni entropie : préservée
+    assert plan_env_example_change(tmp_path, ["APP_KEY"]) is None
+    assert update_env_example(tmp_path, ["APP_KEY"]) == []
+    assert example_file.read_text(encoding="utf-8") == initial
+
+    # Dès qu'un jeton non alphabétique est présent (ex. astérisques/chiffre), il est purgé
+    example_file.write_text("# my h****r\nAPP_KEY=\n", encoding="utf-8")
+    plan = plan_env_example_change(tmp_path, ["APP_KEY"])
+    assert plan is not None
+    _, before, after = plan
+    assert "h****r" not in before
+    assert "h****r" not in after
+    assert update_env_example(tmp_path, ["APP_KEY"]) == ["#comment:1"]
+    assert example_file.read_text(encoding="utf-8") == "# ***\nAPP_KEY=\n"

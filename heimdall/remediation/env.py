@@ -590,10 +590,14 @@ def _has_evocative_keyword_secret(without_urls: str) -> bool:
 def _is_allowlisted_doc_comment(raw_line: str) -> bool:
     """Vrai uniquement pour un commentaire nu respectant la liste blanche documentaire.
 
-    Approche fail-closed (refus par défaut) : tout commentaire nu non allowlisté
-    (jeton isolé comme ``# hunter2``, jeton alphanumérique, haute entropie, userinfo
-    d'URL, motif du masquage central, mot-clé évocateur suivi d'une valeur) est
-    purgé en ``# ***`` pour garantir l'invariant 8.
+    Sont purgés en ``# ***`` : les commentaires à un seul mot (ex. ``# hunter2``),
+    les jetons alphanumériques/symboliques non documentaires, les jetons >= 16 car.
+    à haute entropie, les userinfo d'URL, les motifs du masquage central et les
+    mots-clés évocateurs suivis d'une valeur.
+
+    Limite assumée : la prose alphabétique multi-mots courte (< 16 car./mot, sans
+    ``=``, userinfo, préfixe connu ni mot-clé évocateur) est conservée par
+    conception comme documentation et reste soumise à la revue humaine T32.
     """
     stripped = raw_line.strip()
     if not stripped.startswith("#"):
@@ -629,7 +633,9 @@ def _sanitize_example_comment_line(raw_line: str, *, mask_values: bool) -> str:
       une valeur à haute entropie, elle est systématiquement purgée et masquée par '***'
       sur disque et dans les diffs (before et after) pour garantir l'invariant 8
       (zéro secret dans .env.example versionné ni dans les diffs affichés).
-    - Les commentaires ordinaires de documentation sans secret sont préservés.
+    - Les commentaires ordinaires en prose alphabétique multi-mots courte
+      (sans secret détectable ni mot-clé évocateur) sont préservés par conception
+      et relus en revue humaine T32.
     """
     if "=" in raw_line:
         head, _, val = raw_line.partition("=")
@@ -661,7 +667,9 @@ def _build_sanitized_example_content(
     Si ``mask_values`` est vrai, une valeur préexistante non vide est remplacée
     par le marqueur constant ``***`` au lieu d'être supprimée : utilisé pour
     produire un ``before`` de diff qui ne révèle jamais le secret d'origine.
-    Retourne le contenu assaini final et la liste des variables modifiées ou ajoutées.
+    Retourne le contenu assaini final et la liste des noms ajoutés ou modifiés
+    (valeurs purgées), suivis des marqueurs ``#comment:<ligne>`` pour les
+    commentaires assainis.
     """
     existing_keys: set[str] = set()
     modified_keys: list[str] = []
@@ -830,9 +838,11 @@ def update_env_example(
     système via validate_variable_name (lève EnvRemediationError si invalide).
 
     L'écriture est idempotente : si une variable est déjà déclarée dans .env.example,
-    elle n'est pas dupliquée. L'ordre et les commentaires existants sont préservés.
+    elle n'est pas dupliquée. L'ordre et les commentaires documentaires allowlistés
+    sont préservés.
 
-    Retourne la liste des variables nouvellement ajoutées.
+    Retourne la liste des noms ajoutés ou modifiés (valeurs purgées), suivis le cas
+    échéant des marqueurs statiques de purge de commentaires (``#comment:<ligne>``).
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
