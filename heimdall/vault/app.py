@@ -114,6 +114,7 @@ from heimdall.vault.database import (
     _MAX_SECRET_PAGE_OFFSET,
     DEFAULT_DB_PATH,
     DatabaseUnavailableError,
+    TransitionConcurrencyError,
     _assert_not_symlink,
     resolve_db_path,
     validate_db_path,
@@ -123,6 +124,12 @@ from heimdall.vault.store import (
     InMemorySecretStore,
     QuotaExceededError,
     SqliteSecretStore,
+)
+from heimdall.vault.transitions import (
+    LifecycleTransitionError,
+    SecretLifecycleState,
+    UnknownStateError,
+    canonicalize_state,
 )
 
 _ALLOWED_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -492,6 +499,30 @@ class SecretRead(SecretMetadata):
     value: SecretValue
 
 
+class SecretTransitionRequest(BaseModel):
+    """Corps de requête pour un changement d'état (ticket #117).
+
+    Seul l'état CIBLE est fourni par le client. L'état source est toujours lu
+    côté serveur, jamais accepté depuis la requête. Le schéma expose les cinq
+    états du cycle de vie #115 ; seuls ``vaulte``/``rote`` sont persistables,
+    donc la seule transition API réussie est actuellement ``vaulte -> rote``.
+    """
+
+    model_config = ConfigDict(extra="forbid", regex_engine="python-re")
+    target_status: SecretLifecycleState
+
+
+class SecretTransitionResult(BaseModel):
+    """Résultat d'une transition acceptée, sans valeur ni secret (ticket #117)."""
+
+    model_config = ConfigDict(extra="forbid")
+    project: ProjectId
+    env: EnvironmentId
+    name: SecretName
+    previous_status: SecretStatus
+    status: SecretStatus
+
+
 _MAX_SECRET_OFFSET = _MAX_SECRET_PAGE_OFFSET
 
 
@@ -598,6 +629,18 @@ _SECRETS_STATE_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
         "model": SecretMetadata,
         "description": "Métadonnées courantes, sans la valeur (état seul).",
+        "headers": _NO_STORE_HEADER,
+    },
+}
+
+_SECRETS_TRANSITION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_SECRETS_GET_RESPONSES,
+    200: {
+        "model": SecretTransitionResult,
+        "description": (
+            "Transition acceptée : ancien et nouvel état canoniques, sans valeur "
+            "ni acteur exposé."
+        ),
         "headers": _NO_STORE_HEADER,
     },
 }
@@ -1661,11 +1704,36 @@ def _register_routes(app: FastAPI) -> None:  # noqa: PLR0915
                 status_code=404,
                 detail="Ressource introuvable",
             )
+        try:
+            # Défense en profondeur : même si la base est corrompue (casse,
+            # espaces), un état non canonique ne doit jamais restituer la
+            # valeur. ``rote`` et tout état inconnu retournent le même 404.
+            current_status = canonicalize_state(record["status"])
+        except UnknownStateError:
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            ) from None
+        if current_status not in ("vaulte", "rote"):
+            # Le Vault ne persiste que ces deux états : tout autre état
+            # canonique (détecté, confirmé, faux positif) est une corruption.
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            )
+        if current_status == "rote":
+            # Un secret roté ne restitue jamais l'ancienne valeur (contrat
+            # openapi.yaml) : même réponse 404 que pour un secret absent, sans
+            # révéler l'état ni l'existence de la ressource.
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            )
         return SecretRead(
             project=record["project"],
             env=record["env"],
             name=record["name"],
-            status=record["status"],  # type: ignore[arg-type]
+            status=current_status,
             value=record["value"],
         )
 
@@ -1723,10 +1791,92 @@ def _register_routes(app: FastAPI) -> None:  # noqa: PLR0915
                 status_code=404,
                 detail="Ressource introuvable",
             )
+        try:
+            current_status = canonicalize_state(record["status"])
+        except UnknownStateError:
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            ) from None
+        if current_status not in ("vaulte", "rote"):
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            )
         return SecretMetadata(
             project=record["project"],
             env=record["env"],
             name=record["name"],
+            status=current_status,
+        )
+
+    @app.post(
+        "/api/v1/secrets/{project}/{env}/{name}/transition",
+        response_model=SecretTransitionResult,
+        status_code=200,
+        responses=_SECRETS_TRANSITION_RESPONSES,
+        tags=["Secrets"],
+        summary="Changer l'état d'un secret",
+        operation_id="transitionSecret",
+        # Même contrôle d'accès que GET/DELETE : 401 avant toute recherche,
+        # 403 pour un projet étranger, 404 seulement pour un secret absent.
+        dependencies=[Depends(vault_auth.require_project_access())],
+    )
+    async def transition_secret(  # noqa: PLR0913, PLR0917
+        project: Annotated[
+            ProjectId,
+            FastApiPath(description="Identifiant public du projet ; aucune valeur secrète."),
+        ],
+        env: Annotated[
+            EnvironmentId,
+            FastApiPath(description="Environnement autorisé ; aucune valeur secrète."),
+        ],
+        name: Annotated[
+            SecretName,
+            FastApiPath(description="Nom de variable ; aucune valeur secrète."),
+        ],
+        transition_in: SecretTransitionRequest,
+        request: Request,
+        response: Response,
+    ) -> SecretTransitionResult:
+        """Change l'état d'un secret et journalise la transition (ticket #117).
+
+        L'état source est lu côté serveur, jamais fourni par le client. La
+        matrice #115 interdit toute transition non listée (400 générique), et
+        seuls les états persistables ``vaulte``/``rote`` peuvent être écrits.
+        Aucun message d'erreur ne reflète le corps reçu. La transition et son
+        entrée de journal sont écrites atomiquement par le store.
+        """
+        request.state.audit_target = f"{project}/{env}/{name}"
+        response.headers["Cache-Control"] = "no-store"
+        actor = getattr(request.state, "audit_key_id", None)
+        store: InMemorySecretStore | SqliteSecretStore = app.state.secret_store
+        try:
+            record = await store.transition(
+                project=project,
+                env=env,
+                name=name,
+                target_status=transition_in.target_status,
+                actor=actor if isinstance(actor, str) else None,
+            )
+        except (LifecycleTransitionError, TransitionConcurrencyError):
+            # Transition interdite, réflexive, état source/cible non conforme
+            # ou compare-and-set perdant (état changé sous nos pieds) : 400
+            # contractuel statique, sans exposer la matrice ni l'entrée.
+            raise StarletteHTTPException(
+                status_code=400,
+                detail="Requête invalide",
+            ) from None
+        if record is None:
+            raise StarletteHTTPException(
+                status_code=404,
+                detail="Ressource introuvable",
+            )
+        return SecretTransitionResult(
+            project=record["project"],
+            env=record["env"],
+            name=record["name"],
+            previous_status=record["previous_status"],  # type: ignore[arg-type]
             status=record["status"],  # type: ignore[arg-type]
         )
 
@@ -1995,6 +2145,8 @@ __all__ = [
     "SecretMetadata",
     "SecretPage",
     "SecretRead",
+    "SecretTransitionRequest",
+    "SecretTransitionResult",
     "Settings",
     "UnauthorizedError",
     "UnavailableError",

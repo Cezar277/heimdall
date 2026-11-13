@@ -1,0 +1,56 @@
+# Déploiement local durci du Vault Heimdall (#120).
+#
+# Le Vault est volontairement loopback-only : il refuse en 403 toute requête
+# dont l'IP source n'est pas 127.0.0.1/::1. Un port mapping Docker classique
+# ferait arriver la requête depuis l'IP du bridge Docker, donc en 403.
+# `network_mode: host` est le seul montage qui conserve la boucle locale sans
+# ajouter de proxy ni assouplir la garde de sécurité. Conséquence : Linux
+# uniquement (Docker Desktop macOS/Windows ne partage pas la loopback hôte).
+name: heimdall
+
+services:
+  vault:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: heimdall-vault:local
+    container_name: heimdall-vault
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    read_only: true
+    # Utilisateur non-root figé de l'image (10001:10001, voir Dockerfile:43-57).
+    # Volontairement sans variable : un `user:` variable résolvable en 0
+    # (UID 0 dans .env + `docker compose up` direct sans §4)
+    # démarrait transitoirement le conteneur en root avant la sortie 1
+    # de l'entrypoint. Le `sudo chown -R --no-dereference 10001:"$(id -g)"
+    # data secrets` + `750`/`640` du §3 du guide garde le certificat public
+    # lisible hôte et rend les bind mounts accessibles à cet UID fixe.
+    user: "10001:10001"
+    env_file:
+      - .env
+    environment:
+      HEIMDALL_ENV: production
+      HEIMDALL_VAULT_HOST: 127.0.0.1
+      HEIMDALL_VAULT_PORT: "8443"
+      HEIMDALL_VAULT_STORAGE_BACKEND: sqlite
+      HEIMDALL_VAULT_DB_PATH: /data/vault.db
+      HEIMDALL_VAULT_SSL_CERTFILE: /run/secrets/vault_tls_cert.pem
+      HEIMDALL_VAULT_SSL_KEYFILE: /run/secrets/vault_tls_key.pem
+    volumes:
+      - ./data:/data
+      - ./secrets:/run/secrets:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -18,6 +18,7 @@ Environment = Annotated[str, StringConstraints(min_length=1, max_length=32, patt
 Name = Annotated[str, StringConstraints(min_length=2, max_length=64, pattern=re.compile(r"^[A-Z][A-Z0-9_]{1,63}(?![\s\S])"))]
 Value = Annotated[str, StringConstraints(min_length=1, max_length=65536)]
 Status = Literal["vaulte", "rote"]
+LifecycleStatus = Literal["detecte", "confirme", "vaulte", "rote", "faux_positif"]
 
 
 class StrictModel(BaseModel):
@@ -45,6 +46,18 @@ class SecretRead(SecretMetadata):
 class SecretPage(StrictModel):
     items: list[SecretMetadata] = Field(max_length=100)
     next_offset: int | None = Field(ge=0, le=1_000_000)
+
+
+class SecretTransitionRequest(StrictModel):
+    target_status: LifecycleStatus
+
+
+class SecretTransitionResult(StrictModel):
+    project: Project
+    env: Environment
+    name: Name
+    previous_status: Status
+    status: Status
 
 
 class BadRequestError(StrictModel):
@@ -178,6 +191,13 @@ def build_app() -> FastAPI:
     @app.get("/api/v1/secrets/{project}/{env}/{name}/state", response_model=SecretMetadata,
              operation_id="getSecretState", responses={**responses, 200: {"headers": no_store}}, dependencies=[Depends(require_api_key)])
     def get_state(project: Annotated[Project, Path()], env: Annotated[Environment, Path()], name: Annotated[Name, Path()]) -> NoReturn:
+        raise NotImplementedError("Fixture de contrat uniquement")
+
+    @app.post("/api/v1/secrets/{project}/{env}/{name}/transition", response_model=SecretTransitionResult,
+              operation_id="transitionSecret", responses={**responses, 200: {"headers": no_store}},
+              dependencies=[Depends(require_api_key)])
+    def transition_secret(project: Annotated[Project, Path()], env: Annotated[Environment, Path()],
+                          name: Annotated[Name, Path()], body: SecretTransitionRequest) -> NoReturn:
         raise NotImplementedError("Fixture de contrat uniquement")
 
     @app.get("/api/v1/health", response_model=Health, operation_id="getHealth",

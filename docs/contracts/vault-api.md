@@ -61,8 +61,9 @@ distinctes est décrit au même endroit.
 | Méthode | Route | Succès | Contenu |
 | --- | --- | --- | --- |
 | POST | `/api/v1/secrets` | 201 | Création sans écrasement ; réponse de métadonnées |
-| GET | `/api/v1/secrets/{project}/{env}/{name}` | 200 | Métadonnées et valeur courante |
-| GET | `/api/v1/secrets/{project}/{env}/{name}/state` | 200 | Métadonnées sans valeur |
+| GET | `/api/v1/secrets/{project}/{env}/{name}` | 200 | Métadonnées et valeur courante ; 404 si l'état est `rote` |
+| GET | `/api/v1/secrets/{project}/{env}/{name}/state` | 200 | Métadonnées sans valeur, y compris pour `rote` |
+| POST | `/api/v1/secrets/{project}/{env}/{name}/transition` | 200 | Change l'état et journalise la transition (#117) |
 | GET | `/api/v1/health` | 200 | Seulement `{"status":"ok"}` ; 503 si indisponible |
 
 L'identité du secret est le triplet `(project, env, name)`, pas le
@@ -96,10 +97,11 @@ pas le comptage du flux. Cette exigence runtime ne s'exprime pas avec
 POST n'accepte pas d'état choisi par le client. Il retourne `vaulte` après
 persistance chiffrée. Le Finding côté CLI ne peut passer à `vaulte` qu'après
 vérification supplémentaire de la remédiation locale (#14). `rote` est réservé
-à une rotation vérifiée par le composant responsable (#40). Aucun endpoint
-de rotation ou de modification d'état n'est ajouté en v1. La lecture d'une
-ancienne valeur révoquée est interdite et doit retourner 404 ; la nouvelle
-version courante est servie après une rotation achevée.
+à une rotation vérifiée par le composant responsable (#40). La mutation d'état
+passe exclusivement par l'API de transition (#117) décrite ci-dessous, qui ne
+persiste que `vaulte` et `rote`. La lecture d'une ancienne valeur révoquée est
+interdite et retourne 404 ; la nouvelle version courante est servie après une
+rotation achevée.
 
 ## Authentification et transport
 
@@ -412,6 +414,87 @@ Colonnes persistées : `occurred_at`, `key_id`, `key_fingerprint`, `project`,
   anonyme garde `key_fingerprint` vide. Aucun `key_id` n'est recherché sur cette
   route, pour ne pas ajouter de lookup d'identifiant à un endpoint de santé.
 
+## Transition d'état (#117)
+
+`POST /api/v1/secrets/{project}/{env}/{name}/transition` change l'état d'un
+secret existant. Le corps est strict, `additionalProperties: false`, et ne
+contient **que** l'état cible : `{"target_status": "rote"}`. L'état source est
+toujours relu côté serveur, jamais accepté depuis la requête. La route applique
+la même authentification que les autres routes Vault : 401 sans clé valide,
+403 pour une clé d'un autre projet, 404 pour un secret absent, et ces décisions
+sont prises avant toute écriture.
+
+Les cinq états du cycle de vie #115 sont acceptés comme cible déclarée, mais le
+Vault ne persiste que `vaulte` et `rote`. La matrice #115 est appliquée
+fail-closed : la seule transition API actuellement réussie est
+`vaulte -> rote` ; les transitions réflexives (`vaulte -> vaulte`,
+`rote -> rote`), les régressions, les cibles non persistables et les états
+inconnus retournent 400 `application/json`
+`{"code":"bad_request","message":"Requête invalide"}`, sans refléter le corps
+ni l'état reçu. Après `rote`, l'état est terminal : toute nouvelle transition
+retourne 400.
+
+| Cas | Réponse |
+| --- | --- |
+| `vaulte -> rote` | 200 avec `previous_status: vaulte`, `status: rote` |
+| Transition interdite, réflexive ou cible inconnue | 400 `bad_request` statique |
+| Compare-and-set perdant (état changé sous nos pieds) | 400 `bad_request` statique |
+| Secret absent | 404 `not_found` |
+| Clé absente, invalide ou révoquée | 401 `unauthorized` |
+| Clé d'un autre projet | 403 `forbidden` |
+
+La réponse 200 porte `Cache-Control: no-store` et se limite à
+`project`, `env`, `name`, `previous_status` et `status` : ni valeur, ni
+empreinte, ni clé API, ni acteur. Un secret à l'état `rote` n'est plus lisible
+via `GET /api/v1/secrets/{project}/{env}/{name}` (404, comme une ressource
+absente) ; `GET .../state` continue d'exposer `status: rote` sans valeur.
+
+Chaque transition acceptée est journalisée dans la table SQLite
+`secret_transitions` (ou dans le journal borné du backend mémoire) avec
+`occurred_at`, `project_id`, `env`, `name`, `actor`, `previous_status` et
+`new_status`. L'horodatage est toujours généré côté serveur : aucun appelant ne
+peut fournir `occurred_at` ni forger la chronologie. L'acteur est l'identifiant
+interne de la clé authentifiée (`key_<32 hexadécimaux>`), normalisé
+strictement ; toute autre valeur devient `unknown`, donc une entrée arbitraire
+du client ne peut jamais être persistée. Le journal ne contient ni valeur de
+secret, ni empreinte, ni clé brute. La mise à jour de `secrets.status` et
+l'insertion du journal partagent la même transaction (`BEGIN IMMEDIATE`,
+compare-and-set sur l'ancien état) : deux transitions concurrentes ne peuvent
+pas réussir toutes les deux, et aucune transition acceptée ne peut manquer au
+journal. **Cette garantie d'atomicité (état + journal) et de compare-and-set
+est portée par le backend SQLite** (backend de production) ; le backend **mémoire**
+(tests et développement, strictement mono-processus) n'emprunte aucune
+transaction partagée : il s'appuie sur le verrou `asyncio.Lock` de l'instance
+et le `deque(maxlen=...)` du journal, sans transaction ni compare-and-set
+inter-processus. L'atomicité inter-processus et le CAS ne sont donc garantis que
+par le backend SQLite ; le backend mémoire est réservé aux tests et au
+développement.
+
+Un compare-and-set perdant (`rowcount != 1`) lève
+`TransitionConcurrencyError`, convertie en 400 statique sans fuite. La table
+n'a pas de clé étrangère vers `secrets`, afin que l'historique reste
+consultable après suppression ; sa rétention est bornée **par projet** à
+`MAX_SECRET_TRANSITIONS` (10 000 entrées les plus récentes). Une inondation
+d'un projet ne peut donc pas évincer le journal d'un autre projet, et chaque
+purge locale (SQLite via `logger.warning`, mémoire via `logger.warning` dans le
+`deque` borné) émet un avertissement d'exploitation. Aucune route HTTP n'expose
+ce journal : les helpers de lecture (`database._list_secret_transitions`, ainsi
+que les méthodes privées des stores `InMemorySecretStore._list_transitions` et
+`SqliteSecretStore._list_transitions`) et de reset
+(`database._delete_all_secret_transitions`) sont privés, réservés aux stores et
+aux diagnostics de tests.
+
+La lecture d'une valeur (`GET /api/v1/secrets/{project}/{env}/{name}`)
+canonicalise le statut persisté avant la garde : un statut corrompu (casse,
+espaces, état inconnu) retourne 404, comme `rote`, sans jamais restituer
+l'ancienne valeur.
+
+Preuves : `tests/test_vault_transitions_api.py` (deux backends,
+authentification, matrice, terminalité, journal, atomicité, concurrence, CAS
+perdant, horodatage serveur, isolation et rétention par projet, statut corrompu,
+absence de valeur/empreinte), `tests/contracts/test_vault_openapi.py` (contrat)
+et `tests/test_vault_integration_testclient.py` (schéma runtime).
+
 ## Rejeu de requête (#114)
 
 Le contrat v1 n'ajoute ni nonce ni date de validité : la sémantique anti-rejeu
@@ -479,7 +562,8 @@ de vérification TLS DOIT interrompre la connexion, sans repli non vérifié.
 
 Les réponses de succès contenant des métadonnées ou une valeur portent
 `Cache-Control: no-store`. Le Header Object partagé `NoStore` impose
-`required: true` sur le POST 201 et les deux GET 200 de secrets. Le serveur doit aussi protéger ses logs, les
+`required: true` sur le POST 201, les deux GET 200 de secrets et le POST 200
+de transition. Le serveur doit aussi protéger ses logs, les
 traces middleware et les erreurs de validation : jamais de corps de requête,
 clé, valeur déchiffrée ou entrée utilisateur reflétée. Le MCP/LLM n'a aucun
 outil pour lire une valeur Vault.
@@ -506,8 +590,8 @@ ou un message constant associé au mauvais code est rejeté.
 | 503 | `unavailable` | Service indisponible |
 | 500 / autre erreur inattendue | `internal_error` | Erreur interne |
 
-404 concerne uniquement les lectures : le POST de collection ne renvoie pas
-404. **405 est déclaré sur chaque opération** : une méthode non déclarée sur
+404 concerne les lectures et la transition d'un secret absent : le POST de
+collection ne renvoie pas 404. **405 est déclaré sur chaque opération** : une méthode non déclarée sur
 une route existante (ex. `DELETE /api/v1/secrets`) renvoie
 `{"code":"method_not_allowed","message":"Méthode non autorisée"}`.
 Les erreurs du routeur (route inconnue → 404 `not_found`, méthode non

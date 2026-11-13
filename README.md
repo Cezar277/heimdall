@@ -26,6 +26,31 @@ Windows / PowerShell : remplacer `.venv/bin/python` par `.venv\Scripts\python.ex
 Builds reproductibles : versions en `==` dans `pyproject.toml`
 (voir [ADR-002](docs/adr/002-stack-python.md)), gel transitif **avec hashes
 SHA-256** dans `requirements.lock` (en-tête du fichier = commandes exactes).
+Le lock runtime minimal de l'image Docker est `requirements-runtime.lock`
+(régénéré par `scripts/regen_runtime_lock.py`).
+
+### Vault Docker (Linux)
+
+Le Vault peut être lancé dans un conteneur durci (non root, lecture seule,
+dépendances hashées, TLS obligatoire) via Docker Compose :
+
+```sh
+test ! -e .env || { echo ".env existe déjà : sauvegarder avant d'écraser" >&2; exit 1; }
+install -m 600 .env.example .env
+# Générer les valeurs avec docs/install.md §3 (umask 077, openssl rand,
+# `sudo chown -R --no-dereference 10001:"$(id -g)" data secrets` + `750`/`640`
+# pour l'UID figé, certificat lisible hôte).
+# Exécuter les gardes docs/install.md §4 avant tout `up`, jamais en root hôte.
+# Le compose fige `user: "10001:10001"` : aucun `up` ne peut démarrer en root.
+docker compose up -d --build
+curl --cacert secrets/vault_tls_cert.pem https://127.0.0.1:8443/api/v1/health
+```
+
+Guide complet, génération des secrets/TLS, garde de démarrage non-root (§4),
+premier scan et dépannage : [`docs/install.md`](docs/install.md). Ne jamais
+surcharger `user:` (figé à `10001:10001`). Le Vault reste **loopback-only** :
+`network_mode: host` est requis, et Docker Desktop macOS/Windows n'est pas
+supporté pour ce montage.
 
 ## Usage
 
@@ -175,11 +200,28 @@ heimdall vault key list --project demo
 heimdall vault key revoke key_edb63e52fce048669734ddf21aa06cbf
 ```
 
-Puis, côté serveur, chaque requête porte la clé du projet concerné :
+Puis, côté serveur, chaque requête porte la clé du projet concerné. La clé ne
+doit jamais apparaître dans `argv` (`ps`, historique) : utilisez un fichier
+d'en-tête `600` lu par `curl -K`.
 
-```sh
-curl -H "X-Heimdall-API-Key: <clé du projet>" \
-  http://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
+```bash
+read -rsp "Clé API: " HEIMDALL_API_KEY; echo
+[[ "$HEIMDALL_API_KEY" =~ ^[A-Za-z0-9_-]{43,}$ ]] || {
+  echo "clé API invalide" >&2
+  exit 1
+}
+umask 077
+AUTH_HEADER="$(mktemp /tmp/heimdall-auth.XXXXXX)"
+trap 'rm -f "$AUTH_HEADER"' EXIT INT TERM HUP
+chmod 600 "$AUTH_HEADER"
+printf 'header = "X-Heimdall-API-Key: %s"\n' "$HEIMDALL_API_KEY" \
+  > "$AUTH_HEADER"
+unset HEIMDALL_API_KEY
+
+curl --cacert /chemin/server.crt -K "$AUTH_HEADER" \
+  https://127.0.0.1:8443/api/v1/secrets/demo/dev/DEMO_PASSWORD
+rm -f "$AUTH_HEADER"
+trap - EXIT INT TERM HUP
 ```
 
 Comportement fail-closed appliqué par `heimdall/vault/auth.py` :

@@ -40,6 +40,8 @@ vault.db*
 *.db-wal
 *.db-shm
 *.db-journal
+# Archives de sauvegarde chiffrées du guide Docker (hors dépôt par défaut)
+heimdall-backup-*.tgz.gpg
 
 # --- Outils / OS / IDE ---
 bandit-report.json
@@ -57,3 +59,6 @@ Thumbs.db
 # étapes amont sans rien écrire dans le dépôt ; cette entrée + le `rm -rf` en
 # tête de workflow ne sont qu'une ceinture pour les résidus existants.
 .github/actions/opencode/
+
+# Données locales du Vault en mode Docker (jamais commitées)
+data/

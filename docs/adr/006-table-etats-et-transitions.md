@@ -137,11 +137,65 @@ Afin de respecter l'invariant 8 (« Aucun secret dans les logs, exceptions ou re
 
 ---
 
+### 8. Mise en œuvre de l'API de transition (#117)
+
+Le sous-ticket #117 branche la matrice dans le serveur Vault sans élargir le
+contrat des états persistés :
+
+- **Route** : `POST /api/v1/secrets/{project}/{env}/{name}/transition`, même
+  authentification que les autres routes Vault (401, 403 avant toute recherche,
+  404 pour un secret absent). Le corps est strict et ne porte que
+  `target_status` ; l'état source est toujours lu côté serveur, ce qui interdit
+  au client de forger un état de départ.
+- **Application de la matrice** : `validate_transition()` est appelée sur l'état
+  réellement persisté. Les cinq états #115 sont acceptés comme cible déclarée,
+  mais seuls `vaulte` et `rote` sont persistables
+  (`PERSISTED_STATUSES`) : la seule transition API réussie est actuellement
+  `vaulte -> rote`. Toute autre demande (réflexive, régression, cible inconnue,
+  alias non canonique) retourne 400 avec le message statique du contrat, sans
+  refléter l'entrée.
+- **Réponse** : `SecretTransitionResult` se limite à `project`, `env`, `name`,
+  `previous_status` et `status`, avec `Cache-Control: no-store` ; ni valeur,
+  ni empreinte, ni acteur n'est exposé. Le schéma OpenAPI `SecretStatus`
+  (`vaulte`/`rote`) reste inchangé ; les cinq états sont déclarés séparément
+  dans `SecretLifecycleState` pour le corps de requête.
+- **Journal** : table `secret_transitions` (SQLite) et journal par projet
+  (mémoire) avec `occurred_at`, identité, acteur, `previous_status`,
+  `new_status`. L'horodatage est toujours généré côté serveur par
+  `get_iso_timestamp()` ; aucun paramètre d'API ne permet de le fournir ou de
+  le forger. L'UPDATE conditionnel de `secrets.status` et l'INSERT du journal
+  partagent la même transaction `BEGIN IMMEDIATE` : une transition acceptée ne
+  peut pas manquer au journal, et deux transitions concurrentes ne peuvent pas
+  réussir toutes les deux. **Cette garantie d'atomicité (état + journal) et de
+  compare-and-set est portée par le backend SQLite** (backend de production) ;
+  le backend mémoire, réservé aux tests et au développement mono-processus, n'emprunte
+  aucune transaction partagée : il repose sur le verrou de l'instance et un
+  journal borné, sans transaction ni CAS inter-processus. L'atomicité
+  inter-processus et le CAS ne sont donc garantis que par le backend SQLite.
+  Un compare-and-set perdant (`rowcount != 1`) lève
+  `TransitionConcurrencyError`, mappée en 400 statique par la route, comme les
+  transitions interdites. L'acteur est normalisé sur `^key_[0-9a-f]{32}$` ;
+  toute autre valeur devient `unknown`, donc aucune donnée arbitraire ou
+  sensible n'est persistée. La rétention est bornée **par projet** à
+  `MAX_SECRET_TRANSITIONS` (10 000) : une inondation d'un projet ne peut pas
+  évincer le journal d'un autre, et chaque purge locale émet un avertissement
+  d'exploitation. L'absence de clé étrangère vers `secrets` conserve
+  l'historique après suppression. Aucune route HTTP n'expose le journal.
+- **Après `rote`** : l'état est terminal (toute transition retourne 400). La
+  lecture de l'ancienne valeur via `GET /api/v1/secrets/{project}/{env}/{name}`
+  retourne 404 ; `GET .../state` continue d'exposer `rote` sans valeur. Le
+  statut lu est canonicalisé avant la garde : une valeur corrompue en base
+  (casse, espaces, état inconnu) retourne 404 sans restituer la valeur.
+
+La vérification exhaustive des 20 transitions interdites contre l'API HTTP
+reste portée par #118 ; #117 pose la route, l'application de la matrice et le
+journal atomique.
+
 ## Conséquences et limites
 
-- **Sécurité et robustesse** : Toute logique de contrôle de flux s'appuiera sur `heimdall.vault.transitions` (`validate_transition`) une fois l'API #117 branchée : tout mutateur d'état (route `/api/v1/secrets/.../transition` dans #117 et store Vault) devra obligatoirement appeler `validate_transition()` et persister exclusivement le statut canonique, éliminant tout risque de contournement ou de désynchronisation entre la documentation, le contrat JSON et le comportement d'exécution.
+- **Sécurité et robustesse** : l'API #117 et les mutateurs du store Vault appellent obligatoirement `validate_transition()` et ne persistent que le statut canonique, éliminant tout risque de contournement ou de désynchronisation entre la documentation, le contrat JSON et le comportement d'exécution.
 - **Confinement cryptographique** : Le module `heimdall/vault/transitions.py` est 100 % déterministe et n'utilise que la bibliothèque standard Python. Il respecte l'invariant 5 et n'importe aucune primitive de `cryptography` ou `argon2`.
 - **Découpage des sous-tickets (socle vs application)** :
   - Le ticket **#115** livre le socle formel contractuel, les tables immuables et la bibliothèque de validation logicielle (`validate_transition`, `canonicalize_state`).
-  - L'application opérationnelle (branchement obligatoire dans les endpoints FastAPI `/api/v1/secrets/.../transition` et dans les mutateurs du store Vault) est réservée et portée par le sous-ticket **#117** (« API de transition »).
+  - Le ticket **#117** branche ce socle dans l'endpoint FastAPI `/api/v1/secrets/.../transition` et dans les mutateurs du store Vault, avec le journal atomique des transitions (voir §8).
   - La vérification automatisée de bout en bout des 20 transitions interdites contre l'API HTTP du Vault est portée par le sous-ticket **#118**.

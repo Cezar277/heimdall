@@ -24,6 +24,14 @@ RÈGLES DE SÉCURITÉ ET CONFORMITÉ (DoD, STRIDE, pentest) :
     contrainte d'unicité `UNIQUE(project_id, env, name)`.
   - `status`: contrainte `CHECK(status IN ('vaulte', 'rote'))` + validation
     applicative `Literal["vaulte", "rote"]` avant toute requête.
+- Journal de transitions (ticket #117) : `secret_transitions` conserve, pour
+  chaque changement d'état accepté, l'acteur interne (`key_...`), l'horodatage
+  serveur, l'ancien état et le nouvel état. La mise à jour de `secrets.status`
+  et l'insertion du journal sont atomiques (`BEGIN IMMEDIATE`/savepoint).
+  Aucune valeur de secret, empreinte ou clé API brute n'y est écrite. Le
+  journal est borné par projet (`MAX_SECRET_TRANSITIONS`) : une inondation
+  d'un projet ne peut pas évincer le journal d'un autre. Il n'a pas de clé
+  étrangère vers `secrets` afin de rester consultable après suppression.
 - Permissions fichier au repos :
   - Umask restrictif `0o077` positionné avant création du fichier/répertoire.
   - Mode `0o600` (lecture/écriture propriétaire uniquement) vérifié et confirmé
@@ -58,6 +66,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
+from heimdall.vault.transitions import (
+    InvalidTransitionError,
+    canonicalize_state,
+    validate_transition,
+)
+
 if TYPE_CHECKING:
     from heimdall.vault.crypto import VaultCipher
 
@@ -77,7 +91,16 @@ class _SessionConnection(sqlite3.Connection):
 
 
 SecretStatus = Literal["vaulte", "rote"]
-_ALLOWED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
+PERSISTED_STATUSES: frozenset[str] = frozenset({"vaulte", "rote"})
+_ALLOWED_STATUSES: frozenset[str] = PERSISTED_STATUSES
+# Le journal de transitions est borné PAR PROJET : une inondation dans un
+# projet ne peut pas évincer les entrées d'un autre projet. Les tests
+# réduisent cette valeur par patch.
+MAX_SECRET_TRANSITIONS: int = 10_000
+MAX_TRANSITION_LIST_LIMIT: int = 1_000
+DEFAULT_TRANSITION_LIST_LIMIT: int = 50
+_TRANSITION_ACTOR_PATTERN = re.compile(r"^key_[0-9a-f]{32}$")
+_TRANSITION_FALLBACK_ACTOR: str = "unknown"
 _SCHEMA_MIGRATION_HINT: str = (
     "Schéma Vault antérieur au ticket #70 : exécuter "
     "`python -m heimdall.vault.init_db` (ou ouvrir la base via "
@@ -109,6 +132,8 @@ class KekConcurrencyError(RuntimeError):
     """Écriture conditionnelle sur ``kek_version`` perdante (concurrence)."""
 
 
+class TransitionConcurrencyError(RuntimeError):
+    """Transition perdante : l'état source a changé pendant l'écriture."""
 # Mode fichier sécurisé : lecture/écriture propriétaire uniquement (aucun accès groupe/autres).
 _SECURE_FILE_MODE: int = 0o600
 _SECURE_DIR_MODE: int = 0o700
@@ -178,6 +203,29 @@ CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_name_at
     ON rate_limit_hits(name, hit_at);
 CREATE INDEX IF NOT EXISTS idx_rate_limit_hits_at
     ON rate_limit_hits(hit_at);
+
+-- Journal des transitions d'état (ticket #117). Aucune valeur, empreinte ou
+-- clé API brute : uniquement l'acteur interne, l'horodatage serveur et les
+-- états canoniques. Pas de FK vers secrets : l'historique reste consultable
+-- après suppression du secret. La rétention est bornée par projet.
+CREATE TABLE IF NOT EXISTS secret_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    env TEXT NOT NULL,
+    name TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    previous_status TEXT NOT NULL,
+    new_status TEXT NOT NULL,
+    CONSTRAINT chk_secret_transitions_previous
+        CHECK (previous_status IN ('vaulte', 'rote')),
+    CONSTRAINT chk_secret_transitions_new
+        CHECK (new_status IN ('vaulte', 'rote'))
+);
+CREATE INDEX IF NOT EXISTS idx_secret_transitions_identity
+    ON secret_transitions(project_id, env, name, id);
+CREATE INDEX IF NOT EXISTS idx_secret_transitions_project
+    ON secret_transitions(project_id, id);
 
 -- Ancienne table de fenêtres fixes (lot #63), conservée pour compatibilité
 -- des bases existantes : plus aucun code ne la lit ni ne l'écrit.
@@ -841,6 +889,7 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
         "projects",
         "api_keys",
         "secrets",
+        "secret_transitions",
         "rate_limit_hits",
         "audit_events",
         "audit_chain_state",
@@ -870,6 +919,26 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
         raise RuntimeError(
             "Schéma de base de données non conforme : colonne(s) manquante(s) "
             f"dans secrets ({', '.join(missing_columns)})."
+        )
+
+    # 1ter. Journal des transitions (#117) : colonnes obligatoires.
+    transition_columns = {
+        str(row[1]) for row in cursor.execute("PRAGMA table_info(secret_transitions);").fetchall()
+    }
+    required_transition_columns = {
+        "occurred_at",
+        "project_id",
+        "env",
+        "name",
+        "actor",
+        "previous_status",
+        "new_status",
+    }
+    missing_transition_columns = sorted(required_transition_columns - transition_columns)
+    if missing_transition_columns:
+        raise RuntimeError(
+            "Schéma de base de données non conforme : colonne(s) manquante(s) "
+            f"dans secret_transitions ({', '.join(missing_transition_columns)})."
         )
 
     # 2. Clés étrangères ON DELETE CASCADE (requêtes statiques sans f-string SQL)
@@ -917,6 +986,33 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
 
     # 4. Vérification comportementale des contraintes (CHECK, UNIQUE, CASCADE)
     _verify_schema_behavior(conn)
+
+
+def _verify_transition_check(conn: sqlite3.Connection, probe_project: str) -> None:
+    """Vérifie que le CHECK du journal de transitions rejette un état invalide (#117)."""
+    chk_transition_enforced = False
+    try:
+        conn.execute(
+            "INSERT INTO secret_transitions ("
+            "occurred_at, project_id, env, name, actor, previous_status, new_status"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "2026-01-01",
+                probe_project,
+                "dev",
+                f"PROBE_TR_{uuid4().hex}",
+                "unknown",
+                "vaulte",
+                "invalid_probe_status",
+            ),
+        )
+    except sqlite3.IntegrityError:
+        chk_transition_enforced = True
+    if not chk_transition_enforced:
+        raise RuntimeError(
+            "Schéma de base de données non conforme : "
+            "contrainte CHECK du journal de transitions inopérante."
+        )
 
 
 def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
@@ -1000,6 +1096,9 @@ def _verify_schema_behavior(conn: sqlite3.Connection) -> None:
                 "Schéma de base de données non conforme : "
                 "contrainte CHECK de kek_version inopérante."
             )
+
+        # Test comportemental du CHECK sur le journal de transitions (#117)
+        _verify_transition_check(conn, probe_proj)
 
         # Test comportemental de la contrainte UNIQUE(project_id, env, name)
         try:
@@ -1880,3 +1979,179 @@ def delete_secret(
     query = "DELETE FROM secrets WHERE project_id = ? AND env = ? AND name = ?"
     cursor = conn.execute(query, (project_id, env, name))
     return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Opérations CRUD — Journal des transitions d'état (ticket #117)
+# ---------------------------------------------------------------------------
+
+
+def normalize_transition_actor(actor: Any) -> str:
+    """Normalise l'acteur interne d'une transition, sans jamais refléter une entrée.
+
+    Seul l'identifiant opaque de clé API émis par le registre
+    (``key_<32 hexadécimaux>``) est accepté. Tout autre type ou format est
+    remplacé par ``unknown`` : une valeur arbitraire ne doit jamais entrer dans
+    le journal (injection, donnée sensible, identité forgée).
+    """
+    if isinstance(actor, str) and _TRANSITION_ACTOR_PATTERN.fullmatch(actor):
+        return actor
+    return _TRANSITION_FALLBACK_ACTOR
+
+
+def validate_transition_list_limit(limit: int) -> None:
+    """Borne fail-closed la lecture du journal (défense en profondeur)."""
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or limit < 1
+        or limit > MAX_TRANSITION_LIST_LIMIT
+    ):
+        raise ValueError("limite de journal de transitions hors bornes")
+
+
+def _prune_secret_transitions(conn: sqlite3.Connection, project_id: str) -> None:
+    """Conserve au plus ``MAX_SECRET_TRANSITIONS`` entrées PAR PROJET.
+
+    La purge s'exécute dans la transaction de la transition : soit l'état et
+    son journal sont écrits ensemble, soit rien ne l'est. Elle est filtrée par
+    ``project_id`` : une inondation dans un projet ne peut donc pas évincer le
+    journal d'un autre projet. La sélection du seuil par ``OFFSET`` évite de
+    charger tout le journal en mémoire.
+    """
+    threshold = conn.execute(
+        "SELECT id FROM secret_transitions WHERE project_id = ? "
+        "ORDER BY id DESC LIMIT 1 OFFSET ?",
+        (project_id, MAX_SECRET_TRANSITIONS),
+    ).fetchone()
+    if threshold is not None:
+        cursor = conn.execute(
+            "DELETE FROM secret_transitions WHERE project_id = ? AND id <= ?",
+            (project_id, int(threshold[0])),
+        )
+        if cursor.rowcount > 0:
+            # Alerte d'exploitation : la purge est locale au projet, jamais
+            # globale. Aucune valeur de secret ni clé n'est journalisée.
+            logger.warning(
+                "Rétention du journal de transitions : %d entrée(s) purgée(s) "
+                "pour le projet %s.",
+                cursor.rowcount,
+                project_id,
+            )
+
+
+def transition_secret(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    project_id: str,
+    env: str,
+    name: str,
+    target_status: str,
+    *,
+    actor: str | None = None,
+) -> dict[str, str] | None:
+    """Change atomiquement l'état d'un secret et journalise la transition (#117).
+
+    L'état source est TOUJOURS lu en base : le client ne fournit que l'état
+    cible. La matrice #115 est appliquée par ``validate_transition()`` et seule
+    une forme canonique persistable (``vaulte``/``rote``) peut être écrite.
+    L'UPDATE conditionnel (compare-and-set sur l'ancien état) et l'INSERT dans
+    ``secret_transitions`` partagent la même transaction (``BEGIN IMMEDIATE``
+    via ``_write_transaction``) : aucune transition acceptée ne peut être
+    perdue, et l'état ne peut pas changer sans entrée de journal.
+
+    L'horodatage est TOUJOURS généré côté serveur : aucun appelant ne peut
+    forger la chronologie du journal.
+
+    Retourne les métadonnées de la transition, ou ``None`` si le secret
+    n'existe pas. Lève ``InvalidTransitionError``/``UnknownStateError`` pour
+    toute transition ou tout état cible non conforme (fail-closed), et
+    ``TransitionConcurrencyError`` si l'état a changé sous nos pieds.
+    """
+    target = canonicalize_state(target_status)
+    safe_actor = normalize_transition_actor(actor)
+
+    with _write_transaction(conn):
+        row = conn.execute(
+            "SELECT status FROM secrets WHERE project_id = ? AND env = ? AND name = ?",
+            (project_id, env, name),
+        ).fetchone()
+        if row is None:
+            return None
+        previous = canonicalize_state(row["status"])
+        validate_transition(previous, target)
+        if target not in PERSISTED_STATUSES:
+            # Défense en profondeur : le Vault ne persiste que vaulte/rote.
+            raise InvalidTransitionError(
+                previous,
+                target,
+                "État cible non persistable dans le Vault.",
+            )
+
+        timestamp = get_iso_timestamp()
+        cursor = conn.execute(
+            "UPDATE secrets SET status = ?, updated_at = ? "
+            "WHERE project_id = ? AND env = ? AND name = ? AND status = ?",
+            (target, timestamp, project_id, env, name, previous),
+        )
+        if cursor.rowcount != 1:
+            raise TransitionConcurrencyError("Concurrence détectée sur la transition d'état.")
+
+        conn.execute(
+            "INSERT INTO secret_transitions ("
+            "occurred_at, project_id, env, name, actor, previous_status, new_status"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (timestamp, project_id, env, name, safe_actor, previous, target),
+        )
+        _prune_secret_transitions(conn, project_id)
+
+    return {
+        "project": project_id,
+        "env": env,
+        "name": name,
+        "previous_status": previous,
+        "status": target,
+        "actor": safe_actor,
+        "occurred_at": timestamp,
+    }
+
+
+def _list_secret_transitions(
+    conn: sqlite3.Connection,
+    project_id: str,
+    env: str,
+    name: str,
+    limit: int = DEFAULT_TRANSITION_LIST_LIMIT,
+) -> list[dict[str, str]]:
+    """Lecture interne/test-only du journal, de la plus ancienne à la plus récente.
+
+    Aucune valeur, empreinte ou clé brute n'est exposée : uniquement l'acteur
+    interne normalisé, l'horodatage et les états canoniques. La limite est
+    bornée (1..1000) pour empêcher une lecture non bornée du journal. Le filtre
+    ``project_id`` empêche toute lecture inter-projets.
+
+    Cette fonction n'est branchée sur aucune route HTTP : elle sert aux stores
+    et aux diagnostics de tests. Le préfixe privé matérialise cette frontière.
+    """
+    validate_transition_list_limit(limit)
+    rows = conn.execute(
+        "SELECT occurred_at, project_id AS project, env, name, actor, "
+        "previous_status, new_status AS status "
+        "FROM secret_transitions "
+        "WHERE project_id = ? AND env = ? AND name = ? "
+        "ORDER BY id ASC LIMIT ?",
+        (project_id, env, name, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _delete_all_secret_transitions(conn: sqlite3.Connection) -> int:
+    """Réinitialisation **test-only** de tout le journal de transitions.
+
+    Le préfixe privé et cette documentation matérialisent l'interdiction de
+    tout branchement HTTP : une suppression globale du journal détruirait la
+    traçabilité (répudiation) de tous les projets. Seul le reset de tests
+    ``SqliteSecretStore._clear()`` appelle cette fonction ; aucune route
+    publique ne doit l'importer ni l'exposer.
+    """
+    cursor = conn.execute("DELETE FROM secret_transitions")
+    return cursor.rowcount

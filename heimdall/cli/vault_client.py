@@ -28,6 +28,7 @@ from typing import Final, NoReturn
 
 import typer
 
+from heimdall.remediation.naming import is_dangerous_env_var
 from heimdall.vault.atomic import (
     _bounded_error_message,
     _get_git_toplevel,
@@ -56,135 +57,14 @@ _PROJECT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,63
 _ENV_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _SECRET_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 
-_DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
-    "LD_",
-    "DYLD_",
-    "PYTHON",
-    "NODE_",
-    "NPM_",
-    "YARN_",
-    "PNPM_",
-    "RUBY",
-    "PERL",
-    "GIT_",
-    "BASH_",
-    "PROMPT_",
-    "SYSTEMD_",
-    "JAVA_",
-    "JDK_",
-    "_JAVA_",
-    "MAVEN_",
-    "GRADLE_",
-    "DOTNET_",
-    "COMPOSE_",
-    "DOCKER_",
-    "AWS_",
-    "TF_",
-    "KUBE_",
-    "HELM_",
-    "XDG_",
-    "CARGO_",
-    "RUSTUP_",
-    "RUSTC_",
-    "OPENSSL_",
-    "MALLOC_",
-    # Shadowing credential/processus : un Vault compromis ne doit pas
-    # écraser la credential du fils via `{**os.environ, **injected}`.
-    "HEIMDALL_",
-    # Gestionnaires de runtimes/paquets (LOW) : redirection d'installations
-    # ou d'interpréteurs via l'enfant (BUN_/DENO_/UV_/PIP_/BUNDLE_/GEM_/CONDA_).
-    "BUN_",
-    "DENO_",
-    "UV_",
-    "PIP_",
-    "BUNDLE_",
-    "GEM_",
-    "CONDA_",
-)
-_DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset({
-    "PATH",
-    "SHELL",
-    "IFS",
-    "BASH_ENV",
-    "BASHOPTS",
-    "SHELLOPTS",
-    "ENV",
-    "PS0",
-    "PS1",
-    "PS2",
-    "PS3",
-    "PS4",
-    "PROMPT_COMMAND",
-    "ZDOTDIR",
-    "GLIBC_TUNABLES",
-    "GCONV_PATH",
-    "LOCPATH",
-    "NLSPATH",
-    "HOSTALIASES",
-    "CORE_PAGER",
-    "PAGER",
-    "MANPAGER",
-    "LESSOPEN",
-    "LESSCLOSE",
-    "EDITOR",
-    "VISUAL",
-    "SUDO_ASKPASS",
-    "SSH_ASKPASS",
-    "SSH_ASKPASS_REQUIRE",
-    "SSH_AUTH_SOCK",
-    "SSH_ORIGINAL_COMMAND",
-    "KUBECONFIG",
-    "GOBIN",
-    "GOCACHE",
-    "GOFLAGS",
-    "GOMODCACHE",
-    "GOPATH",
-    "GOROOT",
-    "GOTOOLCHAIN",
-    "CC",
-    "CXX",
-    "CPP",
-    "CFLAGS",
-    "CPPFLAGS",
-    "CXXFLAGS",
-    "LDFLAGS",
-    "MAKEFLAGS",
-    "MFLAGS",
-    "HOME",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "REQUESTS_CA_BUNDLE",
-    "CURL_CA_BUNDLE",
-    # Comportement du shell enfant (LOW) : un Vault compromis ne doit pas
-    # détourner les `cd`/globs/historique des scripts enfants de `run`.
-    # La racine de confiance reste l'allowlist locale (seuls les noms listés
-    # localement sont demandés) ; la denylist n'est qu'une défense en
-    # profondeur. Tout nom listé localement (--name/.env.example/.env) est
-    # une entrée de confiance : ne pas y inscrire de variable système.
-    "CDPATH",
-    "GLOBIGNORE",
-    "HISTFILE",
-    "MAILCAPS",
-    # État du shell/environnement d'exécution (LOW) : chemins terminfo et
-    # cible venv — détournement des enfants via TERMINFO/TERMPATH/VIRTUAL_ENV.
-    "TERMINFO",
-    "TERMPATH",
-    "VIRTUAL_ENV",
-    "INPUTRC",
-    "TERM",
-    "TZ",
-    "TERMCAP",
-    "LUA_PATH",
-    "LUA_CPATH",
-    "LUA_INIT",
-})
 
-#: Bornes anti-OOM locales de `pull`/`run` : nombre de secrets demandés et
-#: volume cumulé des valeurs (caractères). Symétriques des plafonds de réponse
-#: du client (1 Mio) et dimensionnées pour un `.env`/environnement raisonnable.
+def preview_name(name: object) -> str:
+    """Reflet borné et sûr d'un nom de secret (jamais de reflet pour un non-str)."""
+    return name[:32] if isinstance(name, str) else type(name).__name__
+
+
+# Denylist robuste : source unique = heimdall.remediation.naming
+# (importée ci-dessus ; mêmes objets, pas de copie qui divergerait).
 _MAX_SECRETS_PER_PULL: Final[int] = 1024
 _MAX_TOTAL_SECRET_CHARS: Final[int] = 1_048_576
 
@@ -194,14 +74,6 @@ RUN_CONTEXT_SETTINGS: Final[dict[str, bool]] = {
     "allow_extra_args": True,
     "ignore_unknown_options": True,
 }
-
-
-def is_dangerous_env_var(name: str) -> bool:
-    """Vérifie si un nom de variable est dangereux pour l'exécution d'un processus."""
-    upper = name.upper()
-    if upper in _DANGEROUS_ENV_EXACT:
-        return True
-    return any(upper.startswith(prefix) for prefix in _DANGEROUS_ENV_PREFIXES)
 
 
 # Options CLI déclarées au niveau module pour conformité B008
@@ -281,11 +153,11 @@ def _validate_project_and_env(project: str | None, env: str) -> str:
     except VaultClientError as exc:
         typer.echo(f"Erreur de configuration : {exc}", err=True)
         raise typer.Exit(code=2) from None
-    if not _PROJECT_ID_PATTERN.match(proj):
-        typer.echo(f"Identifiant de projet invalide : {proj[:32]!r}", err=True)
+    if not _PROJECT_ID_PATTERN.fullmatch(proj):
+        typer.echo(f"Identifiant de projet invalide : {preview_name(proj)!r}", err=True)
         raise typer.Exit(code=2)
-    if not _ENV_ID_PATTERN.match(env):
-        typer.echo(f"Identifiant d'environnement invalide : {env[:32]!r}", err=True)
+    if not _ENV_ID_PATTERN.fullmatch(env):
+        typer.echo(f"Identifiant d'environnement invalide : {preview_name(env)!r}", err=True)
         raise typer.Exit(code=2)
     return proj
 
@@ -302,9 +174,9 @@ def _validate_requested_names(names: list[str] | None) -> None:
     if not names:
         return
     for name in names:
-        if not _SECRET_NAME_PATTERN.match(name):
+        if not isinstance(name, str) or not _SECRET_NAME_PATTERN.fullmatch(name):
             typer.echo(
-                f"Erreur : nom de secret invalide demandé : {name[:32]!r} "
+                f"Erreur : nom de secret invalide demandé : {preview_name(name)!r} "
                 "(format requis : ^[A-Z][A-Z0-9_]{1,63}$).",
                 err=True,
             )
@@ -341,7 +213,7 @@ def _read_input_secrets(input_file: Path) -> dict[str, str]:
 
 def _filter_secrets(
     secrets: dict[str, str],
-    names: list[str] | None,
+    names: list[str] | None = None,
 ) -> dict[str, str]:
     """Filtre les secrets par nom et valide leur forme contractuelle.
 
@@ -354,12 +226,6 @@ def _filter_secrets(
     for key, value in secrets.items():
         if key not in target_names:
             continue
-        if not _SECRET_NAME_PATTERN.match(key):
-            typer.echo(
-                f"Avertissement : nom de secret ignoré (format invalide) : {key[:32]!r}",
-                err=True,
-            )
-            continue
         if is_dangerous_env_var(key):
             # Même refus que pull/run : un nom interdit à l'injection ne doit
             # jamais être stocké (secret empoisonné, rotation crue mais
@@ -367,11 +233,17 @@ def _filter_secrets(
             # pull/run sortent en 1 car le refus y intervient dans le pipeline
             # de récupération (voir docs/t35-samm.md §6).
             typer.echo(
-                f"Erreur de sécurité : le secret {key[:32]!r} est une variable "
-                "système interdite.",
+                f"Erreur de sécurité : le secret {preview_name(key)!r} "
+                "est une variable système interdite.",
                 err=True,
             )
             raise typer.Exit(code=2)
+        if not isinstance(key, str) or not _SECRET_NAME_PATTERN.fullmatch(key):
+            typer.echo(
+                f"Avertissement : nom de secret ignoré (format invalide) : {preview_name(key)!r}",
+                err=True,
+            )
+            continue
         filtered[key] = value
     return filtered
 
@@ -391,13 +263,14 @@ def _push_single_secret(
     if is_dangerous_env_var(name):
         # Reflet borné et échappé : `_push_single_secret` peut être appelée
         # directement (défense en profondeur) avant tout contrôle de format.
+        # Un nom non-str n'est jamais reflété : seul son type est affiché.
         typer.echo(
-            f"Erreur de sécurité : le secret {name[:32]!r} est une variable "
-            "système interdite.",
+            f"Erreur de sécurité : le secret {preview_name(name)!r} "
+            "est une variable système interdite.",
             err=True,
         )
         raise typer.Exit(code=2)
-    name_preview = f"{name[:32]!r}"
+    name_preview = f"{preview_name(name)!r}"
     try:
         client.create_secret(proj, env, name, value)
         typer.echo(f"Secret {name_preview} poussé vers le Vault ({proj}/{env}) [statut: vaulte].")
@@ -432,9 +305,9 @@ def _push_single_secret(
         # L'identifiant a déjà été validé en amont (patterns CLI) : cette
         # branche est de la défense en profondeur. La valeur n'est jamais
         # reflétée (message statique, invariant 8).
-        if not _SECRET_NAME_PATTERN.match(name):
+        if not isinstance(name, str) or not _SECRET_NAME_PATTERN.fullmatch(name):
             typer.echo(
-                f"Erreur : nom de secret invalide : {name[:32]!r} "
+                f"Erreur : nom de secret invalide : {preview_name(name)!r} "
                 "(format requis : ^[A-Z][A-Z0-9_]{1,63}$).",
                 err=True,
             )
@@ -588,8 +461,7 @@ def _enforce_secret_count(count: int) -> None:
     """Refuse un nombre de secrets au-delà du plafond anti-DoS local."""
     if count > _MAX_SECRETS_PER_PULL:
         typer.echo(
-            f"Erreur de sécurité : trop de secrets ({count}, "
-            f"max {_MAX_SECRETS_PER_PULL}).",
+            f"Erreur de sécurité : trop de secrets ({count}, max {_MAX_SECRETS_PER_PULL}).",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -633,19 +505,19 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
     retrieved: dict[str, str] = {}
     total_chars = 0
     for name in target_names:
-        if not _SECRET_NAME_PATTERN.match(name):
-            typer.echo(
-                f"Avertissement : nom de secret ignoré (format invalide) : {name[:32]!r}",
-                err=True,
-            )
-            continue
         if is_dangerous_env_var(name):
             typer.echo(
-                f"Erreur de sécurité : le secret {name[:32]!r} est une variable "
-                "système interdite.",
+                f"Erreur de sécurité : le secret {preview_name(name)!r} "
+                "est une variable système interdite.",
                 err=True,
             )
             raise typer.Exit(code=1)
+        if not isinstance(name, str) or not _SECRET_NAME_PATTERN.fullmatch(name):
+            typer.echo(
+                f"Avertissement : nom de secret ignoré (format invalide) : {preview_name(name)!r}",
+                err=True,
+            )
+            continue
         try:
             record = client.get_secret(proj, env, name)
             val = record.get("value")
@@ -862,8 +734,7 @@ def _regular_file_identity(path: str) -> tuple[int, int, int, int, int] | None:
 def _refuse_modified_command() -> NoReturn:
     """Refuse une commande dont l'empreinte a changé pendant le fetch Vault."""
     typer.echo(
-        "Erreur de sécurité : commande modifiée ou remplacée "
-        "entre résolution et exécution.",
+        "Erreur de sécurité : commande modifiée ou remplacée entre résolution et exécution.",
         err=True,
     )
     raise typer.Exit(code=1)
@@ -915,9 +786,7 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
     # visé AVANT le round-trip Vault (les deux voies sont soumises au même
     # remplacement à même chemin pendant le fetch). Pour la voie slash,
     # l'empreinte sert aussi de contrôle d'existence/type (fichier régulier).
-    executable_identity = _regular_file_identity(
-        executable if executable is not None else cmd[0]
-    )
+    executable_identity = _regular_file_identity(executable if executable is not None else cmd[0])
     if executable is None and executable_identity is None:
         typer.echo(f"Erreur : commande introuvable : '{cmd[0]}'", err=True)
         raise typer.Exit(code=127)
@@ -967,9 +836,7 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
     # identique juste avant `exec` (même chemin mais inode/taille/mtime/ctime
     # différents → refus). Une réécriture préservant toute l'empreinte reste
     # une limite documentée (pas de `fexecve` portable).
-    current_identity = _regular_file_identity(
-        executable if executable is not None else cmd[0]
-    )
+    current_identity = _regular_file_identity(executable if executable is not None else cmd[0])
     if (
         executable_identity is None
         or current_identity is None
@@ -995,6 +862,7 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
 __all__ = [
     "RUN_CONTEXT_SETTINGS",
     "is_dangerous_env_var",
+    "preview_name",
     "vault_pull",
     "vault_push",
     "vault_run",

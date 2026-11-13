@@ -1,0 +1,166 @@
+# Templates de remplacement par langage — T30.1 (#83)
+
+Ticket : [#83](https://github.com/Cezar277/heimdall/issues/83), parent
+[#30](https://github.com/Cezar277/heimdall/issues/30).
+
+`heimdall.remediation.templates` transforme **en mémoire** une ligne source
+contenant un secret en lecture de variable d'environnement. Il n'écrit aucun
+fichier : l'application atomique du patch et la garde de chemin runtime sont
+décrites dans `remediation-apply.md` (tickets #85 et #86).
+
+## API
+
+```python
+from heimdall.remediation import build_replacement, detect_language
+
+plan = build_replacement(
+    file="app.py",          # chemin relatif au dépôt (contrat Finding v1)
+    source=source,          # texte complet du fichier
+    line=42,                # ligne du Finding
+    secret=valeur,          # valeur exacte du littéral
+    variable="APP_KEY",     # nom validé [A-Z][A-Z0-9_]{1,63}
+)
+
+plan.manual_remediation      # False = patch proposé
+plan.after                   # source complète après substitution
+plan.expression              # os.environ["APP_KEY"]
+plan.import_added            # True si « import os » a été ajouté
+plan.line_after              # nouvelle ligne du remplacement
+```
+
+`detect_language` rend `Language.PYTHON`, `Language.JAVASCRIPT` ou `None`.
+Un chemin hors contrat Finding lève `TemplateError` ; une extension inconnue
+n'est **pas** une erreur, mais une remédiation manuelle.
+
+## Templates
+
+| Langage | Extensions | Expression |
+| --- | --- | --- |
+| Python | `.py`, `.pyw` | `os.environ["NOM"]` |
+| JavaScript | `.js`, `.mjs`, `.cjs` | `process.env.NOM` |
+
+- Python : `os.environ[...]` échoue clairement au démarrage si la variable
+  manque, contrairement à `os.getenv`.
+- JavaScript : `process.env.NOM`.
+- `.pyi`, `.jsx`, `.ts` et les extensions inconnues sont refusés : un stub,
+  un attribut JSX ou une annotation TypeScript ne sont pas des littéraux JS
+  remplaçables par un identifiant sans changer la grammaire.
+
+## Substitution
+
+Seul le **littéral de chaîne** est remplacé, jamais la ligne :
+
+```python
+API_KEY = "valeur-synthetique"      # avant
+API_KEY = os.environ["API_KEY"]     # après
+```
+
+En JavaScript :
+
+```javascript
+const apiKey = "valeur-synthetique";    // avant
+const apiKey = process.env.API_KEY;     // après
+```
+
+La valeur passée doit être la valeur **exacte** du littéral. Une sous-chaîne
+(par exemple l'en-tête d'une PEM dans un littéral plus long) est refusée :
+le moteur ne devine pas quelles autres données du littéral doivent survivre.
+
+### Import Python
+
+`import os` est ajouté seulement s'il n'existe pas déjà au niveau module :
+
+- après le docstring de module et les imports `from __future__` (sinon le
+  fichier ne parse plus) ;
+- avant les décorateurs de la première instruction ;
+- en conservant shebang, commentaire d'encodage et style CRLF.
+
+`import os.path`, `import os as autre_nom`, `from os import environ` et
+`import os` sont reconnus. Toute autre liaison du nom `os` (affectation,
+paramètre, `import sys as os`, `from x import os`) provoque une remédiation
+manuelle : `os.environ` serait ambigu dans ce fichier.
+
+## Refus fail-closed
+
+Un résultat `manual_remediation=True` a toujours `after == before`, aucune
+expression et une raison stable (`ManualReason`) :
+
+| Cas | Raison |
+| --- | --- |
+| Extension non prise en charge | `UNSUPPORTED_LANGUAGE` |
+| Fichier non parsable / chaîne non fermée | `INVALID_SYNTAX` |
+| Ligne absente du fichier | `STALE_LINE` |
+| Valeur absente de la ligne | `SECRET_NOT_FOUND` |
+| Valeur présente mais pas dans un littéral simple exact | `NO_SIMPLE_LITERAL` |
+| Plusieurs littéraux identiques sur la ligne | `MULTIPLE_LITERALS` |
+| F-string ou template literal | `AMBIGUOUS_STRING` |
+| Concaténation explicite (`+`/`-`) ou implicite (chaîne adjacente, non reconnue par le tokenizer JS) | `AMBIGUOUS_CONCATENATION` |
+| Docstring, annotation, `match`, clé/méthode d'objet, import statique | `AMBIGUOUS_CONTEXT` |
+| Clé déjà assainie lue via `os.environ[...]`/`os.getenv(...)`, `getattr(os, ...)`/`operator.getitem(os.environ, ...)`, `os.environ.get(...)`, alias d'import (`import os as o` → `o.environ[...]`, `from os import environ [as env]`/`getenv`, `from os import *` → `environ`/`getenv`), alias d'affectation simple, annotée (`env: dict = os.environ`), multiple (`a = b = os.environ`, y compris hors-ordre résolu par point fixe), dépaquetée (`env, _ = os.environ, 1`), walrus (`(env := os.environ)`), lieurs `for`/`with` (`for env in [os.environ]`, `with … as env`, compréhensions) et défauts d'arguments (`def f(env=os.environ)`, `lambda env=os.environ`) → `env[...]` (jusqu'à point fixe), ou via `process.env[...]`, `process.env.get(...)`, `process["env"][...]`, `Reflect.get(process.env, ...)`, `process?.env[...]`, `process?.[...]`, alias `const env = process.env` / `const env = process["env"]` / `const env = process?.["env"]` / `const {env} = process` / `const {env: e} = process` / `import {env[, …]} from …` (quelle que soit la source, y compris `"autre-lib"`, compromis disponibilité/sécurité) / `for (const env of [process.env])` → `env[...]`/`env.get(...)` (sur-refus documenté : pas d'analyse de flot, le doute profite au refus) | `AMBIGUOUS_CONTEXT` |
+| Accès `os.environ` indirect (curryfication `getattr(os.environ, "get")`, sous-référence `vars(os.environ)`/`getattr(os, "environ")`) | `AMBIGUOUS_CONTEXT` |
+| Accès indirect par import dynamique (`__import__("os")`, `importlib.import_module("os")`, y compris replié `"o"+"s"` / `f"os"`) : le module léger serait contourné. Un littéral replié différent (`__import__("sys")`) ne lie pas `os.environ` (pas de sur-refus, `test_python_dynamic_import_non_os_does_not_alias`), une valeur dynamique inconnue profite au refus | `AMBIGUOUS_CONTEXT` |
+| Littéral passé à `eval`/`exec`/`compile`/`__import__` (Python : `eval`, `exec`, `compile`, `__import__`, y compris par attribut `builtins.eval`, `__builtins__.exec`, par sélection `vars(__builtins__)["eval"]` / `vars(__builtins__)["ev" + "al"]` / `vars(__builtins__)[f"eval"]` et curryfié `getattr(__builtins__, "eval")(...)` / `getattr(__builtins__, "ev" + "al")(...)` / `getattr(__builtins__, f"eval")(...)` (concaténation de littéraux et f-string statique repliées, interpolation = doute = refus) ; JavaScript : `eval`, `Function`, `compile`, `setTimeout`/`setInterval` à premier argument chaîne, y compris optionnel `eval?.(...)`, indirect `(0, eval)(...)` / `(0, eval)?.(...)`, par indice `globalThis["eval"](...)` / `window["Function"](...)` / `obj?.["eval"](...)` et par indice concaténé `globalThis["ev" + "al"](...)` / `window["Fu" + "nction"](...)`, par alias simple `const e = eval` → `e(...)` / `(0, e)(...)` et par `Reflect.apply(eval, …)` / `Reflect.construct(Function, …)` (y compris indirect `(0, Reflect.apply)(eval, …)`, premier argument `eval`/`Function`/alias, valeur nichée dans l'args-list) (sur-refus documenté : pas de dataflow, le doute profite au refus)) : la valeur d'environnement serait ré-évaluée comme du code | `AMBIGUOUS_CONTEXT` |
+| Littéral nommant une entrée d'espace de noms (`vars()["NOM"]`, `locals()["NOM"]`, `globals()["NOM"]`) ou argument d'appel sur récepteur d'espace de noms (`getattr(vars(), "NOM")`, `vars().get("NOM")`, `operator.getitem(locals(), "NOM")`) : le patch lirait la valeur d'environnement à la place de l'entrée locale | `AMBIGUOUS_CONTEXT` |
+| Clé de propriété calculée hors fenêtre littérale bornée (`process["en" + "v"]...`, `process["env"][...]`, `process["env"][(a0, ..., a14, "SECRET")]`, `process?.[...]`) : la fenêtre est désormais bornée par le délimiteur ouvrant englobant le littéral | `AMBIGUOUS_CONTEXT` |
+| Directive prologue JavaScript (`"use strict"`) | `AMBIGUOUS_CONTEXT` |
+| Nom `os` masqué côté Python (`os = …`, `import sys as os`, `def f(os)`, `os.environ = …`, `del os.environ`, `setattr(os, "environ", …)`, `os.__dict__["environ"] = …`) ou `process` masqué côté JavaScript (`process = …`, `process.env = …`, `delete process.env`, `Reflect.set(process, "env", …)`, `globalThis.process = …`, `with (process)` / `with (obj)`) | `SHADOWED_MODULE` |
+
+Cas particuliers refusés côté JavaScript : clé d'objet littérale
+(`{"secret": 1}`), nom de méthode ou champ de classe, spécificateur
+`import`/`from`, `require(...)`, instruction `with` (`with (process)`,
+interdit en strict mode). Un nom `process` lié localement (paramètre,
+`var`/`let`/`const`, fonction/classe, import, déstructuration, `catch`,
+affectation, `with`) provoque aussi `SHADOWED_MODULE` : le patch ne doit jamais lire un
+objet qui n'est pas le global Node. Côté Python : f-string, concaténation,
+docstring, annotation, motif `case`, littéral multiligne.
+
+JSX et TypeScript sont hors périmètre : leurs extensions (`.jsx`, `.tsx`,
+`.ts`) sont refusées en remédiation manuelle. Un fichier `.js` qui contient
+du JSX doit également être revu manuellement, car un attribut JSX n'est pas
+une chaîne JavaScript ordinaire.
+
+## Sécurité
+
+- **Aucune exécution** du code analysé : `ast.parse` et `tokenize` lisent, la
+  valeur d'un littéral vient de l'AST, jamais d'un `eval`/`exec`.
+- **Aucune I/O, aucun réseau**, aucune dépendance hors bibliothèque standard
+  et `heimdall.scanner.finding` (validation lexicale du chemin).
+- **Injection de code impossible** : le nom de variable doit satisfaire
+  `^[A-Z][A-Z0-9_]{1,63}$` (64 caractères max via `MAX_VARIABLE_CHARS`) avant
+  d'entrer dans le template.
+- **Bornes** : source 1 Mio UTF-8, secret 100 000 caractères, chemin 4096
+  caractères. Toute erreur d'API est statique et ne reflète jamais l'entrée.
+- **Pas de fuite par `repr`** : `before` et `after` sont exclus de la
+  représentation du plan, et la valeur décodée d'un jeton JavaScript
+  (`_JsToken.value`) est également masquée. Un journal de session n'y verra
+  pas le secret. Ne jamais sérialiser `before`/`after` (`dataclasses.asdict` /
+  `astuple` les extrairaient en clair) : utiliser `to_safe_dict()`, sans contenu.
+- **Templates immuables** : `TEMPLATES` est un `MappingProxyType`, toute
+  réassignation lève `TypeError`.
+- **Patch vérifié** : après substitution et ajout éventuel de l'import, le
+  texte Python final doit reparser ; sinon aucun patch n'est rendu. Côté
+  JavaScript, aucun patch n'est rendu sur un contexte ambigu (concaténation
+  implicite, clé dynamique, directive prologue, `os`/`process` masqué…) ni sur
+  un fichier aux délimiteurs déséquilibrés (`_js_delimiters_balanced` → `INVALID_SYNTAX`)
+  ni sur un fichier massif (`{` / `[` > 1000 → `INVALID_SYNTAX`, anti-DoS quadratique) :
+  la substitution n'est appliquée qu'à un littéral dont le contexte lexical est
+  sûr, et le tokenizer ne fait pas de reparsing JS complet (hors bibliothèque standard
+  du projet). Toute erreur interne inattendue devient `manual` (`INVALID_SYNTAX`)
+  plutôt qu'une exception (`TemplateError` d'API reste levée). L'`import os`
+  inséré suit la fin de ligne locale (voisinage),
+  pas un `\r\n` lointain.
+
+La validation des noms (denylist système, dédoublonnage `_2`/`_3`),
+l'écriture atomique et la vérification de chemin à l'usage sont décrites dans
+`remediation-apply.md` (tickets #84/#85/#86).
+
+## Tests
+
+```bash
+.venv/bin/pytest -q tests/test_remediation_templates.py
+```
+
+La preuve d'acceptation
+[`test_replacement_is_correct_on_every_plain_leak_of_the_trap_repo`](../tests/test_remediation_templates.py)
+matérialise le corpus T21 et remplace les 10 fuites simples (5 Python,
+5 JavaScript) sans jamais modifier `tests/fixtures/trap_repo` lui-même.
