@@ -109,6 +109,14 @@ def _shannon_entropy(data: bytes) -> float:
 #   5. mots CamelCase répétés (>= 4 mots [A-Z][a-z]{2,}) représentant avec
 #      chiffres associés >= 85 % de la clé (phrases CamelCase avec chiffres
 #      intercalés sans espaces).
+# Les règles 1 à 3 s'appliquent après une normalisation défensive qui remplace
+# tout caractère non alphanumérique ASCII par un blanc (revue LOW #116 #226) :
+# la liste fermée " -_.:,;!?/" n'étant pas exhaustive, une phrase de
+# dictionnaire séparée par "#", "@", "&", ... ne doit pas échapper à la garde
+# sous prétexte que son séparateur n'est pas listé. La règle 3 compte un mot
+# dès que son squelette alphabétique porte >= 2 lettres (insensible à la casse
+# et aux substitutions leet par chiffres), pour refuser aussi les phrases à
+# casse mixte et à leetspeak type "C0rr3ct#H0rs3#...".
 # generate_server_hmac_key() régénère en boucle jusqu'à conformité avec
 # validate_server_hmac_key() : les clés produites par la voie officielle sont
 # toujours garanties valides et portent 256 bits effectifs réels.
@@ -120,11 +128,6 @@ _HUMAN_PHRASE_SEPARATORS: str = " -_.:,;!?/"
 _NATURAL_WORD_MIN_LEN: int = 2
 _ALTERNATING_CASE_MIN_RATIO: float = 0.75
 _ALTERNATING_CASE_MIN_ALPHA_RATIO: float = 0.80
-
-
-def _is_natural_word(w: str) -> bool:
-    """Indique si un tronçon ressemble à un mot de langue naturelle (insensible à la casse)."""
-    return len(w) >= _NATURAL_WORD_MIN_LEN and w.isalpha()
 
 
 def _looks_like_human_phrase(key_bytes: bytes) -> bool:
@@ -140,30 +143,42 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
     cleaned = "".join(" " if ch.isspace() else ch for ch in stripped)
     if len(cleaned) < _HUMAN_PHRASE_MIN_CHARS:
         return False
-    total = len(cleaned)
+    # Normalisation défensive des séparateurs (revue LOW #116 #226) : la liste
+    # _HUMAN_PHRASE_SEPARATORS est une liste fermée, contournable par tout
+    # séparateur hors liste ("#", "@", "&", ...). Tout non-alphanumérique ASCII
+    # est donc réduit à un blanc générique avant les règles de ratios.
+    normalized_ascii = re.sub(r"[^A-Za-z0-9 ]+", " ", cleaned)
+    total = len(normalized_ascii)
     lowercase_or_sep = sum(
         1
-        for ch in cleaned
-        if ch.isascii() and (ch.islower() or ch in _HUMAN_PHRASE_SEPARATORS)
+        for ch in normalized_ascii
+        if ch.isascii() and (ch.islower() or ch == " ")
     )
     uppercase_or_sep = sum(
         1
-        for ch in cleaned
-        if ch.isascii() and (ch.isupper() or ch in _HUMAN_PHRASE_SEPARATORS)
+        for ch in normalized_ascii
+        if ch.isascii() and (ch.isupper() or ch == " ")
     )
     if (
         lowercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
         or uppercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
     ):
         return True
-    if any(ch in _HUMAN_PHRASE_SEPARATORS for ch in cleaned):
+    if " " in normalized_ascii:
         word_chars = sum(
             1
-            for ch in cleaned
-            if ch.isascii() and (ch.isalnum() or ch in _HUMAN_PHRASE_SEPARATORS)
+            for ch in normalized_ascii
+            if ch.isascii() and (ch.isalnum() or ch == " ")
         )
-        words = [w for w in re.split(r"[\s\-_.:,;!?/]+", cleaned) if w]
-        natural_words = [w for w in words if _is_natural_word(w)]
+        words = [w for w in normalized_ascii.split(" ") if w]
+        # Squelette alphabétique >= 2 lettres par mot : insensible à la casse et
+        # aux substitutions leet par chiffres ("C0rr3ct" -> "Crrct"), pour ne pas
+        # contourner la garde par un mélange majuscules/minuscules ou de chiffres.
+        natural_words = [
+            w
+            for w in words
+            if sum(1 for c in w if c.isascii() and c.isalpha()) >= _NATURAL_WORD_MIN_LEN
+        ]
         if (
             len(natural_words) >= _CAMEL_WORDS_MIN_COUNT
             and word_chars / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
@@ -1228,11 +1243,18 @@ class VaultCipher:
     def fingerprint(self, plaintext: bytes, *, aad: bytes = b"") -> str:
         """Empreinte HMAC-SHA256 non réversible et liée au triplet d'identité.
 
-        Utilise la sous-clé HKDF dédiée (jamais la KEK, invariant 5) et intègre
-        l'AAD ``(project, env, name)`` au message : deux valeurs identiques
-        stockées sous des triplets distincts produisent des empreintes
-        distinctes, donc non corrélables depuis la seule base. Déterministe pour
-        un même ``(KEK, aad, valeur)``.
+        Utilise la clé d'empreinte active (sous-clé HKDF dérivée ou clé serveur
+        explicite — jamais la KEK directe, invariant 5) et intègre l'AAD
+        ``(project, env, name)`` au message : deux valeurs identiques stockées
+        sous des triplets distincts produisent des empreintes distinctes, donc
+        non corrélables depuis la seule base. Déterministe pour un même
+        ``(clé d'empreinte, aad, valeur)``.
+
+        La valeur est canonisée en NFC (``canonicalize_secret_value``, ticket
+        #116) au même titre que ``compute_secret_hmac`` : un appelant librairie
+        passant des octets en forme décomposée (NFD) obtient la même empreinte
+        que sa forme NFC — aucun faux négatif silencieux de détection. Les
+        octets non-UTF8 restent pris tels quels (secrets binaires).
 
         Note d'architecture (#71) : cette empreinte est un auxiliaire pré-rotation
         calculé lors de l'insertion initiale. Lors d'une rotation de KEK par
@@ -1241,7 +1263,7 @@ class VaultCipher:
         L'empreinte reste donc volontairement inchangée et ne doit pas servir de
         contrôle d'intégrité post-rotation.
         """
-        message = bytes(aad) + b"\x00" + bytes(plaintext)
+        message = bytes(aad) + b"\x00" + canonicalize_secret_value(plaintext)
         return hmac.new(self._fingerprint_key, message, hashlib.sha256).hexdigest()
 
     def compute_secret_hmac(

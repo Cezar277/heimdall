@@ -43,6 +43,7 @@ from heimdall.vault.crypto import (
     VaultCipherError,
     _extract_key_variants,
     _normalize_server_hmac_key,
+    canonicalize_secret_value,
     compute_secret_hmac,
     generate_encryption_key,
     generate_server_hmac_key,
@@ -323,6 +324,95 @@ class SecretHmacCryptoTests(TestCase):
         _normalize_server_hmac_key(_VALID_SERVER_HMAC_KEY)
         for _ in range(64):
             _normalize_server_hmac_key(generate_server_hmac_key())
+
+    def test_normalize_server_hmac_key_rejects_unlisted_separators(self) -> None:
+        """Refuse une phrase de dictionnaire séparée par des symboles hors liste.
+
+        Revue LOW #226 : ``_HUMAN_PHRASE_SEPARATORS`` est une liste fermée
+        (" -_.:,;!?/") ; une phrase à casse mixte et à leetspeak séparée par
+        "#" ou "@" franchissait diversité (>= 24 symboles), Shannon (>= 4.0)
+        et toutes les signatures de phrase naturelle (règles 1 à 5), donc
+        ``validate_server_hmac_key`` l'acceptait malgré ~60-80 bits effectifs.
+        La normalisation défensive (tout non-alphanumérique ASCII réduit à un
+        blanc, squelette alphabérique >= 2 lettres par mot) rend la garde
+        insensible au séparateur choisi et aux mutations leet.
+        """
+        weak_keys = [
+            # 58 o, 26 symboles distincts, Shannon ~4.28, séparateur "#" (revue LOW #226)
+            "C0rr3ct#H0rs3#B4tt3ry#St4pl3#3xtr4#W0rds#1234#ABCD#xyzQ!9z",
+            # Variante "@" du même leetspeak à casse mixte (revue LOW #226)
+            "C0rr3ct@H0rs3@B4tt3ry@St4pl3@3xtr4@W0rds@1234@ABCD@xyzQ!9z",
+            # 60 o, 28 symboles distincts, Shannon ~4.34, séparateur "#" (revue LOW #226)
+            "correct#horse#battery#staple#extra#words#1234#ABCD#xyzQ!9z##",
+            # Variante "@" basse-casse (revue LOW #226)
+            "correct@horse@battery@staple@extra@words@1234@ABCD@xyzQ!9z@@",
+        ]
+        for key in weak_keys:
+            with self.subTest(key=key):
+                # Précondition : ces clés franchissent diversité et Shannon, et ne
+                # sont refusées que par la garde anti-phrase (d'où le message attendu).
+                self.assertGreaterEqual(len(key.encode("utf-8")), 32)
+                self.assertGreaterEqual(len(set(key)), 24)
+                with self.assertRaises(ValueError) as ctx:
+                    validate_server_hmac_key(key)
+                self.assertIn("phrase naturelle", str(ctx.exception))
+                # Non-périodique : le refus ne vient pas de la garde de périodicité.
+                key_bytes = key.encode("utf-8")
+                self.assertFalse(
+                    any(
+                        all(key_bytes[i] == key_bytes[i % period] for i in range(len(key_bytes)))
+                        for period in range(1, len(key_bytes) // 2 + 1)
+                    )
+                )
+
+        # Aucun faux positif sur la voie supportée après durcissement
+        _normalize_server_hmac_key(_VALID_SERVER_HMAC_KEY)
+        for _ in range(64):
+            _normalize_server_hmac_key(generate_server_hmac_key())
+
+    def test_cipher_fingerprint_canonicalizes_nfc_like_compute_secret_hmac(self) -> None:
+        """VaultCipher.fingerprint canonise en NFC, parité avec compute_secret_hmac.
+
+        Revue LOW #226 : ``fingerprint()`` nue calculait l'empreinte sur les
+        octets bruts sans canonicalisation, alors que ``compute_secret_hmac``
+        / ``is_secret_value_matching`` normalisent (NFD -> NFC). Un appelant
+        librairie passant des octets NFD obtenait une empreinte différente de
+        celle stockée -> faux négatif silencieux de détection (invariant 1).
+        """
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        aad = VaultCipher.aad("project", "prod", "TOKEN")
+
+        # "école" en NFC et en NFD : les octets NFD ("e" + accent combinant U+0301)
+        # doivent produire la même empreinte que la forme NFC.
+        value_nfc = unicodedata.normalize("NFC", "école secrète")
+        value_nfd = unicodedata.normalize("NFD", value_nfc)
+        self.assertNotEqual(value_nfc.encode("utf-8"), value_nfd.encode("utf-8"))
+
+        fp_nfc = cipher.fingerprint(value_nfc.encode("utf-8"), aad=aad)
+        fp_nfd = cipher.fingerprint(value_nfd.encode("utf-8"), aad=aad)
+        self.assertEqual(fp_nfc, fp_nfd)
+
+        # Parité contractuelle : fingerprint(canonicalize(v)) == compute_secret_hmac(v, aad=aad)
+        v = "sécret~valeur"
+        v_nfd = unicodedata.normalize("NFD", v).encode("utf-8")
+        self.assertEqual(
+            cipher.fingerprint(canonicalize_secret_value(v_nfd), aad=aad),
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, v, aad=aad),
+        )
+        # Idempotence : l'octet déjà canonisé n'est pas altéré (stabilité des
+        # empreintes persistées avant correctif).
+        nfc_bytes = value_nfc.encode("utf-8")
+        self.assertEqual(canonicalize_secret_value(nfc_bytes), nfc_bytes)
+        # Les secrets binaires non-UTF8 restent pris tels quels.
+        binary = bytes(range(0, 32))
+        self.assertEqual(
+            cipher.fingerprint(binary, aad=aad),
+            hmac.new(
+                _VALID_SERVER_HMAC_KEY.encode("utf-8"),
+                bytes(aad) + b"\x00" + binary,
+                hashlib.sha256,
+            ).hexdigest(),
+        )
 
     def test_candidate_value_empty_parity_cipher(self) -> None:
         """Une valeur candidate vide retourne False en toute circonstance (avec ou sans AAD)."""
