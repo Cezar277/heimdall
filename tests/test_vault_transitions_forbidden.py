@@ -27,6 +27,7 @@ import asyncio
 import importlib
 import io
 import json
+import re
 import sqlite3
 import sys
 from collections.abc import Iterator
@@ -34,6 +35,11 @@ from contextlib import closing
 from pathlib import Path
 from types import ModuleType
 from typing import Final
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 import coverage
 import pytest
@@ -712,3 +718,51 @@ class TestStateMachineCoverage:
         assert LIFECYCLE_STATES_SET == frozenset(LIFECYCLE_STATES)
         assert len(LIFECYCLE_STATES) == 5
         assert get_transition_matrix().keys() == LIFECYCLE_STATES_SET
+
+
+# ==============================================================================
+# 7. Reproductibilité de la preuve : l'outil de mesure est épinglé
+# ==============================================================================
+
+
+class TestCoverageToolPinning:
+    """Garde-fou de la preuve « 100 % » : l'outil de mesure est déclaré.
+
+    La couverture de la machine d'états est mesurée *en processus* par
+    ``coverage`` (import direct de ce module de test). Résolu seulement
+    transitivement via ``pytest-cov``, ce paquet pourrait dériver de version et
+    la preuve « 100 % » cesserait d'être reproductible à l'identique : le pin
+    est donc direct, exact, et aligné sur le lock — c'est ce qui est vérifié ici.
+    """
+
+    def test_coverage_is_a_pinned_direct_dev_dependency(self) -> None:
+        """``coverage`` est déclaré en dev, épinglé, et c'est cette version qui mesure."""
+        root = Path(__file__).resolve().parents[1]
+        document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        dev = document["project"]["optional-dependencies"]["dev"]
+
+        # (a) Déclaration directe avec un pin exact — jamais une résolution transitive.
+        pins = [
+            match.group(1)
+            for match in (
+                re.fullmatch(r"coverage(?:\[[^\]]+\])?==(\d+\.\d+\.\d+)", requirement)
+                for requirement in dev
+            )
+            if match is not None
+        ]
+        assert len(pins) == 1, (
+            f"coverage doit être déclaré une seule fois en dev, avec un pin exact : {dev}"
+        )
+        version = pins[0]
+
+        # (b) La CI installe depuis le lock : il doit porter le même pin.
+        lock = (root / "requirements.lock").read_text(encoding="utf-8")
+        assert re.search(
+            rf"^coverage(?:\[[^\]]+\])?=={re.escape(version)}\b", lock, re.MULTILINE
+        ), f"requirements.lock ne pin pas coverage {version}"
+
+        # (c) La version qui mesure effectivement la preuve est celle qui est épinglée.
+        assert coverage.__version__ == version, (
+            f"coverage {coverage.__version__} est installé alors que le pin est {version} : "
+            "la preuve de couverture n'est plus reproductible à l'identique."
+        )
