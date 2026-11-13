@@ -1231,6 +1231,15 @@ class VaultCipher:
         Une empreinte corrompue ne peut mathématiquement correspondre à aucun secret.
         Pour les stores de données, le repli déchiffrement transparent s'applique
         lors d'une altération en base afin d'interdire tout faux négatif (invariant 1).
+
+        Avertissement de domaine (empreintes stockées vs brutes, revue LOW #116) :
+        Sans ``aad``, la comparaison porte exclusivement sur l'empreinte HMAC brute non
+        liée (``compute_secret_hmac(value)``). Les empreintes persistées en base étant
+        systématiquement liées à l'identité du secret (``aad=VaultCipher.aad(...)``),
+        passer une empreinte stockée sans fournir son ``aad`` retourne toujours ``False``
+        (séparation cryptographique des domaines interdisant toute confusion de contexte).
+        Pour vérifier une empreinte issue du stockage, fournir obligatoirement le paramètre
+        ``aad``.
         """
         if not isinstance(value, (str, bytes, bytearray)):
             raise TypeError("La valeur candidate doit être de type str, bytes ou bytearray.")

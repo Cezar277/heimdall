@@ -184,6 +184,8 @@ class InMemorySecretStore:
         if "\x00" in value:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")
+        if not value_bytes:
+            raise ValueError("La valeur du secret ne peut pas être vide.")
         if b"\x00" in value_bytes:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         async with self._lock:
@@ -718,6 +720,8 @@ class SqliteSecretStore:
         if "\x00" in value:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         value_bytes = unicodedata.normalize("NFC", value).encode("utf-8")
+        if not value_bytes:
+            raise ValueError("La valeur du secret ne peut pas être vide.")
         if b"\x00" in value_bytes:
             raise ValueError("Le caractère NUL est interdit dans la valeur du secret.")
         with db_session(self._db_path) as conn:

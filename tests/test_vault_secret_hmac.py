@@ -714,33 +714,38 @@ class KeySeparationTests(TestCase):
         )
 
     def test_compute_secret_hmac_naked_primitive_contract_is_documented(self) -> None:
-        """Verrouille le contrat de la primitive nue (revue LOW #116).
+        """Verrouille le contrat de la primitive nue (revue LOW #116 : interdiction documentée).
 
-        Décision d'architecture : ``compute_secret_hmac`` est une primitive bas
-        niveau qui ne peut pas deviner la KEK/maîtresse de l'appelant. La seule
-        voie supportée en production est ``VaultCipher.compute_secret_hmac``
-        (qui injecte toujours sa KEK dans ``forbidden_keys``). Un appelant qui
-        utilise la fonction nue DOIT fournir ``forbidden_keys`` ; sans cela, le
-        calcul reste possible mais l'invariant 5 n'est pas vérifiable.
+        Décision d'architecture (contrat d'interdiction documentée) :
+        ``compute_secret_hmac`` est une primitive cryptographique pure (sans état)
+        qui ne peut pas deviner l'entropie de la KEK de l'appelant. L'utilisation
+        de la KEK comme clé serveur sans ``forbidden_keys`` est strictement interdite
+        par contrat (docstring). La seule voie supportée en production est
+        ``VaultCipher.compute_secret_hmac`` (qui injecte automatiquement sa KEK
+        dans ``forbidden_keys``). Si la primitive nue est appelée directement,
+        l'appelant DOIT fournir ``forbidden_keys`` pour que l'invariant 5 soit
+        appliqué fail-closed.
         """
         value = "naked_primitive_value"
         kek = _VALID_KEK
 
-        # 1. Comportement documenté de la primitive nue : calcul accepté…
+        # 1. Contrat d'interdiction documentée : la fonction nue pure calcule l'HMAC
+        #    mais la réutilisation de KEK est interdite par contrat/docstring...
         fp = compute_secret_hmac(kek, value)
         self.assertRegex(fp, r"^[0-9a-f]{64}$")
 
-        # 2. …mais dès que l'appelant déclare l'entropie interdite, refus fail-closed.
+        # 2. ...et dès que l'appelant déclare l'entropie interdite, refus fail-closed immédiat.
         with self.assertRaises(ValueError):
             compute_secret_hmac(kek, value, forbidden_keys=kek)
         with self.assertRaises(ValueError):
             compute_secret_hmac(kek, value, forbidden_keys=[b"autre", kek])
 
-        # 3. La voie supportée injecte systématiquement la KEK du chiffreur.
+        # 3. La seule voie de production supportée est VaultCipher, qui injecte
+        #    systématiquement la KEK du chiffreur et prévient toute confusion d'entropie.
         cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
         self.assertEqual(
             cipher.compute_secret_hmac(value),
-            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, value),
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, value, forbidden_keys=(b"K" * 32,)),
         )
 
     def test_key_separation_type_safety_rejects_non_string_bytes_types(self) -> None:
@@ -894,6 +899,21 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
 
         # Et l'empreinte liée à l'AAD est bien acceptée
         bound_fp = cipher.fingerprint(val.encode("utf-8"), aad=aad)
+        self.assertTrue(cipher.is_secret_value_matching(val, bound_fp, aad=aad))
+
+    def test_cipher_is_secret_value_matching_without_aad_rejects_bound_fingerprint(
+        self,
+    ) -> None:
+        """is_secret_value_matching sans aad ne matche pas une empreinte liée (revue LOW #116)."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        val = "secret_cross_triplet_probe"
+        aad = VaultCipher.aad("project", "env", "name")
+        bound_fp = cipher.fingerprint(val.encode("utf-8"), aad=aad)
+
+        # Sans AAD, l'empreinte liée issue du stockage est strictement refusée (False)
+        self.assertFalse(cipher.is_secret_value_matching(val, bound_fp))
+
+        # Avec le bon AAD, la correspondance est validée
         self.assertTrue(cipher.is_secret_value_matching(val, bound_fp, aad=aad))
 
     def test_cipher_is_secret_value_matching_in_derived_mode_raises_error(self) -> None:
@@ -1285,6 +1305,27 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             await sql_store.create("demo", "prod", "SEC1", "some_secret_value")
             self.assertFalse(await sql_store.is_secret_value_matching("demo", "prod", "SEC1", ""))
             self.assertEqual(await sql_store.find_secrets_matching_value("demo", ""), [])
+
+    async def test_stores_create_rejects_empty_secret_value_fail_closed(
+        self,
+    ) -> None:
+        """Les stores mémoire et SQLite refusent fail-closed la création d'un secret vide."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+
+        # 1. En mémoire
+        mem_store = InMemorySecretStore(cipher=cipher)
+        with self.assertRaises(ValueError) as ctx_mem:
+            await mem_store.create("demo", "prod", "EMPTY_KEY", "")
+        self.assertIn("vide", str(ctx_mem.exception).lower())
+
+        # 2. En SQLite
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            sql_store = SqliteSecretStore(db_path, cipher)
+            with self.assertRaises(ValueError) as ctx_sql:
+                await sql_store.create("demo", "prod", "EMPTY_KEY", "")
+            self.assertIn("vide", str(ctx_sql.exception).lower())
 
     async def test_explicit_server_hmac_key_change_fails_closed(self) -> None:
         """Changer la clé HMAC serveur invalide les empreintes et échoue fail-closed."""
