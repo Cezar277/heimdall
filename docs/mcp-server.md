@@ -100,7 +100,7 @@ Le chemin vient du LLM : il est traité comme une entrée piégée
 | une seule garde, appelée par tout outil qui reçoit un chemin | `paths.confine` : refus de forme, `resolve()`, `is_relative_to` | `tests/test_mcp_paths.py` |
 | refus de `..`, des chemins absolus, des liens sortants | résolution réelle + confinement sur `Path` résolus | `RefusalTests` |
 | `.git/`, `.env*`, fichiers ignorés interdits | segments interdits (`.env-backup` inclus, `.envelope` sur-bloqué assumé) + `git check-ignore` | `tests/test_mcp_sanitize_file.py` |
-| fichiers de credentials interdits (F-09) | `.netrc`, `.pgpass`, `id_rsa*`, `id_ed25519*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `credentials`, `.docker/config.json`, `.kube/config`, casse ignorée | `test_credential_files_are_forbidden` |
+| fichiers de credentials interdits (F-09) | `.netrc`, `.pgpass`, `id_rsa*`, `id_ed25519*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `credentials`, `.docker/config.json`, `.kube/config`, casse ignorée, **variantes de sauvegarde incluses** (`.netrc.backup`, `.pgpass~`, `credentials.json`, `.docker/config.json.bak`…) | `test_credential_backup_variants_are_forbidden`, `test_credential_files_are_forbidden` |
 | binaire, > 1 Mo, absent, dossier | codes dédiés (`BINARY_FILE`, `TOO_LARGE`, `NOT_FOUND`) | idem |
 | `NOT_FOUND` réservé à l'absence, droits refusés en `INTERNAL` | `EACCES`/`EPERM` (et `lstat` refusé) = panne d'intégrité, pas « introuvable » | `test_unreadable_file_is_internal_not_not_found` |
 | codes stables, liens jugés par leur cible | FIFO avant garde `BINARY_FILE` / après garde `INTERNAL` ; lien sortant `PATH_ESCAPE` | `test_non_regular_files_keep_a_stable_code` |

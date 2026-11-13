@@ -107,3 +107,44 @@ class AuditE03MaskingProofTests(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertEqual(masking.mask_text(line), (line, 0))
+
+    def test_plural_token_keys_are_masked(self) -> None:
+        """Régression de revue : `tokens`/`TOKENS` ne sont pas `tokenizer`.
+
+        `token(?![a-z])`, introduit pour épargner `tokenizer`, excluait aussi
+        le pluriel : `tokens = "hunter2!hunter"` repartait en clair vers le
+        LLM (0 masquage vérifié par exécution). Seul `tokenizer` doit rester
+        lisible.
+        """
+        for line, secret in (
+            ('tokens = "hunter2!hunter"', "hunter2!hunter"),
+            ("TOKENS = hunter2!hunter", "hunter2!hunter"),
+            ("tokens = 'hunter2!hunter'", "hunter2!hunter"),
+            ('{"tokens": "hunter2!hunter"}', "hunter2!hunter"),
+            ("--tokens=abcd1234efgh", "abcd1234efgh"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:", masked)
+
+    def test_author_lookalikes_stay_readable(self) -> None:
+        """`author`/`authors`/`authority` ne sont pas des noms de credentials."""
+        for line in (
+            '{"author": "Martin"}',
+            '{"authors": "Martin Dupont"}',
+            '{"authority": "example.invalid"}',
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(masking.mask_text(line), (line, 0))
+
+    def test_cli_user_password_edge_lengths_are_pinned(self) -> None:
+        """`-u user:a` masque dès 1 caractère ; `-u user:` n'a rien à masquer."""
+        masked, redactions = masking.mask_text("curl -u admin:a https://x")
+        self.assertEqual(redactions, 1)
+        self.assertNotIn("-u admin:a", masked)
+        self.assertIn("admin", masked)
+
+        unchanged = "curl -u admin: https://x"
+        self.assertEqual(masking.mask_text(unchanged), (unchanged, 0))

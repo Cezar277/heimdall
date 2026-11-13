@@ -354,6 +354,41 @@ class ForbiddenPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(server.is_forbidden_path(path))
 
+    def test_credential_backup_variants_are_forbidden(self) -> None:
+        """F-09 (revue) : une copie de sauvegarde reste un fichier de credentials.
+
+        L'égalité exacte laissait lire `.netrc.backup`, `credentials.json` ou
+        `.docker/config.json.bak` ; le masquage E-03 n'est pas une autorisation.
+        """
+        for path in (
+            ".netrc.backup",
+            ".netrc~",
+            ".pgpass.bak",
+            ".pgpass~",
+            ".npmrc-backup",
+            ".npmrc.bak",
+            ".pypirc.old",
+            "credentials.json",
+            "credentials.yaml",
+            "credentials.txt",
+            "credentials.bak",
+            ".docker/config.json.bak",
+            ".docker/config.json.old",
+            ".kube/config.bak",
+            ".kube/config.old",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(server.is_forbidden_path(path))
+
+    def test_npmrc_example_is_overblocked(self) -> None:
+        """`.npmrc.example` commence par `.npmrc` : sur-blocage bénin assumé.
+
+        Un gabarit peut contenir un vrai jeton recopié par erreur ; le
+        préfixe large (comme `.env*`) ferme cette porte plutôt que de
+        deviner si le fichier est encore un exemple.
+        """
+        self.assertTrue(server.is_forbidden_path(".npmrc.example"))
+
     def test_lookalikes_are_allowed(self) -> None:
         for path in (
             ".gitignore",
@@ -367,7 +402,6 @@ class ForbiddenPathTests(unittest.TestCase):
             "keys/readme.txt",
             ".docker/config.yml",
             ".kube/other",
-            ".npmrc.example",
         ):
             with self.subTest(path=path):
                 self.assertFalse(server.is_forbidden_path(path))

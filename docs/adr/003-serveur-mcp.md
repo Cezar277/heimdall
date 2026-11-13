@@ -427,11 +427,15 @@ double garde : avant **et** après lecture), absent/dossier (`NOT_FOUND`),
 **F-09 (audit)** : `is_forbidden_path` refuse aussi les fichiers de
 credentials au-delà de `.git`/`.env*` — `.netrc`, `.pgpass`, `id_rsa*`,
 `id_ed25519*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `credentials`,
-`.docker/config.json` et `.kube/config`, casse ignorée. Le masquage E-03
+`.docker/config.json` et `.kube/config`, casse ignorée. Les variantes de
+sauvegarde sont refusées par préfixe ou extension (`.netrc.backup`,
+`.pgpass~`, `.npmrc-backup`, `credentials.json`, `.docker/config.json.bak`,
+`.kube/config.old`…), car une copie reste un secret. Le masquage E-03
 reste une seconde barrière, jamais une autorisation de lecture ; les
-ressemblances (`netrc.txt`, `credentials.md`, `server.pem.txt`) restent
-lisibles. Preuve :
-`tests/test_mcp_units.py::ForbiddenPathTests` et
+ressemblances (`netrc.txt`, `credentials.md`, `server.pem.txt`,
+`.docker/config.yml`) restent lisibles. Preuve :
+`tests/test_mcp_units.py::ForbiddenPathTests`
+(`test_credential_backup_variants_are_forbidden`) et
 `tests/test_mcp_sanitize_file.py::SanitizeFileToolTests`
 (`test_credential_files_are_forbidden`).
 

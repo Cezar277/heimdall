@@ -2,6 +2,9 @@
 
 > **Document de sécurité interne, versionné depuis le ticket #231.** Il liste des vulnérabilités,
 > dont certaines non corrigées : à manipuler et diffuser avec les précautions d'usage.
+> Le versionner est un choix assumé de traçabilité : il publie aussi les contournements
+> non corrigés par cette PR (notamment C-01, `git commit -a`), qui restent documentés
+> ici pour être traités dans leurs tickets dédiés.
 
 - **Date** : 13 novembre 2026 — commit audité : `c35df09` (branche `main`)
 - **Périmètre lu** : `heimdall/` (Vault, CLI, MCP, LLM, scanner), `docker/`, `Dockerfile`, `docker-compose.yml`, `.github/workflows/`, fichiers de configuration et de verrouillage.
@@ -84,7 +87,7 @@ Le Vault (crypto, SQL, authentification, permissions de fichiers) est la partie 
 
   | Forme | Détection |
   |---|---|
-  | `DB_PASSWORD = "Summer2024!Prod"` | 0 % |
+  | `DB_PASSWORD = "Example-Password-0000"` | 0 % |
   | mot de passe fort de 16 caractères avec symboles | 0 % |
   | `postgres://admin:motdepasse@hôte/base` | 0 % |
   | jeton aléatoire de 20 caractères | 0 % |

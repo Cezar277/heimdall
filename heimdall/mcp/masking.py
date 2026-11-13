@@ -44,8 +44,14 @@ REDACTION_MARKER: Final[str] = "<REDACTED:"
 # une apostrophe (`password = "it's-secret-123"`) et inversement
 # (`password = 'say "hi"'`). Un seul motif ne pouvait pas exprimer les deux
 # sans couper la valeur au premier guillemet interne.
+#
+# Le préfixe `(?<![A-Za-z])` évite de relancer le motif à chaque caractère
+# d'une longue valeur (`password = ` + 120 Ko : ~0,45 s → ~0,05 s mesuré).
+# Un nom de clé ne peut pas commencer au milieu d'une suite de lettres ; les
+# formes utiles (`123password`, `_password`, `.password`) restent couvertes
+# car le caractère qui les précède n'est pas une lettre.
 _QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
-    r"[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
     r"\s*(?:=>|[:=])\s*"
     r'"(?P<value>(?:[^"\\\n]|\\.){4,})"'
 )
@@ -55,7 +61,7 @@ _QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 # couverte par `\\.` ; une apostrophe non échappée termine la chaîne, comme
 # le veut la syntaxe.
 _SINGLE_QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
-    r"[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
     r"\s*(?:=>|[:=])\s*"
     r"'(?P<value>(?:[^'\\\n]|\\.){4,})'"
 )
@@ -73,7 +79,7 @@ _SINGLE_QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 # 1 Mo de valeur dense : linéaire, pas de backtracking (voir
 # `MaskingPerformanceTests`).
 _UNQUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
-    r"[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
     r"\s*(?:=>|[:=])\s*"
     r"(?P<value>[^\s\"'`,;)}\]]{6,})"
 )
@@ -99,7 +105,7 @@ _UNQUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 # sans guillemet fermant, le motif échoue au lieu de consommer (pas de
 # match partiel qui masquerait du code).
 _EVOCATIVE_SHORT_VALUE: Final[re.Pattern[str]] = re.compile(
-    r"[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
     r"\s*(?:=>|[:=])\s*"
     r"(?P<quote>[\"']?)"
     r"(?P<value>[^\s\"'`,;)}\]]{1,5})"
@@ -120,7 +126,7 @@ _EVOCATIVE_SHORT_VALUE: Final[re.Pattern[str]] = re.compile(
 # les appels de fonction (`api_key: str`, `password = get_password()`) pour ne
 # pas noyer le tri sous les faux positifs.
 _EVOCATIVE_UNQUOTED_VALUE: Final[re.Pattern[str]] = re.compile(
-    r"[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
     r"\s*(?:=>|[:=])\s*"
     r"(?P<value>[^\n]+?)(?=[ \t]+#|\n|$)"
 )
@@ -271,10 +277,17 @@ _ENV_REFERENCE: Final[re.Pattern[str]] = re.compile(
 )
 
 # Nom de variable évocateur : le masquage est presque toujours légitime.
+#
+# `token(?!izer\b)` n'épargne QUE le faux positif `tokenizer`/`TOKENIZER` :
+# `token(?![a-z])`, essayé d'abord, excluait aussi `tokens`/`TOKENS` — un
+# secret sous une clé au pluriel repartait en clair (régression fail-closed).
+# De même `auth(?!or(?:s|ities|ity)?\b)` épargne `author`, `authors`,
+# `authority`/`authorities` sans toucher `authorization`, `authentication`
+# ni `auth_token`.
 _SECRET_KEY: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(passwd|password|pwd|secret|token(?![a-z])|api[-_.]?key|access[-_.]?key|"
-    r"private[-_.]?key|credential|authorization|auth(?!or\b)|salt|signature|licen[cs]e|"
-    r"bearer|session|cert|webhook|connection[-_.]?string)"
+    r"(?i)(passwd|password|pwd|secret|token(?!izer\b)|api[-_.]?key|access[-_.]?key|"
+    r"private[-_.]?key|credential|authorization|auth(?!or(?:s|ities|ity)?\b)|salt|"
+    r"signature|licen[cs]e|bearer|session|cert|webhook|connection[-_.]?string)"
 )
 
 # Noms GÉNÉRIQUES de second rang : un nom qui se TERMINE par `key`/`pass`/

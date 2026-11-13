@@ -76,6 +76,42 @@ _FORBIDDEN_FILENAMES: Final[frozenset[str]] = frozenset(
     {".netrc", ".pgpass", ".npmrc", ".pypirc", "credentials"}
 )
 
+# Variantes de sauvegarde des fichiers ci-dessus : `.netrc.backup`,
+# `.pgpass~`, `.npmrc-backup`, `.pypirc.old`… Un éditeur ou une rotation
+# laisse souvent la copie à côté de l'original ; l'égalité exacte laissait
+# ces copies lisibles (revue). Le préfixe est volontairement large (faux
+# positif bénin) ; `netrc.txt` et `credentials.md`, qui ne sont pas des
+# préfixes de ces noms, restent lisibles.
+_FORBIDDEN_BASENAME_PREFIXES: Final[tuple[str, ...]] = (
+    ".netrc",
+    ".pgpass",
+    ".npmrc",
+    ".pypirc",
+)
+
+# `credentials` est un nom nu trop général pour un préfixe large :
+# `credentials.md` est de la documentation. On énumère les extensions et
+# suffixes de sauvegarde qui, eux, contiennent des credentials.
+_CREDENTIALS_VARIANTS: Final[tuple[str, ...]] = tuple(
+    f"credentials{suffix}"
+    for suffix in (
+        ".json",
+        ".yaml",
+        ".yml",
+        ".txt",
+        ".ini",
+        ".toml",
+        ".cfg",
+        ".conf",
+        ".bak",
+        ".backup",
+        ".old",
+        ".orig",
+        ".save",
+        "~",
+    )
+)
+
 # Clés privées et trousseaux : le suffixe suffit, quelle que soit la casse.
 _FORBIDDEN_SUFFIXES: Final[tuple[str, ...]] = (".pem", ".key")
 
@@ -84,10 +120,13 @@ _FORBIDDEN_SUFFIXES: Final[tuple[str, ...]] = (".pem", ".key")
 _FORBIDDEN_PREFIXES: Final[tuple[str, ...]] = ("id_rsa", "id_ed25519")
 
 # Configurations qui contiennent des identifiants de registre / cluster.
-_FORBIDDEN_CONFIG_PATHS: Final[frozenset[tuple[str, str]]] = frozenset(
-    {(".docker", "config.json"), (".kube", "config")}
+# Comparaison par préfixe du nom : `.docker/config.json.bak` et
+# `.kube/config.old` sont des copies de la même configuration, pas des
+# homonymes inoffensifs.
+_FORBIDDEN_CONFIG_PATHS: Final[tuple[tuple[str, str], ...]] = (
+    (".docker", "config.json"),
+    (".kube", "config"),
 )
-_CONFIG_PATH_SEGMENTS: Final[int] = 2
 
 
 # `O_NONBLOCK` n'existe pas sur Windows : repli à 0 (aucun effet) pour
@@ -468,26 +507,29 @@ def is_forbidden_path(relative: str) -> bool:
 
     F-09 : la liste couvre aussi les fichiers de credentials usuels
     (`.netrc`, `.pgpass`, `id_rsa`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`,
-    `.docker/config.json`, `.kube/config`, `credentials`). Le masquage de
-    E-03 reste une seconde barrière, pas une autorisation de lecture.
+    `.docker/config.json`, `.kube/config`, `credentials`) **et leurs
+    variantes de sauvegarde** (`.netrc.backup`, `credentials.json`,
+    `.docker/config.json.bak`…). Le masquage de E-03 reste une seconde
+    barrière, pas une autorisation de lecture.
     """
     segments = relative.split("/")
     lowered = [segment.lower() for segment in segments]
-    for segment in lowered:
-        if segment == ".git":
-            return True
-        if segment.startswith(".env"):
-            return True
-        if segment in _FORBIDDEN_FILENAMES:
-            return True
-        if segment.endswith(_FORBIDDEN_SUFFIXES):
-            return True
-        if segment.startswith(_FORBIDDEN_PREFIXES):
-            return True
-    return (
-        len(lowered) >= _CONFIG_PATH_SEGMENTS
-        and (lowered[-2], lowered[-1]) in _FORBIDDEN_CONFIG_PATHS
+    forbidden_segment = any(
+        segment == ".git"
+        or segment.startswith(".env")
+        or segment in _FORBIDDEN_FILENAMES
+        or segment.startswith(_FORBIDDEN_BASENAME_PREFIXES)
+        or segment in _CREDENTIALS_VARIANTS
+        or segment.endswith(_FORBIDDEN_SUFFIXES)
+        or segment.startswith(_FORBIDDEN_PREFIXES)
+        for segment in lowered
     )
+    forbidden_config = any(
+        segment == directory and lowered[index + 1].startswith(basename)
+        for index, segment in enumerate(lowered[:-1])
+        for directory, basename in _FORBIDDEN_CONFIG_PATHS
+    )
+    return forbidden_segment or forbidden_config
 
 
 def _absent_or_internal(error: OSError) -> ToolFailure:

@@ -282,6 +282,13 @@ class SanitizeFileToolTests(FileRepoTestCase):
             "credentials",
             ".docker/config.json",
             ".kube/config",
+            ".netrc.backup",
+            ".pgpass~",
+            ".npmrc-backup",
+            "credentials.json",
+            "credentials.txt",
+            ".docker/config.json.bak",
+            ".kube/config.old",
         ):
             with self.subTest(path=path):
                 self.write(path, "mot-de-passe-factice\n")
