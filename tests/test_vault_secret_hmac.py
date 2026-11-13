@@ -318,6 +318,20 @@ class SecretHmacCryptoTests(TestCase):
             )
         self.assertIn("phrase naturelle", str(ctx12.exception))
 
+        # 13. Phrase à casse alternée avec séparateurs (revue LOW #116 : 56 chars, Shannon ~4.74)
+        with self.assertRaises(ValueError) as ctx13:
+            validate_server_hmac_key(
+                "cOrReCt-hOrSe-BaTtErY-sTaPlE-eXtRa-WoRdS-1234-ABCD-xyzQ!"
+            )
+        self.assertIn("phrase naturelle", str(ctx13.exception))
+
+        # 14. Variante à casse alternée sans séparateurs (revue LOW #116 : 59 chars, Shannon ≈ 5.0)
+        with self.assertRaises(ValueError) as ctx14:
+            validate_server_hmac_key(
+                "cOrReCtHoRsEBaTtErYsTaPlEeXtRaWoRdS1234ABCDxyzQ!PlusMore456"
+            )
+        self.assertIn("phrase naturelle", str(ctx14.exception))
+
         # Vérifier que validate_server_hmac_key lève également sur la phrase en capitales
         with self.assertRaises(ValueError) as ctx_v:
             validate_server_hmac_key(

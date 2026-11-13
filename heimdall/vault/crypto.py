@@ -118,13 +118,13 @@ _CAMEL_WORDS_MIN_COUNT: int = 4
 _CAMEL_WORDS_PATTERN: re.Pattern[str] = re.compile(r"[A-Z][a-z]{2,}")
 _HUMAN_PHRASE_SEPARATORS: str = " -_.:,;!?/"
 _NATURAL_WORD_MIN_LEN: int = 2
+_ALTERNATING_CASE_MIN_RATIO: float = 0.70
+_ALTERNATING_CASE_MIN_ALPHA_RATIO: float = 0.80
 
 
 def _is_natural_word(w: str) -> bool:
-    """Indique si un tronçon ressemble à un mot de langue naturelle (lettres, casse cohérente)."""
-    if len(w) < _NATURAL_WORD_MIN_LEN or not w.isalpha():
-        return False
-    return w.islower() or w.isupper() or w.istitle()
+    """Indique si un tronçon ressemble à un mot de langue naturelle (insensible à la casse)."""
+    return len(w) >= _NATURAL_WORD_MIN_LEN and w.isalpha()
 
 
 def _looks_like_human_phrase(key_bytes: bytes) -> bool:
@@ -145,14 +145,15 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
         for ch in stripped
         if ch.isascii() and (ch.islower() or ch in _HUMAN_PHRASE_SEPARATORS)
     )
-    if lowercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
-        return True
     uppercase_or_sep = sum(
         1
         for ch in stripped
         if ch.isascii() and (ch.isupper() or ch in _HUMAN_PHRASE_SEPARATORS)
     )
-    if uppercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
+    if (
+        lowercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
+        or uppercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
+    ):
         return True
     if any(ch in _HUMAN_PHRASE_SEPARATORS for ch in stripped):
         word_chars = sum(
@@ -173,10 +174,22 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
         for ch in stripped
         if ch.isascii() and (ch.isdigit() or ch in _HUMAN_PHRASE_SEPARATORS)
     )
-    return (
+    if (
         len(camel_words) >= _CAMEL_WORDS_MIN_COUNT
         and camel_len / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
-    )
+    ):
+        return True
+    letters = [ch for ch in stripped if ch.isascii() and ch.isalpha()]
+    if (
+        len(letters) >= _HUMAN_PHRASE_MIN_CHARS
+        and len(letters) / total >= _ALTERNATING_CASE_MIN_ALPHA_RATIO
+    ):
+        transitions = sum(
+            1 for i in range(len(letters) - 1) if letters[i].islower() != letters[i + 1].islower()
+        )
+        if transitions / (len(letters) - 1) >= _ALTERNATING_CASE_MIN_RATIO:
+            return True
+    return False
 
 
 # Une DEK fait 256 bits, comme la KEK : l'AES-256-GCM exige une clé de 32 octets.
