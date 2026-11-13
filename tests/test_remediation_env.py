@@ -875,15 +875,15 @@ def test_remediate_environment_rejects_conflicting_paths_without_writing(
         assert not (tmp_path / ".env.example").exists()
         assert not (tmp_path / ".gitignore").exists()
 
-    with pytest.raises(EnvRemediationError, match="chemins d'environnement confondus"):
+    with pytest.raises(EnvRemediationError, match="un gabarit"):
         remediate_environment(tmp_path, secrets, env_path=".env.example")
     assert_no_writes()
 
-    with pytest.raises(EnvRemediationError, match="chemins d'environnement confondus"):
+    with pytest.raises(EnvRemediationError, match="nom de gabarit"):
         remediate_environment(tmp_path, secrets, env_path=".env", example_path=".env")
     assert_no_writes()
 
-    with pytest.raises(EnvRemediationError, match="chemins d'environnement confondus"):
+    with pytest.raises(EnvRemediationError, match="nom de gabarit"):
         remediate_environment(tmp_path, secrets, example_path=".env")
     assert_no_writes()
 
@@ -1068,6 +1068,8 @@ def test_env_file_rejects_line_with_empty_key(tmp_path: Path) -> None:
         "# note ... AKIAIOSFODNN7EXAMPLE",
         "# note ... a1b2c3d4e5f6g7h8",
         "# See https://user:pass@example.com",
+        "# password h****r",
+        "# note XqKmNpRtVbYzWcDfGhJkL",
     ],
 )
 def test_env_example_bare_comment_with_secret_is_purged_and_masked(
@@ -1211,3 +1213,57 @@ def test_env_operations_reject_export_prefix_syntax(tmp_path: Path) -> None:
     # 3. Dans .env.example existant lors de plan_env_example_change
     with pytest.raises(EnvRemediationError, match="clé invalide dans .env.example"):
         plan_env_example_change(tmp_path, ["NEW_VAR"])
+
+
+def test_env_operations_reject_infinite_iterables_without_hang(tmp_path: Path) -> None:
+    """Les générateurs infinis sont bornés par islice et rejetés sans hang/OOM."""
+
+    def infinite_pairs() -> object:
+        i = 0
+        while True:
+            yield (f"VAR_{i}", "val")
+            i += 1
+
+    def infinite_names() -> object:
+        i = 0
+        while True:
+            yield f"VAR_{i}"
+            i += 1
+
+    with pytest.raises(EnvRemediationError, match="dépasse"):
+        update_env_example(tmp_path, infinite_names())  # type: ignore[arg-type]
+
+    with pytest.raises(EnvRemediationError, match="dépasse"):
+        update_env_file(tmp_path, infinite_pairs())  # type: ignore[arg-type]
+
+    with pytest.raises(EnvRemediationError, match="dépasse"):
+        remediate_environment(tmp_path, infinite_pairs())  # type: ignore[arg-type]
+
+    assert not (tmp_path / ".env").exists()
+    assert not (tmp_path / ".env.example").exists()
+    assert not (tmp_path / ".gitignore").exists()
+
+
+def test_remediate_environment_rejects_swapped_env_and_example_roles(tmp_path: Path) -> None:
+    """L'inversion env_path='.env.example', example_path='.env' est rejetée sans rien écrire."""
+    secrets = {"API_KEY": "synthetic_secret_value"}
+
+    with pytest.raises(EnvRemediationError, match="gabarit"):
+        remediate_environment(
+            tmp_path,
+            secrets,
+            env_path=".env.example",
+            example_path=".env",
+        )
+
+    assert not (tmp_path / ".env").exists()
+    assert not (tmp_path / ".env.example").exists()
+    assert not (tmp_path / ".gitignore").exists()
+
+    with pytest.raises(EnvRemediationError, match="gabarit"):
+        update_env_file(tmp_path, secrets, env_path=".env.example")
+    assert not (tmp_path / ".env.example").exists()
+
+    with pytest.raises(EnvRemediationError, match="gabarit"):
+        update_env_example(tmp_path, ["API_KEY"], example_path=".env")
+    assert not (tmp_path / ".env").exists()

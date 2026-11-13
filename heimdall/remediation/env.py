@@ -36,6 +36,7 @@ Confinement et sécurité :
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 import shlex
@@ -82,6 +83,14 @@ _MASKED_VALUE: Final[str] = "***"
 
 #: Taille exacte attendue pour une paire (clé, valeur).
 _SECRET_PAIR_LENGTH: Final[int] = 2
+
+#: Suffixes de fichiers gabarits (.env.example, etc.) interdits comme cible de secrets.
+_EXAMPLE_TEMPLATE_SUFFIXES: Final[tuple[str, ...]] = (
+    ".example",
+    ".template",
+    ".sample",
+    ".dist",
+)
 
 #: Extensions de sauvegarde ou fichiers temporaires rejetés fail-closed.
 _REJECTED_ENV_SUFFIXES: Final[tuple[str, ...]] = (
@@ -208,13 +217,38 @@ def _is_env_like_path(rel_path: str) -> bool:
     )
 
 
-def _validate_env_like_path(rel_path: str, name_for_msg: str) -> str:
-    """Valide qu'un chemin désigne un fichier d'environnement, pas une source."""
+def _is_example_template_path(rel_path: str) -> bool:
+    """Vrai si le chemin désigne un gabarit (.env.example, .env.template, etc.)."""
+    name = Path(rel_path).name
+    return any(name.endswith(suffix) for suffix in _EXAMPLE_TEMPLATE_SUFFIXES)
+
+
+def _validate_env_like_path(
+    rel_path: str,
+    name_for_msg: str,
+    *,
+    expect_template: bool | None = None,
+) -> str:
+    """Valide qu'un chemin désigne un fichier d'environnement, pas une source.
+
+    Si ``expect_template`` est vrai, exige un nom de gabarit (``.example``,
+    ``.template``, ``.sample``, ``.dist``). S'il est faux, refuse un gabarit
+    pour empêcher toute inversion de rôle (écriture de secrets dans un gabarit).
+    """
     if not isinstance(rel_path, str):
         raise EnvRemediationError(f"chemin {name_for_msg} invalide (non-str)")
     if not _is_env_like_path(rel_path):
         raise EnvRemediationError(
             f"chemin {name_for_msg} invalide : fichier d'environnement attendu"
+        )
+    is_template = _is_example_template_path(rel_path)
+    if expect_template is True and not is_template:
+        raise EnvRemediationError(
+            f"chemin {name_for_msg} invalide : nom de gabarit (.example) attendu"
+        )
+    if expect_template is False and is_template:
+        raise EnvRemediationError(
+            f"chemin {name_for_msg} invalide : un gabarit (.example) ne peut recevoir de secrets"
         )
     return rel_path
 
@@ -338,9 +372,12 @@ def _extract_and_validate_names(  # noqa: PLR0912
     if isinstance(variables, str):
         raw_names = [variables]
     elif isinstance(variables, Mapping):
-        raw_names = list(variables.keys())
+        raw_names = list(itertools.islice(variables.keys(), _MAX_VARIABLES_COUNT + 1))
     elif isinstance(variables, Iterable):
-        for item in variables:
+        bounded_items: Iterable[str | tuple[str, str]] = itertools.islice(
+            variables, _MAX_VARIABLES_COUNT + 1
+        )
+        for item in bounded_items:
             if isinstance(item, tuple):
                 if len(item) != _SECRET_PAIR_LENGTH:
                     raise EnvRemediationError(
@@ -398,6 +435,116 @@ _MIN_ENTROPY_TOKEN_LEN: Final[int] = 16
 #: Seuil d'entropie de Shannon (bits/caractère), aligné sur le masquage central.
 _COMMENT_ENTROPY_THRESHOLD: Final[float] = 3.5
 
+#: Seuil d'entropie pour les jetons purement alphabétiques (sans chiffre ni symbole).
+_PURE_ALPHA_ENTROPY_THRESHOLD: Final[float] = 3.8
+
+#: Mots-clés évocateurs de secret pouvant précéder une valeur sans ':' ni '='.
+_COMMENT_EVOCATIVE_KEYWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "password",
+        "passwd",
+        "pwd",
+        "pass",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+        "apikey",
+        "api_key",
+        "access_key",
+        "private_key",
+        "client_secret",
+        "auth_token",
+        "bearer",
+        "credential",
+        "credentials",
+        "mdp",
+        "mot_de_passe",
+    }
+)
+
+#: Mots courants de prose documentaire (anglais/français) qui ne sont pas des secrets.
+_PROSE_STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "for",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "by",
+        "or",
+        "and",
+        "with",
+        "from",
+        "without",
+        "not",
+        "as",
+        "if",
+        "this",
+        "that",
+        "your",
+        "our",
+        "my",
+        "un",
+        "une",
+        "le",
+        "la",
+        "les",
+        "de",
+        "du",
+        "des",
+        "au",
+        "aux",
+        "et",
+        "ou",
+        "pour",
+        "est",
+        "sont",
+        "avec",
+        "sans",
+        "dans",
+        "sur",
+        "par",
+        "ce",
+        "cette",
+        "votre",
+        "notre",
+        "mon",
+        "should",
+        "must",
+        "can",
+        "will",
+        "needed",
+        "required",
+        "optional",
+        "generated",
+        "stored",
+        "used",
+        "set",
+        "here",
+        "below",
+        "above",
+        "doit",
+        "requis",
+        "requise",
+        "optionnel",
+        "optionnelle",
+        "généré",
+        "ici",
+        "ci-dessous",
+        "ci-dessus",
+    }
+)
+
 
 def _is_documentation_token(token: str) -> bool:
     """Vrai pour une URL, un chemin ou une version : bruit documentaire, pas un secret."""
@@ -409,15 +556,42 @@ def _is_documentation_token(token: str) -> bool:
     )
 
 
+def _has_bare_comment_secret(text: str) -> bool:
+    """Détecte un jeton à haute entropie ou un mot-clé évocateur suivi d'une valeur."""
+    for token in _COMMENT_TOKEN_PATTERN.findall(text):
+        if len(token) < _MIN_ENTROPY_TOKEN_LEN or _is_documentation_token(token):
+            continue
+        entropy = shannon_entropy(token)
+        has_non_alpha = any(c.isdigit() or c in "_-+/*~" for c in token)
+        is_mixed_case = any(c.isupper() for c in token) and any(c.islower() for c in token)
+        if entropy >= _COMMENT_ENTROPY_THRESHOLD and (
+            has_non_alpha or is_mixed_case or entropy >= _PURE_ALPHA_ENTROPY_THRESHOLD
+        ):
+            return True
+
+    words = text.split()
+    for idx, word in enumerate(words[:-1]):
+        key = word.lower().strip(":=,-_()[]{}\"'")
+        if key not in _COMMENT_EVOCATIVE_KEYWORDS:
+            continue
+        next_word = words[idx + 1].strip(",.;:()[]{}\"'")
+        if next_word and "'" not in next_word and next_word.lower() not in _PROSE_STOPWORDS:
+            return True
+
+    return False
+
+
 def _comment_contains_potential_secret(raw_line: str) -> bool:
     """Détecte si un commentaire (# ...) contient un secret potentiel.
 
-    Trois filets complémentaires, sans jamais recopier le contenu dans un diff :
+    Quatre filets complémentaires, sans jamais recopier le contenu dans un diff :
     1. les credentials d'URL (userinfo ``https://user:pass@hôte``) ;
     2. les motifs déjà reconnus par le masquage central (#16/#22) : affectations,
        préfixes de jetons connus, en-têtes d'autorisation, jetons denses ;
-    3. un jeton nu long et à haute entropie (ex. ``# note ... <jeton aléatoire>``),
-       en excluant les URL, chemins et versions qui relèvent de la documentation.
+    3. un jeton nu long et à haute entropie (y compris purement alphabétique),
+       en excluant les URL, chemins et versions qui relèvent de la documentation ;
+    4. un mot-clé évocateur (``password``, ``secret``, ``token``, etc.) suivi
+       d'une valeur sans ``:`` ni ``=``.
     """
     stripped = raw_line.strip()
     if not stripped.startswith("#"):
@@ -432,19 +606,7 @@ def _comment_contains_potential_secret(raw_line: str) -> bool:
     # Les URL ordinaires (documentation, endpoint) sont retirées avant le
     # masquage central : leurs chemins denses ne sont pas des secrets.
     without_urls = _URL_PATTERN.sub(" ", body)
-    if mask_text(without_urls)[1] > 0:
-        return True
-
-    for token in _COMMENT_TOKEN_PATTERN.findall(without_urls):
-        if (
-            len(token) >= _MIN_ENTROPY_TOKEN_LEN
-            and shannon_entropy(token) >= _COMMENT_ENTROPY_THRESHOLD
-            and any(c.isdigit() or c in "_-+/*~" for c in token)
-            and not _is_documentation_token(token)
-        ):
-            return True
-
-    return False
+    return mask_text(without_urls)[1] > 0 or _has_bare_comment_secret(without_urls)
 
 
 def _sanitize_example_comment_line(raw_line: str, *, mask_values: bool) -> str:
@@ -659,7 +821,7 @@ def update_env_example(
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
-    _validate_env_like_path(example_path, ".env.example")
+    _validate_env_like_path(example_path, ".env.example", expect_template=True)
     validated_names = _extract_and_validate_names(variables)
     confined = _confine_and_check_no_symlink(root, example_path, ".env.example")
 
@@ -746,7 +908,7 @@ def update_env_file(  # noqa: PLR0912, PLR0915
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
-    _validate_env_like_path(env_path, ".env")
+    _validate_env_like_path(env_path, ".env", expect_template=False)
 
     if isinstance(secrets, (str, bytes)):
         raise EnvRemediationError(
@@ -754,9 +916,9 @@ def update_env_file(  # noqa: PLR0912, PLR0915
         )
 
     if isinstance(secrets, Mapping):
-        pairs = list(secrets.items())
+        pairs = list(itertools.islice(secrets.items(), _MAX_VARIABLES_COUNT + 1))
     elif isinstance(secrets, Iterable):
-        pairs = list(secrets)
+        pairs = list(itertools.islice(secrets, _MAX_VARIABLES_COUNT + 1))
     else:
         raise EnvRemediationError("secrets invalides : type non supporté")
 
@@ -893,7 +1055,7 @@ def plan_env_example_change(
     """
     if not isinstance(root, Path):
         raise EnvRemediationError("racine invalide")
-    _validate_env_like_path(example_path, ".env.example")
+    _validate_env_like_path(example_path, ".env.example", expect_template=True)
     validated_names = _extract_and_validate_names(variables)
     confined = _confine_and_check_no_symlink(root, example_path, ".env.example")
 
@@ -986,8 +1148,8 @@ def remediate_environment(  # noqa: PLR0913
     if not isinstance(gitignore_path, str):
         raise EnvRemediationError("chemin gitignore invalide (non-str)")
 
-    _validate_env_like_path(env_path, ".env")
-    _validate_env_like_path(example_path, ".env.example")
+    _validate_env_like_path(env_path, ".env", expect_template=False)
+    _validate_env_like_path(example_path, ".env.example", expect_template=True)
     _validate_gitignore_path(gitignore_path)
 
     confined_env = _confine_and_check_no_symlink(root, env_path, ".env")
@@ -1007,11 +1169,18 @@ def remediate_environment(  # noqa: PLR0913
             "secrets invalides : format attendu dictionnaire ou liste de paires"
         )
     if isinstance(secrets, Mapping):
-        materialized_secrets: list[tuple[str, str]] = list(secrets.items())
+        materialized_secrets: list[tuple[str, str]] = list(
+            itertools.islice(secrets.items(), _MAX_VARIABLES_COUNT + 1)
+        )
     elif isinstance(secrets, Iterable):
-        materialized_secrets = list(secrets)
+        materialized_secrets = list(itertools.islice(secrets, _MAX_VARIABLES_COUNT + 1))
     else:
         raise EnvRemediationError("secrets invalides : type non supporté")
+
+    if len(materialized_secrets) > _MAX_VARIABLES_COUNT:
+        raise EnvRemediationError(
+            f"trop de secrets : {len(materialized_secrets)} dépasse {_MAX_VARIABLES_COUNT}"
+        )
 
     # 1. Mise à jour de .env.example (valeurs vides obligatoires)
     added_to_example = update_env_example(root, materialized_secrets, example_path=example_path)
