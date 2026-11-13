@@ -133,7 +133,10 @@ Environnement : Linux, Python 3.14.6, venv local (`.venv`).
 # 220 passed
 
 .venv/bin/python -m pytest --cov=heimdall --cov-branch --cov-fail-under=85
-# suite complète verte, seuils CI respectés (Vault ≥ 70 %, scanner ≥ 70 %, MCP ≥ 70 %, global ≥ 85 %)
+# 3728 passed, 16 skipped, 6833 subtests passed in 483.12s
+# Required test coverage of 85% reached. Total coverage: 89.07%
+# heimdall/vault/* : 90 % (seuil CI 70 %) ; heimdall/scanner/* : 91 % (seuil 70 %)
+# heimdall/mcp/* : 97 % (seuil 70 %) ; heimdall/vault/transitions.py : 100 %
 
 .venv/bin/ruff check heimdall tests scripts
 # All checks passed!
