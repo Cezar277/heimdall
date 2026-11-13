@@ -1070,6 +1070,7 @@ def test_env_file_rejects_line_with_empty_key(tmp_path: Path) -> None:
         "# See https://user:pass@example.com",
         "# password h****r",
         "# note XqKmNpRtVbYzWcDfGhJkL",
+        "# hunter2",
     ],
 )
 def test_env_example_bare_comment_with_secret_is_purged_and_masked(
@@ -1267,3 +1268,44 @@ def test_remediate_environment_rejects_swapped_env_and_example_roles(tmp_path: P
     with pytest.raises(EnvRemediationError, match="gabarit"):
         update_env_example(tmp_path, ["API_KEY"], example_path=".env")
     assert not (tmp_path / ".env").exists()
+
+
+def test_env_example_short_bare_comment_only_purge_reports_update(tmp_path: Path) -> None:
+    """# hunter2 seul avec APP_KEY= déjà présent : purgé, plan non-None et reçu véridique."""
+    example_file = tmp_path / ".env.example"
+    example_file.write_text("# hunter2\nAPP_KEY=\n", encoding="utf-8")
+
+    # 1. plan_env_example_change détecte la purge seule sans exposer hunter2
+    plan = plan_env_example_change(tmp_path, ["APP_KEY"])
+    assert plan is not None
+    rel_path, before, after = plan
+    assert rel_path == ".env.example"
+    assert "hunter2" not in before
+    assert "hunter2" not in after
+    assert before == "# ***\nAPP_KEY=\n"
+    assert after == "# ***\nAPP_KEY=\n"
+
+    # 2. update_env_example retourne une liste non vide et purge sur disque
+    changed = update_env_example(tmp_path, ["APP_KEY"])
+    assert changed
+    disk_content = example_file.read_text(encoding="utf-8")
+    assert "hunter2" not in disk_content
+    assert disk_content == "# ***\nAPP_KEY=\n"
+
+    # 3. remediate_environment signale example_created_or_updated=True sur purge seule
+    example_file.write_text("# hunter2\nAPP_KEY=\n", encoding="utf-8")
+    receipt = remediate_environment(
+        tmp_path,
+        {"APP_KEY": "synthetic_secret_val"},
+        warn_stderr=False,
+    )
+    assert receipt.example_created_or_updated is True
+    assert "hunter2" not in example_file.read_text(encoding="utf-8")
+
+    # 4. Idempotence : second appel sans changement -> False
+    receipt_second = remediate_environment(
+        tmp_path,
+        {"APP_KEY": "synthetic_secret_val"},
+        warn_stderr=False,
+    )
+    assert receipt_second.example_created_or_updated is False

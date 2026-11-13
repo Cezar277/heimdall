@@ -413,8 +413,14 @@ def _extract_and_validate_names(  # noqa: PLR0912
     return validated
 
 
-#: Jeton de commentaire : lettres, chiffres et symboles usuels des secrets.
-_COMMENT_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_\-+./*~=]+")
+#: Identifiant snake_case documentaire court (ex. npm_install).
+_LOWER_SNAKE_DOC_TOKEN: Final[re.Pattern[str]] = re.compile(r"^[a-z]{2,}(?:_[a-z]{2,})+$")
+
+#: Séparateurs de mots alphabétiques documentaires (apostrophe ou tiret).
+_PROSE_WORD_SPLIT: Final[re.Pattern[str]] = re.compile(r"['\-]")
+
+#: Ponctuation de bord autorisée autour d'un mot de documentation.
+_DOC_EDGE_PUNCTUATION: Final[str] = ".,:;!?()[]{}\"'"
 
 #: Version ou date documentaire (ex. 1.2.3-beta+build.123) : jamais un secret.
 _VERSION_LIKE_TOKEN: Final[re.Pattern[str]] = re.compile(
@@ -435,8 +441,8 @@ _MIN_ENTROPY_TOKEN_LEN: Final[int] = 16
 #: Seuil d'entropie de Shannon (bits/caractère), aligné sur le masquage central.
 _COMMENT_ENTROPY_THRESHOLD: Final[float] = 3.5
 
-#: Seuil d'entropie pour les jetons purement alphabétiques (sans chiffre ni symbole).
-_PURE_ALPHA_ENTROPY_THRESHOLD: Final[float] = 3.8
+#: Nombre minimal de mots pour qu'un commentaire nu soit considéré documentaire.
+_MIN_DOC_COMMENT_WORDS: Final[int] = 2
 
 #: Mots-clés évocateurs de secret pouvant précéder une valeur sans ':' ni '='.
 _COMMENT_EVOCATIVE_KEYWORDS: Final[frozenset[str]] = frozenset(
@@ -546,30 +552,31 @@ _PROSE_STOPWORDS: Final[frozenset[str]] = frozenset(
 )
 
 
-def _is_documentation_token(token: str) -> bool:
-    """Vrai pour une URL, un chemin ou une version : bruit documentaire, pas un secret."""
-    return (
-        "://" in token
-        or token.startswith(("//", "./", "../", "/"))
-        or ("." in token and "/" in token)
-        or _VERSION_LIKE_TOKEN.match(token) is not None
+def _is_safe_doc_token(token: str) -> bool:
+    """Vrai uniquement si le jeton appartient à la grammaire documentaire allowlistée."""
+    cleaned = token.strip(_DOC_EDGE_PUNCTUATION)
+    if not cleaned:
+        return False
+    if _URL_PATTERN.fullmatch(cleaned) is not None:
+        return True
+    if _VERSION_LIKE_TOKEN.match(cleaned) is not None:
+        return True
+    if _LOWER_SNAKE_DOC_TOKEN.match(cleaned) is not None and len(cleaned) < _MIN_ENTROPY_TOKEN_LEN:
+        return True
+
+    parts = _PROSE_WORD_SPLIT.split(cleaned)
+    if not all(part and part.isalpha() for part in parts):
+        return False
+
+    return not (
+        len(cleaned) >= _MIN_ENTROPY_TOKEN_LEN
+        and shannon_entropy(cleaned) >= _COMMENT_ENTROPY_THRESHOLD
     )
 
 
-def _has_bare_comment_secret(text: str) -> bool:
-    """Détecte un jeton à haute entropie ou un mot-clé évocateur suivi d'une valeur."""
-    for token in _COMMENT_TOKEN_PATTERN.findall(text):
-        if len(token) < _MIN_ENTROPY_TOKEN_LEN or _is_documentation_token(token):
-            continue
-        entropy = shannon_entropy(token)
-        has_non_alpha = any(c.isdigit() or c in "_-+/*~" for c in token)
-        is_mixed_case = any(c.isupper() for c in token) and any(c.islower() for c in token)
-        if entropy >= _COMMENT_ENTROPY_THRESHOLD and (
-            has_non_alpha or is_mixed_case or entropy >= _PURE_ALPHA_ENTROPY_THRESHOLD
-        ):
-            return True
-
-    words = text.split()
+def _has_evocative_keyword_secret(without_urls: str) -> bool:
+    """Vrai si un mot-clé évocateur de secret précède une valeur non documentaire."""
+    words = without_urls.split()
     for idx, word in enumerate(words[:-1]):
         key = word.lower().strip(":=,-_()[]{}\"'")
         if key not in _COMMENT_EVOCATIVE_KEYWORDS:
@@ -577,36 +584,40 @@ def _has_bare_comment_secret(text: str) -> bool:
         next_word = words[idx + 1].strip(",.;:()[]{}\"'")
         if next_word and "'" not in next_word and next_word.lower() not in _PROSE_STOPWORDS:
             return True
-
     return False
 
 
-def _comment_contains_potential_secret(raw_line: str) -> bool:
-    """Détecte si un commentaire (# ...) contient un secret potentiel.
+def _is_allowlisted_doc_comment(raw_line: str) -> bool:
+    """Vrai uniquement pour un commentaire nu respectant la liste blanche documentaire.
 
-    Quatre filets complémentaires, sans jamais recopier le contenu dans un diff :
-    1. les credentials d'URL (userinfo ``https://user:pass@hôte``) ;
-    2. les motifs déjà reconnus par le masquage central (#16/#22) : affectations,
-       préfixes de jetons connus, en-têtes d'autorisation, jetons denses ;
-    3. un jeton nu long et à haute entropie (y compris purement alphabétique),
-       en excluant les URL, chemins et versions qui relèvent de la documentation ;
-    4. un mot-clé évocateur (``password``, ``secret``, ``token``, etc.) suivi
-       d'une valeur sans ``:`` ni ``=``.
+    Approche fail-closed (refus par défaut) : tout commentaire nu non allowlisté
+    (jeton isolé comme ``# hunter2``, jeton alphanumérique, haute entropie, userinfo
+    d'URL, motif du masquage central, mot-clé évocateur suivi d'une valeur) est
+    purgé en ``# ***`` pour garantir l'invariant 8.
     """
     stripped = raw_line.strip()
     if not stripped.startswith("#"):
         return False
     body = stripped.lstrip("#").strip()
-    if not body:
+    if not body or body == _MASKED_VALUE:
+        return True
+    if _URL_USERINFO_PATTERN.search(body):
         return False
 
-    if _URL_USERINFO_PATTERN.search(body):
-        return True
-
-    # Les URL ordinaires (documentation, endpoint) sont retirées avant le
-    # masquage central : leurs chemins denses ne sont pas des secrets.
     without_urls = _URL_PATTERN.sub(" ", body)
-    return mask_text(without_urls)[1] > 0 or _has_bare_comment_secret(without_urls)
+    if mask_text(without_urls)[1] > 0 or _has_evocative_keyword_secret(without_urls):
+        return False
+
+    words = body.split()
+    if len(words) < _MIN_DOC_COMMENT_WORDS:
+        return False
+
+    return all(_is_safe_doc_token(word) for word in words)
+
+
+def _comment_contains_potential_secret(raw_line: str) -> bool:
+    """Détecte si un commentaire (# ...) doit être purgé (non allowlisté fail-closed)."""
+    return not _is_allowlisted_doc_comment(raw_line)
 
 
 def _sanitize_example_comment_line(raw_line: str, *, mask_values: bool) -> str:
@@ -654,6 +665,7 @@ def _build_sanitized_example_content(
     """
     existing_keys: set[str] = set()
     modified_keys: list[str] = []
+    purged_comments: list[str] = []
     new_lines: list[str] = []
 
     for raw_line in content.splitlines():
@@ -662,7 +674,10 @@ def _build_sanitized_example_content(
             new_lines.append(raw_line)
             continue
         if stripped.startswith("#"):
-            new_lines.append(_sanitize_example_comment_line(raw_line, mask_values=mask_values))
+            sanitized_comment = _sanitize_example_comment_line(raw_line, mask_values=mask_values)
+            if sanitized_comment != raw_line:
+                purged_comments.append(f"#comment:{len(new_lines) + 1}")
+            new_lines.append(sanitized_comment)
             continue
         if "=" in stripped:
             key, _, val = stripped.partition("=")
@@ -692,7 +707,7 @@ def _build_sanitized_example_content(
         return "", []
 
     new_content = "\n".join(new_lines) + "\n"
-    return new_content, modified_keys + added_keys
+    return new_content, modified_keys + added_keys + purged_comments
 
 
 def _pattern_matches_target(rule: str, target: str) -> bool:

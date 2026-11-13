@@ -20,13 +20,15 @@ locaux nécessaires suite au remplacement d'un secret par une variable d'environ
 - **Zéro fuite** : même si un dictionnaire complet `{nom: valeur}` est fourni en entrée,
   les valeurs sont **systématiquement ignorées**. Seuls les noms validés sont écrits.
 - **Idempotence** : une variable déjà déclarée n'est pas dupliquée.
-- **Préservation et purge des commentaires** : les commentaires `#` de documentation sont préservés,
-  mais toute affectation ou valeur après `=` dans un commentaire (ex. `# APP_KEY=h****k`)
-  ou tout commentaire nu contenant un secret potentiel (motif reconnu par le masquage
-  central #16/#22, préfixe de jeton connu, jeton dense ou valeur à haute entropie,
-  ex. `# note ... z****k`) est **systématiquement purgé et masqué** par `***` sur disque
-  et dans les diffs `plan_env_example_change` (before et after), garantissant l'invariant 8
-  strict (zéro secret dans `.env.example` versionné ni dans les diffs affichés).
+- **Préservation et purge des commentaires** : les commentaires `#` respectant la liste
+  blanche documentaire stricte (prose multi-mots, URL sans userinfo, versions) sont
+  préservés, mais toute affectation ou valeur après `=` dans un commentaire (ex.
+  `# APP_KEY=h****k`) et tout commentaire nu non allowlisté (jeton isolé comme
+  `# hunter2`, mot-clé évocateur suivi d'une valeur, motif reconnu par le masquage
+  central #16/#22, jeton dense ou valeur à haute entropie) est **systématiquement
+  purgé et masqué** par `***` sur disque et dans les diffs `plan_env_example_change`
+  (before et after), garantissant l'invariant 8 strict (zéro secret dans
+  `.env.example` versionné ni dans les diffs affichés).
 
 ### 1.2. `.env` avec permissions strictes 0600 (T31.2)
 - **Secrets locaux en clair** : contient les associations `NOM="valeur"`.
