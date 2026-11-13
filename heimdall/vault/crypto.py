@@ -57,8 +57,10 @@ import hashlib
 import hmac
 import math
 import os
+import re
 import secrets
 import unicodedata
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import argon2.low_level
@@ -92,7 +94,7 @@ def _shannon_entropy(data: bytes) -> float:
 # peut franchir les seuils de diversité (24 symboles) et d'entropie brute
 # (Shannon >= 4.0) tout en ne portant que 60-80 bits effectifs (mots de
 # dictionnaire), restant attaquable hors ligne avec un dump SQLite et le canari
-# public. Trois signatures sont refusées sur une clé de 32+ caractères
+# public. Cinq signatures sont refusées sur une clé de 32+ caractères
 # normalisés :
 #   1. minuscules ASCII + espaces >= 85 % (phrases basse-casse, avec ou sans
 #      espaces, y compris les phrases à chiffres type "password123 ...") ;
@@ -100,22 +102,24 @@ def _shannon_entropy(data: bytes) -> float:
 #   3. si la clé contient un blanc, caractères ASCII alphanumériques + blancs
 #      >= 85 % (phrases capitales, à casse mixte ou à chiffres type
 #      "password123 ..." séparées par des espaces, que la règle 1 ne
-#      comptabilise pas).
-# generate_server_hmac_key() produit du base64url sans blanc (caractère absent
-# de l'alphabet) : les règles 1 et 2 y sont des événements à plus de 5 sigma
-# (environ 40 % de minuscules et 40 % de majuscules par tirage) et la règle 3
-# ne s'applique jamais : aucun faux positif n'est possible sur la seule voie
-# supportée.
-# Les seuils de diversité/entropie ne sont PAS relevables davantage : sur des
-# clés base64url de 43 octets, exiger 28 symboles distincts rejetterait ~3.7 %
-# des clés légitimes et Shannon >= 4.5 en rejetterait ~0.5 %, alors qu'une clé
-# produite par generate_server_hmac_key() doit toujours passer sa propre garde.
+#      comptabilise pas) ;
+#   4. lettres ASCII >= 85 % (phrases CamelCase sans séparateur type
+#      "CorrectHorseBatteryStaple...", y compris avec suffixe chiffré, que les
+#      règles 1 et 2 ne voient pas en raison du mélange majuscules/minuscules) ;
+#   5. mots CamelCase répétés (>= 4 mots [A-Z][a-z]{2,}) représentant avec
+#      chiffres associés >= 85 % de la clé (phrases CamelCase avec chiffres
+#      intercalés sans espaces).
+# generate_server_hmac_key() régénère en boucle jusqu'à conformité avec
+# validate_server_hmac_key() : les clés produites par la voie officielle sont
+# toujours garanties valides et portent 256 bits effectifs réels.
 _HUMAN_PHRASE_MIN_CHARS: int = 32
 _HUMAN_PHRASE_MAX_WORD_RATIO: float = 0.85
+_CAMEL_WORDS_MIN_COUNT: int = 4
+_CAMEL_WORDS_PATTERN: re.Pattern[str] = re.compile(r"[A-Z][a-z]{2,}")
 
 
 def _looks_like_human_phrase(key_bytes: bytes) -> bool:
-    """Détecte une clé qui est en réalité une phrase naturelle (mots + espaces).
+    """Détecte une clé qui est en réalité une phrase naturelle (mots + espaces, CamelCase).
 
     La détection ignore la casse par composition NFKD (accents retirés) et ne
     s'applique qu'aux clés textuelles d'au moins 32 caractères normalisés ;
@@ -141,7 +145,14 @@ def _looks_like_human_phrase(key_bytes: bytes) -> bool:
         )
         if word_chars / total >= _HUMAN_PHRASE_MAX_WORD_RATIO:
             return True
-    return False
+    camel_words = _CAMEL_WORDS_PATTERN.findall(stripped)
+    camel_len = sum(len(w) for w in camel_words) + sum(
+        1 for ch in stripped if ch.isascii() and ch.isdigit()
+    )
+    return (
+        len(camel_words) >= _CAMEL_WORDS_MIN_COUNT
+        and camel_len / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
+    )
 
 
 # Une DEK fait 256 bits, comme la KEK : l'AES-256-GCM exige une clé de 32 octets.
@@ -221,9 +232,16 @@ def generate_server_hmac_key() -> str:
     """Génère une clé HMAC serveur aléatoire avec au moins 256 bits d'entropie (ticket #116).
 
     À utiliser comme clé HMAC serveur dédiée pour le calcul des empreintes de secrets,
-    distincte de la KEK et de la clé maîtresse de chiffrement.
+    distincte de la KEK et de la clé maîtresse de chiffrement. Garantit que la clé
+    produite satisfait immédiatement ``validate_server_hmac_key``.
     """
-    return secrets.token_urlsafe(_KEY_SIZE_BYTES)
+    while True:
+        candidate = secrets.token_urlsafe(_KEY_SIZE_BYTES)
+        try:
+            validate_server_hmac_key(candidate)
+            return candidate
+        except ValueError:
+            continue
 
 
 def _to_raw_server_hmac_bytes(key: str | bytes | bytearray | None) -> bytes:
@@ -420,7 +438,14 @@ def compute_secret_hmac(
     value: str | bytes,
     *,
     aad: bytes | str | None = None,
-    forbidden_keys: tuple[str | bytes, ...] | list[str | bytes] | str | bytes | None = None,
+    forbidden_keys: (
+        Sequence[str | bytes | bytearray]
+        | set[str | bytes | bytearray]
+        | str
+        | bytes
+        | bytearray
+        | None
+    ) = None,
 ) -> str:
     """Calcule l'empreinte HMAC-SHA256 non réversible d'un secret avec la clé serveur (ticket #116).
 
@@ -462,7 +487,8 @@ def compute_secret_hmac(
             forbidden_seq = tuple(forbidden_keys)
         else:
             raise TypeError(
-                "forbidden_keys doit être une clé (str, bytes) ou une séquence de clés."
+                "forbidden_keys doit être une clé (str, bytes, bytearray) "
+                "ou une collection de clés."
             )
         for forbidden in forbidden_seq:
             if not isinstance(forbidden, (str, bytes, bytearray)):
@@ -493,7 +519,14 @@ def verify_secret_hmac(
     expected_hmac: str,
     *,
     aad: bytes | str | None = None,
-    forbidden_keys: tuple[str | bytes, ...] | list[str | bytes] | str | bytes | None = None,
+    forbidden_keys: (
+        Sequence[str | bytes | bytearray]
+        | set[str | bytes | bytearray]
+        | str
+        | bytes
+        | bytearray
+        | None
+    ) = None,
 ) -> bool:
     """Vérifie en temps constant si une valeur candidate correspond à l'empreinte HMAC.
 

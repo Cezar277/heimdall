@@ -291,6 +291,21 @@ class SecretHmacCryptoTests(TestCase):
             )
         self.assertIn("phrase naturelle", str(ctx7.exception))
 
+        # 8. Phrase CamelCase sans séparateur (revue LOW #116 : 45 chars, Shannon > 4.0)
+        with self.assertRaises(ValueError) as ctx8:
+            validate_server_hmac_key("CorrectHorseBatteryStapleExtraWordPlusMore123")
+        self.assertIn("phrase naturelle", str(ctx8.exception))
+
+        # 9. Phrase CamelCase avec chiffres sans espaces (variante avec chiffres sans espaces)
+        with self.assertRaises(ValueError) as ctx9:
+            validate_server_hmac_key("CorrectHorse123Battery456Staple789Word000More111")
+        self.assertIn("phrase naturelle", str(ctx9.exception))
+
+        # 10. Phrase CamelCase pure sans chiffres avec diversité de symboles suffisante
+        with self.assertRaises(ValueError) as ctx10:
+            validate_server_hmac_key("TheQuickBrownFoxJumpsOverTheLazyDogAndMore")
+        self.assertIn("phrase naturelle", str(ctx10.exception))
+
         # Vérifier que validate_server_hmac_key lève également sur la phrase en capitales
         with self.assertRaises(ValueError) as ctx_v:
             validate_server_hmac_key(
@@ -707,10 +722,34 @@ class KeySeparationTests(TestCase):
         with self.assertRaises(ValueError):
             compute_secret_hmac(hex_kek, value, forbidden_keys=(kek,))
 
-        # 4. Clé distincte -> acceptée
+        # 4. Forme set et bytearray de forbidden_keys (revue LOW #116 : alignement contrat)
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(kek, value, forbidden_keys={kek})
+        ba_kek = bytearray(kek.encode("utf-8"))
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(kek, value, forbidden_keys=ba_kek)
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(kek, value, forbidden_keys=[ba_kek])
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(kek, value, dummy_fp, forbidden_keys={kek})
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(kek, value, dummy_fp, forbidden_keys=ba_kek)
+
+        # 5. Clé distincte avec tuple, list, set et bytearray -> acceptée
         fp = compute_secret_hmac(_VALID_SERVER_HMAC_KEY, value, forbidden_keys=(kek,))
         self.assertTrue(
             verify_secret_hmac(_VALID_SERVER_HMAC_KEY, value, fp, forbidden_keys=(kek,))
+        )
+        fp_set = compute_secret_hmac(_VALID_SERVER_HMAC_KEY, value, forbidden_keys={kek})
+        self.assertEqual(fp, fp_set)
+        self.assertTrue(
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, value, fp, forbidden_keys={kek})
+        )
+        other_ba = bytearray(b"O" * 32)
+        fp_ba = compute_secret_hmac(_VALID_SERVER_HMAC_KEY, value, forbidden_keys=other_ba)
+        self.assertEqual(fp, fp_ba)
+        self.assertTrue(
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, value, fp, forbidden_keys=[other_ba])
         )
 
     def test_compute_secret_hmac_naked_primitive_contract_is_documented(self) -> None:
@@ -766,9 +805,13 @@ class KeySeparationTests(TestCase):
         with self.assertRaises(TypeError):
             compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", forbidden_keys=[12345])  # type: ignore[list-item]
         with self.assertRaises(TypeError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", forbidden_keys={12345})  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
             verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", "a" * 64, forbidden_keys=12345)  # type: ignore[arg-type]
         with self.assertRaises(TypeError):
             verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", "a" * 64, forbidden_keys=[12345])  # type: ignore[list-item]
+        with self.assertRaises(TypeError):
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "val", "a" * 64, forbidden_keys={12345})  # type: ignore[arg-type]
 
         # bytearray est accepté sans TypeError
         ba_kek = bytearray(_VALID_KEK.encode("utf-8"))
