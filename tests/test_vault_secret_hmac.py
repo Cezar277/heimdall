@@ -346,6 +346,73 @@ class SecretHmacCryptoTests(TestCase):
                 aad = VaultCipher.aad("p", "prod", "S")
                 self.assertFalse(cipher.is_secret_value_matching(val, bad_fp, aad=aad))  # type: ignore[arg-type]
 
+    def test_compute_raises_while_predicates_return_false_contract_parity(self) -> None:
+        """Verrouille la divergence documentée : compute lève, les prédicats retournent False.
+
+        Revue LOW #116 — contrat verrouillé (décision d'architecture, docstrings
+        ``compute_secret_hmac`` / ``verify_secret_hmac`` / ``is_secret_value_matching``) :
+        - ``compute_secret_hmac`` lève ``ValueError``/``TypeError`` sur entrées invalides
+          du calcul (clé courte/faible, valeur vide, AAD vide, type invalide) : fail-closed.
+        - ``verify_secret_hmac`` et ``is_secret_value_matching`` retournent ``False`` sans
+          exception sur une **empreinte attendue malformée** (format ``^[0-9a-f]{64}$`` non
+          respecté) : une empreinte corrompue ne peut correspondre à aucun secret.
+        - Mais ces prédicats **propagent** toujours les exceptions du calcul (valeur vide,
+          AAD vide, clé faible) : ``False`` est réservé au format de l'empreinte attendue,
+          jamais à une entrée du calcul — aucun faux négatif silencieux possible.
+        Tout futur câblage de ces primitives doit respecter ce partage explicite.
+        """
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        val = "contract-parity-value"
+        good_fp = compute_secret_hmac(_VALID_SERVER_HMAC_KEY, val)
+
+        malformed_expected = [
+            "a" * 63,  # longueur 63
+            "a" * 65,  # longueur 65
+            "",  # vide
+            "G" * 64,  # majuscules
+            "g" * 64,  # non-hex minuscules
+            "0" * 32 + "xyz!",  # symboles hors hex
+            12345,  # type non-str
+            None,  # None
+            b"0" * 64,  # bytes
+        ]
+
+        # 1. compute lève sur ses entrées invalides (fail-closed)
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "")
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, val, aad=b"")
+        with self.assertRaises(ValueError):
+            compute_secret_hmac("short_key_16_bytes!", val)
+        with self.assertRaises(TypeError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, 12345)  # type: ignore[arg-type]
+
+        # 2. Les prédicats retournent False (jamais d'exception) sur empreinte malformée
+        for bad_fp in malformed_expected:
+            with self.subTest(bad_fp=bad_fp):
+                self.assertFalse(verify_secret_hmac(_VALID_SERVER_HMAC_KEY, val, bad_fp))  # type: ignore[arg-type]
+                self.assertFalse(cipher.verify_secret_hmac(val, bad_fp))  # type: ignore[arg-type]
+                self.assertFalse(cipher.is_secret_value_matching(val, bad_fp))  # type: ignore[arg-type]
+
+        # 3. Mais les prédicats PROPAGENT les exceptions du calcul (aucun faux négatif)
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, "", good_fp)
+        with self.assertRaises(ValueError):
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, val, good_fp, aad=b"")
+        with self.assertRaises(ValueError):
+            verify_secret_hmac("short_key_16_bytes!", val, good_fp)
+        with self.assertRaises(TypeError):
+            verify_secret_hmac(_VALID_SERVER_HMAC_KEY, 12345, good_fp)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            cipher.verify_secret_hmac("", good_fp)
+        with self.assertRaises(ValueError):
+            cipher.verify_secret_hmac(val, good_fp, aad=b"")
+        with self.assertRaises(TypeError):
+            cipher.is_secret_value_matching(12345, good_fp)  # type: ignore[arg-type]
+        self.assertFalse(cipher.is_secret_value_matching("", good_fp))
+        with self.assertRaises(ValueError):
+            cipher.is_secret_value_matching(val, good_fp, aad=b"")
+
     def test_compute_secret_hmac_surrogate_unicode_error(self) -> None:
         """Une chaîne avec surrogate isolé non encodable lève ValueError générique."""
         with self.assertRaises(ValueError):
