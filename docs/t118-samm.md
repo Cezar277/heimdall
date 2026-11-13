@@ -16,7 +16,8 @@ remplace pas la revue de code.
 > + stores du Vault), introduit par le sous-ticket #117 (§8 de l'ADR-006). La
 > branche #118 est donc rebasée sur `117-t403-api-de-transition` (`e8f63eb`) :
 > elle en est un fast-forward strict, **sans commit de fusion avec `main`**, et
-> le diff de la PR — base `117-t403-api-de-transition` — ne contient que les
+> la **base de la PR [#225](https://github.com/Cezar277/heimdall/pull/225) est
+> la branche #117** — le diff affiché par GitHub ne contient donc que les
 > fichiers #118 :
 >
 > ```text
@@ -30,8 +31,11 @@ remplace pas la revue de code.
 >
 > Aucun fichier de production n'est modifié par #118 : ni `heimdall/**`,
 > ni `openapi.yaml`, ni `schemas/**`. Le diff contre `main` contient en plus
-> #117, qui doit être fusionné en amont (le maintainer est le seul habilité à
-> merger, cf. CONTRIBUTING §6).
+> #117, qui doit être fusionné en amont (le mainteneur est le seul habilité à
+> merger, cf. CONTRIBUTING §6). **Après** le merge de #117 dans `main`, la
+> branche #118 est rebasée sur `main` et la base de la PR rebascule sur `main` :
+> le diff reste identique (les 5 fichiers ci-dessus), la PR redevient
+> mergeable dans `main` sans base empilée.
 
 ## 1. Exigences du ticket et preuves
 
@@ -181,7 +185,7 @@ Révisions à re-pinner après la fusion : `30201593c50a869492c8dd0cc9811acbb20c
 
 | Remarque | Correctif | Preuve |
 |---|---|---|
-| **[LOW] PR empilée : le diff contre `main` embarquait le chemin opérationnel #117**, alors que la description annonçait « aucun code de production modifié » | La branche #118 est rebasée sur `117-t403-api-de-transition` (`e8f63eb`) : fast-forward strict, **sans commit de fusion avec `main`**. La **base de la PR est la branche #117**, et le diff de la PR ne contient plus que les 5 fichiers #118 (885 insertions, aucun fichier de production). | § « Base de la PR » ci-dessus ; `git diff --stat origin/117-t403-api-de-transition..HEAD` |
+| **[LOW] PR empilée : le diff contre `main` embarquait le chemin opérationnel #117**, alors que la description annonçait « aucun code de production modifié » | La branche #118 est rebasée sur `117-t403-api-de-transition` (`e8f63eb`) : fast-forward strict, **sans commit de fusion avec `main`**. La **base de la PR #225 est la branche #117**, et le diff de la PR ne contient plus que les 5 fichiers #118, aucun fichier de production (ni `heimdall/**`, ni `openapi.yaml`, ni `schemas/**`). | § « Base de la PR » ci-dessus ; `git diff --name-only origin/117-t403-api-de-transition..HEAD` |
 | **[LOW] Assertion de non-reflet fragile en sous-chaîne** (`assert target not in response.text`) : les noms d'état sont des mots courts qu'une recherche sur la réponse entière confond avec un autre mot (« rote » dans « protégé ») | Le non-reflet de l'état demandé est mesuré sur le **corps JSON** (`target not in json.dumps(response.json())`). La garantie principale reste l'**égalité stricte** au payload contractuel `{"code": "bad_request", "message": "Requête invalide"}`. Le canari, jeton unique, reste cherché dans toute la réponse, en-têtes compris. | `::TestForbiddenTransitionApi::test_forbidden_transition_is_refused_without_side_effect` (18 cas), `::test_unknown_target_state_is_refused` |
 | **[Tests manquants signalés]** — cible hostile de type secret en API, acteur `\n`/SQL : **hors périmètre de #118**, à traiter dans #117 | Non ajoutés ici (la revue l'exclut explicitement du périmètre de #118) ; le point est à porter sur #117. | — |
 
