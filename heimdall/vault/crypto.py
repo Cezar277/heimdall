@@ -330,7 +330,8 @@ def _validate_key_complexity(key_bytes: bytes) -> None:
     if len(set(key_bytes)) < _MIN_DISTINCT_SERVER_HMAC_KEY_BYTES:
         raise ValueError(
             "La clé HMAC serveur est trop simple ou répétitive (diversité insuffisante : "
-            f"au moins {_MIN_DISTINCT_SERVER_HMAC_KEY_BYTES} symboles distincts requis) : "
+            f"au moins {_MIN_DISTINCT_SERVER_HMAC_KEY_BYTES} symboles distincts requis — "
+            "les clés hexadécimales à 16 symboles max sont refusées par construction) : "
             "utiliser generate_server_hmac_key() comme seule voie supportée pour "
             "générer une clé aléatoire cryptographiquement sûre de 256 bits."
         )
@@ -364,6 +365,10 @@ def validate_server_hmac_key(key: str | bytes | bytearray | None) -> bytes:
     de Shannon >= 4.0 bits/octet et aucun aspect de phrase naturelle (garde
     anti-phrase humaine). Ces contrôles neutralisent les attaques par
     dictionnaire et les ralentissements par clés géantes.
+
+    Format accepté : les clés encodées en hexadécimal (alphabet de 16
+    symboles maximum < 24) sont **refusées par construction** ; utiliser
+    ``generate_server_hmac_key()`` (jeton base64url à ≥ 24 symboles distincts).
 
     Portée exacte de la garantie (revue LOW #116) : la neutralisation
     dictionnaire/arc-en-ciel avec 256 bits effectifs n'est **prouvée** que pour

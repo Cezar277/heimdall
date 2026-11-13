@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import importlib.util
 import re
+import secrets
 import sqlite3
 import sys
 import tempfile
@@ -46,7 +47,6 @@ from heimdall.vault.crypto import (
     _normalize_server_hmac_key,
     canonicalize_secret_value,
     compute_secret_hmac,
-    generate_encryption_key,
     generate_server_hmac_key,
     server_hmac_key_matches_master_key,
     validate_server_hmac_key,
@@ -71,7 +71,7 @@ from heimdall.vault.store import (
 # Clés de test robustes et diversifiées (satisfaisant les contrôles d'entropie)
 _VALID_SERVER_HMAC_KEY = "k7_H9mP2xW4vL1zR8yB3qT6nF0sV5jC8dE4uA1gX7oZ"
 _VALID_ALT_HMAC_KEY = "m3_Q8vK1zT6nF0sV5jC8dE4uA1gX7oZ2xW4vL9yB3rP"
-_VALID_KEK = generate_encryption_key()
+_VALID_KEK = generate_server_hmac_key()  # base64url 256 bits valide (anti-flakiness)
 _VALID_PEPPER = "p3pp3r_s3rv3r_s3cur3_t0k3n_256_b1ts_v4ult"
 _VALID_MASTER_KEY = "m4st3r_p4ssphr4s3_s3cur3_v4ult_k3y_t0k3n"
 
@@ -301,6 +301,17 @@ class SecretHmacCryptoTests(TestCase):
         with self.assertRaises(ValueError) as ctx6:
             _normalize_server_hmac_key("0123456789abcdef0123456789abcdeg")
         self.assertIn("generate_server_hmac_key()", str(ctx6.exception))
+
+    def test_validate_server_hmac_key_rejects_hex_keys_by_construction(self) -> None:
+        """Les clés hexadécimales (16 symboles max < 24) sont refusées explicitement."""
+        for _ in range(8):
+            hex_key = secrets.token_hex(32)
+            with self.subTest(hex_key=hex_key):
+                with self.assertRaises(ValueError) as ctx:
+                    validate_server_hmac_key(hex_key)
+                msg = str(ctx.exception)
+                self.assertIn("hexadécimales", msg)
+                self.assertIn("generate_server_hmac_key()", msg)
 
     def test_normalize_server_hmac_key_rejects_human_passphrase_phrases(self) -> None:
         """Refuse une phrase naturelle de 32+ octets malgré diversité et Shannon suffisants.
@@ -2031,6 +2042,29 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
             sql_store_2 = SqliteSecretStore(db_path, c2)
             await sql_store_2.create("p", "prod", "S2", "val2")
             self.assertTrue(await sql_store_2.is_secret_value_matching("p", "prod", "S2", "val2"))
+
+    async def test_get_server_hmac_canary_read_only_without_table_returns_none_without_ddl(
+        self,
+    ) -> None:
+        """get_server_hmac_canary en mode=ro sans table canari rend None sans DDL."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "legacy_ro.db"
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                conn.execute("DROP TABLE server_hmac_canary;")
+
+            # Connexion SQLite strictement read-only : tout CREATE TABLE lèverait OperationalError
+            ro_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                self.assertIsNone(get_server_hmac_canary(ro_conn))
+                # La table reste absente (aucun DDL tenté)
+                row = ro_conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='server_hmac_canary';"
+                ).fetchone()
+                self.assertIsNone(row)
+            finally:
+                ro_conn.close()
 
     async def test_stores_reject_invalid_candidate_value_types(self) -> None:
         """Les stores rejettent avec TypeError tout type invalide de candidate_value."""

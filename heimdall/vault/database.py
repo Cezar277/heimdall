@@ -1218,9 +1218,17 @@ def _ensure_server_hmac_canary_table(conn: sqlite3.Connection) -> None:
 
 
 def get_server_hmac_canary(conn: sqlite3.Connection) -> str | None:
-    """Lit le canari de clé HMAC serveur persisté en base (ticket #116)."""
-    _ensure_server_hmac_canary_table(conn)
-    cursor = conn.execute("SELECT canary FROM server_hmac_canary WHERE id = 1;")
+    """Lit le canari de clé HMAC serveur persisté en base sans écriture DDL (ticket #116).
+
+    Si la table ``server_hmac_canary`` est absente (base héritée ou montage en
+    lecture seule), retourne ``None`` sans tenter de ``CREATE TABLE``.
+    """
+    try:
+        cursor = conn.execute("SELECT canary FROM server_hmac_canary WHERE id = 1;")
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        raise
     row = cursor.fetchone()
     return str(row[0]) if row else None
 
