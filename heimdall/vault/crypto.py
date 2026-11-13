@@ -987,7 +987,7 @@ class VaultCipher:
         self,
         key: bytes,
         *,
-        server_hmac_key: bytes | str | None = None,
+        server_hmac_key: str | bytes | bytearray | None = None,
     ) -> None:
         if not isinstance(key, (bytes, bytearray)) or len(key) != _KEY_SIZE_BYTES:
             raise ValueError(f"KEK invalide : {_KEY_SIZE_BYTES} octets exactement sont requis.")
@@ -1018,7 +1018,7 @@ class VaultCipher:
         """Indique si la clé HMAC serveur est explicite (non dérivée de la KEK)."""
         return self._has_explicit_server_hmac_key
 
-    def key_reuses_server_hmac_key(self, server_hmac_key: str | bytes) -> bool:
+    def key_reuses_server_hmac_key(self, server_hmac_key: str | bytes | bytearray) -> bool:
         """Détecte si la KEK de ce chiffreur réutilise l'entropie de la clé HMAC serveur.
 
         Vérifie la KEK brute et ses représentations encodées (invariant 5), sans
@@ -1043,7 +1043,7 @@ class VaultCipher:
         ).hexdigest()
 
     @classmethod
-    def generate(cls, *, server_hmac_key: bytes | str | None = None) -> "VaultCipher":
+    def generate(cls, *, server_hmac_key: str | bytes | bytearray | None = None) -> "VaultCipher":
         """Génère une KEK éphémère (mémoire uniquement, hors production)."""
         return cls(secrets.token_bytes(_KEY_SIZE_BYTES), server_hmac_key=server_hmac_key)
 
@@ -1052,7 +1052,7 @@ class VaultCipher:
         cls,
         encoded: str | bytes,
         *,
-        server_hmac_key: bytes | str | None = None,
+        server_hmac_key: str | bytes | bytearray | None = None,
     ) -> "VaultCipher":
         """Décode une KEK base64 URL-safe (ou standard) de 32 octets."""
         return cls(decode_encoded_key(encoded), server_hmac_key=server_hmac_key)
@@ -1063,7 +1063,7 @@ class VaultCipher:
         master_key: str | bytes,
         salt: str | bytes,
         *,
-        server_hmac_key: bytes | str | None = None,
+        server_hmac_key: str | bytes | bytearray | None = None,
     ) -> "VaultCipher":
         """Dérive la KEK avec Argon2id puis construit le chiffreur (ticket #262).
 
@@ -1272,6 +1272,9 @@ class VaultCipher:
         - ``aad`` non vide : préfixé ``aad_bytes + b"\\x00" + value_bytes`` pour
           lier l'empreinte au triplet ``(project, env, name)`` ; un ``aad`` vide
           (``b""`` / ``""``) lève ``ValueError`` (fail-closed, aucun 3e domaine).
+        - Une valeur vide (``""``, ``b""``, ``bytearray(b"")``) lève
+          ``ValueError`` (parité avec ``compute_secret_hmac`` et le contrat
+          des stores : aucun secret vide ne peut être créé ni indexé).
 
         La valeur (``str``, ``bytes`` ou ``bytearray``) est canonisée en NFC
         (``canonicalize_secret_value``, ticket #116) et ``aad`` validé en
@@ -1289,6 +1292,8 @@ class VaultCipher:
         contrôle d'intégrité post-rotation.
         """
         value_bytes = canonicalize_secret_value(plaintext)
+        if not value_bytes:
+            raise ValueError("La valeur du secret ne peut pas être vide.")
         if aad is None:
             message = value_bytes
         else:

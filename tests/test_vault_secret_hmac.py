@@ -538,6 +538,23 @@ class SecretHmacCryptoTests(TestCase):
             compute_secret_hmac(_VALID_SERVER_HMAC_KEY, "caf\u00e9", aad="ctx"),
         )
 
+    def test_cipher_fingerprint_rejects_empty_value_parity_with_compute(self) -> None:
+        """VaultCipher.fingerprint() refuse une valeur vide, parité avec compute_secret_hmac."""
+        cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
+        aad = VaultCipher.aad("project", "prod", "TOKEN")
+        for empty_val in ("", b"", bytearray(b"")):
+            with self.subTest(empty_val=type(empty_val).__name__):
+                with self.assertRaises(ValueError):
+                    cipher.fingerprint(empty_val)
+                with self.assertRaises(ValueError):
+                    cipher.fingerprint(empty_val, aad=aad)
+                with self.assertRaises(ValueError):
+                    cipher.compute_secret_hmac(empty_val)
+                with self.assertRaises(ValueError):
+                    compute_secret_hmac(_VALID_SERVER_HMAC_KEY, empty_val)
+        with self.assertRaises(ValueError):
+            cipher.fingerprint("", aad=b"")
+
     def test_candidate_value_empty_parity_cipher(self) -> None:
         """Une valeur candidate vide retourne False en toute circonstance (avec ou sans AAD)."""
         cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
@@ -830,6 +847,17 @@ class KeySeparationTests(TestCase):
         with self.assertRaises(ValueError) as ctx:
             VaultCipher(kek, server_hmac_key=kek)
         self.assertIn("distincte", str(ctx.exception))
+
+    def test_key_reuses_server_hmac_key_accepts_bytearray(self) -> None:
+        """key_reuses_server_hmac_key et VaultCipher acceptent bytearray sans rejet de typage."""
+        kek = b"K" * 32
+        cipher = VaultCipher(kek, server_hmac_key=bytearray(_VALID_SERVER_HMAC_KEY.encode("utf-8")))
+        self.assertTrue(cipher.key_reuses_server_hmac_key(bytearray(kek)))
+        self.assertFalse(
+            cipher.key_reuses_server_hmac_key(bytearray(_VALID_SERVER_HMAC_KEY.encode("utf-8")))
+        )
+        with self.assertRaises(ValueError):
+            VaultCipher(kek, server_hmac_key=bytearray(kek))
 
     def test_from_master_key_rejects_server_hmac_key_equal_to_master_key(self) -> None:
         """from_master_key refuse la clé HMAC réutilisant l'entropie maîtresse.
