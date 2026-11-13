@@ -7,34 +7,49 @@ Sous-ticket **T404** (ticket GitHub **#118**) du grand ticket
 remplace pas la revue de code.
 
 > **Permaliens** : les liens ci-dessous sont épinglés sur la révision
-> [`3a3e42f`](https://github.com/Cezar277/heimdall/commit/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc),
-> qui contient la suite de tests exhaustive des transitions interdites. Les
-> plages de lignes des modules déjà livrés (#115, #117) sont celles de cette
-> révision.
+> [`3020159`](https://github.com/Cezar277/heimdall/commit/30201593c50a869492c8dd0cc9811acbb20c9c95),
+> qui contient la suite de tests exhaustive des transitions interdites (version
+> revue). Les plages de lignes des modules déjà livrés (#115, #117) sont celles
+> de cette révision.
 >
-> **Empilement de PR** : la preuve porte sur le chemin *opérationnel* (route
-> HTTP + stores du Vault), introduit par le sous-ticket #117 (§8 de
-> l'ADR-006). La branche #118 est donc construite sur la branche #117 ; le
-> diff propre à #118 est `tests/test_vault_transitions_forbidden.py` et cette
-> fiche.
+> **Base de la PR** : la preuve porte sur le chemin *opérationnel* (route HTTP
+> + stores du Vault), introduit par le sous-ticket #117 (§8 de l'ADR-006). La
+> branche #118 est donc rebasée sur `117-t403-api-de-transition` (`e8f63eb`) :
+> elle en est un fast-forward strict, **sans commit de fusion avec `main`**, et
+> le diff de la PR — base `117-t403-api-de-transition` — ne contient que les
+> fichiers #118 :
+>
+> ```text
+> $ git diff --stat origin/117-t403-api-de-transition..HEAD
+>  README.md                                  |   1 +
+>  docs/adr/006-table-etats-et-transitions.md |   7 +-
+>  docs/contracts/vault-traceability.md       |   1 +
+>  docs/t118-samm.md                          | 165 +++++++
+>  tests/test_vault_transitions_forbidden.py  | 714 +++++++++++++++++++++++++++++
+>  5 files changed, 885 insertions(+), 3 deletions(-)
+> ```
+>
+> Aucun fichier de production n'est modifié par #118. Le diff contre `main`
+> contient en plus #117, qui doit être fusionné en amont (le maintainer est le
+> seul habilité à merger, cf. CONTRIBUTING §6).
 
 ## 1. Exigences du ticket et preuves
 
 | Exigence vérifiée | Implémentation (module + ligne) | Test et preuve permanente | Résultat local |
 |---|---|---|---|
-| **Toutes les transitions interdites sont refusées** : test paramétré sur les 25 couples (état de départ, état d'arrivée), dont les **20 interdits** de la matrice 5x5 | [transitions.py:256-274](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/transitions.py#L256-L274) (`validate_transition`), [transitions.py:93-95](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/transitions.py#L93-L95) (`ALLOWED_TRANSITIONS`), [test_vault_transitions_forbidden.py:161-261](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/tests/test_vault_transitions_forbidden.py#L161-L261) | `tests/test_vault_transitions_forbidden.py::TestForbiddenTransitionMatrix::test_forbidden_transition_raises_with_the_formal_reason` (20 cas paramétrés, un par paire interdite) | Réussi (20/20 refusés avec la justification formelle) |
-| **Les transitions autorisées restent acceptées** : la preuve ne bloque pas tout (5 paires) | [transitions.py:93-95](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/transitions.py#L93-L95) | `::TestForbiddenTransitionMatrix::test_allowed_transition_is_accepted` (5 cas) | Réussi |
-| **La table des justifications est complète et exclusive** : une justification pour chaque paire interdite, aucune pour une paire autorisée | [transitions.py:179-181](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/transitions.py#L179-L181) (`FORBIDDEN_TRANSITION_REASONS`) | `::TestTransitionMatrixIntegrity::test_forbidden_reason_table_covers_exactly_the_forbidden_pairs`, `::test_matrix_partitions_the_25_ordered_pairs` | Réussi |
-| **Un refus ne mute ni l'état ni le journal** (backend mémoire, 25 paires testées) | [store.py:259-331](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/store.py#L259-L331) (`InMemorySecretStore.transition`) | `::TestForbiddenTransitionStore::test_memory_store_applies_the_matrix_without_side_effect` (25 cas) | Réussi (25/25) |
-| **Un refus ne mute ni l'état ni le journal** (backend SQLite, backend de production) | [store.py:632-678](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/store.py#L632-L678) (`SqliteSecretStore.transition`), [database.py:1920-1992](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/database.py#L1920-L1992) (`transition_secret`) | `::TestForbiddenTransitionStore::test_sqlite_store_applies_the_matrix_without_side_effect` (10 cas) | Réussi (10/10) |
-| **Un état source non persistable ne peut pas quitter le Vault** : les 11 paires à source `detecte` / `confirme` / `faux_positif` sont inaccessibles en base (contrainte `CHECK`) et refusées par le store mémoire | [database.py:92](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/database.py#L92) (`PERSISTED_STATUSES`), [database.py:189](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/database.py#L189) (`CHECK(status IN ('vaulte','rote'))`) | `::TestForbiddenTransitionStore::test_sqlite_check_constraint_blocks_non_persistable_source_states`, `::test_memory_store_never_leaves_a_non_persistable_state` | Réussi |
-| **L'API HTTP refuse chaque transition interdite atteignable** : 400 contractuel statique, `no-store`, sans reflet de l'entrée, sans effet de bord (état et journal inchangés) | [app.py:1739-1807](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/app.py#L1739-L1807) (route `POST /api/v1/secrets/{project}/{env}/{name}/transition`), [test_vault_transitions_forbidden.py:485-576](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/tests/test_vault_transitions_forbidden.py#L485-L576) | `::TestForbiddenTransitionApi::test_forbidden_transition_is_refused_without_side_effect` (9 paires × 2 backends = 18 cas), `::test_refused_transition_keeps_the_secret_readable` (18 cas) | Réussi (36/36) |
-| **Le client ne peut pas forger l'état source** : l'état de départ est toujours relu côté serveur, un champ supplémentaire est refusé | [app.py:469-479](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/app.py#L469-L479) (`SecretTransitionRequest`, `extra="forbid"`) | `::TestForbiddenTransitionApi::test_client_cannot_forge_the_source_state` | Réussi |
-| **Fail-closed sur état inconnu** : état cible ou source inconnu refusé, jamais reflété | [transitions.py:188-196](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/transitions.py#L188-L196) (`UnknownStateError`), [transitions.py:210-230](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/transitions.py#L210-L230) (`canonicalize_state`), [transitions.py:241-254](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/transitions.py#L241-L254) (`is_transition_allowed`) | `::TestForbiddenTransitionMatrix::test_unknown_state_fails_closed`, `::test_public_predicates_are_fail_closed_on_unknown_states`, `::TestForbiddenTransitionApi::test_unknown_target_state_is_refused` | Réussi |
-| **Invariant 8 — aucun secret ni entrée brute dans les erreurs** | [transitions.py:188-207](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/transitions.py#L188-L207) (messages statiques, `UnknownStateError` sans argument) | `::TestForbiddenTransitionMatrix::test_error_message_never_reflects_a_secret`, `::test_forbidden_reason_is_deterministic` | Réussi |
-| **Scénarios d'attaque nommés** (audit croisé / pentest) : déclasser un secret vaulté, reclasser un secret compromis en faux positif, court-circuiter la validation humaine, ressusciter une version révoquée, rejouer une écriture réflexive | [test_vault_transitions_forbidden.py:583-626](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/tests/test_vault_transitions_forbidden.py#L583-L626) | `::TestForbiddenTransitionAttackScenarios` (5 scénarios : `test_unvaulting_a_secret_to_hide_it_is_refused`, `test_relabelling_a_vaulted_secret_as_false_positive_is_refused`, `test_rotating_without_confirmation_is_refused`, `test_resurrecting_a_rotated_secret_is_refused`, `test_reflexive_transition_cannot_rewrite_the_journal`) | Réussi (5/5) |
-| **Un refus est tracé (rebut) sans fuite** : l'audit conserve la tentative, jamais la valeur ni la clé brute | [app.py:1739-1807](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/heimdall/vault/app.py#L1739-L1807) (route journalisée par le middleware d'audit) | `::TestForbiddenTransitionApi::test_refused_transition_is_audited_without_leaking` | Réussi |
-| **Couverture de la machine d'états à 100 %**, vérifiée *mécaniquement* (instructions **et** branches), et non seulement constatée dans un rapport | [test_vault_transitions_forbidden.py:633-709](https://github.com/Cezar277/heimdall/blob/3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc/tests/test_vault_transitions_forbidden.py#L633-L709) (pilote `_exhaust_state_machine` + mesure `coverage` en processus, `data_file=None`) | `::TestStateMachineCoverage::test_state_machine_module_is_fully_covered` | Réussi (100 %, 0 ligne et 0 branche manquantes) |
+| **Toutes les transitions interdites sont refusées** : test paramétré sur les 25 couples (état de départ, état d'arrivée), dont les **20 interdits** de la matrice 5x5 | [transitions.py:256-274](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/transitions.py#L256-L274) (`validate_transition`), [transitions.py:93-95](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/transitions.py#L93-L95) (`ALLOWED_TRANSITIONS`), [test_vault_transitions_forbidden.py:161-261](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/tests/test_vault_transitions_forbidden.py#L161-L260) | `tests/test_vault_transitions_forbidden.py::TestForbiddenTransitionMatrix::test_forbidden_transition_raises_with_the_formal_reason` (20 cas paramétrés, un par paire interdite) | Réussi (20/20 refusés avec la justification formelle) |
+| **Les transitions autorisées restent acceptées** : la preuve ne bloque pas tout (5 paires) | [transitions.py:93-95](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/transitions.py#L93-L95) | `::TestForbiddenTransitionMatrix::test_allowed_transition_is_accepted` (5 cas) | Réussi |
+| **La table des justifications est complète et exclusive** : une justification pour chaque paire interdite, aucune pour une paire autorisée | [transitions.py:179-181](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/transitions.py#L179-L181) (`FORBIDDEN_TRANSITION_REASONS`) | `::TestTransitionMatrixIntegrity::test_forbidden_reason_table_covers_exactly_the_forbidden_pairs`, `::test_matrix_partitions_the_25_ordered_pairs` | Réussi |
+| **Un refus ne mute ni l'état ni le journal** (backend mémoire, 25 paires testées) | [store.py:259-331](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/store.py#L259-L331) (`InMemorySecretStore.transition`) | `::TestForbiddenTransitionStore::test_memory_store_applies_the_matrix_without_side_effect` (25 cas) | Réussi (25/25) |
+| **Un refus ne mute ni l'état ni le journal** (backend SQLite, backend de production) | [store.py:632-678](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/store.py#L632-L678) (`SqliteSecretStore.transition`), [database.py:1920-1992](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/database.py#L1920-L1992) (`transition_secret`) | `::TestForbiddenTransitionStore::test_sqlite_store_applies_the_matrix_without_side_effect` (10 cas) | Réussi (10/10) |
+| **Un état source non persistable ne peut pas quitter le Vault** : les 11 paires à source `detecte` / `confirme` / `faux_positif` sont inaccessibles en base (contrainte `CHECK`) et refusées par le store mémoire | [database.py:92](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/database.py#L92) (`PERSISTED_STATUSES`), [database.py:189](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/database.py#L189) (`CHECK(status IN ('vaulte','rote'))`) | `::TestForbiddenTransitionStore::test_sqlite_check_constraint_blocks_non_persistable_source_states`, `::test_memory_store_never_leaves_a_non_persistable_state` | Réussi |
+| **L'API HTTP refuse chaque transition interdite atteignable** : 400 contractuel statique, `no-store`, sans reflet de l'entrée, sans effet de bord (état et journal inchangés) | [app.py:1739-1807](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/app.py#L1739-L1807) (route `POST /api/v1/secrets/{project}/{env}/{name}/transition`), [test_vault_transitions_forbidden.py:485-576](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/tests/test_vault_transitions_forbidden.py#L485-L580) | `::TestForbiddenTransitionApi::test_forbidden_transition_is_refused_without_side_effect` (9 paires × 2 backends = 18 cas), `::test_refused_transition_keeps_the_secret_readable` (18 cas) | Réussi (36/36) |
+| **Le client ne peut pas forger l'état source** : l'état de départ est toujours relu côté serveur, un champ supplémentaire est refusé | [app.py:469-479](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/app.py#L469-L479) (`SecretTransitionRequest`, `extra="forbid"`) | `::TestForbiddenTransitionApi::test_client_cannot_forge_the_source_state` | Réussi |
+| **Fail-closed sur état inconnu** : état cible ou source inconnu refusé, jamais reflété | [transitions.py:188-196](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/transitions.py#L188-L196) (`UnknownStateError`), [transitions.py:210-230](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/transitions.py#L210-L230) (`canonicalize_state`), [transitions.py:241-254](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/transitions.py#L241-L254) (`is_transition_allowed`) | `::TestForbiddenTransitionMatrix::test_unknown_state_fails_closed`, `::test_public_predicates_are_fail_closed_on_unknown_states`, `::TestForbiddenTransitionApi::test_unknown_target_state_is_refused` | Réussi |
+| **Invariant 8 — aucun secret ni entrée brute dans les erreurs** | [transitions.py:188-207](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/transitions.py#L188-L207) (messages statiques, `UnknownStateError` sans argument) | `::TestForbiddenTransitionMatrix::test_error_message_never_reflects_a_secret`, `::test_forbidden_reason_is_deterministic` | Réussi |
+| **Scénarios d'attaque nommés** (audit croisé / pentest) : déclasser un secret vaulté, reclasser un secret compromis en faux positif, court-circuiter la validation humaine, ressusciter une version révoquée, rejouer une écriture réflexive | [test_vault_transitions_forbidden.py:583-626](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/tests/test_vault_transitions_forbidden.py#L588-L630) | `::TestForbiddenTransitionAttackScenarios` (5 scénarios : `test_unvaulting_a_secret_to_hide_it_is_refused`, `test_relabelling_a_vaulted_secret_as_false_positive_is_refused`, `test_rotating_without_confirmation_is_refused`, `test_resurrecting_a_rotated_secret_is_refused`, `test_reflexive_transition_cannot_rewrite_the_journal`) | Réussi (5/5) |
+| **Un refus est tracé (rebut) sans fuite** : l'audit conserve la tentative, jamais la valeur ni la clé brute | [app.py:1739-1807](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/heimdall/vault/app.py#L1739-L1807) (route journalisée par le middleware d'audit) | `::TestForbiddenTransitionApi::test_refused_transition_is_audited_without_leaking` | Réussi |
+| **Couverture de la machine d'états à 100 %**, vérifiée *mécaniquement* (instructions **et** branches), et non seulement constatée dans un rapport | [test_vault_transitions_forbidden.py:633-709](https://github.com/Cezar277/heimdall/blob/30201593c50a869492c8dd0cc9811acbb20c9c95/tests/test_vault_transitions_forbidden.py#L638-L714) (pilote `_exhaust_state_machine` + mesure `coverage` en processus, `data_file=None`) | `::TestStateMachineCoverage::test_state_machine_module_is_fully_covered` | Réussi (100 %, 0 ligne et 0 branche manquantes) |
 
 ## 2. Checklist du ticket
 
@@ -151,7 +166,7 @@ Environnement : Linux, Python 3.14.6, venv local (`.venv`).
 ## 6. Re-pin après fusion
 
 Comme toute preuve par permalien, les liens sont épinglés sur la révision
-`3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc`. Si la fusion est un *squash*
+`30201593c50a869492c8dd0cc9811acbb20c9c95`. Si la fusion est un *squash*
 (cette révision disparaît alors de l'historique de `main`), re-pinner
 mécaniquement la fiche :
 
@@ -160,6 +175,19 @@ mécaniquement la fiche :
 .venv/bin/python scripts/repin_samm.py --fiche docs/t118-samm.md --check
 ```
 
-Révisions à re-pinner après la fusion : `3a3e42fc23b575ec8c1dc3aedfedcff3f93b15bc`.
+Révisions à re-pinner après la fusion : `30201593c50a869492c8dd0cc9811acbb20c9c95`.
+
+## 7. Corrections issues de la revue (APPROVE WITH COMMENTS)
+
+| Remarque | Correctif | Preuve |
+|---|---|---|
+| **[LOW] PR empilée : le diff contre `main` embarquait le chemin opérationnel #117**, alors que la description annonçait « aucun code de production modifié » | La branche #118 est rebasée sur `117-t403-api-de-transition` (`e8f63eb`) : fast-forward strict, **sans commit de fusion avec `main`**. La **base de la PR est la branche #117**, et le diff de la PR ne contient plus que les 5 fichiers #118 (885 insertions, aucun fichier de production). | § « Base de la PR » ci-dessus ; `git diff --stat origin/117-t403-api-de-transition..HEAD` |
+| **[LOW] Assertion de non-reflet fragile en sous-chaîne** (`assert target not in response.text`) : les noms d'état sont des mots courts qu'une recherche sur la réponse entière confond avec un autre mot (« rote » dans « protégé ») | Le non-reflet de l'état demandé est mesuré sur le **corps JSON** (`target not in json.dumps(response.json())`). La garantie principale reste l'**égalité stricte** au payload contractuel `{"code": "bad_request", "message": "Requête invalide"}`. Le canari, jeton unique, reste cherché dans toute la réponse, en-têtes compris. | `::TestForbiddenTransitionApi::test_forbidden_transition_is_refused_without_side_effect` (18 cas), `::test_unknown_target_state_is_refused` |
+| **[Tests manquants signalés]** — cible hostile de type secret en API, acteur `\n`/SQL : **hors périmètre de #118**, à traiter dans #117 | Non ajoutés ici (la revue l'exclut explicitement du périmètre de #118) ; le point est à porter sur #117. | — |
+
+Vérification que la suite détecte une vraie régression (mutation test, non commité) :
+neutraliser `validate_transition()` (la matrice ne refuse plus rien) fait **échouer 66 tests** de la
+suite #118 ; faire refléter l'état demandé dans le payload d'erreur 400 fait **échouer les 18 cas**
+du test API. Les assertions ne sont donc pas vacantes.
 
 Temps passé reporté sur le ticket : `Temps: 2h00`.
