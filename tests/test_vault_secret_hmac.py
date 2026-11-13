@@ -447,6 +447,21 @@ class SecretHmacCryptoTests(TestCase):
                     validate_server_hmac_key(key)
                 self.assertIn("phrase naturelle", str(ctx.exception))
 
+    def test_validate_server_hmac_key_rejects_non_ascii_human_phrases(self) -> None:
+        """La garde anti-phrase couvre les alphabets non-ASCII (cyrillique, grec, ...)."""
+        non_ascii_phrases = (
+            "Секретная_фраза_на_русском_языке_1234567890_ключ",
+            "СекретнаяФразаНаРусскомЯзыкеДляТеста1234567890!@",
+            "ΜυστικήΦράσηΣταΕλληνικάΓιαΈλεγχο1234567890!@xyz",
+            "секретная фраза на русском языке 1234567890 ключ!",
+        )
+        for phrase in non_ascii_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertGreaterEqual(len(set(phrase.encode("utf-8"))), 24)
+                with self.assertRaises(ValueError) as ctx:
+                    validate_server_hmac_key(phrase)
+                self.assertIn("phrase naturelle", str(ctx.exception))
+
     def test_cipher_fingerprint_canonicalizes_nfc_like_compute_secret_hmac(self) -> None:
         """VaultCipher.fingerprint canonise en NFC, parité avec compute_secret_hmac.
 
@@ -492,10 +507,24 @@ class SecretHmacCryptoTests(TestCase):
         )
 
     def test_cipher_fingerprint_accepts_str_bytes_bytearray_and_str_aad_parity(self) -> None:
-        """Parité str | bytes | bytearray sur VaultCipher.fingerprint() et aad."""
+        """Parité str | bytes | bytearray et domaines AAD sur VaultCipher.fingerprint()."""
         cipher = VaultCipher(b"K" * 32, server_hmac_key=_VALID_SERVER_HMAC_KEY)
         self.assertEqual(cipher.fingerprint("str"), cipher.fingerprint(b"str"))
         self.assertEqual(cipher.fingerprint("str"), cipher.fingerprint(bytearray(b"str")))
+
+        # Parité sans AAD (aad=None) : même domaine que compute_secret_hmac et matching
+        fp_raw = cipher.fingerprint(b"val")
+        self.assertEqual(fp_raw, cipher.compute_secret_hmac(b"val"))
+        self.assertEqual(fp_raw, compute_secret_hmac(_VALID_SERVER_HMAC_KEY, b"val"))
+        self.assertTrue(cipher.is_secret_value_matching(b"val", fp_raw))
+
+        # Parité rejet AAD vide (b"" / "") : aucun 3e domaine silencieux
+        with self.assertRaises(ValueError):
+            cipher.fingerprint(b"val", aad=b"")
+        with self.assertRaises(ValueError):
+            cipher.fingerprint(b"val", aad="")
+        with self.assertRaises(ValueError):
+            compute_secret_hmac(_VALID_SERVER_HMAC_KEY, b"val", aad=b"")
 
         expected_ctx = cipher.compute_secret_hmac("caf\u00e9", aad="ctx")
         self.assertEqual(cipher.fingerprint("caf\u00e9", aad="ctx"), expected_ctx)
@@ -2065,6 +2094,34 @@ class ProductionLeakDetectionTests(IsolatedAsyncioTestCase):
                 self.assertIsNone(row)
             finally:
                 ro_conn.close()
+
+    def test_get_server_hmac_canary_uses_sqlite_master_catalog_not_error_text(self) -> None:
+        """Sonde sqlite_master avant SELECT canary : indépendant du libellé OperationalError."""
+
+        class _CursorStub:
+            def __init__(self, row: tuple[object, ...] | None) -> None:
+                self._row = row
+
+            def fetchone(self) -> tuple[object, ...] | None:
+                return self._row
+
+        class _MissingTableConn:
+            def execute(self, sql: str) -> _CursorStub:
+                if "sqlite_master" in sql:
+                    return _CursorStub(None)
+                raise sqlite3.OperationalError("localized missing table message")
+
+        class _LockedTableConn:
+            def execute(self, sql: str) -> _CursorStub:
+                if "sqlite_master" in sql:
+                    return _CursorStub((1,))
+                raise sqlite3.OperationalError("database is locked")
+
+        # Table absente : retourne None via sqlite_master sans exécuter SELECT canary
+        self.assertIsNone(get_server_hmac_canary(_MissingTableConn()))  # type: ignore[arg-type]
+        # Table présente mais erreur opérationnelle réelle : propagation fail-closed
+        with self.assertRaises(sqlite3.OperationalError):
+            get_server_hmac_canary(_LockedTableConn())  # type: ignore[arg-type]
 
     async def test_stores_reject_invalid_candidate_value_types(self) -> None:
         """Les stores rejettent avec TypeError tout type invalide de candidate_value."""

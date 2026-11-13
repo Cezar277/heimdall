@@ -123,78 +123,82 @@ def _shannon_entropy(data: bytes) -> float:
 _HUMAN_PHRASE_MIN_CHARS: int = 32
 _HUMAN_PHRASE_MAX_WORD_RATIO: float = 0.85
 _CAMEL_WORDS_MIN_COUNT: int = 4
-_CAMEL_WORDS_PATTERN: re.Pattern[str] = re.compile(r"[A-Z][a-z]{2,}")
+_CAMEL_WORD_MIN_LEN: int = 3
 _NATURAL_WORD_MIN_LEN: int = 2
 _ALTERNATING_CASE_MIN_RATIO: float = 0.75
 _ALTERNATING_CASE_MIN_ALPHA_RATIO: float = 0.80
 
 
+def _extract_camel_words(text: str) -> list[str]:
+    """Extrait les mots CamelCase (1 majuscule suivie d'au moins 2 minuscules, Unicode inclus)."""
+    words: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i].isupper():
+            j = i + 1
+            while j < n and text[j].islower():
+                j += 1
+            if j - i >= _CAMEL_WORD_MIN_LEN:
+                words.append(text[i:j])
+                i = j
+                continue
+        i += 1
+    return words
+
+
 def _looks_like_human_phrase(key_bytes: bytes) -> bool:
     """Détecte une clé qui est en réalité une phrase naturelle (espaces, ponctuation, CamelCase).
 
-    La détection ignore la casse par composition NFKD (accents retirés) et ne
-    s'applique qu'aux clés textuelles d'au moins 32 caractères normalisés ;
-    les octets binaires non UTF-8 sont réduits par ``errors="ignore"`` et
-    restent du ressort des gardes de diversité et d'entropie.
+    La détection ignore la casse et les diacritiques via NFKD et s'applique
+    aux clés textuelles d'au moins 32 caractères normalisés (ASCII comme
+    alphabets Unicode : latin, cyrillique, grec, etc.) ; les octets binaires
+    non UTF-8 sont réduits par ``errors="ignore"`` et restent du ressort des
+    gardes de diversité et d'entropie.
     """
     normalized = unicodedata.normalize("NFKD", key_bytes.decode("utf-8", errors="ignore"))
     stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     cleaned = "".join(" " if ch.isspace() else ch for ch in stripped)
     if len(cleaned) < _HUMAN_PHRASE_MIN_CHARS:
         return False
-    # Normalisation défensive des séparateurs (revue LOW #116 #226) : une liste
-    # fermée de séparateurs est contournable par tout symbole hors liste ("#",
-    # "@", "&", ...). Tout non-alphanumérique ASCII est donc réduit à un blanc
-    # générique avant toutes les règles (y compris CamelCase et casse alternée).
-    normalized_ascii = re.sub(r"[^A-Za-z0-9 ]+", " ", cleaned)
-    total = len(normalized_ascii)
-    lowercase_or_sep = sum(
-        1
-        for ch in normalized_ascii
-        if ch.isascii() and (ch.islower() or ch == " ")
-    )
-    uppercase_or_sep = sum(
-        1
-        for ch in normalized_ascii
-        if ch.isascii() and (ch.isupper() or ch == " ")
-    )
+    # Normalisation défensive des séparateurs (revues LOW #116 #226) : tout
+    # caractère non alphanumérique (ASCII comme Unicode) est réduit à un blanc
+    # générique avant toutes les règles (y compris CamelCase et casse alternée),
+    # afin qu'aucune phrase naturelle (latine, cyrillique, grecque, etc.) ni
+    # aucun séparateur hors liste ("#", "@", "&", ...) ne contourne la garde.
+    normalized_text = re.sub(r" +", " ", "".join(ch if ch.isalnum() else " " for ch in cleaned))
+    total = len(normalized_text)
+    lowercase_or_sep = sum(1 for ch in normalized_text if ch.islower() or ch == " ")
+    uppercase_or_sep = sum(1 for ch in normalized_text if ch.isupper() or ch == " ")
     if (
         lowercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
         or uppercase_or_sep / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
     ):
         return True
-    if " " in normalized_ascii:
-        word_chars = sum(
-            1
-            for ch in normalized_ascii
-            if ch.isascii() and (ch.isalnum() or ch == " ")
-        )
-        words = [w for w in normalized_ascii.split(" ") if w]
+    if " " in normalized_text:
+        word_chars = sum(1 for ch in normalized_text if ch.isalnum() or ch == " ")
+        words = [w for w in normalized_text.split(" ") if w]
         # Squelette alphabétique >= 2 lettres par mot : insensible à la casse et
         # aux substitutions leet par chiffres ("C0rr3ct" -> "Crrct"), pour ne pas
         # contourner la garde par un mélange majuscules/minuscules ou de chiffres.
         natural_words = [
-            w
-            for w in words
-            if sum(1 for c in w if c.isascii() and c.isalpha()) >= _NATURAL_WORD_MIN_LEN
+            w for w in words if sum(1 for c in w if c.isalpha()) >= _NATURAL_WORD_MIN_LEN
         ]
         if (
             len(natural_words) >= _CAMEL_WORDS_MIN_COUNT
             and word_chars / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
         ):
             return True
-    camel_words = _CAMEL_WORDS_PATTERN.findall(normalized_ascii)
+    camel_words = _extract_camel_words(normalized_text)
     camel_len = sum(len(w) for w in camel_words) + sum(
-        1
-        for ch in normalized_ascii
-        if ch.isascii() and (ch.isdigit() or ch == " ")
+        1 for ch in normalized_text if ch.isdigit() or ch == " "
     )
     if (
         len(camel_words) >= _CAMEL_WORDS_MIN_COUNT
         and camel_len / total >= _HUMAN_PHRASE_MAX_WORD_RATIO
     ):
         return True
-    letters = [ch for ch in normalized_ascii if ch.isascii() and ch.isalpha()]
+    letters = [ch for ch in normalized_text if ch.isalpha()]
     if (
         len(letters) >= _HUMAN_PHRASE_MIN_CHARS
         and len(letters) / total >= _ALTERNATING_CASE_MIN_ALPHA_RATIO
@@ -1255,16 +1259,19 @@ class VaultCipher:
         self,
         plaintext: str | bytes | bytearray,
         *,
-        aad: str | bytes | bytearray = b"",
+        aad: str | bytes | bytearray | None = None,
     ) -> str:
-        """Empreinte HMAC-SHA256 non réversible et liée au triplet d'identité.
+        """Empreinte HMAC-SHA256 non réversible et liée optionnellement au triplet.
 
         Utilise la clé d'empreinte active (sous-clé HKDF dérivée ou clé serveur
-        explicite — jamais la KEK directe, invariant 5) et intègre l'AAD
-        ``(project, env, name)`` au message : deux valeurs identiques stockées
-        sous des triplets distincts produisent des empreintes distinctes, donc
-        non corrélables depuis la seule base. Déterministe pour un même
-        ``(clé d'empreinte, aad, valeur)``.
+        explicite — jamais la KEK directe, invariant 5). Aligné sur les deux
+        domaines cryptographiques de ``compute_secret_hmac`` :
+
+        - ``aad=None`` : empreinte brute sur la valeur canonisée NFC seule (sans
+          préfixe NUL) ; compatible avec ``is_secret_value_matching(v, fp)``.
+        - ``aad`` non vide : préfixé ``aad_bytes + b"\\x00" + value_bytes`` pour
+          lier l'empreinte au triplet ``(project, env, name)`` ; un ``aad`` vide
+          (``b""`` / ``""``) lève ``ValueError`` (fail-closed, aucun 3e domaine).
 
         La valeur (``str``, ``bytes`` ou ``bytearray``) est canonisée en NFC
         (``canonicalize_secret_value``, ticket #116) et ``aad`` validé en
@@ -1281,8 +1288,14 @@ class VaultCipher:
         L'empreinte reste donc volontairement inchangée et ne doit pas servir de
         contrôle d'intégrité post-rotation.
         """
-        aad_bytes = _normalize_aad_bytes(aad)
-        message = aad_bytes + b"\x00" + canonicalize_secret_value(plaintext)
+        value_bytes = canonicalize_secret_value(plaintext)
+        if aad is None:
+            message = value_bytes
+        else:
+            aad_bytes = _normalize_aad_bytes(aad)
+            if not aad_bytes:
+                raise ValueError("Le contexte d'authentification lié (AAD) ne peut pas être vide.")
+            message = aad_bytes + b"\x00" + value_bytes
         return hmac.new(self._fingerprint_key, message, hashlib.sha256).hexdigest()
 
     def compute_secret_hmac(
