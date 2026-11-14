@@ -1,6 +1,6 @@
 # T229 — Preuves du correctif fail-closed après revue
 
-Ticket #229, audit E-01. Révision de code actuelle : `4be7a90882034f23f850bf08222f9cbb87e76b8a`.
+Ticket #229, audit E-01. Révision de code actuelle : `c7218134b87e1ac5cc8cc652ae9b064dfb84694e`.
 Base de la branche : `6bbe7da` (intégration de #228 / #240).
 Les premiers permaliens ci-dessous conservent le SHA du correctif critique
 `aba5eb3`. Les durcissements complémentaires sont épinglés séparément sur
@@ -73,6 +73,14 @@ Révision : `4be7a90882034f23f850bf08222f9cbb87e76b8a`.
 - [`cold_start.py:182`](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/heimdall/cli/cold_start.py#L182) applique le même `prepare_text(strict=False)` et le même moteur tolérant lors de la relecture. Le témoin [`test_cold_start.py:90`](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/tests/test_cold_start.py#L90) conserve finding et opinion avec un jeton long, vérifie le code 2 d'incomplétude du cold start et l'absence du faux message « contenu modifié ». Les gardes de racine et d'appartenance des findings sont conservées.
 - La [politique de tolérance](scanner-tolerance.md) précise que l'intérieur des jetons trop longs n'est pas analysé, même s'il contient un candidat concaténé ; le mode strict refuse, le mode tolérant trace l'exclusion et bloque le verdict propre. La preuve reste celle du verdict fail-closed, sans prétendre retrouver un secret dans chaque contenu exclu.
 
+## Traces de relecture, erreurs typées et lignes historiques
+
+Révision : `c7218134b87e1ac5cc8cc652ae9b064dfb84694e`.
+
+- [`cold_start.py:184`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/heimdall/cli/cold_start.py#L184) compare chaque trace de relecture aux traces du scan initial ; une exclusion nouvelle ou déplacée refuse le contenu avant qualification. Les quatre cas de [`test_cold_start.py:286`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/tests/test_cold_start.py#L286) ajoutent un jeton long ou une jointure hors borne après un scan complet, via API et CLI (ScanError/code 2, sans JSON complet périmé ni appel LLM). Le témoin inchangé de contenu déjà partiel reste accepté.
+- [`policy.py:70`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/heimdall/scanner/policy.py#L70) convertit les erreurs de validation des traces de `prepare_text` en `ScanError` statique, comme `skip_file`. Les trois cas de [`test_scanner_fail_closed.py:427`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/tests/test_scanner_fail_closed.py#L427) couvrent un chemin `../evil` pour `long_token`, `multiline_limit` et `skip_file`, sans fuite de `ValueError` ni trace partiellement ajoutée.
+- [`history.py:239`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/heimdall/cli/history.py#L239) conserve `(reason, line)` dans le cache ; [:265](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/heimdall/cli/history.py#L265) rattache ces traces au chemin et commit courants, et [:311](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/heimdall/cli/history.py#L311) les rend avec `line` en JSON. Le témoin [`test_history.py:30`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/tests/test_history.py#L30) vérifie les lignes du jeton long et de la jointure, la réutilisation du blob renommé, les deux rendus et `bytes_scanned` compté une fois pour le blob lu. Les budgets annoncés restent distincts des octets effectivement lus. Le quatrième élément des tuples `HistoryReport.skipped` est documenté dans la [politique de tolérance](scanner-tolerance.md).
+
 ## Validation
 
 Le correctif critique avait été validé par **3925 tests**, 18 ignorés et
@@ -111,7 +119,15 @@ après le commit de code : **3962 tests, 6911 sous-tests, 18 ignorés**, en
 remédiation. Ruff, MyPy (57 fichiers) et Bandit passent (avertissements de
 lecture `nosec` existants, aucune alerte de sécurité). Aucun code ni test
 n'a changé après ce rejeu ; seuls les documents de preuve ont été actualisés.
-Rapport JUnit final : `/home/nathan/heimdall-t229-coverage-cold-final.xml`.
+Rapport JUnit de `4be7a90` : `/home/nathan/heimdall-t229-coverage-cold-final.xml`.
+
+Dernière révision `c721813` : **228 tests ciblés en 8,37 s**, puis suite
+complète après le commit de code : **3970 tests, 6911 sous-tests, 18 ignorés**,
+en **364,65 s**. Les 14 avertissements existants concernent les sauvegardes
+de remédiation. Ruff, MyPy (57 fichiers) et Bandit passent (avertissements
+de lecture `nosec` existants, aucune alerte de sécurité). Aucun code ni test
+n'a changé après ce rejeu ; seuls les documents de preuve ont été actualisés.
+Rapport JUnit final : `/home/nathan/heimdall-t229-reread-lines-final.xml`.
 
 Environnement : Debian WSL, Python 3.13, dépendances de l'environnement
 existant. La CI aux versions verrouillées n'a pas été déclenchée.
