@@ -939,19 +939,18 @@ class Scanner:
             if index % 256 == 0 and deadline is not None and time.monotonic() > deadline:
                 raise ScanError(_SCAN_ERROR)
             line_number = index + 1
+            following = self._joined_window(line, lines, index, deadline=deadline)
+            current_window = () if following is None else tuple(
+                match for match in find_signature_matches(following[0])
+                if match.start < following[1] and match.context_end <= following[1]
+            )
             for match in find_line_matches(
-                line, self._entropy_config, preceding, deadline=deadline
+                line, self._entropy_config, preceding + current_window, deadline=deadline
             ):
                 self._append(findings, seen, match, line_number, relative, deadline=deadline)
-            following = self._joined_window(line, lines, index, deadline=deadline)
-            if following is None:
-                preceding = ()
-                continue
-            joined, limit = following
-            # La fenêtre sert aussi à la déduplication de la ligne suivante.
-            preceding = tuple(
-                match for match in find_signature_matches(joined) if match.start < limit
-            )
+            # Les deux fragments d'un jeton reconnu dans la fenêtre ne doivent
+            # pas devenir des candidats entropie indépendants.
+            preceding = current_window
             for match in preceding:
                 self._append(
                     findings,

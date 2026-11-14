@@ -537,14 +537,15 @@ def test_scanner_with_allowlist_produces_traces(tmp_path: Path) -> None:
     scanner = Scanner(tmp_path, allowlist=al)
     findings = scanner.scan()
 
-    # Seul le secret réel est retenu comme finding
-    assert len(findings) == 1
+    # Le même secret réel conserve ses deux types pour les allowlists typées.
+    assert len(findings) == 2
+    assert {finding.type for finding in findings} == {"aws", "credential"}
     assert findings[0].file == "app.py"
     assert findings[0].line == 1
 
     # Les deux cas de l'allowlist sont tracés avec leur règle et localisation
     traces = scanner.traces
-    assert len(traces) == 1  # AKIAIOSFODNN7EXAMPLE est une signature AWS
+    assert len(traces) == 2  # Les vues AWS et credential ont été ignorées.
     assert traces[0].file == "app.py"
     assert traces[0].line == 2
     assert traces[0].rule == "example-placeholders"
@@ -1694,7 +1695,7 @@ keywords = ["fake", "mock", "dummy", "placeholder", "synthetic", "factice", "fix
 
     res = _run("scan", str(git_repo.root))
     assert res.exit_code == EXIT_FINDINGS
-    assert "2 secret(s) détecté(s) :" in res.stdout
+    assert "3 secret(s) détecté(s) :" in res.stdout
 
 
 def test_self_attestation_staged_modifying_heimdall_toml_fails_loud(git_repo: GitRepo) -> None:

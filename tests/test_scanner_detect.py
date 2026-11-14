@@ -182,6 +182,7 @@ def test_each_signature_is_detected_with_its_type(tmp_path: Path) -> None:
         (6, "jwt"),
         (7, "pem"),
         (8, "aws"),
+        (8, "credential"),
     ]
     assert all(finding["status"] == "detecte" for finding in findings)
     assert all(finding["source"] == "regex" for finding in findings)
@@ -201,6 +202,18 @@ def test_signature_rules_are_identifiable() -> None:
         "github_fine_grained_pat",
         "jwt",
         "pem_private_key",
+        "service_gitlab",
+        "service_google_api",
+        "service_google_oauth",
+        "service_npm",
+        "service_stripe_webhook",
+        "service_digitalocean",
+        "service_shopify",
+        "url_password",
+        "authorization_header",
+        "credential_double_quoted",
+        "credential_single_quoted",
+        "credential_unquoted",
     }
     matches = find_signature_matches(f'AWS = "{_aws()}"')
     assert len(matches) == 1
@@ -256,6 +269,8 @@ def test_public_values_are_not_silently_allowlisted(tmp_path: Path, line: str) -
     findings = _scan_lines(tmp_path, line)
     if line.startswith(("UUID =", "SHA256 =", "COMMIT =")):
         assert findings and all(f["source"] == "entropy" for f in findings)
+    elif line.startswith("PASSWORD ="):
+        assert findings and all(f["type"] == "credential" for f in findings)
     else:
         assert findings == []
 
@@ -535,7 +550,9 @@ def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:
     secret = fake_token("", 40)
     _write(tmp_path, "split.py", f'aws_secret_access_key =\n"{secret}"\n')
     findings = find_candidates(str(tmp_path))
-    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+    assert [(finding["line"], finding["type"]) for finding in findings] == [
+        (1, "aws"), (1, "credential"),
+    ]
 
 
 def test_split_secret_beyond_the_window_is_fail_closed(tmp_path: Path) -> None:
@@ -562,7 +579,9 @@ def test_secret_split_across_two_contiguous_lines_is_detected(tmp_path: Path) ->
     secret = fake_token("", 40)
     _write(tmp_path, "three.py", f'aws_secret_access_key = "{secret[:20]}\n{secret[20:]}"\n')
     findings = find_candidates(str(tmp_path))
-    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+    assert [(finding["line"], finding["type"]) for finding in findings] == [
+        (1, "aws"), (1, "credential"),
+    ]
 
 
 def test_secret_split_by_more_than_two_newlines_is_a_documented_limit(tmp_path: Path) -> None:

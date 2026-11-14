@@ -149,20 +149,16 @@ class SignatureEngine:
                 and time.monotonic() > self._deadline
             ):
                 raise ScanError(_DEADLINE_ERROR)
+            following = self._joined_window(line, lines, index)
+            current_window = () if following is None else tuple(
+                match for match in find_signature_matches(following[0])
+                if match.start < following[1] and match.context_end <= following[1]
+            )
             for match in find_line_matches(
-                line, self._entropy_config, preceding, deadline=self._deadline
+                line, self._entropy_config, preceding + current_window, deadline=self._deadline
             ):
                 self._append(findings, seen, match, line_number, cible.path)
-            following = self._joined_window(line, lines, index)
-            if following is None:
-                preceding = ()
-                continue
-            joined, limit = following
-            # Réutilisé pour dédupliquer l'entropie de la ligne suivante :
-            # une fenêtre contiguë n'est jamais analysée une seconde fois.
-            preceding = tuple(
-                match for match in find_signature_matches(joined) if match.start < limit
-            )
+            preceding = current_window
             for match in preceding:
                 self._append(findings, seen, match, line_number, cible.path)
         return findings
