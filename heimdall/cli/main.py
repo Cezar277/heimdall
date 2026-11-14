@@ -27,6 +27,7 @@ import typer
 
 import heimdall
 from heimdall.cli.cold_start import collect_cold_start, render_cold_start
+from heimdall.cli.fix import fix_command
 from heimdall.cli.history import collect_history, render_history
 from heimdall.cli.hook import hook_app
 from heimdall.cli.scan import (
@@ -59,6 +60,14 @@ app = typer.Typer(
 app.add_typer(vault_app, name="vault")
 # Hook Git pre-commit (tickets #36, #103-#106).
 app.add_typer(hook_app, name="hook")
+
+app.command(
+    "fix",
+    help=(
+        "Propose et applique la remédiation interactive (Y/N) des secrets détectés. "
+        "L'édition (E) n'est pas prise en charge par cette commande."
+    ),
+)(fix_command)
 
 # Exécution avec injection en mémoire (ticket #101). Voie canonique :
 # `heimdall run`. L'alias `heimdall vault run` (vault_keys.py) partage le
