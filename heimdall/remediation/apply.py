@@ -147,6 +147,8 @@ def cleanup_backup_file(root: Path, receipt: AppliedPatch) -> None:
     """Supprime le fichier ``.bak`` créé lors d'un remplacement validé (F-10)."""
     if not isinstance(receipt, AppliedPatch):
         raise ApplyError
+    if receipt.backup != f"{receipt.file}.bak":
+        raise ApplyError
     try:
         confined = confine(root, receipt.backup)
     except PathEscape:

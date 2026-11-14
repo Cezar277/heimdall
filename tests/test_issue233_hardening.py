@@ -14,7 +14,12 @@ from typer.testing import CliRunner
 from heimdall.cli.fix import run_fix
 from heimdall.cli.main import app
 from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
-from heimdall.remediation.apply import apply_replacement
+from heimdall.remediation.apply import (
+    AppliedPatch,
+    ApplyError,
+    apply_replacement,
+    cleanup_backup_file,
+)
 from heimdall.remediation.env import EnvRemediationError
 from heimdall.remediation.naming import is_dangerous_exec_env_var
 from heimdall.remediation.templates import plan_for_finding
@@ -24,6 +29,7 @@ from heimdall.vault.atomic import (
     is_git_ignored,
     is_git_tracked,
     parse_env_file,
+    parse_example_names,
 )
 from heimdall.vault.client import VaultClient, _detect_from_git, _validate_secret_read_response
 
@@ -292,6 +298,21 @@ def test_f10_apply_replacement_cleanup_backup_tolerates_missing_bak(tmp_path: Pa
         receipt = apply_replacement(tmp_path, plan, cleanup_backup=True)
     assert receipt.file == "app.py"
     assert 'os.environ["API_KEY"]' in target.read_text(encoding="utf-8")
+
+
+def test_f10_cleanup_backup_file_rejects_mismatched_receipt(tmp_path: Path) -> None:
+    victim = tmp_path / "other.py"
+    victim.write_text("keep me\n", encoding="utf-8")
+    forged = AppliedPatch(file="app.py", backup="other.py", mode=0o600, after="x\n")
+    with pytest.raises(ApplyError):
+        cleanup_backup_file(tmp_path, forged)
+    assert victim.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_f11_parse_example_names_handles_export_prefix(tmp_path: Path) -> None:
+    example = tmp_path / ".env.example"
+    example.write_text("export FOO=bar # comment\n", encoding="utf-8")
+    assert parse_example_names(example) == ["FOO"]
 
 
 def test_f11_parse_env_file_handles_export_and_inline_comments(tmp_path: Path) -> None:
