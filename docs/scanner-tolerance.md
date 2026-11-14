@@ -95,8 +95,10 @@ après éviction l'est. `bytes_budgeted` est un champ ajouté au contrat
 `heimdall.history.v1` ; les anciens rapports peuvent ne pas le contenir.
 Les traces d'exclusion de l'index et du diff sont plafonnées à
 `MAX_STAGED_FINDINGS`, y compris avec un collecteur déjà rempli.
-Dans ces deux périmètres, `scanned_files` compte les fichiers entièrement
-analysés : chaque fichier portant une ou plusieurs traces est déduit une fois.
+Dans les trois périmètres (arbre, index, diff), `scanned_files` compte les
+fichiers entièrement analysés : un fichier portant une ou plusieurs traces
+de contenu n'est pas compté. Dans l'API arbre, `Scanner.files_scanned`
+applique la même règle, y compris avec `long_token` / `multiline_limit`.
 
 L'intérieur d'un jeton lexical de plus de 4096 caractères n'est pas analysé,
 y compris s'il contient un secret concaténé sans séparateur. Le mode tolérant

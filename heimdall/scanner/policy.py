@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import partial
 from typing import Literal
 
 from heimdall.scanner.entropy_detection import MAX_TOKEN_LENGTH
@@ -44,7 +45,7 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
         return text
     long_line: int | None = None
 
-    def replace(match: re.Match[str]) -> str:
+    def replace(match: re.Match[str], *, line_number: int) -> str:
         nonlocal long_line
         if len(match.group()) <= MAX_TOKEN_LENGTH:
             return match.group()
@@ -56,7 +57,7 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
     multiline_line: int | None = None
     previous_size = 0
     for line_number, line in enumerate(text.split("\n"), start=1):
-        cleaned = _TOKEN.sub(replace, line)
+        cleaned = _TOKEN.sub(partial(replace, line_number=line_number), line)
         size = len(cleaned.encode("utf-8"))
         if line_number > 1 and previous_size + size > TEXT_WINDOW_BYTES and multiline_line is None:
             multiline_line = line_number - 1

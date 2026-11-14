@@ -315,10 +315,11 @@ class Scanner:
 
     @property
     def files_scanned(self) -> int:
-        """Nombre de fichiers effectivement lus lors du dernier scan.
+        """Nombre de fichiers entièrement analysés lors du dernier scan.
 
         Un fichier n'est compté qu'après une lecture complète et vérifiée
-        (identité, taille, ``mtime_ns``). Ce compteur décrit donc le
+        (identité, taille, ``mtime_ns``), sans exclusion de prétraitement
+        (jeton long ou jointure hors borne). Ce compteur décrit donc le
         **contenu réellement analysé**, hors base VCS élaguée. Il rend
         observable le cas d'un arbre réduit à sa base VCS (aucun fichier de
         contenu lu) sans transformer un dépôt vide en erreur : la politique
@@ -573,7 +574,6 @@ class Scanner:
                     raise ScanError(_SCAN_ERROR)
                 if text is None:
                     continue
-                self._files_scanned += 1
                 before_skips = len(self._skipped)
                 text = prepare_text(text, relative, strict=self._strict, skipped=self._skipped)
                 if len(self._skipped) > self._max_files:
@@ -588,6 +588,8 @@ class Scanner:
                 findings.extend(self._scan_text(text, relative, deadline=deadline))
                 if len(findings) > self._max_findings:
                     raise ScanError(_SCAN_ERROR)
+                if len(self._skipped) == before_skips:
+                    self._files_scanned += 1
         except RecursionError:
             # Parcours ancré récursif : un arbre d'une profondeur extrême ne
             # doit pas produire une exception brute (contrat ``ScanError``,

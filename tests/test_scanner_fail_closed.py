@@ -207,6 +207,9 @@ def test_long_token_trace_uses_the_actual_later_line() -> None:
     skipped: list[ScanSkip] = []
     prepare_text("safe\nsafe\n" + "A" * 5000, "payload.dat", strict=False, skipped=skipped)
     assert next(item for item in skipped if item.reason == "long_token").line == 3
+    second_skips: list[ScanSkip] = []
+    prepare_text("safe\n" + "B" * 5000, "second.dat", strict=False, skipped=second_skips)
+    assert next(item for item in second_skips if item.reason == "long_token").line == 2
 
 
 def test_cold_start_checks_inner_coverage_without_legacy_skips(
@@ -415,9 +418,9 @@ def test_partial_human_report_ends_with_blocking_verdict(repo: GitRepo) -> None:
     assert SYNTHETIC not in result.output
 
 
-@pytest.mark.parametrize("scope", ["staged", "diff"])
+@pytest.mark.parametrize("scope", ["tree", "staged", "diff"])
 @pytest.mark.parametrize("trace_count", [1, 2])
-def test_partial_blobs_are_not_counted_as_fully_scanned(
+def test_partial_files_are_not_counted_as_fully_scanned(
     repo: GitRepo, scope: str, trace_count: int,
 ) -> None:
     base = repo.git_output("rev-parse", "HEAD").strip()
@@ -432,7 +435,7 @@ def test_partial_blobs_are_not_counted_as_fully_scanned(
     )
     assert len(report.skipped) == trace_count
     assert {item.file for item in report.skipped} == {"partial.dat"}
-    assert report.scanned_files == 1
+    assert report.scanned_files == (2 if scope == "tree" else 1)
     assert not report.complete
 
 
@@ -446,3 +449,16 @@ def test_invalid_skip_paths_use_scan_error(operation: str) -> None:
             text = "x" * 5000 if operation == "long_token" else " " * 3000 + "\n" + " " * 3000
             prepare_text(text, "../evil", strict=False, skipped=skipped)
     assert skipped == []
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_tree_with_only_partial_file_counts_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fallback: bool,
+) -> None:
+    (tmp_path / "partial.dat").write_text("A" * 5000, encoding="utf-8")
+    if fallback:
+        monkeypatch.setattr(detect_module, "_DIR_FD_SUPPORTED", False)
+    scanner = Scanner(tmp_path, strict=False)
+    assert scanner.scan() == []
+    assert scanner.skipped == (ScanSkip("partial.dat", "long_token", 1),)
+    assert scanner.files_scanned == 0
