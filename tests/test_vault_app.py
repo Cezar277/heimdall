@@ -13,8 +13,10 @@ X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 import ast
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
+import io
 import json
 import os
 import socket
@@ -603,6 +605,23 @@ class VaultSettingsTests(unittest.TestCase):
     def test_run_server_is_callable(self) -> None:
         """run_server est défini et appelable comme point d'entrée."""
         self.assertTrue(callable(run_server))
+
+    @patch("uvicorn.run")
+    def test_run_server_unknown_env_exits_2_without_traceback(
+        self, mock_uvicorn_run: unittest.mock.MagicMock
+    ) -> None:
+        """HEIMDALL_ENV inconnu : code 2 et message actionnable, jamais de démarrage."""
+        stderr = io.StringIO()
+        with (
+            patch.dict(os.environ, {"HEIMDALL_ENV": "staging"}),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            run_server()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("HEIMDALL_ENV invalide", stderr.getvalue())
+        self.assertIn("production, prod, dev, test", stderr.getvalue())
+        mock_uvicorn_run.assert_not_called()
 
     @patch("uvicorn.run")
     def test_run_server_passes_hardened_uvicorn_arguments(

@@ -850,3 +850,28 @@ class PreM03SchemaTests(unittest.TestCase):
                     self.assertEqual(result.exit_code, 1, result.output)
                     self.assertIn("migration requise", result.output)
                     self.assertNotIn("échec", result.output)
+
+
+class AuditListStreamTests(unittest.IsolatedAsyncioTestCase):
+    """Une inondation de rejets ne masque pas les accès (``--stream access``)."""
+
+    async def test_rejection_flood_does_not_hide_access_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            key = generate_server_hmac_key()
+            log = SqliteAuditLog(db_path, hmac_key=key.encode())
+            for status in (200, 200):
+                await log.record(peer="cli", action="GET", target=None, status_code=status)
+            for _ in range(10):
+                await log.record(peer="cli", action="GET", target=None, status_code=401)
+            base = ["vault", "audit", "list", "--db-path", str(db_path), "--limit", "2", "--json"]
+            env = {"HEIMDALL_VAULT_AUDIT_HMAC_KEY": key}
+            flooded = CliRunner().invoke(cli_app, base, env=env)
+            self.assertEqual(flooded.exit_code, 0, flooded.output)
+            self.assertEqual({e["status_code"] for e in json.loads(flooded.output)}, {401})
+            access = CliRunner().invoke(cli_app, [*base, "--stream", "access"], env=env)
+            self.assertEqual(access.exit_code, 0, access.output)
+            self.assertEqual([e["status_code"] for e in json.loads(access.output)], [200, 200])
+            bad = CliRunner().invoke(cli_app, [*base, "--stream", "other"], env=env)
+            self.assertEqual(bad.exit_code, 2, bad.output)

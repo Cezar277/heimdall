@@ -2185,8 +2185,18 @@ def run_server() -> None:
     et cette contrainte évite tout écart de configuration. Le backend SQLite
     peut être répliqué sans multiplier la limite de débit.
     """
+    # HEIMDALL_ENV inconnu (M-13) : refus fail-closed avec un message
+    # actionnable et le code 2, avant toute lecture de configuration (jamais
+    # de traceback ni de ValidationError brute au démarrage).
+    try:
+        env_mode = _heimdall_env_mode()
+    except ValueError as exc:
+        import sys  # noqa: PLC0415
+
+        print(f"Erreur : {exc}", file=sys.stderr)  # noqa: T201
+        raise SystemExit(2) from None
     server_settings = get_settings()
-    if _heimdall_env_mode() in _PRODUCTION_ENV_MODES and (
+    if env_mode in _PRODUCTION_ENV_MODES and (
         server_settings.ssl_certfile is None or server_settings.ssl_keyfile is None
     ):
         raise ValueError(

@@ -702,23 +702,25 @@ class SqliteAuditLog(AuditLog):
         *,
         limit: int = DEFAULT_LIST_LIMIT,
         project: str | None = None,
+        stream: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Derniers événements ; ``stream`` filtre un flux (``access``/``rejection``).
+
+        Sans filtre, une inondation de rejets peut occuper les ``limit``
+        dernières lignes : ``stream="access"`` garde les accès visibles (M-03).
+        """
+        if stream not in {None, _AUDIT_STREAM_ACCESS, _AUDIT_STREAM_REJECTION}:
+            raise ValueError("flux d'audit invalide (access, rejection ou all).")
         bounded_limit = max(1, min(MAX_LIST_LIMIT, int(limit)))
         with db_session(self._db_path) as conn:
-            if project is None:
-                rows = conn.execute(
-                    "SELECT * FROM ("
-                    "SELECT * FROM audit_events ORDER BY id DESC LIMIT ?"
-                    ") ORDER BY id ASC",
-                    (bounded_limit,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM ("
-                    "SELECT * FROM audit_events WHERE project = ? ORDER BY id DESC LIMIT ?"
-                    ") ORDER BY id ASC",
-                    (project, bounded_limit),
-                ).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM ("
+                "SELECT * FROM audit_events "
+                "WHERE (? IS NULL OR project = ?) AND (? IS NULL OR stream = ?) "
+                "ORDER BY id DESC LIMIT ?"
+                ") ORDER BY id ASC",
+                (project, project, stream, stream, bounded_limit),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def _verify_stream(self, conn: Any, stream: str) -> tuple[bool, int | None]:
@@ -774,7 +776,8 @@ class SqliteAuditLog(AuditLog):
                 if not valid:
                     raise ValueError(
                         "chaîne d'audit non vérifiable avec la clé actuelle : "
-                        "re-signature refusée."
+                        "re-signature refusée (vérifier la KEK courante et "
+                        "HEIMDALL_VAULT_SERVER_HMAC_KEY si le serveur l'utilisait)."
                     )
             for stream in (_AUDIT_STREAM_ACCESS, _AUDIT_STREAM_REJECTION):
                 previous_hash, _pruned = self._checkpoint(conn, stream)

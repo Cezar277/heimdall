@@ -1582,6 +1582,24 @@ class VaultRotateCliTests(unittest.TestCase):
             after = conn.execute("SELECT entry_hash FROM audit_events").fetchall()
         self.assertEqual([tuple(r) for r in before], [tuple(r) for r in after])
 
+    def test_cli_audit_rekey_without_server_hmac_key_names_the_variable(self) -> None:
+        """Serveur en HMAC explicite mais variable absente au rekey : code 2 explicite."""
+        server_hmac_key = generate_server_hmac_key()
+        server_cipher = VaultCipher(_OLD_KEK_BYTES, server_hmac_key=server_hmac_key)
+        log = SqliteAuditLog(self.db_path, hmac_key=server_cipher.audit_hmac_key())
+        asyncio.run(log.record(peer="srv", action="GET", target=None, status_code=200))
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "audit", "rekey", "--db-path", str(self.db_path)],
+            env={
+                "HEIMDALL_VAULT_KEK": _OLD_KEK_B64,
+                "HEIMDALL_VAULT_SERVER_HMAC_KEY": None,
+                "HEIMDALL_VAULT_AUDIT_HMAC_KEY": generate_server_hmac_key(),
+            },
+        )
+        self.assertEqual(res.exit_code, 2, res.output)
+        self.assertIn("HEIMDALL_VAULT_SERVER_HMAC_KEY", res.output)
+
     def test_cli_rotate_invalid_port_is_fail_closed(self) -> None:
         for port in ("abc", "99999", "0"):
             with self.subTest(port=port):

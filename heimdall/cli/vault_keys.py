@@ -303,6 +303,14 @@ def list_audit_events(
         "--json",
         help="Sortie JSON (aucune valeur de secret).",
     ),
+    stream: str = typer.Option(
+        "all",
+        "--stream",
+        help=(
+            "Flux à lister : access (accès), rejection (401/429) ou all. Une "
+            "inondation de rejets ne masque pas les accès avec --stream access."
+        ),
+    ),
 ) -> None:
     """Liste les derniers événements d'audit (jamais de secret ni de clé)."""
     try:
@@ -315,7 +323,11 @@ def list_audit_events(
             resolved, create=False, hmac_key=_resolve_audit_hmac_key()
         )
         _exit_if_audit_schema_outdated(audit_log)
-        events = audit_log.list_events(limit=limit, project=project)
+        if stream not in {"access", "rejection", "all"}:
+            raise ValueError("flux d'audit invalide (access, rejection ou all).")
+        events = audit_log.list_events(
+            limit=limit, project=project, stream=None if stream == "all" else stream
+        )
     except ValueError as exc:
         typer.echo(f"Erreur : {exc}", err=True)
         raise typer.Exit(code=2) from None
@@ -361,7 +373,8 @@ def _derived_audit_hmac_key() -> bytes:
     except ValueError:
         raise ValueError(
             "clé d'audit actuelle indisponible : définir la KEK du Vault (clé dérivée) "
-            "ou HEIMDALL_VAULT_OLD_AUDIT_HMAC_KEY."
+            "et HEIMDALL_VAULT_SERVER_HMAC_KEY si le serveur l'utilisait, ou "
+            "HEIMDALL_VAULT_OLD_AUDIT_HMAC_KEY."
         ) from None
     return cipher.audit_hmac_key()
 
@@ -371,7 +384,8 @@ def _derived_audit_hmac_key() -> bytes:
     help=(
         "Migre le journal d'audit vers une clé HMAC explicite (F-16).\n\n"
         "Vérifie la chaîne avec la clé actuelle ($HEIMDALL_VAULT_OLD_AUDIT_HMAC_KEY,\n"
-        "ou à défaut la sous-clé dérivée de la KEK courante), puis la re-signe avec\n"
+        "ou à défaut la sous-clé dérivée de la KEK courante et, si le serveur\n"
+        "l'utilisait, de $HEIMDALL_VAULT_SERVER_HMAC_KEY), puis la re-signe avec\n"
         "$HEIMDALL_VAULT_AUDIT_HMAC_KEY dans une seule transaction. Une chaîne invalide\n"
         "n'est jamais re-signée. Serveur arrêté ; le redémarrer ensuite avec\n"
         "$HEIMDALL_VAULT_AUDIT_HMAC_KEY. Préalable à rotate-kek sur une base dont\n"
