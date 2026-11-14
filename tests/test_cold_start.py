@@ -58,15 +58,11 @@ def test_cold_start_refuses_clean_file_changed_between_passes(
     repo.write("clean.py", "x = 1\n")
     repo.write("config.py", f'TOKEN = "{SYNTHETIC}"\n')
     repo.commit_all("base")
-    real_status = cold_module._worktree_status
-    calls = 0
+    real_collect = cold_module.collect
 
-    def status_then_modify(access: Any, deadline: float) -> bytes:
-        nonlocal calls
-        calls += 1
-        result = real_status(access, deadline)
-        if calls == 1:
-            repo.write("clean.py", f'TOKEN = "{SYNTHETIC}"\n')
+    def collect_then_modify(*args: Any, **kwargs: Any) -> Any:
+        result = real_collect(*args, **kwargs)
+        repo.write("clean.py", f'TOKEN = "{SYNTHETIC}"\n')
         return result
 
     def chat(**kwargs: Any) -> SimpleNamespace:
@@ -74,7 +70,7 @@ def test_cold_start_refuses_clean_file_changed_between_passes(
             message=SimpleNamespace(content='{"verdict":"secret","confidence":1}')
         )
 
-    monkeypatch.setattr(cold_module, "_worktree_status", status_then_modify)
+    monkeypatch.setattr(cold_module, "collect", collect_then_modify)
     with pytest.raises(ScanError, match="contenu modifié"):
         collect_cold_start(repo.root, chat=chat)
 

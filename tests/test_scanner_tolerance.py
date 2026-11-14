@@ -97,6 +97,18 @@ def test_cp1252_fallback_preserves_ascii_secret_amid_binary_noise(repo: GitRepo)
     assert SYNTHETIC not in render_json(report)
 
 
+def test_valid_utf8_control_bytes_preserve_ascii_secret(repo: GitRepo) -> None:
+    # UTF-8 valide sans NUL : texte présumé, même avec des contrôles. Un
+    # secret ASCII contigu reste analysé et le rapport reste complet.
+    payload = b"\x01\x02\x03\x04" * 100 + f'TOKEN = "{SYNTHETIC}"\n'.encode()
+    repo.write_bytes("payload.dat", payload)
+    repo.stage("payload.dat")
+    report = collect(repo.root, staged=True, allowlist=Allowlist.empty(), strict=False)
+    assert any(item.file == "payload.dat" for item in report.findings)
+    assert report.complete
+    assert SYNTHETIC not in render_json(report)
+
+
 @pytest.mark.parametrize("staged", [False, True])
 def test_oversized_file_is_not_read(
     repo: GitRepo, monkeypatch: pytest.MonkeyPatch, staged: bool

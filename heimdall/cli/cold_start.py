@@ -177,9 +177,16 @@ def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification opti
 ) -> ColdStartReport:
     if type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES:
         raise ScanError("limite de fichier invalide")
-    # Capturer l'identité AVANT collect ferme aussi l'intervalle entre les
-    # deux passes, et pas seulement les substitutions pendant la relecture.
+    # Capturer l'identité et l'état Git AVANT collect ferme aussi l'intervalle
+    # entre les deux passes, et pas seulement les substitutions pendant la
+    # relecture : un fichier propre modifié pendant collect est vu par la
+    # comparaison après la seconde passe.
     access = GitAccess(root) if llm and not ci else None
+    deadline = time.monotonic() + MAX_QUALIFICATION_SECONDS
+    status_before: bytes | None = None
+    if access is not None:
+        _verify_root_unchanged(access, root)
+        status_before = _worktree_status(access, deadline)
     skipped: list[str] = []
     scan = collect(
         root,
@@ -189,14 +196,12 @@ def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification opti
         skipped_files=skipped,
         strict=False,
     )
-    if access is not None:
-        _verify_root_unchanged(access, root)
     if access is None or not scan.findings:
+        if access is not None and status_before is not None:
+            _verify_worktree_status(access, root, status_before, deadline)
         return ColdStartReport(scan, (), tuple(skipped))
     if len(scan.findings) > MAX_QUALIFICATIONS:
         raise ScanError("trop de candidats pour la qualification locale")
-    deadline = time.monotonic() + MAX_QUALIFICATION_SECONDS
-    status_before = _worktree_status(access, deadline)
     by_file: dict[str, list[Finding]] = {}
     for finding in scan.findings:
         by_file.setdefault(finding.file, []).append(finding)
