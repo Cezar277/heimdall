@@ -28,7 +28,7 @@ from typing import Final, NoReturn
 
 import typer
 
-from heimdall.remediation.naming import is_dangerous_env_var
+from heimdall.remediation.naming import is_dangerous_env_var, is_dangerous_exec_env_var
 from heimdall.vault.atomic import (
     _bounded_error_message,
     _get_git_toplevel,
@@ -226,7 +226,7 @@ def _filter_secrets(
     for key, value in secrets.items():
         if key not in target_names:
             continue
-        if is_dangerous_env_var(key):
+        if is_dangerous_exec_env_var(key):
             # Même refus que pull/run : un nom interdit à l'injection ne doit
             # jamais être stocké (secret empoisonné, rotation crue mais
             # inexploitable). Code 2 = validation locale avant tout réseau ;
@@ -260,7 +260,7 @@ def _push_single_secret(
     Retourne ``True`` si le secret a été créé, ``False`` s'il existait déjà
     (409 : avertissement, non écrasé). Les autres erreurs sortent en `Exit`.
     """
-    if is_dangerous_env_var(name):
+    if is_dangerous_exec_env_var(name):
         # Reflet borné et échappé : `_push_single_secret` peut être appelée
         # directement (défense en profondeur) avant tout contrôle de format.
         # Un nom non-str n'est jamais reflété : seul son type est affiché.
@@ -505,7 +505,7 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
     retrieved: dict[str, str] = {}
     total_chars = 0
     for name in target_names:
-        if is_dangerous_env_var(name):
+        if is_dangerous_exec_env_var(name):
             typer.echo(
                 f"Erreur de sécurité : le secret {preview_name(name)!r} "
                 "est une variable système interdite.",
@@ -807,7 +807,7 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
     # localement (jamais par `record["name"]` renvoyé par le Vault).
     # Garde anti-détournement : interdiction d'injecter des variables système sensibles.
     for secret_name in injected_secrets:
-        if is_dangerous_env_var(secret_name):
+        if is_dangerous_exec_env_var(secret_name):
             typer.echo(
                 "Erreur de sécurité : injection refusée pour la variable système "
                 f"{secret_name[:32]!r}.",
@@ -816,7 +816,13 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
             raise typer.Exit(code=1)
 
     target_cmd = [executable if executable is not None else cmd[0], *cmd[1:]]
-    child_env = {**os.environ, **injected_secrets}
+    child_env = {
+        env_key: env_val
+        for env_key, env_val in os.environ.items()
+        if env_key.upper() not in {"HEIMDALL_API_KEY", "HEIMDALL_API_KEY_FILE"}
+        and not env_key.upper().startswith("HEIMDALL_VAULT_")
+    }
+    child_env.update(injected_secrets)
 
     # Anti-TOCTOU juste avant l'exécution : si la commande était un chemin,
     # le fichier a pu être substitué pendant le round-trip réseau — refuser

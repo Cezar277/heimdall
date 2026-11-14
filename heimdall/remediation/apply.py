@@ -143,12 +143,37 @@ def _check_backup_git_status(backup: Path, relative_name: str) -> None:
         warnings.warn(msg, UserWarning, stacklevel=3)
 
 
-def apply_replacement(root: Path, plan: ReplacementPlan) -> AppliedPatch:
+def cleanup_backup_file(root: Path, receipt: AppliedPatch) -> None:
+    """Supprime le fichier ``.bak`` créé lors d'un remplacement validé (F-10)."""
+    if not isinstance(receipt, AppliedPatch):
+        raise ApplyError
+    try:
+        confined = confine(root, receipt.backup)
+    except PathEscape:
+        raise ApplyError from None
+    try:
+        if os.path.islink(confined.absolute):
+            raise ApplyError
+        os.unlink(confined.absolute)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise ApplyError from None
+
+
+def apply_replacement(  # noqa: PLR0912
+    root: Path,
+    plan: ReplacementPlan,
+    *,
+    cleanup_backup: bool = False,
+) -> AppliedPatch:
     """Applique un plan validé sous ``root`` ; lève ``ApplyError`` sinon.
 
     Fail-closed : plan manuel, fichier absent/illisible/modifié depuis le plan
     (``plan.before``), chemin hors dépôt, ou écriture impossible — dans tous
     les cas le fichier d'origine est intact (aucune écriture partielle).
+    Si ``cleanup_backup=True``, supprime ``<fichier>.bak`` après validation
+    de l'écriture atomique (F-10).
     """
     if not isinstance(root, Path):
         raise ApplyError
@@ -176,6 +201,12 @@ def apply_replacement(root: Path, plan: ReplacementPlan) -> AppliedPatch:
             write_file_atomic(confined.absolute, plan.after, mode=mode)
         except ValueError:
             raise ApplyError from None
+        if cleanup_backup:
+            try:
+                if not os.path.islink(backup):
+                    os.unlink(backup)
+            except OSError:
+                raise ApplyError from None
     except ApplyError:
         raise
     except Exception:

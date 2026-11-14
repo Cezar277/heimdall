@@ -1694,7 +1694,7 @@ class VaultPullCliTests(unittest.TestCase):
                 }
                 mock_init.return_value = client_instance
 
-                with patch("heimdall.vault.atomic.shutil.which", return_value=None):
+                with patch("heimdall.mcp.gitdiff.shutil.which", return_value=None):
                     result = self.runner.invoke(
                         app,
                         [
@@ -1819,7 +1819,6 @@ class VaultRunCliTests(unittest.TestCase):
             "DOTNET_STARTUP_HOOKS",
             "COMPOSE_FILE",
             "DOCKER_HOST",
-            "AWS_SECRET_ACCESS_KEY",
             "TF_CLI_CONFIG_FILE",
             "KUBECONFIG",
             "HOME",

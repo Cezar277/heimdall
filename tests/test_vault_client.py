@@ -865,12 +865,11 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             os.symlink(real_dir, link_dir)
         except OSError:
             self.skipTest("Symlinks non supportés")
-        with patch("heimdall.vault.atomic.shutil.which", return_value="/usr/bin/git"):
-            with patch("heimdall.vault.atomic.subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                self.assertIsNone(_get_git_toplevel(link_dir))
-                self.assertEqual(mock_run.call_args.kwargs["cwd"], link_dir.parent)
-                self.assertNotEqual(mock_run.call_args.kwargs["cwd"], link_dir)
+        with patch("heimdall.vault.atomic.GitAccess") as mock_access_cls:
+            mock_access = mock_access_cls.return_value
+            mock_access.execute.return_value = MagicMock(returncode=1, stdout=b"")
+            self.assertIsNone(_get_git_toplevel(link_dir))
+            mock_access_cls.assert_called_once_with(link_dir.parent)
 
     def test_git_helpers_refuse_symlink_output_without_following(self) -> None:
         """Output symlink (fichier ou répertoire) → False fail-closed, git jamais consulté.
@@ -892,7 +891,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 with patch(
                     "heimdall.vault.atomic._get_git_toplevel", return_value=self.tmp_dir
                 ):
-                    with patch("heimdall.vault.atomic.subprocess.run") as mock_run:
+                    with patch("heimdall.mcp.gitdiff.subprocess.run") as mock_run:
                         self.assertFalse(is_git_tracked(link))
                         self.assertFalse(is_git_ignored(link))
                         mock_run.assert_not_called()
@@ -909,26 +908,25 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         except OSError:
             self.skipTest("Symlinks non supportés")
         with patch("heimdall.vault.atomic._get_git_toplevel", return_value=repo):
-            with patch(
-                "heimdall.vault.atomic.subprocess.run",
-                return_value=MagicMock(returncode=0),
-            ) as mock_run:
+            with patch("heimdall.vault.atomic.GitAccess") as mock_access_cls:
+                mock_access = mock_access_cls.return_value
+                mock_access.execute.return_value = MagicMock(returncode=0)
                 # Le chemin régulier continue d'interroger Git (comportement conservé).
                 self.assertTrue(is_git_tracked(target))
-                self.assertEqual(mock_run.call_args.args[0][-1], "tracked.env")
-                mock_run.reset_mock()
+                self.assertEqual(mock_access.execute.call_args.args[0][-1], "tracked.env")
+                mock_access.execute.reset_mock()
                 # Le lien final, lui, est refusé avant toute invocation de Git.
                 self.assertFalse(is_git_tracked(link))
                 self.assertFalse(is_git_ignored(link))
-                mock_run.assert_not_called()
+                mock_access.execute.assert_not_called()
 
     def test_git_helpers_survive_hanging_git_binary(self) -> None:
         """Binaire `git` bloqué : `TimeoutExpired` → statut inconnu, jamais de pendaison."""
         target = self.tmp_dir / ".env"
         target.write_text("x=1\n", encoding="utf-8")
-        with patch("heimdall.vault.atomic.shutil.which", return_value="/fake/git"):
+        with patch("heimdall.mcp.gitdiff.shutil.which", return_value="/usr/bin/git"):
             with patch(
-                "heimdall.vault.atomic.subprocess.run",
+                "heimdall.mcp.gitdiff.subprocess.run",
                 side_effect=subprocess.TimeoutExpired(["git"], 5),
             ) as mock_run:
                 self.assertFalse(is_git_tracked(target))
@@ -952,9 +950,9 @@ class VaultAtomicOperationsTests(unittest.TestCase):
 
     def test_detect_from_git_survives_hanging_git_binary(self) -> None:
         """Détection projet : `TimeoutExpired` → None, jamais de pendaison."""
-        with patch("heimdall.vault.client.shutil.which", return_value="/fake/git"):
+        with patch("heimdall.mcp.gitdiff.shutil.which", return_value="/usr/bin/git"):
             with patch(
-                "heimdall.vault.client.subprocess.check_output",
+                "heimdall.mcp.gitdiff.subprocess.run",
                 side_effect=subprocess.TimeoutExpired(["git"], 5),
             ) as mock_check:
                 self.assertIsNone(_detect_from_git(self.tmp_dir))

@@ -164,9 +164,78 @@ def is_dangerous_env_var(name: object) -> bool:
     if not isinstance(name, str):
         return True
     upper = name.upper()
-    if upper in DANGEROUS_ENV_EXACT:
+    if upper in DANGEROUS_ENV_EXACT or upper in EXECUTION_DANGEROUS_ENV_EXACT:
+        return True
+    if upper.endswith("_PROXY"):
         return True
     return any(upper.startswith(prefix) for prefix in DANGEROUS_ENV_PREFIXES)
+
+
+#: Noms exacts bloqués à l'exécution (`heimdall run`) et dans le Vault (`push`/`pull`).
+EXECUTION_DANGEROUS_ENV_EXACT: Final[frozenset[str]] = DANGEROUS_ENV_EXACT | frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSLKEYLOGFILE",
+        "CLASSPATH",
+        "PHPRC",
+        "PHP_INI_SCAN_DIR",
+        "CURL_HOME",
+        "WGETRC",
+        "GNUPGHOME",
+        "ELECTRON_RUN_AS_NODE",
+        "NODE_OPTIONS",
+        "GIT_SSH_COMMAND",
+        "DOCKER_HOST",
+        "NPM_CONFIG_REGISTRY",
+        "PIP_INDEX_URL",
+        "TF_CLI_CONFIG_FILE",
+        "MAVEN_OPTS",
+        "GRADLE_OPTS",
+        "DOTNET_STARTUP_HOOKS",
+        "COMPOSE_FILE",
+        "CARGO_HOME",
+        "BUN_INSTALL",
+        "DENO_DIR",
+        "UV_PYTHON",
+        "BUNDLE_GEMFILE",
+        "GEM_HOME",
+        "CONDA_ENVS_PATH",
+    }
+)
+
+#: Préfixes bloqués à l'exécution (`heimdall run`) : chargeurs dynamiques,
+#: shells, runtimes et variables internes Heimdall. Autorise AWS_, DOCKER_,
+#: NPM_, GIT_, PIP_, TF_, KUBE_, NODE_ (hors NODE_OPTIONS), etc.
+EXECUTION_DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
+    "LD_",
+    "DYLD_",
+    "PYTHON",
+    "BASH_",
+    "PROMPT_",
+    "RUBY",
+    "PERL",
+    "HEIMDALL_",
+    "OPENSSL_",
+    "MALLOC_",
+    "XDG_",
+    "SYSTEMD_",
+    "JAVA_",
+    "JDK_",
+    "_JAVA_",
+)
+
+
+def is_dangerous_exec_env_var(name: object) -> bool:
+    """Vrai si un nom est interdit pour `vault push/pull/run` (fail-closed)."""
+    if not isinstance(name, str):
+        return True
+    upper = name.upper()
+    if upper in EXECUTION_DANGEROUS_ENV_EXACT or upper.endswith("_PROXY"):
+        return True
+    return any(upper.startswith(prefix) for prefix in EXECUTION_DANGEROUS_ENV_PREFIXES)
 
 
 def validate_variable_name(name: object) -> str:
