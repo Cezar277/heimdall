@@ -24,7 +24,7 @@ heimdall deep-scan --ci --strict .
 | Binaire connu ou contenu sans décodage textuel plausible | ignoré, trace `binary` | code 2 |
 | Fichier/blob > 1 Mio (ou plafond explicitement abaissé) | ignoré sans lire son contenu, trace `too_large` | code 2 |
 | Lien rencontré dans l'arbre de travail | jamais suivi, trace `symlink` | code 2 |
-| Jeton lexical > 4096 caractères | jeton découpé en fenêtres chevauchantes de 4096 caractères ; sortie plafonnée à ~2 Mio, pas choisi pour tenir dans ce budget (garantie au moins 2048 pour un jeton d'1 Mio, 4079 pour 8 Kio) ; trace `long_token` avec sa ligne | code 2 |
+| Jeton lexical > 4096 caractères | jeton découpé en fenêtres chevauchantes de 4096 caractères ; sortie plafonnée à ~2 Mio de caractères, pas choisi pour tenir dans ce budget (garantie au moins 2048 pour un jeton d'1 Mio, 4079 pour 8 Kio) ; trace `long_token` avec sa ligne | code 2 |
 | Jointure de deux lignes > 4096 octets UTF-8 | lignes analysées séparément, trace `multiline_limit` | refus conservateur historique si la jointure pourrait porter un candidat |
 
 Le suffixe ne décide jamais de l'exclusion : un texte Latin-1 portant un
@@ -55,7 +55,9 @@ Depuis #229, le schéma exige `complete` : un document sans ce champ est
 invalide. Si `complete` vaut `false`, `skipped` doit être non vide et
 `skipped_count` au moins 1 ; un rapport partiel sans trace est refusé par
 le schéma. Les `default` restent des annotations, pas des valeurs insérées
-automatiquement.
+automatiquement. Le budget de traces `skipped` est compté en traces (un
+fichier peut en porter deux) ; `skipped_count` et `skipped_files` comptent
+les fichiers distincts, pour l'arbre comme pour l'index/diff.
 L'historique utilise ses champs existants `complete` et `skipped`, avec
 un chemin, un commit, un motif et une `line` pour chaque occurrence, y compris
 après réutilisation du cache de blobs sous un autre chemin. `line` est le
@@ -107,7 +109,7 @@ applique la même règle, y compris avec `long_token` / `multiline_limit`.
 
 Un jeton lexical de plus de 4096 caractères est découpé en fenêtres
 chevauchantes de 4096 caractères avant analyse : l'intérieur n'est plus
-blanchi en bloc. La sortie est plafonnée à ~2 Mio : le pas est choisi pour
+blanchi en bloc. La sortie est plafonnée à ~2 Mio de caractères : le pas est choisi pour
 tenir dans ce budget (garantie au moins 2048 pour un jeton d'1 Mio, 4079
 pour un jeton de 8 Kio). Le mode tolérant conserve la trace `long_token` et
 déclare le rapport partiel (code 2 sans autre finding). Le mode strict le

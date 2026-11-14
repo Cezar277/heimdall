@@ -13,13 +13,13 @@ from heimdall.scanner.limits import MAX_TOKEN_LENGTH, TEXT_WINDOW_BYTES
 
 SkipReason = Literal["binary", "too_large", "symlink", "long_token", "multiline_limit"]
 _TOKEN = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
-#: Plafond de la sortie de ``prepare_text`` : ~2 Mio, expansion comprise.
+#: Plafond de la sortie de ``prepare_text`` : ~2 Mio de caractères, expansion comprise.
 #: Il borne la mémoire et le temps face à un fichier adversarial rempli de
 #: jetons hors borne. Le budget de fenêtres est calculé à partir de la taille
 #: d'origine pour que la sortie totale reste sous ce plafond.
-_MAX_CLEANED_BYTES = 2 * 1024 * 1024
+_MAX_CLEANED_CHARS = 2 * 1024 * 1024
 #: Budget maximal de fenêtres (une fenêtre + son séparateur ≈ 4097 octets).
-_MAX_LONG_TOKEN_WINDOWS = _MAX_CLEANED_BYTES // (MAX_TOKEN_LENGTH + 1)
+_MAX_LONG_TOKEN_WINDOWS = _MAX_CLEANED_CHARS // (MAX_TOKEN_LENGTH + 1)
 
 
 @dataclass(frozen=True)
@@ -80,21 +80,21 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
 
     Un jeton hors borne est découpé en fenêtres chevauchantes de
     :data:`MAX_TOKEN_LENGTH` avant analyse ; l'intérieur n'est donc plus
-    blanchi en bloc. La sortie est plafonnée à ~2 Mio : le pas est choisi pour
-    tenir dans ce budget (garantie au moins 2048 pour un jeton d'1 Mio, 4079
-    pour un jeton de 8 Kio). Au-delà du budget, le jeton est blanchi ; le
-    rapport reste marqué incomplet par la trace ``long_token`` et un appelant
-    ne doit jamais traiter ``complete is False`` comme propre.
+    blanchi en bloc. La sortie est plafonnée à ~2 Mio de caractères : le pas
+    est choisi pour tenir dans ce budget (garantie au moins 2048 pour un jeton
+    d'1 Mio, 4079 pour un jeton de 8 Kio). Au-delà du budget, le jeton est
+    blanchi ; le rapport reste marqué incomplet par la trace ``long_token`` et
+    un appelant ne doit jamais traiter ``complete is False`` comme propre.
     """
     if strict:
         return text
     long_line: int | None = None
     # Le texte d'origine occupe déjà une partie du plafond : ne réserver que
     # l'espace restant pour les fenêtres, afin que la sortie totale reste
-    # bornée à ~2 Mio.
+    # bornée à ~2 Mio de caractères.
     window_budget = min(
         _MAX_LONG_TOKEN_WINDOWS,
-        max(0, (_MAX_CLEANED_BYTES - len(text)) // (MAX_TOKEN_LENGTH + 1)),
+        max(0, (_MAX_CLEANED_CHARS - len(text)) // (MAX_TOKEN_LENGTH + 1)),
     )
 
     def replace(match: re.Match[str], *, line_number: int) -> str:
