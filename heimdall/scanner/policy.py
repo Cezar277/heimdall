@@ -13,11 +13,13 @@ from heimdall.scanner.limits import MAX_TOKEN_LENGTH, TEXT_WINDOW_BYTES
 
 SkipReason = Literal["binary", "too_large", "symlink", "long_token", "multiline_limit"]
 _TOKEN = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
-#: Budget global de fenêtres par appel à ``prepare_text``. Il borne la
-#: mémoire et le temps face à un fichier adversarial rempli de jetons hors
-#: borne, tout en laissant un jeton de 8 Kio obtenir la garantie complète
-#: (pas de 1, toute sous-chaîne ≤ 4096 est dans une fenêtre).
-_MAX_LONG_TOKEN_WINDOWS = 8192
+#: Plafond de la sortie de ``prepare_text`` : ~2 Mio, expansion comprise.
+#: Il borne la mémoire et le temps face à un fichier adversarial rempli de
+#: jetons hors borne. Le budget de fenêtres est calculé à partir de la taille
+#: d'origine pour que la sortie totale reste sous ce plafond.
+_MAX_CLEANED_BYTES = 2 * 1024 * 1024
+#: Budget maximal de fenêtres (une fenêtre + son séparateur ≈ 4097 octets).
+_MAX_LONG_TOKEN_WINDOWS = _MAX_CLEANED_BYTES // (MAX_TOKEN_LENGTH + 1)
 
 
 @dataclass(frozen=True)
@@ -41,11 +43,11 @@ def _window_long_token(token: str, max_windows: int) -> tuple[str, int]:
     """Découpe un jeton hors borne en fenêtres chevauchantes analysables.
 
     Chaque fenêtre reste dans la borne ``MAX_TOKEN_LENGTH``. Le pas est choisi
-    pour tenir dans ``max_windows`` : pas de 1 tant que le budget le permet
-    (garantie complète : toute sous-chaîne ≤ ``MAX_TOKEN_LENGTH`` est entière
-    dans une fenêtre), puis pas élargi pour les jetons plus longs. Les
-    fenêtres sont séparées par une espace pour que le moteur les traite comme
-    des jetons distincts, sans changer le numéro de ligne.
+    pour tenir dans ``max_windows`` : pas de 1 si le jeton est assez court,
+    sinon pas élargi (garantie au moins 2048 pour un jeton d'1 Mio, 4079 pour
+    un jeton de 8 Kio). Les fenêtres sont séparées par une espace pour que le
+    moteur les traite comme des jetons distincts, sans changer le numéro de
+    ligne.
 
     Retourne ``(texte, nombre_de_fenêtres_utilisées)``.
     """
@@ -78,17 +80,22 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
 
     Un jeton hors borne est découpé en fenêtres chevauchantes de
     :data:`MAX_TOKEN_LENGTH` avant analyse ; l'intérieur n'est donc plus
-    blanchi en bloc. Le pas vaut 1 tant que le budget global de fenêtres le
-    permet : un jeton de 8 Kio est couvert avec la garantie complète (toute
-    sous-chaîne ≤ 4096 est entière dans une fenêtre). Au-delà du budget, le
-    pas est élargi puis le jeton est blanchi ; le rapport reste marqué
-    incomplet par la trace ``long_token`` et un appelant ne doit jamais
-    traiter ``complete is False`` comme propre.
+    blanchi en bloc. La sortie est plafonnée à ~2 Mio : le pas est choisi pour
+    tenir dans ce budget (garantie au moins 2048 pour un jeton d'1 Mio, 4079
+    pour un jeton de 8 Kio). Au-delà du budget, le jeton est blanchi ; le
+    rapport reste marqué incomplet par la trace ``long_token`` et un appelant
+    ne doit jamais traiter ``complete is False`` comme propre.
     """
     if strict:
         return text
     long_line: int | None = None
-    window_budget = _MAX_LONG_TOKEN_WINDOWS
+    # Le texte d'origine occupe déjà une partie du plafond : ne réserver que
+    # l'espace restant pour les fenêtres, afin que la sortie totale reste
+    # bornée à ~2 Mio.
+    window_budget = min(
+        _MAX_LONG_TOKEN_WINDOWS,
+        max(0, (_MAX_CLEANED_BYTES - len(text)) // (MAX_TOKEN_LENGTH + 1)),
+    )
 
     def replace(match: re.Match[str], *, line_number: int) -> str:
         nonlocal long_line, window_budget
@@ -109,8 +116,11 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
     multiline_line: int | None = None
     previous_size = 0
     for line_number, line in enumerate(text.split("\n"), start=1):
+        # La fenêtre multiligne se mesure sur les lignes d'origine, pas sur
+        # le texte expansé : sinon une seule ligne à jeton long déclencherait
+        # un ``multiline_limit`` trompeur.
+        size = len(line.encode("utf-8"))
         cleaned = _TOKEN.sub(partial(replace, line_number=line_number), line)
-        size = len(cleaned.encode("utf-8"))
         if line_number > 1 and previous_size + size > TEXT_WINDOW_BYTES and multiline_line is None:
             multiline_line = line_number - 1
         previous_size = size

@@ -125,27 +125,10 @@ def test_long_token_does_not_hide_a_separate_secret_on_the_same_line(
 
 
 def test_long_token_windows_find_a_secret_at_a_window_boundary(repo: GitRepo) -> None:
-    # 4096 A's, puis le secret, puis un séparateur : la fenêtre qui commence
-    # à 4096 contient exactement le secret, donc les frontières de signature
-    # sont restaurées. Le rapport reste incomplet (trace long_token).
-    repo.write("notebook.ipynb", "A" * 4096 + SYNTHETIC + " " + "B" * 5000 + "\n")
-    repo.stage("notebook.ipynb")
-    report = collect(repo.root, staged=True, allowlist=Allowlist.empty(), strict=False)
-    assert any(item.file == "notebook.ipynb" for item in report.findings)
-    assert not report.complete
-    assert any(item.reason == "long_token" for item in report.skipped)
-    payload = json.loads(render_json(report))
-    _scan_validator().validate(payload)
-    assert payload["count"] == 1
-    assert payload["complete"] is False
-    assert SYNTHETIC not in render_json(report)
-
-
-def test_long_token_full_guarantee_finds_secret_at_arbitrary_offset(repo: GitRepo) -> None:
-    # Offset 4100 n'est pas un multiple du pas 2048 : seule la garantie
-    # complète (pas de 1) place le secret en tête d'une fenêtre. Le jeton
-    # avant le séparateur fait 4140 caractères, donc il est bien hors borne.
-    repo.write("notebook.ipynb", "A" * 4100 + SYNTHETIC + " " + "B" * 4000 + "\n")
+    # 4095 A's, puis le secret, puis un séparateur : avec le pas 9 imposé par
+    # le budget de 2 Mio, la fenêtre qui commence à 4095 contient exactement
+    # le secret, donc les frontières de signature sont restaurées.
+    repo.write("notebook.ipynb", "A" * 4095 + SYNTHETIC + " " + "B" * 5000 + "\n")
     repo.stage("notebook.ipynb")
     report = collect(repo.root, staged=True, allowlist=Allowlist.empty(), strict=False)
     assert any(item.file == "notebook.ipynb" for item in report.findings)
@@ -159,9 +142,9 @@ def test_long_token_full_guarantee_finds_secret_at_arbitrary_offset(repo: GitRep
 
 
 def test_long_token_3000_chars_in_8000_is_long_token_and_exit_two(repo: GitRepo) -> None:
-    # Le budget de fenêtres permet un pas de 1 pour un jeton de 8 Kio : la
-    # charge de 3000 caractères est entièrement dans une fenêtre. Le rapport
-    # doit rester incomplet (code 2), jamais propre.
+    # Le pas 17 imposé par le budget de 2 Mio garantit qu'une sous-chaîne de
+    # 3000 caractères est entière dans une fenêtre. Le rapport doit rester
+    # incomplet (code 2), jamais propre.
     secret = fake_token("", 3000)
     repo.write("notebook.ipynb", "A" * 3500 + secret + "B" * 1500 + "\n")
     repo.stage("notebook.ipynb")

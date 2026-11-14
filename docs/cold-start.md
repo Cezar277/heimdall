@@ -108,6 +108,8 @@ commit, et rendent `complete: false` (#229). `deep-scan --strict` les refuse.
 Sans `--strict`, un rapport historique partiel produit 1 si un candidat est
 détecté, 2 sinon ; il ne produit jamais 0. L'API `collect_history` reste
 stricte par défaut ; `strict=False` est un choix explicite de collecte.
+`cold-start` reste toujours tolérant (pas d'option `--strict`) ; un rapport
+partiel est refusé par le code 2, jamais présenté comme propre.
 Les objets absents, clones superficiels, sorties invalides et dépassements
 de budget restent des erreurs d'outillage. Voir la
 [politique de tolérance](scanner-tolerance.md).

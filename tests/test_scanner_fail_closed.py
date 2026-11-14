@@ -206,7 +206,7 @@ def test_megabyte_of_long_tokens_is_bounded_and_keeps_line_numbers() -> None:
     started = time.monotonic()
     cleaned = prepare_text(text, "payload.dat", strict=False, skipped=skipped)
     assert time.monotonic() - started < 5
-    assert len(text) <= len(cleaned) <= 40 * len(text)
+    assert len(text) <= len(cleaned) <= 2 * 1024 * 1024
     assert cleaned.count("\n") == text.count("\n")
     assert skipped == [
         ScanSkip("payload.dat", "long_token", 1),
