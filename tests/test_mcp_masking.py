@@ -111,6 +111,46 @@ class AuditE03MaskingProofTests(unittest.TestCase):
         self.assertNotIn("get_password", masked)
         self.assertTrue(masked.endswith(")"))
 
+    def test_multiline_xml_sensitive_element_is_masked(self) -> None:
+        """Revue (LOW) : un XML indenté laissait la valeur en clair."""
+        for line, secret in (
+            ("<password>\nS3cretP4ss99\n</password>", "S3cretP4ss99"),
+            ("<password>\n  S3cretP4ss99\n</password>", "S3cretP4ss99"),
+            ("<api_key>\n  abcd1234efgh\n</api_key>", "abcd1234efgh"),
+            ("<password>\n  my secret\n  phrase 42\n</password>", "my secret\n  phrase 42"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:", masked)
+                self.assertIn("\n", masked, "la mise en forme XML est préservée")
+
+    def test_multiline_xml_ordinary_element_stays_readable(self) -> None:
+        line = "<name>\n  Martin\n</name>"
+        self.assertEqual(masking.mask_text(line), (line, 0))
+
+    def test_passphrase_with_parens_is_pinned_readable(self) -> None:
+        """Arbitrage bruit/fuite assumé (revue), sans mesure de bruit.
+
+        `_evocative_unquoted_looks_secret` refuse `()[]{}` pour épargner le
+        code ; `password = my secret (test) 99` reste donc lisible. Le
+        premier segment n'est masqué par `_UNQUOTED_ASSIGNMENT` que s'il fait
+        au moins 6 caractères, ce qui n'est pas le cas ici. Comportement figé
+        pour éviter une régression silencieuse dans un sens ou dans l'autre.
+        """
+        for line in (
+            "password = my secret (test) 99",
+            "PASSWORD = my secret [test] 99",
+            "password = my secret {test} 99",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(masking.mask_text(line), (line, 0))
+
+        masked, redactions = masking.mask_text("password = abcdefgh (test) 99")
+        self.assertEqual(redactions, 1)
+        self.assertNotIn("abcdefgh", masked)
+
     def test_quoted_netrc_value_is_masked(self) -> None:
         """Revue (LOW) : `password "S3cr****"` (netrc quoté) partait en clair."""
         for line, secret in (

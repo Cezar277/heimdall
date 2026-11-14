@@ -147,10 +147,14 @@ _UNCLOSED_QUOTED_VALUE: Final[re.Pattern[str]] = re.compile(
 
 # Balise XML sensible : `<password>…</password>`, `<api_key>…</api_key>`.
 # Le nom de la balise est jugé par `_SECRET_KEY` (voir `_iter_matches`), la
-# valeur masquée est l'intérieur seulement.
+# valeur masquée est l'intérieur seulement. `[^<]` accepte les sauts de ligne :
+# un XML indenté (`<password>\n  secret\n</password>`) laissait sinon la
+# valeur en clair (revue). Les espaces de bord sont retirés du span pour
+# préserver l'indentation ; un contenu imbriqué (`<` interne) reste hors
+# périmètre et n'est pas masqué par cette règle.
 _XML_SENSITIVE_ELEMENT: Final[re.Pattern[str]] = re.compile(
     r"<(?P<tag>[A-Za-z_][A-Za-z0-9_.:\-]{0,63})(?:\s[^<>]*)?>"
-    r"(?P<value>[^<\n]{1,})"
+    r"(?P<value>[^<]{1,})"
     r"</(?P=tag)\s*>"
 )
 
@@ -646,12 +650,19 @@ def _unclosed_quoted_spans(match: re.Match[str]) -> list[_Match]:
 
 
 def _xml_sensitive_spans(match: re.Match[str]) -> list[_Match]:
-    """`<password>…</password>` : seule la valeur intérieure est masquée."""
+    """`<password>…</password>` : seule la valeur intérieure est masquée.
+
+    Les espaces et sauts de ligne de bord sont hors span : un XML indenté
+    garde sa mise en forme, seul le secret est remplacé. Le contenu interne
+    (y compris multiligne) est masqué d'un bloc.
+    """
     key = match.group("tag")
-    value = match.group("value")
-    if not _looks_like_secret(key, value):
+    raw = match.group("value")
+    value = raw.strip()
+    if not value or not _looks_like_secret(key, value):
         return []
-    return [_span_match(match, "value", _secret_type(key, value))]
+    start = match.start("value") + len(raw) - len(raw.lstrip())
+    return [_Match(start, start + len(value), _secret_type(key, value), len(value))]
 
 
 def _define_spans(match: re.Match[str]) -> list[_Match]:

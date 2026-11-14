@@ -196,17 +196,20 @@ coquille) est masquée jusqu'à la fin de ligne, et une valeur non quotée à no
 évocateur est masquée jusqu'à la fin de ligne (espaces, `,`, `;` inclus) —
 `password = my secret pass phrase 42` ne laisse plus sa queue en clair. Les
 formes hors affectation sont couvertes : balise XML sensible
-(`<password>…</password>`), `define('DB_PASSWORD', '…')` (nom et valeur nus
-acceptés, `DEFINE` et espace avant `(` admis, comme en PHP), `.netrc`
-(`password …`, `Password` et valeur citée inclus, fermée ou tronquée), `-u
-user:pass` (couple ou mot de passe cité, formes tronquées incluses) et
-`--password <val>`/`--password=<val>`. Le filtre anti-bruit refuse les annotations
+(`<password>…</password>`, y compris indentée ou multiligne, indentation
+préservée), `define('DB_PASSWORD', '…')` (nom et valeur nus acceptés,
+`DEFINE` et espace avant `(` admis, comme en PHP), `.netrc` (`password …`,
+`Password` et valeur citée inclus, fermée ou tronquée), `-u user:pass`
+(couple ou mot de passe cité, formes tronquées incluses) et `--password
+<val>`/`--password=<val>`. Le filtre anti-bruit refuse les annotations
 (`api_key: str`) et littéraux (`session = None`) ; un appel de fonction à nom
 évocateur (`get_password()`) reste partiellement masqué par la règle
 d'affectation — comportement préexistant, épinglé par test et hors périmètre
-de ce correctif. Les clés JSON usuelles (`"author"`, `"tokenizer"`) restent
-lisibles. Preuve : les 11 cas de l'audit rejoués dans
-`tests/test_mcp_masking.py`.
+de ce correctif. Une phrase de passe non quotée contenant `()[]{}` reste
+lisible (arbitrage anti-bruit, épinglé par test) ; seul un premier segment
+d'au moins 6 caractères est masqué par `_UNQUOTED_ASSIGNMENT`. Les clés JSON
+usuelles (`"author"`, `"tokenizer"`) restent lisibles. Preuve : les 11 cas de
+l'audit rejoués dans `tests/test_mcp_masking.py`.
 
 Limites honnêtes : un jeton **sans préfixe connu, noyé dans 100 Ko de
 remplissage**, reste indétectable par fenêtre ; un SHA de commit copié en
