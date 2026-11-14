@@ -192,6 +192,18 @@ def test_signature_rules_are_identifiable() -> None:
         "github_fine_grained_pat",
         "jwt",
         "pem_private_key",
+        "service_gitlab",
+        "service_google_api",
+        "service_google_oauth",
+        "service_npm",
+        "service_stripe_webhook",
+        "service_digitalocean",
+        "service_shopify",
+        "url_password",
+        "authorization_header",
+        "credential_double_quoted",
+        "credential_single_quoted",
+        "credential_unquoted",
     }
     matches = find_signature_matches(f'AWS = "{_aws()}"')
     assert len(matches) == 1
@@ -247,6 +259,8 @@ def test_public_values_are_not_silently_allowlisted(tmp_path: Path, line: str) -
     findings = _scan_lines(tmp_path, line)
     if line.startswith(("UUID =", "SHA256 =", "COMMIT =")):
         assert findings and all(f["source"] == "entropy" for f in findings)
+    elif line.startswith("PASSWORD ="):
+        assert findings and all(f["type"] == "credential" for f in findings)
     else:
         assert findings == []
 

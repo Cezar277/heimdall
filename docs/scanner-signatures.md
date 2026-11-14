@@ -20,8 +20,8 @@ Références :
 
 ## En une phrase
 
-Le registre est la **seule source de vérité** des signatures : dix règles
-réparties en quatre familles, chacune avec un exemple positif et un exemple
+Le registre est la **seule source de vérité** des signatures : 22 règles
+réparties en six familles, chacune avec un exemple positif et un exemple
 négatif vérifiés **à l'import** ; le moteur les applique aux cibles déjà
 validées par #53 et ne rend que des `Finding` sans valeur brute.
 
@@ -33,12 +33,21 @@ validées par #53 et ne rend que des `Finding` sans valeur brute.
 | Stripe / Slack | [`stripe_slack.py`](../heimdall/scanner/signatures/stripe_slack.py) | #56 | 4 |
 | GitHub PAT / JWT | [`github_jwt.py`](../heimdall/scanner/signatures/github_jwt.py) | #57 | 3 |
 | Clés privées PEM | [`pem.py`](../heimdall/scanner/signatures/pem.py) | #58 | 1 |
+| Jetons de services | [`service_tokens.py`](../heimdall/scanner/signatures/service_tokens.py) | #230 | 7 |
+| Identifiants contextualisés | [`credentials.py`](../heimdall/scanner/signatures/credentials.py) | #230 | 5 |
 
-Total : **10 règles**. Les autres fournisseurs cloud (GCP, Azure,
-DigitalOcean) ne sont pas inclus : leurs formats ne sont pas spécifiés par le
-découpage et une règle trop large produirait plus de faux positifs que de
-détections utiles. Les exclusions de fichiers, le parcours du dépôt et la
-détection par entropie restent hors de ce ticket (#59/#60).
+Total : **22 règles**. Les sept préfixes supplémentaires sont `glpat-`,
+`AIza`, `ya29.`, `npm_`, `whsec_`, `dop_v1_` et `shpat_`. Les formes sont
+heuristiques et bornées ; elles ne prouvent ni la validité ni la révocation
+d'un jeton chez un fournisseur. Les clés publiques Stripe `pk_live_` /
+`pk_test_` ne sont pas des secrets : leur masquage conservateur côté MCP
+n'impose pas de les classer comme secrets dans le scanner.
+
+Les cinq règles contextuelles couvrent les mots de passe d'URL, les en-têtes
+Authorization Basic/Bearer et les affectations sensibles à valeur doublement
+citée, simplement citée ou non citée. Les nouveaux types sont `service_token`,
+`url_credentials`, `authorization` et `credential` (Finding v1 inchangé).
+Voir [le périmètre E-02 et ses limites](t230-scanner-allowlist.md).
 
 ## Le contrat d'une règle
 
@@ -62,7 +71,8 @@ La validation est **fail-closed au chargement du module** :
 - exemple positif reconnu, exemple négatif ignoré ;
 - registre non vide et identifiants uniques ;
 - `secret_type` de chaque règle **dans l'ensemble fermé** `aws` / `stripe` /
-  `slack` / `pat` / `jwt` / `pem` / `high_entropy_hex` / `high_entropy_base64`
+  `slack` / `pat` / `jwt` / `pem` / `high_entropy_hex` / `high_entropy_base64` /
+  `service_token` / `credential` / `url_credentials` / `authorization`
   (`ALLOWED_SECRET_TYPES` dans
   [`model.py`](../heimdall/scanner/signatures/model.py)) : un type que rien
   ne documente ne peut pas produire de Finding.
@@ -71,7 +81,7 @@ Les types `high_entropy_hex` et `high_entropy_base64` sont gouvernés par ce
 même ensemble fermé, mais produits par le moteur d'entropie #23, avec
 `source="entropy"`. Leurs seuils sont documentés dans
 [scanner-entropy.md](scanner-entropy.md). Le test du registre vérifie
-explicitement que ses six types sont l'ensemble fermé moins ces deux types.
+explicitement que ses types sont l'ensemble fermé moins ces deux types.
 
 À l'exécution, `Rule.matches()` applique la même logique fail-closed : une
 ligne qui n'est pas un `str` lève une `ScanError` au lieu de rendre un
@@ -85,7 +95,7 @@ registre ne peut pas être silencieusement faux. `make_rule()` construit la
 règle **positionnellement** pour que le SAST (Bandit B106) ne confonde pas le
 nom du champ `secret_type` avec un mot de passe codé en dur.
 
-## Les dix règles
+## Les dix règles historiques
 
 Les valeurs complètes des exemples ne figurent pas dans ce document : les
 motifs ci-dessous décrivent l'ancrage et les bornes, pas un secret utilisable.
@@ -384,8 +394,9 @@ noms qu'elle reconnaît effectivement.
   sérialisée, journalisée ou rendue.
 - Le type d'un Finding produit par le registre est **borné** à l'ensemble
   `aws` / `stripe` / `slack` / `pat` / `jwt` / `pem` / `high_entropy_hex` /
-  `high_entropy_base64` : les deux derniers sont produits par le moteur
-  d'entropie, les six premiers par le registre de signatures. Un nouveau fournisseur
+  `high_entropy_base64` / `service_token` / `credential` / `url_credentials` /
+  `authorization` : les types `high_entropy_*` sont produits par le moteur
+  d'entropie, les autres par le registre de signatures. Un nouveau fournisseur
   implique d'ajouter son type à `ALLOWED_SECRET_TYPES` et de le documenter ici.
 - `find_signature_matches` n'est exportée par **aucun** paquet public :
   `heimdall.scanner` ne l'expose pas, et le registre la tient hors de son

@@ -338,8 +338,9 @@ def _reject_dangerous_regex(raw: str) -> None:  # noqa: PLR0912 - automate expli
 
 
 def _split_alternatives(raw: str) -> tuple[str, ...]:
-    """Découpe sur les ``|`` hors classes et échappements."""
+    """Découpe les alternances au niveau courant, hors groupes/classes."""
     parts: list[str] = []
+    depth = 0
     start = 0
     i = 0
     n = len(raw)
@@ -351,7 +352,11 @@ def _split_alternatives(raw: str) -> tuple[str, ...]:
         if char == "[":
             i = _skip_char_class(raw, i)
             continue
-        if char == "|":
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "|" and depth == 0:
             parts.append(raw[start:i])
             start = i + 1
         i += 1
@@ -359,58 +364,121 @@ def _split_alternatives(raw: str) -> tuple[str, ...]:
     return tuple(parts)
 
 
-def _count_literal_chars(segment: str) -> int:
-    """Compte les caractères littéraux hors classes, ancres et quantificateurs.
+def _group_end(raw: str, start: int) -> int:
+    depth = 1
+    index = start + 1
+    while index < len(raw):
+        char = raw[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            index = _skip_char_class(raw, index)
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    raise ScanError(_CONFIG_ERROR)
 
-    Les classes (``[a-z]``), les ancres (``^``, ``$``, ``\\b``), les classes
-    abrégées (``\\w``, ``\\d``), les jokers (``.``) et les quantificateurs ne
-    comptent pas : ils ne constituent pas un marqueur auditable.
+
+def _escaped_literal(segment: str, start: int) -> tuple[int, int]:
+    escaped = segment[start + 1]
+    if escaped in "dDwWsSbBAZz123456789":
+        return 0, start + 2
+    widths = {"x": 2, "u": 4, "U": 8}
+    if escaped in widths:
+        return 1, start + 2 + widths[escaped]
+    if escaped == "N":
+        return 1, segment.index("}", start + 2) + 1
+    if escaped == "0":
+        end = start + 2
+        while end < min(start + 4, len(segment)) and segment[end] in "01234567":
+            end += 1
+        return 1, end
+    return 1, start + 2
+
+
+def _count_literal_chars(segment: str) -> int:  # noqa: PLR0912 - grammaire bornée explicite
+    """Minimum de marqueurs littéraux obligatoires sur chaque branche.
+
+    Les assertions ne consomment pas de texte. Un atome/groupe optionnel
+    ne contribue pas ; une répétition ne multiplie jamais les marqueurs.
+    La longueur maximale borne aussi la profondeur et le coût du parseur.
     """
+    if len(segment) > MAX_PATTERN_LENGTH:
+        raise ScanError(_CONFIG_ERROR)
+    alternatives = _split_alternatives(segment)
+    if len(alternatives) > 1:
+        return min(_count_literal_chars(branch) for branch in alternatives)
     count = 0
+    atom = 0
     i = 0
     n = len(segment)
     while i < n:
         char = segment[i]
         if char == "\\":
-            if i + 1 >= n:
-                break
-            escaped = segment[i + 1]
-            if escaped in "123456789":
-                raise ScanError(_CONFIG_ERROR)
-            if escaped in "dDwWsSbBAZz":
-                i += 2
-                continue
-            if escaped in "xXuU":
-                count += 1
-                i += 2
-                while i < n and segment[i] in "0123456789abcdefABCDEF":
-                    i += 1
-                continue
-            if escaped == "N" and i + 2 < n and segment[i + 2] == "{":
-                count += 1
-                end = segment.find("}", i + 3)
-                i = n if end < 0 else end + 1
-                continue
-            count += 1
-            i += 2
+            atom, i = _escaped_literal(segment, i)
+            count += atom
             continue
         if char == "[":
             i = _skip_char_class(segment, i)
+            atom = 0
             continue
         if char == "(":
             content_start, skip_to = _group_content_start(segment, i)
-            i = skip_to if skip_to is not None else content_start
+            if skip_to is not None:
+                i = skip_to
+                atom = 0
+                continue
+            end = _group_end(segment, i)
+            assertion = segment.startswith(("(?=", "(?!", "(?<=", "(?<!"), i)
+            atom = 0 if assertion else _count_literal_chars(segment[content_start:end])
+            count += atom
+            i = end + 1
             continue
-        if char == "{":
+        if char in "*?":
+            count -= atom
+            atom = 0
+        elif char == "{":
             end = segment.find("}", i + 1)
+            lower = segment[i + 1:end].split(",", 1)[0] if end >= 0 else ""
+            if not lower or (lower.isascii() and lower.isdigit() and int(lower) == 0):
+                count -= atom
+                atom = 0
             i = end + 1 if end >= 0 else i + 1
             continue
-        if char in ")|^$.*+?":
-            i += 1
-            continue
-        count += 1
+        elif char == "+":
+            pass
+        elif char in "^$.":
+            atom = 0
+        else:
+            atom = 1
+            count += atom
         i += 1
     return count
+
+
+def _path_matches(file_path: str, pattern: str) -> bool:
+    """Glob sensible à la casse : seul un segment ``**`` traverse ``/``."""
+    parts = file_path.split("/")
+    if "\\" in file_path or any(part in {"", ".", ".."} for part in parts):
+        return False
+    reachable = {0}
+    for segment in pattern.split("/"):
+        if not reachable:
+            return False
+        if segment == "**":
+            reachable = set(range(min(reachable), len(parts) + 1))
+        else:
+            reachable = {
+                index + 1 for index in reachable
+                if index < len(parts) and fnmatch.fnmatchcase(parts[index], segment)
+            }
+    return len(parts) in reachable
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,7 +541,7 @@ class AllowlistRule:
 
     Les critères de restriction facultatifs (en conjonction avec
     keywords/patterns/exact_keywords) sont :
-    - `paths` : motifs glob POSIX relatifs (évalués via `fnmatch`)
+    - `paths` : globs POSIX relatifs, `*` par segment et `**` récursif
     - `secret_types` : types de secrets restreints (ex. 'aws', 'stripe')
 
     Les mots-clés sont toujours comparés avec une frontière `\\b` stricte :
@@ -572,7 +640,7 @@ class AllowlistRule:
         l'exposition à un motif pathologique qui aurait échappé aux
         validations.
         """
-        # 1. Filtre par chemin (si spécifié) — moteur unique fnmatch documenté.
+        # 1. Globs par segment ; seul ** traverse les répertoires.
         # Un chemin plus long que MAX_MATCH_PATH_LENGTH n'est pas soumis à
         # fnmatch : le candidat reste signalé (fail-closed), même protection
         # anti-backtracking que pour les regex sur la valeur.
@@ -580,7 +648,7 @@ class AllowlistRule:
             path_matched = (
                 len(file_path) <= MAX_MATCH_PATH_LENGTH
                 and any(
-                    fnmatch.fnmatch(file_path, pattern)
+                    _path_matches(file_path, pattern)
                     for pattern in self.paths
                 )
             )
@@ -731,7 +799,7 @@ def _compile_safe_regex(raw: str) -> re.Pattern[str]:
 
     try:
         compiled = re.compile(raw)
-    except re.error:
+    except (re.error, OverflowError, RecursionError):
         raise ScanError(_CONFIG_ERROR) from None
 
     # 3. Un match de longueur nulle sur "" vaut pour toute valeur en position 0.

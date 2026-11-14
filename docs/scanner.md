@@ -72,6 +72,12 @@ sont documentés dans [scanner-entropy.md](scanner-entropy.md).
 
 ## Signatures (#54)
 
+L'audit E-02 (#230) ajoute les préfixes de services, les mots de passe dans
+les URL, Authorization et les affectations à clé sensible. Voir
+[le périmètre actuel](t230-scanner-allowlist.md),
+[le registre complet](scanner-signatures.md) et
+[les seuils des jetons courts](scanner-entropy.md).
+
 | Règle | Type Finding | Forme attendue |
 | --- | --- | --- |
 | `aws_access_key_id` | `aws` | `AKIA`/`ASIA`/`ABIA`/`ACCA` + 16 caractères majuscules/chiffres |

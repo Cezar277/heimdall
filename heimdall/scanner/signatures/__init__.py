@@ -17,9 +17,11 @@ from dataclasses import dataclass, field
 from typing import Final, Literal
 
 from heimdall.scanner.signatures.aws_cloud import RULES as AWS_CLOUD_RULES
+from heimdall.scanner.signatures.credentials import RULES as CREDENTIAL_RULES
 from heimdall.scanner.signatures.github_jwt import RULES as GITHUB_JWT_RULES
 from heimdall.scanner.signatures.model import Rule, RuleMatch, validate_rules
 from heimdall.scanner.signatures.pem import RULES as PEM_RULES
+from heimdall.scanner.signatures.service_tokens import RULES as SERVICE_TOKEN_RULES
 from heimdall.scanner.signatures.stripe_slack import (
     ROTATING_INNER_RULE_IDS,
     ROTATING_PREFIX_LEN,
@@ -27,11 +29,13 @@ from heimdall.scanner.signatures.stripe_slack import (
 )
 from heimdall.scanner.signatures.stripe_slack import RULES as STRIPE_SLACK_RULES
 
-#: Les quatre familles du découpage #22.2.1 à #22.2.4, dans un ordre stable.
+#: Familles historiques et extensions E-02, dans un ordre stable.
 FAMILIES: Final[tuple[tuple[str, tuple[Rule, ...]], ...]] = (
     ("aws_cloud", AWS_CLOUD_RULES),
     ("stripe_slack", STRIPE_SLACK_RULES),
     ("github_jwt", GITHUB_JWT_RULES),
+    ("service_tokens", SERVICE_TOKEN_RULES),
+    ("credentials", CREDENTIAL_RULES),
     ("pem", PEM_RULES),
 )
 
@@ -67,6 +71,7 @@ class SignatureMatch:
     value: str = field(repr=False)
     start: int = 0
     source: Literal["regex", "entropy"] = "regex"
+    context_end: int = 0  # fin de la clé ; elle ne doit pas traverser une jointure
 
     def __repr__(self) -> str:
         """Résumé sans la valeur candidate (jamais de secret dans un ``repr``)."""
@@ -147,6 +152,10 @@ def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:
                 if (debut - ROTATING_PREFIX_LEN, fin) in bornes_rotatives:
                     continue
             value = match.group("value")
+            if rule.id.startswith("credential_") and any(
+                value == previous.value for previous in matches
+            ):
+                continue
             key = (rule.secret_type, value)
             if key in seen:
                 continue
@@ -157,6 +166,7 @@ def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:
                     signature=rule.id,
                     value=value,
                     start=match.start(),
+                    context_end=match.end("key") if "key" in rule.pattern.groupindex else 0,
                 )
             )
     return tuple(matches)

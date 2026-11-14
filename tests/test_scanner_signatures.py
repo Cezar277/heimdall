@@ -79,6 +79,8 @@ def test_registry_has_one_file_per_family_and_unique_rules() -> None:
         "aws_cloud",
         "stripe_slack",
         "github_jwt",
+        "service_tokens",
+        "credentials",
         "pem",
     ]
     assert len(RULES) == sum(len(rules) for _name, rules in FAMILIES)
@@ -227,7 +229,6 @@ def test_known_false_positives_are_not_reported() -> None:
         'COMMIT = "' + "b" * 40 + '"',
         'INTEGRITY = "sha512-' + "A" * 64 + '"',
         'EXAMPLE = "example"',
-        'PASSWORD = "changeme"',
         'API_KEY = "your_key_here"',
         'IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"',
         'MOCK = "MOCK_TOKEN_FOR_TESTS_ONLY"',
@@ -432,6 +433,18 @@ _ANCHORED_HOSTILE_PREFIX: dict[str, str] = {
     "github_fine_grained_pat": "github_pat_",
     "jwt": "eyJ",
     "pem_private_key": "-----BEGIN ",
+    "service_gitlab": "glpat-",
+    "service_google_api": "AIza",
+    "service_google_oauth": "ya29.",
+    "service_npm": "npm_",
+    "service_stripe_webhook": "whsec_",
+    "service_digitalocean": "dop_v1_",
+    "service_shopify": "shpat_",
+    "url_password": "postgres://user:",
+    "authorization_header": "Authorization: Bearer ",
+    "credential_double_quoted": 'DB_PASSWORD="',
+    "credential_single_quoted": "DB_PASSWORD='",
+    "credential_unquoted": "DB_PASSWORD=",
 }
 
 

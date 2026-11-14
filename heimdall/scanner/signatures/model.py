@@ -34,7 +34,8 @@ _VALUE_GROUP: Final[str] = "value"
 #: ``docs/scanner-signatures.md``). Un type hors de cet ensemble serait un
 #: Finding que rien ne documente : il est refusé au chargement.
 ALLOWED_SECRET_TYPES: Final[frozenset[str]] = frozenset(
-    {"aws", "stripe", "slack", "pat", "jwt", "pem", "high_entropy_hex", "high_entropy_base64"}
+    {"aws", "stripe", "slack", "pat", "jwt", "pem", "high_entropy_hex", "high_entropy_base64",
+     "service_token", "credential", "url_credentials", "authorization"}
 )
 #: Message statique : une ligne non textuelle est une violation de contrat
 #: (invariant 8 : ni l'entrée ni sa valeur ne sont jamais reflétées).

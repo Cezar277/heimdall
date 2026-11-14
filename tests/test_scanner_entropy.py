@@ -476,7 +476,7 @@ def test_signature_results_are_reused_for_lines_and_adjacent_windows(
         else SignatureEngine(hasher).analyser(FileTarget("config.py", text))
     )
     assert [(f.line, f.type, f.source) for f in findings] == [(1, "aws", "regex")]
-    assert calls == [lines[0], lines[0] + lines[1], lines[1], lines[1] + lines[2], lines[2]]
+    assert calls == [lines[0] + lines[1], lines[0], lines[1] + lines[2], lines[1], lines[2]]
 
 
 def test_dense_line_checks_deadline_after_its_single_signature_scan(monkeypatch) -> None:
