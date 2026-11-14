@@ -39,12 +39,16 @@ from heimdall.scanner.finding import Finding
 from heimdall.vault.atomic import parse_env_file, parse_example_names, read_file_secure_no_follow
 
 _FIX_ERROR_MESSAGE: Final[str] = "heimdall fix : remédiation impossible (erreur d'outillage)."
+_INCOMPATIBLE_OPTIONS_MESSAGE: Final[str] = "options incompatibles : --config et --no-allowlist"
 _MAX_LINE_CHARS: Final[int] = 4096
 _ASSIGNMENT_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]")
 
 
 def _default_variable_name(line_text: str, finding: Finding) -> str:
     """Dérive un nom de variable valide pour un Finding sans jamais refléter le secret."""
+    line_text = line_text.lstrip()
+    if line_text.startswith(("export ", "export\t")):
+        line_text = line_text[len("export"):].strip()
     match = _ASSIGNMENT_NAME_RE.match(line_text)
     if match:
         candidate = match.group(1).upper()
@@ -140,6 +144,8 @@ def run_fix(  # noqa: PLR0913, PLR0915
     interactive: bool | None = None,
 ) -> tuple[ReviewReport, int]:
     """Exécute le flux complet scan -> plans -> revue Y/N -> écriture atomique."""
+    if config_path is not None and no_allowlist:
+        raise ScanError(_INCOMPATIBLE_OPTIONS_MESSAGE)
     if root.is_symlink():
         raise ScanError("racine symlinkée refusée")
     resolved_root = root.resolve()
@@ -289,6 +295,9 @@ def fix_command(  # noqa: PLR0913, PLR0917
     ),
 ) -> None:
     """Propose et applique la remédiation interactive des secrets détectés (#233)."""
+    if config is not None and no_allowlist:
+        typer.echo(_INCOMPATIBLE_OPTIONS_MESSAGE, err=True)
+        raise typer.Exit(code=2)
     try:
         report, remaining = run_fix(
             Path(path),

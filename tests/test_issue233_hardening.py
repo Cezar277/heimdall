@@ -15,7 +15,12 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from heimdall.cli.fix import _existing_env_names, _find_single_quoted_literal, run_fix
+from heimdall.cli.fix import (
+    _default_variable_name,
+    _existing_env_names,
+    _find_single_quoted_literal,
+    run_fix,
+)
 from heimdall.cli.main import app
 from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
 from heimdall.cli.vault_client import _pull_secrets_from_vault, vault_pull
@@ -36,6 +41,7 @@ from heimdall.remediation.naming import (
     is_dangerous_exec_env_var,
 )
 from heimdall.remediation.templates import plan_for_finding
+from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 from heimdall.vault.atomic import (
     _get_git_toplevel,
@@ -53,6 +59,64 @@ from heimdall.vault.client import (
 
 _TEST_API_KEY = "A" * 43
 _FAKE_SECRET = "AKIAIOSFODNN7EXAMPLE"  # noqa: S105
+
+
+@pytest.mark.parametrize("ci", [False, True])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_fix_rejects_config_with_no_allowlist_before_work(
+    tmp_path: Path, ci: bool, json_output: bool,
+) -> None:
+    for name in ("app.py", "app.py.bak", ".env", ".env.example", ".gitignore", "private.toml"):
+        (tmp_path / name).write_text("unchanged\n", encoding="utf-8")
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_mode)
+        for path in tmp_path.iterdir()
+    }
+    args = ["fix", str(tmp_path), "--config", str(tmp_path / "private.toml"), "--no-allowlist"]
+    if ci:
+        args.append("--ci")
+    if json_output:
+        args.append("--json")
+    with patch("heimdall.cli.fix.run_fix") as run:
+        result = CliRunner().invoke(app, args)
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert result.stderr == "options incompatibles : --config et --no-allowlist\n"
+    run.assert_not_called()
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_mode)
+        for path in tmp_path.iterdir()
+    }
+    assert after == before
+
+
+def test_run_fix_rejects_conflicting_options_before_io(tmp_path: Path) -> None:
+    with (
+        patch.object(Path, "is_symlink") as symlink_check,
+        patch("heimdall.cli.fix.collect") as collect,
+        patch("heimdall.cli.fix.review_proposals") as review,
+        pytest.raises(ScanError, match="^options incompatibles : --config et --no-allowlist$"),
+    ):
+        run_fix(tmp_path / "absent", config_path=tmp_path / "private.toml", no_allowlist=True)
+    symlink_check.assert_not_called()
+    collect.assert_not_called()
+    review.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('export FOO="x"', "FOO"),
+        ('export\tFOO="x"', "FOO"),
+        (' \texport \tFOO="x"', "FOO"),
+        ('FOO="x"', "FOO"),
+        ('exportFOO="x"', "EXPORTFOO"),
+        ('export FOO-BAR="x"', "SECRET_AWS_KEY"),
+    ],
+)
+def test_default_variable_name_handles_export_prefix(line: str, expected: str) -> None:
+    finding = Finding(file=".env", line=1, type="aws_key", entropy=3.5, snippet_hash="a" * 64)
+    assert _default_variable_name(line, finding) == expected
 
 
 @pytest.mark.parametrize(
