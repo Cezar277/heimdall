@@ -194,19 +194,51 @@ def confined_environment(ceiling: str) -> dict[str, str]:
     }
 
 
+_ADDITIONAL_GIT_PREFIXES: Final[tuple[str, ...]] = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+)
+
+
 def trusted_git_path() -> str:
     """Recherche système explicite, sans reprendre le PATH de l'appelant."""
     if os.name == "nt":
         return os.defpath
-    return os.pathsep.join(
-        (
-            os.defpath,
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/run/current-system/sw/bin",
-            "/nix/var/nix/profiles/default/bin",
-        )
-    )
+    return os.pathsep.join((os.defpath, *_ADDITIONAL_GIT_PREFIXES))
+
+
+def verify_git_prefix(binary: str) -> None:
+    """Exige une installation root pour les préfixes POSIX supplémentaires.
+
+    Vérifie les chemins lexicaux ET les cibles des liens (Homebrew/Nix),
+    parents inclus. Un lien root dans un dossier modifiable reste refusé.
+    Les autres emplacements de os.defpath gardent leur politique historique.
+    """
+    path = Path(binary)
+    if os.name == "nt" or str(path.parent) not in _ADDITIONAL_GIT_PREFIXES:
+        return
+    pending = [path, *path.parents]
+    checked: set[Path] = set()
+    try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise ToolFailure("INTERNAL")
+        while pending:
+            candidate = pending.pop()
+            if candidate in checked:
+                continue
+            checked.add(candidate)
+            metadata = candidate.lstat()
+            if metadata.st_uid != 0 or (
+                not stat.S_ISLNK(metadata.st_mode) and metadata.st_mode & 0o022
+            ):
+                raise ToolFailure("INTERNAL")
+            resolved = candidate.resolve(strict=True)
+            if resolved != candidate:
+                pending.extend((resolved, *resolved.parents))
+    except (OSError, RuntimeError, ValueError):
+        raise ToolFailure("INTERNAL") from None
 
 
 # Délai maximal d'une commande git : un diff qui ne répond pas est une panne
@@ -375,6 +407,7 @@ class GitAccess:
         # fenêtre TOCTOU et aucune divergence si la garde de racine évolue.
         if resolved.is_relative_to(self._root) or resolved.parent == cwd:
             raise ToolFailure("INTERNAL")
+        verify_git_prefix(binary)
         self._git = binary
         if index_file is not None:
             self._select_index(index_file)

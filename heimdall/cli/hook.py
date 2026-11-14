@@ -55,6 +55,7 @@ from heimdall.mcp.gitdiff import (
     GitAccess,
     confined_environment,
     trusted_git_path,
+    verify_git_prefix,
 )
 from heimdall.mcp.paths import ConfinedPath, PathEscape, confine
 from heimdall.scanner.detect import MAX_FILE_BYTES
@@ -140,6 +141,10 @@ def _git_binary(root: Path) -> str:
         raise HookError from None
     if resolved.is_relative_to(repository_root) or resolved.parent == current:
         raise HookError
+    try:
+        verify_git_prefix(git)
+    except ToolFailure:
+        raise HookError from None
     return git
 
 

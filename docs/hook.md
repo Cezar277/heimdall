@@ -233,16 +233,22 @@ Une installation Nix disponible uniquement dans un profil utilisateur doit
 exposer Git via un de ces chemins système. Un binaire dans le dépôt ou le
 répertoire courant reste refusé.
 
-Pour que ces préfixes constituent une source de confiance indépendante du
-compte qui prépare le commit, leurs répertoires, leurs parents et la cible
-résolue de `git` doivent être inscriptibles uniquement par l'administrateur.
-Cette condition est une exigence de déploiement, pas une vérification
-automatique des permissions par Heimdall. Un Homebrew installé dans un
-préfixe modifiable par l'utilisateur ne fournit pas cette séparation : ce
-compte peut remplacer Git, comme il peut désactiver son hook local. La CI
-doit utiliser sa propre installation Git de confiance. La priorité de
-`os.defpath` et le refus d'un Git résolu dans le dépôt ou le dossier courant
-sont testés avec des préfixes simulés, sans écrire dans les chemins système.
+Pour ces préfixes supplémentaires, Heimdall vérifie désormais que le binaire,
+ses répertoires parents, les liens symboliques et leurs cibles résolues
+appartiennent à root (`st_uid == 0`). Les fichiers et répertoires doivent
+en outre être non modifiables par le groupe et les autres (`mode & 0022 == 0`).
+Les permissions des liens eux-mêmes ne sont pas utilisées : leur propriétaire,
+leurs parents et leurs cibles sont contrôlés. Un chemin illisible, absent ou
+non conforme entraîne un refus statique (code 2), sans exécuter le binaire.
+
+Un Homebrew installé dans un préfixe appartenant à l'utilisateur est donc
+refusé : utiliser une installation système protégée de Git. Les autres
+emplacements de `os.defpath` conservent la politique de confiance système
+existante. La CI doit utiliser sa propre installation Git de confiance.
+La priorité de `os.defpath`, le refus d'un Git résolu dans le dépôt ou le
+dossier courant et les contrôles d'appartenance et de permissions sont
+testés sous Linux avec des préfixes simulés, sans écrire dans les chemins
+système. Ces tests ne constituent pas une preuve native macOS ou NixOS.
 
 ```sh
 .venv/bin/python -m pytest tests/test_cli_hook.py -v

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from test_cli_hook import FAKE_AWS_KEY, _git, _run
 from typer.testing import CliRunner
 
 import heimdall.cli.hook as hook_module
+import heimdall.mcp.gitdiff as gitdiff_module
 from heimdall.cli.hook import HookError, apply_and_restage, assert_no_unstaged_changes
 from heimdall.cli.main import app
 from heimdall.mcp.errors import ToolFailure
@@ -298,6 +300,78 @@ def test_system_git_masks_an_added_prefix_and_repo_git_is_refused(
         hook_module._git_binary(git_repo.root)
     with pytest.raises(ToolFailure):
         GitAccess(git_repo.root)
+
+
+@pytest.mark.parametrize(
+    ("location", "fault"),
+    [
+        ("none", "none"),
+        ("link", "owner"),
+        ("prefix", "owner"),
+        ("prefix_parent", "owner"),
+        ("target", "owner"),
+        ("target_parent", "owner"),
+        ("target", "group"),
+        ("prefix", "group"),
+        ("target_parent", "other"),
+        ("target", "missing"),
+    ],
+)
+def test_added_git_prefix_requires_root_owned_protected_paths(
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    location: str,
+    fault: str,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("permissions POSIX uniquement")
+    prefix = tmp_path / "homebrew/bin"
+    target = tmp_path / "nix/store/git/bin/git"
+    prefix.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    target.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    target.chmod(0o755)
+    link = prefix / "git"
+    link.symlink_to(target)
+    locations = {
+        "link": link,
+        "prefix": prefix,
+        "prefix_parent": prefix.parent,
+        "target": target,
+        "target_parent": target.parent,
+    }
+    faulty = locations.get(location)
+    real_lstat = Path.lstat
+
+    def lstat(path: Path) -> os.stat_result:
+        metadata = list(real_lstat(path))
+        # Simule un déploiement root sans chown ni écriture système réels.
+        metadata[4] = 0
+        if not stat.S_ISLNK(metadata[0]):
+            metadata[0] &= ~0o022
+        if path == faulty:
+            if fault == "missing":
+                raise FileNotFoundError
+            if fault == "owner":
+                metadata[4] = 1000
+            elif fault == "group":
+                metadata[0] |= 0o020
+            elif fault == "other":
+                metadata[0] |= 0o002
+        return os.stat_result(metadata)
+
+    monkeypatch.setattr(gitdiff_module, "_ADDITIONAL_GIT_PREFIXES", (str(prefix),))
+    monkeypatch.setattr(shutil, "which", lambda *args, **kwargs: str(link))
+    monkeypatch.setattr(Path, "lstat", lstat)
+    if fault == "none":
+        assert hook_module._git_binary(git_repo.root) == str(link)
+        assert GitAccess(git_repo.root)._git == str(link)
+    else:
+        with pytest.raises(HookError):
+            hook_module._git_binary(git_repo.root)
+        with pytest.raises(ToolFailure):
+            GitAccess(git_repo.root)
 
 
 def test_linked_worktree_uses_its_own_temporary_index(git_repo: GitRepo, tmp_path: Path) -> None:
