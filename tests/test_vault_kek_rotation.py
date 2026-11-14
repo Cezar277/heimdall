@@ -24,6 +24,7 @@ from typing import Any
 from typer.testing import CliRunner
 
 from heimdall.cli.main import app as cli_app
+from heimdall.vault.audit import SqliteAuditLog
 from heimdall.vault.crypto import (
     VaultCipher,
     VaultCipherError,
@@ -1464,6 +1465,29 @@ class VaultRotateCliTests(unittest.TestCase):
             env={"HEIMDALL_VAULT_AUDIT_HMAC_KEY": audit_key, "HEIMDALL_VAULT_KEK": _OLD_KEK_B64},
         )
         self.assertEqual(verify.exit_code, 0, verify.output)
+
+    def test_cli_rotate_refuses_when_history_uses_another_audit_key(self) -> None:
+        """Historique signé avec la clé dérivée : rotation refusée avant toute écriture."""
+        derived = SqliteAuditLog(self.db_path, hmac_key=self.old_cipher.audit_hmac_key())
+        for status in (200, 401):
+            asyncio.run(derived.record(peer="srv", action="GET", target=None, status_code=status))
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY": generate_server_hmac_key(),
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(self.db_path), "--force"],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 2, res.output)
+        self.assertIn("n'est pas vérifiable", res.output)
+        self.assertEqual(derived.count(), 2)
+        store = SqliteSecretStore(self.db_path, VaultCipher(_OLD_KEK_BYTES))
+        rec = store._get("demo", "dev", "API_KEY")
+        assert rec is not None
+        self.assertEqual(rec["value"], "super_secret_value")
 
     def test_cli_rotate_refuses_hot_server_without_force(self) -> None:
         """Audit M-07 : rotation à chaud refusée, --force explicite l'autorise."""

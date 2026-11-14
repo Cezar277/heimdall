@@ -268,6 +268,19 @@ def _resolve_audit_hmac_key() -> bytes:
     return cipher.audit_hmac_key()
 
 
+_SCHEMA_MIGRATION_MESSAGE = (
+    "Erreur : journal d'audit antérieur à M-03, migration requise : démarrer une "
+    "fois le serveur Vault (migration du schéma) puis relancer la commande."
+)
+
+
+def _exit_if_audit_schema_outdated(audit_log: SqliteAuditLog) -> None:
+    """Base pré-M-03 : message « migration requise » explicite (code 1)."""
+    if audit_log.needs_schema_migration():
+        typer.echo(_SCHEMA_MIGRATION_MESSAGE, err=True)
+        raise typer.Exit(code=1)
+
+
 @audit_app.command("list")
 def list_audit_events(
     db_path: Path | None = _DB_PATH_OPTION,
@@ -300,6 +313,7 @@ def list_audit_events(
         audit_log = SqliteAuditLog(
             resolved, create=False, hmac_key=_resolve_audit_hmac_key()
         )
+        _exit_if_audit_schema_outdated(audit_log)
         events = audit_log.list_events(limit=limit, project=project)
     except ValueError as exc:
         typer.echo(f"Erreur : {exc}", err=True)
@@ -307,6 +321,8 @@ def list_audit_events(
     except FileNotFoundError:
         typer.echo("Erreur : base du journal d'audit introuvable.", err=True)
         raise typer.Exit(code=1) from None
+    except typer.Exit:
+        raise
     except Exception:
         typer.echo("Erreur : échec de la lecture du journal d'audit.", err=True)
         raise typer.Exit(code=1) from None
@@ -339,6 +355,7 @@ def verify_audit_chain(
         audit_log = SqliteAuditLog(
             resolved, create=False, hmac_key=_resolve_audit_hmac_key()
         )
+        _exit_if_audit_schema_outdated(audit_log)
         valid, invalid_id = audit_log.verify_chain()
         legacy = not valid and audit_log.is_legacy_sha256_chain()
         total = audit_log.count()
@@ -349,6 +366,8 @@ def verify_audit_chain(
     except FileNotFoundError:
         typer.echo("Erreur : base du journal d'audit introuvable.", err=True)
         raise typer.Exit(code=1) from None
+    except typer.Exit:
+        raise
     except Exception:
         typer.echo("Erreur : échec de la vérification du journal d'audit.", err=True)
         raise typer.Exit(code=1) from None
@@ -449,6 +468,37 @@ def _vault_server_is_listening() -> bool:
         return False
 
 
+def _require_rotation_audit_key(resolved: Path) -> bytes:
+    """Clé d'audit explicite, déjà valide pour l'historique existant (F-16).
+
+    Lève ``ValueError`` (code 2) avant toute écriture si la clé manque ou ne
+    vérifie pas la chaîne existante.
+    """
+    # Fail-closed (F-16) : sans clé d'audit explicite, la sous-clé dérivée
+    # de la KEK change à la rotation et casse la vérification de la chaîne.
+    raw_audit_key = os.environ.get("HEIMDALL_VAULT_AUDIT_HMAC_KEY")
+    if not raw_audit_key:
+        raise ValueError(
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY est obligatoire pour la rotation de la "
+            "KEK : sans clé d'audit explicite, la chaîne d'audit deviendrait "
+            "invérifiable après la rotation."
+        )
+    audit_key = validate_server_hmac_key(raw_audit_key)
+    # La clé fournie doit déjà vérifier l'historique existant : sinon le
+    # serveur tournait avec une autre clé (dérivée, par exemple) et
+    # l'événement de rotation produirait une chaîne mixte invérifiable.
+    existing_audit = SqliteAuditLog(resolved, create=False, hmac_key=audit_key)
+    if existing_audit.needs_schema_migration() or (
+        existing_audit.count() > 0 and existing_audit.verify_chain() != (True, None)
+    ):
+        raise ValueError(
+            "le journal d'audit existant n'est pas vérifiable avec "
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY : configurer le serveur avec cette clé "
+            "(ou migrer le journal) avant la rotation."
+        )
+    return audit_key
+
+
 @vault_app.command(
     "rotate-kek",
     help=(
@@ -517,16 +567,7 @@ def rotate_kek_command(
             raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
         if target_version is not None:
             validate_kek_version(target_version, label="Le numéro de version cible")
-        # Fail-closed (F-16) : sans clé d'audit explicite, la sous-clé dérivée
-        # de la KEK change à la rotation et casse la vérification de la chaîne.
-        raw_audit_key = os.environ.get("HEIMDALL_VAULT_AUDIT_HMAC_KEY")
-        if not raw_audit_key:
-            raise ValueError(
-                "HEIMDALL_VAULT_AUDIT_HMAC_KEY est obligatoire pour la rotation de la "
-                "KEK : sans clé d'audit explicite, la chaîne d'audit deviendrait "
-                "invérifiable après la rotation."
-            )
-        audit_key = validate_server_hmac_key(raw_audit_key)
+        audit_key = _require_rotation_audit_key(resolved)
     except ValueError as exc:
         typer.echo(f"Erreur : {exc}", err=True)
         raise typer.Exit(code=2) from None

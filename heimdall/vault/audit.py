@@ -288,7 +288,9 @@ class InMemoryAuditLog(AuditLog):
     les accès authentifiés (audit M-03).
     """
 
-    def __init__(self, *, hmac_key: bytes | None = None) -> None:
+    def __init__(self, *, hmac_key: bytes | None) -> None:
+        # ``hmac_key`` obligatoire (F-16) : ``None`` = SHA-256 historique, choix
+        # explicite réservé à la lecture des journaux pré-F-16.
         self._hmac_key = hmac_key
         self._events: list[AuditEvent] = []
         self._rejection_events: list[AuditEvent] = []
@@ -470,7 +472,7 @@ class SqliteAuditLog(AuditLog):
         db_path: Path | str,
         *,
         create: bool = True,
-        hmac_key: bytes | None = None,
+        hmac_key: bytes | None,
     ) -> None:
         self._db_path = Path(db_path) if isinstance(db_path, str) else db_path
         self._hmac_key = hmac_key
@@ -750,6 +752,19 @@ class SqliteAuditLog(AuditLog):
             if not valid:
                 return valid, invalid
             return self._verify_stream(conn, _AUDIT_STREAM_REJECTION)
+
+    def needs_schema_migration(self) -> bool:
+        """True si la base date d'avant l'audit M-03 (pas de colonne ``stream``).
+
+        Une lecture en ``create=False`` ne migre pas le schéma : l'appelant
+        doit annoncer « migration requise » plutôt qu'un échec générique.
+        """
+        with db_session(self._db_path) as conn:
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(audit_events);").fetchall()
+            }
+        return bool(columns) and "stream" not in columns
 
     def is_legacy_sha256_chain(self) -> bool:
         """True si le journal est une chaîne SHA-256 historique valide (pré-F-16).

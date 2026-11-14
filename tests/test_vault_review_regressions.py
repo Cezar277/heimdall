@@ -146,6 +146,35 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                             hashing.assert_not_called()
                             lookup.assert_not_called()
 
+    async def test_auth_peer_rejection_precedes_hash_and_lookup(self) -> None:
+        """Le budget auth_peer est contrôlé avant HMAC et parcours d'empreintes."""
+        for backend in ("memory", "sqlite"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmp:
+                target = create_app(
+                    VaultSettings(
+                        db_path=str(Path(tmp) / f"{backend}.db"),
+                        storage_backend=backend,
+                        kek=generate_encryption_key(),
+                        api_key_pepper="p" * 32,
+                        rate_limit_per_key=100,
+                        rate_limit_per_peer=1,
+                        rate_limit_global=100,
+                    )
+                )
+                first_key, second_key = generate_api_key(), generate_api_key()
+                target.state.register_api_key(first_key, "demo")
+                target.state.register_api_key(second_key, "demo")
+                first = await self._authenticated_get(target, first_key)
+                self.assertEqual(first.status_code, 404)
+                with (
+                    patch.object(auth_module, "hash_project_api_key") as hashing,
+                    patch.object(auth_module, "find_api_key_project") as lookup,
+                ):
+                    second = await self._authenticated_get(target, second_key)
+                    self.assertEqual(second.status_code, 429)
+                    hashing.assert_not_called()
+                    lookup.assert_not_called()
+
     async def test_key_rejection_does_not_consume_global_and_anonymous_has_own_budget(
         self,
     ) -> None:

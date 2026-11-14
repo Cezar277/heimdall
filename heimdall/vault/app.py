@@ -1327,12 +1327,12 @@ async def _limiter_peek(limiter: RateLimiter | SqliteRateLimiter, peer: str) -> 
 
 
 async def _limiter_peek_authenticated(
-    limiter: RateLimiter | SqliteRateLimiter,
+    limiter: RateLimiter | SqliteRateLimiter, peer: str
 ) -> tuple[bool, int]:
-    """Lecture seule du budget global authentifié, avant tout hachage."""
+    """Lecture seule des budgets ``auth_peer`` et global, avant tout hachage."""
     if isinstance(limiter, SqliteRateLimiter):
-        return await asyncio.to_thread(limiter.peek_authenticated)
-    return limiter.peek_authenticated()
+        return await asyncio.to_thread(limiter.peek_authenticated, peer)
+    return limiter.peek_authenticated(peer)
 
 
 async def _limiter_consume_peer(
@@ -1497,10 +1497,10 @@ def _register_middleware(app: FastAPI) -> None:
                 headers={"Connection": "close"},
             )
         else:
-            # Rejet précoce sur le budget global authentifié, avant le hachage
+            # Rejet précoce sur les budgets auth_peer et global, avant le hachage
             # et le parcours d'empreintes. Le budget par clé, lui, exige
             # l'empreinte et reste vérifié après résolution.
-            allowed, retry_after = await _limiter_peek_authenticated(limiter)
+            allowed, retry_after = await _limiter_peek_authenticated(limiter, peer)
             if not allowed:
                 return JSONResponse(
                     status_code=429,
