@@ -1,4 +1,40 @@
 Ticket #230 - Audit E-02 / allowlist
+CORRECTION APRES REQUEST CHANGES
+Revision : a95a1f00a221c1df1dd2af93c8155487db765f1c
+Main integre : 4d5bdf8, merge f2711ce.
+
+Bloqueur : deduplication uniquement par (type, valeur). Le temoin CLI
+local/CI garde credential apres une allowlist limitee a service_token,
+avec exit 1, une trace et aucune valeur brute en sortie.
+Npm : charge minimale 16, npm_packages/npm_config_registry non signales.
+Residuels nus sans trois classes et valeurs non citees <4 documentes/testes.
+Integration fix : un patch par fichier/ligne/empreinte apres allowlist.
+Git imbrique : marqueur le plus proche, GitAccess confine conserve,
+marqueurs symboliques refuses avant execution ; temoin .env espaces passe.
+
+Passe ciblee apres integration : 1350 passed, 5 warnings in 35.10s.
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t230-typed-review-final.xml
+Sur 5eee07e : 1 failed, 4396 passed, 18 skipped, 19 warnings,
+7124 subtests passed in 380.12s.
+Unique echec : test_selected_index_changed_on_the_same_inode_is_refused[content],
+precondition ctime identique au meme tick. Temoin stabilise avec 20 ms
+avant reecriture, sans modifier la garde d'index de production.
+python -m pytest tests/test_hook_commit_index.py tests/test_issue230_scanner_allowlist.py tests/test_issue233_hardening.py tests/test_remediation_env.py -o addopts= -q --tb=short
+Apres stabilisation : 440 passed, 5 warnings in 22.99s.
+
+python -m ruff check heimdall tests scripts docker
+All checks passed!
+python -m mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts docker
+Success: no issues found in 69 source files
+python -m bandit -r heimdall scripts docker -q
+Exit 0 ; avertissements nosec existants, aucune alerte de securite.
+
+Validation globale finale : rapport JUnit local au chemin ci-dessus et
+check CI (/ci) de https://github.com/Cezar277/heimdall/pull/253 apres
+commentaire /ci sur la tete corrigee. Consulter la conclusion de ce check
+pour la revision courante. Les anciennes passes ci-dessous sont historiques.
+
+VALIDATION INITIALE - HISTORIQUE d50d0f6
 Branche : 230-audit-e-02-allowlist-scanner-détection-mots-de-passe-urls-jetons-courts-et-contournement-regex-allowlist-_compile_safe_regex
 Code teste : d50d0f6660b79b01d7711c9b9b71f180da87b71e
 Base : 336bc02

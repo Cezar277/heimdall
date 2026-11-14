@@ -1,9 +1,36 @@
 # T230 — Audit E-02 : détection et allowlist
 
-Ticket #230. Code testé : `d50d0f6660b79b01d7711c9b9b71f180da87b71e`.
-Base : `336bc02`. Le commit contient `Closes #230`.
+Ticket #230. Révision corrigée : `a95a1f00a221c1df1dd2af93c8155487db765f1c`.
+`main` intégré : `4d5bdf8` (merge local `f2711ce`). Le commit initial
+`d50d0f6` contient `Closes #230` ; ses preuves historiques restent ci-dessous.
 
-## Propriétés démontrées
+## Correction après REQUEST CHANGES
+
+- [`signatures/__init__.py:155`](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/heimdall/scanner/signatures/__init__.py#L155) déduplique uniquement `(secret_type, value)`. Le bloc de déduplication inter-types a été supprimé : une vue `credential` n'est plus effacée par une vue de service. Les [deux cas CLI local/CI](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/tests/test_issue230_scanner_allowlist.py#L297) vérifient les deux vues avant allowlist, une règle limitée à `service_token`, la survie de `credential`, le code 1, une seule trace et l'absence de valeur brute en sortie.
+- [`service_tokens.py:21`](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/heimdall/scanner/signatures/service_tokens.py#L21) relève à 16 la charge minimale de `npm_`. [Identifiants ordinaires](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/tests/test_issue230_scanner_allowlist.py#L326) et frontières 15/16 sont testés. Les noms longs restent une source possible de faux positifs, documentée.
+- La [politique](t230-scanner-allowlist.md) explicite les résiduels : jetons nus de 20–22 caractères auxquels manque une des trois classes, affectations non citées de moins de quatre caractères et clé `pin` hors vocabulaire. Des témoins négatifs figent ces limites ; aucune couverture universelle n'est revendiquée.
+- [`fix.py:154`](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/heimdall/cli/fix.py#L154) regroupe seulement les remédiations physiques après filtrage typé, par fichier/ligne/empreinte. Le [témoin de double vue](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/tests/test_issue230_scanner_allowlist.py#L349) applique un seul patch et vérifie le rescan propre. Les résultats du scanner restent distincts par type ; les gardes de racine de #233 sont conservées.
+- [`atomic.py:737`](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/heimdall/vault/atomic.py#L737) corrige la découverte de racine depuis un sous-dossier sans élargir le plafond Git : recherche du marqueur le plus proche sur les ancêtres validés, puis `GitAccess` depuis cette racine. [Sous-dossier avec espaces](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/tests/test_issue230_scanner_allowlist.py#L372) et [marqueur symbolique refusé avant exécution](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/tests/test_issue230_scanner_allowlist.py#L380) sont couverts. Le test historique `.env` avec espaces passe désormais.
+- Le [témoin ctime](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/tests/test_hook_commit_index.py#L255) attend 20 ms avant sa réécriture pour ne pas rester dans le même tick. L'assertion ctime, la restauration du mtime et les gardes d'index de production ne sont pas affaiblies.
+
+## Validation de la correction
+
+Après intégration : **1350 tests ciblés passent en 35,10 s**. Le premier
+rejeu global sur `5eee07e` donne **4396 passés, 1 échec, 18 ignorés,
+7124 sous-tests passés**, en 380,12 s : l'unique échec est la précondition
+ctime du témoin #228. Après stabilisation, les quatre modules ciblés passent :
+**440 tests en 22,99 s**, avec les cinq avertissements `.bak` existants.
+Ruff, MyPy (69 fichiers) et Bandit passent ; les avertissements de lecture
+des anciens commentaires `nosec` restent présents, sans alerte de sécurité.
+
+La validation globale finale utilise le rejeu local
+`/home/nathan/heimdall-t230-typed-review-final.xml` et le check **CI (/ci)**
+de la [PR #253](https://github.com/Cezar277/heimdall/pull/253), déclenché par
+`/ci` après la poussée de la tête corrigée. Lire son statut et sa conclusion
+sur la révision courante ; les résultats locaux ne remplacent pas ce check.
+
+## Propriétés initiales — historique `d50d0f6`
+
 
 | Périmètre | Code et témoins |
 | --- | --- |
@@ -34,7 +61,7 @@ heuristiques et bornes sont décrites dans
 [t230-scanner-allowlist.md](t230-scanner-allowlist.md). Aucun nouveau réseau,
 shell, chiffrement ou paquet externe ; les fixtures sont synthétiques.
 
-## Validation
+## Validation initiale — historique `d50d0f6`
 
 Les six modules ciblés passent : **776 tests en 13,81 s**. Sur le commit
 figé, les commandes de contrôle de la CI passent localement : Ruff,
