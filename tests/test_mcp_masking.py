@@ -331,6 +331,7 @@ class AuditE03MaskingProofTests(unittest.TestCase):
             ("pwd S3cretP4ss", "S3cretP4ss"),
             ("password hunter2,abc12399", "hunter2,abc12399"),
             ("password hunter2;abc12399", "hunter2;abc12399"),
+            ("password hunter2(test)99", "hunter2(test)99"),
             ('api_key "my secret 42"', "my secret 42"),
             ('secret "my secret 42', "my secret 42"),
         ):

@@ -188,7 +188,7 @@ _NETRC_PASSWORD: Final[re.Pattern[str]] = re.compile(
     r"(?:"
     r"(?P<quote>[\"'])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=quote)"
     r"|[\"'](?P<unclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
-    r"|(?P<value>[^\s\"'`(){}\[\]]{1,})"
+    r"|(?P<value>[^\s\"'`(){}\[\]][^\s\"']*)"
     r")"
 )
 
