@@ -62,7 +62,7 @@ def _parse_blocks(text: str) -> list[dict[str, object]]:
         assert isinstance(cast_lines, list)  # nosec B101 -- narrowing de type, pas une garde
         cast_lines.append(line)
         via = current["via"]
-        assert isinstance(via, list)  # nosec B101 -- narrowing de type, pas une garde -- narrowing de type, pas une garde
+        assert isinstance(via, list)  # nosec B101 -- narrowing de type, pas une garde
         via_match = _VIA_RE.match(line)
         if via_match:
             if via_match.group(1):
