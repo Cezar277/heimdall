@@ -726,7 +726,7 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
             ) from None
 
     status_val = data.get("status")
-    if status_val not in ("actif", "revoque", "vaulte", "rote"):
+    if status_val not in ("vaulte", "rote"):
         status_preview = str(status_val)[:_PREVIEW_LEN]
         raise VaultClientError(f"Statut de secret non conforme : {status_preview!r}")
 

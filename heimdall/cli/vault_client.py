@@ -520,9 +520,10 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             continue
         try:
             record = client.get_secret(proj, env, name)
-            if record.get("status") in ("rote", "revoque"):
+            if record.get("status") != "vaulte":
                 typer.echo(
-                    f"Erreur de sécurité : le secret '{preview_name(name)}' est roté ou révoqué.",
+                    f"Erreur de sécurité : le secret '{preview_name(name)}' "
+                    "n'est pas au statut 'vaulte'.",
                     err=True,
                 )
                 raise typer.Exit(code=1)

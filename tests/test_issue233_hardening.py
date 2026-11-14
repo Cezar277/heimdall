@@ -345,7 +345,10 @@ def test_m09_fix_deduplication_overflow_marks_unfixable_not_exit2(tmp_path: Path
     assert report.outcomes == ()
 
 
-def test_f02_vault_pull_and_run_reject_rotated_secret(tmp_path: Path) -> None:
+@pytest.mark.parametrize("bad_status", ["rote", "actif", "confirme"])
+def test_f02_vault_pull_and_run_reject_non_vaulte_secret(
+    tmp_path: Path, bad_status: str
+) -> None:
     exe = tmp_path / "tool.sh"
     exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     exe.chmod(0o700)
@@ -358,7 +361,7 @@ def test_f02_vault_pull_and_run_reject_rotated_secret(tmp_path: Path) -> None:
                 "project": "demo",
                 "env": "dev",
                 "name": "APP_KEY",
-                "status": "rote",
+                "status": bad_status,
                 "value": _FAKE_SECRET,
             }
             mock_init.return_value = client
