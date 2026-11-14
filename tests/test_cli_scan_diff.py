@@ -469,7 +469,7 @@ def test_scan_diff_refuses_a_binary_blob(git_repo: GitRepo) -> None:
     _commit(git_repo, "binary")
 
     result = _run(
-        "scan", "--ci", "--diff", "origin/main", "--no-allowlist", str(git_repo.root)
+        "scan", "--strict", "--ci", "--diff", "origin/main", "--no-allowlist", str(git_repo.root)
     )
     assert result.exit_code == EXIT_ERROR
     assert result.stderr.strip() == SCAN_ERROR_MESSAGE

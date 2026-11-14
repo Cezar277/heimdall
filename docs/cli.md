@@ -40,7 +40,7 @@ Références :
 ## Utilisation
 
 ```sh
-heimdall scan [CHEMIN]              # arbre de travail (mode strict)
+heimdall scan [CHEMIN]              # arbre de travail (tolérance tracée)
 heimdall scan --staged [CHEMIN]     # blobs ajoutés ou modifiés dans l'index
 heimdall scan --ci [CHEMIN]         # mode CI headless (verdict = code de sortie)
 heimdall scan --ci --diff REF [CHEMIN]  # merge-base(REF, HEAD)...HEAD
@@ -57,6 +57,14 @@ heimdall scan --no-gitignore [CHEMIN]  # parcours intégral de l'arbre
 | `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; inclut les traces et décomptes d'allowlist (#24) ; les erreurs restent sur stderr |
 | `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) ; un chemin **hors du dépôt** est accepté : choix opérateur explicite, soumis aux mêmes gardes (`_resolve_root` + `O_NOFOLLOW`, plafond de taille, contrat fermé) |
 | `--no-allowlist` | désactive l'allowlist déterministe pour le scan courant |
+| `--strict` | refuse les exclusions de contenu (binaires, taille, liens et limites de texte) au lieu de rendre un rapport partiel (#229) |
+
+Par défaut, les exclusions de contenu sont tracées avec leurs chemins et motifs.
+Un code 0 ne couvre que le contenu analysé ; les rapports partiels exposent
+`complete: false`, `skipped_count` et `skipped` dans le JSON. Un rapport
+partiel ne retourne jamais 0 : code 1 avec findings, code 2 sinon, même sans
+`--ci` et sans `--strict`. Les erreurs de
+lecture restent bloquantes. Voir la [politique de tolérance](scanner-tolerance.md).
 
 En `--ci`, l'allowlist du dépôt ne peut jamais s'auto-attester : si un
 `heimdall.toml` est présent dans le dépôt scanné (versionné à la racine,
@@ -117,20 +125,16 @@ bibliothèque (`Scanner`, #22), hors contrat hook/CI.
 
 | Périmètre | Ce qui est analysé | Exclusions |
 | --- | --- | --- |
-| `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **base VCS** (`.git/`, `.hg/`, `.svn/` : métadonnées, pas du contenu) et **entrées non suivies ignorées par un `.gitignore` du dépôt**. Un fichier **suivi** est toujours lu, même si un motif le matche (`git add -f`). Tout le reste (`vendor/`, `node_modules/`, `.venv/`, lockfiles, sorties de build **non ignorés**) est lu par contenu ; binaire connu, lien ou fichier illisible est **refusé** (code 2), jamais sauté |
-| `staged` (`--staged`) | le contenu **indexé** de chaque fichier ajouté ou modifié | **aucune exclusion de chemin** : `vendor/`, `third_party/`, `package-lock.json`, `.gitignore`… sont analysés ; un binaire connu est **refusé** (code 2), jamais sauté |
-| `diff` (`--ci --diff REF`) | les blobs **ajoutés ou modifiés** entre `merge-base(REF, HEAD)` et `HEAD` (trois points) | **aucune exclusion de chemin** ; suppressions et gitlinks ignorés (aucun blob à scanner), binaire connu **refusé** (code 2) |
+| `working-tree` (défaut) | l'arbre de travail, avec exclusions de contenu tracées | base VCS et entrées non suivies ignorées par `.gitignore`. Les fichiers suivis sont examinés même s'ils correspondent à un motif Git ; binaires, liens et contenus hors borne sont tracés ou refusés avec `--strict`. Les erreurs de lecture restent en code 2. |
+| `staged` (`--staged`) | le contenu indexé de chaque fichier ajouté ou modifié | aucune exclusion de chemin ; exclusions de contenu tracées ou refusées avec `--strict` |
+| `diff` (`--ci --diff REF`) | les blobs ajoutés ou modifiés entre `merge-base(REF, HEAD)` et `HEAD` | aucune exclusion de chemin ; suppressions et gitlinks ignorés ; exclusions de contenu tracées ou refusées avec `--strict` |
 
-« Aucune exclusion de **chemin** » ne veut pas dire « aucune exclusion du
-tout » : un contenu dont la signature magique **et** la majorité sont
-binaires (PNG, PDF, ZIP, ELF…) n'a pas de texte à analyser. Dans **les trois
-périmètres**, ce contenu est **refusé** (`ScanError`), ce qui rend le verdict
-propre impossible (code 2) : un secret placé dans un commentaire PNG ou une
-archive ne devient jamais un faux négatif silencieux. Un contenu inconnu
-(NUL + texte) reste fail-closed de la même façon : jamais sauté sur simple
-suffixe.
+« Aucune exclusion de chemin » n'implique pas une analyse des binaires ou
+des portions hors borne. Dans les trois périmètres, ces exclusions ont une
+trace explicite et rendent le rapport partiel ; `--strict` les refuse en
+code 2. Un contenu inconnu n'est jamais ignoré sur son simple suffixe.
 
-Le mode strict est une correction issue de la revue de #165 (point HIGH) :
+L'absence d'exclusions nominales est issue de la revue de #165 (point HIGH) :
 la politique #59 excluait `vendor/`, `node_modules/` et les lockfiles, donc un
 secret posé dans `vendor/evil.py` n'était **jamais** signalé. Un secret y est
 un secret : aucun nom de fichier ou de répertoire de contenu n'exclut plus rien,
@@ -321,6 +325,9 @@ change. Le JSON garde le chemin exact.
 
 ```json
 {
+  "complete": true,
+  "skipped_count": 0,
+  "skipped": [],
   "count": 1,
   "findings": [
     {
@@ -345,18 +352,20 @@ change. Le JSON garde le chemin exact.
 
 Le document porte le périmètre (`scope`), le nombre de Findings (`count`) et
 les Findings eux-mêmes, avec **exactement les sept champs** du contrat
-Finding v1 (#14). Il porte aussi les décomptes d'allowlist (#24),
-`vcs_ignored` (bases VCS élaguées par le mode arbre) et `git_ignored`
-(entrées non suivies ignorées par un `.gitignore` du dépôt). Les deux
-compteurs valent toujours 0 en `--staged` et `--diff` ; `git_ignored` vaut aussi 0 avec
-`--no-gitignore`. En mode `--diff`, `scope` vaut `"diff"`. Il n'y a rien
-d'autre : pas de valeur de secret, pas de champ libre, pas d'extrait de ligne.
+Finding v1 (#14). Il porte aussi `complete`, `skipped_count` et `skipped`
+(couverture de l'analyse), les décomptes d'allowlist (#24), `vcs_ignored`
+(bases VCS élaguées par le mode arbre) et `git_ignored` (entrées non suivies
+ignorées par un `.gitignore` du dépôt). Les deux compteurs valent toujours 0
+en `--staged` et `--diff` ; `git_ignored` vaut aussi 0 avec `--no-gitignore`.
+En mode `--diff`, `scope` vaut `"diff"`. Il n'y a rien d'autre : pas de valeur
+de secret, pas de champ libre, pas d'extrait de ligne.
 
 Le contrat machine est figé par [`schemas/scan.schema.json`](../schemas/scan.schema.json)
 (draft 2020-12) : objet fermé (`additionalProperties: false`), `schema` en
-constante `heimdall.scan.v1`, `scope` en enum, `count` entier ≥ 0, et chaque
-élément de `findings` validé contre le contrat Finding v1 par `$ref` (sans
-duplication : toute dérive du Finding casse la validation). Les deux `$id`
+constante `heimdall.scan.v1`, `scope` en enum, `count` entier ≥ 0, `complete`
+requis, et chaque élément de `findings` validé contre le contrat Finding v1
+par `$ref` (sans duplication : toute dérive du Finding casse la validation).
+Un document `complete: false` sans `skipped` non vide est invalide. Les deux `$id`
 sont alignés sur la même base (`https://github.com/Cezar277/heimdall/schemas/`),
 donc le `$ref` relatif se résout sans registre câblé, depuis le filesystem.
 La cohérence `count == len(findings)`, inexprimable en JSON Schema pur, est
@@ -401,18 +410,11 @@ document si `count != len(findings)` (contrainte explicitée dans la
 
 ## Limites connues (honnêtes)
 
-- Le contenu **binaire** n'est pas analysé : un secret placé dans un
-  commentaire PNG ou une archive n'est pas détecté. Dans **les trois
-  périmètres**, un binaire du périmètre est **refusé** (`ScanError`) et la
-  CLI sort en **2** (verdict propre impossible) : il n'existe plus de `0`
-  propre pour un contenu binaire non analysable. C'est une impossibilité
-  technique documentée, pas une exclusion de chemin. En mode arbre, une
-  entrée **non suivie et ignorée** par Git est écartée avant lecture et
-  comptée dans `git_ignored` : elle ne peut pas être commitée sans devenir
-  suivie, donc sans être scannée. Les répertoires et fichiers textuels de
-  `node_modules/`, `vendor/`, `.venv/`, `build/`, `dist/`, `target/` ou
-  `htmlcov/` sont, eux, scannés dans les trois périmètres dès qu'ils sont
-  suivis ou non ignorés.
+- Le contenu binaire n'est pas analysé : il est signalé comme exclusion
+  dans un rapport partiel, ou refusé avec `--strict`. Les noms de fichiers
+  ne cachent pas de contenu textuel ; les fichiers suivis et les textes
+  non ignorés restent analysés. Un contenu écarté interdit le code 0 :
+  le verdict vaut 1 avec finding, 2 sinon.
 - La fenêtre multi-ligne reste bornée à 4 Kio : un secret coupé par un
   retour à la ligne au-delà de cette borne n'est pas recherché.
 - Le mode `--staged` analyse l'**index**, pas l'historique : un secret déjà
