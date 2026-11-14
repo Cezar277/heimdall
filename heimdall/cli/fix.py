@@ -134,6 +134,22 @@ def _existing_env_names(root: Path) -> set[str]:
     return taken
 
 
+def _checked_root_identity(root: Path, resolved_root: Path) -> tuple[int, int, int]:
+    """Relit l'identité sans accepter une redirection ou une racine disparue."""
+    try:
+        if root.is_symlink() or root.resolve() != resolved_root:
+            raise ScanError("racine modifiée depuis le scan")
+        current = os.stat(resolved_root, follow_symlinks=False)
+    except (OSError, RuntimeError):
+        raise ScanError("racine modifiée depuis le scan") from None
+    return current.st_dev, current.st_ino, current.st_ctime_ns
+
+
+def _verify_root_identity(root: Path, resolved_root: Path, expected: tuple[int, int, int]) -> None:
+    if _checked_root_identity(root, resolved_root) != expected:
+        raise ScanError("racine modifiée depuis le scan")
+
+
 def run_fix(  # noqa: PLR0913, PLR0915
     root: Path,
     *,
@@ -210,13 +226,12 @@ def run_fix(  # noqa: PLR0913, PLR0915
         proposals.append(proposal)
 
     def _apply(proposal: Proposal) -> None:
-        if root.is_symlink() or root.resolve() != resolved_root:
-            raise ApplyError
+        nonlocal root_id
         try:
-            current_stat = os.stat(resolved_root)
-        except OSError:
+            current_id = _checked_root_identity(root, resolved_root)
+        except ScanError:
             raise ApplyError from None
-        if (current_stat.st_dev, current_stat.st_ino, current_stat.st_ctime_ns) != root_id:
+        if current_id != root_id:
             raise ApplyError
         entry = plans_by_finding.get(proposal.finding)
         if entry is None:
@@ -225,6 +240,15 @@ def run_fix(  # noqa: PLR0913, PLR0915
         receipt = apply_replacement(resolved_root, plan, cleanup_backup=False)
         remediate_environment(resolved_root, {plan.variable: secret_value})
         cleanup_backup_file(resolved_root, receipt)
+        try:
+            current_id = _checked_root_identity(root, resolved_root)
+        except ScanError:
+            raise ApplyError from None
+        if current_id[:2] != root_id[:2]:
+            raise ApplyError
+        # Nos écritures atomiques changent le ctime du dossier. Rafraîchir
+        # seulement après contrôle dev/ino ; ne jamais adopter un autre dossier.
+        root_id = current_id
 
     report = review_proposals(
         proposals,
@@ -236,6 +260,7 @@ def run_fix(  # noqa: PLR0913, PLR0915
         apply=_apply,
     )
     if any(outcome.applied for outcome in report.outcomes):
+        _verify_root_identity(root, resolved_root, root_id)
         post_scan = collect(
             resolved_root,
             staged=False,
@@ -244,6 +269,7 @@ def run_fix(  # noqa: PLR0913, PLR0915
             ci=ci,
             respect_gitignore=not no_gitignore,
         )
+        _verify_root_identity(root, resolved_root, root_id)
         remaining = len(post_scan.findings)
     else:
         remaining = unfixable + sum(1 for outcome in report.outcomes if not outcome.applied)

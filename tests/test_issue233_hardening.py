@@ -23,6 +23,7 @@ from heimdall.cli.fix import (
 )
 from heimdall.cli.main import app
 from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
+from heimdall.cli.scan import collect
 from heimdall.cli.vault_client import _pull_secrets_from_vault, vault_pull
 from heimdall.remediation.apply import (
     AppliedPatch,
@@ -553,6 +554,81 @@ def test_m09_fix_rejects_replaced_root_inode(tmp_path: Path) -> None:
         res = runner.invoke(app, ["fix", str(repo)])
     assert res.exit_code == 2
     assert _FAKE_SECRET in (repo / "app.py").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("cli", [False, True])
+@pytest.mark.parametrize("moment", ["before_rescan", "during_rescan"])
+def test_fix_refuses_replaced_root_after_apply(tmp_path: Path, cli: bool, moment: str) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)  # noqa: S603, S607
+    (repo / "app.py").write_text(f'API_KEY = "{_FAKE_SECRET}"\n', encoding="utf-8")
+    (repo / "unfixable.py").write_text(f'KEY = "{_FAKE_SECRET}"; OTHER = "x"\n', encoding="utf-8")
+    original_repo = tmp_path / "original"
+    (repo / ".gitignore").write_text("*.bak\n", encoding="utf-8")
+
+    def swap_root() -> None:
+        before = repo.stat()
+        repo.rename(original_repo)
+        repo.mkdir()
+        assert repo.stat().st_ino != before.st_ino
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)  # noqa: S603, S607
+
+    def review(proposals, *, apply, **kwargs):
+        outcomes = []
+        for proposal in proposals:
+            apply(proposal)
+            outcomes.append(ReviewOutcome(Choice.VALIDATE, True, 0, proposal))
+        assert outcomes
+        if moment == "before_rescan":
+            swap_root()
+        return ReviewReport(tuple(outcomes), True)
+
+    calls = 0
+
+    def scan(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            assert moment == "during_rescan"
+            swap_root()
+        return collect(*args, **kwargs)
+
+    with (
+        patch("heimdall.cli.fix.review_proposals", side_effect=review),
+        patch("heimdall.cli.fix.collect", side_effect=scan),
+    ):
+        if cli:
+            result = CliRunner().invoke(app, ["fix", str(repo), "--json"])
+            assert result.exit_code == 2
+            assert result.stdout == ""
+            assert result.stderr == "heimdall fix : remédiation impossible (erreur d'outillage).\n"
+        else:
+            with pytest.raises(ScanError, match="^racine modifiée depuis le scan$"):
+                run_fix(repo, interactive=True)
+    assert calls == (1 if moment == "before_rescan" else 2)
+    assert _FAKE_SECRET in (original_repo / "unfixable.py").read_text(encoding="utf-8")
+    assert not (repo / "app.py").exists()
+
+
+def test_fix_multiple_patches_refresh_only_own_root_ctime(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S603, S607
+    (tmp_path / ".gitignore").write_text("*.bak\n", encoding="utf-8")
+    for name, variable in (("first.py", "FIRST_KEY"), ("second.py", "SECOND_KEY")):
+        (tmp_path / name).write_text(f'{variable} = "{_FAKE_SECRET}"\n', encoding="utf-8")
+
+    def review(proposals, *, apply, **kwargs):
+        outcomes = []
+        for proposal in proposals:
+            apply(proposal)
+            outcomes.append(ReviewOutcome(Choice.VALIDATE, True, 0, proposal))
+        return ReviewReport(tuple(outcomes), True)
+
+    with patch("heimdall.cli.fix.review_proposals", side_effect=review):
+        report, remaining = run_fix(tmp_path, interactive=True)
+    assert len(report.outcomes) == 2
+    assert all(outcome.applied for outcome in report.outcomes)
+    assert remaining == 0
 
 
 def test_f10_cleanup_backup_file_rejects_symlink_target(tmp_path: Path) -> None:
