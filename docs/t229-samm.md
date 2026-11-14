@@ -1,6 +1,6 @@
 # T229 — Preuves du correctif fail-closed après revue
 
-Ticket #229, audit E-01. Révision de code actuelle : `c7218134b87e1ac5cc8cc652ae9b064dfb84694e`.
+Ticket #229, audit E-01. Révision de code actuelle : `09364abeab80ab47259be64d55246708ab03118d`.
 Base de la branche : `6bbe7da` (intégration de #228 / #240).
 Les premiers permaliens ci-dessous conservent le SHA du correctif critique
 `aba5eb3`. Les durcissements complémentaires sont épinglés séparément sur
@@ -81,6 +81,14 @@ Révision : `c7218134b87e1ac5cc8cc652ae9b064dfb84694e`.
 - [`policy.py:70`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/heimdall/scanner/policy.py#L70) convertit les erreurs de validation des traces de `prepare_text` en `ScanError` statique, comme `skip_file`. Les trois cas de [`test_scanner_fail_closed.py:427`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/tests/test_scanner_fail_closed.py#L427) couvrent un chemin `../evil` pour `long_token`, `multiline_limit` et `skip_file`, sans fuite de `ValueError` ni trace partiellement ajoutée.
 - [`history.py:239`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/heimdall/cli/history.py#L239) conserve `(reason, line)` dans le cache ; [:265](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/heimdall/cli/history.py#L265) rattache ces traces au chemin et commit courants, et [:311](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/heimdall/cli/history.py#L311) les rend avec `line` en JSON. Le témoin [`test_history.py:30`](https://github.com/Cezar277/heimdall/blob/c7218134b87e1ac5cc8cc652ae9b064dfb84694e/tests/test_history.py#L30) vérifie les lignes du jeton long et de la jointure, la réutilisation du blob renommé, les deux rendus et `bytes_scanned` compté une fois pour le blob lu. Les budgets annoncés restent distincts des octets effectivement lus. Le quatrième élément des tuples `HistoryReport.skipped` est documenté dans la [politique de tolérance](scanner-tolerance.md).
 
+## Compteurs de volume historique et remarques déjà couvertes
+
+Révision : `09364abeab80ab47259be64d55246708ab03118d`.
+
+- [`history.py:55`](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/heimdall/cli/history.py#L55) ajoute `bytes_budgeted`, alimenté par le volume annoncé imputé à `MAX_READ_BYTES`, exclusions comprises, sur chaque défaut de cache. Le [JSON](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/heimdall/cli/history.py#L320) et le [texte](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/heimdall/cli/history.py#L329) exposent ce compteur à côté de `bytes_scanned`, qui reste les octets réellement lus. Le témoin [`test_scanner_fail_closed.py:252`](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/tests/test_scanner_fail_closed.py#L252) vérifie deux blobs exclus sans lecture, le refus au plafond 150 puis le rapport à 5 octets lus / 205 imputés sous un plafond supérieur, dans l'API et les deux rendus.
+- Le point de revue `scanned_files` était déjà corrigé : [:859](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/heimdall/cli/scan.py#L859) et [:940](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/heimdall/cli/scan.py#L940) soustraient tous les chemins de `skipped`, sans filtre par motif. Le témoin [:420](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/tests/test_scanner_fail_closed.py#L420) couvre désormais quatre cas : staged/diff et `long_token` seul / accompagné de `multiline_limit` ; le fichier partiel est déduit une seule fois dans tous les cas.
+- La [politique de tolérance](scanner-tolerance.md) documente déjà explicitement l'intérieur non analysé des jetons trop longs, même avec un secret concaténé, et le refus strict. Les témoins de charge `long_token` restent présents sur les quatre périmètres, avec code 2 et trace, jamais de verdict propre. Aucune détection par fenêtre glissante n'est revendiquée.
+
 ## Validation
 
 Le correctif critique avait été validé par **3925 tests**, 18 ignorés et
@@ -127,7 +135,15 @@ en **364,65 s**. Les 14 avertissements existants concernent les sauvegardes
 de remédiation. Ruff, MyPy (57 fichiers) et Bandit passent (avertissements
 de lecture `nosec` existants, aucune alerte de sécurité). Aucun code ni test
 n'a changé après ce rejeu ; seuls les documents de preuve ont été actualisés.
-Rapport JUnit final : `/home/nathan/heimdall-t229-reread-lines-final.xml`.
+Rapport JUnit de `c721813` : `/home/nathan/heimdall-t229-reread-lines-final.xml`.
+
+Dernière révision `09364ab` : **189 tests ciblés en 8,18 s**, puis suite
+complète après le commit de code : **3972 tests, 6911 sous-tests, 18 ignorés**,
+en **380,67 s**. Les 14 avertissements existants concernent les sauvegardes
+de remédiation. Ruff, MyPy (57 fichiers) et Bandit passent (avertissements
+de lecture `nosec` existants, aucune alerte de sécurité). Aucun code ni test
+n'a changé après ce rejeu ; seuls les documents de preuve ont été actualisés.
+Rapport JUnit final : `/home/nathan/heimdall-t229-history-volume-final.xml`.
 
 Environnement : Debian WSL, Python 3.13, dépendances de l'environnement
 existant. La CI aux versions verrouillées n'a pas été déclenchée.
