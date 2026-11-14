@@ -74,12 +74,21 @@ class EarlyRejectionTests(unittest.TestCase):
         )
         key = generate_api_key()
         target.state.register_api_key(key, "demo")
-        if rejection in ("peer", "global"):
+        key_header = f"X-Heimdall-API-Key: {key}\r\n"
+        if rejection == "peer":
+            # Budget anonyme : la requête ne porte pas de clé.
             target.state.rate_limiter.check("127.0.0.1")
+            key_header = ""
+        elif rejection == "global":
+            # Budget global authentifié : consommer clé + global.
+            target.state.rate_limiter.check_authenticated(
+                "127.0.0.1", hash_api_key(key, pepper="p" * 32)
+            )
         elif rejection == "key":
             target.state.rate_limiter.check_key(hash_api_key(key, pepper="p" * 32))
         elif rejection == "header":
             key = "A" * 513
+            key_header = f"X-Heimdall-API-Key: {key}\r\n"
 
         async def app(scope: Scope, receive: Receive, send: Send) -> None:
             if scope["path"] == "/api/v1/secrets":
@@ -101,7 +110,7 @@ class EarlyRejectionTests(unittest.TestCase):
             request = (
                 (
                     "POST /api/v1/secrets HTTP/1.1\r\nHost: localhost\r\n"
-                    f"X-Heimdall-API-Key: {key}\r\nContent-Length: {len(body)}\r\n"
+                    f"{key_header}Content-Length: {len(body)}\r\n"
                     "Connection: keep-alive\r\n\r\n"
                 ).encode()
                 + body

@@ -723,6 +723,16 @@ class VaultSettings(BaseSettings):
             "dédiée dérivée de la KEK est utilisée. Jamais renvoyée au client ni journalisée."
         ),
     )
+    audit_hmac_key: str | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,  # jamais dans model_dump()/model_dump_json()
+        description=(
+            "Clé HMAC dédiée au chaînage du journal d'audit (audit F-16). "
+            "Configurable via HEIMDALL_VAULT_AUDIT_HMAC_KEY. Si absente, une sous-clé "
+            "HKDF du chiffreur est utilisée. Jamais renvoyée au client ni journalisée."
+        ),
+    )
     storage_backend: Literal["memory", "sqlite"] | None = Field(
         default=None,
         description=(
@@ -1015,6 +1025,15 @@ class VaultSettings(BaseSettings):
         validate_server_hmac_key(value)
         return value
 
+    @field_validator("audit_hmac_key")
+    @classmethod
+    def validate_audit_hmac_key(cls, value: str | None) -> str | None:
+        """Valide la clé HMAC d'audit avec les mêmes contrôles que la clé serveur."""
+        if value is None:
+            return None
+        validate_server_hmac_key(value)
+        return value
+
     @model_validator(mode="after")
     def validate_server_hmac_key_distinct(self) -> "VaultSettings":
         """La clé HMAC serveur doit être distincte de la KEK, clé maîtresse et pepper."""
@@ -1037,6 +1056,24 @@ class VaultSettings(BaseSettings):
             raise ValueError(
                 "Le pepper d'authentification et la clé HMAC serveur doivent être distincts."
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_audit_hmac_key_distinct(self) -> "VaultSettings":
+        """La clé HMAC d'audit doit être distincte des autres secrets serveur."""
+        audit_k = self.audit_hmac_key
+        if audit_k is None:
+            return self
+        for label, other in (
+            ("clé maîtresse", self.master_key),
+            ("KEK", self.kek),
+            ("pepper", self.api_key_pepper),
+            ("clé HMAC serveur", self.server_hmac_key),
+        ):
+            if other is not None and server_hmac_key_matches_master_key(other, audit_k):
+                raise ValueError(
+                    f"La clé HMAC d'audit et la {label} doivent être distinctes (invariant 5)."
+                )
         return self
 
     @field_validator("db_path")
@@ -1289,6 +1326,15 @@ async def _limiter_peek(limiter: RateLimiter | SqliteRateLimiter, peer: str) -> 
     return limiter.peek(peer)
 
 
+async def _limiter_peek_authenticated(
+    limiter: RateLimiter | SqliteRateLimiter,
+) -> tuple[bool, int]:
+    """Lecture seule du budget global authentifié, avant tout hachage."""
+    if isinstance(limiter, SqliteRateLimiter):
+        return await asyncio.to_thread(limiter.peek_authenticated)
+    return limiter.peek_authenticated()
+
+
 async def _limiter_consume_peer(
     limiter: RateLimiter | SqliteRateLimiter, peer: str
 ) -> tuple[bool, int]:
@@ -1451,6 +1497,16 @@ def _register_middleware(app: FastAPI) -> None:
                 headers={"Connection": "close"},
             )
         else:
+            # Rejet précoce sur le budget global authentifié, avant le hachage
+            # et le parcours d'empreintes. Le budget par clé, lui, exige
+            # l'empreinte et reste vérifié après résolution.
+            allowed, retry_after = await _limiter_peek_authenticated(limiter)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content=_ERROR_PAYLOADS[429],
+                    headers={"Retry-After": str(retry_after), "Connection": "close"},
+                )
             key_hash = await _resolve_request_key_hash(request)
             if key_hash is not None:
                 allowed, retry_after = await _limiter_consume_authenticated(
@@ -1993,10 +2049,17 @@ def create_app(
     # Journal d'audit (ticket #113) : SQLite en mode persistant (partagé entre
     # workers), mémoire pour le backend de développement/test. Le chemin est
     # celui du store effectif, aligné sur l'authentification et le débit.
+    audit_hmac_key = (
+        validate_server_hmac_key(effective_settings.audit_hmac_key)
+        if effective_settings.audit_hmac_key is not None
+        else app.state.secret_store.cipher.audit_hmac_key()
+    )
     if app.state.storage_backend == "sqlite":
-        app.state.audit_log = SqliteAuditLog(app.state.db_path)
+        app.state.audit_log = SqliteAuditLog(
+            app.state.db_path, hmac_key=audit_hmac_key
+        )
     else:
-        app.state.audit_log = InMemoryAuditLog()
+        app.state.audit_log = InMemoryAuditLog(hmac_key=audit_hmac_key)
 
     if api_key_hashes is not None and api_keys is not None:
         raise ValueError("Spécifiez 'api_key_hashes' ou 'api_keys', pas les deux simultanément.")

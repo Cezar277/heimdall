@@ -29,6 +29,7 @@ from heimdall.vault.crypto import (
     VaultCipherError,
     generate_dek,
     generate_kek_salt,
+    generate_server_hmac_key,
 )
 from heimdall.vault.database import (
     _SCHEMA_MIGRATION_HINT,
@@ -1137,6 +1138,27 @@ class VaultRotateCliTests(unittest.TestCase):
         assert rec is not None
         self.assertEqual(rec["value"], "super_secret_value")
 
+    def test_cli_rotate_writes_an_audit_event(self) -> None:
+        """Audit M-07 : la rotation réussie est journalisée dans l'audit."""
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 0, res.output)
+        with db_session(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT action, status_code, target FROM audit_events "
+                "WHERE action = 'VAULT KEK ROTATE'"
+            ).fetchone()
+        assert row is not None
+        self.assertEqual(row["status_code"], 200)
+        self.assertTrue(str(row["target"]).startswith("kek_version="))
+
     def test_cli_rotate_with_argon2id_derivation_env_vars(self) -> None:
         """Rotation via Argon2id avec clés et sels passés par l'environnement."""
         old_salt = generate_kek_salt()
@@ -1350,6 +1372,78 @@ class VaultRotateCliTests(unittest.TestCase):
         )
         self.assertEqual(res.exit_code, 1)
         self.assertIn("échec du déchiffrement avec l'ancienne KEK", res.output)
+
+    def test_cli_rotate_with_server_hmac_key_keeps_canary(self) -> None:
+        """Audit M-07 : la clé HMAC serveur est chargée et le canari reste valide."""
+        server_hmac_key = generate_server_hmac_key()
+        db_path = Path(self.tmp.name) / "vault_hmac.db"
+        init_db(db_path)
+        old_cipher = VaultCipher(_OLD_KEK_BYTES, server_hmac_key=server_hmac_key)
+        store = SqliteSecretStore(db_path, old_cipher)
+        store._create("demo", "dev", "API_KEY", "super_secret_value")
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+            "HEIMDALL_VAULT_SERVER_HMAC_KEY": server_hmac_key,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(db_path)],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 0, res.output)
+        new_cipher = VaultCipher(_NEW_KEK_BYTES, server_hmac_key=server_hmac_key)
+        store_new = SqliteSecretStore(db_path, new_cipher)
+        rec = store_new._get("demo", "dev", "API_KEY")
+        assert rec is not None
+        self.assertEqual(rec["value"], "super_secret_value")
+
+    def test_cli_rotate_without_server_hmac_key_distinguishes_canary_error(self) -> None:
+        """Audit M-07 : l'absence de clé HMAC ne devient pas « ancienne KEK invalide »."""
+        server_hmac_key = generate_server_hmac_key()
+        db_path = Path(self.tmp.name) / "vault_hmac_missing.db"
+        init_db(db_path)
+        old_cipher = VaultCipher(_OLD_KEK_BYTES, server_hmac_key=server_hmac_key)
+        store = SqliteSecretStore(db_path, old_cipher)
+        store._create("demo", "dev", "API_KEY", "super_secret_value")
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(db_path)],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 1)
+        self.assertIn("mode dérivé", res.output)
+        self.assertNotIn("échec du déchiffrement avec l'ancienne KEK", res.output)
+
+    def test_cli_rotate_refuses_hot_server_without_force(self) -> None:
+        """Audit M-07 : rotation à chaud refusée, --force explicite l'autorise."""
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+        }
+        with unittest.mock.patch(
+            "heimdall.cli.vault_keys._vault_server_is_listening", return_value=True
+        ):
+            refused = self.runner.invoke(
+                cli_app,
+                ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+                env=env,
+            )
+        self.assertEqual(refused.exit_code, 2)
+        self.assertIn("serveur Vault", refused.output)
+        with unittest.mock.patch(
+            "heimdall.cli.vault_keys._vault_server_is_listening", return_value=True
+        ):
+            forced = self.runner.invoke(
+                cli_app,
+                ["vault", "rotate-kek", "--db-path", str(self.db_path), "--force"],
+                env=env,
+            )
+        self.assertEqual(forced.exit_code, 0, forced.output)
 
     def test_cli_alias_kek_rotate_works_and_rotate_removed(self) -> None:
         """L'alias `kek-rotate` fonctionne et l'alias trop générique `rotate` est supprimé."""

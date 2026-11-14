@@ -242,10 +242,16 @@ _MIN_MASTER_KEY_SHANNON_ENTROPY: float = 3.0
 # label rompt la vérification d'empreintes existantes ; c'est un dérivé
 # auxiliaire, jamais une donnée de référence (rotation documentée sur la classe).
 _FINGERPRINT_HKDF_INFO: bytes = b"heimdall-vault-fingerprint-v1"
+# Label de domaine dédié au chaînage HMAC du journal d'audit (audit F-16).
+_AUDIT_HKDF_INFO: bytes = b"heimdall-vault-audit-hmac-v1"
 
 
 class VaultCipherError(ValueError):
     """Erreur de chiffrement/déchiffrement sans détail sensible."""
+
+
+class KekHmacContinuityError(VaultCipherError):
+    """La clé HMAC serveur ne permet pas la continuité de la rotation de KEK."""
 
 
 class SecretEnvelope(NamedTuple):
@@ -1060,6 +1066,15 @@ class VaultCipher:
                 info=_FINGERPRINT_HKDF_INFO,
             ).derive(self._key)
             self._has_explicit_server_hmac_key = False
+        # Sous-clé dédiée au journal d'audit, distincte de la KEK et de la clé
+        # d'empreinte. Dérivée de la clé d'empreinte : stable à travers une
+        # rotation de KEK lorsque la clé HMAC serveur est explicite.
+        self._audit_hmac_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=_KEY_SIZE_BYTES,
+            salt=None,
+            info=_AUDIT_HKDF_INFO,
+        ).derive(self._fingerprint_key)
 
     def __repr__(self) -> str:
         return "VaultCipher(<REDACTED>)"
@@ -1068,6 +1083,10 @@ class VaultCipher:
     def has_explicit_server_hmac_key(self) -> bool:
         """Indique si la clé HMAC serveur est explicite (non dérivée de la KEK)."""
         return self._has_explicit_server_hmac_key
+
+    def audit_hmac_key(self) -> bytes:
+        """Sous-clé HMAC dédiée au chaînage du journal d'audit (audit F-16)."""
+        return self._audit_hmac_key
 
     def key_reuses_server_hmac_key(self, server_hmac_key: str | bytes | bytearray) -> bool:
         """Détecte si la KEK de ce chiffreur réutilise l'entropie de la clé HMAC serveur.

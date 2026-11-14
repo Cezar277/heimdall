@@ -7,6 +7,8 @@ from collections.abc import Iterator
 
 import pytest
 
+from heimdall.vault.crypto import generate_server_hmac_key
+
 
 @pytest.fixture(autouse=True)
 def _heimdall_env_test(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -16,6 +18,9 @@ def _heimdall_env_test(monkeypatch: pytest.MonkeyPatch) -> None:
     tests qui veulent tester ce défaut suppriment la variable explicitement.
     """
     monkeypatch.setenv("HEIMDALL_ENV", "test")
+    # Clé HMAC dédiée au journal d'audit (audit F-16) : partagée par l'app et
+    # la CLI dans un même run de tests.
+    monkeypatch.setenv("HEIMDALL_VAULT_AUDIT_HMAC_KEY", generate_server_hmac_key())
 
 
 @pytest.fixture(autouse=True)

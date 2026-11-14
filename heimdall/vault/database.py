@@ -247,6 +247,7 @@ CREATE TABLE IF NOT EXISTS server_hmac_canary (
 -- complète : uniquement des métadonnées publiques et une empreinte tronquée.
 CREATE TABLE IF NOT EXISTS audit_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stream TEXT NOT NULL DEFAULT 'access',
     occurred_at TEXT NOT NULL,
     key_id TEXT,
     key_fingerprint TEXT,
@@ -261,11 +262,19 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_events_occurred_at
     ON audit_events(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_audit_events_stream_id
+    ON audit_events(stream, id);
 
 -- Point de contrôle de chaîne après purge de rétention (ticket #113).
 -- Le premier événement retenu pointe sur `checkpoint_hash` ; la vérification
 -- reprend donc à ce point sans charger tout l'historique.
 CREATE TABLE IF NOT EXISTS audit_chain_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    checkpoint_hash TEXT NOT NULL,
+    pruned_events INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_rejection_chain_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     checkpoint_hash TEXT NOT NULL,
     pruned_events INTEGER NOT NULL DEFAULT 0,
@@ -896,6 +905,7 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
         "rate_limit_hits",
         "audit_events",
         "audit_chain_state",
+        "audit_rejection_chain_state",
     }
     if not required_tables.issubset(tables):
         raise RuntimeError("Schéma de base de données non conforme : tables manquantes.")
@@ -1826,7 +1836,7 @@ def _check_rotate_kek_hmac_continuity(
     new_cipher: "VaultCipher",
 ) -> None:
     """Vérifie la continuité de clé HMAC serveur lors de rotate_secrets_kek (ticket #116)."""
-    from heimdall.vault.crypto import VaultCipherError  # noqa: PLC0415
+    from heimdall.vault.crypto import KekHmacContinuityError  # noqa: PLC0415
 
     cursor = conn.execute("SELECT 1 FROM secrets LIMIT 1")
     has_secrets = cursor.fetchone() is not None
@@ -1840,20 +1850,20 @@ def _check_rotate_kek_hmac_continuity(
         # contrôle reste immédiat même base vide, sans différer l'échec au
         # prochain create (revue LOW #116).
         if not new_cipher.has_explicit_server_hmac_key:
-            raise VaultCipherError(
+            raise KekHmacContinuityError(
                 "La rotation de KEK vers un chiffreur en mode dérivé "
                 "est interdite sur une base contenant des secrets sous clé "
                 "explicite (refus fail-closed). Une migration des "
                 "empreintes est requise."
             )
         if not hmac.compare_digest(persisted_canary, new_cipher.server_hmac_key_canary()):
-            raise VaultCipherError(
+            raise KekHmacContinuityError(
                 "La clé HMAC serveur du nouveau chiffreur diffère de la clé "
                 "enregistrée en base (refus fail-closed immédiat). "
                 "Une migration des empreintes est requise."
             )
     elif new_cipher.has_explicit_server_hmac_key:
-        raise VaultCipherError(
+        raise KekHmacContinuityError(
             "La base de données contient des secrets créés en mode dérivé. "
             "La rotation vers un chiffreur avec clé HMAC explicite "
             "nécessite une migration des empreintes."
@@ -2101,11 +2111,21 @@ def transition_secret(  # noqa: PLR0913
             )
 
         timestamp = get_iso_timestamp()
-        cursor = conn.execute(
-            "UPDATE secrets SET status = ?, updated_at = ? "
-            "WHERE project_id = ? AND env = ? AND name = ? AND status = ?",
-            (target, timestamp, project_id, env, name, previous),
-        )
+        if target == "rote":
+            # Efface la valeur et la DEK : un retour en base à ``vaulte`` ne
+            # peut pas ressusciter l'ancien secret (audit F-03).
+            cursor = conn.execute(
+                "UPDATE secrets SET status = ?, updated_at = ?, "
+                "encrypted_value = '', encrypted_dek = NULL "
+                "WHERE project_id = ? AND env = ? AND name = ? AND status = ?",
+                (target, timestamp, project_id, env, name, previous),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE secrets SET status = ?, updated_at = ? "
+                "WHERE project_id = ? AND env = ? AND name = ? AND status = ?",
+                (target, timestamp, project_id, env, name, previous),
+            )
         if cursor.rowcount != 1:
             raise TransitionConcurrencyError("Concurrence détectée sur la transition d'état.")
 

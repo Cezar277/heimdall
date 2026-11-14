@@ -238,6 +238,19 @@ class RateLimiter:
                     return False, _retry_after(oldest, now, self._window_seconds)
             return True, 0
 
+    def peek_authenticated(self) -> tuple[bool, int]:
+        """Contrôle sans consommation le budget global authentifié (rejet précoce)."""
+        with self._lock:
+            now = self._clock()
+            bucket = self._buckets.get("global")
+            if bucket is None:
+                return True, 0
+            self._prune_bucket(bucket, now)
+            if bucket.count >= self._global_limit:
+                oldest = bucket.hits[0] if bucket.hits else now
+                return False, _retry_after(oldest, now, self._window_seconds)
+            return True, 0
+
     def check_authenticated(self, peer: str, key_hash: str) -> tuple[bool, int]:
         """Consomme pair/global + clé en une seule section critique.
 
@@ -424,6 +437,23 @@ class SqliteRateLimiter:
                         now,
                         self._window_seconds,
                     )
+            return True, 0
+
+    def peek_authenticated(self) -> tuple[bool, int]:
+        """Contrôle sans consommation le budget global authentifié (rejet précoce)."""
+        with db_session(self._db_path) as conn:
+            now = self._clock()
+            cutoff = now - self._window_seconds
+            count = self._count(conn, "global", cutoff)
+            if count >= self._global_limit:
+                oldest = self._oldest(conn, "global", cutoff)
+                if oldest is not None and oldest > now:
+                    oldest = now
+                return False, _retry_after(
+                    oldest if oldest is not None else now,
+                    now,
+                    self._window_seconds,
+                )
             return True, 0
 
     def check_authenticated(self, peer: str, key_hash: str) -> tuple[bool, int]:

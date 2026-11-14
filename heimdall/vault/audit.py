@@ -28,6 +28,7 @@ DÉFENSES ET INVARIANTS
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import threading
@@ -56,6 +57,12 @@ DEFAULT_LIST_LIMIT: Final[int] = 50
 # point de contrôle de chaîne est conservé. La valeur est volontairement
 # généreuse ; les tests la réduisent par patch pour vérifier la purge.
 MAX_AUDIT_EVENTS: Final[int] = 100_000
+# Les rejets 401/429 ont leur propre flux et leur propre rétention : une
+# inondation de rejets ne peut jamais purger les accès authentifiés (audit M-03).
+MAX_REJECTION_EVENTS: Final[int] = 10_000
+_AUDIT_STREAM_ACCESS: Final[str] = "access"
+_AUDIT_STREAM_REJECTION: Final[str] = "rejection"
+_REJECTION_STATUS_CODES: Final[frozenset[int]] = frozenset({401, 429})
 # Purge par lots : chaque transaction ne supprime qu'un lot borné, pour ne pas
 # tenir le verrou d'écriture SQLite pendant une purge massive (excess >> 1).
 _PRUNE_BATCH_SIZE: Final[int] = 1_000
@@ -63,6 +70,7 @@ _PRUNE_BATCH_SIZE: Final[int] = 1_000
 _AUDIT_TABLE_SQL: Final[str] = """
 CREATE TABLE IF NOT EXISTS audit_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stream TEXT NOT NULL DEFAULT 'access',
     occurred_at TEXT NOT NULL,
     key_id TEXT,
     key_fingerprint TEXT,
@@ -80,8 +88,20 @@ _AUDIT_INDEX_SQL: Final[str] = """
 CREATE INDEX IF NOT EXISTS idx_audit_events_occurred_at
     ON audit_events(occurred_at);
 """
+_AUDIT_STREAM_INDEX_SQL: Final[str] = """
+CREATE INDEX IF NOT EXISTS idx_audit_events_stream_id
+    ON audit_events(stream, id);
+"""
 _AUDIT_STATE_TABLE_SQL: Final[str] = """
 CREATE TABLE IF NOT EXISTS audit_chain_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    checkpoint_hash TEXT NOT NULL,
+    pruned_events INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+"""
+_AUDIT_REJECTION_STATE_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS audit_rejection_chain_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     checkpoint_hash TEXT NOT NULL,
     pruned_events INTEGER NOT NULL DEFAULT 0,
@@ -185,9 +205,11 @@ def _canonical_payload(  # noqa: PLR0913
     ).encode("utf-8")
 
 
-def _entry_hash(payload: bytes) -> str:
-    """SHA-256 hexadécimal de la charge canonique d'un événement."""
-    return hashlib.sha256(payload).hexdigest()
+def _entry_hash(payload: bytes, hmac_key: bytes | None) -> str:
+    """HMAC-SHA-256 (ou SHA-256 historique si aucune clé n'est configurée)."""
+    if hmac_key is None:
+        return hashlib.sha256(payload).hexdigest()
+    return hmac.new(hmac_key, payload, hashlib.sha256).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -259,26 +281,45 @@ class AuditLog:
 class InMemoryAuditLog(AuditLog):
     """Journal en mémoire, réservé au backend mémoire de développement/test.
 
-    Il n'est pas partagé entre processus et disparaît au redémarrage : la
-    production utilise ``SqliteAuditLog``.
+    Deux flux indépendants (accès authentifiés et rejets 401/429) ont chacun
+    leur chaîne et leur rétention : une inondation de rejets ne peut pas purger
+    les accès authentifiés (audit M-03).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, hmac_key: bytes | None = None) -> None:
+        self._hmac_key = hmac_key
         self._events: list[AuditEvent] = []
+        self._rejection_events: list[AuditEvent] = []
         self._checkpoint_hash = GENESIS_HASH
+        self._rejection_checkpoint_hash = GENESIS_HASH
         self._pruned_events = 0
+        self._rejection_pruned_events = 0
         self._next_id = 1
         self._lock = threading.Lock()
 
-    def _prune_locked(self) -> None:
-        """Purge les plus anciens événements et avance le point de contrôle."""
-        excess = len(self._events) - max(1, MAX_AUDIT_EVENTS)
+    @staticmethod
+    def _stream_for(status_code: int) -> str:
+        return (
+            _AUDIT_STREAM_REJECTION
+            if status_code in _REJECTION_STATUS_CODES
+            else _AUDIT_STREAM_ACCESS
+        )
+
+    def _prune_locked(self, stream: str) -> None:
+        """Purge le flux demandé et avance son point de contrôle."""
+        events = self._rejection_events if stream == _AUDIT_STREAM_REJECTION else self._events
+        limit = MAX_REJECTION_EVENTS if stream == _AUDIT_STREAM_REJECTION else MAX_AUDIT_EVENTS
+        excess = len(events) - max(1, limit)
         if excess <= 0:
             return
-        pruned = self._events[:excess]
-        self._checkpoint_hash = pruned[-1].entry_hash
-        self._pruned_events += len(pruned)
-        del self._events[:excess]
+        pruned = events[:excess]
+        if stream == _AUDIT_STREAM_REJECTION:
+            self._rejection_checkpoint_hash = pruned[-1].entry_hash
+            self._rejection_pruned_events += len(pruned)
+        else:
+            self._checkpoint_hash = pruned[-1].entry_hash
+            self._pruned_events += len(pruned)
+        del events[:excess]
 
     async def record(  # noqa: PLR0913
         self,
@@ -291,10 +332,19 @@ class InMemoryAuditLog(AuditLog):
         key_id: str | None = None,
         project: str | None = None,
     ) -> AuditEvent:
+        stream = self._stream_for(status_code)
         with self._lock:
-            previous_hash = (
-                self._events[-1].entry_hash if self._events else self._checkpoint_hash
+            events = (
+                self._rejection_events
+                if stream == _AUDIT_STREAM_REJECTION
+                else self._events
             )
+            checkpoint = (
+                self._rejection_checkpoint_hash
+                if stream == _AUDIT_STREAM_REJECTION
+                else self._checkpoint_hash
+            )
+            previous_hash = events[-1].entry_hash if events else checkpoint
             occurred_at = get_iso_timestamp()
             safe_peer = _sanitize(peer, MAX_PEER_LENGTH) or "unknown"
             safe_action = _sanitize(action, MAX_ACTION_LENGTH) or "UNKNOWN"
@@ -327,11 +377,11 @@ class InMemoryAuditLog(AuditLog):
                 status_code=status_code,
                 outcome=outcome,
                 previous_hash=previous_hash,
-                entry_hash=_entry_hash(payload),
+                entry_hash=_entry_hash(payload, self._hmac_key),
             )
             self._next_id += 1
-            self._events.append(event)
-            self._prune_locked()
+            events.append(event)
+            self._prune_locked(stream)
             return event
 
     def list_events(
@@ -343,62 +393,109 @@ class InMemoryAuditLog(AuditLog):
         bounded_limit = max(1, min(MAX_LIST_LIMIT, int(limit)))
         with self._lock:
             selected = [
-                event for event in self._events if project is None or event.project == project
+                event
+                for event in sorted(
+                    (*self._events, *self._rejection_events),
+                    key=lambda item: (item.occurred_at, item.id),
+                )
+                if project is None or event.project == project
             ]
             return [event.as_dict() for event in selected[-bounded_limit:]]
 
+    def _verify_stream(
+        self, events: list[AuditEvent], checkpoint: str
+    ) -> tuple[bool, int | None]:
+        previous_hash = checkpoint
+        for event in events:
+            if event.previous_hash != previous_hash:
+                return False, event.id
+            payload = _canonical_payload(
+                occurred_at=event.occurred_at,
+                key_id=event.key_id,
+                key_fingerprint_value=event.key_fingerprint,
+                project=event.project,
+                peer=event.peer,
+                action=event.action,
+                target=event.target,
+                status_code=event.status_code,
+                outcome=event.outcome,
+                previous_hash=event.previous_hash,
+            )
+            if _entry_hash(payload, self._hmac_key) != event.entry_hash:
+                return False, event.id
+            previous_hash = event.entry_hash
+        return True, None
+
     def verify_chain(self) -> tuple[bool, int | None]:
         with self._lock:
-            previous_hash = self._checkpoint_hash
-            for event in self._events:
-                if event.previous_hash != previous_hash:
-                    return False, event.id
-                payload = _canonical_payload(
-                    occurred_at=event.occurred_at,
-                    key_id=event.key_id,
-                    key_fingerprint_value=event.key_fingerprint,
-                    project=event.project,
-                    peer=event.peer,
-                    action=event.action,
-                    target=event.target,
-                    status_code=event.status_code,
-                    outcome=event.outcome,
-                    previous_hash=event.previous_hash,
-                )
-                if _entry_hash(payload) != event.entry_hash:
-                    return False, event.id
-                previous_hash = event.entry_hash
-            return True, None
+            valid, invalid = self._verify_stream(self._events, self._checkpoint_hash)
+            if not valid:
+                return valid, invalid
+            return self._verify_stream(
+                self._rejection_events, self._rejection_checkpoint_hash
+            )
 
     def pruned_count(self) -> int:
         """Nombre d'événements purgés par la rétention (diagnostic)."""
         with self._lock:
-            return self._pruned_events
+            return self._pruned_events + self._rejection_pruned_events
 
     def clear(self) -> None:
         """Réinitialise le journal (tests isolés)."""
         with self._lock:
             self._events.clear()
+            self._rejection_events.clear()
             self._checkpoint_hash = GENESIS_HASH
+            self._rejection_checkpoint_hash = GENESIS_HASH
             self._pruned_events = 0
+            self._rejection_pruned_events = 0
             self._next_id = 1
 
 
 class SqliteAuditLog(AuditLog):
     """Journal d'audit persistant, partagé entre workers via SQLite.
 
-    L'ajout est sérialisé par ``BEGIN IMMEDIATE`` : deux workers ne peuvent pas
-    lire le même ``previous_hash`` puis insérer deux lignes concurrentes. La
-    lecture et la vérification ne prennent aucun verrou d'écriture.
+    Deux flux indépendants (accès authentifiés et rejets 401/429) ont chacun
+    leur chaîne et leur rétention : une inondation de rejets ne peut pas purger
+    les accès authentifiés (audit M-03). L'ajout est sérialisé par
+    ``BEGIN IMMEDIATE`` : deux workers ne peuvent pas lire le même
+    ``previous_hash`` puis insérer deux lignes concurrentes. La lecture et la
+    vérification ne prennent aucun verrou d'écriture.
     """
 
-    def __init__(self, db_path: Path | str, *, create: bool = True) -> None:
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        create: bool = True,
+        hmac_key: bytes | None = None,
+    ) -> None:
         self._db_path = Path(db_path) if isinstance(db_path, str) else db_path
+        self._hmac_key = hmac_key
         if create:
             with db_session(self._db_path) as conn:
                 conn.execute(_AUDIT_TABLE_SQL)
                 conn.execute(_AUDIT_INDEX_SQL)
+                conn.execute(_AUDIT_STREAM_INDEX_SQL)
                 conn.execute(_AUDIT_STATE_TABLE_SQL)
+                conn.execute(_AUDIT_REJECTION_STATE_TABLE_SQL)
+                self._ensure_stream_column(conn)
+
+    @staticmethod
+    def _ensure_stream_column(conn: Any) -> None:
+        """Ajoute ``audit_events.stream`` aux bases créées avant l'audit M-03."""
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(audit_events);").fetchall()
+        }
+        if "stream" in columns:
+            return
+        conn.execute(
+            "ALTER TABLE audit_events ADD COLUMN stream TEXT NOT NULL DEFAULT 'access'"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_stream_id "
+            "ON audit_events(stream, id)"
+        )
 
     @property
     def db_path(self) -> Path | str:
@@ -406,32 +503,54 @@ class SqliteAuditLog(AuditLog):
         return self._db_path
 
     @staticmethod
-    def _checkpoint(conn: Any) -> tuple[str, int]:
-        """Retourne le point de contrôle de chaîne et le nombre d'événements purgés."""
+    def _state_table(stream: str) -> str:
+        return (
+            "audit_rejection_chain_state"
+            if stream == _AUDIT_STREAM_REJECTION
+            else "audit_chain_state"
+        )
+
+    @staticmethod
+    def _stream_for(status_code: int) -> str:
+        return (
+            _AUDIT_STREAM_REJECTION
+            if status_code in _REJECTION_STATUS_CODES
+            else _AUDIT_STREAM_ACCESS
+        )
+
+    @classmethod
+    def _checkpoint(cls, conn: Any, stream: str) -> tuple[str, int]:
+        """Retourne le point de contrôle et le nombre d'événements purgés du flux."""
+        table = cls._state_table(stream)
+        # `table` provient d'un ensemble fermé de deux noms constants.
         row = conn.execute(
-            "SELECT checkpoint_hash, pruned_events FROM audit_chain_state WHERE id = 1"
+            f"SELECT checkpoint_hash, pruned_events FROM {table} WHERE id = 1"  # noqa: S608
         ).fetchone()
         if row is None:
             return GENESIS_HASH, 0
         return str(row["checkpoint_hash"]), int(row["pruned_events"])
 
-    @staticmethod
-    def _prune(conn: Any) -> bool:
-        """Supprime au plus ``_PRUNE_BATCH_SIZE`` événements excédentaires.
+    @classmethod
+    def _prune(cls, conn: Any, stream: str) -> bool:
+        """Supprime au plus ``_PRUNE_BATCH_SIZE`` événements excédentaires du flux.
 
         Retourne ``True`` s'il reste des événements à purger. Chaque lot avance
-        le point de contrôle de chaîne avec le dernier ``entry_hash`` supprimé :
-        les événements retenus restent prouvables et ``verify_chain`` valide.
+        le point de contrôle de chaîne du flux avec le dernier ``entry_hash``
+        supprimé : les événements retenus restent prouvables.
         """
-        row = conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()
+        limit = MAX_REJECTION_EVENTS if stream == _AUDIT_STREAM_REJECTION else MAX_AUDIT_EVENTS
+        row = conn.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE stream = ?", (stream,)
+        ).fetchone()
         count = int(row[0]) if row is not None else 0
-        excess = count - max(1, MAX_AUDIT_EVENTS)
+        excess = count - max(1, limit)
         if excess <= 0:
             return False
         batch = min(excess, _PRUNE_BATCH_SIZE)
         rows = conn.execute(
-            "SELECT id, entry_hash FROM audit_events ORDER BY id ASC LIMIT ?",
-            (batch,),
+            "SELECT id, entry_hash FROM audit_events WHERE stream = ? "
+            "ORDER BY id ASC LIMIT ?",
+            (stream, batch),
         ).fetchall()
         if not rows:
             return False
@@ -440,28 +559,26 @@ class SqliteAuditLog(AuditLog):
             "DELETE FROM audit_events WHERE id = ?",
             [(int(item["id"]),) for item in rows],
         )
+        table = cls._state_table(stream)
+        # `table` provient d'un ensemble fermé de deux noms constants.
         conn.execute(
-            "INSERT INTO audit_chain_state ("
+            f"INSERT INTO {table} ("  # noqa: S608
             "id, checkpoint_hash, pruned_events, updated_at"
             ") VALUES (1, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET "
             "checkpoint_hash = excluded.checkpoint_hash, "
-            "pruned_events = audit_chain_state.pruned_events + excluded.pruned_events, "
+            f"pruned_events = {table}.pruned_events + excluded.pruned_events, "
             "updated_at = excluded.updated_at",
             (checkpoint_hash, len(rows), get_iso_timestamp()),
         )
         return excess > len(rows)
 
-    def _prune_batched(self) -> None:
-        """Purge les excédents par lots, chaque lot dans sa propre transaction.
-
-        Le verrou d'écriture n'est donc tenu que pour ``_PRUNE_BATCH_SIZE``
-        suppressions au plus, même après l'import d'une base pré-remplie.
-        """
+    def _prune_batched(self, stream: str) -> None:
+        """Purge les excédents du flux par lots, chaque lot dans sa transaction."""
         while True:
             with db_session(self._db_path) as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                more = self._prune(conn)
+                more = self._prune(conn, stream)
             if not more:
                 return
 
@@ -498,6 +615,7 @@ class SqliteAuditLog(AuditLog):
         key_id: str | None = None,
         project: str | None = None,
     ) -> AuditEvent:
+        stream = self._stream_for(status_code)
         safe_peer = _sanitize(peer, MAX_PEER_LENGTH) or "unknown"
         safe_action = _sanitize(action, MAX_ACTION_LENGTH) or "UNKNOWN"
         safe_target = _sanitize(target, MAX_TARGET_LENGTH)
@@ -508,9 +626,11 @@ class SqliteAuditLog(AuditLog):
         occurred_at = get_iso_timestamp()
         with db_session(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            checkpoint_hash, _pruned = self._checkpoint(conn)
+            checkpoint_hash, _pruned = self._checkpoint(conn, stream)
             row = conn.execute(
-                "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+                "SELECT entry_hash FROM audit_events WHERE stream = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (stream,),
             ).fetchone()
             previous_hash = str(row[0]) if row is not None else checkpoint_hash
             payload = _canonical_payload(
@@ -525,13 +645,14 @@ class SqliteAuditLog(AuditLog):
                 outcome=outcome,
                 previous_hash=previous_hash,
             )
-            entry_hash = _entry_hash(payload)
+            entry_hash = _entry_hash(payload, self._hmac_key)
             cursor = conn.execute(
                 "INSERT INTO audit_events ("
-                "occurred_at, key_id, key_fingerprint, project, peer, action, target, "
+                "stream, occurred_at, key_id, key_fingerprint, project, peer, action, target, "
                 "status_code, outcome, previous_hash, entry_hash"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
+                    stream,
                     occurred_at,
                     safe_key_id,
                     safe_fingerprint,
@@ -546,12 +667,17 @@ class SqliteAuditLog(AuditLog):
                 ),
             )
             event_id = int(cursor.lastrowid or 0)
-            row = conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()
-            needs_prune = int(row[0] if row is not None else 0) > max(
-                1, MAX_AUDIT_EVENTS
+            limit = (
+                MAX_REJECTION_EVENTS
+                if stream == _AUDIT_STREAM_REJECTION
+                else MAX_AUDIT_EVENTS
             )
+            row = conn.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE stream = ?", (stream,)
+            ).fetchone()
+            needs_prune = int(row[0] if row is not None else 0) > max(1, limit)
         if needs_prune:
-            self._prune_batched()
+            self._prune_batched(stream)
         return AuditEvent(
             id=event_id,
             occurred_at=occurred_at,
@@ -591,31 +717,37 @@ class SqliteAuditLog(AuditLog):
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def _verify_stream(self, conn: Any, stream: str) -> tuple[bool, int | None]:
+        previous_hash, _pruned = self._checkpoint(conn, stream)
+        for row in conn.execute(
+            "SELECT * FROM audit_events WHERE stream = ? ORDER BY id ASC", (stream,)
+        ):
+            event_id = int(row["id"])
+            if str(row["previous_hash"]) != previous_hash:
+                return False, event_id
+            payload = _canonical_payload(
+                occurred_at=str(row["occurred_at"]),
+                key_id=row["key_id"],
+                key_fingerprint_value=row["key_fingerprint"],
+                project=row["project"],
+                peer=str(row["peer"]),
+                action=str(row["action"]),
+                target=row["target"],
+                status_code=int(row["status_code"]),
+                outcome=str(row["outcome"]),
+                previous_hash=str(row["previous_hash"]),
+            )
+            if _entry_hash(payload, self._hmac_key) != str(row["entry_hash"]):
+                return False, event_id
+            previous_hash = str(row["entry_hash"])
+        return True, None
+
     def verify_chain(self) -> tuple[bool, int | None]:
         with db_session(self._db_path) as conn:
-            previous_hash, _pruned = self._checkpoint(conn)
-            # Itération du curseur : la table est bornée par la rétention, donc
-            # la vérification ne charge pas un historique illimité en mémoire.
-            for row in conn.execute("SELECT * FROM audit_events ORDER BY id ASC"):
-                event_id = int(row["id"])
-                if str(row["previous_hash"]) != previous_hash:
-                    return False, event_id
-                payload = _canonical_payload(
-                    occurred_at=str(row["occurred_at"]),
-                    key_id=row["key_id"],
-                    key_fingerprint_value=row["key_fingerprint"],
-                    project=row["project"],
-                    peer=str(row["peer"]),
-                    action=str(row["action"]),
-                    target=row["target"],
-                    status_code=int(row["status_code"]),
-                    outcome=str(row["outcome"]),
-                    previous_hash=str(row["previous_hash"]),
-                )
-                if _entry_hash(payload) != str(row["entry_hash"]):
-                    return False, event_id
-                previous_hash = str(row["entry_hash"])
-        return True, None
+            valid, invalid = self._verify_stream(conn, _AUDIT_STREAM_ACCESS)
+            if not valid:
+                return valid, invalid
+            return self._verify_stream(conn, _AUDIT_STREAM_REJECTION)
 
     def count(self) -> int:
         """Nombre d'événements persistés (diagnostic et tests)."""
@@ -626,16 +758,21 @@ class SqliteAuditLog(AuditLog):
     def pruned_count(self) -> int:
         """Nombre d'événements purgés par la rétention (diagnostic)."""
         with db_session(self._db_path) as conn:
-            _checkpoint_hash, pruned = self._checkpoint(conn)
-        return pruned
+            _access_hash, access_pruned = self._checkpoint(conn, _AUDIT_STREAM_ACCESS)
+            _rej_hash, rejection_pruned = self._checkpoint(
+                conn, _AUDIT_STREAM_REJECTION
+            )
+        return access_pruned + rejection_pruned
 
     def clear(self) -> None:
         """Réinitialise le journal (tests isolés)."""
         with db_session(self._db_path) as conn:
             conn.execute(_AUDIT_TABLE_SQL)
             conn.execute(_AUDIT_STATE_TABLE_SQL)
+            conn.execute(_AUDIT_REJECTION_STATE_TABLE_SQL)
             conn.execute("DELETE FROM audit_events")
             conn.execute("DELETE FROM audit_chain_state")
+            conn.execute("DELETE FROM audit_rejection_chain_state")
 
 
 class AuditMiddleware:

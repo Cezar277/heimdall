@@ -25,6 +25,7 @@ from typer.testing import CliRunner
 from heimdall.cli.main import app as cli_app
 from heimdall.vault import audit as audit_module
 from heimdall.vault.app import VaultSettings, create_app
+from heimdall.vault.audit import SqliteAuditLog
 from heimdall.vault.crypto import generate_api_key, generate_encryption_key
 from heimdall.vault.database import DatabaseUnavailableError, db_session, init_db
 
@@ -164,8 +165,8 @@ class AuditTrailTests(unittest.IsolatedAsyncioTestCase):
     async def test_rate_limited_requests_are_audited(self) -> None:
         """Un 429 de débit est journalisé avec l'outcome ``rate_limited``."""
         app = _memory_app(
-            rate_limit_per_key=100,
-            rate_limit_per_peer=1,
+            rate_limit_per_key=1,
+            rate_limit_per_peer=100,
             rate_limit_global=100,
         )
         key = generate_api_key()
@@ -490,6 +491,79 @@ class AuditRetentionTests(unittest.IsolatedAsyncioTestCase):
                     (audit_module.GENESIS_HASH,),
                 )
             self.assertEqual(app.state.audit_log.verify_chain(), (False, 4))
+
+    async def test_rejection_flood_does_not_prune_authenticated_events(self) -> None:
+        """Audit M-03 : les 401/429 ont leur rétention et ne purgent pas les accès."""
+        app = _memory_app()
+        with (
+            patch.object(audit_module, "MAX_AUDIT_EVENTS", 2),
+            patch.object(audit_module, "MAX_REJECTION_EVENTS", 2),
+        ):
+            for index in range(2):
+                await app.state.audit_log.record(
+                    peer="127.0.0.1",
+                    action=f"GET /auth/{index}",
+                    target=None,
+                    status_code=200,
+                )
+            for index in range(10):
+                await app.state.audit_log.record(
+                    peer="127.0.0.1",
+                    action=f"GET /rejection/{index}",
+                    target=None,
+                    status_code=401,
+                )
+        actions = [event["action"] for event in app.state.audit_log.list_events(limit=100)]
+        self.assertIn("GET /auth/0", actions)
+        self.assertIn("GET /auth/1", actions)
+        self.assertNotIn("GET /rejection/0", actions)
+        self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
+
+    async def test_sqlite_rejection_flood_does_not_prune_authenticated_events(self) -> None:
+        """Même séparation de rétention sur le backend SQLite."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = _sqlite_app(tmp)
+            with (
+                patch.object(audit_module, "MAX_AUDIT_EVENTS", 2),
+                patch.object(audit_module, "MAX_REJECTION_EVENTS", 2),
+            ):
+                for index in range(2):
+                    await app.state.audit_log.record(
+                        peer="127.0.0.1",
+                        action=f"GET /auth/{index}",
+                        target=None,
+                        status_code=200,
+                    )
+                for index in range(10):
+                    await app.state.audit_log.record(
+                        peer="127.0.0.1",
+                        action=f"GET /rejection/{index}",
+                        target=None,
+                        status_code=401,
+                    )
+            actions = [
+                event["action"] for event in app.state.audit_log.list_events(limit=100)
+            ]
+            self.assertIn("GET /auth/0", actions)
+            self.assertIn("GET /auth/1", actions)
+            self.assertNotIn("GET /rejection/0", actions)
+            self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
+
+    async def test_sqlite_chain_is_hmac_keyed(self) -> None:
+        """Audit F-16 : une autre clé HMAC invalide la vérification de chaîne."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            app = _sqlite_app(tmp)
+            await app.state.audit_log.record(
+                peer="127.0.0.1",
+                action="GET /auth",
+                target=None,
+                status_code=200,
+            )
+            other = SqliteAuditLog(
+                db_path, create=False, hmac_key=b"x" * 32
+            )
+            self.assertEqual(other.verify_chain(), (False, 1))
 
     def test_init_db_recreates_audit_tables_on_pre_t39_database(self) -> None:
         """Une base antérieure à #39 reçoit les tables de débit, d'audit et d'état."""

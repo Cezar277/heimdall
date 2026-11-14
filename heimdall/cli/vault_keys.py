@@ -22,6 +22,7 @@ Codes de sortie (convention de la CLI) : 0 (succès), 1 (échec opérationnel),
 2 (usage ou configuration invalide).
 """
 
+import asyncio
 import json
 import os
 import stat
@@ -37,7 +38,12 @@ from heimdall.cli.vault_client import (
 )
 from heimdall.vault import auth as vault_auth
 from heimdall.vault.audit import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, SqliteAuditLog
-from heimdall.vault.crypto import VaultCipher, VaultCipherError
+from heimdall.vault.crypto import (
+    KekHmacContinuityError,
+    VaultCipher,
+    VaultCipherError,
+    validate_server_hmac_key,
+)
 from heimdall.vault.database import (
     KekConcurrencyError,
     KekVersionError,
@@ -230,6 +236,25 @@ def revoke_key(
     typer.echo(f"Clé API {key_id} révoquée : elle n'authentifie plus aucune requête.")
 
 
+def _resolve_audit_hmac_key() -> bytes | None:
+    """Résout la clé HMAC du journal d'audit (env dédiée ou chiffreur configuré)."""
+    raw = os.environ.get("HEIMDALL_VAULT_AUDIT_HMAC_KEY")
+    if raw:
+        return validate_server_hmac_key(raw)
+    try:
+        cipher = _resolve_cli_cipher(
+            env_direct="HEIMDALL_VAULT_KEK",
+            env_fallback=None,
+            env_master="HEIMDALL_VAULT_MASTER_KEY",
+            env_salt="HEIMDALL_VAULT_KEK_SALT",
+            label="la KEK du Vault",
+            server_hmac_key=os.environ.get("HEIMDALL_VAULT_SERVER_HMAC_KEY"),
+        )
+    except ValueError:
+        return None
+    return cipher.audit_hmac_key()
+
+
 @audit_app.command("list")
 def list_audit_events(
     db_path: Path | None = _DB_PATH_OPTION,
@@ -259,7 +284,9 @@ def list_audit_events(
             vault_auth.validate_project_id(project)
         if not resolved.is_file():
             raise FileNotFoundError
-        audit_log = SqliteAuditLog(resolved, create=False)
+        audit_log = SqliteAuditLog(
+            resolved, create=False, hmac_key=_resolve_audit_hmac_key()
+        )
         events = audit_log.list_events(limit=limit, project=project)
     except ValueError as exc:
         typer.echo(f"Erreur : {exc}", err=True)
@@ -296,7 +323,9 @@ def verify_audit_chain(
         resolved = _resolve_db_path(db_path)
         if not resolved.is_file():
             raise FileNotFoundError
-        audit_log = SqliteAuditLog(resolved, create=False)
+        audit_log = SqliteAuditLog(
+            resolved, create=False, hmac_key=_resolve_audit_hmac_key()
+        )
         valid, invalid_id = audit_log.verify_chain()
         total = audit_log.count()
         pruned = audit_log.pruned_count()
@@ -329,13 +358,14 @@ def _read_env_secret(var_name: str, label: str) -> str | None:
     return val
 
 
-def _resolve_cli_cipher(
+def _resolve_cli_cipher(  # noqa: PLR0913 - paramètres nommés explicites
     *,
     env_direct: str,
     env_fallback: str | None,
     env_master: str,
     env_salt: str,
     label: str,
+    server_hmac_key: str | None = None,
 ) -> VaultCipher:
     """Résout un chiffreur VaultCipher depuis une clé directe ou une dérivation Argon2id."""
     resolved_direct = _read_env_secret(env_direct, label)
@@ -358,12 +388,16 @@ def _resolve_cli_cipher(
         )
     if resolved_direct:
         try:
-            return VaultCipher.from_encoded_key(resolved_direct)
+            return VaultCipher.from_encoded_key(
+                resolved_direct, server_hmac_key=server_hmac_key
+            )
         except Exception:
             raise ValueError(f"{label} directe invalide (base64 attendu).") from None
     if resolved_master and resolved_salt:
         try:
-            return VaultCipher.from_master_key(resolved_master, resolved_salt)
+            return VaultCipher.from_master_key(
+                resolved_master, resolved_salt, server_hmac_key=server_hmac_key
+            )
         except Exception:
             raise ValueError(f"{label} dérivée invalide.") from None
     if resolved_master or resolved_salt:
@@ -371,6 +405,27 @@ def _resolve_cli_cipher(
     raise ValueError(
         f"{label} manquante dans l'environnement ({env_direct} ou {env_master}+{env_salt} requis)."
     )
+
+
+_MAX_TCP_PORT: int = 65535
+
+
+def _vault_server_is_listening() -> bool:
+    """True si un serveur Vault répond sur le port configuré (rotation à chaud)."""
+    import socket  # noqa: PLC0415
+
+    raw_port = os.environ.get("HEIMDALL_VAULT_PORT", "8443")
+    try:
+        port = int(raw_port)
+    except ValueError:
+        return False
+    if not 1 <= port <= _MAX_TCP_PORT:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
 
 
 @vault_app.command(
@@ -383,7 +438,14 @@ def _resolve_cli_cipher(
         "- KEK directe : $HEIMDALL_VAULT_OLD_KEK (ou $HEIMDALL_VAULT_KEK) et\n"
         "  $HEIMDALL_VAULT_NEW_KEK\n"
         "- Dérivation Argon2id : $HEIMDALL_VAULT_OLD_MASTER_KEY + $HEIMDALL_VAULT_OLD_KEK_SALT et\n"
-        "  $HEIMDALL_VAULT_NEW_MASTER_KEY + $HEIMDALL_VAULT_NEW_KEK_SALT"
+        "  $HEIMDALL_VAULT_NEW_MASTER_KEY + $HEIMDALL_VAULT_NEW_KEK_SALT\n\n"
+        "La clé HMAC serveur ($HEIMDALL_VAULT_SERVER_HMAC_KEY) est requise si la base\n"
+        "porte un canari HMAC. La rotation ne renouvelle pas les DEK : après une\n"
+        "compromission de la KEK, un rechiffrement complet des valeurs est nécessaire.\n"
+        "Le serveur doit être arrêté (ou --force explicite) pour éviter une rotation\n"
+        "à chaud avec une KEK encore en mémoire dans le processus serveur. Pour un\n"
+        "journal d'audit stable à travers la rotation, définir\n"
+        "HEIMDALL_VAULT_AUDIT_HMAC_KEY (sinon la sous-clé dérivée de la KEK change)."
     ),
 )
 def rotate_kek_command(
@@ -393,6 +455,11 @@ def rotate_kek_command(
         "--target-version",
         help="Version de KEK cible explicite (kek_version).",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Autorise la rotation même si un serveur Vault semble écouter sur le port.",
+    ),
 ) -> None:
     """Effectue la rotation transactionnelle de la KEK sur tous les secrets (ticket #71)."""
     try:
@@ -400,12 +467,21 @@ def rotate_kek_command(
         # Pré-contrôle sans suivi de lien symbolique (lstat), avant la garde
         # d'ouverture sécurisée de db_session (invariant 8, fail-closed).
         _assert_regular_non_empty_db_file(resolved)
+        if not force and _vault_server_is_listening():
+            raise ValueError(
+                "Un serveur Vault semble écouter sur le port configuré : arrêter le "
+                "serveur avant la rotation (ou utiliser --force)."
+            )
+        server_hmac_key = _read_env_secret(
+            "HEIMDALL_VAULT_SERVER_HMAC_KEY", "la clé HMAC serveur"
+        )
         old_cipher = _resolve_cli_cipher(
             env_direct="HEIMDALL_VAULT_OLD_KEK",
             env_fallback="HEIMDALL_VAULT_KEK",
             env_master="HEIMDALL_VAULT_OLD_MASTER_KEY",
             env_salt="HEIMDALL_VAULT_OLD_KEK_SALT",
             label="l'ancienne KEK",
+            server_hmac_key=server_hmac_key,
         )
         new_cipher = _resolve_cli_cipher(
             env_direct="HEIMDALL_VAULT_NEW_KEK",
@@ -413,6 +489,7 @@ def rotate_kek_command(
             env_master="HEIMDALL_VAULT_NEW_MASTER_KEY",
             env_salt="HEIMDALL_VAULT_NEW_KEK_SALT",
             label="la nouvelle KEK",
+            server_hmac_key=server_hmac_key,
         )
         if old_cipher.has_same_key_as(new_cipher):
             raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
@@ -424,12 +501,15 @@ def rotate_kek_command(
 
     try:
         with db_session(resolved) as conn:
-            count, _ = rotate_secrets_kek(
+            count, new_version = rotate_secrets_kek(
                 conn,
                 old_cipher,
                 new_cipher,
                 target_kek_version=target_version,
             )
+    except KekHmacContinuityError as exc:
+        typer.echo(f"Erreur : {exc}", err=True)
+        raise typer.Exit(code=1) from None
     except VaultCipherError:
         typer.echo("Erreur : échec du déchiffrement avec l'ancienne KEK.", err=True)
         raise typer.Exit(code=1) from None
@@ -449,6 +529,24 @@ def rotate_kek_command(
             err=True,
         )
         raise typer.Exit(code=1)
+
+    try:
+        audit_key = _resolve_audit_hmac_key() or new_cipher.audit_hmac_key()
+        audit_log = SqliteAuditLog(resolved, hmac_key=audit_key)
+        asyncio.run(
+            audit_log.record(
+                peer="cli",
+                action="VAULT KEK ROTATE",
+                target=f"kek_version={new_version}",
+                status_code=200,
+            )
+        )
+    except Exception:
+        typer.echo(
+            "Erreur : rotation effectuée mais journal d'audit indisponible.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
 
     typer.echo(f"Rotation de la KEK réussie : {count} secret(s) réenveloppé(s).")
 
