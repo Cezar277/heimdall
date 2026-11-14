@@ -21,6 +21,7 @@ from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.detect import MAX_FILE_BYTES, Scanner
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
+from heimdall.scanner.policy import _MAX_CLEANED_CHARS, ScanSkip, prepare_text
 
 SYNTHETIC = fake_token("ghp_", 36)
 BINARY = b"\x89PNG\r\n\x1a\n" + b"\x00\xff" * 200
@@ -257,3 +258,13 @@ def test_latin1_named_like_an_image_is_not_excluded(repo: GitRepo) -> None:
     report = collect(repo.root, staged=False, allowlist=Allowlist.empty(), strict=False)
     assert any(item.file == "looks-like-image.png" for item in report.findings)
     assert report.complete
+
+
+def test_prepare_text_cap_is_in_characters_for_multibyte_text() -> None:
+    text = "é" * 500_000 + "\n" + "A" * 300_000 + "\n"
+    skipped: list[ScanSkip] = []
+    out = prepare_text(text, "app.py", strict=False, skipped=skipped)
+    assert len(out) <= _MAX_CLEANED_CHARS
+    # Plafond documenté en caractères : l'encodage UTF-8 reste borné à 4 octets/car.
+    assert len(out.encode("utf-8")) <= 4 * _MAX_CLEANED_CHARS
+    assert any(item.reason == "long_token" for item in skipped)

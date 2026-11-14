@@ -109,7 +109,9 @@ Sans `--strict`, un rapport historique partiel produit 1 si un candidat est
 détecté, 2 sinon ; il ne produit jamais 0. L'API `collect_history` reste
 stricte par défaut ; `strict=False` est un choix explicite de collecte.
 `cold-start` est tolérant par défaut ; `cold-start --strict` refuse les
-contenus exclus (code 2) dès la collecte. Sans `--strict`, un rapport
+contenus exclus (code 2) dès la collecte. L'API `collect_cold_start` est stricte
+par défaut, comme `collect` et `collect_history` ; la CLI passe `strict`
+explicitement. Sans `--strict`, un rapport
 partiel est refusé par le code 2, jamais présenté comme propre.
 Les objets absents, clones superficiels, sorties invalides et dépassements
 de budget restent des erreurs d'outillage. Voir la

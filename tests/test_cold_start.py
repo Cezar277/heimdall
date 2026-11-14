@@ -106,7 +106,7 @@ def test_clean_repo_never_calls_llm(repo: GitRepo) -> None:
 
 def test_latin1_context_keeps_explicit_tolerant_decoding(repo: GitRepo) -> None:
     repo.write_bytes("app.py", f'# café\nkey = "{SYNTHETIC}"\n'.encode("cp1252"))
-    report = collect_cold_start(repo.root, chat=_secret_chat)
+    report = collect_cold_start(repo.root, strict=False, chat=_secret_chat)
     assert len(report.scan.findings) == len(report.opinions) == 1
 
 
@@ -119,6 +119,12 @@ def test_strict_cold_start_refuses_excluded_content(repo: GitRepo) -> None:
     assert SYNTHETIC not in result.output
 
 
+def test_library_default_is_strict(repo: GitRepo) -> None:
+    repo.write("app.py", f'key = "{SYNTHETIC}"\n' + "A" * 5000 + "\n")
+    with pytest.raises(ScanError):
+        collect_cold_start(repo.root, chat=_secret_chat)
+
+
 def test_strict_cold_start_rejects_non_bool_policy(repo: GitRepo) -> None:
     with pytest.raises(ScanError, match="politique de contenu invalide"):
         collect_cold_start(repo.root, strict=1, chat=_secret_chat)  # type: ignore[arg-type]
@@ -128,7 +134,7 @@ def test_partial_context_keeps_findings_and_does_not_claim_mutation(
     repo: GitRepo, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo.write("app.py", f'key = "{SYNTHETIC}"\n' + "A" * 5000 + "\n")
-    report = collect_cold_start(repo.root, chat=_secret_chat)
+    report = collect_cold_start(repo.root, strict=False, chat=_secret_chat)
     assert report.scan.findings
     assert len(report.opinions) == len(report.scan.findings)
     assert not report.scan.complete
@@ -347,7 +353,7 @@ def test_new_reread_exclusions_refuse_complete_report(
         assert SYNTHETIC not in result.output
     else:
         with pytest.raises(ScanError, match="^contenu modifié depuis le scan déterministe$"):
-            collect_cold_start(repo.root, chat=forbidden)
+            collect_cold_start(repo.root, strict=False, chat=forbidden)
 
 
 def test_reread_respects_configured_size_limit(
@@ -416,7 +422,7 @@ def test_same_size_mutation_during_reread_is_refused(
         assert SYNTHETIC not in result.output
     else:
         with pytest.raises(ScanError, match="^contenu modifié depuis le scan déterministe$"):
-            collect_cold_start(repo.root, chat=forbidden)
+            collect_cold_start(repo.root, strict=False, chat=forbidden)
     assert mutations == [True]
 
 

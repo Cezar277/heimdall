@@ -148,7 +148,7 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
     ci: bool = False,
     llm: bool = True,
     max_file_bytes: int = MAX_FILE_BYTES,
-    strict: bool = False,
+    strict: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:
@@ -179,7 +179,7 @@ def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification opti
     ci: bool = False,
     llm: bool = True,
     max_file_bytes: int = MAX_FILE_BYTES,
-    strict: bool = False,
+    strict: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:

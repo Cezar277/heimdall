@@ -214,7 +214,7 @@ def test_history_skip_uses_the_static_scan_error_contract() -> None:
 
 def test_cold_start_size_limit_reports_skip(repo: GitRepo) -> None:
     repo.write("large.txt", "x" * 100)
-    report = collect_cold_start(repo.root, ci=True, max_file_bytes=10)
+    report = collect_cold_start(repo.root, ci=True, max_file_bytes=10, strict=False)
     assert report.skipped_files == ("large.txt",)
     result = CliRunner().invoke(
         app, ["cold-start", str(repo.root), "--ci", "--json", "--max-file-bytes", "10"]
