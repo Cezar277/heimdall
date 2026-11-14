@@ -38,7 +38,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest==9.2.0",
-  "ruff==0.17.3",
+  "ruff==0.17.4",
   "mypy==2.4.1",
   "bandit==1.9.4",
   "setuptools==84.2.1",     # backend de build, installé depuis le lock en CI
