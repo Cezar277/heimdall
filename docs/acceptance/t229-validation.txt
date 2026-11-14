@@ -15,7 +15,7 @@ python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/histor
 Exit 0, aucune alerte de securite.
 
 python -m heimdall.cli.main scan --ci --no-allowlist --json .
-Exit 1 : 3986 candidats, 320 fichiers analyses, 3 exclusions de contenu.
+Exit 1 : 3986 candidats, 321 fichiers analyses, 3 exclusions de contenu.
 complete=false ; pas d'erreur d'outillage (code 2).
 Exclusions : docs/security/dfd.png (binary), docs/t116-samm.md:64
 et docs/contracts/vault-traceability.md:30 (multiline_limit).
@@ -23,3 +23,8 @@ Les candidats proviennent notamment des fixtures synthetiques et empreintes
 du depot ; aucune allowlist active. Ne pas confondre code 1 et erreur.
 Rapports bruts hors depot : /home/nathan/heimdall-t229-self-scan.json
 et /home/nathan/heimdall-t229-self-scan.stderr.
+
+Rejeu sur 7019d78a1c60846598ec5e786ff87efe025fb20c :
+python -m pytest tests/test_scanner_tolerance.py tests/security/test_prompt_injection.py -o addopts= -q
+30 passed in 2.70s
+Auto-scan ci-dessus rejoue sur cette meme revision.
