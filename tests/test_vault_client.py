@@ -857,7 +857,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 self.assertFalse(is_git_ignored(target))
 
     def test_git_toplevel_does_not_follow_symlinked_dir(self) -> None:
-        """Répertoire symlinké → cwd = parent réel (lstat), jamais la cible suivie."""
+        """Répertoire symlinké → refus avant tout appel à GitAccess."""
         real_dir = self.tmp_dir / "real_repo"
         real_dir.mkdir()
         link_dir = self.tmp_dir / "link_repo"
@@ -869,7 +869,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             mock_access = mock_access_cls.return_value
             mock_access.execute.return_value = MagicMock(returncode=1, stdout=b"")
             self.assertIsNone(_get_git_toplevel(link_dir))
-            mock_access_cls.assert_called_once_with(link_dir.parent)
+            mock_access_cls.assert_not_called()
 
     def test_git_helpers_refuse_symlink_output_without_following(self) -> None:
         """Output symlink (fichier ou répertoire) → False fail-closed, git jamais consulté.
