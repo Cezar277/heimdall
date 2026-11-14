@@ -12,11 +12,15 @@ from support.fake_secrets import fake_token
 from support.git_repo import GitRepo
 from typer.testing import CliRunner
 
+import heimdall.cli.history as history_module
+import heimdall.cli.main as main_module
 import heimdall.cli.scan as scan_module
+from heimdall.cli.cold_start import ColdStartReport
 from heimdall.cli.history import collect_history
 from heimdall.cli.main import app
-from heimdall.cli.scan import collect
+from heimdall.cli.scan import ScanReport, collect
 from heimdall.mcp.gitdiff import GitAccess
+from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.detect import MAX_FILE_BYTES, Scanner, find_candidates, scan
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.policy import ScanSkip, prepare_text
@@ -193,3 +197,92 @@ def test_long_token_trace_uses_the_actual_later_line() -> None:
     skipped: list[ScanSkip] = []
     prepare_text("safe\nsafe\n" + "A" * 5000, "payload.dat", strict=False, skipped=skipped)
     assert next(item for item in skipped if item.reason == "long_token").line == 3
+
+
+def test_cold_start_checks_inner_coverage_without_legacy_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = ColdStartReport(
+        scan=ScanReport(
+            scope="working-tree", findings=(), skipped=(ScanSkip("image.png", "binary"),)
+        ),
+        opinions=(),
+        skipped_files=(),
+    )
+    monkeypatch.setattr(main_module, "collect_cold_start", lambda *args, **kwargs: report)
+    result = CliRunner().invoke(app, ["cold-start", "--ci", "--json", "."])
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["complete"] is False
+
+
+@pytest.mark.parametrize("helper", ["tree", "staged", "diff", "changes"])
+def test_private_scan_helpers_are_strict_by_default(repo: GitRepo, helper: str) -> None:
+    base = repo.git_output("rev-parse", "HEAD").strip()
+    repo.write_bytes("payload.dat", _payload("nul"))
+    repo.stage("payload.dat")
+    if helper == "diff":
+        repo.git("commit", "-qm", "synthetic payload")
+    with pytest.raises(ScanError):
+        if helper == "tree":
+            scan_module._collect_tree(repo.root)
+        elif helper == "staged":
+            scan_module._collect_staged(repo.root)
+        elif helper == "diff":
+            scan_module._collect_diff(repo.root, base=base)
+        else:
+            access = GitAccess(repo.root)
+            scan_module._scan_changes(
+                access,
+                access.staged_changes(),
+                Allowlist.empty(),
+                time.monotonic() + 30,
+            )
+
+
+def test_history_oversized_blobs_consume_volume_without_being_read(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write_bytes("a", b"x" * 100)
+    repo.write_bytes("b", b"y" * 100)
+    repo.commit_all("two oversized blobs")
+    oversized = {repo.git_output("rev-parse", f"HEAD:{name}").strip() for name in ("a", "b")}
+    original = GitAccess.blob_bytes
+
+    def read(access: GitAccess, oid: str, **kwargs: object) -> bytes:
+        assert oid not in oversized, "oversized historical blob read"
+        return original(access, oid, **kwargs)
+
+    monkeypatch.setattr(GitAccess, "blob_bytes", read)
+    monkeypatch.setattr(history_module, "MAX_READ_BYTES", 150)
+    with pytest.raises(ScanError, match="limite historique dépassée"):
+        collect_history(repo.root, ci=True, strict=False, max_file_bytes=32)
+
+
+@pytest.mark.parametrize("reason", ["binary", "too_large", "text"])
+def test_staged_skip_traces_have_a_hard_limit(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    data = b"A" * 5000 + b"\n" if reason == "text" else _payload("font")
+    for name in ("a", "b"):
+        repo.write_bytes(name, data)
+        repo.stage(name)
+    monkeypatch.setattr(scan_module, "MAX_STAGED_FINDINGS", 1)
+    if reason == "too_large":
+        monkeypatch.setattr(scan_module, "MAX_FILE_BYTES", 32)
+    with pytest.raises(ScanError):
+        collect(repo.root, staged=True, strict=False)
+
+
+def test_private_scan_rejects_an_already_overfull_skip_collector(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scan_module, "MAX_STAGED_FINDINGS", 1)
+    with pytest.raises(ScanError):
+        scan_module._scan_changes(
+            GitAccess(repo.root),
+            (),
+            Allowlist.empty(),
+            time.monotonic() + 30,
+            strict=False,
+            skipped=[ScanSkip("a", "binary"), ScanSkip("b", "binary")],
+        )

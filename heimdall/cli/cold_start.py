@@ -201,7 +201,7 @@ def render_cold_start(report: ColdStartReport, *, json_output: bool = False) -> 
                 "schema": "heimdall.cold-start.v1",
                 "scan": json.loads(render_json(report.scan)),
                 "opinions": [opinion.as_dict() for opinion in report.opinions],
-                "complete": not report.skipped_files,
+                "complete": not report.skipped_files and report.scan.complete,
                 "skipped_files": report.skipped_files,
             },
             ensure_ascii=True,

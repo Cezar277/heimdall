@@ -72,11 +72,16 @@ et le choix UTF-16/32 conservent leurs gardes ; un rejet rend le rapport
 incomplet et ne permet jamais un code 0.
 Les tailles annoncées des gros fichiers et blobs exclus consomment aussi
 les budgets globaux de l'arbre et de l'index, sans lecture de leur contenu.
+L'historique compte lui aussi la taille de chaque blob absent du cache,
+même s'il est exclu ; `bytes_scanned` reste le compteur des octets lus.
+Les traces d'exclusion de l'index et du diff sont plafonnées à
+`MAX_STAGED_FINDINGS`, y compris avec un collecteur déjà rempli.
 
 ## Bibliothèque et autres commandes
 
 `Scanner(root)`, `scan(root)`, `find_candidates(root)`, `collect(...)` et
-`collect_history(...)` sont stricts par défaut. La tolérance doit être
+`collect_history(...)` sont stricts par défaut, ainsi que les helpers privés
+de collecte et d'analyse des blobs. La tolérance doit être
 demandée explicitement par `strict=False` ; un appelant doit alors exploiter
 le rapport de couverture (`scanner.skipped` / `report.complete`). La CLI
 demande explicitement cette collecte pour rendre les traces puis applique
@@ -85,7 +90,9 @@ primitives d'entropie restent également stricts par défaut.
 
 Le cold start conserve son contrat de rapport incomplet : son collecteur
 `skipped_files` inclut les exclusions rencontrées et sa CLI retourne 2 si
-ce collecteur n'est pas vide. `deep-scan` rend son rapport et retourne 2
+ce collecteur n'est pas vide ou si son rapport de scan interne est incomplet,
+même avec un collecteur historique vide. Le JSON externe reste cohérent
+avec cette couverture. `deep-scan` rend son rapport et retourne 2
 s'il est partiel sans finding, ou 1 si un finding est présent. Le prétraitement
 des jetons traite chaque ligne une fois et calcule sa taille UTF-8 une fois ;
 aucun préfixe du fichier n'est recompté pour chaque jeton.

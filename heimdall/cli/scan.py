@@ -558,7 +558,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
     max_file_bytes: int | None = None,
     skipped_files: list[str] | None = None,
     respect_gitignore: bool = True,
-    strict: bool = False,
+    strict: bool = True,
 ) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
@@ -680,13 +680,18 @@ def _call_timeout(deadline: float) -> float:
     return min(remaining, GIT_TIMEOUT_SECONDS)
 
 
+def _check_skip_budget(skipped: Sequence[ScanSkip]) -> None:
+    if len(skipped) > MAX_STAGED_FINDINGS:
+        raise ScanError(_MSG_TOO_MANY_FINDINGS)
+
+
 def _scan_changes(  # noqa: PLR0913 - politique et collecteur de traces explicites
     access: GitAccess,
     changes: Sequence[StagedChange],
     allowlist: Allowlist,
     deadline: float,
     *,
-    strict: bool = False,
+    strict: bool = True,
     skipped: list[ScanSkip] | None = None,
 ) -> tuple[list[Finding], tuple[AllowlistTrace, ...]]:
     """Scanne les blobs d'une liste de changements (index ou plage de commits).
@@ -701,6 +706,7 @@ def _scan_changes(  # noqa: PLR0913 - politique et collecteur de traces explicit
     # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).
     if skipped is None:
         skipped = []
+    _check_skip_budget(skipped)
     engine = SignatureEngine(
         max_findings=MAX_STAGED_FINDINGS,
         deadline=deadline,
@@ -726,6 +732,7 @@ def _scan_changes(  # noqa: PLR0913 - politique et collecteur de traces explicit
             raise ScanError(_MSG_TOO_LARGE)
         if size > MAX_FILE_BYTES:
             skip_file(change.path, "too_large", strict=strict, skipped=skipped)
+            _check_skip_budget(skipped)
             continue
         data = access.blob_bytes(
             change.blob,
@@ -748,8 +755,10 @@ def _scan_changes(  # noqa: PLR0913 - politique et collecteur de traces explicit
             # Aucun texte à analyser : couverture partielle explicite, ou
             # refus strict. Le contenu binaire n'est jamais déclaré propre.
             skip_file(change.path, "binary", strict=strict, skipped=skipped)
+            _check_skip_budget(skipped)
             continue
         text = prepare_text(text, change.path, strict=strict, skipped=skipped)
+        _check_skip_budget(skipped)
         # `FileTarget` valide le chemin (contrat #14) : un chemin que le
         # contrat ne sait pas représenter est une erreur, pas un fichier
         # ignoré en silence.
@@ -779,7 +788,7 @@ def _collect_staged(
     config: str | Path | None = None,
     custom_allowlist: Allowlist | None = None,
     ci: bool = False,
-    strict: bool = False,
+    strict: bool = True,
 ) -> ScanReport:
     """Scanne les blobs **ajoutés ou modifiés** de l'index git avec allowlist (#24).
 
@@ -859,7 +868,7 @@ def _collect_diff(
     base: str,
     config: str | Path | None = None,
     custom_allowlist: Allowlist | None = None,
-    strict: bool = False,
+    strict: bool = True,
 ) -> ScanReport:
     """Scanne les blobs ajoutés ou modifiés entre ``base...HEAD`` (#37).
 

@@ -273,7 +273,7 @@ def cold_start(
     except Exception:
         _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
-    if report.skipped_files:
+    if report.skipped_files or not report.scan.complete:
         raise typer.Exit(code=2)
     raise typer.Exit(code=EXIT_FINDINGS if report.scan.findings else EXIT_CLEAN)
 

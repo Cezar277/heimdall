@@ -26,6 +26,7 @@ BATCH_SIZE = 128
 MAX_COMMITS = 100_000
 MAX_TREE_BYTES = 8 * 1024 * 1024
 MAX_ENTRIES = 1_000_000
+# Budget des tailles annoncées sur chaque défaut de cache, exclusions comprises.
 MAX_READ_BYTES = 256 * 1024 * 1024
 MAX_RECORDS = 10_000
 MAX_OCCURRENCES = 1_000_000
@@ -49,7 +50,7 @@ class HistoryReport:
     skipped: tuple[tuple[str, str, str], ...]
     commits_scanned: int
     entries_scanned: int
-    bytes_scanned: int
+    bytes_scanned: int  # octets effectivement lus, distincts du budget annoncé
     elapsed_seconds: float
 
     @property
@@ -174,7 +175,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     cache_skips: dict[str, tuple[str, ...]] = {}
     skipped: list[tuple[str, str, str]] = []
     opinions: list[CandidateOpinion] = []
-    commits = entries = volume = occurrences = cache_findings = 0
+    commits = entries = volume = read_volume = occurrences = cache_findings = 0
     scanner = Scanner(SignatureEngine(deadline=deadline, strict=strict))
     while tips:
         raw = _git(
@@ -215,17 +216,18 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                     cache.move_to_end(oid)
                 else:
                     size = access.blob_size(oid, timeout=_call_timeout(deadline))
+                    volume += size
+                    if size < 0 or volume > MAX_READ_BYTES:
+                        raise ScanError("limite historique dépassée")
                     if size > max_file_bytes:
                         if strict:
                             raise ScanError("historique non analysable")
                         cached = "taille maximale dépassée"
                     else:
-                        volume += size
-                        if volume > MAX_READ_BYTES:
-                            raise ScanError("limite historique dépassée")
                         data = access.blob_bytes(oid, timeout=_call_timeout(deadline))
                         if len(data) != size:
                             raise ScanError("objet historique modifié")
+                        read_volume += len(data)
                         text = decode_text(data, strict=strict)
                         content_skips: list[ScanSkip] = []
                         if text is None:
@@ -290,7 +292,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
         tuple(skipped),
         commits,
         entries,
-        volume,
+        read_volume,
         time.monotonic() - started,
     )
 
