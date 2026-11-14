@@ -18,8 +18,8 @@ Invariants de sécurité :
   hook étranger alors qu'une sauvegarde existe déjà est refusé (fail-closed) ;
 - **écriture atomique** : le hook est écrit dans un fichier temporaire du
   même répertoire, ``fsync`` puis ``os.replace``, permissions ``0700`` ;
-- **anti-récursion** : le script pose ``HEIMDALL_IN_HOOK=1`` et sort
-  immédiatement si la variable vaut déjà ``1`` ;
+- **anti-récursion** : le script pose ``HEIMDALL_IN_HOOK=1`` et refuse
+  en code 2 toute variable déjà héritée, même vide ;
 - **ré-indexation sûre** : :func:`apply_and_restage` vérifie **avant** la
   remédiation qu'aucun fichier cible n'a de modification non indexée, puis
   ré-indexe le contenu exact via ``git hash-object --no-filters`` et
@@ -54,6 +54,7 @@ from heimdall.mcp.gitdiff import (
     GIT_TIMEOUT_SECONDS,
     GitAccess,
     confined_environment,
+    trusted_git_path,
 )
 from heimdall.mcp.paths import ConfinedPath, PathEscape, confine
 from heimdall.scanner.detect import MAX_FILE_BYTES
@@ -128,7 +129,7 @@ def _git_binary(root: Path) -> str:
     résolu sous la racine du dépôt (ou dans le répertoire courant, cas
     Windows) ne doit jamais être exécuté.
     """
-    git = shutil.which("git", path=os.defpath)
+    git = shutil.which("git", path=trusted_git_path())
     if git is None:
         raise HookError
     try:
@@ -398,7 +399,7 @@ def _is_chainable(path: Path) -> bool:
     return stat.S_ISREG(metadata.st_mode) and os.access(path, os.X_OK)
 
 
-def _hook_script(launcher: str, legacy: Path | None) -> bytes:
+def _hook_script(launcher: str, legacy: Path | None, *, no_allowlist: bool = False) -> bytes:
     """Génère le script POSIX, avec quoting systématique des chemins.
 
     Le hook précédent est exécuté **avant** Heimdall : s'il modifie l'index,
@@ -409,9 +410,9 @@ def _hook_script(launcher: str, legacy: Path | None) -> bytes:
         "#!/bin/sh",
         HOOK_MARKER,
         "# Généré par `heimdall hook install` : ne pas éditer à la main.",
-        'if [ "${HEIMDALL_IN_HOOK:-}" = "1" ]; then',
-        '    echo "heimdall: hook déjà en cours (HEIMDALL_IN_HOOK=1), scan ignoré" >&2',
-        "    exit 0",
+        'if [ "${HEIMDALL_IN_HOOK+x}" = "x" ]; then',
+        '    echo "heimdall: récursion ou environnement de hook hérité refusé" >&2',
+        "    exit 2",
         "fi",
         "HEIMDALL_IN_HOOK=1",
         "export HEIMDALL_IN_HOOK",
@@ -436,7 +437,7 @@ def _hook_script(launcher: str, legacy: Path | None) -> bytes:
             "unset PYTHONPATH PYTHONHOME",
             "PYTHONSAFEPATH=1",
             "export PYTHONSAFEPATH",
-            f'exec {launcher} scan --staged "$PWD"',
+            f'exec {launcher} scan --staged {"--no-allowlist " if no_allowlist else ""}"$PWD"',
         ]
     )
     return ("\n".join(lines) + "\n").encode("utf-8")
@@ -598,7 +599,7 @@ def _prepare_existing_hook(hook_path: Path, legacy_path: Path) -> tuple[bool, bo
     return False, True
 
 
-def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
+def install_hook(root: Path, *, force: bool = False, no_allowlist: bool = False) -> InstallOutcome:
     """Installe (ou met à jour) le hook ``pre-commit`` du dépôt ``root``.
 
     Un hook existant est conservé : renommé en ``pre-commit.heimdall-legacy``
@@ -634,7 +635,7 @@ def install_hook(root: Path, *, force: bool = False) -> InstallOutcome:
         previous = _read_regular(hook_path, MAX_HOOK_BYTES) if ours else None
         try:
             legacy_for_chain = legacy_path if _is_chainable(legacy_path) else None
-            script = _hook_script(launcher, legacy_for_chain)
+            script = _hook_script(launcher, legacy_for_chain, no_allowlist=no_allowlist)
             _atomic_write(hook_path, script)
             _verify_root(access)
         except BaseException:
@@ -1108,10 +1109,15 @@ def hook_install(
         "--force",
         help="Autoriser un hooksPath absolu hors du dépôt et du Git commun.",
     ),
+    no_allowlist: bool = typer.Option(
+        False,
+        "--no-allowlist",
+        help="Scanner sans aucune exclusion d'allowlist, y compris la configuration stagée.",
+    ),
 ) -> None:
     """Installe le hook pre-commit dans le dépôt indiqué."""
     try:
-        outcome = install_hook(Path(path), force=force)
+        outcome = install_hook(Path(path), force=force, no_allowlist=no_allowlist)
     except OutsideRepositoryError:
         typer.echo("hook pre-commit : hooksPath hors du dépôt (utiliser --force)", err=True)
         raise typer.Exit(code=2) from None

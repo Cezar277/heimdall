@@ -7,8 +7,9 @@ verrouillé :
   proscrit (bandit + invariant 5 : aucune commande arbitraire) ;
 - **environnement reconstruit de zéro**. ``GIT_DIR``, ``GIT_INDEX_FILE``,
   ``GIT_WORK_TREE``… hérités permettraient de rediriger le dépôt analysé
-  sans toucher au code ; ils sont simplement absents de l'environnement
-  passé au sous-processus. Idem les configurations système/global ;
+  sans toucher au code ; ils sont absents de l'environnement passé au
+  sous-processus, sauf l'index explicitement validé pour le scan CLI staged
+  (#228). Idem les configurations système/global ;
   ``HOME`` pointe vers ``os.devnull``, jamais vers la racine ni vers le ~
   du développeur ;
 - **découverte plafonnée à la racine**. ``GIT_CEILING_DIRECTORIES`` vaut le
@@ -29,7 +30,7 @@ verrouillé :
   vérifiée avec PATH hostile). Le pager hostile est prouvé inopérant
   (sorties toujours pipées) : aucun override, aucune surface ajoutée ;
 - **binaire résolu hors PATH hérité**. `shutil.which("git",
-  path=os.defpath)` : un PATH compromis ne détourne pas l'exécutable.
+  path=trusted_git_path())` : un PATH compromis ne détourne pas l'exécutable.
   Absent du défaut système → panne d'outillage, jamais de repli ;
 - **options du contrat imposées** : ``--no-ext-diff`` et ``--no-textconv``
   empêchent git d'exécuter ``diff.external`` ou les filtres ``textconv``
@@ -193,6 +194,21 @@ def confined_environment(ceiling: str) -> dict[str, str]:
     }
 
 
+def trusted_git_path() -> str:
+    """Recherche système explicite, sans reprendre le PATH de l'appelant."""
+    if os.name == "nt":
+        return os.defpath
+    return os.pathsep.join(
+        (
+            os.defpath,
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/run/current-system/sw/bin",
+            "/nix/var/nix/profiles/default/bin",
+        )
+    )
+
+
 # Délai maximal d'une commande git : un diff qui ne répond pas est une panne
 # d'outillage (INTERNAL), pas une attente sans fin.
 GIT_TIMEOUT_SECONDS: Final[float] = 30.0
@@ -292,12 +308,16 @@ class GitAccess:
     égalité du résolu. Le mode arbre et le mode `--staged` partagent donc
     exactement la même définition d'une racine acceptable — pas de seconde
     garde divergente. La racine est figée sous forme résolue et tous les
-    usages (`-C`, plafond, comparaisons) partent de cette forme.
+    usages (`-C`, plafond, comparaisons) partent de cette forme. L'option
+    explicite ``index_file`` est réservée au scan staged de la CLI ; sa
+    validation n'hérite d'aucune autre variable de redirection Git.
     """
 
-    __slots__ = ("_ceiling", "_git", "_root", "_root_id")
+    __slots__ = ("_ceiling", "_git", "_index_file", "_index_id", "_root", "_root_id")
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, index_file: str | None = None) -> None:
+        self._index_file: Path | None = None
+        self._index_id: tuple[int, int] | None = None
         try:
             self._root = _resolve_root(root)
         except ScanError:
@@ -329,11 +349,10 @@ class GitAccess:
         # Plafond figé avec la racine (lexical, sans I/O) : voir `confined_environment`.
         self._ceiling = str(self._root.parent)
         # Jamais le PATH hérité : un PATH compromis (poste, CI, direnv)
-        # détournerait le binaire exécuté à chaque outil. `os.defpath`
-        # (`/bin:/usr/bin` sur POSIX) est le défaut système sûr, pas une
-        # liste codée en dur (portable : Nix, macOS...). Absent → panne
-        # d'outillage, jamais de repli vers un PATH non fiable.
-        binary = shutil.which("git", path=os.defpath)
+        # détournerait le binaire exécuté à chaque outil. Le défaut système
+        # est complété par les préfixes système Homebrew/Nix (#228).
+        # Absent → panne d'outillage, jamais de repli vers le PATH hérité.
+        binary = shutil.which("git", path=trusted_git_path())
         if binary is None:
             # Panne d'outillage : message statique, jamais de chemin ni de
             # contenu reflété (invariant 8).
@@ -357,6 +376,60 @@ class GitAccess:
         if resolved.is_relative_to(self._root) or resolved.parent == cwd:
             raise ToolFailure("INTERNAL")
         self._git = binary
+        if index_file is not None:
+            self._select_index(index_file)
+
+    def _select_index(self, raw: str) -> None:
+        """Accepte uniquement un index régulier du Git dir de CE worktree.
+
+        La découverte du Git dir utilise l'environnement confiné par défaut.
+        Un worktree lié possède son propre index dans .git/worktrees/<nom>.
+        Aucun GIT_DIR/GIT_WORK_TREE hérité ne participe à cette validation.
+        """
+        if not raw or any(character in raw for character in ("\x00", "\n", "\r")):
+            raise ToolFailure("INTERNAL")
+        completed = self.execute(("rev-parse", "--absolute-git-dir"))
+        directory = completed.stdout.removesuffix(b"\n")
+        if (
+            completed.returncode
+            or not directory
+            or any(c in directory for c in (b"\x00", b"\n", b"\r"))
+        ):
+            raise ToolFailure("INTERNAL")
+        try:
+            git_dir = _resolve_root(Path(os.fsdecode(directory)))
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = self._root / candidate
+            index = _resolve_root(candidate)
+            if index.parent != git_dir or not (
+                index.name in {"index", "index.lock"}
+                or re.fullmatch(r"next-index-[0-9]+\.lock", index.name)
+            ):
+                raise ToolFailure("INTERNAL")
+            metadata = index.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ToolFailure("INTERNAL")
+        except (ScanError, OSError, ValueError):
+            raise ToolFailure("INTERNAL") from None
+        self._index_file = index
+        self._index_id = (metadata.st_dev, metadata.st_ino)
+
+    def _environment(self) -> dict[str, str]:
+        environment = confined_environment(self._ceiling)
+        if self._index_file is not None:
+            try:
+                index = _resolve_root(self._index_file)
+                metadata = index.lstat()
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or (metadata.st_dev, metadata.st_ino) != self._index_id
+                ):
+                    raise ToolFailure("INTERNAL")
+            except (ScanError, OSError):
+                raise ToolFailure("INTERNAL") from None
+            environment["GIT_INDEX_FILE"] = str(index)
+        return environment
 
     @property
     def root(self) -> Path:
@@ -403,7 +476,7 @@ class GitAccess:
                 capture_output=True,
                 check=False,
                 timeout=timeout,
-                env=confined_environment(self._ceiling),
+                env=self._environment(),
             )
         except (OSError, subprocess.TimeoutExpired):
             # Panne d'outillage (binaire absent, délai dépassé) : message
@@ -581,7 +654,7 @@ class GitAccess:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env=confined_environment(self._ceiling),
+                env=self._environment(),
             )
         except OSError:
             raise ToolFailure("INTERNAL") from None
@@ -736,7 +809,7 @@ class GitAccess:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env=confined_environment(self._ceiling),
+                env=self._environment(),
             )
         except OSError:
             raise ToolFailure("INTERNAL") from None
