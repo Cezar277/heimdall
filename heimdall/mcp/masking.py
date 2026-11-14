@@ -189,7 +189,7 @@ _NETRC_PASSWORD: Final[re.Pattern[str]] = re.compile(
     r"(?:"
     r"(?P<quote>[\"'`])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=quote)"
     r"|[\"'`](?P<unclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
-    r"|(?P<value>[^\s\"'`(){}\[\]][^\s\"']*)"
+    r"|(?P<value>[^\s\"'`(){}\[\]][^\s\"']*)(?=\s|$)"
     r")"
 )
 
@@ -690,6 +690,14 @@ def _netrc_spans(match: re.Match[str]) -> list[_Match]:
         group = "value"
     key = match.group("key")
     value = match.group(group)
+    if group == "value" and key.lower() not in {"password", "passwd", "pwd"}:
+        line_start = match.string.rfind("\n", 0, match.start("key")) + 1
+        at_line_start = not match.string[line_start : match.start("key")].strip()
+        has_signal = value.lower().startswith(_KNOWN_PREFIXES) or any(
+            character.isdigit() or character == "*" for character in value
+        )
+        if not at_line_start and not has_signal:
+            return []
     if _CODE_LITERAL.match(value) or not _looks_like_secret(key, value):
         return []
     return [_span_match(match, group, _secret_type(key, value))]

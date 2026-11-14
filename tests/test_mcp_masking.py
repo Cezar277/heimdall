@@ -348,6 +348,8 @@ class AuditE03MaskingProofTests(unittest.TestCase):
             "password $SECRET_ENV",
             "--name bob",
             "curl -u admin:$SECRET_ENV https://x",
+            "# Token d'authentification à générer",
+            "# Token authentication required",
         ):
             with self.subTest(readable=line):
                 self.assertEqual(masking.mask_text(line), (line, 0))
