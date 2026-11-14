@@ -85,6 +85,18 @@ def test_unknown_and_known_binary_content_is_classified(data: bytes) -> None:
     assert decode_text(data, strict=False) is None
 
 
+def test_cp1252_fallback_preserves_ascii_secret_amid_binary_noise(repo: GitRepo) -> None:
+    # CP1252 est une présomption de texte : un binaire sans NUL ni magie peut
+    # être compté comme texte, mais un secret ASCII contigu reste analysé.
+    payload = b"\xe9" + b"\x01" * 100 + f'TOKEN = "{SYNTHETIC}"\n'.encode()
+    repo.write_bytes("payload.dat", payload)
+    repo.stage("payload.dat")
+    report = collect(repo.root, staged=True, allowlist=Allowlist.empty(), strict=False)
+    assert any(item.file == "payload.dat" for item in report.findings)
+    assert report.complete
+    assert SYNTHETIC not in render_json(report)
+
+
 @pytest.mark.parametrize("staged", [False, True])
 def test_oversized_file_is_not_read(
     repo: GitRepo, monkeypatch: pytest.MonkeyPatch, staged: bool
