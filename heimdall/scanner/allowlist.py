@@ -386,6 +386,8 @@ def _group_end(raw: str, start: int) -> int:
 
 
 def _escaped_literal(segment: str, start: int) -> tuple[int, int]:
+    if start < 0 or start + 1 >= len(segment):
+        raise ScanError(_CONFIG_ERROR)
     escaped = segment[start + 1]
     if escaped in "dDwWsSbBAZz123456789":
         return 0, start + 2
@@ -393,7 +395,10 @@ def _escaped_literal(segment: str, start: int) -> tuple[int, int]:
     if escaped in widths:
         return 1, start + 2 + widths[escaped]
     if escaped == "N":
-        return 1, segment.index("}", start + 2) + 1
+        try:
+            return 1, segment.index("}", start + 2) + 1
+        except ValueError:
+            raise ScanError(_CONFIG_ERROR) from None
     if escaped == "0":
         end = start + 2
         while end < min(start + 4, len(segment)) and segment[end] in "01234567":

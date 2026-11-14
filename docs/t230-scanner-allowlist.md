@@ -83,6 +83,10 @@ Les globs de chemin sont sensibles à la casse sur toutes les plateformes :
 `*`, `?`, `[...]` restent dans un segment ; seul un segment `**` traverse
 zéro ou plusieurs répertoires. Ainsi `tests/*` ne couvre plus
 `tests/nested/file.py` ; employer `tests/**` si ce périmètre est voulu.
+« Zéro » inclut le préfixe lui-même : `logs/**` couvre aussi un fichier
+nommé `logs`. Pour ne couvrir que les descendants, utiliser `logs/*` pour
+un niveau, ou `logs/*/**` pour une profondeur quelconque avec au moins un
+segment consommé après `logs`.
 Une règle exige toujours un critère portant sur la valeur : un chemin ne
 suffit pas à supprimer un finding. Les plafonds de chemin et de jokers
 restent appliqués.

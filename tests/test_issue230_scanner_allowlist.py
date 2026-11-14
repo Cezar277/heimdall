@@ -16,7 +16,13 @@ from typer.testing import CliRunner
 from heimdall.cli.fix import run_fix
 from heimdall.cli.main import app
 from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
-from heimdall.scanner.allowlist import AllowlistRule, _compile_safe_regex, _split_alternatives
+from heimdall.scanner.allowlist import (
+    AllowlistRule,
+    _compile_safe_regex,
+    _count_literal_chars,
+    _escaped_literal,
+    _split_alternatives,
+)
 from heimdall.scanner.entropy_detection import EntropyConfig, find_line_matches
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.hashing import SnippetHasher
@@ -172,6 +178,10 @@ def test_alternation_split_respects_groups_escapes_and_classes() -> None:
         ("**/fixtures/*.txt", "fixtures/demo.txt", True),
         ("**/fixtures/*.txt", "deep/fixtures/demo.txt", True),
         ("tests/*", "Tests/fixture.py", False),
+        ("logs/**", "logs", True),
+        ("logs/*/**", "logs", False),
+        ("logs/*/**", "logs/a", True),
+        ("logs/*/**", "logs/a/b", True),
     ],
 )
 def test_allowlist_path_globs_are_segment_scoped(pattern: str, path: str, expected: bool) -> None:
@@ -391,3 +401,27 @@ def test_git_discovery_refuses_symlinked_metadata_before_execution(
 
     monkeypatch.setattr("heimdall.vault.atomic.GitAccess.execute", forbidden)
     assert _get_git_toplevel(repo.root / ".env") is None
+
+
+@pytest.mark.parametrize("path", ["helper", "counter", "compiler"])
+@pytest.mark.parametrize("pattern", ["\\", "EXAMPLE\\", r"\N", r"\N{INCOMPLETE"])
+def test_malformed_escapes_always_use_static_scan_error(path: str, pattern: str) -> None:
+    with pytest.raises(ScanError, match="^configuration allowlist invalide$"):
+        if path == "helper":
+            _escaped_literal(pattern, pattern.rfind("\\"))
+        elif path == "counter":
+            _count_literal_chars(pattern)
+        else:
+            _compile_safe_regex(pattern)
+
+
+@pytest.mark.parametrize("start", [-1, 2])
+def test_invalid_escape_offsets_use_scan_error(start: int) -> None:
+    with pytest.raises(ScanError, match="^configuration allowlist invalide$"):
+        _escaped_literal(r"\n", start)
+
+
+@pytest.mark.parametrize("pattern", [r"\x41BC", r"\N{LATIN CAPITAL LETTER A}BC"])
+def test_valid_escape_literals_still_count_as_required_markers(pattern: str) -> None:
+    assert _count_literal_chars(pattern) == 3
+    assert _compile_safe_regex(pattern).fullmatch("ABC") is not None
