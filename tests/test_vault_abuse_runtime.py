@@ -96,21 +96,20 @@ class BruteforceAbuseTests(unittest.IsolatedAsyncioTestCase):
         key = generate_api_key()
         app.state.register_api_key(key, "demo")
         async with _client(app) as client:
+            # Requêtes anonymes : elles consomment le budget peer anonyme,
+            # séparé du budget des clients authentifiés (audit M-02).
             first = await client.get(
-                SECRET_PATH,
-                headers={"X-Heimdall-API-Key": key, "X-Forwarded-For": "203.0.113.1"},
+                SECRET_PATH, headers={"X-Forwarded-For": "203.0.113.1"}
             )
             second = await client.get(
-                SECRET_PATH,
-                headers={"X-Heimdall-API-Key": key, "X-Forwarded-For": "203.0.113.2"},
+                SECRET_PATH, headers={"X-Forwarded-For": "203.0.113.2"}
             )
             third = await client.get(
-                SECRET_PATH,
-                headers={"X-Heimdall-API-Key": key, "X-Forwarded-For": "203.0.113.3"},
+                SECRET_PATH, headers={"X-Forwarded-For": "203.0.113.3"}
             )
         self.assertEqual(
             [first.status_code, second.status_code, third.status_code],
-            [404, 404, 429],
+            [401, 401, 429],
         )
 
 

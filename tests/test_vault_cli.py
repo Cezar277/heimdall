@@ -582,7 +582,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "BIG_00",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "x" * 65_536,
                 }
                 mock_init.return_value = client_instance
@@ -818,7 +818,7 @@ class VaultPullCliTests(unittest.TestCase):
                 "project": project,
                 "env": env,
                 "name": name,
-                "status": "actif",
+                "status": "vaulte",
                 "value": "found_val",
             }
 
@@ -940,7 +940,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SAFE_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "secret_val",
                 }
                 mock_init.return_value = client_instance
@@ -970,7 +970,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SAFE_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "secret_val",
                 }
                 mock_init.return_value = client_instance
@@ -1018,7 +1018,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SAFE_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "secret_val",
                 }
                 mock_init.return_value = client_instance
@@ -1066,7 +1066,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "BIG_00",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "x" * 65_536,
                 }
                 mock_init.return_value = client_instance
@@ -1205,7 +1205,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "EVIL_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "x\ny=1",
                 }
                 mock_init.return_value = client_instance
@@ -1238,7 +1238,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "EVIL_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "x\ry=1",
                 }
                 mock_init.return_value = client_instance
@@ -1278,7 +1278,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SAFE_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "safe_val",
                 }
                 mock_init.return_value = client_instance
@@ -1319,7 +1319,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SAFE_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "safe_val",
                 }
                 mock_init.return_value = client_instance
@@ -1355,7 +1355,7 @@ class VaultPullCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SPECIAL_VALUE",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": value,
                 }
                 mock_init.return_value = client_instance
@@ -1694,7 +1694,7 @@ class VaultPullCliTests(unittest.TestCase):
                 }
                 mock_init.return_value = client_instance
 
-                with patch("heimdall.vault.atomic.shutil.which", return_value=None):
+                with patch("heimdall.mcp.gitdiff.shutil.which", return_value=None):
                     result = self.runner.invoke(
                         app,
                         [
@@ -1819,7 +1819,6 @@ class VaultRunCliTests(unittest.TestCase):
             "DOTNET_STARTUP_HOOKS",
             "COMPOSE_FILE",
             "DOCKER_HOST",
-            "AWS_SECRET_ACCESS_KEY",
             "TF_CLI_CONFIG_FILE",
             "KUBECONFIG",
             "HOME",
@@ -1840,7 +1839,7 @@ class VaultRunCliTests(unittest.TestCase):
                             "project": "demo",
                             "env": "dev",
                             "name": var_name,
-                            "status": "actif",
+                            "status": "vaulte",
                             "value": "/opt/evil",
                         }
                         mock_init.return_value = client_instance
@@ -1881,7 +1880,7 @@ class VaultRunCliTests(unittest.TestCase):
                             "project": "demo",
                             "env": "dev",
                             "name": var_name,
-                            "status": "actif",
+                            "status": "vaulte",
                             "value": "attacker_controlled",
                         }
                         mock_init.return_value = client_instance
@@ -1930,7 +1929,7 @@ class VaultRunCliTests(unittest.TestCase):
                             "project": "demo",
                             "env": "dev",
                             "name": var_name,
-                            "status": "actif",
+                            "status": "vaulte",
                             "value": "attacker_controlled",
                         }
                         mock_init.return_value = client_instance
@@ -1974,7 +1973,7 @@ class VaultRunCliTests(unittest.TestCase):
                             "project": "demo",
                             "env": "dev",
                             "name": var_name,
-                            "status": "actif",
+                            "status": "vaulte",
                             "value": "attacker_controlled",
                         }
                         mock_init.return_value = client_instance
@@ -2010,7 +2009,7 @@ class VaultRunCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SAFE_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "secret_val",
                 }
                 mock_init.return_value = client_instance
@@ -2051,7 +2050,7 @@ class VaultRunCliTests(unittest.TestCase):
                 "project": "demo",
                 "env": "dev",
                 "name": "SAFE_VAR",
-                "status": "actif",
+                "status": "vaulte",
                 "value": "secret_val",
             }
 
@@ -2091,7 +2090,7 @@ class VaultRunCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SAFE_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "secret_val",
                 }
                 mock_init.return_value = client_instance
@@ -2111,7 +2110,7 @@ class VaultRunCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SAFE_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "secret_val",
                 }
                 mock_init.return_value = client_instance
@@ -2143,7 +2142,7 @@ class VaultRunCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "RESOLVED_FROM_ENV",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "val",
                 }
                 mock_init.return_value = client_instance
@@ -2225,7 +2224,7 @@ class VaultRunCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "SAFE_VAR",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "val",
                 }
                 mock_init.return_value = client_instance
@@ -2270,7 +2269,7 @@ class VaultRunCliTests(unittest.TestCase):
                             "project": "demo",
                             "env": "dev",
                             "name": var_name,
-                            "status": "actif",
+                            "status": "vaulte",
                             "value": "/opt/evil",
                         }
                         mock_init.return_value = client_instance
@@ -2306,7 +2305,7 @@ class VaultRunCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "PS4",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "evil_prompt",
                 }
                 mock_init.return_value = client_instance
@@ -2343,7 +2342,7 @@ class VaultRunCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "NULL_VAL",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "embedded\x00null",
                 }
                 mock_init.return_value = client_instance
@@ -2407,7 +2406,7 @@ class VaultRunCliTests(unittest.TestCase):
                     "project": "demo",
                     "env": "dev",
                     "name": "MY_SECRET",
-                    "status": "actif",
+                    "status": "vaulte",
                     "value": "clean_value",
                 }
                 mock_init.return_value = client_instance

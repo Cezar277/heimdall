@@ -79,6 +79,8 @@ class VaultTlsTransportTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        cls._previous_env = os.environ.get("HEIMDALL_ENV")
+        os.environ["HEIMDALL_ENV"] = "test"
         cls._tmp = tempfile.TemporaryDirectory(prefix="heimdall-tls-")
         tmp_dir = Path(cls._tmp.name)
         cls.certfile, cls.keyfile = _generate_self_signed_cert(tmp_dir)
@@ -109,6 +111,10 @@ class VaultTlsTransportTests(unittest.TestCase):
         cls.server.should_exit = True
         cls.thread.join(timeout=15)
         cls._tmp.cleanup()
+        if cls._previous_env is None:
+            os.environ.pop("HEIMDALL_ENV", None)
+        else:
+            os.environ["HEIMDALL_ENV"] = cls._previous_env
 
     def test_certificate_advertises_loopback_ip_san(self) -> None:
         """Le certificat servi porte bien le SAN IP 127.0.0.1 (pas seulement le CN)."""

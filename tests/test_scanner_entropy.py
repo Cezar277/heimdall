@@ -108,7 +108,7 @@ def test_unquoted_env_assignment_is_detected(alphabet: str) -> None:
 def test_invalid_byte_inside_candidate_is_fail_closed(tmp_path: Path) -> None:
     (tmp_path / "config.py").write_bytes(b"AKIA12345678\xff12345678")
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
-        TreeScanner(tmp_path, hasher=SnippetHasher(key=b"T" * 32)).scan()
+        TreeScanner(tmp_path, hasher=SnippetHasher(key=b"T" * 32), strict=True).scan()
 
 
 def test_complete_assignment_does_not_hide_an_incomplete_one() -> None:
@@ -224,7 +224,7 @@ def test_multiline_overflow_is_not_provider_specific(tmp_path: Path, label: str)
     (tmp_path / "config.py").write_text(text)
     hasher = SnippetHasher(key=b"T" * 32)
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
-        TreeScanner(tmp_path, hasher=hasher).scan()
+        TreeScanner(tmp_path, hasher=hasher, strict=True).scan()
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
         SignatureEngine(hasher).analyser(FileTarget("config.py", text))
 
@@ -263,7 +263,7 @@ def test_megabyte_token_and_expired_deadline_in_both_engines(tmp_path: Path) -> 
     hasher = SnippetHasher(key=b"T" * 32)
     for deadline in (None, 0.0):
         with pytest.raises(ScanError):
-            TreeScanner(tmp_path, hasher=hasher).scan(deadline=deadline)
+            TreeScanner(tmp_path, hasher=hasher, strict=True).scan(deadline=deadline)
         with pytest.raises(ScanError):
             SignatureEngine(hasher, deadline=deadline).analyser(FileTarget("config.py", text))
 
@@ -385,7 +385,7 @@ def test_benign_minified_json_overflow_is_an_explicit_refusal(tmp_path: Path) ->
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
         check_multiline_overflow(line, "{}")
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
-        TreeScanner(tmp_path, hasher=hasher).scan()
+        TreeScanner(tmp_path, hasher=hasher, strict=True).scan()
     with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
         SignatureEngine(hasher).analyser(FileTarget("data.jsonl", text))
 
@@ -475,8 +475,10 @@ def test_signature_results_are_reused_for_lines_and_adjacent_windows(
         if engine == "tree"
         else SignatureEngine(hasher).analyser(FileTarget("config.py", text))
     )
-    assert [(f.line, f.type, f.source) for f in findings] == [(1, "aws", "regex")]
-    assert calls == [lines[0], lines[0] + lines[1], lines[1], lines[1] + lines[2], lines[2]]
+    assert [(f.line, f.type, f.source) for f in findings] == [
+        (1, "aws", "regex"), (1, "credential", "regex"),
+    ]
+    assert calls == [lines[0] + lines[1], lines[0], lines[1] + lines[2], lines[1], lines[2]]
 
 
 def test_dense_line_checks_deadline_after_its_single_signature_scan(monkeypatch) -> None:

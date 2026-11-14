@@ -6,9 +6,9 @@ nominale est un contournement trivial : il suffit de renommer le fichier
 secret ne soit ni signalé ni refusé. Le **contenu** décide :
 
 - un fichier **textuel** est décodé puis scanné ;
-- un contenu non décodable lève ``ScanError`` ; un binaire **connu** est
-  reconnu comme non textuel (``None``) et le scanner le refuse en
-  ``ScanError`` : il n'est jamais ignoré silencieusement.
+- un contenu sans décodage textuel plausible rend ``None`` : le scanner le
+  trace comme binaire, ou le refuse en mode strict (#229) ;
+- un texte non UTF-8 bénéficie d'un repli CP1252, sans exécution de contenu.
 
 Dans le scanner, seule la base VCS (``.git/``, ``.hg/``, ``.svn/``) est
 écartée : ce n'est pas le contenu du dépôt. Aucune exclusion nominale n'est
@@ -81,7 +81,7 @@ _DECODE_ERROR: Final[str] = "scan impossible : entrée non analysable"
 # Signatures fortes de formats binaires connus. Un contenu qui porte l'une
 # d'elles ET reste majoritairement binaire est reconnu comme non textuel par
 # ``decode_text`` (retour ``None``) : le scanner d'arbre et la CLI ``--staged``
-# le refusent alors en ``ScanError`` (fail-closed), jamais un skip silencieux.
+# le tracent ou le refusent selon la politique explicite, jamais silencieusement.
 _BINARY_MAGIC: Final[tuple[bytes, ...]] = (
     b"\x7fELF",
     b"\x89PNG\r\n\x1a\n",
@@ -196,7 +196,7 @@ def _is_known_binary(data: bytes) -> bool:
     Même critère que ``decode_text`` pour rendre ``None`` : une signature
     magique connue **et** un ratio d'octets binaires ≥ 0,5. Helper interne :
     il ne décide jamais du périmètre à lui seul et le scanner ne le consulte
-    pas par son nom. Un binaire inconnu (NUL + texte) reste fail-closed.
+    pas par son nom. Les binaires inconnus passent aussi par le décodeur.
     """
     return any(data.startswith(magic) for magic in _BINARY_MAGIC) and (
         _binary_byte_ratio(data) >= _BINARY_RATIO_MIN
@@ -224,16 +224,16 @@ def is_known_binary(data: bytes) -> bool:
     return _is_known_binary(data)
 
 
-def decode_text(data: bytes) -> str | None:
-    """Décode un fichier texte ou identifie un binaire connu.
+def decode_text(data: bytes, *, strict: bool = True) -> str | None:  # noqa: PLR0911, PLR0912 - encodages distincts
+    """Décode un texte ou rend None pour un contenu non textuel (#229).
 
     - BOM UTF-8/UTF-16/UTF-32 : décodage strict ;
     - UTF-16/UTF-32 sans BOM : heuristique bornée, jamais de remplacement ;
-    - UTF-8 invalide sans NUL : ScanError statique (#23) ;
+    - UTF-8 invalide sans NUL : repli CP1252, ou refus avec strict=True ;
     - signature binaire **et** contenu majoritairement binaire : reconnu
-      comme non textuel (``None``), l'appelant le refuse (une simple signature
+      comme non textuel (``None``), l'appelant le trace ou le refuse (une simple signature
       suivie de texte clair ne suffit pas : ce serait un contournement) ;
-    - NUL sans décodage possible : ``ScanError``.
+    - NUL sans décodage possible : None, ou ScanError avec strict=True.
 
     Le nom du fichier n'intervient jamais : un ``evil.png`` dont le contenu
     est du texte est décodé et scanné comme un ``.txt``.
@@ -248,17 +248,34 @@ def decode_text(data: bytes) -> str | None:
         (codecs.BOM_UTF8, "utf-8-sig"),
     ):
         if data.startswith(bom):
-            return _decode_exact(data, encoding)
+            try:
+                return _decode_exact(data, encoding)
+            except ScanError:
+                if strict:
+                    raise
+                return None
     if b"\x00" not in data:
         try:
-            return data.decode("utf-8")
+            text = data.decode("utf-8")
+            # Du bruit de contrôle autour d'un candidat ASCII ne doit pas
+            # transformer un texte UTF-8 valide en exclusion binaire.
+            return text
         except UnicodeDecodeError:
             if _is_known_binary(data):
                 return None
-            raise ScanError(_DECODE_ERROR) from None
+            if strict:
+                raise ScanError(_DECODE_ERROR) from None
+            # CP1252 préserve les secrets ASCII et les textes occidentaux.
+            # Aucun remplacement silencieux : l'appelant trace l'exclusion.
+            try:
+                return data.decode("cp1252")
+            except UnicodeDecodeError:
+                return None
     decoded = _decode_utf16_or_32(data)
     if decoded is not None:
         return decoded
     if _is_known_binary(data):
         return None
-    raise ScanError(_DECODE_ERROR)
+    if strict:
+        raise ScanError(_DECODE_ERROR)
+    return None

@@ -106,6 +106,16 @@ def _decrypt_record(
 ) -> dict[str, str]:
     """Déchiffre un enregistrement (enveloppe #70 ou ligne héritée) en clair."""
     aad = VaultCipher.aad(project, env, name)
+    status = str(record.get("status", "vaulte"))
+    if status == "rote":
+        # Un secret roté ne conserve plus de valeur chiffrée (audit F-03).
+        return {
+            "project": str(record.get("project", record.get("project_id", project))),
+            "env": str(record["env"]),
+            "name": str(record["name"]),
+            "status": status,
+            "value": "",
+        }
     try:
         encrypted_dek = str(record.get("encrypted_dek") or "")
         if encrypted_dek:
@@ -186,6 +196,13 @@ class InMemorySecretStore:
     def kek_version(self) -> int:
         """Numéro de version courant de la KEK gérée par ce store."""
         return self._kek_version
+
+    def audit_hmac_key(self) -> bytes:
+        """Sous-clé HMAC d'audit du chiffreur actif (moindre privilège, F-16).
+
+        Le chiffreur lui-même (qui porte la KEK) n'est jamais exposé.
+        """
+        return self._cipher.audit_hmac_key()
 
     async def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
         async with self._lock:
@@ -515,6 +532,11 @@ class InMemorySecretStore:
             occurred_at = get_iso_timestamp()
             safe_actor = normalize_transition_actor(actor)
             record["status"] = target
+            if target == "rote":
+                # Efface la valeur et la DEK : un retour en base à ``vaulte``
+                # ne peut pas restituer l'ancien secret via l'API (audit F-03).
+                record["encrypted_value"] = ""
+                record["encrypted_dek"] = None
             journal = self._transitions.get(project)
             if journal is None:
                 journal = deque(maxlen=MAX_SECRET_TRANSITIONS)
@@ -761,6 +783,13 @@ class SqliteSecretStore:
     def kek_version(self) -> int:
         """Numéro de version courant de la KEK gérée par ce store."""
         return self._kek_version
+
+    def audit_hmac_key(self) -> bytes:
+        """Sous-clé HMAC d'audit du chiffreur actif (moindre privilège, F-16).
+
+        Le chiffreur lui-même (qui porte la KEK) n'est jamais exposé.
+        """
+        return self._cipher.audit_hmac_key()
 
     def _detect_current_kek_version(self) -> int:
         """Détecte la version KEK maximale persistée dans la base.

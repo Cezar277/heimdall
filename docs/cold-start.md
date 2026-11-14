@@ -70,6 +70,11 @@ figées au début et relues avant le verdict : une divergence produit une
 `ScanError` statique et un code 2. Cette vérification compare les ensembles de
 SHA observés aux deux instants ; ce n'est pas un verrou des références. Une
 écriture après la vérification finale nécessite de relancer le scan.
+La seconde passe du cold start ne relit que les fichiers porteurs de findings,
+mais l'état Git du worktree (fichiers suivis et non suivis) est comparé avant
+et après : un fichier propre modifié entre les passes provoque `ScanError`.
+Pour un verdict opposable, figer le dépôt (checkout CI, worktree dédié) ou
+relancer le cold start.
 Les commits sont énumérés par lots de 128 ; un seul arbre et
 un seul blob sont lus à la fois. Cette variante de `rev-list` puis lecture
 des snapshots permet aussi d'associer les commits où le secret reste inchangé
@@ -97,17 +102,27 @@ Le scan ne fait aucun checkout, fetch, filtre textconv ou réécriture.
 Les variables Git héritées, les remplacements et les grafts locaux sont
 neutralisés. Les symlinks ne sont jamais suivis sur le disque : leur blob Git
 `120000`, qui contient le texte de leur cible, est scanné comme en `--staged`.
-Les commits de sous-modules (`160000`) sont exclus ; les binaires
-connus sont refusés (code 2), comme dans les scans arbre et index. Les objets
-absents, clones superficiels, sorties invalides
-et dépassements de budget donnent une erreur d'outillage. Les commits devenus
+Les commits de sous-modules (`160000`) sont exclus. Les binaires et contenus
+hors borne sont désormais signalés dans `skipped` avec leur chemin et leur
+commit, et rendent `complete: false` (#229). `deep-scan --strict` les refuse.
+Sans `--strict`, un rapport historique partiel produit 1 si un candidat est
+détecté, 2 sinon ; il ne produit jamais 0. L'API `collect_history` reste
+stricte par défaut ; `strict=False` est un choix explicite de collecte.
+`cold-start` est tolérant par défaut ; `cold-start --strict` refuse les
+contenus exclus (code 2) dès la collecte. L'API `collect_cold_start` est stricte
+par défaut, comme `collect` et `collect_history` ; la CLI passe `strict`
+explicitement. Sans `--strict`, un rapport
+partiel est refusé par le code 2, jamais présenté comme propre.
+Les objets absents, clones superficiels, sorties invalides et dépassements
+de budget restent des erreurs d'outillage. Voir la
+[politique de tolérance](scanner-tolerance.md).
+
+Les commits devenus
 inaccessibles (objets pendants, reflogs seuls) et les dépôts de sous-modules
 ne font pas partie de ce périmètre.
 
-Le nom du fichier n'autorise aucune exclusion : un contenu binaire ou
-indécodable est refusé, quel que soit son suffixe. Un contenu inconnu avec
-NUL et texte dans `evil.png` est refusé
-en `ScanError` / code 2. Le parseur d'arbres convertit aussi les noms non UTF-8
+Le nom du fichier n'autorise aucune exclusion : le contenu et ses limites
+décident du traitement, avec des traces ou un refus en mode strict. Le parseur d'arbres convertit aussi les noms non UTF-8
 et chemins invalides en `ScanError` statique.
 
 `complete=True` signifie complet dans ce périmètre : aucun binaire ou blob

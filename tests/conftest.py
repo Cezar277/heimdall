@@ -9,6 +9,25 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _heimdall_env_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Défaut de test explicite : ``HEIMDALL_ENV=test``.
+
+    Depuis l'audit M-13, l'absence de ``HEIMDALL_ENV`` vaut production. Les
+    tests qui veulent tester ce défaut suppriment la variable explicitement.
+    """
+    monkeypatch.setenv("HEIMDALL_ENV", "test")
+    # Clé HMAC dédiée au journal d'audit (audit F-16) : partagée par l'app et
+    # la CLI dans un même run de tests.
+    # Import paresseux : certains jobs CI (modèle de sécurité) n'installent pas
+    # les dépendances Vault (argon2) et n'ont pas besoin de cette clé.
+    try:
+        from heimdall.vault.crypto import generate_server_hmac_key  # noqa: PLC0415
+    except ImportError:
+        return
+    monkeypatch.setenv("HEIMDALL_VAULT_AUDIT_HMAC_KEY", generate_server_hmac_key())
+
+
+@pytest.fixture(autouse=True)
 def _umask_022() -> Iterator[None]:
     """Umask déterministe : un runner peut tourner en 0002 (dossiers 0775).
 

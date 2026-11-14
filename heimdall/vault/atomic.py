@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import secrets
-import shutil
 import stat
-import subprocess  # nosec B404
 import tempfile
 from pathlib import Path
 from typing import Final
+
+from heimdall.mcp.gitdiff import GitAccess
 
 _DEFAULT_SECURE_MODE: Final[int] = 0o600
 _MAX_BACKUP_BYTES: Final[int] = 1_048_576
@@ -650,9 +651,33 @@ def read_file_secure_no_follow(  # noqa: PLR0911, PLR0912
         return None
 
 
+def _strip_env_inline_comment(raw_value: str) -> str:
+    """Supprime un éventuel commentaire de fin de ligne hors chaînes quotées."""
+    value = raw_value.strip()
+    if not value or value.startswith("#"):
+        return ""
+    quote = value[0]
+    if quote in ('"', "'"):
+        index = 1
+        while index < len(value):
+            char = value[index]
+            if quote == '"' and char == "\\" and index + 1 < len(value):
+                index += 2
+                continue
+            if char == quote:
+                trailing = value[index + 1 :]
+                if not trailing or trailing.lstrip().startswith("#"):
+                    return value[: index + 1]
+                return value
+            index += 1
+        return value
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
 def parse_env_file(path: Path) -> dict[str, str] | None:
     """Parse un fichier .env en extrayant les paires clé=valeur.
 
+    Gère le préfixe optionnel ``export `` et les commentaires de fin de ligne.
     Ignore les commentaires (#...) et les lignes vides.
     Refuse de suivre les liens symboliques (anti-exfiltration).
     Retourne None si le fichier ne peut pas être lu (symlink, permission, non-régulier).
@@ -661,17 +686,20 @@ def parse_env_file(path: Path) -> dict[str, str] | None:
     content = read_file_secure_no_follow(path)
     if content is None:
         return None
-    secrets: dict[str, str] = {}
+    secrets_map: dict[str, str] = {}
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
         key = key.strip()
-        val = _decode_env_value(val)
+        if key.startswith(("export ", "export\t")):
+            key = key[len("export") :].strip()
+        cleaned_val = _strip_env_inline_comment(val)
+        decoded_val = _decode_env_value(cleaned_val)
         if key:
-            secrets[key] = val
-    return secrets
+            secrets_map[key] = decoded_val
+    return secrets_map
 
 
 def parse_example_names(path: Path) -> list[str] | None:
@@ -696,6 +724,8 @@ def parse_example_names(path: Path) -> list[str] | None:
         if not line or line.startswith("#"):
             continue
         key = line.partition("=")[0].strip()
+        if key.startswith(("export ", "export\t")):
+            key = key[len("export") :].strip()
         # Dédoublonnage O(1) : un .env.example d'1 Mio peut contenir ~200k
         # noms ; `key not in names` (liste) était O(n²), DoS CPU local.
         if key and key not in seen:
@@ -704,38 +734,61 @@ def parse_example_names(path: Path) -> list[str] | None:
     return names
 
 
+def _find_repo_dir_without_symlinks(start: Path) -> Path | None:
+    """Premier ancêtre portant ``.git``, par ``lstat`` seulement.
+
+    Retourne ``None`` si un ancêtre ou ``.git`` lui-même est un lien
+    symbolique (fail-closed), ou si aucun dépôt n'est trouvé.
+    """
+    for candidate in (start, *start.parents):
+        try:
+            if stat.S_ISLNK(os.lstat(candidate).st_mode):
+                return None
+            git_entry = os.lstat(candidate / ".git")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        # ``.git`` symlinké vers l'extérieur : statut Git indéterminé.
+        return None if stat.S_ISLNK(git_entry.st_mode) else candidate
+    return None
+
+
 def _get_git_toplevel(path: Path) -> Path | None:
-    """Trouve la racine du dépôt Git contenant le chemin.
+    """Trouve la racine du dépôt Git contenant le chemin via ``GitAccess``.
 
     Sans jamais suivre les liens symboliques (``lstat``) : un répertoire
     ou un parent échangé contre un symlink ne doit pas fausser le cwd
     de ``git rev-parse`` (oracle Git trompeur, invariant 10).
     """
-    git_bin = shutil.which("git")
-    if not git_bin:
-        return None
     try:
         path_stat = os.lstat(path)
+        if stat.S_ISLNK(path_stat.st_mode):
+            return None
         is_plain_dir = stat.S_ISDIR(path_stat.st_mode) and not stat.S_ISLNK(path_stat.st_mode)
     except OSError:
         is_plain_dir = False
     parent_dir = path if is_plain_dir else path.parent
+    # ``GitAccess`` plafonne la découverte à son répertoire de travail
+    # (``GIT_CEILING_DIRECTORIES``) : on localise donc la racine nous-mêmes,
+    # par ``lstat`` seulement (aucun processus git par ancêtre). Un ancêtre
+    # symlinké arrête la recherche (fail-closed : jamais de repli sur un dépôt
+    # ancêtre sans rapport avec le fichier), puis un seul ``rev-parse``.
+    repo_dir = _find_repo_dir_without_symlinks(parent_dir)
+    if repo_dir is None:
+        return None
     try:
-        res = subprocess.run(  # noqa: S603  # nosec B603
-            [git_bin, "rev-parse", "--show-toplevel"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            cwd=parent_dir,
-            text=True,
-            check=False,
-            timeout=_GIT_TIMEOUT_SECONDS,
-        )
-        if res.returncode == 0:
-            top = res.stdout.strip()
-            if top:
-                return Path(top)
-    except Exception:  # noqa: S110  # nosec B110
-        pass
+        access = GitAccess(repo_dir)
+        res = access.execute(("rev-parse", "--show-toplevel"), timeout=_GIT_TIMEOUT_SECONDS)
+        if res.returncode != 0:
+            return None
+        top = res.stdout.decode("utf-8", errors="strict").strip()
+        # Le toplevel annoncé par Git doit être exactement le dépôt localisé
+        # par lstat, jamais un ancêtre ou une cible de lien.
+        if top and Path(top) == access.root:
+            return access.root
+    except Exception:  # noqa: BLE001  # nosec B110
+        return None
     return None
 
 
@@ -763,10 +816,7 @@ def _git_relative_path(path: Path, top: Path) -> Path | None:
 
 
 def is_git_tracked(path: Path) -> bool:
-    """Vérifie si un fichier est actuellement suivi dans Git."""
-    git_bin = shutil.which("git")
-    if not git_bin:
-        return False
+    """Vérifie si un fichier est actuellement suivi dans Git via ``GitAccess``."""
     top = _get_git_toplevel(path)
     if top is None:
         return False
@@ -774,12 +824,9 @@ def is_git_tracked(path: Path) -> bool:
     if rel is None:
         return False
     try:
-        res = subprocess.run(  # noqa: S603  # nosec B603
-            [git_bin, "ls-files", "--error-unmatch", str(rel)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=top,
-            check=False,
+        access = GitAccess(top)
+        res = access.execute(
+            ("ls-files", "--error-unmatch", str(rel)),
             timeout=_GIT_TIMEOUT_SECONDS,
         )
         return res.returncode == 0
@@ -788,10 +835,7 @@ def is_git_tracked(path: Path) -> bool:
 
 
 def is_git_ignored(path: Path) -> bool:
-    """Vérifie si un chemin est ignoré par les règles .gitignore."""
-    git_bin = shutil.which("git")
-    if not git_bin:
-        return False
+    """Vérifie si un chemin est ignoré par les règles .gitignore via ``GitAccess``."""
     top = _get_git_toplevel(path)
     if top is None:
         return False
@@ -799,12 +843,9 @@ def is_git_ignored(path: Path) -> bool:
     if rel is None:
         return False
     try:
-        res = subprocess.run(  # noqa: S603  # nosec B603
-            [git_bin, "check-ignore", "-q", str(rel)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=top,
-            check=False,
+        access = GitAccess(top)
+        res = access.execute(
+            ("check-ignore", "-q", str(rel)),
             timeout=_GIT_TIMEOUT_SECONDS,
         )
         return res.returncode == 0

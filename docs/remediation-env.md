@@ -174,6 +174,24 @@ if gitignore_diff:
 
 ## 4. Tests et vérification
 
+Pour `heimdall fix`, `--config` et `--no-allowlist` sont incompatibles,
+comme pour `scan` : la commande retourne 2 avec un message statique avant
+toute lecture du dépôt, revue ou écriture. L'API `run_fix` refuse également
+cette combinaison par `ScanError` avant accès au système de fichiers.
+Lors de la proposition d'un nom, les affectations `export FOO="…"` et
+`export\tFOO="…"` conservent `FOO`, après validation habituelle du nom et
+avant déduplication. Cela ne change pas les restrictions sur les noms
+acceptés pour la remédiation et l'exécution.
+
+Après une remédiation appliquée par `fix`, l'identité de la racine
+(`st_dev`, `st_ino`, `st_ctime_ns`) est contrôlée avant et après le rescan.
+Une disparition, redirection ou substitution du dossier refuse le bilan
+par `ScanError` (code 2 en CLI), même si le dossier substitué est propre.
+Les écritures atomiques de la remédiation changent normalement le `ctime`
+du dossier : après patch, mise à jour de l'environnement et nettoyage du
+backup, celui-ci est rafraîchi seulement après contrôle du même
+périphérique/inode. Les corrections successives restent ainsi possibles.
+
 ```bash
 .venv/bin/pytest -v tests/test_remediation_env.py
 .venv/bin/pytest --cov=heimdall.remediation.env --cov-fail-under=70 tests/test_remediation_env.py
