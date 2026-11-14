@@ -1018,7 +1018,8 @@ def render_text(report: ScanReport) -> str:
             lines.append(f"  {_visible(item.file)}{location}  ignoré={item.reason}")
     if not report.findings:
         lines.append(
-            "Aucun secret détecté dans le contenu analysé."
+            "ANALYSE PARTIELLE : aucun secret détecté dans le contenu analysé ; "
+            "ne pas déployer (code 2)."
             if report.skipped else "Aucun secret détecté."
         )
     else:
@@ -1047,6 +1048,8 @@ def render_text(report: ScanReport) -> str:
         "écartée(s) (non analysée(s))."
     )
     lines.append(_CODES_LINE)
+    if not report.complete and not report.findings:
+        lines.append("ANALYSE PARTIELLE : ne pas déployer (code 2).")
     return "\n".join(lines)
 
 

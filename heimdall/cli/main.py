@@ -228,7 +228,8 @@ def scan(  # noqa: PLR0913, PLR0917
                 f"{report.vcs_ignored} base(s) VCS élaguée(s) "
                 "(historique non parcouru), "
                 f"{report.git_ignored} entrée(s) ignorée(s) par .gitignore. "
-                f"{len(report.skipped)} exclusion(s) de contenu ; "
+                f"{len(report.skipped)} exclusion(s) de contenu, "
+                f"{len({item.file for item in report.skipped})} fichier(s) concerné(s) ; "
                 f"analyse {'complète' if report.complete else 'partielle'}.",
                 err=True,
             )

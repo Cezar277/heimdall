@@ -20,7 +20,7 @@ heimdall deep-scan --ci --strict .
 | Contenu | Mode par défaut | Mode `--strict` |
 | --- | --- | --- |
 | Texte UTF-8, UTF-16 ou UTF-32 | analysé, avec ou sans BOM lorsque l'heuristique est applicable | analysé avec les gardes de décodage historiques |
-| Texte Latin-1 / CP1252 | repli CP1252, remplacement des octets non définis ; candidats ASCII préservés même avec du bruit de contrôle | UTF-8 invalide refusé |
+| Texte Latin-1 / CP1252 | repli CP1252 sans remplacement ; octets non définis : exclusion `binary`, rapport partiel ; candidats ASCII préservés avec du bruit décodable | UTF-8 invalide refusé |
 | Binaire connu ou contenu sans décodage textuel plausible | ignoré, trace `binary` | code 2 |
 | Fichier/blob > 1 Mio (ou plafond explicitement abaissé) | ignoré sans lire son contenu, trace `too_large` | code 2 |
 | Lien rencontré dans l'arbre de travail | jamais suivi, trace `symlink` | code 2 |
@@ -83,6 +83,18 @@ Les traces d'exclusion de l'index et du diff sont plafonnées à
 `MAX_STAGED_FINDINGS`, y compris avec un collecteur déjà rempli.
 
 ## Bibliothèque et autres commandes
+
+Le résumé stderr distingue le nombre de traces d'exclusion et le nombre
+de fichiers concernés. Le JSON `skipped_count` compte les fichiers distincts ;
+`len(skipped)` compte les traces (un fichier peut en porter plusieurs).
+Un rapport humain partiel sans conclusion se termine par
+« ANALYSE PARTIELLE : ne pas déployer (code 2). »
+
+Les octets CP1252 non définis (`81`, `8D`, `8F`, `90`, `9D` en hexadécimal)
+ne sont jamais remplacés par U+FFFD. Même insérés dans un candidat ASCII,
+ils entraînent une exclusion `binary` tracée et empêchent le verdict propre.
+Il ne s'agit pas de reconstruire un secret corrompu : le contenu est déclaré
+non analysable, avec code 2 sans autre conclusion (ou 1 avec conclusions).
 
 `Scanner(root)`, `scan(root)`, `find_candidates(root)`, `collect(...)` et
 `collect_history(...)` sont stricts par défaut, ainsi que les helpers privés

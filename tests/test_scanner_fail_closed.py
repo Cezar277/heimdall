@@ -56,6 +56,8 @@ def _payload(kind: str) -> bytes:  # noqa: PLR0911 - charges adverses distinctes
         return token + b"\x01" * 100
     if kind == "cp1252_noise":
         return b"# caf\xe9\n" + token + b"\x01" * 100
+    if kind == "cp1252_split":
+        return token[:15] + b"\x81" + token[15:]
     if kind == "too_large":
         return b"x " * (MAX_FILE_BYTES // 2) + token
     if kind == "long_token":
@@ -67,7 +69,11 @@ def _payload(kind: str) -> bytes:  # noqa: PLR0911 - charges adverses distinctes
 
 @pytest.mark.parametrize("scope", ["tree", "staged", "diff", "history"])
 @pytest.mark.parametrize(
-    "kind", ["nul", "noise", "cp1252_noise", "too_large", "long_token", "multiline", "font"]
+    "kind",
+    [
+        "nul", "noise", "cp1252_noise", "cp1252_split",
+        "too_large", "long_token", "multiline", "font",
+    ],
 )
 def test_ci_cannot_greenlight_a_hidden_secret(repo: GitRepo, scope: str, kind: str) -> None:
     base = repo.git_output("rev-parse", "HEAD").strip()
@@ -367,3 +373,29 @@ def test_optional_complete_field_has_documented_true_default() -> None:
     )
     validator.validate(partial)
     assert partial.get("complete", True) is False
+
+
+@pytest.mark.parametrize("byte", [0x81, 0x8D, 0x8F, 0x90, 0x9D])
+def test_undefined_cp1252_bytes_are_never_replaced_silently(byte: int) -> None:
+    data = SYNTHETIC[:15].encode() + bytes([byte]) + SYNTHETIC[15:].encode()
+    assert decode_text(data, strict=False) is None
+    with pytest.raises(ScanError):
+        decode_text(data)
+
+
+def test_trace_and_file_counts_are_explicit(repo: GitRepo) -> None:
+    repo.write("payload.dat", "A" * 5000 + "\n")
+    result = CliRunner().invoke(app, ["scan", "--ci", "--json", "--no-allowlist", str(repo.root)])
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["skipped_count"] == 1
+    assert len(payload["skipped"]) == 2
+    assert "2 exclusion(s) de contenu, 1 fichier(s) concerné(s)" in result.stderr
+
+
+def test_partial_human_report_ends_with_blocking_verdict(repo: GitRepo) -> None:
+    repo.write_bytes("payload.dat", _payload("cp1252_split"))
+    result = CliRunner().invoke(app, ["scan", "--no-allowlist", str(repo.root)])
+    assert result.exit_code == 2
+    assert result.stdout.splitlines()[-1] == "ANALYSE PARTIELLE : ne pas déployer (code 2)."
+    assert SYNTHETIC not in result.output

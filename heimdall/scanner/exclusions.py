@@ -224,7 +224,7 @@ def is_known_binary(data: bytes) -> bool:
     return _is_known_binary(data)
 
 
-def decode_text(data: bytes, *, strict: bool = True) -> str | None:  # noqa: PLR0911 - encodages distincts
+def decode_text(data: bytes, *, strict: bool = True) -> str | None:  # noqa: PLR0911, PLR0912 - encodages distincts
     """Décode un texte ou rend None pour un contenu non textuel (#229).
 
     - BOM UTF-8/UTF-16/UTF-32 : décodage strict ;
@@ -266,9 +266,11 @@ def decode_text(data: bytes, *, strict: bool = True) -> str | None:  # noqa: PLR
             if strict:
                 raise ScanError(_DECODE_ERROR) from None
             # CP1252 préserve les secrets ASCII et les textes occidentaux.
-            # Les octets non définis sont remplacés, jamais exécutés.
-            text = data.decode("cp1252", errors="replace")
-            return text
+            # Aucun remplacement silencieux : l'appelant trace l'exclusion.
+            try:
+                return data.decode("cp1252")
+            except UnicodeDecodeError:
+                return None
     decoded = _decode_utf16_or_32(data)
     if decoded is not None:
         return decoded
