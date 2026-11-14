@@ -1,10 +1,10 @@
 # T229 — Preuves du correctif fail-closed après revue
 
-Ticket #229, audit E-01. Révision de code actuelle : `2f60301ec4427899a41fb3f45be21727050a49d7`.
+Ticket #229, audit E-01. Révision de code actuelle : `624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f`.
 Base de la branche : `6bbe7da` (intégration de #228 / #240).
 Les premiers permaliens ci-dessous conservent le SHA du correctif critique
 `aba5eb3`. Les durcissements complémentaires sont épinglés séparément sur
-la révision actuelle, sans modifier la propriété de verdict démontrée.
+leurs révisions respectives, sans modifier la propriété de verdict démontrée.
 
 ## Propriété démontrée
 
@@ -46,6 +46,16 @@ manqué » : les limites algorithmiques et les périmètres Git restent document
 | Volume historique | [`history.py:219`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/heimdall/cli/history.py#L219) consomme la taille annoncée avant le test d'exclusion, sur chaque défaut de cache. `bytes_scanned` conserve son sens d'octets effectivement lus. [`test_scanner_fail_closed.py:242`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/tests/test_scanner_fail_closed.py#L242) : deux blobs distincts trop gros épuisent le budget sans être lus. |
 | Borne des traces staged/diff | [`scan.py:683`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/heimdall/cli/scan.py#L683) borne le collecteur à `MAX_STAGED_FINDINGS`, avant usage puis après chaque ajout binaire, taille ou préparation de texte. Les témoins [:262](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/tests/test_scanner_fail_closed.py#L262) et [:276](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/tests/test_scanner_fail_closed.py#L276) couvrent ces trois chemins et un collecteur initial déjà hors borne. |
 
+## Décodeur, traces d'arbre, racines et contrat JSON
+
+Révision : `624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f`.
+
+- [`exclusions.py:227`](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/heimdall/scanner/exclusions.py#L227) : `decode_text` est strict par défaut. Tous les appels de production indiquent leur mode ; l'appel implicite du cold start a été rendu explicitement tolérant pour conserver sa relecture Latin-1. Les témoins [:295](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/tests/test_scanner_fail_closed.py#L295) et [`test_cold_start.py:84`](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/tests/test_cold_start.py#L84) vérifient le refus par défaut et la qualification conservée sur le contexte non UTF-8.
+- [`detect.py:579`](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/heimdall/scanner/detect.py#L579) : les ajouts de `prepare_text` respectent `_max_files`, avec annulation des ajouts du fichier courant en cas de dépassement. [:302](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/tests/test_scanner_fail_closed.py#L302) abaisse la borne à deux traces et vérifie le refus du deuxième fichier à deux traces, sans débordement résiduel, sur les deux modes de parcours.
+- [`interface.py:64`](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/heimdall/scanner/interface.py#L64) refuse `os.fspath(root)` vide avant conversion en `Path`. [`main.py:54`](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/heimdall/cli/main.py#L54) refuse aussi l'argument CLI vide avant normalisation. Les témoins [:323](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/tests/test_scanner_fail_closed.py#L323) et [:346](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/tests/test_scanner_fail_closed.py#L346) couvrent les chaînes, les `PathLike` vides et les trois commandes.
+- Le point de revue `collect(Path(""))` nécessite une précision : `Path("") == Path(".")` et `os.fspath(Path("")) == "."`. Il est impossible de distinguer ces valeurs après construction. Le répertoire courant explicite reste valide ; [:335](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/tests/test_scanner_fail_closed.py#L335) fixe cette sémantique, sans prétendre retrouver la chaîne initiale.
+- [`scan.schema.json:15`](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/schemas/scan.schema.json#L15) documente l'absence de `complete` comme `true`, de `skipped_count` comme `0` et de `skipped` comme `[]`, avec les annotations `default`. [:355](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/tests/test_scanner_fail_closed.py#L355) valide les rapports complets et partiels et l'interprétation de la valeur absente.
+
 ## Validation
 
 Le correctif critique avait été validé par **3925 tests**, 18 ignorés et
@@ -56,10 +66,16 @@ La suite complète est relancée après ce dernier commit de code et passe :
 **3935 passed, 18 skipped, 6911 subtests passed**, en **336,29 secondes**.
 Les 14 avertissements existants concernent les tests de sauvegardes de
 remédiation. Aucun code ni test n'a changé après ce rejeu ; seuls les
-documents de preuve sont mis à jour ensuite.
+documents de preuve ont été mis à jour ensuite pour cette révision `2f60301`.
+
+La passe ciblée du dernier durcissement `624f8d7` passe : **309 tests**, en
+6,56 secondes, avec treize nouveaux cas. Ruff, MyPy et Bandit passent. La
+suite complète, rejouée après ce dernier commit de code, passe : **3948 tests,
+6911 sous-tests, 18 ignorés**, sans échec ni erreur, en **336,212 secondes**
+(rapport JUnit). Aucun code ni test n'a changé après ce rejeu.
 
 Transcription : [acceptance/t229-validation.txt](acceptance/t229-validation.txt).
-Rapport JUnit final : `/home/nathan/heimdall-t229-final-hardening.xml`.
+Rapport JUnit final : `/home/nathan/heimdall-t229-decoder-root-final.xml`.
 Les anciennes passes archivées correspondent à l'état initial de la PR et
 ne constituent pas une preuve de cette correction fail-closed.
 

@@ -1,4 +1,27 @@
 Ticket #229 - Audit E-01
+DERNIERE REVISION - DECODEUR, RACINES ET BORNES DES TRACES
+Code teste : 624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-decoder-root-final.xml
+Rapport JUnit : 10877 entrees, 0 failures, 0 errors, 18 skipped, 336.212s.
+Soit 3948 tests passes et 6911 sous-tests passes, plus 18 ignores.
+Rejeu apres le dernier commit de code ; aucun code ni test modifie ensuite.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite ; avertissements existants de lecture nosec.
+
+Passe ciblee : 309 passed in 6.56s, treize nouveaux cas : decode_text strict
+par defaut, traces arbre bornees (fd et repli), racines vraiment vides via
+str/PathLike et CLI, contrat JSON et relecture CP1252 du cold start.
+Path("") est deja normalise en Path(".") par pathlib : les deux sont
+indistinguables. Le repertoire courant reste une racine valide ; les
+entrees str/PathLike vides sont rejetees avant conversion.
+La CI n'a pas ete declenchee. Les passes precedentes restent historiques.
+
 DERNIERS DURCISSEMENTS APRES APPROBATION AVEC COMMENTAIRES
 Code teste : 2f60301ec4427899a41fb3f45be21727050a49d7
 
