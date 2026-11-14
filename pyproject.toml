@@ -23,7 +23,7 @@ classifiers = [
 dependencies = [
   # --- Runtime (versions verrouillées, voir docs/adr/002-stack-python.md) ---
   "fastapi==0.162.0",       # API du Vault (#25). Épinglé à l'identique de tests/contracts/requirements.txt
-  "pydantic==2.14.2",       # Modèles + génération OpenAPI comparée au contrat (#15)
+  "pydantic==2.14.3",       # Modèles + génération OpenAPI comparée au contrat (#15)
   "pydantic-settings==2.15.0", # Settings via variables d'environnement (#25)
   "uvicorn==0.54.0",        # Serveur ASGI du Vault (#25), réseau privé + TLS uniquement
   "mcp==2.3.0",             # SDK officiel du serveur MCP stdio (#27)
