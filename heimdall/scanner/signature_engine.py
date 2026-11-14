@@ -91,9 +91,10 @@ class SignatureEngine:
         "_hasher",
         "_max_findings",
         "_traces",
+        "_strict",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - bornes et politique explicites
         self,
         hasher: SnippetHasher | None = None,
         entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
@@ -101,8 +102,12 @@ class SignatureEngine:
         max_findings: int | None = None,
         deadline: float | None = None,
         allowlist: Allowlist | None = None,
+        strict: bool = True,
     ) -> None:
         self._deadline = deadline
+        if type(strict) is not bool:
+            raise ValueError("politique de contenu invalide")
+        self._strict = strict
         if not isinstance(entropy_config, EntropyConfig):
             raise ValueError("configuration d'entropie invalide")
         self._entropy_config = entropy_config
@@ -189,12 +194,18 @@ class SignatureEngine:
             return None
         joined = line + following
         if len(joined) > MULTILINE_WINDOW:
-            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
+            if self._strict:
+                check_multiline_overflow(
+                    line, following, self._entropy_config, deadline=self._deadline
+                )
             return None
         # Le nombre de caractères minore le nombre d'octets UTF-8 : le premier
         # contrôle évite d'encoder les lignes déjà trop longues.
         if not joined.isascii() and len(joined.encode("utf-8")) > MULTILINE_WINDOW:
-            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
+            if self._strict:
+                check_multiline_overflow(
+                    line, following, self._entropy_config, deadline=self._deadline
+                )
             return None
         return joined, len(line)
 

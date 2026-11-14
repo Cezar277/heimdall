@@ -57,6 +57,12 @@ heimdall scan --no-gitignore [CHEMIN]  # parcours intégral de l'arbre
 | `--json` | le rapport humain est remplacé par le document JSON `heimdall.scan.v1` (stdout) ; inclut les traces et décomptes d'allowlist (#24) ; les erreurs restent sur stderr |
 | `--config PATH` | spécifie un fichier de configuration alternatif (par défaut : `heimdall.toml` à la racine du dépôt) ; un chemin **hors du dépôt** est accepté : choix opérateur explicite, soumis aux mêmes gardes (`_resolve_root` + `O_NOFOLLOW`, plafond de taille, contrat fermé) |
 | `--no-allowlist` | désactive l'allowlist déterministe pour le scan courant |
+| `--strict` | refuse les exclusions de contenu (binaires, taille, liens et limites de texte) au lieu de rendre un rapport partiel (#229) |
+
+Par défaut, les exclusions de contenu sont tracées avec leurs chemins et motifs.
+Un code 0 ne couvre que le contenu analysé ; les rapports partiels exposent
+`complete: false`, `skipped_count` et `skipped` dans le JSON. Les erreurs de
+lecture restent bloquantes. Voir la [politique de tolérance](scanner-tolerance.md).
 
 En `--ci`, l'allowlist du dépôt ne peut jamais s'auto-attester : si un
 `heimdall.toml` est présent dans le dépôt scanné (versionné à la racine,

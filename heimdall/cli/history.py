@@ -19,6 +19,7 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding, validate_relative_path
 from heimdall.scanner.interface import FileTarget, Scanner
+from heimdall.scanner.policy import ScanSkip, prepare_text
 from heimdall.scanner.signature_engine import SignatureEngine
 
 BATCH_SIZE = 128
@@ -117,11 +118,18 @@ def collect_history(  # noqa: PLR0913 - explicit scan and qualification options
     llm: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
+    strict: bool = False,
 ) -> HistoryReport:
     """Scan historical blobs; Git failures become static ScanError errors."""
     try:
         return _collect_history(
-            root, max_file_bytes=max_file_bytes, ci=ci, llm=llm, chat=chat, journal=journal
+            root,
+            max_file_bytes=max_file_bytes,
+            ci=ci,
+            llm=llm,
+            chat=chat,
+            journal=journal,
+            strict=strict,
         )
     except ToolFailure:
         raise ScanError("historique non analysable") from None
@@ -135,6 +143,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     llm: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
+    strict: bool = False,
 ) -> HistoryReport:
     """Scan every reachable snapshot, including merges and deleted files.
 
@@ -145,6 +154,8 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     """
     if type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES:
         raise ScanError("limite de fichier invalide")
+    if type(strict) is not bool:
+        raise ScanError("politique de contenu invalide")
     started = time.monotonic()
     deadline = started + MAX_SECONDS
     access = GitAccess(root)
@@ -159,10 +170,11 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     records: dict[tuple[str, str, str], tuple[Finding, dict[str, None]]] = {}
     qualified: set[tuple[str, str]] = set()
     cache: OrderedDict[str, tuple[Finding, ...] | str] = OrderedDict()
+    cache_skips: dict[str, tuple[str, ...]] = {}
     skipped: list[tuple[str, str, str]] = []
     opinions: list[CandidateOpinion] = []
     commits = entries = volume = occurrences = cache_findings = 0
-    scanner = Scanner(SignatureEngine(deadline=deadline))
+    scanner = Scanner(SignatureEngine(deadline=deadline, strict=strict))
     while tips:
         raw = _git(
             access,
@@ -203,6 +215,8 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                 else:
                     size = access.blob_size(oid, timeout=_call_timeout(deadline))
                     if size > max_file_bytes:
+                        if strict:
+                            raise ScanError("historique non analysable")
                         cached = "taille maximale dépassée"
                     else:
                         volume += size
@@ -211,11 +225,15 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                         data = access.blob_bytes(oid, timeout=_call_timeout(deadline))
                         if len(data) != size:
                             raise ScanError("objet historique modifié")
-                        text = decode_text(data)
-                        # Match the working-tree and staged scanners: a binary
-                        # blob cannot yield a clean verdict, regardless of name.
+                        text = decode_text(data, strict=strict)
+                        content_skips: list[ScanSkip] = []
                         if text is None:
-                            raise ScanError("historique non analysable")
+                            if strict:
+                                raise ScanError("historique non analysable")
+                            content_skips.append(ScanSkip(file, "binary"))
+                            text = ""
+                        text = prepare_text(text, file, strict=strict, skipped=content_skips)
+                        cache_skips[oid] = tuple(item.reason for item in content_skips)
                         target = FileTarget(file, text)
                         cached = tuple(scanner.scan(target))
                         if llm and not ci:
@@ -238,8 +256,13 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                     cache[oid] = cached
                     cache_findings += 0 if isinstance(cached, str) else len(cached)
                     while len(cache) > CACHE_SIZE or cache_findings > MAX_RECORDS:
-                        _, evicted = cache.popitem(last=False)
+                        evicted_oid, evicted = cache.popitem(last=False)
+                        cache_skips.pop(evicted_oid, None)
                         cache_findings -= 0 if isinstance(evicted, str) else len(evicted)
+                for reason in cache_skips.get(oid, ()):
+                    skipped.append((file, commit, reason))
+                    if len(skipped) > MAX_RECORDS:
+                        raise ScanError("limite historique dépassée")
                 if isinstance(cached, str):
                     skipped.append((file, commit, cached))
                     if len(skipped) > MAX_RECORDS:

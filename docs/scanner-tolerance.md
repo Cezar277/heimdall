@@ -1,0 +1,89 @@
+# Tolérance du scanner — audit E-01 (#229)
+
+`heimdall scan` et `heimdall deep-scan` tolèrent désormais les contenus
+qui empêchaient auparavant toute analyse du dépôt. Les erreurs de lecture,
+les objets incohérents, les conflits d'index, les racines invalides et les
+dépassements des budgets globaux restent des erreurs d'outillage (code 2).
+
+```sh
+heimdall scan --ci --no-allowlist .
+heimdall scan --staged --json .
+heimdall scan --ci --diff main --no-allowlist --json .
+heimdall scan --strict --ci --no-allowlist .
+heimdall deep-scan --ci --strict .
+```
+
+## Politique de contenu
+
+| Contenu | Mode par défaut | Mode `--strict` |
+| --- | --- | --- |
+| Texte UTF-8, UTF-16 ou UTF-32 | analysé, avec ou sans BOM lorsque l'heuristique est applicable | analysé avec les gardes de décodage historiques |
+| Texte Latin-1 / CP1252 | repli CP1252, remplacement des octets non définis ; candidats ASCII préservés | UTF-8 invalide refusé |
+| Binaire connu ou contenu sans décodage textuel plausible | ignoré, trace `binary` | code 2 |
+| Fichier/blob > 1 Mio (ou plafond explicitement abaissé) | ignoré sans lire son contenu, trace `too_large` | code 2 |
+| Lien rencontré dans l'arbre de travail | jamais suivi, trace `symlink` | code 2 |
+| Jeton lexical > 4096 caractères | jeton remplacé par des espaces pour l'analyse, trace `long_token` avec sa ligne ; les autres candidats restent analysés | code 2 |
+| Jointure de deux lignes > 4096 octets UTF-8 | lignes analysées séparément, trace `multiline_limit` | refus conservateur historique si la jointure pourrait porter un candidat |
+
+Le suffixe ne décide jamais de l'exclusion : un texte Latin-1 portant un
+secret dans `image.png` reste analysé. Les textes UTF-16/32 sont essayés
+avant de classer comme binaire un contenu contenant des NUL. Une signature
+de format suivie de texte ne suffit pas à ignorer ce texte si le décodage
+reste plausible. Aucun contenu n'est exécuté.
+
+Les racines et leurs ancêtres symboliques restent refusés. Les symlinks
+internes sont écartés avant toute résolution ou ouverture de leur cible.
+Dans l'index ou l'historique, le blob Git d'un lien contient son nom de
+cible : ce texte peut être analysé sans suivre le lien sur le disque.
+
+## Rapport et codes de sortie
+
+Les exclusions sont distinctes des rejets d'allowlist et des exclusions Git.
+Le rapport humain annonce **Analyse partielle** et liste les chemins relatifs,
+les motifs et, pour les limites de texte, les lignes concernées. Les chemins
+sont échappés à l'affichage. Aucun extrait de contenu ou secret n'est ajouté.
+
+Quand du contenu est écarté, le JSON `heimdall.scan.v1` ajoute les champs
+optionnels `complete: false`, `skipped_count` (nombre de fichiers distincts)
+et `skipped`, tableau d'objets `{file, reason, line}`. Le schéma versionné
+accepte ces champs. Les rapports sans exclusion gardent leur forme précédente.
+L'historique utilise ses champs existants `complete` et `skipped`, avec
+un chemin et un commit pour chaque occurrence, y compris après réutilisation
+du cache de blobs.
+
+- `0` : aucun candidat détecté dans le contenu effectivement analysé.
+- `1` : au moins un candidat détecté, même si d'autres contenus ont été écartés.
+- `2` : erreur d'outillage ou contenu refusé en mode strict.
+
+Un code 0 accompagné de `complete: false` ne prouve pas que les contenus
+écartés sont exempts de secrets. Les binaires, archives, portions de texte
+hors borne et cibles de liens ne sont pas couverts. Une politique CI exigeant
+une couverture sans ces exclusions doit utiliser `--strict` ou vérifier
+les traces. `--no-allowlist` désactive l'allowlist, pas ces limites physiques.
+
+## Bibliothèque et autres commandes
+
+`Scanner(root)` expose ses exclusions dans `scanner.skipped`. Les helpers
+`scan(root)` et `find_candidates(root)`, qui ne renvoient qu'une liste de
+Findings sans rapport de couverture, restent stricts par défaut. Le moteur
+de signatures et les primitives d'entropie restent stricts par défaut ;
+les orchestrateurs tolérants préparent explicitement leur texte.
+
+Le cold start conserve son contrat de rapport incomplet : son collecteur
+`skipped_files` inclut les exclusions rencontrées et sa CLI retourne 2 si
+ce collecteur n'est pas vide. Le mode historique tolérant rend son rapport
+au lieu d'échouer sur un binaire ; `deep-scan --strict` conserve le refus.
+
+## Vérification sur Heimdall
+
+`heimdall scan --ci --no-allowlist .` termine désormais sans erreur
+d'outillage sur `docs/security/dfd.png`. Le code 1 reste attendu sur ce
+dépôt : les fixtures synthétiques et les empreintes de fichiers du projet
+produisent des candidats quand toute allowlist est désactivée. Cette
+vérification ne signifie ni que ces candidats sont des secrets réels, ni
+que le dépôt est déclaré propre.
+
+Les tests de `tests/test_scanner_tolerance.py` couvrent les trois périmètres,
+les encodages, les binaires connus/inconnus, les gros fichiers non lus, les
+jetons longs avec un candidat distinct sur la même ligne, les symlinks
+sans suivi, les rapports JSON et le cache historique.

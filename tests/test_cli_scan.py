@@ -157,6 +157,7 @@ def _cles_denses(nombre: int) -> str:
     """
     return " ".join(f'"AKIA{chr(65 + (i % 26))}{i:015d}"' for i in range(nombre))
 
+
 #: Exemple de clé AWS (documentation AWS) : jamais une clé fonctionnelle.
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 
@@ -434,6 +435,7 @@ def test_collect_tree_uses_the_pinned_root(
             self.vcs_ignored = 0
             self.git_ignored = 0
             self.files_scanned = 0
+            self.skipped = ()
 
         def scan(self, *, deadline: float | None = None) -> list[object]:
             assert deadline is not None
@@ -441,7 +443,7 @@ def test_collect_tree_uses_the_pinned_root(
 
     monkeypatch.setattr("heimdall.cli.scan.TreeScanner", ScannerEspion)
     racine = git_repo.root / ".." / git_repo.root.name
-    resultat = _run("scan", str(racine))
+    resultat = _run("scan", "--strict", str(racine))
     assert resultat.exit_code == EXIT_CLEAN
     assert seen == [(git_repo.root.resolve(), True)]
 
@@ -742,6 +744,7 @@ def test_collect_ci_refuses_a_tree_reduced_to_gitignored_entries(
             self.vcs_ignored = 0
             self.git_ignored = 1
             self.files_scanned = 0
+            self.skipped = ()
 
         def scan(self, *, deadline: float | None = None) -> list[object]:
             assert deadline is not None
@@ -785,11 +788,13 @@ def test_scan_tree_ignored_binary_is_skipped_without_code_two(
     git_repo.commit_all("base")
     git_repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 512)
 
-    resultat = _run("scan", "--no-allowlist", str(git_repo.root))
+    resultat = _run("scan", "--strict", "--no-allowlist", str(git_repo.root))
     assert resultat.exit_code == EXIT_CLEAN
     assert "Gitignore : 1 entrée(s)" in resultat.stdout
 
-    resultat_integral = _run("scan", "--no-allowlist", "--no-gitignore", str(git_repo.root))
+    resultat_integral = _run(
+        "scan", "--strict", "--no-allowlist", "--no-gitignore", str(git_repo.root)
+    )
     assert resultat_integral.exit_code == EXIT_ERROR
     assert resultat_integral.stderr.strip() == SCAN_ERROR_MESSAGE
 
@@ -839,7 +844,7 @@ def test_scan_staged_scans_a_gitignored_secret(git_repo: GitRepo) -> None:
 def test_scan_tree_strict_refuses_real_binary_suffix(git_repo: GitRepo) -> None:
     """Un vrai binaire interrompt le scan (code 2), jamais un verdict propre."""
     git_repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 512)
-    resultat = _run("scan", str(git_repo.root))
+    resultat = _run("scan", "--strict", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
@@ -852,11 +857,11 @@ def test_scan_tree_strict_refuses_unknown_binary_suffix(git_repo: GitRepo) -> No
     deux (code 2), pas 0 d'un côté et 2 de l'autre.
     """
     git_repo.write_bytes("evil.png", b"\x00\x01" + f'AWS = "{FAKE_AWS_KEY}"\n'.encode())
-    resultat = _run("scan", str(git_repo.root))
+    resultat = _run("scan", "--strict", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
     git_repo.stage("evil.png")
-    resultat = _run("scan", "--staged", str(git_repo.root))
+    resultat = _run("scan", "--strict", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
@@ -1031,7 +1036,7 @@ def test_scan_staged_rejects_oversized_blob(git_repo: GitRepo) -> None:
     """Un blob au-delà de la borne de lecture est une erreur (jamais 0)."""
     git_repo.write("gros.txt", "A" * (1024 * 1024 + 1))
     git_repo.stage("gros.txt")
-    resultat = _run("scan", "--staged", str(git_repo.root))
+    resultat = _run("scan", "--strict", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
 
 
@@ -1068,7 +1073,7 @@ def test_scan_staged_refuses_a_binary_blob(git_repo: GitRepo) -> None:
     git_repo.write_bytes("image.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 512)
     git_repo.write("app.py", "x = 1\n")
     git_repo.stage("image.png", "app.py")
-    resultat = _run("scan", "--staged", str(git_repo.root))
+    resultat = _run("scan", "--strict", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert resultat.stderr.strip() == SCAN_ERROR_MESSAGE
 
@@ -1119,11 +1124,9 @@ def test_scan_staged_gitlink_does_not_hide_other_secrets(git_repo: GitRepo) -> N
 
 def test_scan_staged_polyglot_binary_header_is_fail_closed(git_repo: GitRepo) -> None:
     """T23 : faux PNG avec UTF-8 invalide -> erreur, jamais propre."""
-    git_repo.write_bytes(
-        "faux.png", b"\x89PNG\r\n\x1a\n" + f'AWS = "{FAKE_AWS_KEY}"\n'.encode()
-    )
+    git_repo.write_bytes("faux.png", b"\x89PNG\r\n\x1a\n" + f'AWS = "{FAKE_AWS_KEY}"\n'.encode())
     git_repo.stage("faux.png")
-    resultat = _run("scan", "--staged", str(git_repo.root))
+    resultat = _run("scan", "--strict", "--staged", str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert FAKE_AWS_KEY not in resultat.output
 
@@ -1135,7 +1138,7 @@ def test_benign_minified_json_multiline_overflow_exits_two(git_repo: GitRepo, st
     git_repo.write("data.jsonl", line + "\n{}\n")
     git_repo.stage("data.jsonl")
     options = ("--staged",) if staged else ()
-    resultat = _run("scan", *options, str(git_repo.root))
+    resultat = _run("scan", "--strict", *options, str(git_repo.root))
     assert resultat.exit_code == EXIT_ERROR
     assert line not in resultat.output
 

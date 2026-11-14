@@ -97,17 +97,19 @@ Le scan ne fait aucun checkout, fetch, filtre textconv ou réécriture.
 Les variables Git héritées, les remplacements et les grafts locaux sont
 neutralisés. Les symlinks ne sont jamais suivis sur le disque : leur blob Git
 `120000`, qui contient le texte de leur cible, est scanné comme en `--staged`.
-Les commits de sous-modules (`160000`) sont exclus ; les binaires
-connus sont refusés (code 2), comme dans les scans arbre et index. Les objets
-absents, clones superficiels, sorties invalides
-et dépassements de budget donnent une erreur d'outillage. Les commits devenus
+Les commits de sous-modules (`160000`) sont exclus. Les binaires et contenus
+hors borne sont désormais signalés dans `skipped` avec leur chemin et leur
+commit, et rendent `complete: false` (#229). `deep-scan --strict` les refuse.
+Les objets absents, clones superficiels, sorties invalides et dépassements
+de budget restent des erreurs d'outillage. Voir la
+[politique de tolérance](scanner-tolerance.md).
+
+Les commits devenus
 inaccessibles (objets pendants, reflogs seuls) et les dépôts de sous-modules
 ne font pas partie de ce périmètre.
 
-Le nom du fichier n'autorise aucune exclusion : un contenu binaire ou
-indécodable est refusé, quel que soit son suffixe. Un contenu inconnu avec
-NUL et texte dans `evil.png` est refusé
-en `ScanError` / code 2. Le parseur d'arbres convertit aussi les noms non UTF-8
+Le nom du fichier n'autorise aucune exclusion : le contenu et ses limites
+décident du traitement, avec des traces ou un refus en mode strict. Le parseur d'arbres convertit aussi les noms non UTF-8
 et chemins invalides en `ScanError` statique.
 
 `complete=True` signifie complet dans ce périmètre : aucun binaire ou blob

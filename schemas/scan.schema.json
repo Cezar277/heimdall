@@ -12,6 +12,24 @@
     "findings"
   ],
   "properties": {
+    "complete": {
+      "type": "boolean",
+      "description": "False si du contenu est exclu par la politique de tolérance (#229)."
+    },
+    "skipped_count": { "type": "integer", "minimum": 0 },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "reason", "line"],
+        "properties": {
+          "file": {"type": "string", "minLength": 1, "maxLength": 4096},
+          "reason": {"enum": ["binary", "too_large", "symlink", "long_token", "multiline_limit"]},
+          "line": {"type": ["integer", "null"], "minimum": 1}
+        }
+      }
+    },
     "schema": {
       "const": "heimdall.scan.v1",
       "description": "Version du contrat de sortie. Un parseur CI DOIT refuser toute autre valeur."

@@ -56,6 +56,8 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
     inattendu, racine absente) est refusé en ``ScanError`` statique, jamais
     en ``ValueError``/``TypeError`` brut (contrat d'erreur unique).
     """
+    if isinstance(root, str) and not root:
+        raise ScanError(_MSG_SCAN_IMPOSSIBLE)
     try:
         absolute = Path(os.path.abspath(Path(root).expanduser()))
         for candidate in (absolute, *absolute.parents):

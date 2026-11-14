@@ -1,0 +1,72 @@
+"""Exclusions de contenu explicites, bornées et sans extrait de secret (#229)."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Literal
+
+from heimdall.scanner.entropy_detection import MAX_TOKEN_LENGTH
+from heimdall.scanner.errors import ScanError
+from heimdall.scanner.finding import validate_relative_path
+
+SkipReason = Literal["binary", "too_large", "symlink", "long_token", "multiline_limit"]
+TEXT_WINDOW_BYTES = 4096
+_TOKEN = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
+
+
+@dataclass(frozen=True)
+class ScanSkip:
+    file: str
+    reason: SkipReason
+    line: int | None = None
+
+    def __post_init__(self) -> None:
+        validate_relative_path(self.file)
+        if self.reason not in {"binary", "too_large", "symlink", "long_token", "multiline_limit"}:
+            raise ValueError("motif d'exclusion invalide")
+        if self.line is not None and (type(self.line) is not int or self.line < 1):
+            raise ValueError("ligne d'exclusion invalide")
+
+    def as_dict(self) -> dict[str, str | int | None]:
+        return {"file": self.file, "reason": self.reason, "line": self.line}
+
+
+def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip]) -> str:
+    """Écarte seulement les jetons hors borne ; conserve les autres candidats.
+
+    Le remplacement par des espaces conserve les lignes et les séparations.
+    Une trace par motif et fichier borne le rapport même sur une longue ligne.
+    Les fenêtres multilignes hors borne restent visibles sans masquer les
+    signatures analysables sur chacune de leurs lignes.
+    """
+    if strict:
+        return text
+    long_line: int | None = None
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal long_line
+        if len(match.group()) <= MAX_TOKEN_LENGTH:
+            return match.group()
+        if long_line is None:
+            long_line = text.count("\n", 0, match.start()) + 1
+        return " " * len(match.group())
+
+    cleaned = _TOKEN.sub(replace, text)
+    if long_line is not None:
+        skipped.append(ScanSkip(file, "long_token", long_line))
+    lines = cleaned.split("\n")
+    for index in range(len(lines) - 1):
+        if len((lines[index] + lines[index + 1]).encode("utf-8")) > TEXT_WINDOW_BYTES:
+            skipped.append(ScanSkip(file, "multiline_limit", index + 1))
+            break
+    return cleaned
+
+
+def skip_file(file: str, reason: SkipReason, *, strict: bool, skipped: list[ScanSkip]) -> None:
+    if strict:
+        raise ScanError("scan impossible : entrée non analysable")
+    try:
+        skipped.append(ScanSkip(file, reason))
+    except ValueError:
+        raise ScanError("scan impossible : entrée non analysable") from None

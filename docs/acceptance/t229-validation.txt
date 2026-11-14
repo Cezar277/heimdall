@@ -1,0 +1,25 @@
+Ticket #229 - Audit E-01
+Environnement : Debian WSL, Python 3.13, venv de test hors du depot.
+Dependances de l'environnement existant reutilisees ; CI verrouillee non lancee.
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-full.xml
+3829 passed, 18 skipped, 14 warnings, 6911 subtests passed in 320.03s
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+
+python -m mypy heimdall
+Success: no issues found in 57 source files
+
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py
+Exit 0, aucune alerte de securite.
+
+python -m heimdall.cli.main scan --ci --no-allowlist --json .
+Exit 1 : 3986 candidats, 320 fichiers analyses, 3 exclusions de contenu.
+complete=false ; pas d'erreur d'outillage (code 2).
+Exclusions : docs/security/dfd.png (binary), docs/t116-samm.md:64
+et docs/contracts/vault-traceability.md:30 (multiline_limit).
+Les candidats proviennent notamment des fixtures synthetiques et empreintes
+du depot ; aucune allowlist active. Ne pas confondre code 1 et erreur.
+Rapports bruts hors depot : /home/nathan/heimdall-t229-self-scan.json
+et /home/nathan/heimdall-t229-self-scan.stderr.
