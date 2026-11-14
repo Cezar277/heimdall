@@ -764,7 +764,9 @@ class SqliteAuditLog(AuditLog):
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(audit_events);").fetchall()
             }
-        return bool(columns) and "stream" not in columns
+        # Table absente (base très ancienne ou incomplète) : même diagnostic
+        # « migration requise » plutôt qu'une OperationalError générique.
+        return not columns or "stream" not in columns
 
     def is_legacy_sha256_chain(self) -> bool:
         """True si le journal est une chaîne SHA-256 historique valide (pré-F-16).

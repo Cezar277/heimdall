@@ -517,7 +517,10 @@ def _require_rotation_audit_key(resolved: Path) -> bytes:
         "à chaud avec une KEK encore en mémoire dans le processus serveur (garde\n"
         "best-effort : sonde TCP sur $HEIMDALL_VAULT_PORT, pas un verrou ; préférer un\n"
         "arrêt supervisé). $HEIMDALL_VAULT_AUDIT_HMAC_KEY est obligatoire et doit être\n"
-        "la même avant et après la rotation, sinon la chaîne d'audit est invérifiable."
+        "la même avant et après la rotation, sinon la chaîne d'audit est invérifiable.\n"
+        "L'événement VAULT KEK ROTATE est écrit après le commit de la rotation\n"
+        "(best-effort) : en cas d'échec, code 1 explicite ; lancer ensuite\n"
+        "'heimdall vault audit verify'."
     ),
 )
 def rotate_kek_command(
@@ -615,7 +618,9 @@ def rotate_kek_command(
         )
     except Exception:
         typer.echo(
-            "Erreur : rotation effectuée mais journal d'audit indisponible.",
+            "Erreur : rotation effectuée mais journal d'audit indisponible "
+            "(événement VAULT KEK ROTATE non écrit) : lancer 'heimdall vault audit "
+            "verify' et consigner la rotation hors bande.",
             err=True,
         )
         raise typer.Exit(code=1) from None

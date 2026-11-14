@@ -869,10 +869,25 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             mock_access = mock_access_cls.return_value
             mock_access.execute.return_value = MagicMock(returncode=1, stdout=b"")
             self.assertIsNone(_get_git_toplevel(link_dir))
-            # Remontée des ancêtres : le premier cwd est le parent réel du lien.
-            self.assertEqual(mock_access_cls.call_args_list[0].args, (link_dir.parent,))
+            # Jamais de cwd dans la cible suivie du lien.
             for call in mock_access_cls.call_args_list:
                 self.assertNotEqual(call.args[0], real_dir)
+
+    def test_git_toplevel_refuses_symlinked_ancestor_without_fallback(self) -> None:
+        """Ancêtre symlinké → None, jamais le dépôt d'un ancêtre ; aucun git lancé."""
+        outer = self.tmp_dir / "outer_repo"
+        (outer / ".git").mkdir(parents=True)
+        target_dir = self.tmp_dir / "elsewhere"
+        target_dir.mkdir()
+        link = outer / "link"
+        try:
+            os.symlink(target_dir, link)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        (target_dir / ".env").write_text("X=1\n", encoding="utf-8")
+        with patch("heimdall.vault.atomic.GitAccess") as mock_access_cls:
+            self.assertIsNone(_get_git_toplevel(link / ".env"))
+            mock_access_cls.assert_not_called()
 
     def test_git_helpers_refuse_symlink_output_without_following(self) -> None:
         """Output symlink (fichier ou répertoire) → False fail-closed, git jamais consulté.

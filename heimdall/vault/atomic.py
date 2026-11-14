@@ -748,18 +748,34 @@ def _get_git_toplevel(path: Path) -> Path | None:
         is_plain_dir = False
     parent_dir = path if is_plain_dir else path.parent
     # ``GitAccess`` plafonne la découverte à son répertoire de travail
-    # (``GIT_CEILING_DIRECTORIES``) : depuis un sous-dossier, ``rev-parse``
-    # échoue. On remonte donc les ancêtres jusqu'au premier dépôt trouvé.
+    # (``GIT_CEILING_DIRECTORIES``) : on localise donc la racine nous-mêmes,
+    # par ``lstat`` seulement (aucun processus git par ancêtre). Un ancêtre
+    # symlinké arrête la recherche (fail-closed : jamais de repli sur un dépôt
+    # ancêtre sans rapport avec le fichier), puis un seul ``rev-parse``.
+    repo_dir: Path | None = None
     for candidate in (parent_dir, *parent_dir.parents):
         try:
-            access = GitAccess(candidate)
-            res = access.execute(("rev-parse", "--show-toplevel"), timeout=_GIT_TIMEOUT_SECONDS)
-        except Exception:  # noqa: S112  # nosec B112
+            if stat.S_ISLNK(os.lstat(candidate).st_mode):
+                return None
+        except OSError:
+            return None
+        try:
+            os.lstat(candidate / ".git")
+        except OSError:
             continue
-        if res.returncode == 0:
-            top = res.stdout.decode("utf-8", errors="replace").strip()
-            if top:
-                return Path(top)
+        repo_dir = candidate
+        break
+    if repo_dir is None:
+        return None
+    try:
+        access = GitAccess(repo_dir)
+        res = access.execute(("rev-parse", "--show-toplevel"), timeout=_GIT_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001  # nosec B110
+        return None
+    if res.returncode == 0:
+        top = res.stdout.decode("utf-8", errors="replace").strip()
+        if top:
+            return Path(top)
     return None
 
 

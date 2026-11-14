@@ -1489,6 +1489,28 @@ class VaultRotateCliTests(unittest.TestCase):
         assert rec is not None
         self.assertEqual(rec["value"], "super_secret_value")
 
+    def test_cli_rotate_audit_failure_is_explicit_and_chain_stays_valid(self) -> None:
+        """Échec d'écriture de VAULT KEK ROTATE : code 1 explicite, chaîne vérifiable."""
+        audit_key = generate_server_hmac_key()
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY": audit_key,
+        }
+        with unittest.mock.patch.object(
+            SqliteAuditLog, "record", side_effect=OSError("disk full")
+        ):
+            res = self.runner.invoke(
+                cli_app,
+                ["vault", "rotate-kek", "--db-path", str(self.db_path), "--force"],
+                env=env,
+            )
+        self.assertEqual(res.exit_code, 1, res.output)
+        self.assertIn("VAULT KEK ROTATE non écrit", res.output)
+        self.assertNotIn("disk full", res.output)
+        log = SqliteAuditLog(self.db_path, create=False, hmac_key=audit_key.encode())
+        self.assertEqual(log.verify_chain(), (True, None))
+
     def test_cli_rotate_refuses_hot_server_without_force(self) -> None:
         """Audit M-07 : rotation à chaud refusée, --force explicite l'autorise."""
         env = {

@@ -311,6 +311,7 @@ def test_m04_vault_client_disables_trust_env() -> None:
 def test_m05_git_helpers_use_git_access(tmp_path: Path) -> None:
     target = tmp_path / ".env"
     target.write_text("X=1\n", encoding="utf-8")
+    (tmp_path / ".git").mkdir()  # racine localisée par lstat, sans git
     with patch("heimdall.vault.client.GitAccess") as mock_client_git:
         mock_client_git.return_value.execute.return_value = MagicMock(
             returncode=0, stdout=b"/tmp/demo-repo\n"
