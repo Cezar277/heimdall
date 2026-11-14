@@ -1600,6 +1600,17 @@ class VaultRotateCliTests(unittest.TestCase):
         self.assertEqual(res.exit_code, 2, res.output)
         self.assertIn("HEIMDALL_VAULT_SERVER_HMAC_KEY", res.output)
 
+    def test_cli_audit_rekey_same_key_is_refused(self) -> None:
+        """Ancienne et nouvelle clé identiques : code 2 « déjà cette clé », aucune écriture."""
+        same = generate_server_hmac_key()
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "audit", "rekey", "--db-path", str(self.db_path)],
+            env={"HEIMDALL_VAULT_OLD_AUDIT_HMAC_KEY": same, "HEIMDALL_VAULT_AUDIT_HMAC_KEY": same},
+        )
+        self.assertEqual(res.exit_code, 2, res.output)
+        self.assertIn("déjà cette clé", res.output)
+
     def test_cli_rotate_invalid_port_is_fail_closed(self) -> None:
         for port in ("abc", "99999", "0"):
             with self.subTest(port=port):

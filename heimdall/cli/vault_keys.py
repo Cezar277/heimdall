@@ -23,6 +23,7 @@ Codes de sortie (convention de la CLI) : 0 (succès), 1 (échec opérationnel),
 """
 
 import asyncio
+import hmac
 import json
 import os
 import sqlite3
@@ -405,7 +406,7 @@ def rekey_audit_chain(
             raise ValueError("HEIMDALL_VAULT_AUDIT_HMAC_KEY est obligatoire pour la migration.")
         new_key = validate_server_hmac_key(raw_new)
         old_key = _derived_audit_hmac_key()
-        if old_key == new_key:
+        if hmac.compare_digest(old_key, new_key):
             raise ValueError("le journal utilise déjà cette clé d'audit.")
         audit_log = SqliteAuditLog(resolved, create=False, hmac_key=old_key)
         _exit_if_audit_schema_outdated(audit_log)

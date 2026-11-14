@@ -393,15 +393,23 @@ class InMemoryAuditLog(AuditLog):
         *,
         limit: int = DEFAULT_LIST_LIMIT,
         project: str | None = None,
+        stream: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Derniers événements ; ``stream`` filtre un flux (parité SQLite, M-03)."""
+        if stream not in {None, _AUDIT_STREAM_ACCESS, _AUDIT_STREAM_REJECTION}:
+            raise ValueError("flux d'audit invalide (access, rejection ou all).")
         bounded_limit = max(1, min(MAX_LIST_LIMIT, int(limit)))
         with self._lock:
+            sources: tuple[AuditEvent, ...]
+            if stream == _AUDIT_STREAM_ACCESS:
+                sources = tuple(self._events)
+            elif stream == _AUDIT_STREAM_REJECTION:
+                sources = tuple(self._rejection_events)
+            else:
+                sources = (*self._events, *self._rejection_events)
             selected = [
                 event
-                for event in sorted(
-                    (*self._events, *self._rejection_events),
-                    key=lambda item: (item.occurred_at, item.id),
-                )
+                for event in sorted(sources, key=lambda item: (item.occurred_at, item.id))
                 if project is None or event.project == project
             ]
             return [event.as_dict() for event in selected[-bounded_limit:]]

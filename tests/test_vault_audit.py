@@ -26,7 +26,7 @@ from typer.testing import CliRunner
 from heimdall.cli.main import app as cli_app
 from heimdall.vault import audit as audit_module
 from heimdall.vault.app import VaultSettings, create_app
-from heimdall.vault.audit import SqliteAuditLog
+from heimdall.vault.audit import InMemoryAuditLog, SqliteAuditLog
 from heimdall.vault.crypto import (
     VaultCipher,
     generate_api_key,
@@ -875,3 +875,22 @@ class AuditListStreamTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([e["status_code"] for e in json.loads(access.output)], [200, 200])
             bad = CliRunner().invoke(cli_app, [*base, "--stream", "other"], env=env)
             self.assertEqual(bad.exit_code, 2, bad.output)
+
+
+class InMemoryAuditListStreamTests(unittest.IsolatedAsyncioTestCase):
+    """Parité mémoire/SQLite : filtre ``stream`` sous inondation de rejets."""
+
+    async def test_rejection_flood_does_not_hide_access_events_in_memory(self) -> None:
+        log = InMemoryAuditLog(hmac_key=generate_server_hmac_key().encode())
+        for _ in range(2):
+            await log.record(peer="cli", action="GET", target=None, status_code=200)
+        for _ in range(10):
+            await log.record(peer="cli", action="GET", target=None, status_code=401)
+        flooded = log.list_events(limit=2)
+        self.assertEqual({e["status_code"] for e in flooded}, {401})
+        access = log.list_events(limit=2, stream="access")
+        self.assertEqual([e["status_code"] for e in access], [200, 200])
+        rejection = log.list_events(limit=2, stream="rejection")
+        self.assertEqual({e["status_code"] for e in rejection}, {401})
+        with self.assertRaises(ValueError):
+            log.list_events(stream="other")
