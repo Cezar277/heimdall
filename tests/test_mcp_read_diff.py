@@ -385,6 +385,33 @@ class ReadDiffToolTests(GitRepoTestCase):
         entry = self.call_read_diff()["files"][0]
         self.assertEqual(entry["file"], "brand/new.py")
 
+    def test_multiline_xml_is_masked_end_to_end(self) -> None:
+        """Revue (HIGH) : XML multiligne masqué dans read_diff (via _masked_files)."""
+        self.write(
+            "settings.xml",
+            "<password>\n  S3cr3tP4ss!\n</password>\n",
+        )
+        self.stage("settings.xml")
+        entry = self.call_read_diff()["files"][0]
+        self.assertEqual(entry["redactions"], 1)
+        texts = [line["text"] for line in entry["added_lines"]]
+        self.assertEqual(len(texts), 3)
+        self.assertNotIn("S3cr3tP4ss!", "\n".join(texts))
+        self.assertIn("<REDACTED:", texts[1])
+
+        self.write(
+            "phrase.xml",
+            "<password>\n  my secret\n  phrase 42\n</password>\n",
+        )
+        self.stage("phrase.xml")
+        payload = self.call_read_diff()
+        phrase_entry = next(item for item in payload["files"] if item["file"] == "phrase.xml")
+        self.assertEqual(phrase_entry["redactions"], 1)
+        self.assertEqual([line["line"] for line in phrase_entry["added_lines"]], [1, 2, 3, 4])
+        self.assertEqual(phrase_entry["added_lines"][3]["text"], "</password>")
+        self.assertNotIn("my secret", str(phrase_entry))
+        self.assertNotIn("phrase 42", str(phrase_entry))
+
 
 class ReadDiffConformanceTests(GitRepoTestCase):
     """Critère d'acceptation du #27 : les réponses sont conformes au schéma."""

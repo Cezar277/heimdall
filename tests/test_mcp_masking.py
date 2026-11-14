@@ -399,6 +399,16 @@ class AuditE03MaskingProofTests(unittest.TestCase):
                 self.assertNotIn(secret, masked)
                 self.assertIn("<REDACTED:", masked)
 
+    def test_mask_lines_preserves_line_count_for_multiline_values(self) -> None:
+        self.assertEqual(masking.mask_lines([]), [])
+        lines = ["<password>", "  my secret", "  phrase 42", "</password>"]
+        masked = masking.mask_lines(lines)
+        self.assertEqual(len(masked), 4)
+        self.assertEqual(masked[0], "<password>")
+        self.assertIn("<REDACTED:", masked[1])
+        self.assertEqual(masked[2], "")
+        self.assertEqual(masked[3], "</password>")
+
     def test_xml_closing_tag_case_insensitive_is_masked(self) -> None:
         """Revue (LOW) : `<PASSWORD>…</password>` apparié quelle que soit la casse."""
         for line, secret in (

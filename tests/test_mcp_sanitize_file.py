@@ -412,6 +412,28 @@ class SanitizeFileToolTests(FileRepoTestCase):
         self.assertEqual(mcp_contract.errors("SanitizeFileResult", payload), [])
         self.assertNotEqual(mcp_contract.errors("SanitizeFileOutput", payload), [])
 
+    def test_multiline_xml_is_masked_end_to_end(self) -> None:
+        """Revue (HIGH) : XML indenté sur plusieurs lignes masqué en bout en bout."""
+        self.write(
+            "settings.xml",
+            "<settings>\n  <password>\n    S3cr3tP4ss!\n  </password>\n</settings>\n",
+        )
+        payload = self.read({"path": "settings.xml"})
+        self.assertEqual(payload["redactions"], 1)
+        self.assertNotIn("S3cr3tP4ss!", payload["content"])
+        self.assertIn("<REDACTED:", payload["content"])
+        self.assertEqual(payload["end_line"], 5)
+
+        self.write(
+            "phrase.xml",
+            "<password>\n  my secret\n  phrase 42\n</password>\n",
+        )
+        payload = self.read({"path": "phrase.xml"})
+        self.assertEqual(payload["redactions"], 1)
+        self.assertNotIn("my secret", payload["content"])
+        self.assertNotIn("phrase 42", payload["content"])
+        self.assertEqual(payload["end_line"], 4)
+
 
 class GuardWiringTests(FileRepoTestCase):
     """La garde est bien celle de #76, et elle est appelée avant tout accès."""

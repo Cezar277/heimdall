@@ -15,6 +15,7 @@ historique de conversation Ollama.
 import math
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final
 
@@ -868,6 +869,22 @@ def _iter_matches(text: str) -> list[_Match]:
     return kept
 
 
+def _render_masked(text: str, matches: list[_Match], *, preserve_newlines: bool) -> str:
+    """Remplace les intervalles retenus par leur marqueur."""
+    pieces: list[str] = []
+    cursor = 0
+    for item in matches:
+        pieces.append(text[cursor : item.start])
+        pieces.append(f"{REDACTION_MARKER}{item.secret_type}:len={item.length}>")
+        if preserve_newlines:
+            newline_count = text[item.start : item.end].count("\n")
+            if newline_count:
+                pieces.append("\n" * newline_count)
+        cursor = item.end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 def mask_text(text: str) -> tuple[str, int]:
     """Remplace les valeurs candidates par ``<REDACTED:type:len=N>``.
 
@@ -879,11 +896,15 @@ def mask_text(text: str) -> tuple[str, int]:
     matches = _iter_matches(text)
     if not matches:
         return text, 0
-    pieces: list[str] = []
-    cursor = 0
-    for item in matches:
-        pieces.append(text[cursor : item.start])
-        pieces.append(f"{REDACTION_MARKER}{item.secret_type}:len={item.length}>")
-        cursor = item.end
-    pieces.append(text[cursor:])
-    return "".join(pieces), len(matches)
+    return _render_masked(text, matches, preserve_newlines=False), len(matches)
+
+
+def mask_lines(lines: Sequence[str]) -> list[str]:
+    """Masque des lignes jointes (motifs multilignes) en gardant leur nombre."""
+    if not lines:
+        return []
+    joined = "\n".join(lines)
+    matches = _iter_matches(joined)
+    if not matches:
+        return list(lines)
+    return _render_masked(joined, matches, preserve_newlines=True).split("\n")
