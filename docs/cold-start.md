@@ -70,10 +70,11 @@ figées au début et relues avant le verdict : une divergence produit une
 `ScanError` statique et un code 2. Cette vérification compare les ensembles de
 SHA observés aux deux instants ; ce n'est pas un verrou des références. Une
 écriture après la vérification finale nécessite de relancer le scan.
-La seconde passe du cold start ne relit que les fichiers porteurs de findings :
-un fichier propre modifié entre les deux passes n'est pas relu. Pour un verdict
-opposable, figer le dépôt (checkout CI, worktree dédié) ou relancer le cold
-start.
+La seconde passe du cold start ne relit que les fichiers porteurs de findings,
+mais l'état Git du worktree (fichiers suivis et non suivis) est comparé avant
+et après : un fichier propre modifié entre les passes provoque `ScanError`.
+Pour un verdict opposable, figer le dépôt (checkout CI, worktree dédié) ou
+relancer le cold start.
 Les commits sont énumérés par lots de 128 ; un seul arbre et
 un seul blob sont lus à la fois. Cette variante de `rev-list` puis lecture
 des snapshots permet aussi d'associer les commits où le secret reste inchangé

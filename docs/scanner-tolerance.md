@@ -24,7 +24,7 @@ heimdall deep-scan --ci --strict .
 | Binaire connu ou contenu sans décodage textuel plausible | ignoré, trace `binary` | code 2 |
 | Fichier/blob > 1 Mio (ou plafond explicitement abaissé) | ignoré sans lire son contenu, trace `too_large` | code 2 |
 | Lien rencontré dans l'arbre de travail | jamais suivi, trace `symlink` | code 2 |
-| Jeton lexical > 4096 caractères | jeton découpé en fenêtres chevauchantes de 4096 caractères (chevauchement 2048 : toute sous-chaîne ≤ 2048 est entière dans une fenêtre), trace `long_token` avec sa ligne ; au-delà de 2048, une signature concaténée sans frontière peut encore échapper aux motifs | code 2 |
+| Jeton lexical > 4096 caractères | jeton découpé en fenêtres chevauchantes de 4096 caractères ; pas de 1 tant que le budget de 8192 fenêtres le permet (jeton ≤ 8192 : garantie complète, toute sous-chaîne ≤ 4096 est dans une fenêtre), puis pas élargi pour rester borné ; trace `long_token` avec sa ligne | code 2 |
 | Jointure de deux lignes > 4096 octets UTF-8 | lignes analysées séparément, trace `multiline_limit` | refus conservateur historique si la jointure pourrait porter un candidat |
 
 Le suffixe ne décide jamais de l'exclusion : un texte Latin-1 portant un
@@ -107,13 +107,14 @@ applique la même règle, y compris avec `long_token` / `multiline_limit`.
 
 Un jeton lexical de plus de 4096 caractères est découpé en fenêtres
 chevauchantes de 4096 caractères avant analyse : l'intérieur n'est plus
-blanchi en bloc. Le chevauchement de moitié garantit qu'une sous-chaîne de
-longueur ≤ 2048 est entièrement contenue dans une fenêtre. Au-delà, une
-signature concaténée sans frontière peut encore échapper aux motifs ; le mode
-tolérant conserve alors la trace `long_token` et déclare le rapport partiel
-(code 2 sans autre finding). Le mode strict le refuse. Le schéma impose
-`complete` et refuse un rapport partiel sans `skipped` : un consommateur ne
-peut donc pas traiter `count == 0` seul comme propre.
+blanchi en bloc. Le pas vaut 1 tant que le budget global de 8192 fenêtres le
+permet : un jeton de 8 Kio est donc couvert avec la garantie complète (toute
+sous-chaîne ≤ 4096 est entière dans une fenêtre). Au-delà du budget, le pas
+est élargi pour rester borné ; le mode tolérant conserve la trace
+`long_token` et déclare le rapport partiel (code 2 sans autre finding). Le
+mode strict le refuse. Le schéma impose `complete` et refuse un rapport
+partiel sans `skipped` : un consommateur ne peut donc pas traiter
+`count == 0` seul comme propre.
 
 ## Bibliothèque et autres commandes
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from heimdall.cli.scan import (
     ScanReport,
+    _call_timeout,
     _read_worktree_file,
     _verify_root_unchanged,
     collect,
@@ -38,6 +39,34 @@ MAX_QUALIFICATION_SECONDS = 300.0
 def _check_deadline(deadline: float) -> None:
     if time.monotonic() >= deadline:
         raise ScanError("limite de temps de qualification dépassée")
+
+
+def _worktree_status(access: GitAccess, deadline: float) -> bytes:
+    """Empreinte bornée de l'état Git du worktree (suivi + non suivi)."""
+    result = access.execute(
+        (
+            "--no-replace-objects",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ),
+        timeout=_call_timeout(deadline),
+    )
+    if result.returncode != 0:
+        raise ScanError("contenu modifié depuis le scan déterministe")
+    return result.stdout
+
+
+def _verify_worktree_status(
+    access: GitAccess, root: Path, before: bytes, deadline: float
+) -> None:
+    """Refuse si un fichier suivi ou non suivi a changé depuis la première passe."""
+    _verify_root_unchanged(access, root)
+    if _worktree_status(access, deadline) != before:
+        raise ScanError("contenu modifié depuis le scan déterministe")
 
 
 @dataclass(frozen=True)
@@ -124,9 +153,10 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
 ) -> ColdStartReport:
     """Collect and qualify candidates; Git failures use the scanner contract.
 
-    La seconde passe ne relit que les fichiers porteurs de findings : un
-    fichier propre modifié entre les deux passes n'est pas relu. Pour un
-    verdict opposable, figer le dépôt ou relancer le cold start.
+    La seconde passe ne relit que les fichiers porteurs de findings, mais
+    l'état Git du worktree (suivi + non suivi) est comparé avant et après :
+    un fichier propre modifié entre les passes provoque ``ScanError``. Pour
+    un verdict opposable, figer le dépôt ou relancer le cold start.
     """
     try:
         return _collect_cold_start(
@@ -136,7 +166,7 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
         raise ScanError("scan impossible : entrée non analysable") from None
 
 
-def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification options
+def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification options
     root: Path,
     *,
     ci: bool = False,
@@ -166,6 +196,7 @@ def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification opti
     if len(scan.findings) > MAX_QUALIFICATIONS:
         raise ScanError("trop de candidats pour la qualification locale")
     deadline = time.monotonic() + MAX_QUALIFICATION_SECONDS
+    status_before = _worktree_status(access, deadline)
     by_file: dict[str, list[Finding]] = {}
     for finding in scan.findings:
         by_file.setdefault(finding.file, []).append(finding)
@@ -199,7 +230,8 @@ def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification opti
         opinions.extend(
             qualify_target(target, findings, ci=ci, chat=chat, journal=journal, deadline=deadline)
         )
-    _verify_root_unchanged(access, root)
+    if status_before is not None:
+        _verify_worktree_status(access, root, status_before, deadline)
     _check_deadline(deadline)
     return ColdStartReport(scan, tuple(opinions), tuple(skipped))
 

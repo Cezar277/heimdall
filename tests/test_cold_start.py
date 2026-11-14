@@ -52,6 +52,33 @@ def repo(monkeypatch: pytest.MonkeyPatch) -> Iterator[GitRepo]:
         value.close()
 
 
+def test_cold_start_refuses_clean_file_changed_between_passes(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write("clean.py", "x = 1\n")
+    repo.write("config.py", f'TOKEN = "{SYNTHETIC}"\n')
+    repo.commit_all("base")
+    real_status = cold_module._worktree_status
+    calls = 0
+
+    def status_then_modify(access: Any, deadline: float) -> bytes:
+        nonlocal calls
+        calls += 1
+        result = real_status(access, deadline)
+        if calls == 1:
+            repo.write("clean.py", f'TOKEN = "{SYNTHETIC}"\n')
+        return result
+
+    def chat(**kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            message=SimpleNamespace(content='{"verdict":"secret","confidence":1}')
+        )
+
+    monkeypatch.setattr(cold_module, "_worktree_status", status_then_modify)
+    with pytest.raises(ScanError, match="contenu modifié"):
+        collect_cold_start(repo.root, chat=chat)
+
+
 def test_llm_only_sees_masked_candidates(repo: GitRepo) -> None:
     repo.write("app.py", "# safe\n" * 1000 + f'key = "{SYNTHETIC}"\n' + "# safe\n" * 1000)
     calls: list[str] = []

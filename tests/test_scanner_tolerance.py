@@ -141,9 +141,27 @@ def test_long_token_windows_find_a_secret_at_a_window_boundary(repo: GitRepo) ->
     assert SYNTHETIC not in render_json(report)
 
 
-def test_long_token_guarantee_is_bounded_to_the_overlap(repo: GitRepo) -> None:
-    # 3000 > chevauchement 2048 : le secret peut chevaucher deux fenêtres.
-    # Le rapport doit rester incomplet (code 2), jamais propre.
+def test_long_token_full_guarantee_finds_secret_at_arbitrary_offset(repo: GitRepo) -> None:
+    # Offset 4100 n'est pas un multiple du pas 2048 : seule la garantie
+    # complète (pas de 1) place le secret en tête d'une fenêtre. Le jeton
+    # avant le séparateur fait 4140 caractères, donc il est bien hors borne.
+    repo.write("notebook.ipynb", "A" * 4100 + SYNTHETIC + " " + "B" * 4000 + "\n")
+    repo.stage("notebook.ipynb")
+    report = collect(repo.root, staged=True, allowlist=Allowlist.empty(), strict=False)
+    assert any(item.file == "notebook.ipynb" for item in report.findings)
+    assert not report.complete
+    assert any(item.reason == "long_token" for item in report.skipped)
+    payload = json.loads(render_json(report))
+    _scan_validator().validate(payload)
+    assert payload["count"] == 1
+    assert payload["complete"] is False
+    assert SYNTHETIC not in render_json(report)
+
+
+def test_long_token_3000_chars_in_8000_is_long_token_and_exit_two(repo: GitRepo) -> None:
+    # Le budget de fenêtres permet un pas de 1 pour un jeton de 8 Kio : la
+    # charge de 3000 caractères est entièrement dans une fenêtre. Le rapport
+    # doit rester incomplet (code 2), jamais propre.
     secret = fake_token("", 3000)
     repo.write("notebook.ipynb", "A" * 3500 + secret + "B" * 1500 + "\n")
     repo.stage("notebook.ipynb")
