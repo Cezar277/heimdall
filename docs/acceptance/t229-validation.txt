@@ -1,4 +1,28 @@
 Ticket #229 - Audit E-01
+DERNIERE REVISION - COMPTEUR ARBRE ET NUMEROS DE LIGNE EXPLICITES
+Code teste : 66e4bbdb4f68e8600fb4080608543678c56508ea
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-tree-count-final.xml
+3976 passed, 18 skipped, 14 warnings, 6911 subtests passed in 381.31s (0:06:21)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 14 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_scanner_fail_closed.py tests/test_scanner_tolerance.py tests/test_scanner_detect.py -o addopts= -q --tb=short
+295 passed in 6.78s.
+Quatre nouveaux cas : parite arbre/index/diff avec une ou deux traces
+(deux cas arbre ajoutes), arbre compose seulement d'un fichier partiel
+compte pour zero sur les parcours ancre et de repli (deux cas).
+Temoin direct de prepare_text renforce : appels successifs, lignes 3 puis 2.
+Gardes existantes chemins invalides et JSON partiel rejouees.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite ; avertissements existants de lecture nosec.
+La CI n'a pas ete declenchee. Les passes precedentes restent historiques.
+
 DERNIERE REVISION - COMPTEURS HISTORIQUES EXPLICITES
 Code teste : 09364abeab80ab47259be64d55246708ab03118d
 

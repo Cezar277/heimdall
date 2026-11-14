@@ -1,6 +1,6 @@
 # T229 — Preuves du correctif fail-closed après revue
 
-Ticket #229, audit E-01. Révision de code actuelle : `09364abeab80ab47259be64d55246708ab03118d`.
+Ticket #229, audit E-01. Révision de code actuelle : `66e4bbdb4f68e8600fb4080608543678c56508ea`.
 Base de la branche : `6bbe7da` (intégration de #228 / #240).
 Les premiers permaliens ci-dessous conservent le SHA du correctif critique
 `aba5eb3`. Les durcissements complémentaires sont épinglés séparément sur
@@ -89,6 +89,14 @@ Révision : `09364abeab80ab47259be64d55246708ab03118d`.
 - Le point de revue `scanned_files` était déjà corrigé : [:859](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/heimdall/cli/scan.py#L859) et [:940](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/heimdall/cli/scan.py#L940) soustraient tous les chemins de `skipped`, sans filtre par motif. Le témoin [:420](https://github.com/Cezar277/heimdall/blob/09364abeab80ab47259be64d55246708ab03118d/tests/test_scanner_fail_closed.py#L420) couvre désormais quatre cas : staged/diff et `long_token` seul / accompagné de `multiline_limit` ; le fichier partiel est déduit une seule fois dans tous les cas.
 - La [politique de tolérance](scanner-tolerance.md) documente déjà explicitement l'intérieur non analysé des jetons trop longs, même avec un secret concaténé, et le refus strict. Les témoins de charge `long_token` restent présents sur les quatre périmètres, avec code 2 et trace, jamais de verdict propre. Aucune détection par fenêtre glissante n'est revendiquée.
 
+## Parité du compteur arbre et numéros de ligne explicites
+
+Révision : `66e4bbdb4f68e8600fb4080608543678c56508ea`.
+
+- [`detect.py:592`](https://github.com/Cezar277/heimdall/blob/66e4bbdb4f68e8600fb4080608543678c56508ea/heimdall/scanner/detect.py#L592) incrémente `files_scanned` seulement après analyse réussie et sans nouvelle trace de prétraitement. La propriété documente désormais les fichiers entièrement analysés. Le témoin [`test_scanner_fail_closed.py:423`](https://github.com/Cezar277/heimdall/blob/66e4bbdb4f68e8600fb4080608543678c56508ea/tests/test_scanner_fail_closed.py#L423) compare arbre/index/diff, avec `long_token` seul ou accompagné de `multiline_limit`. Le témoin [:455](https://github.com/Cezar277/heimdall/blob/66e4bbdb4f68e8600fb4080608543678c56508ea/tests/test_scanner_fail_closed.py#L455) vérifie zéro fichier entièrement analysé pour un arbre composé d'un seul fichier partiel, sur les parcours ancré et de repli.
+- [`policy.py:48`](https://github.com/Cezar277/heimdall/blob/66e4bbdb4f68e8600fb4080608543678c56508ea/heimdall/scanner/policy.py#L48) reçoit `line_number` en paramètre explicite, lié par `functools.partial` à chaque substitution [:60](https://github.com/Cezar277/heimdall/blob/66e4bbdb4f68e8600fb4080608543678c56508ea/heimdall/scanner/policy.py#L60). Le témoin direct [:206](https://github.com/Cezar277/heimdall/blob/66e4bbdb4f68e8600fb4080608543678c56508ea/tests/test_scanner_fail_closed.py#L206) enchaîne deux appels de `prepare_text` avec des traces aux lignes 3 puis 2, sans dépendance au numéro de boucle d'un appel précédent.
+- Les témoins déjà présents [:443](https://github.com/Cezar277/heimdall/blob/66e4bbdb4f68e8600fb4080608543678c56508ea/tests/test_scanner_fail_closed.py#L443) et [:374](https://github.com/Cezar277/heimdall/blob/66e4bbdb4f68e8600fb4080608543678c56508ea/tests/test_scanner_fail_closed.py#L374) couvrent les chemins invalides (`ScanError` pour les deux motifs et `skip_file`) et le contrôle de couverture JSON en plus de `count`. La [politique de tolérance](scanner-tolerance.md) conserve l'interdiction d'ignorer la couverture et la limite explicite sur l'intérieur des jetons longs ; aucune détection par fenêtre glissante n'est revendiquée.
+
 ## Validation
 
 Le correctif critique avait été validé par **3925 tests**, 18 ignorés et
@@ -143,7 +151,15 @@ en **380,67 s**. Les 14 avertissements existants concernent les sauvegardes
 de remédiation. Ruff, MyPy (57 fichiers) et Bandit passent (avertissements
 de lecture `nosec` existants, aucune alerte de sécurité). Aucun code ni test
 n'a changé après ce rejeu ; seuls les documents de preuve ont été actualisés.
-Rapport JUnit final : `/home/nathan/heimdall-t229-history-volume-final.xml`.
+Rapport JUnit de `09364ab` : `/home/nathan/heimdall-t229-history-volume-final.xml`.
+
+Dernière révision `66e4bbd` : **295 tests ciblés en 6,78 s**, puis suite
+complète après le commit de code : **3976 tests, 6911 sous-tests, 18 ignorés**,
+en **381,31 s**. Les 14 avertissements existants concernent les sauvegardes
+de remédiation. Ruff, MyPy (57 fichiers) et Bandit passent (avertissements
+de lecture `nosec` existants, aucune alerte de sécurité). Aucun code ni test
+n'a changé après ce rejeu ; seuls les documents de preuve ont été actualisés.
+Rapport JUnit final : `/home/nathan/heimdall-t229-tree-count-final.xml`.
 
 Environnement : Debian WSL, Python 3.13, dépendances de l'environnement
 existant. La CI aux versions verrouillées n'a pas été déclenchée.
