@@ -266,6 +266,16 @@ def test_history_oversized_blobs_consume_volume_without_being_read(
     monkeypatch.setattr(history_module, "MAX_READ_BYTES", 150)
     with pytest.raises(ScanError, match="limite historique dépassée"):
         collect_history(repo.root, ci=True, strict=False, max_file_bytes=32)
+    monkeypatch.setattr(history_module, "MAX_READ_BYTES", 250)
+    report = collect_history(repo.root, ci=True, strict=False, max_file_bytes=32)
+    assert report.bytes_scanned == len(b"safe\n")
+    assert report.bytes_budgeted == report.bytes_scanned + 200
+    assert not report.complete
+    payload = json.loads(history_module.render_history(report, json_output=True))
+    assert payload["bytes_scanned"] < payload["bytes_budgeted"] == 205
+    assert "5 octet(s) lu(s), 205 octet(s) imputé(s) au budget" in (
+        history_module.render_history(report)
+    )
 
 
 @pytest.mark.parametrize("reason", ["binary", "too_large", "text"])
@@ -406,9 +416,12 @@ def test_partial_human_report_ends_with_blocking_verdict(repo: GitRepo) -> None:
 
 
 @pytest.mark.parametrize("scope", ["staged", "diff"])
-def test_partial_blobs_are_not_counted_as_fully_scanned(repo: GitRepo, scope: str) -> None:
+@pytest.mark.parametrize("trace_count", [1, 2])
+def test_partial_blobs_are_not_counted_as_fully_scanned(
+    repo: GitRepo, scope: str, trace_count: int,
+) -> None:
     base = repo.git_output("rev-parse", "HEAD").strip()
-    repo.write("partial.dat", "A" * 5000 + "\n")
+    repo.write("partial.dat", "A" * 5000 + ("\n" if trace_count == 2 else ""))
     repo.write("complete.dat", "safe\n")
     repo.stage("partial.dat", "complete.dat")
     if scope == "diff":
@@ -417,7 +430,7 @@ def test_partial_blobs_are_not_counted_as_fully_scanned(repo: GitRepo, scope: st
         repo.root, staged=scope == "staged", diff=base if scope == "diff" else None,
         ci=True, allowlist=Allowlist.empty(), strict=False,
     )
-    assert len(report.skipped) == 2
+    assert len(report.skipped) == trace_count
     assert {item.file for item in report.skipped} == {"partial.dat"}
     assert report.scanned_files == 1
     assert not report.complete

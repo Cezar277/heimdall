@@ -52,6 +52,7 @@ class HistoryReport:
     entries_scanned: int
     bytes_scanned: int  # octets effectivement lus, distincts du budget annoncé
     elapsed_seconds: float
+    bytes_budgeted: int = 0  # tailles annoncées sur défaut de cache, exclusions comprises
 
     @property
     def complete(self) -> bool:
@@ -294,6 +295,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
         entries,
         read_volume,
         time.monotonic() - started,
+        bytes_budgeted=volume,
     )
 
 
@@ -315,6 +317,7 @@ def render_history(report: HistoryReport, *, json_output: bool = False) -> str:
                 "commits_scanned": report.commits_scanned,
                 "entries_scanned": report.entries_scanned,
                 "bytes_scanned": report.bytes_scanned,
+                "bytes_budgeted": report.bytes_budgeted,
                 "elapsed_seconds": report.elapsed_seconds,
             },
             ensure_ascii=True,
@@ -322,7 +325,9 @@ def render_history(report: HistoryReport, *, json_output: bool = False) -> str:
         )
     lines = [
         f"Historique : {report.commits_scanned} commits, "
-        f"{len(report.findings)} secret(s), {report.elapsed_seconds:.3f} s."
+        f"{len(report.findings)} secret(s), {report.elapsed_seconds:.3f} s.",
+        f"Volume : {report.bytes_scanned} octet(s) lu(s), "
+        f"{report.bytes_budgeted} octet(s) imputé(s) au budget (exclusions comprises).",
     ]
     for item in report.findings:
         commits = ", ".join(item.commits[:MAX_TEXT_COMMITS])

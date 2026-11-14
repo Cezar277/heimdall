@@ -84,6 +84,15 @@ Les tailles annoncées des gros fichiers et blobs exclus consomment aussi
 les budgets globaux de l'arbre et de l'index, sans lecture de leur contenu.
 L'historique compte lui aussi la taille de chaque blob absent du cache,
 même s'il est exclu ; `bytes_scanned` reste le compteur des octets lus.
+Le rapport historique expose aussi `bytes_budgeted` : somme des tailles
+annoncées imputées à `MAX_READ_BYTES` sur chaque défaut de cache, exclusions
+comprises. Ces deux compteurs figurent dans le JSON, le texte et l'API
+`HistoryReport`. Par exemple, deux blobs distincts exclus de 100 octets et
+un texte lu de 5 octets donnent `bytes_scanned: 5`, `bytes_budgeted: 205`.
+Comparer `bytes_budgeted` au plafond de volume, et non `bytes_scanned`.
+Un blob réutilisé depuis le cache n'est pas à nouveau imputé ; une relecture
+après éviction l'est. `bytes_budgeted` est un champ ajouté au contrat
+`heimdall.history.v1` ; les anciens rapports peuvent ne pas le contenir.
 Les traces d'exclusion de l'index et du diff sont plafonnées à
 `MAX_STAGED_FINDINGS`, y compris avec un collecteur déjà rempli.
 Dans ces deux périmètres, `scanned_files` compte les fichiers entièrement
