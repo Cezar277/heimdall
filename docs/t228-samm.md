@@ -83,3 +83,29 @@ Les permaliens du commit local seront accessibles sur GitHub après push.
 En cas de squash, re-pinner cette fiche sur le SHA final avec
 `scripts/repin_samm.py --sha <SHA> --fiche docs/t228-samm.md`, puis vérifier
 avec `--check`.
+
+## Durcissements après revue
+
+Révision de code : `bbd3e90fbf01fa2508a0f16e0c98c8c8de0bb47a`.
+Les preuves ci-dessus restent celles de la livraison initiale ; cette
+section couvre les remarques faibles de la revue.
+
+| Remarque | Correction et preuve permanente |
+| --- | --- |
+| Remédiation sur le mauvais index | [`hook.py:544`](https://github.com/Cezar277/heimdall/blob/bbd3e90fbf01fa2508a0f16e0c98c8c8de0bb47a/heimdall/cli/hook.py#L544) : refus statique en `HookError` de toute variable `GIT_INDEX_FILE` présente dans les opérations de remédiation. [`test_hook_commit_index.py:196`](https://github.com/Cezar277/heimdall/blob/bbd3e90fbf01fa2508a0f16e0c98c8c8de0bb47a/tests/test_hook_commit_index.py#L196) : index `index.lock`, `next-index-123.lock`, `index` et variable vide ; refus avant callback ; contenu du worktree et des deux index inchangé. La garde et la primitive interne de ré-indexation sont également testées directement. |
+| Identité d'index insuffisante | [`gitdiff.py:421`](https://github.com/Cezar277/heimdall/blob/bbd3e90fbf01fa2508a0f16e0c98c8c8de0bb47a/heimdall/mcp/gitdiff.py#L421) : comparaison de `st_dev`, `st_ino`, `st_ctime_ns`, `st_mtime_ns` et `st_size` avant chaque commande. [`test_hook_commit_index.py:229`](https://github.com/Cezar277/heimdall/blob/bbd3e90fbf01fa2508a0f16e0c98c8c8de0bb47a/tests/test_hook_commit_index.py#L229) : réécriture par un autre index Git valide, de même taille, même inode et mtime restauré ; modification de mtime ; changement de taille. Tous sont refusés. |
+| Confiance dans les préfixes Git ajoutés | [Conditions de déploiement](hook.md#preuves) : préfixes, parents et cible résolue administrateur-écrits seuls pour une confiance indépendante du compte utilisateur. Cette condition n'est pas un contrôle automatique de permissions. [`test_hook_commit_index.py:265`](https://github.com/Cezar277/heimdall/blob/bbd3e90fbf01fa2508a0f16e0c98c8c8de0bb47a/tests/test_hook_commit_index.py#L265) : Git système prioritaire face à un faux Git dans un préfixe `/usr/local/bin` simulé ; repli vers un lien de ce préfixe pointant dans le dépôt refusé par `GitAccess` et par le hook. |
+
+La remédiation d'un index effectif imposé reste volontairement indisponible
+jusqu'à son intégration explicite avec #30/#32. Le scan staged continue à
+prendre en charge les index temporaires. Les nouveaux tests de résolution
+s'exécutent sous Linux avec des préfixes simulés ; aucune preuve native
+macOS/Nix n'est revendiquée.
+
+Validation après revue : même commande de régression élargie que ci-dessus,
+`553 passed, 750 subtests passed in 90.16s`. Le témoin de réécriture d'un
+index valide avec mtime restauré a été renforcé pendant cette passe puis
+rejoué avec les deux autres cas d'identité : `3 passed`. Ruff, MyPy
+(56 fichiers), Bandit et la vérification des permaliens passent. Rapport
+JUnit local : `/home/nathan/heimdall-t228-review.xml`. La suite complète
+n'a pas été rejouée pour ces durcissements.
