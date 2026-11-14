@@ -1611,6 +1611,52 @@ class VaultRotateCliTests(unittest.TestCase):
         self.assertEqual(res.exit_code, 2, res.output)
         self.assertIn("déjà cette clé", res.output)
 
+    def test_hot_rotation_guard_probes_ipv6_loopback(self) -> None:
+        """Serveur sur ::1 seul : la garde le détecte (rotation refusée sans --force)."""
+        from heimdall.cli import vault_keys  # noqa: PLC0415
+
+        probed: list[str] = []
+
+        def fake_connect(address: tuple[str, int], timeout: float) -> unittest.mock.MagicMock:
+            probed.append(address[0])
+            if address[0] != "::1":
+                raise OSError("refused")
+            return unittest.mock.MagicMock()
+
+        with unittest.mock.patch("socket.create_connection", side_effect=fake_connect):
+            self.assertTrue(vault_keys._vault_server_is_listening())
+            res = self.runner.invoke(
+                cli_app,
+                ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+                env={
+                    "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+                    "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+                },
+            )
+        self.assertEqual(probed[:2], ["127.0.0.1", "::1"])
+        self.assertEqual(res.exit_code, 2, res.output)
+        self.assertIn("serveur Vault", res.output)
+
+    def test_cli_audit_rekey_on_pruned_base_stays_verifiable_with_new_key(self) -> None:
+        """Base purgée puis rekey : chaîne (True, None) avec la seule nouvelle clé."""
+        from heimdall.vault import audit as audit_module  # noqa: PLC0415
+
+        derived = SqliteAuditLog(self.db_path, hmac_key=self.old_cipher.audit_hmac_key())
+        with unittest.mock.patch.object(audit_module, "MAX_AUDIT_EVENTS", 3):
+            for _ in range(6):
+                asyncio.run(derived.record(peer="srv", action="GET", target=None, status_code=200))
+        self.assertGreater(derived.pruned_count(), 0)
+        audit_key = generate_server_hmac_key()
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "audit", "rekey", "--db-path", str(self.db_path)],
+            env={"HEIMDALL_VAULT_KEK": _OLD_KEK_B64, "HEIMDALL_VAULT_AUDIT_HMAC_KEY": audit_key},
+        )
+        self.assertEqual(res.exit_code, 0, res.output)
+        rekeyed = SqliteAuditLog(self.db_path, create=False, hmac_key=audit_key.encode())
+        self.assertEqual(rekeyed.verify_chain(), (True, None))
+        self.assertGreater(rekeyed.pruned_count(), 0)
+
     def test_cli_rotate_invalid_port_is_fail_closed(self) -> None:
         for port in ("abc", "99999", "0"):
             with self.subTest(port=port):

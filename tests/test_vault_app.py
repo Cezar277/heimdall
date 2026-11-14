@@ -606,6 +606,23 @@ class VaultSettingsTests(unittest.TestCase):
         """run_server est défini et appelable comme point d'entrée."""
         self.assertTrue(callable(run_server))
 
+    def test_factory_get_app_unknown_env_exits_2_without_traceback(self) -> None:
+        """Déploiement factory : HEIMDALL_ENV inconnu → code 2, jamais d'app construite."""
+        import heimdall.vault.app as app_module  # noqa: PLC0415
+
+        stderr = io.StringIO()
+        with (
+            patch.dict(app_module._APP_HOLDER, clear=True),
+            patch.dict(os.environ, {"HEIMDALL_ENV": "staging"}),
+            patch.object(app_module, "create_app") as factory,
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            get_app()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("HEIMDALL_ENV invalide", stderr.getvalue())
+        factory.assert_not_called()
+
     @patch("uvicorn.run")
     def test_run_server_unknown_env_exits_2_without_traceback(
         self, mock_uvicorn_run: unittest.mock.MagicMock

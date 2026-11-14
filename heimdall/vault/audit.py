@@ -773,6 +773,14 @@ class SqliteAuditLog(AuditLog):
         valeur de ``previous_hash``). Une chaîne invalide n'est jamais
         re-signée : ``ValueError`` et aucune écriture. Retourne le nombre
         d'événements re-signés.
+
+        Limite documentée : après une purge, le point de contrôle
+        (``checkpoint_hash`` = dernier ``entry_hash`` purgé) reste celui
+        calculé sous l'ancienne clé. La chaîne reste vérifiable ``(True, None)``
+        avec la seule nouvelle clé (le checkpoint est comparé, pas re-haché),
+        mais le point de purge lui-même n'est authentifiable qu'avec l'ancienne
+        clé. Recommandation : lancer ``rekey`` avant toute purge (continuité
+        pure), et archiver l'ancienne clé si la base a déjà été purgée.
         """
         if not new_hmac_key:
             raise ValueError("nouvelle clé HMAC d'audit invalide.")

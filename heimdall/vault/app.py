@@ -2159,8 +2159,26 @@ def get_app() -> FastAPI:
     if "app" not in _APP_HOLDER:
         with _app_lock:
             if "app" not in _APP_HOLDER:
+                _require_valid_env_mode()
                 _APP_HOLDER["app"] = create_app()
     return _APP_HOLDER["app"]
+
+
+def _require_valid_env_mode() -> str:
+    """Valide ``HEIMDALL_ENV`` aux deux points d'entrée serveur (M-13).
+
+    ``run_server`` et la factory ``get_app`` (déploiement uvicorn factory)
+    refusent une valeur inconnue avec un message actionnable et le code 2,
+    jamais un traceback. ``create_app`` appelé directement (bibliothèque,
+    tests) lève toujours ``ValueError``.
+    """
+    try:
+        return _heimdall_env_mode()
+    except ValueError as exc:
+        import sys  # noqa: PLC0415
+
+        print(f"Erreur : {exc}", file=sys.stderr)  # noqa: T201
+        raise SystemExit(2) from None
 
 
 def __dir__() -> list[str]:
@@ -2185,16 +2203,7 @@ def run_server() -> None:
     et cette contrainte évite tout écart de configuration. Le backend SQLite
     peut être répliqué sans multiplier la limite de débit.
     """
-    # HEIMDALL_ENV inconnu (M-13) : refus fail-closed avec un message
-    # actionnable et le code 2, avant toute lecture de configuration (jamais
-    # de traceback ni de ValidationError brute au démarrage).
-    try:
-        env_mode = _heimdall_env_mode()
-    except ValueError as exc:
-        import sys  # noqa: PLC0415
-
-        print(f"Erreur : {exc}", file=sys.stderr)  # noqa: T201
-        raise SystemExit(2) from None
+    env_mode = _require_valid_env_mode()
     server_settings = get_settings()
     if env_mode in _PRODUCTION_ENV_MODES and (
         server_settings.ssl_certfile is None or server_settings.ssl_keyfile is None

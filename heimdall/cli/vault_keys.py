@@ -547,11 +547,16 @@ def _vault_server_is_listening() -> bool:
             "port invalide, vérifier HEIMDALL_VAULT_PORT ou passer --force en "
             "connaissance de cause."
         )
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-            return True
-    except OSError:
-        return False
+    # Toutes les adresses loopback que ``validate_host`` autorise côté serveur
+    # (127.0.0.1, ::1 ; localhost s'y résout) : un serveur sur ::1 seul ne doit
+    # pas rendre la garde aveugle.
+    for host in ("127.0.0.1", "::1"):
+        try:
+            with socket.create_connection((host, port), timeout=0.2):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _require_rotation_audit_key(resolved: Path) -> bytes:
