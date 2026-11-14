@@ -734,6 +734,26 @@ def parse_example_names(path: Path) -> list[str] | None:
     return names
 
 
+def _find_repo_dir_without_symlinks(start: Path) -> Path | None:
+    """Premier ancêtre portant ``.git``, par ``lstat`` seulement.
+
+    Retourne ``None`` si un ancêtre ou ``.git`` lui-même est un lien
+    symbolique (fail-closed), ou si aucun dépôt n'est trouvé.
+    """
+    for candidate in (start, *start.parents):
+        try:
+            if stat.S_ISLNK(os.lstat(candidate).st_mode):
+                return None
+            git_entry = os.lstat(candidate / ".git")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        # ``.git`` symlinké vers l'extérieur : statut Git indéterminé.
+        return None if stat.S_ISLNK(git_entry.st_mode) else candidate
+    return None
+
+
 def _get_git_toplevel(path: Path) -> Path | None:
     """Trouve la racine du dépôt Git contenant le chemin via ``GitAccess``.
 
@@ -752,19 +772,7 @@ def _get_git_toplevel(path: Path) -> Path | None:
     # par ``lstat`` seulement (aucun processus git par ancêtre). Un ancêtre
     # symlinké arrête la recherche (fail-closed : jamais de repli sur un dépôt
     # ancêtre sans rapport avec le fichier), puis un seul ``rev-parse``.
-    repo_dir: Path | None = None
-    for candidate in (parent_dir, *parent_dir.parents):
-        try:
-            if stat.S_ISLNK(os.lstat(candidate).st_mode):
-                return None
-        except OSError:
-            return None
-        try:
-            os.lstat(candidate / ".git")
-        except OSError:
-            continue
-        repo_dir = candidate
-        break
+    repo_dir = _find_repo_dir_without_symlinks(parent_dir)
     if repo_dir is None:
         return None
     try:

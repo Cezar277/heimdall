@@ -833,3 +833,20 @@ class PreM03SchemaTests(unittest.TestCase):
             )
             self.assertEqual(result.exit_code, 1, result.output)
             self.assertIn("migration requise", result.output)
+
+    def test_missing_rejection_state_table_reports_migration_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                conn.execute("DROP TABLE audit_rejection_chain_state")
+            log = SqliteAuditLog(db_path, create=False, hmac_key=None)
+            self.assertTrue(log.needs_schema_migration())
+            for command in ("verify", "list"):
+                with self.subTest(command=command):
+                    result = CliRunner().invoke(
+                        cli_app, ["vault", "audit", command, "--db-path", str(db_path)]
+                    )
+                    self.assertEqual(result.exit_code, 1, result.output)
+                    self.assertIn("migration requise", result.output)
+                    self.assertNotIn("échec", result.output)

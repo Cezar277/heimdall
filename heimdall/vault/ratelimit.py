@@ -168,9 +168,10 @@ class RateLimiter:
     ) -> tuple[bool, int]:
         """Évalue tous les budgets, puis consomme atomiquement.
 
-        ``consume_on_reject`` permet de conserver la sémantique du middleware :
-        pair/global sont consommés même quand le budget clé est plein, tandis
-        qu'un rejet pair/global n'ajoute rien.
+        Aucun budget n'est consommé sur rejet par défaut : le chemin
+        authentifié évalue la clé en premier et refuse sans consommer
+        ``auth_peer`` ni global (M-02). ``consume_on_reject`` reste une option
+        explicite, inutilisée par le middleware actuel.
         """
         buckets: list[tuple[str, int, _Bucket | None]] = []
         full: tuple[_Bucket, int] | None = None
@@ -210,13 +211,14 @@ class RateLimiter:
         # Les requêtes sans clé valide ont leur propre budget : un flot
         # anonyme ne peut pas épuiser le budget des clients authentifiés
         # (audit M-02).
+        if key_hash is not None:
+            # Une clé fournie n'entre jamais dans les budgets anonymes (M-02) :
+            # chemin authentifié key + auth_peer + global.
+            return self.check_authenticated(peer, key_hash)
         specs: list[tuple[str, int]] = [
             ("anon_global", self._global_limit),
             (f"anon_peer:{peer}", self._per_peer),
         ]
-        if key_hash is not None:
-            specs.append((f"key:{key_hash}", self._per_key))
-
         with self._lock:
             return self._evaluate(specs, self._clock())
 
@@ -413,13 +415,13 @@ class SqliteRateLimiter:
     def check(self, peer: str, key_hash: str | None = None) -> tuple[bool, int]:
         """Consomme une unité de façon atomique entre workers, sans stocker la clé."""
         # Budget anonyme séparé du budget authentifié (audit M-02).
+        if key_hash is not None:
+            # Une clé fournie n'entre jamais dans les budgets anonymes (M-02).
+            return self.check_authenticated(peer, key_hash)
         specs: list[tuple[str, int]] = [
             ("anon_global", self._global_limit),
             (f"anon_peer:{peer}", self._per_peer),
         ]
-        if key_hash is not None:
-            specs.append((f"key:{key_hash}", self._per_key))
-
         with db_session(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             return self._evaluate(conn, specs, self._clock())

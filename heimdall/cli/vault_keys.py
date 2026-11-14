@@ -25,6 +25,7 @@ Codes de sortie (convention de la CLI) : 0 (succès), 1 (échec opérationnel),
 import asyncio
 import json
 import os
+import sqlite3
 import stat
 from pathlib import Path
 
@@ -488,9 +489,16 @@ def _require_rotation_audit_key(resolved: Path) -> bytes:
     # serveur tournait avec une autre clé (dérivée, par exemple) et
     # l'événement de rotation produirait une chaîne mixte invérifiable.
     existing_audit = SqliteAuditLog(resolved, create=False, hmac_key=audit_key)
-    if existing_audit.needs_schema_migration() or (
-        existing_audit.count() > 0 and existing_audit.verify_chain() != (True, None)
-    ):
+    try:
+        unverifiable = existing_audit.needs_schema_migration() or (
+            existing_audit.count() > 0 and existing_audit.verify_chain() != (True, None)
+        )
+    except sqlite3.Error:
+        raise ValueError(
+            "journal d'audit illisible, migration requise : démarrer une fois le "
+            "serveur Vault (migration du schéma) avant la rotation."
+        ) from None
+    if unverifiable:
         raise ValueError(
             "le journal d'audit existant n'est pas vérifiable avec "
             "HEIMDALL_VAULT_AUDIT_HMAC_KEY : configurer le serveur avec cette clé "

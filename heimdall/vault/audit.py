@@ -764,6 +764,16 @@ class SqliteAuditLog(AuditLog):
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(audit_events);").fetchall()
             }
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+        # Les deux tables d'état de chaîne sont lues par verify_chain/record :
+        # leur absence est aussi une base à migrer (pas une OperationalError).
+        if not {"audit_chain_state", "audit_rejection_chain_state"} <= tables:
+            return True
         # Table absente (base très ancienne ou incomplète) : même diagnostic
         # « migration requise » plutôt qu'une OperationalError générique.
         return not columns or "stream" not in columns

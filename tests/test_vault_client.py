@@ -873,6 +873,23 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             for call in mock_access_cls.call_args_list:
                 self.assertNotEqual(call.args[0], real_dir)
 
+    def test_git_toplevel_refuses_symlinked_dot_git(self) -> None:
+        """``.git`` symlinké vers l'extérieur → None, git jamais lancé."""
+        repo = self.tmp_dir / "repo_with_linked_git"
+        repo.mkdir()
+        outside = self.tmp_dir / "outside_git"
+        outside.mkdir()
+        try:
+            os.symlink(outside, repo / ".git")
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        target = repo / ".env"
+        target.write_text("X=1\n", encoding="utf-8")
+        with patch("heimdall.vault.atomic.GitAccess") as mock_access_cls:
+            self.assertIsNone(_get_git_toplevel(target))
+            self.assertFalse(is_git_tracked(target))
+            mock_access_cls.assert_not_called()
+
     def test_git_toplevel_refuses_symlinked_ancestor_without_fallback(self) -> None:
         """Ancêtre symlinké → None, jamais le dépôt d'un ancêtre ; aucun git lancé."""
         outer = self.tmp_dir / "outer_repo"

@@ -1511,6 +1511,28 @@ class VaultRotateCliTests(unittest.TestCase):
         log = SqliteAuditLog(self.db_path, create=False, hmac_key=audit_key.encode())
         self.assertEqual(log.verify_chain(), (True, None))
 
+    def test_cli_rotate_on_pre_m03_audit_schema_reports_migration(self) -> None:
+        """Table d'état rejection absente : code 2 « migration », sans traceback."""
+        with db_session(self.db_path) as conn:
+            conn.execute("DROP TABLE audit_rejection_chain_state")
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY": generate_server_hmac_key(),
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(self.db_path), "--force"],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 2, res.output)
+        self.assertIsNone(res.exception if not isinstance(res.exception, SystemExit) else None)
+        self.assertIn("migr", res.output)
+        store = SqliteSecretStore(self.db_path, VaultCipher(_OLD_KEK_BYTES))
+        rec = store._get("demo", "dev", "API_KEY")
+        assert rec is not None
+        self.assertEqual(rec["value"], "super_secret_value")
+
     def test_cli_rotate_refuses_hot_server_without_force(self) -> None:
         """Audit M-07 : rotation à chaud refusée, --force explicite l'autorise."""
         env = {

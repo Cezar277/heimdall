@@ -55,9 +55,9 @@ class SlidingWindowMemoryTests(unittest.TestCase):
             window_seconds=10,
             clock=lambda: now[0],
         )
-        self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+        self.assertTrue(limiter.check("127.0.0.1")[0])
         now[0] = 1.0
-        self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+        self.assertTrue(limiter.check("127.0.0.1")[0])
         now[0] = 2.0
         allowed, retry = limiter.peek("127.0.0.1")
         self.assertFalse(allowed)
@@ -186,6 +186,18 @@ class AuthenticatedPeerAndClockTests(unittest.TestCase):
                     # Un autre pair n'est pas affecté.
                     self.assertTrue(limiter.check_authenticated("10.0.0.2", "k3")[0])
 
+    def test_check_with_key_never_consumes_anonymous_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for limiter in self._limiters(tmp, lambda: 1000.0):
+                with self.subTest(backend=type(limiter).__name__):
+                    self.assertTrue(limiter.check("10.0.0.5", "k1")[0])
+                    self.assertTrue(limiter.check("10.0.0.5", "k2")[0])
+                    # auth_peer (per_peer=2) plein, mais budget anonyme intact.
+                    self.assertFalse(limiter.check("10.0.0.5", "k3")[0])
+                    self.assertTrue(limiter.check("10.0.0.5")[0])
+                    self.assertTrue(limiter.check("10.0.0.5")[0])
+                    self.assertFalse(limiter.check("10.0.0.5")[0])
+
     def test_clock_rollback_ignores_future_hits_and_bounds_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             now = [1000.0]
@@ -243,9 +255,9 @@ class SlidingWindowSqliteTests(unittest.TestCase):
                 window_seconds=10,
                 clock=lambda: now[0],
             )
-            self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+            self.assertTrue(limiter.check("127.0.0.1")[0])
             self.assertTrue(limiter.peek("127.0.0.1")[0])
-            self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+            self.assertTrue(limiter.check("127.0.0.1")[0])
             allowed, retry = limiter.peek("127.0.0.1")
             self.assertFalse(allowed)
             self.assertEqual(retry, 10)
