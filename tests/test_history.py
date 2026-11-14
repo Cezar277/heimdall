@@ -8,6 +8,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from jsonschema import Draft202012Validator
+from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT202012
 from support.git_repo import GitRepo
 from typer.testing import CliRunner
 
@@ -25,6 +28,30 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 
 SYNTHETIC = "AKIAIOSFODNN7EXAMPLE"
+REPO = Path(__file__).resolve().parents[1]
+
+
+def _history_validator() -> Draft202012Validator:
+    """Validateur du contrat `heimdall.history.v1`, Finding v1 résolu par registre."""
+    history_schema = json.loads(
+        (REPO / "schemas/history.schema.json").read_text(encoding="utf-8")
+    )
+    finding_schema = json.loads(
+        (REPO / "schemas/finding.schema.json").read_text(encoding="utf-8")
+    )
+    registry = Registry().with_resources(
+        [
+            (
+                "https://github.com/Cezar277/heimdall/schemas/finding.schema.json",
+                Resource(contents=finding_schema, specification=DRAFT202012),
+            ),
+            (
+                "https://github.com/Cezar277/heimdall/schemas/history.schema.json",
+                Resource(contents=history_schema, specification=DRAFT202012),
+            ),
+        ]
+    )
+    return Draft202012Validator(history_schema, registry=registry)
 
 
 def test_history_keeps_skip_lines_on_cache_hits(repo: GitRepo) -> None:
@@ -153,6 +180,17 @@ def test_oversized_blobs_never_read_and_cli_is_incomplete(
     assert json.loads(result.stdout)["complete"] is False
 
 
+def test_history_json_validates_against_the_versioned_schema(repo: GitRepo) -> None:
+    repo.write("large.txt", "x" * 100)
+    repo.commit_all("large")
+    report = history.collect_history(repo.root, ci=True, max_file_bytes=10, strict=False)
+    payload = json.loads(history.render_history(report, json_output=True))
+    _history_validator().validate(payload)
+    assert payload["bytes_budgeted"] >= payload["bytes_scanned"]
+    assert payload["skipped"][0]["reason"] == "too_large"
+    assert payload["skipped"][0]["line"] is None
+
+
 def test_oversized_blob_reason_is_the_enum_too_large(repo: GitRepo) -> None:
     repo.write("large.txt", "x" * 100)
     repo.commit_all("large")
@@ -279,6 +317,9 @@ def test_rejection_is_displayed_and_does_not_remove_finding(
     assert SYNTHETIC not in calls[0]
     assert "faux_positif" in history.render_history(report)
     assert len(journal.read()) == 1
+    payload = json.loads(history.render_history(report, json_output=True))
+    _history_validator().validate(payload)
+    assert payload["opinions"][0]["verdict"] == "faux_positif"
 
 
 def test_cache_eviction_preserves_commits(repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
