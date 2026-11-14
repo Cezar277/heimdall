@@ -25,89 +25,113 @@ _MAX_NAME_LENGTH: Final[int] = MAX_VARIABLE_CHARS
 #: Nombre maximal de noms existants lus lors d'une déduplication.
 _MAX_TAKEN: Final[int] = 10_000
 
+#: Noms exacts des redirecteurs HTTP/proxy et charges d'exécution (13 noms).
+#: Source unique partagée par la denylist de remédiation et celle d'exécution :
+#: un ajout futur ne peut pas diverger entre les deux.
+_BASE_EXEC_EXACT: Final[frozenset[str]] = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSLKEYLOGFILE",
+        "CLASSPATH",
+        "PHPRC",
+        "PHP_INI_SCAN_DIR",
+        "CURL_HOME",
+        "WGETRC",
+        "GNUPGHOME",
+        "ELECTRON_RUN_AS_NODE",
+        "NODE_OPTIONS",
+    }
+)
+
 #: Noms exacts refusés : variables système/shell dont l'écrasement détournerait
 #: l'exécution des processus enfants (voir ticket #84).
-DANGEROUS_ENV_EXACT: Final[frozenset[str]] = frozenset(
-    {
-        "PATH",
-        "SHELL",
-        "IFS",
-        "BASH_ENV",
-        "BASHOPTS",
-        "SHELLOPTS",
-        "ENV",
-        "PS0",
-        "PS1",
-        "PS2",
-        "PS3",
-        "PS4",
-        "PROMPT_COMMAND",
-        "ZDOTDIR",
-        "GLIBC_TUNABLES",
-        "GCONV_PATH",
-        "LOCPATH",
-        "NLSPATH",
-        "HOSTALIASES",
-        "CORE_PAGER",
-        "PAGER",
-        "MANPAGER",
-        "LESSOPEN",
-        "LESSCLOSE",
-        "EDITOR",
-        "VISUAL",
-        "SUDO_ASKPASS",
-        "SSH_ASKPASS",
-        "SSH_ASKPASS_REQUIRE",
-        "SSH_AUTH_SOCK",
-        "SSH_ORIGINAL_COMMAND",
-        "KUBECONFIG",
-        "GOBIN",
-        "GOCACHE",
-        "GOFLAGS",
-        "GOMODCACHE",
-        "GOPATH",
-        "GOROOT",
-        "GOTOOLCHAIN",
-        "CC",
-        "CXX",
-        "CPP",
-        "CFLAGS",
-        "CPPFLAGS",
-        "CXXFLAGS",
-        "LDFLAGS",
-        "MAKEFLAGS",
-        "MFLAGS",
-        "HOME",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "REQUESTS_CA_BUNDLE",
-        "CURL_CA_BUNDLE",
-        # Comportement du shell enfant (LOW) : un Vault compromis ne doit pas
-        # détourner les `cd`/globs/historique des scripts enfants de `run`.
-        # La racine de confiance reste l'allowlist locale (seuls les noms listés
-        # localement sont demandés) ; la denylist n'est qu'une défense en
-        # profondeur. Tout nom listé localement (--name/.env.example/.env) est
-        # une entrée de confiance : ne pas y inscrire de variable système.
-        "CDPATH",
-        "GLOBIGNORE",
-        "HISTFILE",
-        "MAILCAPS",
-        # État du shell/environnement d'exécution (LOW) : chemins terminfo et
-        # cible venv — détournement des enfants via TERMINFO/TERMPATH/VIRTUAL_ENV.
-        "TERMINFO",
-        "TERMPATH",
-        "VIRTUAL_ENV",
-        "INPUTRC",
-        "TERM",
-        "TZ",
-        "TERMCAP",
-        "LUA_PATH",
-        "LUA_CPATH",
-        "LUA_INIT",
-    }
+DANGEROUS_ENV_EXACT: Final[frozenset[str]] = (
+    frozenset(
+        {
+            "PATH",
+            "SHELL",
+            "IFS",
+            "BASH_ENV",
+            "BASHOPTS",
+            "SHELLOPTS",
+            "ENV",
+            "PS0",
+            "PS1",
+            "PS2",
+            "PS3",
+            "PS4",
+            "PROMPT_COMMAND",
+            "ZDOTDIR",
+            "GLIBC_TUNABLES",
+            "GCONV_PATH",
+            "LOCPATH",
+            "NLSPATH",
+            "HOSTALIASES",
+            "CORE_PAGER",
+            "PAGER",
+            "MANPAGER",
+            "LESSOPEN",
+            "LESSCLOSE",
+            "EDITOR",
+            "VISUAL",
+            "SUDO_ASKPASS",
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+            "SSH_AUTH_SOCK",
+            "SSH_ORIGINAL_COMMAND",
+            "KUBECONFIG",
+            "GOBIN",
+            "GOCACHE",
+            "GOFLAGS",
+            "GOMODCACHE",
+            "GOPATH",
+            "GOROOT",
+            "GOTOOLCHAIN",
+            "CC",
+            "CXX",
+            "CPP",
+            "CFLAGS",
+            "CPPFLAGS",
+            "CXXFLAGS",
+            "LDFLAGS",
+            "MAKEFLAGS",
+            "MFLAGS",
+            "HOME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            # Comportement du shell enfant (LOW) : un Vault compromis ne doit pas
+            # détourner les `cd`/globs/historique des scripts enfants de `run`.
+            # La racine de confiance reste l'allowlist locale (seuls les noms listés
+            # localement sont demandés) ; la denylist n'est qu'une défense en
+            # profondeur. Tout nom listé localement (--name/.env.example/.env) est
+            # une entrée de confiance : ne pas y inscrire de variable système.
+            "CDPATH",
+            "GLOBIGNORE",
+            "HISTFILE",
+            "MAILCAPS",
+            # État du shell/environnement d'exécution (LOW) : chemins terminfo et
+            # cible venv — détournement des enfants via TERMINFO/TERMPATH/VIRTUAL_ENV.
+            "TERMINFO",
+            "TERMPATH",
+            "VIRTUAL_ENV",
+            "INPUTRC",
+            "TERM",
+            "TZ",
+            "TERMCAP",
+            "LUA_PATH",
+            "LUA_CPATH",
+            "LUA_INIT",
+        }
+    )
+    | _BASE_EXEC_EXACT
 )
 
 #: Préfixes refusés : familles d'outils, runtimes et chargeurs dynamiques dont
@@ -164,9 +188,85 @@ def is_dangerous_env_var(name: object) -> bool:
     if not isinstance(name, str):
         return True
     upper = name.upper()
-    if upper in DANGEROUS_ENV_EXACT:
+    if upper in DANGEROUS_ENV_EXACT or upper.endswith("_PROXY"):
         return True
     return any(upper.startswith(prefix) for prefix in DANGEROUS_ENV_PREFIXES)
+
+
+#: Noms exacts bloqués à l'exécution (`heimdall run`) et dans le Vault (`push`/`pull`).
+#: Les 13 noms exacts HTTP_PROXY..NODE_OPTIONS sont déjà vérifiés par
+#: `is_dangerous_env_var`, à laquelle `is_dangerous_exec_env_var` délègue.
+EXECUTION_DANGEROUS_ENV_EXACT: Final[frozenset[str]] = DANGEROUS_ENV_EXACT | frozenset(
+    {
+        "GIT_SSH_COMMAND",
+        "DOCKER_HOST",
+        "NPM_CONFIG_REGISTRY",
+        "PIP_INDEX_URL",
+        "TF_CLI_CONFIG_FILE",
+        "MAVEN_OPTS",
+        "GRADLE_OPTS",
+        "DOTNET_STARTUP_HOOKS",
+        "COMPOSE_FILE",
+        "CARGO_HOME",
+        "BUN_INSTALL",
+        "DENO_DIR",
+        "UV_PYTHON",
+        "BUNDLE_GEMFILE",
+        "GEM_HOME",
+        "CONDA_ENVS_PATH",
+    }
+)
+
+#: Variables légitimes autorisées explicitement dans `vault push/pull/run`
+#: malgré l'appartenance de leur préfixe à la denylist LLM/système.
+ALLOWED_EXEC_SECRET_EXACT: Final[frozenset[str]] = frozenset(
+    {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "DOCKER_PASSWORD",
+        "DOCKER_TOKEN",
+        "DOCKER_USERNAME",
+        "DOCKER_REGISTRY_PASSWORD",
+        "NPM_TOKEN",
+        "NPM_AUTH_TOKEN",
+        "GIT_TOKEN",
+        "GITHUB_TOKEN",
+        "GITLAB_TOKEN",
+        "GIT_PASSWORD",
+        "PIP_PASSWORD",
+        "PIP_TOKEN",
+        "KUBE_TOKEN",
+        "KUBE_PASSWORD",
+        "NODE_ENV",
+    }
+)
+
+#: Préfixes de variables de secrets applicatifs autorisés dans `vault push/pull/run`
+#: (ex. `TF_VAR_*`), tandis que les variables de configuration d'outil (`TF_DATA_DIR`,
+#: `TF_CLI_CONFIG_FILE`, `GIT_DIR`, `NODE_PATH`, `AWS_CONFIG_FILE`, etc.) restent bloquées.
+ALLOWED_EXEC_SECRET_PREFIXES: Final[tuple[str, ...]] = ("TF_VAR_",)
+
+#: Préfixes bloqués à l'exécution (`heimdall run`) : reprend la denylist
+#: complète (chargeurs dynamiques, runtimes, redirecteurs d'outils).
+EXECUTION_DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = DANGEROUS_ENV_PREFIXES
+
+
+def is_dangerous_exec_env_var(name: object) -> bool:
+    """Vrai si un nom est interdit pour `vault push/pull/run` (fail-closed)."""
+    if not isinstance(name, str):
+        return True
+    upper = name.upper()
+    if upper in ALLOWED_EXEC_SECRET_EXACT:
+        return False
+    if any(upper.startswith(prefix) for prefix in ALLOWED_EXEC_SECRET_PREFIXES):
+        return False
+    if upper in EXECUTION_DANGEROUS_ENV_EXACT:
+        return True
+    if any(upper.startswith(prefix) for prefix in EXECUTION_DANGEROUS_ENV_PREFIXES):
+        return True
+    return is_dangerous_env_var(name)
 
 
 def validate_variable_name(name: object) -> str:

@@ -65,7 +65,6 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                 (store_module, store.clear, 1),
                 (auth_module, lambda: self._authenticated_get(target, key), 1),
                 (ratelimit_module, lambda: self._authenticated_get(target, key), 1),
-                (ratelimit_module, lambda: self._authenticated_get(target, key), 2),
             )
             async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
                 for module, operation, blocked_call in operations:
@@ -118,19 +117,40 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                 "/api/v1/secrets/demo/dev/TOKEN", headers={"X-Heimdall-API-Key": key}
             )
 
-    async def test_peer_and_global_rejection_precede_hash_and_lookup(self) -> None:
-        """Une requête refusée avant auth ne paie ni HMAC ni parcours d'empreintes."""
-        with tempfile.TemporaryDirectory() as tmp:
+    async def test_forged_host_is_rejected_before_rate_limit(self) -> None:
+        """Host forgé : 400 sans consommer de budget (TrustedHost avant rate-limit)."""
+        target = create_app(
+            VaultSettings(
+                storage_backend="memory",
+                kek=generate_encryption_key(),
+                api_key_pepper="p" * 32,
+                rate_limit_per_peer=1,
+            )
+        )
+        transport = ASGITransport(app=target, client=("127.0.0.1", 54321))
+        async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            for _ in range(3):
+                forged = await client.get(
+                    "/api/v1/secrets/demo/dev/TOKEN", headers={"Host": "evil.test"}
+                )
+                self.assertEqual(forged.status_code, 400)
+            # Le budget anonyme (per_peer=1) est intact : la 1re requête légitime passe.
+            legit = await client.get("/api/v1/secrets/demo/dev/TOKEN")
+            self.assertEqual(legit.status_code, 401)
+
+    async def test_global_rejection_precedes_hash_and_lookup(self) -> None:
+        """Le budget global authentifié est contrôlé avant HMAC et parcours d'empreintes."""
+        with tempfile.TemporaryDirectory():
             for backend in ("memory", "sqlite"):
-                for bucket in ("peer", "global"):
-                    with self.subTest(backend=backend, bucket=bucket):
+                with self.subTest(backend=backend):
+                    with tempfile.TemporaryDirectory() as tmp2:
                         settings = VaultSettings(
-                            db_path=str(Path(tmp) / f"{backend}-{bucket}.db"),
+                            db_path=str(Path(tmp2) / f"{backend}.db"),
                             storage_backend=backend,
                             kek=generate_encryption_key(),
                             api_key_pepper="p" * 32,
-                            rate_limit_per_peer=1 if bucket == "peer" else 100,
-                            rate_limit_global=1 if bucket == "global" else 100,
+                            rate_limit_per_key=100,
+                            rate_limit_global=1,
                         )
                         target = create_app(settings)
                         key = generate_api_key()
@@ -147,8 +167,39 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                             hashing.assert_not_called()
                             lookup.assert_not_called()
 
-    async def test_peer_global_are_consumed_once_even_when_key_is_rejected(self) -> None:
-        """La phase clé ne recompte pas pair/global et ses 429 restent comptés."""
+    async def test_auth_peer_rejection_precedes_hash_and_lookup(self) -> None:
+        """Le budget auth_peer est contrôlé avant HMAC et parcours d'empreintes."""
+        for backend in ("memory", "sqlite"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmp:
+                target = create_app(
+                    VaultSettings(
+                        db_path=str(Path(tmp) / f"{backend}.db"),
+                        storage_backend=backend,
+                        kek=generate_encryption_key(),
+                        api_key_pepper="p" * 32,
+                        rate_limit_per_key=100,
+                        rate_limit_per_peer=1,
+                        rate_limit_global=100,
+                    )
+                )
+                first_key, second_key = generate_api_key(), generate_api_key()
+                target.state.register_api_key(first_key, "demo")
+                target.state.register_api_key(second_key, "demo")
+                first = await self._authenticated_get(target, first_key)
+                self.assertEqual(first.status_code, 404)
+                with (
+                    patch.object(auth_module, "hash_project_api_key") as hashing,
+                    patch.object(auth_module, "find_api_key_project") as lookup,
+                ):
+                    second = await self._authenticated_get(target, second_key)
+                    self.assertEqual(second.status_code, 429)
+                    hashing.assert_not_called()
+                    lookup.assert_not_called()
+
+    async def test_key_rejection_does_not_consume_global_and_anonymous_has_own_budget(
+        self,
+    ) -> None:
+        """Une clé pleine ne consomme pas le global ; les anonymes ont leur budget."""
         with tempfile.TemporaryDirectory() as tmp:
             for backend in ("memory", "sqlite"):
                 with self.subTest(backend=backend):
@@ -159,7 +210,7 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                             kek=generate_encryption_key(),
                             api_key_pepper="p" * 32,
                             rate_limit_per_key=1,
-                            rate_limit_per_peer=3,
+                            rate_limit_per_peer=2,
                             rate_limit_global=100,
                         )
                     )
@@ -167,6 +218,9 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                     target.state.register_api_key(key, "demo")
                     self.assertEqual((await self._authenticated_get(target, key)).status_code, 404)
                     self.assertEqual((await self._authenticated_get(target, key)).status_code, 429)
+                    self.assertEqual(
+                        (await self._authenticated_get(target, "unknown")).status_code, 401
+                    )
                     self.assertEqual(
                         (await self._authenticated_get(target, "unknown")).status_code, 401
                     )
@@ -406,7 +460,7 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(allowed)
         allowed, _ = limiter.peek("127.0.0.1")
         self.assertFalse(allowed)
-        self.assertEqual(limiter._buckets["peer:127.0.0.1"].count, 1)
+        self.assertEqual(limiter._buckets["anon_peer:127.0.0.1"].count, 1)
 
     async def test_store_create_refuses_nul_even_off_http_path(self) -> None:
         """Garde anti-contournement : le store refuse NUL même hors validation HTTP.

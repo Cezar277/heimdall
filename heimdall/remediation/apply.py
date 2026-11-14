@@ -143,12 +143,42 @@ def _check_backup_git_status(backup: Path, relative_name: str) -> None:
         warnings.warn(msg, UserWarning, stacklevel=3)
 
 
-def apply_replacement(root: Path, plan: ReplacementPlan) -> AppliedPatch:
+def cleanup_backup_file(root: Path, receipt: AppliedPatch) -> None:
+    """Supprime le fichier ``.bak`` créé lors d'un remplacement validé (F-10)."""
+    if not isinstance(receipt, AppliedPatch):
+        raise ApplyError
+    if receipt.backup != f"{receipt.file}.bak":
+        raise ApplyError
+    try:
+        confined = confine(root, receipt.backup)
+    except PathEscape:
+        raise ApplyError from None
+    # Un seul chemin fait foi : celui déjà résolu et confiné par `confine`.
+    # `relative` est canonique ; s'il diffère du reçu, un lien symbolique a
+    # redirigé la cible (même à l'intérieur de la racine) : refus fail-closed.
+    if confined.relative != receipt.backup:
+        raise ApplyError
+    try:
+        os.unlink(confined.absolute)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise ApplyError from None
+
+
+def apply_replacement(  # noqa: PLR0912
+    root: Path,
+    plan: ReplacementPlan,
+    *,
+    cleanup_backup: bool = False,
+) -> AppliedPatch:
     """Applique un plan validé sous ``root`` ; lève ``ApplyError`` sinon.
 
     Fail-closed : plan manuel, fichier absent/illisible/modifié depuis le plan
     (``plan.before``), chemin hors dépôt, ou écriture impossible — dans tous
     les cas le fichier d'origine est intact (aucune écriture partielle).
+    Si ``cleanup_backup=True``, supprime ``<fichier>.bak`` après validation
+    de l'écriture atomique (F-10).
     """
     if not isinstance(root, Path):
         raise ApplyError
@@ -180,12 +210,15 @@ def apply_replacement(root: Path, plan: ReplacementPlan) -> AppliedPatch:
         raise
     except Exception:
         raise ApplyError from None
-    return AppliedPatch(
+    receipt = AppliedPatch(
         file=confined.relative,
         backup=backup_rel,
         mode=mode,
         after=plan.after,
     )
+    if cleanup_backup:
+        cleanup_backup_file(root, receipt)
+    return receipt
 
 
 def undo_apply(root: Path, receipt: AppliedPatch) -> None:

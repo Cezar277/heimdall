@@ -52,7 +52,11 @@ DECISION_SCHEMA: Final[str] = "heimdall.review-decision.v1"
 #: Marqueur de masquage à longueur constante (aucun oracle de taille).
 MASKED_MARKER: Final[str] = "<MASKED>"
 PROMPT: Final[str] = "Valider (Y), ignorer (N) ou éditer (E) ? "
+PROMPT_NO_EDIT: Final[str] = "Valider (Y) ou ignorer (N) ? "
 INVALID_CHOICE: Final[str] = "Réponse invalide : répondre Y, N ou E (aucune action par défaut)."
+INVALID_CHOICE_NO_EDIT: Final[str] = (
+    "Réponse invalide : répondre Y ou N (aucune action par défaut)."
+)
 EDIT_CANCELLED: Final[str] = "Édition annulée : aucune modification, réponse attendue."
 UNAPPLIED_TRACE: Final[str] = (
     "Modification appliquée mais non journalisée : trace d'audit incomplète."
@@ -740,6 +744,7 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
     edit: EditFn | None = None,
     journal: DecisionJournal | None = None,
     interactive: bool = True,
+    allow_edit: bool = True,
     notify: NotifyFn | None = None,
     stream: object | None = None,
 ) -> ReviewOutcome:
@@ -754,8 +759,15 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
     interface ne calcule ni ne pose aucun patch. Toute exception du backend
     est convertie en :class:`ReviewError` statique (invariant 8), et le
     journal n'est écrit qu'**après** l'action, avec son résultat réel.
+
+    ``allow_edit=False`` réserve le dialogue à Y/N : le prompt ne propose
+    plus E et une réponse E est refusée avant tout journal ou toute écriture.
     """
-    if not isinstance(proposal, Proposal) or not isinstance(interactive, bool):
+    if (
+        not isinstance(proposal, Proposal)
+        or not isinstance(interactive, bool)
+        or not isinstance(allow_edit, bool)
+    ):
         raise ReviewError
     if not interactive or not is_interactive(stream=stream):
         # #89 : rapport seul, ni backend, ni journal, ni écriture.
@@ -763,6 +775,8 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
     ask_fn = partial(_stdin_ask, stream=stream) if ask is None else ask
     notify_fn = _stderr_notify if notify is None else notify
     journal_fn = _resolve_journal(journal)
+    prompt = PROMPT if allow_edit else PROMPT_NO_EDIT
+    invalid_choice = INVALID_CHOICE if allow_edit else INVALID_CHOICE_NO_EDIT
     current = proposal
     edits = 0
     prompts = 0
@@ -772,13 +786,16 @@ def review_proposal(  # noqa: PLR0912, PLR0913, PLR0915 - boucle et injections e
             raise ReviewError
         # Une lecture impossible (EOF, terminal fermé) interrompt la boucle :
         # ce n'est pas une réponse invalide, donc pas de redemande en aveugle.
-        raw = _ask(ask_fn, render_diff(current) + "\n" + PROMPT)
+        raw = _ask(ask_fn, render_diff(current) + "\n" + prompt)
         try:
             choice = parse_choice(raw)
         except ReviewError:
             # Entrée invalide : on redemande, on ne devine jamais.
-            _notify(notify_fn, INVALID_CHOICE)
+            _notify(notify_fn, invalid_choice)
             continue
+        if choice is Choice.EDIT and not allow_edit:
+            # E n'est pas proposé : refus fail-closed avant journal/écriture.
+            raise ReviewError
         if choice is Choice.IGNORE:
             _journal(journal_fn, Decision.now(choice, current.finding))
             return ReviewOutcome(choice, False, edits, current)
@@ -848,6 +865,7 @@ def _review_all(  # noqa: PLR0913 - injections explicites de la session
     proposals: Iterable[Proposal],
     *,
     mode: bool,
+    allow_edit: bool,
     ask: AskFn | None,
     apply: ApplyFn | None,
     edit: EditFn | None,
@@ -881,6 +899,7 @@ def _review_all(  # noqa: PLR0913 - injections explicites de la session
                     edit=edit,
                     journal=journal,
                     interactive=mode,
+                    allow_edit=allow_edit,
                     notify=notify,
                     stream=stream,
                 )
@@ -901,6 +920,7 @@ def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
     *,
     ci: bool = False,
     interactive: bool | None = None,
+    allow_edit: bool = True,
     ask: AskFn | None = None,
     apply: ApplyFn | None = None,
     edit: EditFn | None = None,
@@ -918,13 +938,18 @@ def review_proposals(  # noqa: PLR0913 - boucle et injections explicites
     """
     # Valider les options AVANT de consommer le producteur : un producteur
     # coûteux ou infini ne doit pas être parcouru pour rejeter `ci=1`.
-    if not isinstance(ci, bool) or (interactive is not None and not isinstance(interactive, bool)):
+    if (
+        not isinstance(ci, bool)
+        or (interactive is not None and not isinstance(interactive, bool))
+        or not isinstance(allow_edit, bool)
+    ):
         raise ReviewError
     # `interactive=True` explicite ne contourne ni `--ci` ni l'absence de TTY.
     mode = False if ci or interactive is False else is_interactive(stream=stream)
     outcomes = _review_all(
         proposals,
         mode=mode,
+        allow_edit=allow_edit,
         ask=ask,
         apply=apply,
         edit=edit,

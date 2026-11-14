@@ -4,6 +4,7 @@
 .gitignore
 .gitattributes
 .venv
+.venv-ci
 .venv-security
 .venv-injection
 venv

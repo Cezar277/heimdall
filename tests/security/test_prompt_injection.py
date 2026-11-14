@@ -153,6 +153,9 @@ _OS_ALLOWED_ATTRS = frozenset(
         "O_NONBLOCK",
         "defpath",
         "devnull",
+        "name",
+        "pathsep",
+        "fsdecode",
     }
 )
 # `cwd` : lecture seule du répertoire courant, utilisée comme ENTRÉE d'un
@@ -227,10 +230,32 @@ def _os_usage_violations(path: Path) -> list[str]:  # noqa: PLR0912
             for alias in node.names:
                 aliases[alias.asname or alias.name] = node.module
     found = []
+    # #228 : seule lecture d'environnement ajoutée au scan staged. L'index
+    # est ensuite validé par GitAccess ; aucune lecture OLLAMA_HOST/proxy ni
+    # copie globale de l'environnement n'est autorisée par cette exception.
+    index_reads = {
+        id(node.func.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "environ"
+        and isinstance(node.func.value.value, ast.Name)
+        and aliases.get(node.func.value.value.id, node.func.value.value.id) == "os"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "GIT_INDEX_FILE"
+        and not node.keywords
+    }
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             canonical = aliases.get(node.value.id, node.value.id)
-            if canonical in ("os", "os.path") and node.attr not in _OS_ALLOWED_ATTRS:
+            if (
+                canonical in ("os", "os.path")
+                and node.attr not in _OS_ALLOWED_ATTRS
+                and id(node) not in index_reads
+            ):
                 found.append(f"os.{node.attr}")
             elif canonical == "pathlib" and node.attr not in _PATHLIB_ALLOWED_NAMES:
                 found.append(f"pathlib.{node.attr}")
@@ -497,6 +522,20 @@ def test_no_llm_in_ci() -> None:
     req = REQUIREMENTS.read_text(encoding="utf-8")
     assert "REQ-SEC-02" in req
     assert "scan --ci" in req
+
+
+def test_os_guard_only_allows_the_index_environment_read(tmp_path: Path) -> None:
+    witness = tmp_path / "index_read.py"
+    witness.write_text('import os\nos.environ.get("GIT_INDEX_FILE")\n', encoding="utf-8")
+    assert _os_usage_violations(witness) == []
+    for operation in (
+        'os.environ.get("OLLAMA_HOST")',
+        "dict(os.environ)",
+        'os.environ["GIT_INDEX_FILE"]',
+        'os.environ.get("GIT_INDEX_FILE", "fallback")',
+    ):
+        witness.write_text(f"import os\n{operation}\n", encoding="utf-8")
+        assert _os_usage_violations(witness) == ["os.environ"]
 
 
 def test_ast_guard_detects_inherited_stdin(tmp_path: Path) -> None:

@@ -3,6 +3,10 @@
 Tickets : #36 (parent), #103 (installation/désinstallation), #104 (diff
 indexé uniquement), #105 (re-stage sans boucle), #106 (commit partiel).
 
+Mise à jour sécurité : les garanties actuelles sur l'index temporaire et le
+refus de `HEIMDALL_IN_HOOK` hérité sont dans [T228](t228-samm.md). La présente
+fiche conserve les preuves historiques de #36, dont l'ancien contournement.
+
 SHA de référence du code : `50d94fca4b74d215fc9c13554a26c4361e05452d`
 (révision du code testée ; le commit de documentation qui suit ne modifie que
 ce fichier. Les permaliens et numéros de ligne sont régénérés contre ce SHA.)

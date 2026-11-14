@@ -22,6 +22,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
@@ -338,10 +339,23 @@ class ApiKeyRegistryTests(unittest.TestCase):
                     vault_auth.validate_key_id(malformed)
                 self.assertNotIn(malformed, str(ctx.exception))
 
+    def test_heimdall_env_defaults_to_production_and_rejects_unknown(self) -> None:
+        """Audit M-13 : absence = production, valeur inconnue refusée."""
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(vault_auth.heimdall_env_mode(), "production")
+        for mode in ("production", "prod", "dev", "test", " DEV "):
+            with patch.dict(os.environ, {"HEIMDALL_ENV": mode}, clear=True):
+                self.assertEqual(vault_auth.heimdall_env_mode(), mode.strip().lower())
+        for invalid in ("", "development", "staging", "prod2"):
+            with patch.dict(os.environ, {"HEIMDALL_ENV": invalid}, clear=True):
+                with self.assertRaises(ValueError):
+                    vault_auth.heimdall_env_mode()
+
     def test_public_dev_pepper_is_refused_outside_test_mode(self) -> None:
         """Le pepper public committé est refusé hors HEIMDALL_ENV=test."""
-        with self.assertRaises(ValueError):
-            vault_auth.validate_api_key_pepper(vault_auth.INSECURE_DEFAULT_PEPPER)
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "production"}, clear=False):
+            with self.assertRaises(ValueError):
+                vault_auth.validate_api_key_pepper(vault_auth.INSECURE_DEFAULT_PEPPER)
         with self.assertRaises(ValueError):
             vault_auth.validate_api_key_pepper("trop-court")
 

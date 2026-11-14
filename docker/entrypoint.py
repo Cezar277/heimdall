@@ -19,7 +19,7 @@ def main() -> int:
         print(_REFUS_ROOT, file=sys.stderr)
         return 1
     try:
-        os.execvp(sys.executable, [sys.executable, "-m", "heimdall.vault.app"])  # noqa: S606
+        os.execvp(sys.executable, [sys.executable, "-m", "heimdall.vault.app"])  # noqa: S606  # nosec B606
     except OSError:
         # Message générique : jamais de chemin, de module ni de secret,
         # cohérent avec docker/healthcheck.py (fail-closed sans détail).
