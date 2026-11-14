@@ -753,6 +753,57 @@ class SqliteAuditLog(AuditLog):
                 return valid, invalid
             return self._verify_stream(conn, _AUDIT_STREAM_REJECTION)
 
+    def resign_chain(self, new_hmac_key: bytes) -> int:
+        """Re-signe tout le journal avec ``new_hmac_key`` (migration F-16).
+
+        Bascule dérivé → explicite : la chaîne est d'abord vérifiée avec la
+        clé courante, puis chaque ``entry_hash`` est recalculé avec la nouvelle
+        clé, flux par flux, dans une seule transaction ``BEGIN IMMEDIATE``. Les
+        points de contrôle de purge restent inchangés (ils ne sont qu'une
+        valeur de ``previous_hash``). Une chaîne invalide n'est jamais
+        re-signée : ``ValueError`` et aucune écriture. Retourne le nombre
+        d'événements re-signés.
+        """
+        if not new_hmac_key:
+            raise ValueError("nouvelle clé HMAC d'audit invalide.")
+        resigned = 0
+        with db_session(self._db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for stream in (_AUDIT_STREAM_ACCESS, _AUDIT_STREAM_REJECTION):
+                valid, _invalid = self._verify_stream(conn, stream)
+                if not valid:
+                    raise ValueError(
+                        "chaîne d'audit non vérifiable avec la clé actuelle : "
+                        "re-signature refusée."
+                    )
+            for stream in (_AUDIT_STREAM_ACCESS, _AUDIT_STREAM_REJECTION):
+                previous_hash, _pruned = self._checkpoint(conn, stream)
+                rows = conn.execute(
+                    "SELECT * FROM audit_events WHERE stream = ? ORDER BY id ASC", (stream,)
+                ).fetchall()
+                for row in rows:
+                    payload = _canonical_payload(
+                        occurred_at=str(row["occurred_at"]),
+                        key_id=row["key_id"],
+                        key_fingerprint_value=row["key_fingerprint"],
+                        project=row["project"],
+                        peer=str(row["peer"]),
+                        action=str(row["action"]),
+                        target=row["target"],
+                        status_code=int(row["status_code"]),
+                        outcome=str(row["outcome"]),
+                        previous_hash=previous_hash,
+                    )
+                    entry_hash = _entry_hash(payload, new_hmac_key)
+                    conn.execute(
+                        "UPDATE audit_events SET previous_hash = ?, entry_hash = ? WHERE id = ?",
+                        (previous_hash, entry_hash, int(row["id"])),
+                    )
+                    previous_hash = entry_hash
+                    resigned += 1
+        self._hmac_key = new_hmac_key
+        return resigned
+
     def needs_schema_migration(self) -> bool:
         """True si la base date d'avant l'audit M-03 (pas de colonne ``stream``).
 

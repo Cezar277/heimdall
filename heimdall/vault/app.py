@@ -1425,7 +1425,6 @@ def _register_middleware(app: FastAPI) -> None:
     allowed_hosts = ["127.0.0.1", "localhost", "[::1]"]
     if _heimdall_env_mode() == "test":
         allowed_hosts.append("testserver")
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=_MAX_BODY_SIZE)
 
     # Le rate-limiting est enregistré avant le middleware loopback : ce dernier,
@@ -1551,6 +1550,10 @@ def _register_middleware(app: FastAPI) -> None:
             )
         return await call_next(request)
 
+    # TrustedHost ajouté après rate-limit et loopback, donc exécuté AVANT eux
+    # (Starlette : le dernier ajouté est le plus externe). Un Host forgé est
+    # rejeté en 400 sans consommer de budget anon_* / auth_peer / global.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     _register_no_store_middleware(app)
 
 

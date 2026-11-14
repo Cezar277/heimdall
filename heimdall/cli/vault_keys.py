@@ -344,6 +344,72 @@ def list_audit_events(
         )
 
 
+def _derived_audit_hmac_key() -> bytes:
+    """Sous-clé d'audit dérivée de la KEK courante (mode historique du serveur)."""
+    raw_old = os.environ.get("HEIMDALL_VAULT_OLD_AUDIT_HMAC_KEY")
+    if raw_old is not None:
+        return validate_server_hmac_key(raw_old)
+    try:
+        cipher = _resolve_cli_cipher(
+            env_direct="HEIMDALL_VAULT_KEK",
+            env_fallback=None,
+            env_master="HEIMDALL_VAULT_MASTER_KEY",
+            env_salt="HEIMDALL_VAULT_KEK_SALT",
+            label="la KEK du Vault",
+            server_hmac_key=os.environ.get("HEIMDALL_VAULT_SERVER_HMAC_KEY"),
+        )
+    except ValueError:
+        raise ValueError(
+            "clé d'audit actuelle indisponible : définir la KEK du Vault (clé dérivée) "
+            "ou HEIMDALL_VAULT_OLD_AUDIT_HMAC_KEY."
+        ) from None
+    return cipher.audit_hmac_key()
+
+
+@audit_app.command(
+    "rekey",
+    help=(
+        "Migre le journal d'audit vers une clé HMAC explicite (F-16).\n\n"
+        "Vérifie la chaîne avec la clé actuelle ($HEIMDALL_VAULT_OLD_AUDIT_HMAC_KEY,\n"
+        "ou à défaut la sous-clé dérivée de la KEK courante), puis la re-signe avec\n"
+        "$HEIMDALL_VAULT_AUDIT_HMAC_KEY dans une seule transaction. Une chaîne invalide\n"
+        "n'est jamais re-signée. Serveur arrêté ; le redémarrer ensuite avec\n"
+        "$HEIMDALL_VAULT_AUDIT_HMAC_KEY. Préalable à rotate-kek sur une base dont\n"
+        "le serveur tournait en clé dérivée."
+    ),
+)
+def rekey_audit_chain(
+    db_path: Path | None = _DB_PATH_OPTION,
+) -> None:
+    """Re-signe le journal d'audit avec la clé explicite (migration dérivé → explicite)."""
+    try:
+        resolved = _resolve_db_path(db_path)
+        if not resolved.is_file():
+            raise FileNotFoundError
+        raw_new = os.environ.get("HEIMDALL_VAULT_AUDIT_HMAC_KEY")
+        if not raw_new:
+            raise ValueError("HEIMDALL_VAULT_AUDIT_HMAC_KEY est obligatoire pour la migration.")
+        new_key = validate_server_hmac_key(raw_new)
+        old_key = _derived_audit_hmac_key()
+        if old_key == new_key:
+            raise ValueError("le journal utilise déjà cette clé d'audit.")
+        audit_log = SqliteAuditLog(resolved, create=False, hmac_key=old_key)
+        _exit_if_audit_schema_outdated(audit_log)
+        count = audit_log.resign_chain(new_key)
+    except ValueError as exc:
+        typer.echo(f"Erreur : {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    except FileNotFoundError:
+        typer.echo("Erreur : base du journal d'audit introuvable.", err=True)
+        raise typer.Exit(code=1) from None
+    except typer.Exit:
+        raise
+    except Exception:
+        typer.echo("Erreur : échec de la migration du journal d'audit.", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"Journal d'audit re-signé avec la clé explicite ({count} événements).")
+
+
 @audit_app.command("verify")
 def verify_audit_chain(
     db_path: Path | None = _DB_PATH_OPTION,
@@ -456,12 +522,16 @@ def _vault_server_is_listening() -> bool:
     import socket  # noqa: PLC0415
 
     raw_port = os.environ.get("HEIMDALL_VAULT_PORT", "8443")
+    # Fail-closed : une coquille dans le port ne doit pas désactiver la garde.
     try:
         port = int(raw_port)
     except ValueError:
-        return False
+        port = 0
     if not 1 <= port <= _MAX_TCP_PORT:
-        return False
+        raise ValueError(
+            "port invalide, vérifier HEIMDALL_VAULT_PORT ou passer --force en "
+            "connaissance de cause."
+        )
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.2):
             return True
@@ -501,8 +571,9 @@ def _require_rotation_audit_key(resolved: Path) -> bytes:
     if unverifiable:
         raise ValueError(
             "le journal d'audit existant n'est pas vérifiable avec "
-            "HEIMDALL_VAULT_AUDIT_HMAC_KEY : configurer le serveur avec cette clé "
-            "(ou migrer le journal) avant la rotation."
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY : migrer le journal avec 'heimdall vault "
+            "audit rekey' (serveur arrêté, KEK courante dans l'environnement), puis "
+            "relancer la rotation."
         )
     return audit_key
 

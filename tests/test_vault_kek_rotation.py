@@ -1533,6 +1533,74 @@ class VaultRotateCliTests(unittest.TestCase):
         assert rec is not None
         self.assertEqual(rec["value"], "super_secret_value")
 
+    def test_cli_audit_rekey_migrates_derived_history_then_rotation_succeeds(self) -> None:
+        """Migration dérivé → explicite : rotate refusé, rekey, puis rotate accepté."""
+        derived = SqliteAuditLog(self.db_path, hmac_key=self.old_cipher.audit_hmac_key())
+        for status in (200, 401, 200):
+            asyncio.run(derived.record(peer="srv", action="GET", target=None, status_code=status))
+        audit_key = generate_server_hmac_key()
+        rotate_env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY": audit_key,
+        }
+        rotate = ["vault", "rotate-kek", "--db-path", str(self.db_path), "--force"]
+        refused = self.runner.invoke(cli_app, rotate, env=rotate_env)
+        self.assertEqual(refused.exit_code, 2, refused.output)
+        self.assertIn("vault audit rekey", refused.output)
+
+        rekey_env = {"HEIMDALL_VAULT_KEK": _OLD_KEK_B64, "HEIMDALL_VAULT_AUDIT_HMAC_KEY": audit_key}
+        rekey = self.runner.invoke(
+            cli_app, ["vault", "audit", "rekey", "--db-path", str(self.db_path)], env=rekey_env
+        )
+        self.assertEqual(rekey.exit_code, 0, rekey.output)
+        self.assertIn("3 événements", rekey.output)
+
+        rotated = self.runner.invoke(cli_app, rotate, env=rotate_env)
+        self.assertEqual(rotated.exit_code, 0, rotated.output)
+        log = SqliteAuditLog(self.db_path, create=False, hmac_key=audit_key.encode())
+        self.assertEqual(log.verify_chain(), (True, None))
+        self.assertEqual(log.count(), 4)
+
+    def test_cli_audit_rekey_refuses_tampered_history_without_writing(self) -> None:
+        derived = SqliteAuditLog(self.db_path, hmac_key=self.old_cipher.audit_hmac_key())
+        asyncio.run(derived.record(peer="srv", action="GET", target=None, status_code=200))
+        with db_session(self.db_path) as conn:
+            conn.execute("UPDATE audit_events SET status_code = 500 WHERE id = 1")
+            before = conn.execute("SELECT entry_hash FROM audit_events").fetchall()
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "audit", "rekey", "--db-path", str(self.db_path)],
+            env={
+                "HEIMDALL_VAULT_KEK": _OLD_KEK_B64,
+                "HEIMDALL_VAULT_AUDIT_HMAC_KEY": generate_server_hmac_key(),
+            },
+        )
+        self.assertEqual(res.exit_code, 2, res.output)
+        self.assertIn("re-signature refusée", res.output)
+        with db_session(self.db_path) as conn:
+            after = conn.execute("SELECT entry_hash FROM audit_events").fetchall()
+        self.assertEqual([tuple(r) for r in before], [tuple(r) for r in after])
+
+    def test_cli_rotate_invalid_port_is_fail_closed(self) -> None:
+        for port in ("abc", "99999", "0"):
+            with self.subTest(port=port):
+                res = self.runner.invoke(
+                    cli_app,
+                    ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+                    env={
+                        "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+                        "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+                        "HEIMDALL_VAULT_PORT": port,
+                    },
+                )
+                self.assertEqual(res.exit_code, 2, res.output)
+                self.assertIn("port invalide", res.output)
+        store = SqliteSecretStore(self.db_path, VaultCipher(_OLD_KEK_BYTES))
+        rec = store._get("demo", "dev", "API_KEY")
+        assert rec is not None
+        self.assertEqual(rec["value"], "super_secret_value")
+
     def test_cli_rotate_refuses_hot_server_without_force(self) -> None:
         """Audit M-07 : rotation à chaud refusée, --force explicite l'autorise."""
         env = {

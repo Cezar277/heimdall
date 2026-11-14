@@ -117,6 +117,27 @@ class VaultReviewTests(unittest.IsolatedAsyncioTestCase):
                 "/api/v1/secrets/demo/dev/TOKEN", headers={"X-Heimdall-API-Key": key}
             )
 
+    async def test_forged_host_is_rejected_before_rate_limit(self) -> None:
+        """Host forgé : 400 sans consommer de budget (TrustedHost avant rate-limit)."""
+        target = create_app(
+            VaultSettings(
+                storage_backend="memory",
+                kek=generate_encryption_key(),
+                api_key_pepper="p" * 32,
+                rate_limit_per_peer=1,
+            )
+        )
+        transport = ASGITransport(app=target, client=("127.0.0.1", 54321))
+        async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            for _ in range(3):
+                forged = await client.get(
+                    "/api/v1/secrets/demo/dev/TOKEN", headers={"Host": "evil.test"}
+                )
+                self.assertEqual(forged.status_code, 400)
+            # Le budget anonyme (per_peer=1) est intact : la 1re requête légitime passe.
+            legit = await client.get("/api/v1/secrets/demo/dev/TOKEN")
+            self.assertEqual(legit.status_code, 401)
+
     async def test_global_rejection_precedes_hash_and_lookup(self) -> None:
         """Le budget global authentifié est contrôlé avant HMAC et parcours d'empreintes."""
         with tempfile.TemporaryDirectory():
