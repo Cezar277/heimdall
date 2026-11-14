@@ -14,6 +14,7 @@ Preuves SAMM : module + ligne (voir ``docs/t113-samm.md``).
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,8 +26,15 @@ from typer.testing import CliRunner
 from heimdall.cli.main import app as cli_app
 from heimdall.vault import audit as audit_module
 from heimdall.vault.app import VaultSettings, create_app
-from heimdall.vault.crypto import generate_api_key, generate_encryption_key
+from heimdall.vault.audit import InMemoryAuditLog, SqliteAuditLog
+from heimdall.vault.crypto import (
+    VaultCipher,
+    generate_api_key,
+    generate_encryption_key,
+    generate_server_hmac_key,
+)
 from heimdall.vault.database import DatabaseUnavailableError, db_session, init_db
+from heimdall.vault.store import InMemorySecretStore, SqliteSecretStore
 
 PEPPER = "t113_pepper_value_0123456789abcdef"
 CANARY_VALUE = "canary-secret-value-t113-never-in-audit"
@@ -164,8 +172,8 @@ class AuditTrailTests(unittest.IsolatedAsyncioTestCase):
     async def test_rate_limited_requests_are_audited(self) -> None:
         """Un 429 de débit est journalisé avec l'outcome ``rate_limited``."""
         app = _memory_app(
-            rate_limit_per_key=100,
-            rate_limit_per_peer=1,
+            rate_limit_per_key=1,
+            rate_limit_per_peer=100,
             rate_limit_global=100,
         )
         key = generate_api_key()
@@ -491,6 +499,79 @@ class AuditRetentionTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(app.state.audit_log.verify_chain(), (False, 4))
 
+    async def test_rejection_flood_does_not_prune_authenticated_events(self) -> None:
+        """Audit M-03 : les 401/429 ont leur rétention et ne purgent pas les accès."""
+        app = _memory_app()
+        with (
+            patch.object(audit_module, "MAX_AUDIT_EVENTS", 2),
+            patch.object(audit_module, "MAX_REJECTION_EVENTS", 2),
+        ):
+            for index in range(2):
+                await app.state.audit_log.record(
+                    peer="127.0.0.1",
+                    action=f"GET /auth/{index}",
+                    target=None,
+                    status_code=200,
+                )
+            for index in range(10):
+                await app.state.audit_log.record(
+                    peer="127.0.0.1",
+                    action=f"GET /rejection/{index}",
+                    target=None,
+                    status_code=401,
+                )
+        actions = [event["action"] for event in app.state.audit_log.list_events(limit=100)]
+        self.assertIn("GET /auth/0", actions)
+        self.assertIn("GET /auth/1", actions)
+        self.assertNotIn("GET /rejection/0", actions)
+        self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
+
+    async def test_sqlite_rejection_flood_does_not_prune_authenticated_events(self) -> None:
+        """Même séparation de rétention sur le backend SQLite."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = _sqlite_app(tmp)
+            with (
+                patch.object(audit_module, "MAX_AUDIT_EVENTS", 2),
+                patch.object(audit_module, "MAX_REJECTION_EVENTS", 2),
+            ):
+                for index in range(2):
+                    await app.state.audit_log.record(
+                        peer="127.0.0.1",
+                        action=f"GET /auth/{index}",
+                        target=None,
+                        status_code=200,
+                    )
+                for index in range(10):
+                    await app.state.audit_log.record(
+                        peer="127.0.0.1",
+                        action=f"GET /rejection/{index}",
+                        target=None,
+                        status_code=401,
+                    )
+            actions = [
+                event["action"] for event in app.state.audit_log.list_events(limit=100)
+            ]
+            self.assertIn("GET /auth/0", actions)
+            self.assertIn("GET /auth/1", actions)
+            self.assertNotIn("GET /rejection/0", actions)
+            self.assertEqual(app.state.audit_log.verify_chain(), (True, None))
+
+    async def test_sqlite_chain_is_hmac_keyed(self) -> None:
+        """Audit F-16 : une autre clé HMAC invalide la vérification de chaîne."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            app = _sqlite_app(tmp)
+            await app.state.audit_log.record(
+                peer="127.0.0.1",
+                action="GET /auth",
+                target=None,
+                status_code=200,
+            )
+            other = SqliteAuditLog(
+                db_path, create=False, hmac_key=b"x" * 32
+            )
+            self.assertEqual(other.verify_chain(), (False, 1))
+
     def test_init_db_recreates_audit_tables_on_pre_t39_database(self) -> None:
         """Une base antérieure à #39 reçoit les tables de débit, d'audit et d'état."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -576,6 +657,37 @@ class AuditCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("valide", result.output)
 
+    def test_verify_without_resolvable_key_exits_2_explicitly(self) -> None:
+        """Sans clé d'audit résolvable : code 2 explicite, jamais « chaîne invalide »."""
+        env = {
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY": None,
+            "HEIMDALL_VAULT_KEK": None,
+            "HEIMDALL_VAULT_MASTER_KEY": None,
+            "HEIMDALL_VAULT_KEK_SALT": None,
+        }
+        for command in ("verify", "list"):
+            with self.subTest(command=command):
+                result = self.runner.invoke(
+                    cli_app,
+                    ["vault", "audit", command, "--db-path", str(self.db_path)],
+                    env=env,
+                )
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("clé HMAC d'audit indisponible", result.output)
+                self.assertNotIn("invalide", result.output.replace("indisponible", ""))
+
+    def test_empty_audit_key_env_is_explicit_error_not_derived_fallback(self) -> None:
+        """HEIMDALL_VAULT_AUDIT_HMAC_KEY vide : code 2, jamais repli sur la clé dérivée."""
+        for command in ("verify", "list"):
+            with self.subTest(command=command):
+                result = self.runner.invoke(
+                    cli_app,
+                    ["vault", "audit", command, "--db-path", str(self.db_path)],
+                    env={"HEIMDALL_VAULT_AUDIT_HMAC_KEY": ""},
+                )
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("clé HMAC d'audit indisponible", result.output)
+
     def test_verify_reports_tampering(self) -> None:
         with db_session(self.db_path) as conn:
             conn.execute("UPDATE audit_events SET status_code = 500 WHERE id = 1")
@@ -634,3 +746,181 @@ class AuditCliTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(result.exit_code, 2)
+
+
+class LegacyAuditChainTests(unittest.IsolatedAsyncioTestCase):
+    """Base pré-F-16 (SHA-256 nu) : « migration requise », pas « chaîne invalide »."""
+
+    async def test_legacy_sha256_chain_reports_migration_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            legacy = SqliteAuditLog(db_path, hmac_key=None)
+            await legacy.record(peer="cli", action="GET", target=None, status_code=200)
+            await legacy.record(peer="cli", action="GET", target=None, status_code=401)
+            key = generate_server_hmac_key()
+            current = SqliteAuditLog(db_path, create=False, hmac_key=key.encode())
+            self.assertFalse(current.verify_chain()[0])
+            self.assertTrue(current.is_legacy_sha256_chain())
+            result = CliRunner().invoke(
+                cli_app,
+                ["vault", "audit", "verify", "--db-path", str(db_path)],
+                env={"HEIMDALL_VAULT_AUDIT_HMAC_KEY": key},
+            )
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertIn("migration requise", result.output)
+            self.assertNotIn("chaîne d'audit invalide", result.output)
+
+    async def test_tampered_legacy_chain_is_still_reported_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            legacy = SqliteAuditLog(db_path, hmac_key=None)
+            await legacy.record(peer="cli", action="GET", target=None, status_code=200)
+            with db_session(db_path) as conn:
+                conn.execute("UPDATE audit_events SET status_code = 500 WHERE id = 1")
+            current = SqliteAuditLog(
+                db_path, create=False, hmac_key=generate_server_hmac_key().encode()
+            )
+            self.assertFalse(current.is_legacy_sha256_chain())
+
+
+class StoreLeastPrivilegeTests(unittest.TestCase):
+    """Le store expose la sous-clé d'audit, jamais le chiffreur porteur de la KEK."""
+
+    def test_stores_expose_audit_key_not_cipher(self) -> None:
+        cipher = VaultCipher(os.urandom(32))
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            for store in (InMemorySecretStore(cipher=cipher), SqliteSecretStore(db_path, cipher)):
+                with self.subTest(store=type(store).__name__):
+                    self.assertFalse(hasattr(store, "cipher"))
+                    self.assertEqual(store.audit_hmac_key(), cipher.audit_hmac_key())
+
+
+class PreM03SchemaTests(unittest.TestCase):
+    """Base sans colonne ``stream`` : « migration requise », pas un échec générique."""
+
+    def test_cli_reports_schema_migration_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                conn.execute("DROP INDEX IF EXISTS idx_audit_events_stream_id")
+                conn.execute("ALTER TABLE audit_events DROP COLUMN stream")
+            log = SqliteAuditLog(db_path, create=False, hmac_key=None)
+            self.assertTrue(log.needs_schema_migration())
+            for command in ("verify", "list"):
+                with self.subTest(command=command):
+                    result = CliRunner().invoke(
+                        cli_app, ["vault", "audit", command, "--db-path", str(db_path)]
+                    )
+                    self.assertEqual(result.exit_code, 1, result.output)
+                    self.assertIn("migration requise", result.output)
+                    self.assertNotIn("échec", result.output)
+
+    def test_missing_audit_table_reports_migration_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                conn.execute("DROP TABLE audit_events")
+            log = SqliteAuditLog(db_path, create=False, hmac_key=None)
+            self.assertTrue(log.needs_schema_migration())
+            result = CliRunner().invoke(
+                cli_app, ["vault", "audit", "verify", "--db-path", str(db_path)]
+            )
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertIn("migration requise", result.output)
+
+    def test_missing_rejection_state_table_reports_migration_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            with db_session(db_path) as conn:
+                conn.execute("DROP TABLE audit_rejection_chain_state")
+            log = SqliteAuditLog(db_path, create=False, hmac_key=None)
+            self.assertTrue(log.needs_schema_migration())
+            for command in ("verify", "list"):
+                with self.subTest(command=command):
+                    result = CliRunner().invoke(
+                        cli_app, ["vault", "audit", command, "--db-path", str(db_path)]
+                    )
+                    self.assertEqual(result.exit_code, 1, result.output)
+                    self.assertIn("migration requise", result.output)
+                    self.assertNotIn("échec", result.output)
+
+
+class AuditListStreamTests(unittest.IsolatedAsyncioTestCase):
+    """Une inondation de rejets ne masque pas les accès (``--stream access``)."""
+
+    async def test_rejection_flood_does_not_hide_access_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            key = generate_server_hmac_key()
+            log = SqliteAuditLog(db_path, hmac_key=key.encode())
+            for status in (200, 200):
+                await log.record(peer="cli", action="GET", target=None, status_code=status)
+            for _ in range(10):
+                await log.record(peer="cli", action="GET", target=None, status_code=401)
+            base = ["vault", "audit", "list", "--db-path", str(db_path), "--limit", "2", "--json"]
+            env = {"HEIMDALL_VAULT_AUDIT_HMAC_KEY": key}
+            flooded = CliRunner().invoke(cli_app, base, env=env)
+            self.assertEqual(flooded.exit_code, 0, flooded.output)
+            self.assertEqual({e["status_code"] for e in json.loads(flooded.output)}, {401})
+            access = CliRunner().invoke(cli_app, [*base, "--stream", "access"], env=env)
+            self.assertEqual(access.exit_code, 0, access.output)
+            self.assertEqual([e["status_code"] for e in json.loads(access.output)], [200, 200])
+            bad = CliRunner().invoke(cli_app, [*base, "--stream", "other"], env=env)
+            self.assertEqual(bad.exit_code, 2, bad.output)
+
+
+class InMemoryAuditListStreamTests(unittest.IsolatedAsyncioTestCase):
+    """Parité mémoire/SQLite : filtre ``stream`` sous inondation de rejets."""
+
+    async def test_rejection_flood_does_not_hide_access_events_in_memory(self) -> None:
+        log = InMemoryAuditLog(hmac_key=generate_server_hmac_key().encode())
+        for _ in range(2):
+            await log.record(peer="cli", action="GET", target=None, status_code=200)
+        for _ in range(10):
+            await log.record(peer="cli", action="GET", target=None, status_code=401)
+        flooded = log.list_events(limit=2)
+        self.assertEqual({e["status_code"] for e in flooded}, {401})
+        access = log.list_events(limit=2, stream="access")
+        self.assertEqual([e["status_code"] for e in access], [200, 200])
+        rejection = log.list_events(limit=2, stream="rejection")
+        self.assertEqual({e["status_code"] for e in rejection}, {401})
+        with self.assertRaises(ValueError):
+            log.list_events(stream="other")
+
+
+class PreM03HistoryStreamTests(unittest.IsolatedAsyncioTestCase):
+    """Historique pré-M-03 : chaîne unique conservée dans ``access``, sans backfill."""
+
+    async def test_legacy_single_chain_stays_verifiable_after_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            key = generate_server_hmac_key().encode()
+            log = SqliteAuditLog(db_path, hmac_key=key)
+            # Avant M-03 : une seule chaîne, rejets compris.
+            with patch.object(audit_module, "_REJECTION_STATUS_CODES", frozenset()):
+                for status in (200, 401, 200, 429, 200):
+                    await log.record(peer="cli", action="GET", target=None, status_code=status)
+            with db_session(db_path) as conn:
+                SqliteAuditLog._ensure_stream_column(conn)
+                streams = {
+                    str(row[0])
+                    for row in conn.execute("SELECT DISTINCT stream FROM audit_events")
+                }
+            self.assertEqual(streams, {"access"})
+            self.assertEqual(log.verify_chain(), (True, None))
+            # Un reclassement des anciens rejets casserait la chaîne : preuve
+            # que l'absence de backfill est le seul choix sûr.
+            with db_session(db_path) as conn:
+                conn.execute(
+                    "UPDATE audit_events SET stream = 'rejection' WHERE status_code IN (401, 429)"
+                )
+            self.assertFalse(log.verify_chain()[0])

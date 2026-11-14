@@ -9,6 +9,7 @@ from pathlib import Path
 
 from heimdall.cli.scan import (
     ScanReport,
+    _call_timeout,
     _read_worktree_file,
     _verify_root_unchanged,
     collect,
@@ -26,6 +27,7 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.interface import FileTarget, Scanner
+from heimdall.scanner.policy import ScanSkip, prepare_text
 from heimdall.scanner.signature_engine import SignatureEngine
 
 CONTEXT_LINES = 5
@@ -37,6 +39,34 @@ MAX_QUALIFICATION_SECONDS = 300.0
 def _check_deadline(deadline: float) -> None:
     if time.monotonic() >= deadline:
         raise ScanError("limite de temps de qualification dépassée")
+
+
+def _worktree_status(access: GitAccess, deadline: float) -> bytes:
+    """Empreinte bornée de l'état Git du worktree (suivi + non suivi)."""
+    result = access.execute(
+        (
+            "--no-replace-objects",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ),
+        timeout=_call_timeout(deadline),
+    )
+    if result.returncode != 0:
+        raise ScanError("contenu modifié depuis le scan déterministe")
+    return result.stdout
+
+
+def _verify_worktree_status(
+    access: GitAccess, root: Path, before: bytes, deadline: float
+) -> None:
+    """Refuse si un fichier suivi ou non suivi a changé depuis la première passe."""
+    _verify_root_unchanged(access, root)
+    if _worktree_status(access, deadline) != before:
+        raise ScanError("contenu modifié depuis le scan déterministe")
 
 
 @dataclass(frozen=True)
@@ -118,41 +148,70 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
     ci: bool = False,
     llm: bool = True,
     max_file_bytes: int = MAX_FILE_BYTES,
+    strict: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:
-    """Collect and qualify candidates; Git failures use the scanner contract."""
+    """Collect and qualify candidates; Git failures use the scanner contract.
+
+    La seconde passe ne relit que les fichiers porteurs de findings, mais
+    l'état Git du worktree (suivi + non suivi) est comparé avant et après :
+    un fichier propre modifié entre les passes provoque ``ScanError``. Pour
+    un verdict opposable, figer le dépôt ou relancer le cold start.
+    """
     try:
         return _collect_cold_start(
-            root, ci=ci, llm=llm, max_file_bytes=max_file_bytes, chat=chat, journal=journal
+            root,
+            ci=ci,
+            llm=llm,
+            max_file_bytes=max_file_bytes,
+            strict=strict,
+            chat=chat,
+            journal=journal,
         )
     except ToolFailure:
         raise ScanError("scan impossible : entrée non analysable") from None
 
 
-def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification options
+def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification options
     root: Path,
     *,
     ci: bool = False,
     llm: bool = True,
     max_file_bytes: int = MAX_FILE_BYTES,
+    strict: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:
     if type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES:
         raise ScanError("limite de fichier invalide")
-    # Capturer l'identité AVANT collect ferme aussi l'intervalle entre les
-    # deux passes, et pas seulement les substitutions pendant la relecture.
+    if type(strict) is not bool:
+        raise ScanError("politique de contenu invalide")
+    # Capturer l'identité et l'état Git AVANT collect ferme aussi l'intervalle
+    # entre les deux passes, et pas seulement les substitutions pendant la
+    # relecture : un fichier propre modifié pendant collect est vu par la
+    # comparaison après la seconde passe.
     access = GitAccess(root) if llm and not ci else None
-    skipped: list[str] = []
-    scan = collect(root, staged=False, ci=ci, max_file_bytes=max_file_bytes, skipped_files=skipped)
+    deadline = time.monotonic() + MAX_QUALIFICATION_SECONDS
+    status_before: bytes | None = None
     if access is not None:
         _verify_root_unchanged(access, root)
+        status_before = _worktree_status(access, deadline)
+    skipped: list[str] = []
+    scan = collect(
+        root,
+        staged=False,
+        ci=ci,
+        max_file_bytes=max_file_bytes,
+        skipped_files=skipped,
+        strict=strict,
+    )
     if access is None or not scan.findings:
+        if access is not None and status_before is not None:
+            _verify_worktree_status(access, root, status_before, deadline)
         return ColdStartReport(scan, (), tuple(skipped))
     if len(scan.findings) > MAX_QUALIFICATIONS:
         raise ScanError("trop de candidats pour la qualification locale")
-    deadline = time.monotonic() + MAX_QUALIFICATION_SECONDS
     by_file: dict[str, list[Finding]] = {}
     for finding in scan.findings:
         by_file.setdefault(finding.file, []).append(finding)
@@ -166,23 +225,28 @@ def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification opti
             raise ScanError("chemin de qualification hors périmètre") from None
         raw = _read_worktree_file(path, max_bytes=max_file_bytes)
         try:
-            text = decode_text(raw) if raw is not None else None
+            text = decode_text(raw, strict=strict) if raw is not None else None
         except ScanError:
             raise ScanError("contenu modifié depuis le scan déterministe") from None
         if text is None:
+            raise ScanError("contenu modifié depuis le scan déterministe")
+        reread_skipped: list[ScanSkip] = []
+        text = prepare_text(text, file, strict=strict, skipped=reread_skipped)
+        if any(item not in scan.skipped for item in reread_skipped):
             raise ScanError("contenu modifié depuis le scan déterministe")
         target = FileTarget(file, text)
         # Sur-ensemble volontaire sans allowlist : on vérifie l'appartenance
         # des findings retenus, pas l'égalité de deux rapports. TreeScanner et
         # SignatureEngine partagent DEFAULT_ENTROPY_CONFIG et la même clé HMAC
         # locale persistante via SnippetHasher() ; le test de parité le prouve.
-        current = Scanner(SignatureEngine(deadline=deadline)).scan(target)
+        current = Scanner(SignatureEngine(deadline=deadline, strict=strict)).scan(target)
         if any(finding not in current for finding in findings):
             raise ScanError("contenu modifié depuis le scan déterministe")
         opinions.extend(
             qualify_target(target, findings, ci=ci, chat=chat, journal=journal, deadline=deadline)
         )
-    _verify_root_unchanged(access, root)
+    if status_before is not None:
+        _verify_worktree_status(access, root, status_before, deadline)
     _check_deadline(deadline)
     return ColdStartReport(scan, tuple(opinions), tuple(skipped))
 
@@ -194,7 +258,7 @@ def render_cold_start(report: ColdStartReport, *, json_output: bool = False) -> 
                 "schema": "heimdall.cold-start.v1",
                 "scan": json.loads(render_json(report.scan)),
                 "opinions": [opinion.as_dict() for opinion in report.opinions],
-                "complete": not report.skipped_files,
+                "complete": not report.skipped_files and report.scan.complete,
                 "skipped_files": report.skipped_files,
             },
             ensure_ascii=True,

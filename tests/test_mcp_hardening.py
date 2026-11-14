@@ -282,6 +282,23 @@ class MaskingPerformanceTests(unittest.TestCase):
         self.assertLess(elapsed, 5.0, f"masquage trop lent : {elapsed:.1f}s")
         self.assertEqual((masked, count), (line, 0))
 
+    def test_evocative_key_on_huge_line_completes_in_time(self) -> None:
+        """Revue (LOW) : une clé évocatrice ne doit pas ralentir un fichier minifié.
+
+        `password = ` + 120 Ko déclenchait un balayage de la valeur par
+        chaque motif d'affectation (~0,45 s mesuré ici, ~1,1 s en revue).
+        Le préfixe `(?<![A-Za-z])` empêche de relancer les motifs au milieu
+        d'une suite de lettres : coût mesuré ~0,05 s. La borne de 5 s est
+        celle des autres tests de performance du module.
+        """
+        line = "password = " + "a" * 120_000
+        started = time.monotonic()
+        masked, count = masking.mask_text(line)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0, f"masquage trop lent : {elapsed:.1f}s")
+        self.assertEqual(count, 1)
+        self.assertNotIn("a" * 100, masked)
+
     def test_diluted_secret_is_caught_by_its_prefix(self) -> None:
         """Un jeton noyé dans du remplissage : l'entropie locale est diluée,
         seul son préfixe le trahit — d'où les règles nues (faille corrigée).
@@ -395,7 +412,6 @@ class MaskingPerformanceTests(unittest.TestCase):
         self.assertLessEqual(len(response), 1024)
         # Le retrait est bien « les derniers d'abord » (le préfixe survit).
         self.assertEqual([item["file"] for item in files], [f"f{i}.py" for i in range(len(files))])
-
 
 
 if __name__ == "__main__":

@@ -851,7 +851,7 @@ def test_hook_blocks_a_secret_from_a_subdirectory_commit(
     assert FAKE_AWS_KEY not in completed.stdout + completed.stderr
 
 
-def test_heimdall_in_hook_is_a_documented_bypass(git_repo: GitRepo) -> None:
+def test_heimdall_in_hook_cannot_bypass_the_hook(git_repo: GitRepo) -> None:
     git_repo.write("app.py", "x = 1\n")
     git_repo.stage("app.py")
     git_repo.commit_all("base")
@@ -871,9 +871,9 @@ def test_heimdall_in_hook_is_a_documented_bypass(git_repo: GitRepo) -> None:
         check=False,
     )
 
-    assert completed.returncode == 0
-    assert "scan ignoré" in completed.stderr
-    assert FAKE_AWS_KEY in git_repo.git_output("show", "HEAD:app.py")
+    assert completed.returncode != 0
+    assert "hérité refusé" in completed.stderr
+    assert FAKE_AWS_KEY not in git_repo.git_output("show", "HEAD:app.py")
 
 
 def test_hook_scans_only_the_index(git_repo: GitRepo) -> None:
@@ -1226,12 +1226,13 @@ def test_verify_root_detects_a_replaced_root(git_repo: GitRepo) -> None:
         _verify_root(access)
 
 
-def test_hook_skips_when_already_inside_a_hook(git_repo: GitRepo) -> None:
+@pytest.mark.parametrize("value", ["1", "0", "", "external"])
+def test_hook_refuses_an_inherited_recursion_marker(git_repo: GitRepo, value: str) -> None:
     git_repo.write("app.py", f'AWS = "{FAKE_AWS_KEY}"\n')
     git_repo.stage("app.py")
     assert _run("hook", "install", str(git_repo.root)).exit_code == 0
     environment = dict(os.environ)
-    environment[HEIMDALL_IN_HOOK_ENV] = "1"
+    environment[HEIMDALL_IN_HOOK_ENV] = value
 
     completed = subprocess.run(  # noqa: S603 - hook local généré
         [str(_hook(git_repo))],
@@ -1243,8 +1244,8 @@ def test_hook_skips_when_already_inside_a_hook(git_repo: GitRepo) -> None:
         check=False,
     )
 
-    assert completed.returncode == 0
-    assert "scan ignoré" in completed.stderr
+    assert completed.returncode == 2
+    assert "hérité refusé" in completed.stderr
     assert FAKE_AWS_KEY not in completed.stdout + completed.stderr
 
 

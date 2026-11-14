@@ -147,6 +147,48 @@ def test_valid_transition_changes_state_and_returns_metadata_only(vault: TestCli
     assert _CANARY not in old_value.text
 
 
+def test_rote_clears_encrypted_value_and_dek(vault: TestClient) -> None:
+    """Audit F-03 : la valeur chiffrée et la DEK sont effacées à la transition rote."""
+    _create(vault)
+    assert vault.post(_TRANSITION, json={"target_status": "rote"}).status_code == 200
+    store = vault.app.state.secret_store
+    if isinstance(store, InMemorySecretStore):
+        record = store._secrets[(_PROJECT, _ENV, _NAME)]
+        assert record["encrypted_value"] == ""
+        assert record["encrypted_dek"] is None
+    else:
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT encrypted_value, encrypted_dek FROM secrets "
+                "WHERE project_id = ? AND env = ? AND name = ?",
+                (_PROJECT, _ENV, _NAME),
+            ).fetchone()
+        assert row is not None
+        assert row["encrypted_value"] == ""
+        assert row["encrypted_dek"] is None
+
+
+def test_rote_value_cannot_be_resurrected_by_a_status_flip(vault: TestClient) -> None:
+    """Audit F-03 : même en repassant le statut à vaulte, l'ancienne valeur est vide."""
+    _create(vault)
+    assert vault.post(_TRANSITION, json={"target_status": "rote"}).status_code == 200
+    store = vault.app.state.secret_store
+    if isinstance(store, InMemorySecretStore):
+        store._secrets[(_PROJECT, _ENV, _NAME)]["status"] = "vaulte"
+    else:
+        with closing(sqlite3.connect(store.db_path)) as connection:
+            connection.execute(
+                "UPDATE secrets SET status = 'vaulte' "
+                "WHERE project_id = ? AND env = ? AND name = ?",
+                (_PROJECT, _ENV, _NAME),
+            )
+            connection.commit()
+    response = vault.get(_RESOURCE)
+    assert response.status_code != 200
+    assert _CANARY not in response.text
+
+
 def test_transition_journal_contains_actor_timestamp_and_states(vault: TestClient) -> None:
     _create(vault)
     key_id = vault.app.state.api_key_registry.list_entries()[0].key_id

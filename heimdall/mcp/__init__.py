@@ -14,8 +14,30 @@ sérialisation),
 tout échec renvoyé sous forme d'enveloppe ``{"error": {…}}``.
 """
 
+import importlib
+from typing import Any, Final
+
 from heimdall.mcp.errors import ERROR_MESSAGES, ErrorCode, ToolFailure, dumps, failure
-from heimdall.mcp.server import MCP_TOOLS, SERVER_TOOLS, build_server, run_stdio
+
+#: Exports du serveur MCP, chargés à la demande. Le SDK ``mcp`` n'est requis
+#: que pour ces symboles : importer ``heimdall.mcp.gitdiff`` (client Vault,
+#: scanner, hook) ne doit pas tirer le serveur ni sa dépendance lourde.
+_SERVER_EXPORTS: Final[frozenset[str]] = frozenset(
+    {"MCP_TOOLS", "SERVER_TOOLS", "build_server", "run_stdio"}
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Import paresseux des exports serveur (PEP 562), sans dépendance ``mcp``."""
+    if name in _SERVER_EXPORTS:
+        server = importlib.import_module("heimdall.mcp.server")
+        return getattr(server, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _SERVER_EXPORTS)
+
 
 __all__ = [
     "ERROR_MESSAGES",

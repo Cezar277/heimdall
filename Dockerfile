@@ -52,6 +52,7 @@ RUN groupadd --gid 10001 heimdall \
 
 # Uniquement le runtime Python et l'entrée CLI : pas d'outils de développement dans le PATH.
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+RUN rm -rf /usr/local/lib/python3.12/site-packages/pip* /usr/local/lib/python3.12/site-packages/setuptools* /usr/local/lib/python3.12/site-packages/wheel* /usr/local/lib/python3.12/site-packages/_distutils_hack* /usr/local/bin/pip*
 COPY --from=builder /usr/local/bin/heimdall /usr/local/bin/heimdall
 COPY --chown=heimdall:heimdall docker/healthcheck.py /app/healthcheck.py
 COPY --chown=heimdall:heimdall docker/entrypoint.py /app/entrypoint.py

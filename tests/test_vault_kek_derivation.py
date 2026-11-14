@@ -49,6 +49,7 @@ from heimdall.vault.crypto import (
     derive_kek_from_master_key,
     generate_encryption_key,
     generate_kek_salt,
+    generate_master_key,
     kek_matches_pepper,
 )
 from heimdall.vault.store import InMemorySecretStore
@@ -171,6 +172,8 @@ class Argon2idDerivationTests(unittest.TestCase):
             " leading-space",
             "trailing-space ",
             "\ud800",  # surrogate isolé : encodage UTF-8 impossible
+            "A" * 32,  # répétitif : diversité insuffisante
+            "ab" * 16,  # périodique
         ]
         for invalid_master_key in invalid_master_keys:
             with self.subTest(master_key=invalid_master_key):
@@ -179,13 +182,15 @@ class Argon2idDerivationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             derive_kek_from_master_key(None, _SALT_A)  # type: ignore[arg-type]
 
-    def test_minimum_master_key_length_is_128_bits(self) -> None:
-        """La borne est inclusive : 16 octets passent, 15 sont refusés."""
-        self.assertEqual(MIN_MASTER_KEY_BYTES, 16)
-        accepted = derive_kek_from_master_key("A" * MIN_MASTER_KEY_BYTES, _SALT_A)
+    def test_minimum_master_key_length_is_256_bits(self) -> None:
+        """La borne est inclusive : 32 octets complexes passent, 31 sont refusés."""
+        self.assertEqual(MIN_MASTER_KEY_BYTES, 32)
+        accepted = derive_kek_from_master_key(generate_master_key(), _SALT_A)
         self.assertEqual(len(accepted), 32)
         with self.assertRaises(ValueError):
             derive_kek_from_master_key("A" * (MIN_MASTER_KEY_BYTES - 1), _SALT_A)
+        with self.assertRaises(ValueError):
+            derive_kek_from_master_key("A" * MIN_MASTER_KEY_BYTES, _SALT_A)
 
 
 class VaultSettingsMasterKeyTests(unittest.TestCase):

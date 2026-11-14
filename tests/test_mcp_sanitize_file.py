@@ -105,6 +105,23 @@ class SanitizeFileToolTests(FileRepoTestCase):
             with self.subTest(**arguments):
                 self.assertNotIn(jeton, str(self.read(arguments)))
 
+    def test_json_quoted_password_is_masked_end_to_end(self) -> None:
+        """E-03 : une clé JSON entre guillemets ne part plus en clair au LLM."""
+        self.write("config.json", '{"password": "hunter2!hunter"}\n')
+        payload = self.read({"path": "config.json"})
+        self.assertNotIn("hunter2!hunter", payload["content"])
+        self.assertIn("<REDACTED:generic_secret:len=14>", payload["content"])
+        self.assertEqual(payload["redactions"], 1)
+
+    def test_unclosed_quoted_password_is_masked_end_to_end(self) -> None:
+        """Revue (MEDIUM) : guillemet fermant absent, secret quand même masqué."""
+        self.write("conf.py", 'password="hunter2!hunter\n')
+        payload = self.read({"path": "conf.py"})
+        self.assertNotIn("hunter2!hunter", payload["content"])
+        self.assertIn("<REDACTED:generic_secret:len=14>", payload["content"])
+        self.assertEqual(payload["redactions"], 1)
+        self.assertEqual(mcp_contract.errors("SanitizeFileResult", payload), [])
+
     def test_long_quoted_value_is_masked_not_windowed(self) -> None:
         """Régression de revue : plus de fenêtre AVANT le masquage.
 
@@ -260,6 +277,44 @@ class SanitizeFileToolTests(FileRepoTestCase):
                 payload = self.read({"path": path})
                 self.assertEqual(payload["error"]["code"], "FORBIDDEN_PATH")
 
+    def test_credential_files_are_forbidden(self) -> None:
+        """F-09 : les fichiers de credentials ne sont jamais lus, même masqués."""
+        for path in (
+            ".netrc",
+            "netrc",
+            ".pgpass",
+            "pgpass",
+            "id_rsa",
+            "id_ed25519",
+            "server.pem",
+            "private.key",
+            ".npmrc",
+            ".pypirc",
+            "credentials",
+            "credential",
+            "credentials.env",
+            "credentials.db",
+            "credential.json",
+            ".docker/config.json",
+            ".kube/config",
+            ".netrc.backup",
+            ".pgpass~",
+            ".npmrc-backup",
+            "credentials.json",
+            "credentials.txt",
+            "credentials.bak.json",
+            "credentials-backup",
+            "credentials_backup",
+            "server.pem.bak",
+            "private.key.old",
+            ".docker/config.json.bak",
+            ".kube/config.old",
+        ):
+            with self.subTest(path=path):
+                self.write(path, "mot-de-passe-factice\n")
+                payload = self.read({"path": path})
+                self.assertEqual(payload["error"]["code"], "FORBIDDEN_PATH")
+
     def test_envelope_lookalike_is_overblocked(self) -> None:
         """`.envelope.py` n'est pas un `.env*` légitime à lire : le contrat
         dit `.env*`, fail-closed l'emporte sur la disponibilité."""
@@ -356,6 +411,28 @@ class SanitizeFileToolTests(FileRepoTestCase):
         payload = self.read({"path": "/etc/passwd"})
         self.assertEqual(mcp_contract.errors("SanitizeFileResult", payload), [])
         self.assertNotEqual(mcp_contract.errors("SanitizeFileOutput", payload), [])
+
+    def test_multiline_xml_is_masked_end_to_end(self) -> None:
+        """Revue (HIGH) : XML indenté sur plusieurs lignes masqué en bout en bout."""
+        self.write(
+            "settings.xml",
+            "<settings>\n  <password>\n    S3cr3tP4ss!\n  </password>\n</settings>\n",
+        )
+        payload = self.read({"path": "settings.xml"})
+        self.assertEqual(payload["redactions"], 1)
+        self.assertNotIn("S3cr3tP4ss!", payload["content"])
+        self.assertIn("<REDACTED:", payload["content"])
+        self.assertEqual(payload["end_line"], 5)
+
+        self.write(
+            "phrase.xml",
+            "<password>\n  my secret\n  phrase 42\n</password>\n",
+        )
+        payload = self.read({"path": "phrase.xml"})
+        self.assertEqual(payload["redactions"], 1)
+        self.assertNotIn("my secret", payload["content"])
+        self.assertNotIn("phrase 42", payload["content"])
+        self.assertEqual(payload["end_line"], 4)
 
 
 class GuardWiringTests(FileRepoTestCase):

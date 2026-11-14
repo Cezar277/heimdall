@@ -6,6 +6,13 @@ les types et les attentes avant son implémentation.
 
 ## Cas
 
+Évolution E-02 (#230) : l'oracle reste indépendant et inchangé. Le scan brut
+signale désormais `PASSWORD="changeme"` et les mocks nommés comme jetons,
+dans les deux langages. Avec les huit alertes UUID/hash/intégrité déjà
+présentes, cela fait 12 faux positifs selon cet oracle historique : précision
+`core` 10/22, rappel 1 ; précision `all` 12/24, rappel 0,75. Le seuil du script
+de mesure reste 0,90 et n'est donc pas atteint sans allowlist explicite.
+
 - 10 leaks synthétiques : AWS, Stripe, JWT, PAT GitHub et PEM, en Python et JS.
 - 18 non-leaks : UUID, SHA-256, hash de commit, intégrité de lockfile,
   `example`, `changeme`, `your_key_here`, image GIF base64 et mocks dans `tests/`.

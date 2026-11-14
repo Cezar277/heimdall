@@ -34,10 +34,8 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import ScanTarget
+from heimdall.scanner.limits import MULTILINE_WINDOW
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
-
-#: Fenêtre maximale de jointure de deux lignes, en **octets UTF-8** (4 Kio).
-MULTILINE_WINDOW: Final[int] = 4096
 
 #: Plafond du nombre de Findings rendus en une passe (#29). Les bornes
 #: d'entrée ne suffisent pas : un dépôt adverse dense en candidats (un millier
@@ -91,9 +89,10 @@ class SignatureEngine:
         "_hasher",
         "_max_findings",
         "_traces",
+        "_strict",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - bornes et politique explicites
         self,
         hasher: SnippetHasher | None = None,
         entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
@@ -101,8 +100,12 @@ class SignatureEngine:
         max_findings: int | None = None,
         deadline: float | None = None,
         allowlist: Allowlist | None = None,
+        strict: bool = True,
     ) -> None:
         self._deadline = deadline
+        if type(strict) is not bool:
+            raise ValueError("politique de contenu invalide")
+        self._strict = strict
         if not isinstance(entropy_config, EntropyConfig):
             raise ValueError("configuration d'entropie invalide")
         self._entropy_config = entropy_config
@@ -146,20 +149,16 @@ class SignatureEngine:
                 and time.monotonic() > self._deadline
             ):
                 raise ScanError(_DEADLINE_ERROR)
+            following = self._joined_window(line, lines, index)
+            current_window = () if following is None else tuple(
+                match for match in find_signature_matches(following[0])
+                if match.start < following[1] and match.context_end <= following[1]
+            )
             for match in find_line_matches(
-                line, self._entropy_config, preceding, deadline=self._deadline
+                line, self._entropy_config, preceding + current_window, deadline=self._deadline
             ):
                 self._append(findings, seen, match, line_number, cible.path)
-            following = self._joined_window(line, lines, index)
-            if following is None:
-                preceding = ()
-                continue
-            joined, limit = following
-            # Réutilisé pour dédupliquer l'entropie de la ligne suivante :
-            # une fenêtre contiguë n'est jamais analysée une seconde fois.
-            preceding = tuple(
-                match for match in find_signature_matches(joined) if match.start < limit
-            )
+            preceding = current_window
             for match in preceding:
                 self._append(findings, seen, match, line_number, cible.path)
         return findings
@@ -189,12 +188,18 @@ class SignatureEngine:
             return None
         joined = line + following
         if len(joined) > MULTILINE_WINDOW:
-            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
+            if self._strict:
+                check_multiline_overflow(
+                    line, following, self._entropy_config, deadline=self._deadline
+                )
             return None
         # Le nombre de caractères minore le nombre d'octets UTF-8 : le premier
         # contrôle évite d'encoder les lignes déjà trop longues.
         if not joined.isascii() and len(joined.encode("utf-8")) > MULTILINE_WINDOW:
-            check_multiline_overflow(line, following, self._entropy_config, deadline=self._deadline)
+            if self._strict:
+                check_multiline_overflow(
+                    line, following, self._entropy_config, deadline=self._deadline
+                )
             return None
         return joined, len(line)
 

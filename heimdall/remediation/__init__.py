@@ -20,6 +20,7 @@ from heimdall.remediation.env import (
 from heimdall.remediation.naming import (
     deduplicate_variable_name,
     is_dangerous_env_var,
+    is_dangerous_exec_env_var,
     validate_variable_name,
 )
 from heimdall.remediation.templates import (
@@ -57,6 +58,7 @@ __all__ = [
     "detect_language",
     "ensure_gitignore_ignores_env",
     "is_dangerous_env_var",
+    "is_dangerous_exec_env_var",
     "plan_env_example_change",
     "plan_for_finding",
     "plan_gitignore_change",

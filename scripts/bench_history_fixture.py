@@ -22,7 +22,7 @@ def main() -> None:
     git = shutil.which("git", path=os.defpath)
     if git is None:
         raise RuntimeError("git required")
-    subprocess.run([git, "-C", str(destination), "init", "-q"], check=True)  # noqa: S603
+    subprocess.run([git, "-C", str(destination), "init", "-q"], check=True)  # noqa: S603  # nosec B603
     stream = bytearray()
     for number in range(COMMITS):
         stream.extend(
@@ -45,12 +45,12 @@ def main() -> None:
         data = f"# revision {number}\n".encode()
         stream.extend(f"M 100644 inline file0.py\ndata {len(data)}\n".encode())
         stream.extend(data + b"\n\n")
-    subprocess.run(  # noqa: S603 - fixed git command, synthetic stdin
+    subprocess.run(  # noqa: S603 - fixed git command, synthetic stdin  # nosec B603
         [git, "-C", str(destination), "fast-import", "--quiet"],
         input=stream,
         check=True,
     )
-    subprocess.run(  # noqa: S603 - fixed git command
+    subprocess.run(  # noqa: S603 - fixed git command  # nosec B603
         [git, "-C", str(destination), "symbolic-ref", "HEAD", "refs/heads/main"],
         check=True,
     )

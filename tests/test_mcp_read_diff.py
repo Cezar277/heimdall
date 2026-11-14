@@ -205,6 +205,33 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.assertEqual(payload["files"][0]["redactions"], 2)
         self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
 
+    def test_json_quoted_password_is_masked_end_to_end(self) -> None:
+        """E-03 : une clé JSON entre guillemets ne fuit plus dans le diff."""
+        self.write("config.json", '{"password": "hunter2!hunter"}\n')
+        self.stage("config.json")
+        payload = self.call_read_diff()
+        content = json.dumps(payload)
+        self.assertNotIn("hunter2!hunter", content)
+        self.assertIn("<REDACTED:generic_secret:len=14>", content)
+        self.assertEqual(payload["files"][0]["redactions"], 1)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
+    def test_unclosed_quoted_password_is_masked_end_to_end(self) -> None:
+        """Revue (MEDIUM) : un guillemet fermant manquant ne laisse pas le secret.
+
+        Une ligne de diff tronquée ou une coquille suffisait à envoyer
+        `password="hunter2!hunter` en clair dans la réponse sérialisée.
+        """
+        self.write("config.py", 'password="hunter2!hunter\nMODE="read"\n')
+        self.stage("config.py")
+        payload = self.call_read_diff()
+        content = json.dumps(payload)
+        self.assertNotIn("hunter2!hunter", content)
+        self.assertIn("<REDACTED:generic_secret:len=14>", content)
+        self.assertIn("read", content, "une valeur fermée et non secrète reste lisible")
+        self.assertEqual(payload["files"][0]["redactions"], 1)
+        self.assertEqual(mcp_contract.errors("ReadDiffResult", payload), [])
+
     def test_generic_key_names_are_masked_end_to_end(self) -> None:
         """`KEY=hunter2`, `AWS_KEY=...`, `MYKEY=ab12` : bout en bout.
 
@@ -357,6 +384,33 @@ class ReadDiffToolTests(GitRepoTestCase):
         self.stage("brand/new.py")
         entry = self.call_read_diff()["files"][0]
         self.assertEqual(entry["file"], "brand/new.py")
+
+    def test_multiline_xml_is_masked_end_to_end(self) -> None:
+        """Revue (HIGH) : XML multiligne masqué dans read_diff (via _masked_files)."""
+        self.write(
+            "settings.xml",
+            "<password>\n  S3cr3tP4ss!\n</password>\n",
+        )
+        self.stage("settings.xml")
+        entry = self.call_read_diff()["files"][0]
+        self.assertEqual(entry["redactions"], 1)
+        texts = [line["text"] for line in entry["added_lines"]]
+        self.assertEqual(len(texts), 3)
+        self.assertNotIn("S3cr3tP4ss!", "\n".join(texts))
+        self.assertIn("<REDACTED:", texts[1])
+
+        self.write(
+            "phrase.xml",
+            "<password>\n  my secret\n  phrase 42\n</password>\n",
+        )
+        self.stage("phrase.xml")
+        payload = self.call_read_diff()
+        phrase_entry = next(item for item in payload["files"] if item["file"] == "phrase.xml")
+        self.assertEqual(phrase_entry["redactions"], 1)
+        self.assertEqual([line["line"] for line in phrase_entry["added_lines"]], [1, 2, 3, 4])
+        self.assertEqual(phrase_entry["added_lines"][3]["text"], "</password>")
+        self.assertNotIn("my secret", str(phrase_entry))
+        self.assertNotIn("phrase 42", str(phrase_entry))
 
 
 class ReadDiffConformanceTests(GitRepoTestCase):

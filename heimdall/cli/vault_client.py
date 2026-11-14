@@ -28,7 +28,7 @@ from typing import Final, NoReturn
 
 import typer
 
-from heimdall.remediation.naming import is_dangerous_env_var
+from heimdall.remediation.naming import is_dangerous_env_var, is_dangerous_exec_env_var
 from heimdall.vault.atomic import (
     _bounded_error_message,
     _get_git_toplevel,
@@ -226,7 +226,7 @@ def _filter_secrets(
     for key, value in secrets.items():
         if key not in target_names:
             continue
-        if is_dangerous_env_var(key):
+        if is_dangerous_exec_env_var(key):
             # Même refus que pull/run : un nom interdit à l'injection ne doit
             # jamais être stocké (secret empoisonné, rotation crue mais
             # inexploitable). Code 2 = validation locale avant tout réseau ;
@@ -260,7 +260,7 @@ def _push_single_secret(
     Retourne ``True`` si le secret a été créé, ``False`` s'il existait déjà
     (409 : avertissement, non écrasé). Les autres erreurs sortent en `Exit`.
     """
-    if is_dangerous_env_var(name):
+    if is_dangerous_exec_env_var(name):
         # Reflet borné et échappé : `_push_single_secret` peut être appelée
         # directement (défense en profondeur) avant tout contrôle de format.
         # Un nom non-str n'est jamais reflété : seul son type est affiché.
@@ -505,7 +505,7 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
     retrieved: dict[str, str] = {}
     total_chars = 0
     for name in target_names:
-        if is_dangerous_env_var(name):
+        if is_dangerous_exec_env_var(name):
             typer.echo(
                 f"Erreur de sécurité : le secret {preview_name(name)!r} "
                 "est une variable système interdite.",
@@ -520,16 +520,24 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             continue
         try:
             record = client.get_secret(proj, env, name)
+            if record.get("status") != "vaulte":
+                typer.echo(
+                    f"Erreur de sécurité : le secret {preview_name(name)!r} "
+                    "n'est pas au statut 'vaulte'.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
             val = record.get("value")
             if not isinstance(val, str):
                 typer.echo(
-                    f"Erreur : valeur de type inattendu pour '{name}' dans le Vault.",
+                    f"Erreur : valeur de type inattendu pour {preview_name(name)!r} dans le Vault.",
                     err=True,
                 )
                 raise typer.Exit(code=1)
             if "\x00" in val:
                 typer.echo(
-                    f"Erreur de sécurité : le secret '{name}' contient un octet nul interdit.",
+                    f"Erreur de sécurité : le secret {preview_name(name)!r} "
+                    "contient un octet nul interdit.",
                     err=True,
                 )
                 raise typer.Exit(code=1)
@@ -538,7 +546,7 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             retrieved[name] = val
         except VaultNotFoundError:
             typer.echo(
-                f"Erreur : secret '{name}' introuvable dans le Vault ({proj}/{env}).",
+                f"Erreur : secret {preview_name(name)!r} introuvable dans le Vault ({proj}/{env}).",
                 err=True,
             )
             raise typer.Exit(code=1) from None
@@ -562,14 +570,17 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             raise typer.Exit(code=1) from None
         except VaultClientError as exc:
             msg = _bounded_error_message(str(exc))
-            typer.echo(f"Erreur lors de la récupération de '{name}' : {msg}", err=True)
+            typer.echo(
+                f"Erreur lors de la récupération de {preview_name(name)!r} : {msg}",
+                err=True,
+            )
             raise typer.Exit(code=1) from None
         except ValueError:
             # Défense en profondeur : les patterns CLI et client sont
             # dupliqués aujourd'hui. Une divergence future ne doit jamais
             # produire un traceback (invariant 11) ni refléter la valeur.
             typer.echo(
-                f"Erreur : identifiant invalide pour le secret '{name[:32]!r}'.",
+                f"Erreur : identifiant invalide pour le secret {preview_name(name)!r}.",
                 err=True,
             )
             raise typer.Exit(code=1) from None
@@ -603,8 +614,8 @@ def vault_pull(  # noqa: PLR0912, PLR0913, PLR0917
     for key, value in retrieved.items():
         if "\n" in value or "\r" in value:
             typer.echo(
-                f"Erreur : Le secret '{key}' contient un saut de ligne interdit dans le fichier "
-                ".env (risque d'injection).",
+                f"Erreur : Le secret {preview_name(key)!r} contient un saut de ligne interdit "
+                "dans le fichier .env (risque d'injection).",
                 err=True,
             )
             raise typer.Exit(code=1)
@@ -807,16 +818,22 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
     # localement (jamais par `record["name"]` renvoyé par le Vault).
     # Garde anti-détournement : interdiction d'injecter des variables système sensibles.
     for secret_name in injected_secrets:
-        if is_dangerous_env_var(secret_name):
+        if is_dangerous_exec_env_var(secret_name):
             typer.echo(
                 "Erreur de sécurité : injection refusée pour la variable système "
-                f"{secret_name[:32]!r}.",
+                f"{preview_name(secret_name)!r}.",
                 err=True,
             )
             raise typer.Exit(code=1)
 
     target_cmd = [executable if executable is not None else cmd[0], *cmd[1:]]
-    child_env = {**os.environ, **injected_secrets}
+    child_env = {
+        env_key: env_val
+        for env_key, env_val in os.environ.items()
+        if env_key.upper() not in {"HEIMDALL_API_KEY", "HEIMDALL_API_KEY_FILE"}
+        and not env_key.upper().startswith("HEIMDALL_VAULT_")
+    }
+    child_env.update(injected_secrets)
 
     # Anti-TOCTOU juste avant l'exécution : si la commande était un chemin,
     # le fichier a pu être substitué pendant le round-trip réseau — refuser

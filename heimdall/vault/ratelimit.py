@@ -74,7 +74,12 @@ class _Bucket:
 
 
 def _retry_after(oldest_hit: float, now: float, window_seconds: int) -> int:
-    """Délai entier avant l'expiration de la plus ancienne admission."""
+    """Délai entier avant l'expiration de la plus ancienne admission.
+
+    Recul d'horloge (audit F-15) : un horodatage futur est ramené à ``now``,
+    donc le délai ne dépasse jamais la fenêtre, sur les deux backends.
+    """
+    oldest_hit = min(oldest_hit, now)
     return max(
         1,
         min(
@@ -118,6 +123,15 @@ class RateLimiter:
         cutoff = now - self._window_seconds
         while bucket.hits and bucket.hits[0] <= cutoff:
             bucket.hits.popleft()
+        # Recul d'horloge (audit F-15) : les admissions « futures » ne
+        # comptent plus, sinon elles bloqueraient à tort jusqu'à une fenêtre.
+        # Une horloge qui recule puis avance laisse un deque non trié (ex.
+        # [100, 50] à now=50) : un futur peut alors se trouver n'importe où.
+        # Chemin rapide si les deux extrémités sont dans la fenêtre ; sinon
+        # reconstruction triée sans aucun futur ni expiré.
+        hits = bucket.hits
+        if hits and (hits[0] > now or hits[-1] > now):
+            bucket.hits = deque(sorted(hit for hit in hits if cutoff < hit <= now))
 
     def _existing_bucket(self, name: str, now: float) -> _Bucket | None:
         """Retourne le bucket existant après purge, sans jamais en créer.
@@ -159,9 +173,10 @@ class RateLimiter:
     ) -> tuple[bool, int]:
         """Évalue tous les budgets, puis consomme atomiquement.
 
-        ``consume_on_reject`` permet de conserver la sémantique du middleware :
-        pair/global sont consommés même quand le budget clé est plein, tandis
-        qu'un rejet pair/global n'ajoute rien.
+        Aucun budget n'est consommé sur rejet par défaut : le chemin
+        authentifié évalue la clé en premier et refuse sans consommer
+        ``auth_peer`` ni global (M-02). ``consume_on_reject`` reste une option
+        explicite, inutilisée par le middleware actuel.
         """
         buckets: list[tuple[str, int, _Bucket | None]] = []
         full: tuple[_Bucket, int] | None = None
@@ -198,20 +213,19 @@ class RateLimiter:
 
         Le nom de bucket d'une clé est son empreinte HMAC, jamais la clé brute.
         """
-        specs: list[tuple[str, int]] = [
-            ("global", self._global_limit),
-            (f"peer:{peer}", self._per_peer),
-        ]
+        # Les requêtes sans clé valide ont leur propre budget : un flot
+        # anonyme ne peut pas épuiser le budget des clients authentifiés
+        # (audit M-02).
         if key_hash is not None:
-            specs.append((f"key:{key_hash}", self._per_key))
-
+            # Une clé fournie n'entre jamais dans les budgets anonymes (M-02) :
+            # chemin authentifié key + auth_peer + global.
+            return self.check_authenticated(peer, key_hash)
+        specs: list[tuple[str, int]] = [
+            ("anon_global", self._global_limit),
+            (f"anon_peer:{peer}", self._per_peer),
+        ]
         with self._lock:
             return self._evaluate(specs, self._clock())
-
-    def check_key(self, key_hash: str) -> tuple[bool, int]:
-        """Consomme seulement le budget clé après admission pair/global."""
-        with self._lock:
-            return self._evaluate([(f"key:{key_hash}", self._per_key)], self._clock())
 
     def peek(self, peer: str) -> tuple[bool, int]:
         """Contrôle sans consommation des budgets pair/global (rejet précoce).
@@ -223,8 +237,25 @@ class RateLimiter:
         with self._lock:
             now = self._clock()
             for name, limit in (
+                ("anon_global", self._global_limit),
+                (f"anon_peer:{peer}", self._per_peer),
+            ):
+                bucket = self._buckets.get(name)
+                if bucket is None:
+                    continue
+                self._prune_bucket(bucket, now)
+                if bucket.count >= limit:
+                    oldest = bucket.hits[0] if bucket.hits else now
+                    return False, _retry_after(oldest, now, self._window_seconds)
+            return True, 0
+
+    def peek_authenticated(self, peer: str) -> tuple[bool, int]:
+        """Contrôle sans consommation ``auth_peer`` + global authentifié (rejet précoce)."""
+        with self._lock:
+            now = self._clock()
+            for name, limit in (
+                (f"auth_peer:{peer}", self._per_peer),
                 ("global", self._global_limit),
-                (f"peer:{peer}", self._per_peer),
             ):
                 bucket = self._buckets.get(name)
                 if bucket is None:
@@ -236,20 +267,23 @@ class RateLimiter:
             return True, 0
 
     def check_authenticated(self, peer: str, key_hash: str) -> tuple[bool, int]:
-        """Consomme pair/global + clé en une seule section critique.
+        """Consomme clé + ``auth_peer`` + global en une seule section critique.
 
-        Sémantique préservée : pair/global sont consommés même quand le budget
-        clé est plein, sans fenêtre inter-transactions.
+        Le budget clé est évalué en premier : une clé pleine est refusée sans
+        consommer ``auth_peer`` ni global (audit M-02).
         """
         with self._lock:
+            # Budget clé évalué en premier : une clé pleine est refusée sans
+            # consommer le budget global des clients authentifiés. Le budget
+            # par pair authentifié (distinct de ``anon_peer``) empêche N clés
+            # valides depuis une même IP de contourner ``per_peer``.
             return self._evaluate(
                 [
-                    ("global", self._global_limit),
-                    (f"peer:{peer}", self._per_peer),
                     (f"key:{key_hash}", self._per_key),
+                    (f"auth_peer:{peer}", self._per_peer),
+                    ("global", self._global_limit),
                 ],
                 self._clock(),
-                consume_on_reject=frozenset({"global", f"peer:{peer}"}),
             )
 
     def clear(self) -> None:
@@ -309,20 +343,24 @@ class SqliteRateLimiter:
         conn.execute("DELETE FROM rate_limit_hits WHERE hit_at <= ?", (cutoff,))
 
     @staticmethod
-    def _count(conn: sqlite3.Connection, name: str, cutoff: float) -> int:
-        """Compte les admissions encore dans la fenêtre pour un budget."""
+    def _count(conn: sqlite3.Connection, name: str, cutoff: float, now: float) -> int:
+        """Compte les admissions encore dans la fenêtre pour un budget.
+
+        Les admissions postérieures à ``now`` (recul d'horloge, audit F-15)
+        sont ignorées : elles ne bloquent pas une requête légitime.
+        """
         row = conn.execute(
-            "SELECT COUNT(*) FROM rate_limit_hits WHERE name = ? AND hit_at > ?",
-            (name, cutoff),
+            "SELECT COUNT(*) FROM rate_limit_hits WHERE name = ? AND hit_at > ? AND hit_at <= ?",
+            (name, cutoff, now),
         ).fetchone()
         return int(row[0]) if row is not None else 0
 
     @staticmethod
-    def _oldest(conn: sqlite3.Connection, name: str, cutoff: float) -> float | None:
+    def _oldest(conn: sqlite3.Connection, name: str, cutoff: float, now: float) -> float | None:
         """Retourne l'horodatage de la plus ancienne admission de la fenêtre."""
         row = conn.execute(
-            "SELECT MIN(hit_at) FROM rate_limit_hits WHERE name = ? AND hit_at > ?",
-            (name, cutoff),
+            "SELECT MIN(hit_at) FROM rate_limit_hits WHERE name = ? AND hit_at > ? AND hit_at <= ?",
+            (name, cutoff, now),
         ).fetchone()
         if row is None or row[0] is None:
             return None
@@ -342,8 +380,12 @@ class SqliteRateLimiter:
         states: list[tuple[str, int, int, float | None]] = []
         full: float | None = None
         for name, limit in specs:
-            count = self._count(conn, name, cutoff)
-            oldest = self._oldest(conn, name, cutoff)
+            count = self._count(conn, name, cutoff, now)
+            oldest = self._oldest(conn, name, cutoff, now)
+            # Recul d'horloge : un horodatage futur ne doit pas prolonger le
+            # blocage au-delà de la fenêtre courante (audit F-15).
+            if oldest is not None and oldest > now:
+                oldest = now
             states.append((name, limit, count, oldest))
             if full is None and count >= limit:
                 full = oldest
@@ -372,26 +414,17 @@ class SqliteRateLimiter:
 
     def check(self, peer: str, key_hash: str | None = None) -> tuple[bool, int]:
         """Consomme une unité de façon atomique entre workers, sans stocker la clé."""
-        specs: list[tuple[str, int]] = [
-            ("global", self._global_limit),
-            (f"peer:{peer}", self._per_peer),
-        ]
+        # Budget anonyme séparé du budget authentifié (audit M-02).
         if key_hash is not None:
-            specs.append((f"key:{key_hash}", self._per_key))
-
+            # Une clé fournie n'entre jamais dans les budgets anonymes (M-02).
+            return self.check_authenticated(peer, key_hash)
+        specs: list[tuple[str, int]] = [
+            ("anon_global", self._global_limit),
+            (f"anon_peer:{peer}", self._per_peer),
+        ]
         with db_session(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             return self._evaluate(conn, specs, self._clock())
-
-    def check_key(self, key_hash: str) -> tuple[bool, int]:
-        """Consomme seulement le budget clé après admission pair/global."""
-        with db_session(self._db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            return self._evaluate(
-                conn,
-                [(f"key:{key_hash}", self._per_key)],
-                self._clock(),
-            )
 
     def peek(self, peer: str) -> tuple[bool, int]:
         """Contrôle sans consommation des budgets pair/global (rejet précoce).
@@ -403,12 +436,32 @@ class SqliteRateLimiter:
             now = self._clock()
             cutoff = now - self._window_seconds
             for name, limit in (
-                ("global", self._global_limit),
-                (f"peer:{peer}", self._per_peer),
+                ("anon_global", self._global_limit),
+                (f"anon_peer:{peer}", self._per_peer),
             ):
-                count = self._count(conn, name, cutoff)
+                count = self._count(conn, name, cutoff, now)
                 if count >= limit:
-                    oldest = self._oldest(conn, name, cutoff)
+                    oldest = self._oldest(conn, name, cutoff, now)
+                    if oldest is not None and oldest > now:
+                        oldest = now
+                    return False, _retry_after(
+                        oldest if oldest is not None else now,
+                        now,
+                        self._window_seconds,
+                    )
+            return True, 0
+
+    def peek_authenticated(self, peer: str) -> tuple[bool, int]:
+        """Contrôle sans consommation ``auth_peer`` + global authentifié (rejet précoce)."""
+        with db_session(self._db_path) as conn:
+            now = self._clock()
+            cutoff = now - self._window_seconds
+            for name, limit in (
+                (f"auth_peer:{peer}", self._per_peer),
+                ("global", self._global_limit),
+            ):
+                if self._count(conn, name, cutoff, now) >= limit:
+                    oldest = self._oldest(conn, name, cutoff, now)
                     return False, _retry_after(
                         oldest if oldest is not None else now,
                         now,
@@ -417,23 +470,23 @@ class SqliteRateLimiter:
             return True, 0
 
     def check_authenticated(self, peer: str, key_hash: str) -> tuple[bool, int]:
-        """Consomme pair/global + clé en une seule transaction ``BEGIN IMMEDIATE``.
+        """Consomme clé + ``auth_peer`` + global en une transaction ``BEGIN IMMEDIATE``.
 
-        Sémantique préservée : pair/global sont consommés même quand le budget
-        clé est plein (une seule transaction au lieu de deux, sans fenêtre
-        inter-transactions ni double verrou d'écriture).
+        Le budget clé est évalué en premier : une clé pleine est refusée sans
+        consommer ``auth_peer`` ni global (audit M-02), sans fenêtre
+        inter-transactions ni double verrou d'écriture.
         """
         with db_session(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            # Budget par pair authentifié conservé (distinct de ``anon_peer``).
             return self._evaluate(
                 conn,
                 [
-                    ("global", self._global_limit),
-                    (f"peer:{peer}", self._per_peer),
                     (f"key:{key_hash}", self._per_key),
+                    (f"auth_peer:{peer}", self._per_peer),
+                    ("global", self._global_limit),
                 ],
                 self._clock(),
-                consume_on_reject=frozenset({"global", f"peer:{peer}"}),
             )
 
     def clear(self) -> None:

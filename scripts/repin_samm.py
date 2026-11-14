@@ -35,7 +35,7 @@ import os
 import re
 import shutil
 import stat
-import subprocess
+import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -100,7 +100,7 @@ def _git(*args: str, cwd: Path) -> tuple[int, str]:
     if executable is None:
         return 1, ""
     try:
-        fini = subprocess.run(  # noqa: S603 — arguments fixes, aucun shell
+        fini = subprocess.run(  # noqa: S603 — arguments fixes, aucun shell  # nosec B603
             (executable, *args),
             cwd=cwd,
             capture_output=True,
