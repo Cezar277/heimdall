@@ -12,6 +12,8 @@ from support.git_repo import GitRepo
 from test_cli_hook import FAKE_AWS_KEY, _git, _run
 from typer.testing import CliRunner
 
+import heimdall.cli.hook as hook_module
+from heimdall.cli.hook import HookError, apply_and_restage, assert_no_unstaged_changes
 from heimdall.cli.main import app
 from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess, trusted_git_path
@@ -188,6 +190,114 @@ def test_system_git_search_does_not_inherit_path(monkeypatch: pytest.MonkeyPatch
         assert "/opt/homebrew/bin" in search
         assert "/usr/local/bin" in search
         assert "/run/current-system/sw/bin" in search
+
+
+@pytest.mark.parametrize("value", ["index.lock", "next-index-123.lock", "index", ""])
+def test_remediation_refuses_an_effective_index_before_applying(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.commit_all("base")
+    index = git_repo.root / ".git/index"
+    selected = git_repo.root / ".git" / value if value else None
+    if selected is not None and selected != index:
+        shutil.copyfile(index, selected)
+    original_index = index.read_bytes()
+    original_selected = selected.read_bytes() if selected is not None else None
+    monkeypatch.setenv("GIT_INDEX_FILE", str(selected) if selected is not None else "")
+    applied = False
+
+    def apply() -> None:
+        nonlocal applied
+        applied = True
+        git_repo.write("app.py", "x = 2\n")
+
+    with pytest.raises(HookError, match="index Git effectif imposé"):
+        apply_and_restage(git_repo.root, ["app.py"], apply)
+    with pytest.raises(HookError, match="index Git effectif imposé"):
+        assert_no_unstaged_changes(git_repo.root, ["app.py"])
+    with pytest.raises(HookError, match="index Git effectif imposé"):
+        hook_module._restage_paths(git_repo.root, ["app.py"])
+    assert not applied
+    assert (git_repo.root / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert index.read_bytes() == original_index
+    if selected is not None:
+        assert selected.read_bytes() == original_selected
+
+
+@pytest.mark.parametrize("change", ["content", "mtime", "size"])
+def test_selected_index_changed_on_the_same_inode_is_refused(
+    git_repo: GitRepo, change: str
+) -> None:
+    git_repo.write("app.py", "x = 1\n")
+    git_repo.commit_all("base")
+    index = git_repo.root / ".git/index"
+    replacement: bytes | None = None
+    if change == "content":
+        # Deux index valides avec le même état d'extension cache-tree.
+        git_repo.write("app.py", "x = 0\n")
+        git_repo.stage("app.py")
+        original = index.read_bytes()
+        git_repo.write("app.py", "x = 2\n")
+        git_repo.stage("app.py")
+        replacement = index.read_bytes()
+        assert len(replacement) == len(original)
+        index.write_bytes(original)
+    access = GitAccess(git_repo.root, index_file=str(index))
+    before = index.stat()
+    if change == "content":
+        assert replacement is not None
+        index.write_bytes(replacement)
+        # Même inode, même taille et mtime restauré : seul ctime atteste
+        # encore la réécriture. Pas besoin de provoquer un recyclage ext4.
+        os.utime(index, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert index.stat().st_ctime_ns != before.st_ctime_ns
+    elif change == "mtime":
+        os.utime(index, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    else:
+        with index.open("ab") as stream:
+            stream.write(b"changed")
+    assert index.stat().st_ino == before.st_ino
+    with pytest.raises(ToolFailure):
+        access.staged_changes()
+
+
+def test_system_git_masks_an_added_prefix_and_repo_git_is_refused(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    if os.name == "nt":
+        pytest.skip("préfixes POSIX uniquement")
+    system = tmp_path / "system"
+    added = tmp_path / "usr/local/bin"
+    system.mkdir()
+    added.mkdir(parents=True)
+    system_git = system / "git"
+    planted_git = added / "git"
+    for binary in (system_git, planted_git):
+        binary.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        binary.chmod(0o755)
+    real_which = shutil.which
+    monkeypatch.setattr(os, "defpath", str(system))
+
+    def which(command: str, *, path: str) -> str | None:
+        # Simule le préfixe ajouté sans écrire dans le vrai /usr/local/bin.
+        mapped = path.replace("/usr/local/bin", str(added))
+        return real_which(command, path=mapped)
+
+    monkeypatch.setattr(shutil, "which", which)
+    assert hook_module._git_binary(git_repo.root) == str(system_git)
+    assert GitAccess(git_repo.root)._git == str(system_git)
+    # Force le repli vers /usr/local/bin, dont git pointe dans le dépôt.
+    system_git.unlink()
+    planted_git.unlink()
+    repo_git = git_repo.root / "git"
+    repo_git.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    repo_git.chmod(0o755)
+    planted_git.symlink_to(repo_git)
+    with pytest.raises(HookError):
+        hook_module._git_binary(git_repo.root)
+    with pytest.raises(ToolFailure):
+        GitAccess(git_repo.root)
 
 
 def test_linked_worktree_uses_its_own_temporary_index(git_repo: GitRepo, tmp_path: Path) -> None:

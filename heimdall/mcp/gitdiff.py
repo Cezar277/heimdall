@@ -317,7 +317,7 @@ class GitAccess:
 
     def __init__(self, root: Path, *, index_file: str | None = None) -> None:
         self._index_file: Path | None = None
-        self._index_id: tuple[int, int] | None = None
+        self._index_id: tuple[int, int, int, int, int] | None = None
         try:
             self._root = _resolve_root(root)
         except ScanError:
@@ -413,7 +413,10 @@ class GitAccess:
         except (ScanError, OSError, ValueError):
             raise ToolFailure("INTERNAL") from None
         self._index_file = index
-        self._index_id = (metadata.st_dev, metadata.st_ino)
+        self._index_id = (
+            metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns,
+            metadata.st_mtime_ns, metadata.st_size,
+        )
 
     def _environment(self) -> dict[str, str]:
         environment = confined_environment(self._ceiling)
@@ -423,7 +426,10 @@ class GitAccess:
                 metadata = index.lstat()
                 if (
                     not stat.S_ISREG(metadata.st_mode)
-                    or (metadata.st_dev, metadata.st_ino) != self._index_id
+                    or (
+                        metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns,
+                        metadata.st_mtime_ns, metadata.st_size,
+                    ) != self._index_id
                 ):
                     raise ToolFailure("INTERNAL")
             except (ScanError, OSError):

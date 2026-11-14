@@ -541,8 +541,13 @@ def _check_ancestors_private(path: Path) -> None:
         raise HookError from None
 
 
-def _open_repository(root: Path) -> GitAccess:
+def _open_repository(root: Path, *, for_remediation: bool = False) -> GitAccess:
     """Ouvre la racine comme dépôt Git, ou lève une erreur statique."""
+    if for_remediation and "GIT_INDEX_FILE" in os.environ:
+        # La remédiation utilise son propre verrou d'index. Tant qu'elle ne
+        # gère pas les index de commit temporaires (#30/#32), refuser AVANT
+        # le callback plutôt que d'assainir silencieusement le mauvais index.
+        raise HookError("remédiation refusée : index Git effectif imposé")
     try:
         access = GitAccess(root)
         if not access.is_repository():
@@ -836,7 +841,7 @@ def assert_no_unstaged_changes(root: Path, paths: Iterable[str]) -> list[Confine
     choisies. Les chemins sont confinés par :func:`confine` (liens sortants
     et traversées refusés).
     """
-    access = _open_repository(root)
+    access = _open_repository(root, for_remediation=True)
     repository_root = access.root
     _verify_root(access)
     confined = _confined_paths(repository_root, paths)
@@ -995,7 +1000,7 @@ def _restage_paths(
     dedans puis remplacé atomiquement : ni panne médiane ni ``git add``
     concurrent ne laisse l'index réel partiellement modifié.
     """
-    access = _open_repository(root)
+    access = _open_repository(root, for_remediation=True)
     repository_root = access.root
     _verify_root(access)
     confined = _confined_paths(repository_root, paths)

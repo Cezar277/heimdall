@@ -128,6 +128,13 @@ avant de relancer un commit normal.
 La primitive `heimdall.cli.hook.apply_and_restage(root, paths, apply)` est
 fournie pour le moteur de remédiation (#30/#32) :
 
+Si `GIT_INDEX_FILE` est présente, même vide ou égale à l'index par défaut,
+la remédiation refuse en `HookError` **avant** d'appeler `apply()`. La garde
+des modifications non indexées et la primitive interne de ré-indexation
+appliquent le même refus. Le scan du hook continue à utiliser l'index
+effectif validé ; la remédiation des index temporaires reste à intégrer
+avec #30/#32. Ce refus évite d'assainir un autre index que celui du commit.
+
 1. `assert_no_unstaged_changes` vérifie **avant** l'application qu'aucun
    fichier cible n'a de modification non indexée. Sinon la remédiation
    automatique est refusée (`UnstagedChangesError`) : un `git add` après
@@ -225,6 +232,17 @@ Git est cherché dans `os.defpath` puis, sur POSIX, dans `/opt/homebrew/bin`,
 Une installation Nix disponible uniquement dans un profil utilisateur doit
 exposer Git via un de ces chemins système. Un binaire dans le dépôt ou le
 répertoire courant reste refusé.
+
+Pour que ces préfixes constituent une source de confiance indépendante du
+compte qui prépare le commit, leurs répertoires, leurs parents et la cible
+résolue de `git` doivent être inscriptibles uniquement par l'administrateur.
+Cette condition est une exigence de déploiement, pas une vérification
+automatique des permissions par Heimdall. Un Homebrew installé dans un
+préfixe modifiable par l'utilisateur ne fournit pas cette séparation : ce
+compte peut remplacer Git, comme il peut désactiver son hook local. La CI
+doit utiliser sa propre installation Git de confiance. La priorité de
+`os.defpath` et le refus d'un Git résolu dans le dépôt ou le dossier courant
+sont testés avec des préfixes simulés, sans écrire dans les chemins système.
 
 ```sh
 .venv/bin/python -m pytest tests/test_cli_hook.py -v
