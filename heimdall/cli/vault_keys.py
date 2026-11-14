@@ -243,7 +243,13 @@ def _resolve_audit_hmac_key() -> bytes:
     ``ValueError`` (code 2) au lieu d'annoncer à tort une chaîne invalide.
     """
     raw = os.environ.get("HEIMDALL_VAULT_AUDIT_HMAC_KEY")
-    if raw:
+    if raw is not None:
+        # Une variable exportée vide est une erreur explicite (code 2), jamais
+        # un repli silencieux sur la sous-clé dérivée.
+        if not raw:
+            raise ValueError(
+                "clé HMAC d'audit indisponible : HEIMDALL_VAULT_AUDIT_HMAC_KEY est vide."
+            )
         return validate_server_hmac_key(raw)
     try:
         cipher = _resolve_cli_cipher(
@@ -334,6 +340,7 @@ def verify_audit_chain(
             resolved, create=False, hmac_key=_resolve_audit_hmac_key()
         )
         valid, invalid_id = audit_log.verify_chain()
+        legacy = not valid and audit_log.is_legacy_sha256_chain()
         total = audit_log.count()
         pruned = audit_log.pruned_count()
     except ValueError as exc:
@@ -345,6 +352,13 @@ def verify_audit_chain(
     except Exception:
         typer.echo("Erreur : échec de la vérification du journal d'audit.", err=True)
         raise typer.Exit(code=1) from None
+    if legacy:
+        typer.echo(
+            "Erreur : journal d'audit historique SHA-256 (pré-F-16), migration "
+            "requise : archiver la base puis réinitialiser le journal d'audit.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     if not valid:
         typer.echo(
             f"Erreur : chaîne d'audit invalide à l'événement {invalid_id}.",

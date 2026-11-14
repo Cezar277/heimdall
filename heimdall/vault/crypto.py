@@ -847,9 +847,9 @@ def _normalize_master_key(master_key: str | bytes) -> bytearray:
     des octets sont copiés tels quels (utile aux tests et aux appelants qui
     détiennent déjà une clé aléatoire). Le ``bytearray`` retourné appartient à
     l'appelant, qui doit l'effacer après usage (``_zeroize_buffer``). La longueur
-    minimale de 128 bits est une défense en profondeur contre une phrase de passe
-    triviale : Argon2id ralentit l'attaque hors ligne mais ne compense pas une
-    clé maîtresse sans entropie.
+    minimale de 256 bits (``MIN_MASTER_KEY_BYTES``, audit M-11) est une défense
+    en profondeur contre une phrase de passe triviale : Argon2id ralentit
+    l'attaque hors ligne mais ne compense pas une clé maîtresse sans entropie.
     """
     if isinstance(master_key, str):
         if not master_key or not master_key.strip():

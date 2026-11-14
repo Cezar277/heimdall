@@ -197,10 +197,12 @@ class InMemorySecretStore:
         """Numéro de version courant de la KEK gérée par ce store."""
         return self._kek_version
 
-    @property
-    def cipher(self) -> VaultCipher:
-        """Chiffreur actif (accès contrôlé pour les sous-clés serveur)."""
-        return self._cipher
+    def audit_hmac_key(self) -> bytes:
+        """Sous-clé HMAC d'audit du chiffreur actif (moindre privilège, F-16).
+
+        Le chiffreur lui-même (qui porte la KEK) n'est jamais exposé.
+        """
+        return self._cipher.audit_hmac_key()
 
     async def get(self, project: str, env: str, name: str) -> dict[str, str] | None:
         async with self._lock:
@@ -782,10 +784,12 @@ class SqliteSecretStore:
         """Numéro de version courant de la KEK gérée par ce store."""
         return self._kek_version
 
-    @property
-    def cipher(self) -> VaultCipher:
-        """Chiffreur actif (accès contrôlé pour les sous-clés serveur)."""
-        return self._cipher
+    def audit_hmac_key(self) -> bytes:
+        """Sous-clé HMAC d'audit du chiffreur actif (moindre privilège, F-16).
+
+        Le chiffreur lui-même (qui porte la KEK) n'est jamais exposé.
+        """
+        return self._cipher.audit_hmac_key()
 
     def _detect_current_kek_version(self) -> int:
         """Détecte la version KEK maximale persistée dans la base.

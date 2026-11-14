@@ -14,6 +14,7 @@ Preuves SAMM : module + ligne (voir ``docs/t113-samm.md``).
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,8 +27,14 @@ from heimdall.cli.main import app as cli_app
 from heimdall.vault import audit as audit_module
 from heimdall.vault.app import VaultSettings, create_app
 from heimdall.vault.audit import SqliteAuditLog
-from heimdall.vault.crypto import generate_api_key, generate_encryption_key
+from heimdall.vault.crypto import (
+    VaultCipher,
+    generate_api_key,
+    generate_encryption_key,
+    generate_server_hmac_key,
+)
 from heimdall.vault.database import DatabaseUnavailableError, db_session, init_db
+from heimdall.vault.store import InMemorySecretStore, SqliteSecretStore
 
 PEPPER = "t113_pepper_value_0123456789abcdef"
 CANARY_VALUE = "canary-secret-value-t113-never-in-audit"
@@ -669,6 +676,18 @@ class AuditCliTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("clé HMAC d'audit indisponible", result.output)
                 self.assertNotIn("invalide", result.output.replace("indisponible", ""))
 
+    def test_empty_audit_key_env_is_explicit_error_not_derived_fallback(self) -> None:
+        """HEIMDALL_VAULT_AUDIT_HMAC_KEY vide : code 2, jamais repli sur la clé dérivée."""
+        for command in ("verify", "list"):
+            with self.subTest(command=command):
+                result = self.runner.invoke(
+                    cli_app,
+                    ["vault", "audit", command, "--db-path", str(self.db_path)],
+                    env={"HEIMDALL_VAULT_AUDIT_HMAC_KEY": ""},
+                )
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("clé HMAC d'audit indisponible", result.output)
+
     def test_verify_reports_tampering(self) -> None:
         with db_session(self.db_path) as conn:
             conn.execute("UPDATE audit_events SET status_code = 500 WHERE id = 1")
@@ -727,3 +746,54 @@ class AuditCliTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(result.exit_code, 2)
+
+
+class LegacyAuditChainTests(unittest.IsolatedAsyncioTestCase):
+    """Base pré-F-16 (SHA-256 nu) : « migration requise », pas « chaîne invalide »."""
+
+    async def test_legacy_sha256_chain_reports_migration_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            legacy = SqliteAuditLog(db_path, hmac_key=None)
+            await legacy.record(peer="cli", action="GET", target=None, status_code=200)
+            await legacy.record(peer="cli", action="GET", target=None, status_code=401)
+            key = generate_server_hmac_key()
+            current = SqliteAuditLog(db_path, create=False, hmac_key=key.encode())
+            self.assertFalse(current.verify_chain()[0])
+            self.assertTrue(current.is_legacy_sha256_chain())
+            result = CliRunner().invoke(
+                cli_app,
+                ["vault", "audit", "verify", "--db-path", str(db_path)],
+                env={"HEIMDALL_VAULT_AUDIT_HMAC_KEY": key},
+            )
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertIn("migration requise", result.output)
+            self.assertNotIn("chaîne d'audit invalide", result.output)
+
+    async def test_tampered_legacy_chain_is_still_reported_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            legacy = SqliteAuditLog(db_path, hmac_key=None)
+            await legacy.record(peer="cli", action="GET", target=None, status_code=200)
+            with db_session(db_path) as conn:
+                conn.execute("UPDATE audit_events SET status_code = 500 WHERE id = 1")
+            current = SqliteAuditLog(
+                db_path, create=False, hmac_key=generate_server_hmac_key().encode()
+            )
+            self.assertFalse(current.is_legacy_sha256_chain())
+
+
+class StoreLeastPrivilegeTests(unittest.TestCase):
+    """Le store expose la sous-clé d'audit, jamais le chiffreur porteur de la KEK."""
+
+    def test_stores_expose_audit_key_not_cipher(self) -> None:
+        cipher = VaultCipher(os.urandom(32))
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            for store in (InMemorySecretStore(cipher=cipher), SqliteSecretStore(db_path, cipher)):
+                with self.subTest(store=type(store).__name__):
+                    self.assertFalse(hasattr(store, "cipher"))
+                    self.assertEqual(store.audit_hmac_key(), cipher.audit_hmac_key())

@@ -10,7 +10,9 @@ DÉFENSES ET INVARIANTS
   de route, le triplet public ``project/env/name`` et un **empreinte tronquée**
   de la clé (16 caractères hexadécimaux, jamais la clé) sont persistés.
 - **Chaînage par hash** : chaque ligne contient ``previous_hash`` et
-  ``entry_hash`` (SHA-256 d'une charge canonique JSON). Modifier, insérer ou
+  ``entry_hash`` (HMAC-SHA-256 d'une charge canonique JSON, avec la clé
+  ``HEIMDALL_VAULT_AUDIT_HMAC_KEY`` ou à défaut une sous-clé HKDF dédiée du
+  chiffreur ; SHA-256 nu uniquement pour les journaux historiques pré-F-16). Modifier, insérer ou
   supprimer une ligne casse la chaîne ; ``verify_chain()`` localise la première
   ligne invalide. On parle de journal « résistant à l'altération », pas
   « inviolable » : un attaquant qui contrôle toute la base peut recalculer la
@@ -748,6 +750,17 @@ class SqliteAuditLog(AuditLog):
             if not valid:
                 return valid, invalid
             return self._verify_stream(conn, _AUDIT_STREAM_REJECTION)
+
+    def is_legacy_sha256_chain(self) -> bool:
+        """True si le journal est une chaîne SHA-256 historique valide (pré-F-16).
+
+        Permet de distinguer « migration requise » d'une falsification quand
+        la vérification HMAC échoue sur une base créée avant l'audit F-16.
+        """
+        if self._hmac_key is None or self.count() == 0:
+            return False
+        legacy = SqliteAuditLog(self._db_path, create=False, hmac_key=None)
+        return legacy.verify_chain() == (True, None)
 
     def count(self) -> int:
         """Nombre d'événements persistés (diagnostic et tests)."""

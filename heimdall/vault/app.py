@@ -2052,7 +2052,7 @@ def create_app(
     audit_hmac_key = (
         validate_server_hmac_key(effective_settings.audit_hmac_key)
         if effective_settings.audit_hmac_key is not None
-        else app.state.secret_store.cipher.audit_hmac_key()
+        else app.state.secret_store.audit_hmac_key()
     )
     if app.state.storage_backend == "sqlite":
         app.state.audit_log = SqliteAuditLog(
