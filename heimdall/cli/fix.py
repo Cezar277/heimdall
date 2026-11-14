@@ -23,7 +23,7 @@ from heimdall.cli.review import (
 )
 from heimdall.cli.scan import EXIT_CLEAN, EXIT_FINDINGS, ToolFailure, collect
 from heimdall.mcp.paths import PathEscape, confine
-from heimdall.remediation.apply import ApplyError, apply_replacement
+from heimdall.remediation.apply import ApplyError, apply_replacement, cleanup_backup_file
 from heimdall.remediation.env import EnvRemediationError, remediate_environment
 from heimdall.remediation.naming import deduplicate_variable_name, validate_variable_name
 from heimdall.remediation.templates import ReplacementPlan, TemplateError, plan_for_finding
@@ -59,18 +59,21 @@ def _extract_secret_for_finding(
     finding: Finding,
     variable: str,
 ) -> tuple[str, ReplacementPlan] | None:
-    """Extrait le littéral secret sur ``finding.line`` et construit un plan valide."""
+    """Extrait le littéral secret unique sur ``finding.line`` (fail-closed si ambigu)."""
     lines = source.splitlines()
     if not 1 <= finding.line <= len(lines):
         return None
     line_text = lines[finding.line - 1]
-    for _quote, raw_literal in _QUOTED_LITERAL_RE.findall(line_text):
-        try:
-            plan = plan_for_finding(finding, source, raw_literal, variable)
-        except TemplateError:
-            continue
-        if not plan.manual_remediation and plan.before != plan.after:
-            return raw_literal, plan
+    literals = _QUOTED_LITERAL_RE.findall(line_text)
+    if len(literals) != 1:
+        return None
+    _quote, raw_literal = literals[0]
+    try:
+        plan = plan_for_finding(finding, source, raw_literal, variable)
+    except TemplateError:
+        return None
+    if not plan.manual_remediation and plan.before != plan.after:
+        return raw_literal, plan
     return None
 
 
@@ -148,8 +151,9 @@ def run_fix(  # noqa: PLR0913
         if entry is None:
             raise ApplyError
         plan, secret_value = entry
-        apply_replacement(resolved_root, plan, cleanup_backup=True)
+        receipt = apply_replacement(resolved_root, plan, cleanup_backup=False)
         remediate_environment(resolved_root, {plan.variable: secret_value})
+        cleanup_backup_file(resolved_root, receipt)
 
     report = review_proposals(
         proposals,
@@ -157,7 +161,18 @@ def run_fix(  # noqa: PLR0913
         interactive=interactive,
         apply=_apply,
     )
-    remaining = unfixable + sum(1 for outcome in report.outcomes if not outcome.applied)
+    if any(outcome.applied for outcome in report.outcomes):
+        post_scan = collect(
+            root,
+            staged=False,
+            config=config_path,
+            allowlist=Allowlist() if no_allowlist else None,
+            ci=ci,
+            respect_gitignore=not no_gitignore,
+        )
+        remaining = len(post_scan.findings)
+    else:
+        remaining = unfixable + sum(1 for outcome in report.outcomes if not outcome.applied)
     return report, remaining
 
 

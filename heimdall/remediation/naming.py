@@ -206,26 +206,40 @@ EXECUTION_DANGEROUS_ENV_EXACT: Final[frozenset[str]] = DANGEROUS_ENV_EXACT | fro
     }
 )
 
-#: Préfixes bloqués à l'exécution (`heimdall run`) : chargeurs dynamiques,
-#: shells, runtimes et variables internes Heimdall. Autorise AWS_, DOCKER_,
-#: NPM_, GIT_, PIP_, TF_, KUBE_, NODE_ (hors NODE_OPTIONS), etc.
-EXECUTION_DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = (
-    "LD_",
-    "DYLD_",
-    "PYTHON",
-    "BASH_",
-    "PROMPT_",
-    "RUBY",
-    "PERL",
-    "HEIMDALL_",
-    "OPENSSL_",
-    "MALLOC_",
-    "XDG_",
-    "SYSTEMD_",
-    "JAVA_",
-    "JDK_",
-    "_JAVA_",
+#: Variables légitimes autorisées explicitement dans `vault push/pull/run`
+#: malgré l'appartenance de leur préfixe à la denylist LLM/système.
+ALLOWED_EXEC_SECRET_EXACT: Final[frozenset[str]] = frozenset(
+    {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "DOCKER_PASSWORD",
+        "DOCKER_TOKEN",
+        "DOCKER_USERNAME",
+        "DOCKER_REGISTRY_PASSWORD",
+        "NPM_TOKEN",
+        "NPM_AUTH_TOKEN",
+        "GIT_TOKEN",
+        "GITHUB_TOKEN",
+        "GITLAB_TOKEN",
+        "GIT_PASSWORD",
+        "PIP_PASSWORD",
+        "PIP_TOKEN",
+        "KUBE_TOKEN",
+        "KUBE_PASSWORD",
+        "NODE_ENV",
+    }
 )
+
+#: Préfixes de variables de secrets applicatifs autorisés dans `vault push/pull/run`
+#: (ex. `TF_VAR_*`), tandis que les variables de configuration d'outil (`TF_DATA_DIR`,
+#: `TF_CLI_CONFIG_FILE`, `GIT_DIR`, `NODE_PATH`, `AWS_CONFIG_FILE`, etc.) restent bloquées.
+ALLOWED_EXEC_SECRET_PREFIXES: Final[tuple[str, ...]] = ("TF_VAR_",)
+
+#: Préfixes bloqués à l'exécution (`heimdall run`) : reprend la denylist
+#: complète (chargeurs dynamiques, runtimes, redirecteurs d'outils).
+EXECUTION_DANGEROUS_ENV_PREFIXES: Final[tuple[str, ...]] = DANGEROUS_ENV_PREFIXES
 
 
 def is_dangerous_exec_env_var(name: object) -> bool:
@@ -233,6 +247,10 @@ def is_dangerous_exec_env_var(name: object) -> bool:
     if not isinstance(name, str):
         return True
     upper = name.upper()
+    if upper in ALLOWED_EXEC_SECRET_EXACT:
+        return False
+    if any(upper.startswith(prefix) for prefix in ALLOWED_EXEC_SECRET_PREFIXES):
+        return False
     if upper in EXECUTION_DANGEROUS_ENV_EXACT or upper.endswith("_PROXY"):
         return True
     return any(upper.startswith(prefix) for prefix in EXECUTION_DANGEROUS_ENV_PREFIXES)

@@ -13,8 +13,9 @@ from typer.testing import CliRunner
 
 from heimdall.cli.fix import run_fix
 from heimdall.cli.main import app
-from heimdall.cli.review import ReviewReport
+from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
 from heimdall.remediation.apply import apply_replacement
+from heimdall.remediation.env import EnvRemediationError
 from heimdall.remediation.naming import is_dangerous_exec_env_var
 from heimdall.remediation.templates import plan_for_finding
 from heimdall.scanner.finding import Finding
@@ -65,10 +66,53 @@ def test_m08_allows_cloud_and_tool_secret_names(name: str) -> None:
         "NODE_OPTIONS",
         "LD_PRELOAD",
         "BASH_ENV",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "NODE_PATH",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "DOCKER_CONFIG",
+        "NPM_CONFIG_PREFIX",
+        "PIP_FIND_LINKS",
+        "TF_DATA_DIR",
     ],
 )
 def test_m08_blocks_execution_hijack_env_vars(name: str) -> None:
     assert is_dangerous_exec_env_var(name) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "NODE_PATH",
+        "AWS_CONFIG_FILE",
+        "DOCKER_CONFIG",
+        "PIP_FIND_LINKS",
+        "TF_DATA_DIR",
+    ],
+)
+def test_m08_vault_push_and_pull_reject_tool_redirectors(tmp_path: Path, name: str) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"{name}=/tmp/evil\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    runner = CliRunner()
+    with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+        with patch("heimdall.cli.vault_client._init_client") as mock_init:
+            client = MagicMock()
+            client.__enter__.return_value = client
+            mock_init.return_value = client
+            push_res = runner.invoke(
+                app, ["vault", "push", "--project", "demo", "--file", str(env_file)]
+            )
+            assert push_res.exit_code == 2
+            pull_res = runner.invoke(
+                app,
+                ["vault", "pull", "--project", "demo", "--name", name, "--output", str(env_file)],
+            )
+            assert pull_res.exit_code == 1
 
 
 def test_m08_vault_push_allows_aws_secret_access_key(tmp_path: Path) -> None:
@@ -232,12 +276,16 @@ def test_m09_fix_cli_ci_and_interactive_apply_e2e(tmp_path: Path) -> None:
     app_file = tmp_path / "app.py"
     app_file.write_text(f'API_KEY = "{_FAKE_SECRET}"\n', encoding="utf-8")
 
-    # 1. Mode --ci via CLI : rapport seul, aucune écriture, code 1.
+    # 1. Mode --ci via CLI : rapport seul, aucune écriture (mtime/.bak/.env inchangés), code 1.
+    mtime_before = app_file.stat().st_mtime_ns
     runner = CliRunner()
     ci_result = runner.invoke(app, ["fix", str(tmp_path), "--ci", "--json"])
     assert ci_result.exit_code == 1, ci_result.output
     assert _FAKE_SECRET not in ci_result.output
     assert _FAKE_SECRET in app_file.read_text(encoding="utf-8")
+    assert app_file.stat().st_mtime_ns == mtime_before
+    assert not (tmp_path / "app.py.bak").exists()
+    assert not (tmp_path / ".env").exists()
 
     # 2. Mode interactif simulé : validation humaine -> patch + .env + .env.example + .gitignore.
     def _fake_review(proposals, *, ci=False, interactive=None, apply=None, **_kwargs):
@@ -245,6 +293,7 @@ def test_m09_fix_cli_ci_and_interactive_apply_e2e(tmp_path: Path) -> None:
         for prop in proposals:
             if apply is not None:
                 apply(prop)
+            outcomes.append(ReviewOutcome(Choice.VALIDATE, True, 0, prop))
         return ReviewReport(tuple(outcomes), True)
 
     with patch("heimdall.cli.fix.review_proposals", side_effect=_fake_review):
@@ -259,3 +308,39 @@ def test_m09_fix_cli_ci_and_interactive_apply_e2e(tmp_path: Path) -> None:
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     assert "API_KEY=" in (tmp_path / ".env.example").read_text(encoding="utf-8")
     assert ".env" in (tmp_path / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_m09_fix_refuses_ambiguous_multi_literal_line_fail_closed(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S603, S607  # nosec B603, B607
+    app_file = tmp_path / "app.py"
+    original = f'key = "public"; aws = "{_FAKE_SECRET}"\n'
+    app_file.write_text(original, encoding="utf-8")
+
+    runner = CliRunner()
+    res = runner.invoke(app, ["fix", str(tmp_path), "--json"])
+    assert res.exit_code == 1, res.output
+    assert app_file.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".env").exists()
+
+
+def test_m09_fix_preserves_bak_if_env_remediation_fails(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S603, S607  # nosec B603, B607
+    app_file = tmp_path / "app.py"
+    app_file.write_text(f'API_KEY = "{_FAKE_SECRET}"\n', encoding="utf-8")
+
+    def _fake_review(proposals, *, apply=None, **_kwargs):
+        for prop in proposals:
+            if apply is not None:
+                apply(prop)
+        return ReviewReport((), True)
+
+    with patch("heimdall.cli.fix.review_proposals", side_effect=_fake_review):
+        with patch(
+            "heimdall.cli.fix.remediate_environment",
+            side_effect=EnvRemediationError("disk full"),
+        ):
+            runner = CliRunner()
+            res = runner.invoke(app, ["fix", str(tmp_path)])
+
+    assert res.exit_code == 2
+    assert (tmp_path / "app.py.bak").is_file()
