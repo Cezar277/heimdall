@@ -650,6 +650,25 @@ class AuditCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("valide", result.output)
 
+    def test_verify_without_resolvable_key_exits_2_explicitly(self) -> None:
+        """Sans clé d'audit résolvable : code 2 explicite, jamais « chaîne invalide »."""
+        env = {
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY": None,
+            "HEIMDALL_VAULT_KEK": None,
+            "HEIMDALL_VAULT_MASTER_KEY": None,
+            "HEIMDALL_VAULT_KEK_SALT": None,
+        }
+        for command in ("verify", "list"):
+            with self.subTest(command=command):
+                result = self.runner.invoke(
+                    cli_app,
+                    ["vault", "audit", command, "--db-path", str(self.db_path)],
+                    env=env,
+                )
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("clé HMAC d'audit indisponible", result.output)
+                self.assertNotIn("invalide", result.output.replace("indisponible", ""))
+
     def test_verify_reports_tampering(self) -> None:
         with db_session(self.db_path) as conn:
             conn.execute("UPDATE audit_events SET status_code = 500 WHERE id = 1")

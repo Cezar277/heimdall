@@ -869,7 +869,10 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             mock_access = mock_access_cls.return_value
             mock_access.execute.return_value = MagicMock(returncode=1, stdout=b"")
             self.assertIsNone(_get_git_toplevel(link_dir))
-            mock_access_cls.assert_called_once_with(link_dir.parent)
+            # Remontée des ancêtres : le premier cwd est le parent réel du lien.
+            self.assertEqual(mock_access_cls.call_args_list[0].args, (link_dir.parent,))
+            for call in mock_access_cls.call_args_list:
+                self.assertNotEqual(call.args[0], real_dir)
 
     def test_git_helpers_refuse_symlink_output_without_following(self) -> None:
         """Output symlink (fichier ou répertoire) → False fail-closed, git jamais consulté.

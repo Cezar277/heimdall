@@ -1419,6 +1419,52 @@ class VaultRotateCliTests(unittest.TestCase):
         self.assertIn("mode dérivé", res.output)
         self.assertNotIn("échec du déchiffrement avec l'ancienne KEK", res.output)
 
+    def test_cli_rotate_refuses_without_explicit_audit_key(self) -> None:
+        """F-16 fail-closed : sans clé d'audit explicite, la rotation est refusée."""
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY": None,
+        }
+        res = self.runner.invoke(
+            cli_app,
+            ["vault", "rotate-kek", "--db-path", str(self.db_path)],
+            env=env,
+        )
+        self.assertEqual(res.exit_code, 2, res.output)
+        self.assertIn("HEIMDALL_VAULT_AUDIT_HMAC_KEY est obligatoire", res.output)
+        # Rien n'a été réenveloppé : l'ancienne KEK lit toujours le secret.
+        store = SqliteSecretStore(self.db_path, VaultCipher(_OLD_KEK_BYTES))
+        rec = store._get("demo", "dev", "API_KEY")
+        assert rec is not None
+        self.assertEqual(rec["value"], "super_secret_value")
+
+    def test_cli_rotate_keeps_audit_chain_verifiable_with_new_kek(self) -> None:
+        """Rotation puis vérification sous la nouvelle KEK : chaîne toujours valide."""
+        audit_key = generate_server_hmac_key()
+        env = {
+            "HEIMDALL_VAULT_OLD_KEK": _OLD_KEK_B64,
+            "HEIMDALL_VAULT_NEW_KEK": _NEW_KEK_B64,
+            "HEIMDALL_VAULT_AUDIT_HMAC_KEY": audit_key,
+        }
+        for _ in range(2):
+            res = self.runner.invoke(
+                cli_app,
+                ["vault", "rotate-kek", "--db-path", str(self.db_path), "--force"],
+                env=env,
+            )
+            env["HEIMDALL_VAULT_OLD_KEK"], env["HEIMDALL_VAULT_NEW_KEK"] = (
+                env["HEIMDALL_VAULT_NEW_KEK"],
+                env["HEIMDALL_VAULT_OLD_KEK"],
+            )
+            self.assertEqual(res.exit_code, 0, res.output)
+        verify = self.runner.invoke(
+            cli_app,
+            ["vault", "audit", "verify", "--db-path", str(self.db_path)],
+            env={"HEIMDALL_VAULT_AUDIT_HMAC_KEY": audit_key, "HEIMDALL_VAULT_KEK": _OLD_KEK_B64},
+        )
+        self.assertEqual(verify.exit_code, 0, verify.output)
+
     def test_cli_rotate_refuses_hot_server_without_force(self) -> None:
         """Audit M-07 : rotation à chaud refusée, --force explicite l'autorise."""
         env = {

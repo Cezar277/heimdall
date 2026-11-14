@@ -747,15 +747,19 @@ def _get_git_toplevel(path: Path) -> Path | None:
     except OSError:
         is_plain_dir = False
     parent_dir = path if is_plain_dir else path.parent
-    try:
-        access = GitAccess(parent_dir)
-        res = access.execute(("rev-parse", "--show-toplevel"), timeout=_GIT_TIMEOUT_SECONDS)
+    # ``GitAccess`` plafonne la découverte à son répertoire de travail
+    # (``GIT_CEILING_DIRECTORIES``) : depuis un sous-dossier, ``rev-parse``
+    # échoue. On remonte donc les ancêtres jusqu'au premier dépôt trouvé.
+    for candidate in (parent_dir, *parent_dir.parents):
+        try:
+            access = GitAccess(candidate)
+            res = access.execute(("rev-parse", "--show-toplevel"), timeout=_GIT_TIMEOUT_SECONDS)
+        except Exception:  # noqa: S112  # nosec B112
+            continue
         if res.returncode == 0:
             top = res.stdout.decode("utf-8", errors="replace").strip()
             if top:
                 return Path(top)
-    except Exception:  # noqa: S110  # nosec B110
-        pass
     return None
 
 

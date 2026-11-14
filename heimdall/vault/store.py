@@ -532,7 +532,7 @@ class InMemorySecretStore:
             record["status"] = target
             if target == "rote":
                 # Efface la valeur et la DEK : un retour en base à ``vaulte``
-                # ne peut pas ressusciter l'ancien secret (audit F-03).
+                # ne peut pas restituer l'ancien secret via l'API (audit F-03).
                 record["encrypted_value"] = ""
                 record["encrypted_dek"] = None
             journal = self._transitions.get(project)

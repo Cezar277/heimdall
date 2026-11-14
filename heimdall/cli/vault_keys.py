@@ -236,8 +236,12 @@ def revoke_key(
     typer.echo(f"Clé API {key_id} révoquée : elle n'authentifie plus aucune requête.")
 
 
-def _resolve_audit_hmac_key() -> bytes | None:
-    """Résout la clé HMAC du journal d'audit (env dédiée ou chiffreur configuré)."""
+def _resolve_audit_hmac_key() -> bytes:
+    """Résout la clé HMAC du journal d'audit (env dédiée ou chiffreur configuré).
+
+    Jamais de repli silencieux sur SHA-256 nu : sans clé résolvable, lève
+    ``ValueError`` (code 2) au lieu d'annoncer à tort une chaîne invalide.
+    """
     raw = os.environ.get("HEIMDALL_VAULT_AUDIT_HMAC_KEY")
     if raw:
         return validate_server_hmac_key(raw)
@@ -251,7 +255,10 @@ def _resolve_audit_hmac_key() -> bytes | None:
             server_hmac_key=os.environ.get("HEIMDALL_VAULT_SERVER_HMAC_KEY"),
         )
     except ValueError:
-        return None
+        raise ValueError(
+            "clé HMAC d'audit indisponible : définir HEIMDALL_VAULT_AUDIT_HMAC_KEY "
+            "ou la KEK du Vault."
+        ) from None
     return cipher.audit_hmac_key()
 
 
@@ -443,9 +450,10 @@ def _vault_server_is_listening() -> bool:
         "porte un canari HMAC. La rotation ne renouvelle pas les DEK : après une\n"
         "compromission de la KEK, un rechiffrement complet des valeurs est nécessaire.\n"
         "Le serveur doit être arrêté (ou --force explicite) pour éviter une rotation\n"
-        "à chaud avec une KEK encore en mémoire dans le processus serveur. Pour un\n"
-        "journal d'audit stable à travers la rotation, définir\n"
-        "HEIMDALL_VAULT_AUDIT_HMAC_KEY (sinon la sous-clé dérivée de la KEK change)."
+        "à chaud avec une KEK encore en mémoire dans le processus serveur (garde\n"
+        "best-effort : sonde TCP sur $HEIMDALL_VAULT_PORT, pas un verrou ; préférer un\n"
+        "arrêt supervisé). $HEIMDALL_VAULT_AUDIT_HMAC_KEY est obligatoire et doit être\n"
+        "la même avant et après la rotation, sinon la chaîne d'audit est invérifiable."
     ),
 )
 def rotate_kek_command(
@@ -495,6 +503,16 @@ def rotate_kek_command(
             raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
         if target_version is not None:
             validate_kek_version(target_version, label="Le numéro de version cible")
+        # Fail-closed (F-16) : sans clé d'audit explicite, la sous-clé dérivée
+        # de la KEK change à la rotation et casse la vérification de la chaîne.
+        raw_audit_key = os.environ.get("HEIMDALL_VAULT_AUDIT_HMAC_KEY")
+        if not raw_audit_key:
+            raise ValueError(
+                "HEIMDALL_VAULT_AUDIT_HMAC_KEY est obligatoire pour la rotation de la "
+                "KEK : sans clé d'audit explicite, la chaîne d'audit deviendrait "
+                "invérifiable après la rotation."
+            )
+        audit_key = validate_server_hmac_key(raw_audit_key)
     except ValueError as exc:
         typer.echo(f"Erreur : {exc}", err=True)
         raise typer.Exit(code=2) from None
@@ -531,7 +549,6 @@ def rotate_kek_command(
         raise typer.Exit(code=1)
 
     try:
-        audit_key = _resolve_audit_hmac_key() or new_cipher.audit_hmac_key()
         audit_log = SqliteAuditLog(resolved, hmac_key=audit_key)
         asyncio.run(
             audit_log.record(

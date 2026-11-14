@@ -7,8 +7,6 @@ from collections.abc import Iterator
 
 import pytest
 
-from heimdall.vault.crypto import generate_server_hmac_key
-
 
 @pytest.fixture(autouse=True)
 def _heimdall_env_test(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -20,6 +18,12 @@ def _heimdall_env_test(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEIMDALL_ENV", "test")
     # Clé HMAC dédiée au journal d'audit (audit F-16) : partagée par l'app et
     # la CLI dans un même run de tests.
+    # Import paresseux : certains jobs CI (modèle de sécurité) n'installent pas
+    # les dépendances Vault (argon2) et n'ont pas besoin de cette clé.
+    try:
+        from heimdall.vault.crypto import generate_server_hmac_key  # noqa: PLC0415
+    except ImportError:
+        return
     monkeypatch.setenv("HEIMDALL_VAULT_AUDIT_HMAC_KEY", generate_server_hmac_key())
 
 

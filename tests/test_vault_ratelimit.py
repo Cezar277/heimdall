@@ -160,6 +160,51 @@ class SlidingWindowMemoryTests(unittest.TestCase):
         self.assertLessEqual(len(limiter._buckets), 3)
 
 
+class AuthenticatedPeerAndClockTests(unittest.TestCase):
+    """Budget par pair authentifié (M-02) et recul d'horloge mémoire (F-15)."""
+
+    def _limiters(self, tmp: str, clock: object) -> list[RateLimiter | SqliteRateLimiter]:
+        kwargs = {
+            "per_key": 100,
+            "per_peer": 2,
+            "global_limit": 100,
+            "window_seconds": 10,
+            "clock": clock,
+        }
+        return [
+            RateLimiter(**kwargs),  # type: ignore[arg-type]
+            SqliteRateLimiter(Path(tmp) / "vault.db", **kwargs),  # type: ignore[arg-type]
+        ]
+
+    def test_distinct_keys_from_one_peer_share_the_peer_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for limiter in self._limiters(tmp, lambda: 1000.0):
+                with self.subTest(backend=type(limiter).__name__):
+                    self.assertTrue(limiter.check_authenticated("10.0.0.1", "k1")[0])
+                    self.assertTrue(limiter.check_authenticated("10.0.0.1", "k2")[0])
+                    self.assertFalse(limiter.check_authenticated("10.0.0.1", "k3")[0])
+                    # Un autre pair n'est pas affecté.
+                    self.assertTrue(limiter.check_authenticated("10.0.0.2", "k3")[0])
+
+    def test_clock_rollback_ignores_future_hits_and_bounds_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [1000.0]
+            for limiter in self._limiters(tmp, lambda: now[0]):
+                with self.subTest(backend=type(limiter).__name__):
+                    now[0] = 1000.0
+                    self.assertTrue(limiter.check_authenticated("10.0.0.9", "k")[0])
+                    self.assertTrue(limiter.check_authenticated("10.0.0.9", "k")[0])
+                    self.assertFalse(limiter.check_authenticated("10.0.0.9", "k")[0])
+                    now[0] = 1000.0 - 3600.0
+                    allowed, retry = limiter.check_authenticated("10.0.0.9", "k")
+                    self.assertTrue(allowed)
+                    self.assertEqual(retry, 0)
+                    self.assertTrue(limiter.check_authenticated("10.0.0.9", "k")[0])
+                    allowed, retry = limiter.check_authenticated("10.0.0.9", "k")
+                    self.assertFalse(allowed)
+                    self.assertLessEqual(retry, 10)
+
+
 class SlidingWindowSqliteTests(unittest.TestCase):
     def test_sqlite_budget_is_not_doubled_at_a_fixed_window_boundary(self) -> None:
         """La fenêtre glissante est aussi exacte avec le backend partagé SQLite."""
@@ -289,6 +334,10 @@ class SlidingWindowSqliteTests(unittest.TestCase):
             )
             self.assertTrue(limiter.check("127.0.0.1", "key")[0])
             now[0] = 1000.0 - 3600.0
+            # Les admissions « futures » sont ignorées : pas de blocage à tort.
+            allowed, retry = limiter.check("127.0.0.1", "key")
+            self.assertTrue(allowed)
+            self.assertEqual(retry, 0)
             allowed, retry = limiter.check("127.0.0.1", "key")
             self.assertFalse(allowed)
             self.assertLessEqual(retry, 10)

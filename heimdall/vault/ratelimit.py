@@ -74,7 +74,12 @@ class _Bucket:
 
 
 def _retry_after(oldest_hit: float, now: float, window_seconds: int) -> int:
-    """Délai entier avant l'expiration de la plus ancienne admission."""
+    """Délai entier avant l'expiration de la plus ancienne admission.
+
+    Recul d'horloge (audit F-15) : un horodatage futur est ramené à ``now``,
+    donc le délai ne dépasse jamais la fenêtre, sur les deux backends.
+    """
+    oldest_hit = min(oldest_hit, now)
     return max(
         1,
         min(
@@ -118,6 +123,10 @@ class RateLimiter:
         cutoff = now - self._window_seconds
         while bucket.hits and bucket.hits[0] <= cutoff:
             bucket.hits.popleft()
+        # Recul d'horloge (audit F-15) : les admissions « futures » ne
+        # comptent plus, sinon elles bloqueraient à tort jusqu'à une fenêtre.
+        while bucket.hits and bucket.hits[-1] > now:
+            bucket.hits.pop()
 
     def _existing_bucket(self, name: str, now: float) -> _Bucket | None:
         """Retourne le bucket existant après purge, sans jamais en créer.
@@ -259,10 +268,13 @@ class RateLimiter:
         """
         with self._lock:
             # Budget clé évalué en premier : une clé pleine est refusée sans
-            # consommer le budget global des clients authentifiés.
+            # consommer le budget global des clients authentifiés. Le budget
+            # par pair authentifié (distinct de ``anon_peer``) empêche N clés
+            # valides depuis une même IP de contourner ``per_peer``.
             return self._evaluate(
                 [
                     (f"key:{key_hash}", self._per_key),
+                    (f"auth_peer:{peer}", self._per_peer),
                     ("global", self._global_limit),
                 ],
                 self._clock(),
@@ -325,20 +337,24 @@ class SqliteRateLimiter:
         conn.execute("DELETE FROM rate_limit_hits WHERE hit_at <= ?", (cutoff,))
 
     @staticmethod
-    def _count(conn: sqlite3.Connection, name: str, cutoff: float) -> int:
-        """Compte les admissions encore dans la fenêtre pour un budget."""
+    def _count(conn: sqlite3.Connection, name: str, cutoff: float, now: float) -> int:
+        """Compte les admissions encore dans la fenêtre pour un budget.
+
+        Les admissions postérieures à ``now`` (recul d'horloge, audit F-15)
+        sont ignorées : elles ne bloquent pas une requête légitime.
+        """
         row = conn.execute(
-            "SELECT COUNT(*) FROM rate_limit_hits WHERE name = ? AND hit_at > ?",
-            (name, cutoff),
+            "SELECT COUNT(*) FROM rate_limit_hits WHERE name = ? AND hit_at > ? AND hit_at <= ?",
+            (name, cutoff, now),
         ).fetchone()
         return int(row[0]) if row is not None else 0
 
     @staticmethod
-    def _oldest(conn: sqlite3.Connection, name: str, cutoff: float) -> float | None:
+    def _oldest(conn: sqlite3.Connection, name: str, cutoff: float, now: float) -> float | None:
         """Retourne l'horodatage de la plus ancienne admission de la fenêtre."""
         row = conn.execute(
-            "SELECT MIN(hit_at) FROM rate_limit_hits WHERE name = ? AND hit_at > ?",
-            (name, cutoff),
+            "SELECT MIN(hit_at) FROM rate_limit_hits WHERE name = ? AND hit_at > ? AND hit_at <= ?",
+            (name, cutoff, now),
         ).fetchone()
         if row is None or row[0] is None:
             return None
@@ -358,8 +374,8 @@ class SqliteRateLimiter:
         states: list[tuple[str, int, int, float | None]] = []
         full: float | None = None
         for name, limit in specs:
-            count = self._count(conn, name, cutoff)
-            oldest = self._oldest(conn, name, cutoff)
+            count = self._count(conn, name, cutoff, now)
+            oldest = self._oldest(conn, name, cutoff, now)
             # Recul d'horloge : un horodatage futur ne doit pas prolonger le
             # blocage au-delà de la fenêtre courante (audit F-15).
             if oldest is not None and oldest > now:
@@ -427,9 +443,9 @@ class SqliteRateLimiter:
                 ("anon_global", self._global_limit),
                 (f"anon_peer:{peer}", self._per_peer),
             ):
-                count = self._count(conn, name, cutoff)
+                count = self._count(conn, name, cutoff, now)
                 if count >= limit:
-                    oldest = self._oldest(conn, name, cutoff)
+                    oldest = self._oldest(conn, name, cutoff, now)
                     if oldest is not None and oldest > now:
                         oldest = now
                     return False, _retry_after(
@@ -444,9 +460,9 @@ class SqliteRateLimiter:
         with db_session(self._db_path) as conn:
             now = self._clock()
             cutoff = now - self._window_seconds
-            count = self._count(conn, "global", cutoff)
+            count = self._count(conn, "global", cutoff, now)
             if count >= self._global_limit:
-                oldest = self._oldest(conn, "global", cutoff)
+                oldest = self._oldest(conn, "global", cutoff, now)
                 if oldest is not None and oldest > now:
                     oldest = now
                 return False, _retry_after(
@@ -465,10 +481,12 @@ class SqliteRateLimiter:
         """
         with db_session(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            # Budget par pair authentifié conservé (distinct de ``anon_peer``).
             return self._evaluate(
                 conn,
                 [
                     (f"key:{key_hash}", self._per_key),
+                    (f"auth_peer:{peer}", self._per_peer),
                     ("global", self._global_limit),
                 ],
                 self._clock(),

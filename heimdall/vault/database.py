@@ -801,8 +801,9 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
         conn = sqlite3.connect(resolved, timeout=SQLITE_TIMEOUT_SECONDS, factory=_SessionConnection)
 
     conn.execute("PRAGMA foreign_keys = ON;")
-    # Les lignes supprimées ne doivent pas rester lisibles dans les pages
-    # libres du fichier SQLite (audit F-05).
+    # Les pages libérées sont écrasées (audit F-05). Ce n'est pas un effacement
+    # forensique : l'ancienne valeur peut subsister dans le WAL/journal ou des
+    # pages non réécrites ; il faut un VACUUM hors ligne + rotation des DEK.
     conn.execute("PRAGMA secure_delete = ON;")
     conn.row_factory = sqlite3.Row
     return conn
@@ -2113,7 +2114,7 @@ def transition_secret(  # noqa: PLR0913
         timestamp = get_iso_timestamp()
         if target == "rote":
             # Efface la valeur et la DEK : un retour en base à ``vaulte`` ne
-            # peut pas ressusciter l'ancien secret (audit F-03).
+            # peut pas restituer l'ancien secret via l'API (audit F-03).
             cursor = conn.execute(
                 "UPDATE secrets SET status = ?, updated_at = ?, "
                 "encrypted_value = '', encrypted_dek = NULL "

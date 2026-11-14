@@ -13,8 +13,8 @@ Périmètre : rate-limiting local, journal d'audit, rotation KEK, clé maîtress
 | **M-07 / F-04** — rotation KEK avec HMAC, erreurs distinctes, à chaud, auditée | `vault_keys.py` charge `HEIMDALL_VAULT_SERVER_HMAC_KEY`, distingue `KekHmacContinuityError`, refuse un serveur qui écoute (`--force` explicite), journalise `VAULT KEK ROTATE`, et documente que les DEK ne sont pas renouvelées. Tests : `test_vault_kek_rotation.py::VaultRotateCliTests::test_cli_rotate_with_server_hmac_key_keeps_canary`, `::test_cli_rotate_without_server_hmac_key_distinguishes_canary_error`, `::test_cli_rotate_refuses_hot_server_without_force`, `::test_cli_rotate_writes_an_audit_event`. |
 | **M-11** — clé maîtresse complexe | `crypto.py` exige 32 octets, 8 symboles distincts, aucune période répétitive et une entropie minimale ; `generate_master_key()` fournit la voie sûre. Tests : `test_vault_kek_derivation.py::test_minimum_master_key_length_is_256_bits`, `::test_invalid_master_key_is_rejected`. |
 | **M-13** — production par défaut, valeurs inconnues refusées | `auth.py` retourne `production` si `HEIMDALL_ENV` est absent et refuse toute valeur hors `production/prod/dev/test`. Tests : `test_vault_auth.py::test_heimdall_env_defaults_to_production_and_rejects_unknown`, `test_vault_app.py` (pepper/docs/auth en production). |
-| **F-03** — valeur et DEK effacées à `rote` | `store.py` et `database.py` vident `encrypted_value` et `encrypted_dek` lors de la transition vers `rote` ; un retour manuel à `vaulte` ne ressuscite pas l'ancienne valeur. Tests : `test_vault_transitions_api.py::test_rote_clears_encrypted_value_and_dek`, `::test_rote_value_cannot_be_resurrected_by_a_status_flip`. |
-| **F-05** — `secure_delete` | `database.py` exécute `PRAGMA secure_delete = ON` sur chaque connexion. Test : `test_vault_db.py::test_secure_delete_is_enabled_by_default`. |
+| **F-03** — valeur et DEK effacées à `rote` | `store.py` et `database.py` vident `encrypted_value` et `encrypted_dek` lors de la transition vers `rote` ; un retour manuel à `vaulte` ne restitue pas l'ancienne valeur via l'API. Ce n'est pas un effacement forensique : l'ancienne valeur peut subsister dans le WAL/journal ou des pages non réécrites jusqu'à un `VACUUM` hors ligne et une rotation des DEK. Tests : `test_vault_transitions_api.py::test_rote_clears_encrypted_value_and_dek`, `::test_rote_value_cannot_be_resurrected_by_a_status_flip`. |
+| **F-05** — `secure_delete` | `database.py` exécute `PRAGMA secure_delete = ON` sur chaque connexion (écrase les pages libérées, sans garantie forensique sur le WAL). Test : `test_vault_db.py::test_secure_delete_is_enabled_by_default`. |
 | **F-06** — Host et limites uvicorn | `app.py` ajoute `TrustedHostMiddleware` (loopback, `testserver` en mode test) et borne `limit_concurrency`/`timeout_keep_alive`. Tests : `test_vault_app.py::test_run_server_passes_hardened_uvicorn_arguments`, `::test_run_server_passes_tls_files_in_production`. |
 | **F-15** — recul d'horloge | `ratelimit.py` borne un horodatage futur à `now` avant de calculer `Retry-After`. Test : `test_vault_ratelimit.py::SlidingWindowSqliteTests::test_sqlite_clock_rollback_bounds_retry_after`. |
 
@@ -29,3 +29,13 @@ Périmètre : rate-limiting local, journal d'audit, rotation KEK, clé maîtress
 - Les tests de non-régression Vault, audit, TLS, transitions et rotation
   passent localement ; la suite complète conserve uniquement l'échec
   pré-existant `test_env_path_with_spaces_properly_quoted_in_git_rm_command`.
+
+## Corrections de revue
+
+| Point | Preuve |
+| --- | --- |
+| **F-16** — continuité d'audit à la rotation KEK | `vault rotate-kek` refuse (code 2) sans `HEIMDALL_VAULT_AUDIT_HMAC_KEY` explicite, commune avant et après la rotation. Tests : `test_vault_kek_rotation.py::test_cli_rotate_refuses_without_explicit_audit_key`, `::test_cli_rotate_keeps_audit_chain_verifiable_with_new_kek`. |
+| **F-16** — pas de repli SHA-256 silencieux | `vault audit list/verify` sortent en code 2 « clé HMAC d'audit indisponible » sans clé résolvable. Test : `test_vault_audit.py::test_verify_without_resolvable_key_exits_2_explicitly`. |
+| **M-02** — budget par pair authentifié | `check_authenticated` consomme `key`, `auth_peer:<ip>` (distinct de `anon_peer`) et `global`. Test : `test_vault_ratelimit.py::test_distinct_keys_from_one_peer_share_the_peer_budget`. |
+| **F-15** — recul d'horloge, deux backends | Admissions futures ignorées du comptage, `Retry-After` borné à la fenêtre. Test : `test_vault_ratelimit.py::test_clock_rollback_ignores_future_hits_and_bounds_retry`. |
+| Garde anti-rotation à chaud | Sonde TCP best-effort sur `HEIMDALL_VAULT_PORT`, pas un verrou : préférer un arrêt supervisé. |
