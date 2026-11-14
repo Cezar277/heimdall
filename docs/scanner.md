@@ -306,13 +306,12 @@ jamais 0 ni 1.
 - Les binaires ne sont pas analysés : ils produisent une trace et un rapport
   partiel, ou un refus avec `--strict`. Aucun verdict de couverture complète
   ne doit être déduit du code 0 seul ; voir [E-01](scanner-tolerance.md).
-- La jointure multi-ligne est bornée à 4 Kio. Une affectation ou un jeton de
-  longueur candidate sur une des lignes provoque `ScanError` lorsque cette
-  borne est dépassée, sans exception par fournisseur. Les jetons individuels
-  > 4096 caractères provoquent également `ScanError`, jamais un skip.
+- La jointure multiligne est bornée à 4 Kio et les jetons individuels à
+  4096 caractères. Le dépassement est tracé dans le rapport tolérant ; le
+  mode strict conserve les refus conservateurs sans exception par fournisseur.
 - Le motif de signature JWT accepte une charge de 64 Kio et un en-tête de
-  1 Kio, mais le moteur refuse désormais tout jeton lexical > 4096 caractères
-  (`ScanError`, y compris pour un JWT). Les autres
+  1 Kio, mais un jeton lexical > 4096 caractères est écarté avec trace ou
+  refusé en mode strict, y compris pour un JWT. Les autres
   préfixes AWS (au-delà de `AKIA`/`ASIA`/`ABIA`/`ACCA`) ne sont pas couverts.
 - Seules les familles de jetons Slack publiées par Slack sont couvertes
   (`xoxb-`, `xoxp-`, `xapp-`, `xwfp-`, `xoxe.` et les historiques `xoxa-`,

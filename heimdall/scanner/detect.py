@@ -872,13 +872,7 @@ class Scanner:
             if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
                 raise ScanError(_SCAN_ERROR)
             if after.st_size > self._max_file_bytes:
-                # Le collecteur historique autorise déjà ce seul skip
-                # explicitement, même en mode strict (cold start).
-                if self._strict and self._skipped_files is not None:
-                    self._skipped_files.append(relative)
-                    self._skipped.append(ScanSkip(relative, "too_large"))
-                else:
-                    self._skip(relative, "too_large")
+                self._skip(relative, "too_large")
                 return None, 0
             remaining = self._max_file_bytes + 1
             while remaining > 0:

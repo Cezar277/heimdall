@@ -40,7 +40,7 @@ Références :
 ## Utilisation
 
 ```sh
-heimdall scan [CHEMIN]              # arbre de travail (mode strict)
+heimdall scan [CHEMIN]              # arbre de travail (tolérance tracée)
 heimdall scan --staged [CHEMIN]     # blobs ajoutés ou modifiés dans l'index
 heimdall scan --ci [CHEMIN]         # mode CI headless (verdict = code de sortie)
 heimdall scan --ci --diff REF [CHEMIN]  # merge-base(REF, HEAD)...HEAD
@@ -123,20 +123,16 @@ bibliothèque (`Scanner`, #22), hors contrat hook/CI.
 
 | Périmètre | Ce qui est analysé | Exclusions |
 | --- | --- | --- |
-| `working-tree` (défaut) | l'arbre de travail, en **mode strict** | **base VCS** (`.git/`, `.hg/`, `.svn/` : métadonnées, pas du contenu) et **entrées non suivies ignorées par un `.gitignore` du dépôt**. Un fichier **suivi** est toujours lu, même si un motif le matche (`git add -f`). Tout le reste (`vendor/`, `node_modules/`, `.venv/`, lockfiles, sorties de build **non ignorés**) est lu par contenu ; binaire connu, lien ou fichier illisible est **refusé** (code 2), jamais sauté |
-| `staged` (`--staged`) | le contenu **indexé** de chaque fichier ajouté ou modifié | **aucune exclusion de chemin** : `vendor/`, `third_party/`, `package-lock.json`, `.gitignore`… sont analysés ; un binaire connu est **refusé** (code 2), jamais sauté |
-| `diff` (`--ci --diff REF`) | les blobs **ajoutés ou modifiés** entre `merge-base(REF, HEAD)` et `HEAD` (trois points) | **aucune exclusion de chemin** ; suppressions et gitlinks ignorés (aucun blob à scanner), binaire connu **refusé** (code 2) |
+| `working-tree` (défaut) | l'arbre de travail, avec exclusions de contenu tracées | base VCS et entrées non suivies ignorées par `.gitignore`. Les fichiers suivis sont examinés même s'ils correspondent à un motif Git ; binaires, liens et contenus hors borne sont tracés ou refusés avec `--strict`. Les erreurs de lecture restent en code 2. |
+| `staged` (`--staged`) | le contenu indexé de chaque fichier ajouté ou modifié | aucune exclusion de chemin ; exclusions de contenu tracées ou refusées avec `--strict` |
+| `diff` (`--ci --diff REF`) | les blobs ajoutés ou modifiés entre `merge-base(REF, HEAD)` et `HEAD` | aucune exclusion de chemin ; suppressions et gitlinks ignorés ; exclusions de contenu tracées ou refusées avec `--strict` |
 
-« Aucune exclusion de **chemin** » ne veut pas dire « aucune exclusion du
-tout » : un contenu dont la signature magique **et** la majorité sont
-binaires (PNG, PDF, ZIP, ELF…) n'a pas de texte à analyser. Dans **les trois
-périmètres**, ce contenu est **refusé** (`ScanError`), ce qui rend le verdict
-propre impossible (code 2) : un secret placé dans un commentaire PNG ou une
-archive ne devient jamais un faux négatif silencieux. Un contenu inconnu
-(NUL + texte) reste fail-closed de la même façon : jamais sauté sur simple
-suffixe.
+« Aucune exclusion de chemin » n'implique pas une analyse des binaires ou
+des portions hors borne. Dans les trois périmètres, ces exclusions ont une
+trace explicite et rendent le rapport partiel ; `--strict` les refuse en
+code 2. Un contenu inconnu n'est jamais ignoré sur son simple suffixe.
 
-Le mode strict est une correction issue de la revue de #165 (point HIGH) :
+L'absence d'exclusions nominales est issue de la revue de #165 (point HIGH) :
 la politique #59 excluait `vendor/`, `node_modules/` et les lockfiles, donc un
 secret posé dans `vendor/evil.py` n'était **jamais** signalé. Un secret y est
 un secret : aucun nom de fichier ou de répertoire de contenu n'exclut plus rien,
@@ -407,18 +403,11 @@ document si `count != len(findings)` (contrainte explicitée dans la
 
 ## Limites connues (honnêtes)
 
-- Le contenu **binaire** n'est pas analysé : un secret placé dans un
-  commentaire PNG ou une archive n'est pas détecté. Dans **les trois
-  périmètres**, un binaire du périmètre est **refusé** (`ScanError`) et la
-  CLI sort en **2** (verdict propre impossible) : il n'existe plus de `0`
-  propre pour un contenu binaire non analysable. C'est une impossibilité
-  technique documentée, pas une exclusion de chemin. En mode arbre, une
-  entrée **non suivie et ignorée** par Git est écartée avant lecture et
-  comptée dans `git_ignored` : elle ne peut pas être commitée sans devenir
-  suivie, donc sans être scannée. Les répertoires et fichiers textuels de
-  `node_modules/`, `vendor/`, `.venv/`, `build/`, `dist/`, `target/` ou
-  `htmlcov/` sont, eux, scannés dans les trois périmètres dès qu'ils sont
-  suivis ou non ignorés.
+- Le contenu binaire n'est pas analysé : il est signalé comme exclusion
+  dans un rapport partiel, ou refusé avec `--strict`. Les noms de fichiers
+  ne cachent pas de contenu textuel ; les fichiers suivis et les textes
+  non ignorés restent analysés. Un code 0 seul ne prouve pas l'absence de
+  secrets dans les contenus écartés.
 - La fenêtre multi-ligne reste bornée à 4 Kio : un secret coupé par un
   retour à la ligne au-delà de cette borne n'est pas recherché.
 - Le mode `--staged` analyse l'**index**, pas l'historique : un secret déjà

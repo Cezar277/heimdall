@@ -92,13 +92,20 @@ def test_size_skip_preserves_confined_readers_and_file_count(
     monkeypatch.setattr(os, "read", bounded_read)
     skipped: list[str] = []
     scanner = Scanner(
-        oversized if single else tmp_path, max_file_bytes=32, skipped_files=skipped, strict=True
+        oversized if single else tmp_path, max_file_bytes=32, skipped_files=skipped, strict=False
     )
     assert scanner.scan() == []
     assert skipped == ["large.txt" if single else "nested/large.txt"]
     assert scanner.files_scanned == (0 if single else 1)
     with pytest.raises(ScanError):
         Scanner(oversized if single else tmp_path, max_file_bytes=32, strict=True).scan()
+    with pytest.raises(ScanError):
+        Scanner(
+            oversized if single else tmp_path,
+            max_file_bytes=32,
+            skipped_files=[],
+            strict=True,
+        ).scan()
 
 
 def _stripe(seed: str = "stripe") -> str:
