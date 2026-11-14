@@ -329,8 +329,122 @@ class ForbiddenPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(server.is_forbidden_path(path))
 
+    def test_credential_files_are_forbidden(self) -> None:
+        """F-09 : `.netrc`/variantes sans point, clés SSH/PEM, configs Docker/Kube, etc."""
+        for path in (
+            ".netrc",
+            "home/.netrc",
+            "netrc",
+            "a/netrc",
+            "_netrc",
+            ".pgpass",
+            "postgres/.pgpass",
+            "pgpass",
+            "a/pgpass",
+            "id_rsa",
+            "id_rsa.pub",
+            "sub/id_ed25519",
+            "server.pem",
+            "certs/SERVER.PEM",
+            "private.key",
+            ".npmrc",
+            "npmrc",
+            ".pypirc",
+            "pypirc",
+            "credentials",
+            "aws/credentials",
+            "credential",
+            "a/credential",
+            "credentials.env",
+            "credentials.db",
+            "credentials.sqlite",
+            "credentials.sqlite3",
+            "credentials.store",
+            "credential.json",
+            "a/credential.json",
+            "credential.env",
+            "credential.bak.json",
+            ".docker/config.json",
+            "sub/.docker/config.json",
+            ".kube/config",
+            "prod/.kube/config",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(server.is_forbidden_path(path))
+
+    def test_credential_backup_variants_are_forbidden(self) -> None:
+        """F-09 (revue) : une copie de sauvegarde reste un fichier de credentials.
+
+        L'égalité exacte laissait lire `.netrc.backup`, `credentials.json` ou
+        `.docker/config.json.bak` ; le masquage E-03 n'est pas une autorisation.
+        """
+        for path in (
+            ".netrc.backup",
+            ".netrc.backup.old",
+            ".netrc~",
+            ".pgpass.bak",
+            ".pgpass~",
+            ".npmrc-backup",
+            ".npmrc.bak",
+            ".pypirc.old",
+            "credentials.json",
+            "credentials.yaml",
+            "credentials.txt",
+            "credentials.bak",
+            "credentials.bak.json",
+            "credentials.old.json",
+            "credentials-backup.json",
+            "credentials~.json",
+            "credentials-backup",
+            "credentials_backup",
+            "credentials-old",
+            "credentials_old",
+            ".docker/config.json.bak",
+            ".docker/config.json.old",
+            ".kube/config.bak",
+            ".kube/config.old",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(server.is_forbidden_path(path))
+
+    def test_pem_key_backup_variants_are_forbidden(self) -> None:
+        """Revue (MEDIUM) : `server.pem.bak` reste une clé privée.
+
+        Le suffixe était testé sur le nom brut, donc toute copie
+        (`server.pem.bak`, `private.key.old`, `server.pem~`) passait. Le nom
+        est désormais normalisé avant comparaison ; `server.pem.txt` reste
+        une ressemblance inoffensive et lisible.
+        """
+        for path in (
+            "server.pem.bak",
+            "server.pem.backup",
+            "server.pem~",
+            "server.pem.old",
+            "private.key.old",
+            "private.key.bak",
+            "private.key~",
+            "certs/server.pem.save",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(server.is_forbidden_path(path))
+        self.assertFalse(server.is_forbidden_path("server.pem.txt"))
+
     def test_lookalikes_are_allowed(self) -> None:
-        for path in (".gitignore", ".github/a", "git/x", "my.env/file", "a.envb/c"):
+        for path in (
+            ".gitignore",
+            ".github/a",
+            "git/x",
+            "my.env/file",
+            "a.envb/c",
+            "netrc.txt",
+            "credentials.md",
+            "credential.md",
+            "server.pem.txt",
+            "keys/readme.txt",
+            ".docker/config.yml",
+            ".kube/other",
+            ".npmrc.example",
+        ):
             with self.subTest(path=path):
                 self.assertFalse(server.is_forbidden_path(path))
 
@@ -1333,7 +1447,6 @@ class MaskingRulesTests(unittest.TestCase):
         for line in (
             'MYDATA="x1"',
             'key = "ab"',
-            'TOKEN="x1',
             "TOKEN=",
         ):
             with self.subTest(line=line):

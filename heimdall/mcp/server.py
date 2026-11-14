@@ -27,6 +27,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import stat
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -68,6 +69,98 @@ DEFAULT_MAX_LINES: Final[int] = 200
 MAX_SANITIZE_LINES: Final[int] = 400
 MAX_FILE_BYTES: Final[int] = 1024 * 1024
 MAX_CONTENT_CHARS: Final[int] = 100_000
+
+# Fichiers de credentials refusés par `sanitize_file` (audit F-09), en plus de
+# `.git/` et `.env*` : un faux positif de lecture coûte un fichier de contexte,
+# une lecture de `.netrc`/clé privée coûte un secret envoyé au LLM.
+_FORBIDDEN_FILENAMES: Final[frozenset[str]] = frozenset(
+    {
+        ".netrc",
+        "netrc",
+        "_netrc",
+        ".pgpass",
+        "pgpass",
+        ".npmrc",
+        "npmrc",
+        ".pypirc",
+        "pypirc",
+        "credentials",
+        "credential",
+    }
+)
+
+# Suffixes qu'un éditeur ou une rotation ajoute à une copie de fichier.
+# Retirés en boucle avant comparaison : `server.pem.bak` → `server.pem`,
+# `.netrc.backup` → `.netrc`, `credentials-backup` → `credentials`. Les
+# extensions de documentation (`.md`, `.txt`) n'en font pas partie :
+# `credentials.md` et `server.pem.txt` restent lisibles.
+_BACKUP_SUFFIXES: Final[tuple[str, ...]] = (
+    "~",
+    ".bak",
+    ".backup",
+    ".old",
+    ".orig",
+    ".save",
+    ".swp",
+    "-bak",
+    "-backup",
+    "-old",
+    "_bak",
+    "_backup",
+    "_old",
+)
+
+# Même vocabulaire en position d'INFIXE, devant l'extension finale :
+# `credentials.bak.json` → `credentials.json`. Le lookahead exige une
+# extension finale, sinon `.bak` serait déjà traité comme suffixe.
+_BACKUP_INFIX: Final[re.Pattern[str]] = re.compile(
+    "(?:"
+    + "|".join(re.escape(suffix) for suffix in sorted(_BACKUP_SUFFIXES, key=len, reverse=True))
+    + r")(?=\.[^.]+$)"
+)
+
+# `credentials` / `credential` sont des noms nus trop généraux pour un
+# préfixe large : `credentials.md` / `credential.md` est de la documentation.
+# On énumère les extensions qui, elles, contiennent des credentials (configs,
+# mais aussi coffres locaux `.env`, `.db`, `.sqlite*`, `.store`) ; les
+# suffixes de sauvegarde sont retirés avant comparaison par
+# `_strip_backup_suffixes`.
+_CREDENTIALS_VARIANTS: Final[tuple[str, ...]] = tuple(
+    f"{stem}{suffix}"
+    for stem in ("credentials", "credential")
+    for suffix in (
+        ".json",
+        ".yaml",
+        ".yml",
+        ".txt",
+        ".ini",
+        ".toml",
+        ".cfg",
+        ".conf",
+        ".xml",
+        ".env",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".store",
+    )
+)
+
+# Clés privées et trousseaux : le suffixe suffit, quelle que soit la casse.
+_FORBIDDEN_SUFFIXES: Final[tuple[str, ...]] = (".pem", ".key")
+
+# Préfixes de clés SSH : `id_rsa.pub` est public, mais le sur-blocage est
+# bénin et une clé privée sans suffixe ne doit pas passer par variante.
+_FORBIDDEN_PREFIXES: Final[tuple[str, ...]] = ("id_rsa", "id_ed25519")
+
+# Configurations qui contiennent des identifiants de registre / cluster.
+# Comparaison par préfixe du nom : `.docker/config.json.bak` et
+# `.kube/config.old` sont des copies de la même configuration, pas des
+# homonymes inoffensifs.
+_FORBIDDEN_CONFIG_PATHS: Final[tuple[tuple[str, str], ...]] = (
+    (".docker", "config.json"),
+    (".kube", "config"),
+)
 
 
 # `O_NONBLOCK` n'existe pas sur Windows : repli à 0 (aucun effet) pour
@@ -297,34 +390,17 @@ def _clean_trailing_marker(text: str) -> str:
     return text
 
 
-def _masked_line(raw_text: str) -> tuple[str, bool]:
-    """Masque une ligne ENTIÈRE, puis la borne à ``MAX_LINE_CHARS``.
-
-    L'ordre est la garantie, pas un détail : sans fenêtre préalable, le
-    guillemet fermant d'une valeur citée est toujours vu par
-    ``mask_text`` et la valeur toujours remplacée. La fenêtre
-    ``MAX_LINE_CHARS + 500`` qui précédait coupait en deux toute valeur
-    citée dont le guillemet fermant tombait au-delà : ``SECRET="`` + 5000
-    caractères + ``"`` ne matchait alors plus ``_QUOTED_ASSIGNMENT``, et le
-    préfixe de 2000 caractères de la valeur partait en clair au LLM
-    (régression de masquage prouvée par exécution en revue, puis épinglée
-    par ``tests/test_mcp_read_diff.py`` et ``tests/test_mcp_units.py``).
-
-    Coût : ``mask_text`` voit au plus ce qu'il voyait déjà — la fenêtre
-    couvrait ``MAX_LINE_CHARS + 500`` par ligne, le fichier entier est
-    plafonné à 1 Mo (``MAX_FILE_BYTES``) et le diff lu à ``max_bytes``,
-    motifs linéaires sans ReDoS. C'est le coût déjà acté en ADR-003 §7.
-
-    Le masquage ne peut que raccourcir une ligne (une valeur entière devient
-    un marqueur), donc masquer d'abord ne fait jamais franchir une borne
-    que la ligne respectait déjà : la troncature ne reste due que là où elle
-    l'était (grosse ligne de remplissage, valeur citée > 20 000 caractères
-    — borne ADR-003 §7 —, fichier minifié).
-    """
-    masked, _ = masking.mask_text(raw_text)
+def _bound_line(masked: str) -> tuple[str, bool]:
+    """Borne une ligne déjà masquée à ``MAX_LINE_CHARS`` sans couper de marqueur."""
     if len(masked) <= gitdiff.MAX_LINE_CHARS:
         return masked, False
     return _clean_trailing_marker(masked[: gitdiff.MAX_LINE_CHARS]), True
+
+
+def _masked_line(raw_text: str) -> tuple[str, bool]:
+    """Masque une ligne ENTIÈRE, puis la borne à ``MAX_LINE_CHARS``."""
+    masked, _ = masking.mask_text(raw_text)
+    return _bound_line(masked)
 
 
 def _tools(root: Path) -> dict[str, Callable[..., str]]:
@@ -393,10 +469,10 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
             raise errors.ToolFailure("FORBIDDEN_PATH")
         content, total_lines, truncated = _read_extract(confined.absolute, start_line, max_lines)
         pieces: list[str] = []
-        for raw_line in content:
-            masked, cut = _masked_line(raw_line)
+        for masked_line in masking.mask_lines(content):
+            bounded, cut = _bound_line(masked_line)
             truncated = truncated or cut
-            pieces.append(masked)
+            pieces.append(bounded)
         # Borne de contenu du contrat (100 000 caractères) : elle s'applique
         # APRÈS masquage, pour les mêmes raisons que read_diff — et la coupe
         # est nettoyée comme les lignes : sans cela, un marqueur à cheval
@@ -429,8 +505,42 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
     return {"ping": ping, "read_diff": read_diff, "sanitize_file": sanitize_file}
 
 
+def _strip_backup_suffixes(segment: str) -> str:
+    """Retire les suffixes et infixes de sauvegarde, en boucle.
+
+    `.netrc.backup.old` doit redevenir `.netrc` et `credentials.bak.json`
+    doit redevenir `credentials.json` ; une seule passe laisserait
+    `.netrc.backup` (pas égal à `.netrc`) ou le `.bak` en position d'infixe.
+    La borne de longueur évite de réduire un nom à la chaîne vide.
+    """
+    while True:
+        without_infix = _BACKUP_INFIX.sub("", segment)
+        if without_infix != segment:
+            segment = without_infix
+            continue
+        for suffix in _BACKUP_SUFFIXES:
+            if segment.endswith(suffix) and len(segment) > len(suffix):
+                segment = segment[: -len(suffix)]
+                break
+        else:
+            return segment
+
+
+def _is_forbidden_segment(segment: str) -> bool:
+    """Un segment (déjà en minuscules) désigne-t-il un fichier interdit ?"""
+    normalized = _strip_backup_suffixes(segment)
+    return (
+        normalized == ".git"
+        or normalized.startswith(".env")
+        or normalized in _FORBIDDEN_FILENAMES
+        or normalized in _CREDENTIALS_VARIANTS
+        or normalized.endswith(_FORBIDDEN_SUFFIXES)
+        or normalized.startswith(_FORBIDDEN_PREFIXES)
+    )
+
+
 def is_forbidden_path(relative: str) -> bool:
-    """Segments que le contrat interdit de lire : ``.git/`` et ``.env*``.
+    """Segments que le contrat interdit de lire, élargis par l'audit F-09.
 
     Décidé sur le chemin **canonique** renvoyé par la garde, pas sur
     l'entrée : ``./.git`` ou ``sous/.././.git`` arrivent ici déjà
@@ -445,14 +555,25 @@ def is_forbidden_path(relative: str) -> bool:
     l'exige le contrat (`.env*`, §4.2) : sur-bloquer `.envelope` est un
     faux positif bénin assumé, laisser passer `.env-backup` serait un
     contournement de l'interdit (sauvegardes !).
+
+    F-09 : la liste couvre aussi les fichiers de credentials usuels
+    (`.netrc`/`netrc`/`_netrc`, `.pgpass`/`pgpass`, `id_rsa`, `*.pem`, `*.key`,
+    `.npmrc`/`npmrc`, `.pypirc`/`pypirc`, `.docker/config.json`, `.kube/config`,
+    `credentials`/`credential`) **et leurs variantes de sauvegarde**
+    (`.netrc.backup`, `credentials.json`, `credential.json`, `server.pem.bak`,
+    `private.key.old`, `.docker/config.json.bak`…). Le masquage de E-03 reste
+    une seconde barrière, pas une autorisation de lecture.
     """
-    for segment in relative.split("/"):
-        lowered = segment.lower()
-        if lowered == ".git":
-            return True
-        if lowered.startswith(".env"):
-            return True
-    return False
+    segments = relative.split("/")
+    lowered = [segment.lower() for segment in segments]
+    forbidden_segment = any(_is_forbidden_segment(segment) for segment in lowered)
+    forbidden_config = any(
+        _strip_backup_suffixes(segment) == directory
+        and _strip_backup_suffixes(lowered[index + 1]).startswith(basename)
+        for index, segment in enumerate(lowered[:-1])
+        for directory, basename in _FORBIDDEN_CONFIG_PATHS
+    )
+    return forbidden_segment or forbidden_config
 
 
 def _absent_or_internal(error: OSError) -> ToolFailure:
@@ -564,8 +685,9 @@ def _masked_files(entries: list[gitdiff.DiffEntry]) -> tuple[list[dict[str, obje
     for entry in entries:
         added: list[dict[str, object]] = []
         finals: list[str] = []
-        for number, raw_text in entry.lines:
-            masked, cut = _masked_line(raw_text)
+        masked_lines = masking.mask_lines([raw_text for _, raw_text in entry.lines])
+        for (number, _), masked_raw in zip(entry.lines, masked_lines, strict=True):
+            masked, cut = _bound_line(masked_raw)
             truncated = truncated or cut
             added.append({"line": number, "text": masked})
             finals.append(masked)

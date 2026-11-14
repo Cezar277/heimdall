@@ -15,6 +15,7 @@ historique de conversation Ollama.
 import math
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final
 
@@ -34,12 +35,36 @@ REDACTION_MARKER: Final[str] = "<REDACTED:"
 # bornée par sa ligne (1 Mo au plus, `MAX_FILE_BYTES`), et `_looks_like_secret`
 # décide toujours si elle est un secret. Coût mesuré : linéaire, sans
 # backtracking (voir `MaskingPerformanceTests`).
+#
+# Les guillemets autour de la CLÉ sont optionnels : `{"password": "…"}` et
+# `'api_key': '…'` (JSON, YAML, dict Python) ne matchent plus seulement la
+# forme `password = "…"`. Le séparateur `=>` couvre PHP/Ruby.
+#
+# Deux motifs distincts pour la VALEUR, au lieu d'une classe qui excluait les
+# deux types de guillemets : une chaîne entre guillemets doubles peut contenir
+# une apostrophe (`password = "it's-secret-123"`) et inversement
+# (`password = 'say "hi"'`). Un seul motif ne pouvait pas exprimer les deux
+# sans couper la valeur au premier guillemet interne.
+#
+# Le préfixe `(?<![A-Za-z])` évite de relancer le motif à chaque caractère
+# d'une longue valeur (`password = ` + 120 Ko : ~0,45 s → ~0,05 s mesuré).
+# Un nom de clé ne peut pas commencer au milieu d'une suite de lettres ; les
+# formes utiles (`123password`, `_password`, `.password`) restent couvertes
+# car le caractère qui les précède n'est pas une lettre.
 _QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
-    r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
-    r"\s*[:=]\s*"
-    r"(?P<quote>[\"'])"
-    r"(?P<value>(?:[^\"'\\\n]|\\.){4,})"
-    r"(?P=quote)"
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"\s*(?:=>|[:=])\s*"
+    r'"(?P<value>(?:[^"\\\n]|\\.){4,})"'
+)
+
+# Même règle pour une valeur entre guillemets simples, qui peut donc contenir
+# des guillemets doubles (`'say "hi"'`). L'apostrophe interne échappée reste
+# couverte par `\\.` ; une apostrophe non échappée termine la chaîne, comme
+# le veut la syntaxe.
+_SINGLE_QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"\s*(?:=>|[:=])\s*"
+    r"'(?P<value>(?:[^'\\\n]|\\.){4,})'"
 )
 
 # clé = valeur  (shell, export KEY=..., YAML sans guillemets, TOML)
@@ -55,8 +80,8 @@ _QUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 # 1 Mo de valeur dense : linéaire, pas de backtracking (voir
 # `MaskingPerformanceTests`).
 _UNQUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
-    r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
-    r"\s*[:=]\s*"
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"\s*(?:=>|[:=])\s*"
     r"(?P<value>[^\s\"'`,;)}\]]{6,})"
 )
 
@@ -81,11 +106,131 @@ _UNQUOTED_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 # sans guillemet fermant, le motif échoue au lieu de consommer (pas de
 # match partiel qui masquerait du code).
 _EVOCATIVE_SHORT_VALUE: Final[re.Pattern[str]] = re.compile(
-    r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
-    r"\s*[:=]\s*"
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"\s*(?:=>|[:=])\s*"
     r"(?P<quote>[\"']?)"
     r"(?P<value>[^\s\"'`,;)}\]]{1,5})"
     r"(?P=quote)"
+)
+
+# Valeur NON QUOTÉE à nom évocateur, avec espaces et ponctuation :
+# `password = my secret pass phrase 42`, `password=abc,defghijk99`,
+# `DB_PASSWORD: p@ss;word1234`. Les règles précédentes s'arrêtaient au premier
+# espace ou à la première virgule/point-virgule, donc la queue de la valeur
+# partait en clair. Cette règle prend le reste de la ligne jusqu'à un
+# commentaire précédé d'espace (` #`) ou la fin de ligne.
+#
+# Elle est SÉPARÉE et placée après les règles citées : une valeur entre
+# guillemets doit être jugée par la règle citée (intérieur exact, apostrophe
+# interne supportée), pas avalée jusqu'à la fin de ligne. Le filtre
+# `_evocative_unquoted_looks_secret` refuse en plus les annotations de type et
+# les appels de fonction (`api_key: str`, `password = get_password()`) pour ne
+# pas noyer le tri sous les faux positifs.
+_EVOCATIVE_UNQUOTED_VALUE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"\s*(?:=>|[:=])\s*"
+    r"(?P<value>[^\n]+?)(?=[ \t]+#|\n|$)"
+)
+
+# Valeur quotée NON REFERMÉE : `password="hunter2!hunter` (ligne de diff
+# tronquée, coquille, multiligne). Les règles citées exigent le guillemet
+# fermant, et la règle non quotée refuse explicitement les valeurs commençant
+# par un guillemet : le secret partait en clair (revue). Le guillemet ouvrant
+# est exclu du span, la valeur va jusqu'à la fin de ligne ou au commentaire
+# ` #`, et le jugement reste `_looks_like_secret`. Si un guillemet fermant
+# non échappé est trouvé, `_unclosed_quoted_spans` rend la main aux règles
+# citées (pas de double masquage).
+_UNCLOSED_QUOTED_VALUE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z])[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})[\"']?"
+    r"\s*(?:=>|[:=])\s*"
+    r"(?P<quote>[\"'])(?P<value>[^\n]*?)(?=[ \t]+#|\n|$)"
+)
+
+# Balise XML sensible : `<password>…</password>`, `<api_key>…</api_key>`.
+# Le nom de la balise est jugé par `_SECRET_KEY` (voir `_iter_matches`), la
+# valeur masquée est l'intérieur seulement. `[^<]` accepte les sauts de ligne :
+# un XML indenté (`<password>\n  secret\n</password>`) laissait sinon la
+# valeur en clair (revue). Les espaces de bord sont retirés du span pour
+# préserver l'indentation ; un `<` brut dans la valeur sans `>` fermant
+# (`<password>P@ss<wo1234</password>`) est couvert, tandis qu'une vraie balise
+# imbriquée (`<…>`) reste hors périmètre et n'est pas masquée par cette règle.
+_XML_SENSITIVE_ELEMENT: Final[re.Pattern[str]] = re.compile(
+    r"<(?P<tag>[A-Za-z_][A-Za-z0-9_.:\-]{0,63})(?:\s[^<>]*)?>"
+    r"(?P<value>(?:[^<]|<(?![^<>]*>)){1,})"
+    r"</(?P=tag)\s*>",
+    re.IGNORECASE,
+)
+
+# `define('DB_PASSWORD', 'S3cr3tValue99')` (PHP/Ruby). Nom ET valeur peuvent
+# être nus (`define(DB_PASSWORD, S3cr3tValue99)`) : PHP les accepte comme
+# constantes, et la valeur reste un secret. Guillemets optionnels mais
+# symétriques ; le jugement final reste `_looks_like_secret`. Insensible à la
+# casse : les fonctions PHP le sont (`DEFINE(...)` est valide).
+_DEFINE_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
+    r"(?i)define\s*\(\s*(?P<keyquote>[\"']?)"
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
+    r"(?P=keyquote)\s*,\s*"
+    r"(?P<valuequote>[\"']?)"
+    r"(?P<value>(?:[^\\\n]|\\.)*?)"
+    r"(?P=valuequote)\s*\)"
+)
+
+# `.netrc` et directives espace-séparées : `machine github.com login bob
+# password S3cretP4ss`, `api_key …`, `secret …`, `token …`. Le nom n'est pas
+# suivi de `:`/`=`, donc aucune règle d'affectation ne le voyait. Insensible
+# à la casse (`Password`, `API_KEY`), valeur citée (fermée ou non) ou nue
+# couverte. Le jeton doit être en début de ligne ou précédé d'un espace : dans
+# `<password lang="en">`, le nom est collé à `<` et l'attribut `lang=` ne
+# doit pas être pris pour la valeur (revue) ; `(?<!\S)` couvre aussi
+# `<ns:password>` et `data-password`.
+_NETRC_PASSWORD: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?<!\S)(?P<key>password|passwd|pwd|secret|tokens?(?!izer\b)|api[-_.]?key)"
+    r"[ \t]+(?![ \t]*[=:])"
+    r"(?:"
+    r"(?P<quote>[\"'`])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=quote)"
+    r"|[\"'`](?P<unclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
+    r"|(?P<value>[^\s\"'`(){}\[\]][^\s\"']*)(?=\s|$)"
+    r")"
+)
+
+# Option CLI `--password <val>` / `--password=<val>` / `--api-key=…`.
+# La valeur peut être citée (`--password "my secret"`).
+_CLI_SECRET_OPTION: Final[re.Pattern[str]] = re.compile(
+    r"(?<![\w-])--(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})"
+    r"(?:\s*=\s*|\s+)"
+    r"(?:(?P<quote>[\"'])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=quote)"
+    r"|(?P<value>[^\s\"']+))"
+)
+
+# Option CLI à valeur quotée non refermée : `--password "hunter2!hunter`.
+# La branche citée ci-dessus exige le guillemet fermant ; sans cette règle,
+# la valeur partait en clair. Même filtrage de fermeture que
+# `_UNCLOSED_QUOTED_VALUE`.
+_CLI_UNCLOSED_QUOTED_OPTION: Final[re.Pattern[str]] = re.compile(
+    r"(?<![\w-])--(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})"
+    r"(?:\s*=\s*|\s+)"
+    r"(?P<quote>[\"'])(?P<value>[^\n]*?)(?=[ \t]+#|\n|$)"
+)
+
+# `curl -u admin:Sup3rS3cret` : identifiants passés en argument CLI, hors URL.
+# La forme `-u "user:pass"` (guillemets shell autour du couple) et
+# `-u user:"pass"` (mot de passe seul cité) sont usuelles dès qu'un caractère
+# spécial est présent ; seuls `user:pass` nus étaient vus (revue).
+_CLI_USER_PASSWORD: Final[re.Pattern[str]] = re.compile(
+    r"(?<![\w-])-u[ \t]+"
+    r"(?:"
+    # Guillemets shell autour du couple user:pass, refermés.
+    r"(?P<wholequote>[\"'])[^\s:\"']{1,64}:"
+    r"(?P<wholevalue>(?:[^\\\n]|\\.)*?)(?P=wholequote)"
+    # Même forme, guillemet non refermé (ligne tronquée).
+    r"|[\"'][^\s:\"']{1,64}:(?P<wholeunclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
+    # Utilisateur nu, mot de passe cité (fermé puis non refermé).
+    r"|[^\s:\"']{1,64}:"
+    r"(?P<valuequote>[\"'])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=valuequote)"
+    r"|[^\s:\"']{1,64}:[\"'](?P<pwunclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
+    # Utilisateur nu, mot de passe nu.
+    r"|[^\s:\"']{1,64}:(?P<value>[^\s\"']{1,})"
+    r")"
 )
 
 # Authorization: Bearer <jeton>
@@ -194,10 +339,17 @@ _ENV_REFERENCE: Final[re.Pattern[str]] = re.compile(
 )
 
 # Nom de variable évocateur : le masquage est presque toujours légitime.
+#
+# `token(?!izer\b)` n'épargne QUE le faux positif `tokenizer`/`TOKENIZER` :
+# `token(?![a-z])`, essayé d'abord, excluait aussi `tokens`/`TOKENS` — un
+# secret sous une clé au pluriel repartait en clair (régression fail-closed).
+# De même `auth(?!or(?:s|ities|ity)?\b)` épargne `author`, `authors`,
+# `authority`/`authorities` sans toucher `authorization`, `authentication`
+# ni `auth_token`.
 _SECRET_KEY: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(passwd|password|pwd|secret|token|api[-_.]?key|access[-_.]?key|"
-    r"private[-_.]?key|credential|auth|salt|signature|licen[cs]e|bearer|"
-    r"session|cert|webhook|connection[-_.]?string)"
+    r"(?i)(passwd|password|pwd|secret|token(?!izer\b)|api[-_.]?key|access[-_.]?key|"
+    r"private[-_.]?key|credential|authorization|auth(?!or(?:s|ities|ity)?\b)|salt|"
+    r"signature|licen[cs]e|bearer|session|cert|webhook|connection[-_.]?string)"
 )
 
 # Noms GÉNÉRIQUES de second rang : un nom qui se TERMINE par `key`/`pass`/
@@ -330,6 +482,12 @@ MIN_URL_USERINFO_BITS: Final[float] = 3.0
 # ce n'est pas un credential mais une constante (`token = 0`).
 MIN_SHORT_VALUE_LENGTH: Final[int] = 2
 
+# Valeur non quotée évocatrice : sous 6 caractères, la règle longue ou la
+# règle courte s'en charge ; au-delà, plusieurs mots peuvent être une phrase
+# de passe (`correct horse battery staple`).
+MIN_EVOCATIVE_UNQUOTED_LENGTH: Final[int] = 6
+MIN_PASSPHRASE_WORDS: Final[int] = 2
+
 
 def _generic_name_carries_a_secret(key: str, value: str) -> bool:
     """`KEY=`, `PASS=`, `AWS_KEY=` : la valeur vaut-elle un credential ?
@@ -410,6 +568,167 @@ def _short_evocative_looks_secret(key: str, value: str) -> bool:
     if not any(character.isdigit() for character in value):
         return False
     return _SECRET_KEY.search(key) is not None or _generic_name_carries_a_secret(key, value)
+
+
+def _unquoted_name_is_evocative(key: str, value: str) -> bool:
+    """Le nom suffit-il à lui seul, ou faut-il un indice dans la valeur ?"""
+    if _SECRET_KEY.search(key):
+        return True
+    if _generic_name_carries_a_secret(key, value):
+        return True
+    return _GENERIC_SECRET_KEY.search(key) is not None and (
+        len(value.split()) >= MIN_PASSPHRASE_WORDS or any(character in value for character in ",;")
+    )
+
+
+def _unquoted_value_has_credential_signal(value: str) -> bool:
+    """Au moins un signal qui distingue un secret d'un mot de code."""
+    if value.lower().startswith(_KNOWN_PREFIXES):
+        return True
+    if any(character.isdigit() for character in value):
+        return True
+    if any(character in value for character in ",;"):
+        return True
+    return len(value.split()) >= MIN_PASSPHRASE_WORDS
+
+
+def _evocative_unquoted_looks_secret(key: str, value: str) -> bool:
+    """Valeur non quotée à nom évocateur : jusqu'où masquer ?
+
+    Le motif prend le reste de la ligne (espaces, `,`, `;` inclus), mais tout
+    l'espace n'est pas un secret : une annotation de type (`api_key: str`), un
+    appel de fonction (`password = get_password()`) ou un littéral
+    (`session = None`) doivent rester lisibles. On exige donc, en plus d'un
+    nom évocateur, un signal de credential : préfixe connu, chiffre, virgule
+    ou point-virgule, plusieurs mots (phrase de passe) — et on refuse la
+    ponctuation de code (`()[]{}`, `->`). Le commentaire éventuel n'est pas
+    inclus dans la valeur masquée (le motif s'arrête avant ` #`), mais une
+    valeur qui contient un `#` collé est masquée jusqu'au bout : une valeur
+    en trop ne coûte rien, une queue de secret coûte une fuite.
+    """
+    candidate = value.strip()
+    if not candidate:
+        return False
+    significant = candidate.split("#", 1)[0].rstrip()
+    if len(significant) < MIN_EVOCATIVE_UNQUOTED_LENGTH or significant[0] in "\"'":
+        return False
+    if _ENV_REFERENCE.match(significant) or _CODE_LITERAL.match(significant):
+        return False
+    if not _unquoted_name_is_evocative(key, significant):
+        return False
+    if any(character in significant for character in "()[]{}") or "->" in significant:
+        return False
+    return _unquoted_value_has_credential_signal(significant)
+
+
+def _evocative_unquoted_span(match: re.Match[str]) -> _Match:
+    """Span du reste de ligne, espaces de fin exclus."""
+    value = match.group("value").rstrip()
+    start = match.start("value")
+    return _Match(start, start + len(value), _secret_type(match.group("key"), value), len(value))
+
+
+def _unclosed_quoted_spans(match: re.Match[str]) -> list[_Match]:
+    """Valeur après guillemet ouvrant, si la ligne ne referme pas la citation.
+
+    Un guillemet fermant non échappé est cherché dans la valeur (les `\\"`
+    comptent comme échappés). S'il existe, les règles citées s'en chargent et
+    cette règle de rattrapage ne produit aucun span : pas de double masquage
+    ni de commentaire avalé. Sinon, un nom évocateur suffit à masquer jusqu'à
+    la fin de la valeur, commentaire ` #` exclu.
+    """
+    value = match.group("value")
+    quote = match.group("quote")
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == quote:
+            return []
+        index += 1
+    value = value.rstrip()
+    if not value or not _looks_like_secret(match.group("key"), value):
+        return []
+    start = match.start("value")
+    return [_Match(start, start + len(value), _secret_type(match.group("key"), value), len(value))]
+
+
+def _xml_sensitive_spans(match: re.Match[str]) -> list[_Match]:
+    """`<password>…</password>` : seule la valeur intérieure est masquée.
+
+    Les espaces et sauts de ligne de bord sont hors span : un XML indenté
+    garde sa mise en forme, seul le secret est remplacé. Le contenu interne
+    (y compris multiligne) est masqué d'un bloc.
+    """
+    key = match.group("tag")
+    raw = match.group("value")
+    value = raw.strip()
+    if not value or not _looks_like_secret(key, value):
+        return []
+    start = match.start("value") + len(raw) - len(raw.lstrip())
+    return [_Match(start, start + len(value), _secret_type(key, value), len(value))]
+
+
+def _define_spans(match: re.Match[str]) -> list[_Match]:
+    """`define('DB_PASSWORD', '…')` : seule la valeur est masquée."""
+    key = match.group("key")
+    value = match.group("value")
+    if not _looks_like_secret(key, value):
+        return []
+    return [_span_match(match, "value", _secret_type(key, value))]
+
+
+def _netrc_spans(match: re.Match[str]) -> list[_Match]:
+    """`.netrc` et directives espace-séparées : seule la valeur est masquée."""
+    if match.group("quoted") is not None:
+        group = "quoted"
+    elif match.group("unclosed") is not None:
+        group = "unclosed"
+    else:
+        group = "value"
+    key = match.group("key")
+    value = match.group(group)
+    if group == "value" and key.lower() not in {"password", "passwd", "pwd"}:
+        line_start = match.string.rfind("\n", 0, match.start("key")) + 1
+        at_line_start = not match.string[line_start : match.start("key")].strip()
+        has_signal = value.lower().startswith(_KNOWN_PREFIXES) or any(
+            character.isdigit() or character == "*" for character in value
+        )
+        if not at_line_start and not has_signal:
+            return []
+    if _CODE_LITERAL.match(value) or not _looks_like_secret(key, value):
+        return []
+    return [_span_match(match, group, _secret_type(key, value))]
+
+
+def _cli_secret_option_spans(match: re.Match[str]) -> list[_Match]:
+    """`--password <val>` : valeur citée ou nue, jamais le nom de l'option."""
+    group = "quoted" if match.group("quoted") is not None else "value"
+    value = match.group(group)
+    key = match.group("key")
+    if not _looks_like_secret(key, value):
+        return []
+    return [_span_match(match, group, _secret_type(key, value))]
+
+
+def _cli_user_password_spans(match: re.Match[str]) -> list[_Match]:
+    """`-u user:pass` : le mot de passe seul, l'utilisateur reste lisible."""
+    if match.group("wholevalue") is not None:
+        group = "wholevalue"
+    elif match.group("wholeunclosed") is not None:
+        group = "wholeunclosed"
+    elif match.group("quoted") is not None:
+        group = "quoted"
+    elif match.group("pwunclosed") is not None:
+        group = "pwunclosed"
+    else:
+        group = "value"
+    value = match.group(group)
+    if not _looks_like_secret("password", value):
+        return []
+    return [_span_match(match, group, _secret_type("password", value))]
 
 
 def _bare_known_matches(text: str) -> list[_Match]:
@@ -500,6 +819,43 @@ def _iter_matches(text: str) -> list[_Match]:
         ],
         [
             _span_match(match, "value", _secret_type(match.group("key"), match.group("value")))
+            for match in _SINGLE_QUOTED_ASSIGNMENT.finditer(text)
+            if _looks_like_secret(match.group("key"), match.group("value"))
+        ],
+        [
+            span
+            for match in _UNCLOSED_QUOTED_VALUE.finditer(text)
+            for span in _unclosed_quoted_spans(match)
+        ],
+        [
+            span
+            for match in _XML_SENSITIVE_ELEMENT.finditer(text)
+            for span in _xml_sensitive_spans(match)
+        ],
+        [span for match in _DEFINE_ASSIGNMENT.finditer(text) for span in _define_spans(match)],
+        [
+            span
+            for match in _CLI_SECRET_OPTION.finditer(text)
+            for span in _cli_secret_option_spans(match)
+        ],
+        [
+            span
+            for match in _CLI_UNCLOSED_QUOTED_OPTION.finditer(text)
+            for span in _unclosed_quoted_spans(match)
+        ],
+        [
+            span
+            for match in _CLI_USER_PASSWORD.finditer(text)
+            for span in _cli_user_password_spans(match)
+        ],
+        [
+            _evocative_unquoted_span(match)
+            for match in _EVOCATIVE_UNQUOTED_VALUE.finditer(text)
+            if _evocative_unquoted_looks_secret(match.group("key"), match.group("value"))
+        ],
+        [span for match in _NETRC_PASSWORD.finditer(text) for span in _netrc_spans(match)],
+        [
+            _span_match(match, "value", _secret_type(match.group("key"), match.group("value")))
             for match in _UNQUOTED_ASSIGNMENT.finditer(text)
             if _looks_like_secret(match.group("key"), match.group("value"))
         ],
@@ -521,6 +877,22 @@ def _iter_matches(text: str) -> list[_Match]:
     return kept
 
 
+def _render_masked(text: str, matches: list[_Match], *, preserve_newlines: bool) -> str:
+    """Remplace les intervalles retenus par leur marqueur."""
+    pieces: list[str] = []
+    cursor = 0
+    for item in matches:
+        pieces.append(text[cursor : item.start])
+        pieces.append(f"{REDACTION_MARKER}{item.secret_type}:len={item.length}>")
+        if preserve_newlines:
+            newline_count = text[item.start : item.end].count("\n")
+            if newline_count:
+                pieces.append("\n" * newline_count)
+        cursor = item.end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 def mask_text(text: str) -> tuple[str, int]:
     """Remplace les valeurs candidates par ``<REDACTED:type:len=N>``.
 
@@ -532,11 +904,15 @@ def mask_text(text: str) -> tuple[str, int]:
     matches = _iter_matches(text)
     if not matches:
         return text, 0
-    pieces: list[str] = []
-    cursor = 0
-    for item in matches:
-        pieces.append(text[cursor : item.start])
-        pieces.append(f"{REDACTION_MARKER}{item.secret_type}:len={item.length}>")
-        cursor = item.end
-    pieces.append(text[cursor:])
-    return "".join(pieces), len(matches)
+    return _render_masked(text, matches, preserve_newlines=False), len(matches)
+
+
+def mask_lines(lines: Sequence[str]) -> list[str]:
+    """Masque des lignes jointes (motifs multilignes) en gardant leur nombre."""
+    if not lines:
+        return []
+    joined = "\n".join(lines)
+    matches = _iter_matches(joined)
+    if not matches:
+        return list(lines)
+    return _render_masked(joined, matches, preserve_newlines=True).split("\n")
