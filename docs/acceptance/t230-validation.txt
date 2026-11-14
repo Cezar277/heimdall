@@ -1,0 +1,39 @@
+Ticket #230 - Audit E-02 / allowlist
+Branche : 230-audit-e-02-allowlist-scanner-détection-mots-de-passe-urls-jetons-courts-et-contournement-regex-allowlist-_compile_safe_regex
+Code teste : d50d0f6660b79b01d7711c9b9b71f180da87b71e
+Base : 336bc02
+Debian WSL, Python 3.13, environnement local existant.
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t230-final.xml
+4056 passed, 18 skipped, 14 warnings, 7125 subtests passed in 361.50s (0:06:01)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 14 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_issue230_scanner_allowlist.py tests/test_scanner_allowlist.py tests/test_scanner_signatures.py tests/test_scanner_entropy.py tests/test_scanner_detect.py tests/test_trap_acceptance.py -o addopts= -q --tb=short
+776 passed in 13.81s.
+Passe ciblee apres les correctifs d'integration ; le formatage ulterieur
+des trois nouveaux modules ne modifie pas leur logique. Suite complete
+rejouee sur le commit fige ci-dessus.
+
+python -m ruff check heimdall tests scripts docker
+All checks passed!
+python -m mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts docker
+Success: no issues found in 66 source files
+python -m bandit -r heimdall scripts docker -q
+Exit 0, aucune alerte de securite ; avertissements de lecture des anciens
+commentaires nosec et d'un nosec B603 sans alerte correspondante.
+
+Corpus E-02 : positifs=75, negatifs=15, TP=74, FN=1, FP=1.
+Rappel=74/75, precision=74/75, soit 98.6667% sur ce seul corpus.
+Le FN est le positif d'indice 34 (jeton court) ; FP : negatif d'indice 14 (UUID).
+Le test impose rappel >= 0.90 et precision >= 0.95.
+
+Corpus T21 historique, oracle inchange :
+core : TP=10 FP=12 FN=0 precision=10/22 rappel=1.0.
+all : TP=12 FP=12 FN=4 precision=12/24 rappel=0.75.
+Quatre candidats contextuels supplementaires : changeme et mocks nommes
+comme jetons, dans les deux langages. Les deux alertes artificielles par
+jointure de commentaires ont ete corrigees, avec regression dediee.
+Le script historique garde son seuil 0.90 et retourne 1, comme documente.
+
+La CI n'a pas ete declenchee. Aucun merge effectue.
