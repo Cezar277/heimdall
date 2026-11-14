@@ -821,7 +821,7 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
         if is_dangerous_exec_env_var(secret_name):
             typer.echo(
                 "Erreur de sécurité : injection refusée pour la variable système "
-                f"{secret_name[:32]!r}.",
+                f"{preview_name(secret_name)!r}.",
                 err=True,
             )
             raise typer.Exit(code=1)

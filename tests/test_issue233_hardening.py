@@ -28,6 +28,7 @@ from heimdall.remediation.apply import (
 from heimdall.remediation.env import EnvRemediationError
 from heimdall.remediation.naming import (
     _MAX_TAKEN,
+    DANGEROUS_ENV_EXACT,
     DANGEROUS_ENV_PREFIXES,
     EXECUTION_DANGEROUS_ENV_EXACT,
     EXECUTION_DANGEROUS_ENV_PREFIXES,
@@ -404,11 +405,41 @@ def test_f02_vault_pull_and_run_reject_non_vaulte_secret(tmp_path: Path, bad_sta
 
 @pytest.mark.parametrize(
     "name",
-    ["CUSTOM_PROXY", "SSLKEYLOGFILE", "NODE_OPTIONS", *sorted(EXECUTION_DANGEROUS_ENV_EXACT)],
+    ["CUSTOM_PROXY", *sorted(DANGEROUS_ENV_EXACT | EXECUTION_DANGEROUS_ENV_EXACT)],
 )
 def test_m08_denylist_sync_between_remediation_and_exec(name: str) -> None:
     assert is_dangerous_env_var(name) is True
     assert is_dangerous_exec_env_var(name) is True
+
+
+def test_m09_fix_oversized_source_is_unfixable_and_others_still_processed(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S603, S607  # nosec B603, B607
+    large = tmp_path / "large.py"
+    large_original = f'API_KEY = "{_FAKE_SECRET}"\n' + ("# padding\n" * 12_000)
+    large.write_text(large_original, encoding="utf-8")
+    small = tmp_path / "small.py"
+    small.write_text(f'OTHER_KEY = "{_FAKE_SECRET}"\n', encoding="utf-8")
+
+    def _fake_review(proposals, *, apply=None, **_kwargs):
+        outcomes = []
+        for prop in proposals:
+            if apply is not None:
+                apply(prop)
+            outcomes.append(ReviewOutcome(Choice.VALIDATE, True, 0, prop))
+        return ReviewReport(tuple(outcomes), True)
+
+    with patch("heimdall.cli.fix.review_proposals", side_effect=_fake_review):
+        report, remaining = run_fix(tmp_path, interactive=True)
+
+    assert report.applied == 1
+    assert remaining == 1
+    assert large.read_text(encoding="utf-8") == large_original
+    assert 'os.environ["OTHER_KEY"]' in small.read_text(encoding="utf-8")
+    assert not (tmp_path / "small.py.bak").exists()
+    assert not (tmp_path / "large.py.bak").exists()
+    assert "OTHER_KEY=" in (tmp_path / ".env").read_text(encoding="utf-8")
 
 
 def test_m09_fix_refuses_edit_without_writing(tmp_path: Path) -> None:
@@ -604,6 +635,32 @@ def test_m09_fix_preserves_bak_if_env_remediation_fails(tmp_path: Path) -> None:
 
     assert res.exit_code == 2
     assert (tmp_path / "app.py.bak").is_file()
+
+
+def test_m08_vault_run_previews_dangerous_injected_name(tmp_path: Path) -> None:
+    exe = tmp_path / "tool.sh"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o700)
+    evil_name = "HEIMDALL_\nINJECTED_LOG"
+    runner = CliRunner()
+    with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+        with patch("heimdall.cli.vault_client._init_client") as mock_init:
+            client = MagicMock()
+            client.__enter__.return_value = client
+            mock_init.return_value = client
+            with patch(
+                "heimdall.cli.vault_client._pull_secrets_from_vault",
+                return_value={evil_name: "x"},
+            ):
+                with patch("heimdall.cli.vault_client.subprocess.run") as mock_run:
+                    result = runner.invoke(
+                        app,
+                        ["run", "--project", "demo", "--name", "SAFE_VAR", "--", str(exe)],
+                    )
+    assert result.exit_code == 1
+    assert "\nINJECTED_LOG" not in result.stderr
+    assert "HEIMDALL_\\nINJECTED_LOG" in result.stderr
+    mock_run.assert_not_called()
 
 
 def test_m08_pull_secrets_uses_preview_name_on_null_byte_error(

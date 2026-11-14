@@ -187,16 +187,21 @@ def run_fix(  # noqa: PLR0913, PLR0915
             unfixable += 1
             continue
         secret_value, plan = extracted
-        used_names.add(variable)
-        plans_by_finding[finding] = (plan, secret_value)
-        proposals.append(
-            Proposal(
+        try:
+            proposal = Proposal(
                 finding=finding,
                 variable=variable,
                 changes=(TextChange(file=plan.file, before=plan.before, after=plan.after),),
                 secrets=(secret_value,),
             )
-        )
+        except ReviewError:
+            # Fichier trop volumineux pour le rendu de revue (ou secret hors
+            # bornes) : ce finding reste non remédiable, sans avorter le lot.
+            unfixable += 1
+            continue
+        used_names.add(variable)
+        plans_by_finding[finding] = (plan, secret_value)
+        proposals.append(proposal)
 
     def _apply(proposal: Proposal) -> None:
         if root.is_symlink() or root.resolve() != resolved_root:
