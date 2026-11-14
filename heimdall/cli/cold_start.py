@@ -122,7 +122,12 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:
-    """Collect and qualify candidates; Git failures use the scanner contract."""
+    """Collect and qualify candidates; Git failures use the scanner contract.
+
+    La seconde passe ne relit que les fichiers porteurs de findings : un
+    fichier propre modifié entre les deux passes n'est pas relu. Pour un
+    verdict opposable, figer le dépôt ou relancer le cold start.
+    """
     try:
         return _collect_cold_start(
             root, ci=ci, llm=llm, max_file_bytes=max_file_bytes, chat=chat, journal=journal

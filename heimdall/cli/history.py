@@ -19,7 +19,7 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding, validate_relative_path
 from heimdall.scanner.interface import FileTarget, Scanner
-from heimdall.scanner.policy import ScanSkip, prepare_text
+from heimdall.scanner.policy import ScanSkip, SkipReason, prepare_text, skip_file
 from heimdall.scanner.signature_engine import SignatureEngine
 
 BATCH_SIZE = 128
@@ -137,6 +137,13 @@ def collect_history(  # noqa: PLR0913 - explicit scan and qualification options
         raise ScanError("historique non analysable") from None
 
 
+def _scan_skip(file: str, reason: SkipReason) -> ScanSkip:
+    """Construit une trace via la garde unique, en ``ScanError`` statique."""
+    skipped: list[ScanSkip] = []
+    skip_file(file, reason, strict=False, skipped=skipped)
+    return skipped[0]
+
+
 def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan accounting
     root: Path,
     *,
@@ -223,7 +230,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                     if size > max_file_bytes:
                         if strict:
                             raise ScanError("historique non analysable")
-                        cached = ScanSkip(file, "too_large")
+                        cached = _scan_skip(file, "too_large")
                     else:
                         data = access.blob_bytes(oid, timeout=_call_timeout(deadline))
                         if len(data) != size:
@@ -234,7 +241,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                         if text is None:
                             if strict:
                                 raise ScanError("historique non analysable")
-                            content_skips.append(ScanSkip(file, "binary"))
+                            content_skips.append(_scan_skip(file, "binary"))
                             text = ""
                         text = prepare_text(text, file, strict=strict, skipped=content_skips)
                         cache_skips[oid] = tuple((item.reason, item.line) for item in content_skips)

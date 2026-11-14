@@ -129,6 +129,27 @@ def test_long_token_windows_find_a_secret_at_a_window_boundary(repo: GitRepo) ->
     assert SYNTHETIC not in render_json(report)
 
 
+def test_long_token_guarantee_is_bounded_to_the_overlap(repo: GitRepo) -> None:
+    # 3000 > chevauchement 2048 : le secret peut chevaucher deux fenêtres.
+    # Le rapport doit rester incomplet (code 2), jamais propre.
+    secret = fake_token("", 3000)
+    repo.write("notebook.ipynb", "A" * 3500 + secret + "B" * 1500 + "\n")
+    repo.stage("notebook.ipynb")
+    report = collect(repo.root, staged=True, allowlist=Allowlist.empty(), strict=False)
+    assert report.findings == ()
+    assert not report.complete
+    assert any(item.reason == "long_token" for item in report.skipped)
+    payload = json.loads(render_json(report))
+    _scan_validator().validate(payload)
+    assert payload["count"] == 0
+    assert payload["complete"] is False
+    result = CliRunner().invoke(
+        app, ["scan", "--ci", "--staged", "--no-allowlist", "--json", str(repo.root)]
+    )
+    assert result.exit_code == 2
+    assert secret not in result.output
+
+
 def test_concatenated_secret_inside_a_long_token_is_incomplete_not_clean(
     repo: GitRepo,
 ) -> None:

@@ -169,6 +169,11 @@ def test_oversized_blob_reason_is_the_enum_too_large(repo: GitRepo) -> None:
     ]
 
 
+def test_history_skip_uses_the_static_scan_error_contract() -> None:
+    with pytest.raises(ScanError):
+        history._scan_skip("../evil", "too_large")
+
+
 def test_cold_start_size_limit_reports_skip(repo: GitRepo) -> None:
     repo.write("large.txt", "x" * 100)
     report = collect_cold_start(repo.root, ci=True, max_file_bytes=10)
