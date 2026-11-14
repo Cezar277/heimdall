@@ -31,7 +31,7 @@ dependencies = [
   "cryptography==50.0.2",   # Chiffrement au repos du Vault — import confiné à heimdall/vault/crypto.py
   "argon2-cffi==25.1.0",    # Dérivation/hachage côté Vault — import confiné à heimdall/vault/crypto.py
   "httpx==0.28.1",          # Client HTTP (tests ASGI + futur client Vault avec verify obligatoire)
-  "typer==0.27.3",          # CLI `heimdall` (Typer au-dessus de Click)
+  "typer==0.29.0",          # CLI `heimdall` (Typer au-dessus de Click)
   "tomli==2.5.0",            # lecture TOML (détection projet) sur Python 3.10 ; pin inconditionnel pour --require-hashes
 ]
 
