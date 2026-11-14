@@ -1,6 +1,6 @@
 # T229 — Preuves du correctif fail-closed après revue
 
-Ticket #229, audit E-01. Révision de code actuelle : `624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f`.
+Ticket #229, audit E-01. Révision de code actuelle : `7eda6e2bffdebcb7499568e5e816a98a9b2ac974`.
 Base de la branche : `6bbe7da` (intégration de #228 / #240).
 Les premiers permaliens ci-dessous conservent le SHA du correctif critique
 `aba5eb3`. Les durcissements complémentaires sont épinglés séparément sur
@@ -56,6 +56,14 @@ Révision : `624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f`.
 - Le point de revue `collect(Path(""))` nécessite une précision : `Path("") == Path(".")` et `os.fspath(Path("")) == "."`. Il est impossible de distinguer ces valeurs après construction. Le répertoire courant explicite reste valide ; [:335](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/tests/test_scanner_fail_closed.py#L335) fixe cette sémantique, sans prétendre retrouver la chaîne initiale.
 - [`scan.schema.json:15`](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/schemas/scan.schema.json#L15) documente l'absence de `complete` comme `true`, de `skipped_count` comme `0` et de `skipped` comme `[]`, avec les annotations `default`. [:355](https://github.com/Cezar277/heimdall/blob/624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f/tests/test_scanner_fail_closed.py#L355) valide les rapports complets et partiels et l'interprétation de la valeur absente.
 
+## Comptage, repli sans perte et verdict humain
+
+Révision : `7eda6e2bffdebcb7499568e5e816a98a9b2ac974`.
+
+- [`main.py:231`](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/heimdall/cli/main.py#L231) affiche le nombre de traces et celui des fichiers distincts. Le témoin [`test_scanner_fail_closed.py:386`](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/tests/test_scanner_fail_closed.py#L386) vérifie deux traces pour un fichier, `skipped_count == 1` et le résumé stderr.
+- [`exclusions.py:269`](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/heimdall/scanner/exclusions.py#L269) décode CP1252 sans remplacement. Les cinq octets non définis rendent le contenu non analysable : trace `binary`, couverture partielle, jamais un verdict propre. Le témoin [:379](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/tests/test_scanner_fail_closed.py#L379) couvre les cinq octets ; la charge `cp1252_split` de [:59](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/tests/test_scanner_fail_closed.py#L59) vérifie le code 2 sur arbre, index, diff et historique. La propriété n'est pas la reconstruction d'un secret altéré.
+- [`scan.py:1052`](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/heimdall/cli/scan.py#L1052) termine le rapport partiel sans finding par « ANALYSE PARTIELLE : ne pas déployer (code 2). » Le témoin [:396](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/tests/test_scanner_fail_closed.py#L396) vérifie la dernière ligne et le code réel.
+
 ## Validation
 
 Le correctif critique avait été validé par **3925 tests**, 18 ignorés et
@@ -68,14 +76,23 @@ Les 14 avertissements existants concernent les tests de sauvegardes de
 remédiation. Aucun code ni test n'a changé après ce rejeu ; seuls les
 documents de preuve ont été mis à jour ensuite pour cette révision `2f60301`.
 
-La passe ciblée du dernier durcissement `624f8d7` passe : **309 tests**, en
+La passe ciblée du durcissement précédent `624f8d7` passe : **309 tests**, en
 6,56 secondes, avec treize nouveaux cas. Ruff, MyPy et Bandit passent. La
 suite complète, rejouée après ce dernier commit de code, passe : **3948 tests,
 6911 sous-tests, 18 ignorés**, sans échec ni erreur, en **336,212 secondes**
 (rapport JUnit). Aucun code ni test n'a changé après ce rejeu.
 
 Transcription : [acceptance/t229-validation.txt](acceptance/t229-validation.txt).
-Rapport JUnit final : `/home/nathan/heimdall-t229-decoder-root-final.xml`.
+Rapport JUnit de `624f8d7` : `/home/nathan/heimdall-t229-decoder-root-final.xml`.
+La révision `7eda6e2` passe la sélection ciblée : **294 tests en 15,11 s**,
+dont onze nouveaux cas. Le rejeu complet après le commit de code passe :
+**3959 tests, 6911 sous-tests, 18 ignorés**, en **339,68 s**. Les 14
+avertissements existants concernent les sauvegardes de remédiation.
+Ruff, MyPy (57 fichiers) et Bandit passent ; Bandit conserve ses avertissements
+de lecture des anciens commentaires `nosec`, sans alerte de sécurité.
+Rapport JUnit final : `/home/nathan/heimdall-t229-report-decoding-final.xml`.
+Aucun code ni test n'a changé après ce rejeu ; seuls les documents de preuve
+ont été mis à jour.
 Les anciennes passes archivées correspondent à l'état initial de la PR et
 ne constituent pas une preuve de cette correction fail-closed.
 
