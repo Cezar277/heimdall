@@ -894,3 +894,33 @@ class InMemoryAuditListStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({e["status_code"] for e in rejection}, {401})
         with self.assertRaises(ValueError):
             log.list_events(stream="other")
+
+
+class PreM03HistoryStreamTests(unittest.IsolatedAsyncioTestCase):
+    """Historique pré-M-03 : chaîne unique conservée dans ``access``, sans backfill."""
+
+    async def test_legacy_single_chain_stays_verifiable_after_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "vault.db"
+            init_db(db_path)
+            key = generate_server_hmac_key().encode()
+            log = SqliteAuditLog(db_path, hmac_key=key)
+            # Avant M-03 : une seule chaîne, rejets compris.
+            with patch.object(audit_module, "_REJECTION_STATUS_CODES", frozenset()):
+                for status in (200, 401, 200, 429, 200):
+                    await log.record(peer="cli", action="GET", target=None, status_code=status)
+            with db_session(db_path) as conn:
+                SqliteAuditLog._ensure_stream_column(conn)
+                streams = {
+                    str(row[0])
+                    for row in conn.execute("SELECT DISTINCT stream FROM audit_events")
+                }
+            self.assertEqual(streams, {"access"})
+            self.assertEqual(log.verify_chain(), (True, None))
+            # Un reclassement des anciens rejets casserait la chaîne : preuve
+            # que l'absence de backfill est le seul choix sûr.
+            with db_session(db_path) as conn:
+                conn.execute(
+                    "UPDATE audit_events SET stream = 'rejection' WHERE status_code IN (401, 429)"
+                )
+            self.assertFalse(log.verify_chain()[0])

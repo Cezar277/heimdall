@@ -495,7 +495,17 @@ class SqliteAuditLog(AuditLog):
 
     @staticmethod
     def _ensure_stream_column(conn: Any) -> None:
-        """Ajoute ``audit_events.stream`` aux bases créées avant l'audit M-03."""
+        """Ajoute ``audit_events.stream`` aux bases créées avant l'audit M-03.
+
+        Pas de backfill volontaire : avant M-03, accès et rejets formaient une
+        seule chaîne (chaque ``previous_hash`` pointe sur l'événement
+        précédent, quel que soit son statut). Reclasser les anciens 401/429
+        dans le flux ``rejection`` casserait les liens des deux flux et
+        ``verify_chain`` signalerait une falsification. L'historique reste donc
+        une chaîne continue dans ``access`` ; la séparation de rétention M-03
+        ne vaut que pour les événements postérieurs à la migration (les
+        anciens rejets comptent contre le quota ``access``).
+        """
         columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(audit_events);").fetchall()
         }
