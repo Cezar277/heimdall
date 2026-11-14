@@ -269,6 +269,7 @@ def cold_start(
         max=1_048_576,
         help="Taille maximale par fichier, en octets.",
     ),
+    strict: bool = typer.Option(False, "--strict", help="Refuse les exclusions de contenu."),
 ) -> None:
     """Premier scan complet : regex/entropie puis avis du LLM local (#107).
 
@@ -277,7 +278,11 @@ def cold_start(
     """
     try:
         report = collect_cold_start(
-            _scan_root_argument(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes
+            _scan_root_argument(path),
+            ci=ci,
+            llm=llm,
+            max_file_bytes=max_file_bytes,
+            strict=strict,
         )
         typer.echo(render_cold_start(report, json_output=json_output))
     except Exception:

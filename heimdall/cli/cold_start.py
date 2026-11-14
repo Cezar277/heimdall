@@ -148,6 +148,7 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
     ci: bool = False,
     llm: bool = True,
     max_file_bytes: int = MAX_FILE_BYTES,
+    strict: bool = False,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:
@@ -160,7 +161,13 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
     """
     try:
         return _collect_cold_start(
-            root, ci=ci, llm=llm, max_file_bytes=max_file_bytes, chat=chat, journal=journal
+            root,
+            ci=ci,
+            llm=llm,
+            max_file_bytes=max_file_bytes,
+            strict=strict,
+            chat=chat,
+            journal=journal,
         )
     except ToolFailure:
         raise ScanError("scan impossible : entrée non analysable") from None
@@ -172,11 +179,14 @@ def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification opti
     ci: bool = False,
     llm: bool = True,
     max_file_bytes: int = MAX_FILE_BYTES,
+    strict: bool = False,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
 ) -> ColdStartReport:
     if type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES:
         raise ScanError("limite de fichier invalide")
+    if type(strict) is not bool:
+        raise ScanError("politique de contenu invalide")
     # Capturer l'identité et l'état Git AVANT collect ferme aussi l'intervalle
     # entre les deux passes, et pas seulement les substitutions pendant la
     # relecture : un fichier propre modifié pendant collect est vu par la
@@ -194,7 +204,7 @@ def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification opti
         ci=ci,
         max_file_bytes=max_file_bytes,
         skipped_files=skipped,
-        strict=False,
+        strict=strict,
     )
     if access is None or not scan.findings:
         if access is not None and status_before is not None:
@@ -215,13 +225,13 @@ def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification opti
             raise ScanError("chemin de qualification hors périmètre") from None
         raw = _read_worktree_file(path, max_bytes=max_file_bytes)
         try:
-            text = decode_text(raw, strict=False) if raw is not None else None
+            text = decode_text(raw, strict=strict) if raw is not None else None
         except ScanError:
             raise ScanError("contenu modifié depuis le scan déterministe") from None
         if text is None:
             raise ScanError("contenu modifié depuis le scan déterministe")
         reread_skipped: list[ScanSkip] = []
-        text = prepare_text(text, file, strict=False, skipped=reread_skipped)
+        text = prepare_text(text, file, strict=strict, skipped=reread_skipped)
         if any(item not in scan.skipped for item in reread_skipped):
             raise ScanError("contenu modifié depuis le scan déterministe")
         target = FileTarget(file, text)
@@ -229,7 +239,7 @@ def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification opti
         # des findings retenus, pas l'égalité de deux rapports. TreeScanner et
         # SignatureEngine partagent DEFAULT_ENTROPY_CONFIG et la même clé HMAC
         # locale persistante via SnippetHasher() ; le test de parité le prouve.
-        current = Scanner(SignatureEngine(deadline=deadline, strict=False)).scan(target)
+        current = Scanner(SignatureEngine(deadline=deadline, strict=strict)).scan(target)
         if any(finding not in current for finding in findings):
             raise ScanError("contenu modifié depuis le scan déterministe")
         opinions.extend(

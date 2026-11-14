@@ -18,7 +18,7 @@ _TOKEN = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
 #: jetons hors borne. Le budget de fenêtres est calculé à partir de la taille
 #: d'origine pour que la sortie totale reste sous ce plafond.
 _MAX_CLEANED_CHARS = 2 * 1024 * 1024
-#: Budget maximal de fenêtres (une fenêtre + son séparateur ≈ 4097 octets).
+#: Budget maximal de fenêtres (une fenêtre + son séparateur ≈ 4097 caractères).
 _MAX_LONG_TOKEN_WINDOWS = _MAX_CLEANED_CHARS // (MAX_TOKEN_LENGTH + 1)
 
 
@@ -44,8 +44,11 @@ def _window_long_token(token: str, max_windows: int) -> tuple[str, int]:
 
     Chaque fenêtre reste dans la borne ``MAX_TOKEN_LENGTH``. Le pas est choisi
     pour tenir dans ``max_windows`` : pas de 1 si le jeton est assez court,
-    sinon pas élargi (garantie au moins 2048 pour un jeton d'1 Mio, 4079 pour
-    un jeton de 8 Kio). Les fenêtres sont séparées par une espace pour que le
+    sinon pas élargi. Garantie adaptative : le recouvrement vaut
+    ``MAX_TOKEN_LENGTH - pas`` (4079 pour un jeton de 8 Kio, ~336 seulement
+    pour un jeton d'1 Mio dans un fichier d'1 Mio) ; une sous-chaîne plus
+    longue que ce recouvrement peut ne tenir dans aucune fenêtre, d'où la
+    trace ``long_token`` qui rend le rapport incomplet. Les fenêtres sont séparées par une espace pour que le
     moteur les traite comme des jetons distincts, sans changer le numéro de
     ligne.
 
@@ -81,8 +84,10 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
     Un jeton hors borne est découpé en fenêtres chevauchantes de
     :data:`MAX_TOKEN_LENGTH` avant analyse ; l'intérieur n'est donc plus
     blanchi en bloc. La sortie est plafonnée à ~2 Mio de caractères : le pas
-    est choisi pour tenir dans ce budget (garantie au moins 2048 pour un jeton
-    d'1 Mio, 4079 pour un jeton de 8 Kio). Au-delà du budget, le jeton est
+    est choisi pour tenir dans ce budget (recouvrement adaptatif
+    ``MAX_TOKEN_LENGTH - pas``, voir :func:`_window_long_token`). Le plafond est
+    compté en caractères, pas en octets : la sortie encodée en UTF-8 peut le
+    dépasser pour un texte multioctets. Au-delà du budget, le jeton est
     blanchi ; le rapport reste marqué incomplet par la trace ``long_token`` et
     un appelant ne doit jamais traiter ``complete is False`` comme propre.
     """

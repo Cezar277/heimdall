@@ -110,6 +110,20 @@ def test_latin1_context_keeps_explicit_tolerant_decoding(repo: GitRepo) -> None:
     assert len(report.scan.findings) == len(report.opinions) == 1
 
 
+def test_strict_cold_start_refuses_excluded_content(repo: GitRepo) -> None:
+    repo.write("app.py", f'key = "{SYNTHETIC}"\n' + "A" * 5000 + "\n")
+    with pytest.raises(ScanError):
+        collect_cold_start(repo.root, strict=True, chat=_secret_chat)
+    result = CliRunner().invoke(app, ["cold-start", "--ci", "--strict", str(repo.root)])
+    assert result.exit_code == 2
+    assert SYNTHETIC not in result.output
+
+
+def test_strict_cold_start_rejects_non_bool_policy(repo: GitRepo) -> None:
+    with pytest.raises(ScanError, match="politique de contenu invalide"):
+        collect_cold_start(repo.root, strict=1, chat=_secret_chat)  # type: ignore[arg-type]
+
+
 def test_partial_context_keeps_findings_and_does_not_claim_mutation(
     repo: GitRepo, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
