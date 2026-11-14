@@ -62,10 +62,13 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
             multiline_line = line_number - 1
         previous_size = size
         cleaned_lines.append(cleaned)
-    if long_line is not None:
-        skipped.append(ScanSkip(file, "long_token", long_line))
-    if multiline_line is not None:
-        skipped.append(ScanSkip(file, "multiline_limit", multiline_line))
+    try:
+        if long_line is not None:
+            skipped.append(ScanSkip(file, "long_token", long_line))
+        if multiline_line is not None:
+            skipped.append(ScanSkip(file, "multiline_limit", multiline_line))
+    except ValueError:
+        raise ScanError("scan impossible : entrée non analysable") from None
     return "\n".join(cleaned_lines)
 
 

@@ -27,6 +27,27 @@ from heimdall.scanner.finding import Finding
 SYNTHETIC = "AKIAIOSFODNN7EXAMPLE"
 
 
+def test_history_keeps_skip_lines_on_cache_hits(repo: GitRepo) -> None:
+    content = "safe\nsafe\n" + "A" * 5000 + "\n"
+    repo.write("original.dat", content)
+    repo.commit_all("first")
+    repo.git("mv", "original.dat", "renamed.dat")
+    repo.commit_all("rename")
+    report = history.collect_history(repo.root, ci=True, strict=False)
+    payload = json.loads(history.render_history(report, json_output=True))
+    long_tokens = [item for item in payload["skipped"] if item["reason"] == "long_token"]
+    assert {item["file"] for item in long_tokens} == {"original.dat", "renamed.dat"}
+    assert len(long_tokens) == 2
+    assert all(item["line"] == 3 for item in long_tokens)
+    assert all(
+        item["line"] == 2 for item in payload["skipped"] if item["reason"] == "multiline_limit"
+    )
+    assert '"original.dat":3' in history.render_history(report)
+    assert '"renamed.dat":3' in history.render_history(report)
+    assert report.bytes_scanned == len(content.encode())
+    assert not report.complete
+
+
 @pytest.fixture
 def repo(monkeypatch: pytest.MonkeyPatch) -> Iterator[GitRepo]:
     monkeypatch.setenv("HEIMDALL_SNIPPET_HMAC_KEY", "01" * 32)

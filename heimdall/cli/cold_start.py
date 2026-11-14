@@ -181,6 +181,8 @@ def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification opti
             raise ScanError("contenu modifié depuis le scan déterministe")
         reread_skipped: list[ScanSkip] = []
         text = prepare_text(text, file, strict=False, skipped=reread_skipped)
+        if any(item not in scan.skipped for item in reread_skipped):
+            raise ScanError("contenu modifié depuis le scan déterministe")
         target = FileTarget(file, text)
         # Sur-ensemble volontaire sans allowlist : on vérifie l'appartenance
         # des findings retenus, pas l'égalité de deux rapports. TreeScanner et

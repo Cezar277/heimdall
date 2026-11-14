@@ -281,6 +281,38 @@ def test_content_mutation_refuses_api_and_cli(
                 collect_cold_start(repo.root, chat=_secret_chat)
 
 
+@pytest.mark.parametrize("cli", [False, True])
+@pytest.mark.parametrize("addition", ["A" * 5000, " " * 3000 + "\n" + " " * 3000])
+def test_new_reread_exclusions_refuse_complete_report(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch, cli: bool, addition: str,
+) -> None:
+    original = cold_module.collect
+    content = f'key = "{SYNTHETIC}"\n'
+    repo.write("app.py", content)
+
+    def mutate(*args: Any, **kwargs: Any) -> Any:
+        report = original(*args, **kwargs)
+        assert report.complete
+        repo.write("app.py", content + addition + "\n")
+        return report
+
+    def forbidden(**kwargs: Any) -> None:
+        pytest.fail("new exclusions must not reach qualification")
+
+    monkeypatch.setattr(cold_module, "collect", mutate)
+    monkeypatch.setattr(
+        main_module, "collect_cold_start", partial(collect_cold_start, chat=forbidden)
+    )
+    if cli:
+        result = CliRunner().invoke(app, ["cold-start", "--json", str(repo.root)])
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert SYNTHETIC not in result.output
+    else:
+        with pytest.raises(ScanError, match="^contenu modifié depuis le scan déterministe$"):
+            collect_cold_start(repo.root, chat=forbidden)
+
+
 def test_reread_respects_configured_size_limit(
     repo: GitRepo,
     monkeypatch: pytest.MonkeyPatch,

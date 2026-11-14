@@ -55,8 +55,13 @@ Le schéma conserve les champs optionnels pour les anciens rapports v1 :
 leur absence signifiait respectivement `true`, `0` et `[]`. Ses `default`
 sont des annotations, pas des valeurs insérées automatiquement.
 L'historique utilise ses champs existants `complete` et `skipped`, avec
-un chemin et un commit pour chaque occurrence, y compris après réutilisation
-du cache de blobs.
+un chemin, un commit, un motif et une `line` pour chaque occurrence, y compris
+après réutilisation du cache de blobs sous un autre chemin. `line` est le
+numéro de ligne pour `long_token` / `multiline_limit`, sinon `null`.
+Dans l'API bibliothèque, chaque entrée `HistoryReport.skipped` est désormais
+un tuple `(file, commit, reason, line)` ; les consommateurs doivent intégrer
+ce quatrième élément. Le JSON ajoute le champ `line` et le rendu humain
+l'affiche après le chemin quand il est connu.
 
 - `0` : aucun candidat détecté et aucune exclusion de contenu.
 - `1` : au moins un candidat détecté, même si d'autres contenus ont été écartés.
@@ -122,6 +127,11 @@ qualification. Un finding accompagné d'un jeton long reste un rapport partiel :
 le cold start conserve son code 2 d'incomplétude, sans prétendre que le contenu
 a été modifié. Les vérifications de racine et de présence des findings restent
 actives.
+Les traces de cette seconde passe sont comparées à celles de la première :
+une exclusion nouvelle ou déplacée provoque `ScanError` (« contenu modifié
+depuis le scan déterministe ») avant qualification, avec code 2 en CLI.
+Un rapport initialement complet ne peut ainsi rester complet après l'ajout
+d'un jeton long ou d'une nouvelle jointure hors borne entre les passes.
 `deep-scan` rend son rapport et retourne 2
 s'il est partiel sans finding, ou 1 si un finding est présent. Le prétraitement
 des jetons traite chaque ligne une fois et calcule sa taille UTF-8 une fois ;

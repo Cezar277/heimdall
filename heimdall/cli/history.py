@@ -47,7 +47,7 @@ class HistoricalFinding:
 class HistoryReport:
     findings: tuple[HistoricalFinding, ...]
     opinions: tuple[CandidateOpinion, ...]
-    skipped: tuple[tuple[str, str, str], ...]
+    skipped: tuple[tuple[str, str, str, int | None], ...]
     commits_scanned: int
     entries_scanned: int
     bytes_scanned: int  # octets effectivement lus, distincts du budget annoncé
@@ -172,8 +172,8 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     records: dict[tuple[str, str, str], tuple[Finding, dict[str, None]]] = {}
     qualified: set[tuple[str, str]] = set()
     cache: OrderedDict[str, tuple[Finding, ...] | str] = OrderedDict()
-    cache_skips: dict[str, tuple[str, ...]] = {}
-    skipped: list[tuple[str, str, str]] = []
+    cache_skips: dict[str, tuple[tuple[str, int | None], ...]] = {}
+    skipped: list[tuple[str, str, str, int | None]] = []
     opinions: list[CandidateOpinion] = []
     commits = entries = volume = read_volume = occurrences = cache_findings = 0
     scanner = Scanner(SignatureEngine(deadline=deadline, strict=strict))
@@ -236,7 +236,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                             content_skips.append(ScanSkip(file, "binary"))
                             text = ""
                         text = prepare_text(text, file, strict=strict, skipped=content_skips)
-                        cache_skips[oid] = tuple(item.reason for item in content_skips)
+                        cache_skips[oid] = tuple((item.reason, item.line) for item in content_skips)
                         target = FileTarget(file, text)
                         cached = tuple(scanner.scan(target))
                         if llm and not ci:
@@ -262,12 +262,12 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                         evicted_oid, evicted = cache.popitem(last=False)
                         cache_skips.pop(evicted_oid, None)
                         cache_findings -= 0 if isinstance(evicted, str) else len(evicted)
-                for reason in cache_skips.get(oid, ()):
-                    skipped.append((file, commit, reason))
+                for reason, line in cache_skips.get(oid, ()):
+                    skipped.append((file, commit, reason, line))
                     if len(skipped) > MAX_RECORDS:
                         raise ScanError("limite historique dépassée")
                 if isinstance(cached, str):
-                    skipped.append((file, commit, cached))
+                    skipped.append((file, commit, cached, None))
                     if len(skipped) > MAX_RECORDS:
                         raise ScanError("limite historique dépassée")
                     continue
@@ -308,7 +308,10 @@ def render_history(report: HistoryReport, *, json_output: bool = False) -> str:
                     for item in report.findings
                 ],
                 "opinions": [item.as_dict() for item in report.opinions],
-                "skipped": [{"file": f, "commit": c, "reason": r} for f, c, r in report.skipped],
+                "skipped": [
+                    {"file": f, "commit": c, "reason": r, "line": line}
+                    for f, c, r, line in report.skipped
+                ],
                 "commits_scanned": report.commits_scanned,
                 "entries_scanned": report.entries_scanned,
                 "bytes_scanned": report.bytes_scanned,
@@ -331,9 +334,10 @@ def render_history(report: HistoryReport, *, json_output: bool = False) -> str:
             f"{WARNING}. {json.dumps(item.finding.file, ensure_ascii=True)}:"
             f"{item.finding.line} [{item.finding.type}]"
         )
-    for file, commit, reason in report.skipped:
+    for file, commit, reason, line in report.skipped:
+        location = f":{line}" if line is not None else ""
         lines.append(
-            f"Fichier ignoré {json.dumps(file, ensure_ascii=True)} (commit {commit}) : "
+            f"Fichier ignoré {json.dumps(file, ensure_ascii=True)}{location} (commit {commit}) : "
             f"{reason}. Scan incomplet."
         )
     for opinion in report.opinions:

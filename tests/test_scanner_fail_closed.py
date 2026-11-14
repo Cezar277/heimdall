@@ -27,7 +27,7 @@ from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.detect import MAX_FILE_BYTES, Scanner, find_candidates, scan
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
-from heimdall.scanner.policy import ScanSkip, prepare_text
+from heimdall.scanner.policy import ScanSkip, prepare_text, skip_file
 
 SYNTHETIC = fake_token("ghp_", 36)
 
@@ -421,3 +421,15 @@ def test_partial_blobs_are_not_counted_as_fully_scanned(repo: GitRepo, scope: st
     assert {item.file for item in report.skipped} == {"partial.dat"}
     assert report.scanned_files == 1
     assert not report.complete
+
+
+@pytest.mark.parametrize("operation", ["long_token", "multiline_limit", "skip_file"])
+def test_invalid_skip_paths_use_scan_error(operation: str) -> None:
+    skipped: list[ScanSkip] = []
+    with pytest.raises(ScanError, match="^scan impossible : entrée non analysable$"):
+        if operation == "skip_file":
+            skip_file("../evil", "binary", strict=False, skipped=skipped)
+        else:
+            text = "x" * 5000 if operation == "long_token" else " " * 3000 + "\n" + " " * 3000
+            prepare_text(text, "../evil", strict=False, skipped=skipped)
+    assert skipped == []
