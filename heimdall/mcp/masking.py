@@ -160,7 +160,7 @@ _XML_SENSITIVE_ELEMENT: Final[re.Pattern[str]] = re.compile(
 # symétriques ; le jugement final reste `_looks_like_secret`. Insensible à la
 # casse : les fonctions PHP le sont (`DEFINE(...)` est valide).
 _DEFINE_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
-    r"(?i)define\(\s*(?P<keyquote>[\"']?)"
+    r"(?i)define\s*\(\s*(?P<keyquote>[\"']?)"
     r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
     r"(?P=keyquote)\s*,\s*"
     r"(?P<valuequote>[\"']?)"
@@ -171,9 +171,16 @@ _DEFINE_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 # `.netrc` : `machine github.com login bob password S3cretP4ss`. Le nom
 # `password` n'est pas suivi de `:`/`=`, donc aucune règle d'affectation ne
 # le voyait. Insensible à la casse : `Password` est accepté par les clients
-# `.netrc` et était oublié.
+# `.netrc` et était oublié. La valeur peut être citée (guillemets simples ou
+# doubles, espaces internes inclus) : sans branche citée, la forme plausible
+# `password "…"` partait en clair (revue).
 _NETRC_PASSWORD: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?<![\w-])password[ \t]+(?![=:])(?P<value>[^\s\"']{1,})"
+    r"(?i)(?<![\w-])password[ \t]+(?![=:])"
+    r"(?:"
+    r"(?P<quote>[\"'])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=quote)"
+    r"|[\"'](?P<unclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
+    r"|(?P<value>[^\s\"']{1,})"
+    r")"
 )
 
 # Option CLI `--password <val>` / `--password=<val>` / `--api-key=…`.
@@ -196,8 +203,24 @@ _CLI_UNCLOSED_QUOTED_OPTION: Final[re.Pattern[str]] = re.compile(
 )
 
 # `curl -u admin:Sup3rS3cret` : identifiants passés en argument CLI, hors URL.
+# La forme `-u "user:pass"` (guillemets shell autour du couple) et
+# `-u user:"pass"` (mot de passe seul cité) sont usuelles dès qu'un caractère
+# spécial est présent ; seuls `user:pass` nus étaient vus (revue).
 _CLI_USER_PASSWORD: Final[re.Pattern[str]] = re.compile(
-    r"(?<![\w-])-u[ \t]+(?P<user>[^\s:\"']{1,64}):(?P<value>[^\s\"']{1,})"
+    r"(?<![\w-])-u[ \t]+"
+    r"(?:"
+    # Guillemets shell autour du couple user:pass, refermés.
+    r"(?P<wholequote>[\"'])[^\s:\"']{1,64}:"
+    r"(?P<wholevalue>(?:[^\\\n]|\\.)*?)(?P=wholequote)"
+    # Même forme, guillemet non refermé (ligne tronquée).
+    r"|[\"'][^\s:\"']{1,64}:(?P<wholeunclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
+    # Utilisateur nu, mot de passe cité (fermé puis non refermé).
+    r"|[^\s:\"']{1,64}:"
+    r"(?P<valuequote>[\"'])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=valuequote)"
+    r"|[^\s:\"']{1,64}:[\"'](?P<pwunclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
+    # Utilisateur nu, mot de passe nu.
+    r"|[^\s:\"']{1,64}:(?P<value>[^\s\"']{1,})"
+    r")"
 )
 
 # Authorization: Bearer <jeton>
@@ -642,10 +665,16 @@ def _define_spans(match: re.Match[str]) -> list[_Match]:
 
 def _netrc_spans(match: re.Match[str]) -> list[_Match]:
     """`.netrc` : `password <valeur>`, seule la valeur est masquée."""
-    value = match.group("value")
+    if match.group("quoted") is not None:
+        group = "quoted"
+    elif match.group("unclosed") is not None:
+        group = "unclosed"
+    else:
+        group = "value"
+    value = match.group(group)
     if not _looks_like_secret("password", value):
         return []
-    return [_span_match(match, "value", _secret_type("password", value))]
+    return [_span_match(match, group, _secret_type("password", value))]
 
 
 def _cli_secret_option_spans(match: re.Match[str]) -> list[_Match]:
@@ -660,10 +689,20 @@ def _cli_secret_option_spans(match: re.Match[str]) -> list[_Match]:
 
 def _cli_user_password_spans(match: re.Match[str]) -> list[_Match]:
     """`-u user:pass` : le mot de passe seul, l'utilisateur reste lisible."""
-    value = match.group("value")
+    if match.group("wholevalue") is not None:
+        group = "wholevalue"
+    elif match.group("wholeunclosed") is not None:
+        group = "wholeunclosed"
+    elif match.group("quoted") is not None:
+        group = "quoted"
+    elif match.group("pwunclosed") is not None:
+        group = "pwunclosed"
+    else:
+        group = "value"
+    value = match.group(group)
     if not _looks_like_secret("password", value):
         return []
-    return [_span_match(match, "value", _secret_type("password", value))]
+    return [_span_match(match, group, _secret_type("password", value))]
 
 
 def _bare_known_matches(text: str) -> list[_Match]:

@@ -111,6 +111,51 @@ class AuditE03MaskingProofTests(unittest.TestCase):
         self.assertNotIn("get_password", masked)
         self.assertTrue(masked.endswith(")"))
 
+    def test_quoted_netrc_value_is_masked(self) -> None:
+        """Revue (LOW) : `password "S3cr****"` (netrc quoté) partait en clair."""
+        for line, secret in (
+            ('password "S3cretP4ss"', "S3cretP4ss"),
+            ("Password 'S3cretP4ss'", "S3cretP4ss"),
+            ('machine x login bob password "S3cretP4ss"', "S3cretP4ss"),
+            ('machine x login bob password "my secret phrase 42"', "my secret phrase 42"),
+            ('password "my secret phrase 42', "my secret phrase 42"),
+            ('password "my secret phrase 42 # note', "my secret phrase 42"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+
+    def test_quoted_cli_user_password_is_masked(self) -> None:
+        """Revue (LOW) : `-u "user:pass"` et `-u user:"pass"` sont usuels."""
+        for line, secret in (
+            ('curl -u "admin:S3cretP4ss" https://x', "S3cretP4ss"),
+            ("curl -u 'admin:S3cretP4ss' https://x", "S3cretP4ss"),
+            ('curl -u admin:"S3cretP4ss" https://x', "S3cretP4ss"),
+            ("curl -u admin:'S3cretP4ss' https://x", "S3cretP4ss"),
+            ('curl -u "admin:my secret phrase 42" https://x', "my secret phrase 42"),
+            ('curl -u admin:"my secret phrase 42" https://x', "my secret phrase 42"),
+            ('curl -u "admin:S3cretP4ss', "S3cretP4ss"),
+            ('curl -u admin:"S3cretP4ss', "S3cretP4ss"),
+            ('curl -u "admin:S3cretP4ss # rotation', "S3cretP4ss"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("admin", masked, "le nom d'utilisateur reste lisible")
+
+    def test_define_with_space_before_parenthesis_is_masked(self) -> None:
+        """Revue (LOW) : PHP autorise `define (` ; les formatters l'ajoutent."""
+        for line, secret in (
+            ("define ( 'DB_PASSWORD' , 'S3cr3tValue99' )", "S3cr3tValue99"),
+            ('DEFINE ( "DB_PASSWORD" , "S3cr3tValue99" )', "S3cr3tValue99"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+
     def test_define_with_unquoted_arguments_is_masked(self) -> None:
         """`define(DB_PASSWORD, S3cr3tValue99)` : nom et valeur nus sont valides."""
         for line, secret in (
@@ -169,6 +214,7 @@ class AuditE03MaskingProofTests(unittest.TestCase):
             '{"key": "production"}',
             '{"version": "1.2.3"}',
             "define('DB_NAME', 'production');",
+            "define ('DB_NAME', 'production');",
             "define('WP_DEBUG', true);",
         ):
             with self.subTest(line=line):

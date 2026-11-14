@@ -197,9 +197,10 @@ coquille) est masquée jusqu'à la fin de ligne, et une valeur non quotée à no
 `password = my secret pass phrase 42` ne laisse plus sa queue en clair. Les
 formes hors affectation sont couvertes : balise XML sensible
 (`<password>…</password>`), `define('DB_PASSWORD', '…')` (nom et valeur nus
-acceptés, `DEFINE` insensible à la casse comme en PHP), `.netrc`
-(`password …`, `Password` inclus), `-u user:pass` et `--password
-<val>`/`--password=<val>`. Le filtre anti-bruit refuse les annotations
+acceptés, `DEFINE` et espace avant `(` admis, comme en PHP), `.netrc`
+(`password …`, `Password` et valeur citée inclus, fermée ou tronquée), `-u
+user:pass` (couple ou mot de passe cité, formes tronquées incluses) et
+`--password <val>`/`--password=<val>`. Le filtre anti-bruit refuse les annotations
 (`api_key: str`) et littéraux (`session = None`) ; un appel de fonction à nom
 évocateur (`get_password()`) reste partiellement masqué par la règle
 d'affectation — comportement préexistant, épinglé par test et hors périmètre
