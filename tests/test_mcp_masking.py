@@ -386,6 +386,19 @@ class AuditE03MaskingProofTests(unittest.TestCase):
         inner_tag = "<password><nested>short</nested></password>"
         self.assertEqual(masking.mask_text(inner_tag), (inner_tag, 0))
 
+    def test_netrc_backtick_value_is_pinned(self) -> None:
+        """Revue (LOW) : valeur espace-séparée entre backticks masquée."""
+        for line, secret in (
+            ("password `S3cretP4ss99`", "S3cretP4ss99"),
+            ("api_key `my secret 42`", "my secret 42"),
+            ("password `S3cretP4ss99", "S3cretP4ss99"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:", masked)
+
     def test_xml_closing_tag_case_insensitive_is_masked(self) -> None:
         """Revue (LOW) : `<PASSWORD>…</password>` apparié quelle que soit la casse."""
         for line, secret in (
