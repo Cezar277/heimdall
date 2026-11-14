@@ -172,7 +172,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     tips = _tips(access, deadline)
     records: dict[tuple[str, str, str], tuple[Finding, dict[str, None]]] = {}
     qualified: set[tuple[str, str]] = set()
-    cache: OrderedDict[str, tuple[Finding, ...] | str] = OrderedDict()
+    cache: OrderedDict[str, tuple[Finding, ...] | ScanSkip] = OrderedDict()
     cache_skips: dict[str, tuple[tuple[str, int | None], ...]] = {}
     skipped: list[tuple[str, str, str, int | None]] = []
     opinions: list[CandidateOpinion] = []
@@ -223,7 +223,7 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                     if size > max_file_bytes:
                         if strict:
                             raise ScanError("historique non analysable")
-                        cached = "taille maximale dépassée"
+                        cached = ScanSkip(file, "too_large")
                     else:
                         data = access.blob_bytes(oid, timeout=_call_timeout(deadline))
                         if len(data) != size:
@@ -258,17 +258,17 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                             )
                             qualified.update((f.type, f.snippet_hash) for f in new)
                     cache[oid] = cached
-                    cache_findings += 0 if isinstance(cached, str) else len(cached)
+                    cache_findings += 0 if isinstance(cached, ScanSkip) else len(cached)
                     while len(cache) > CACHE_SIZE or cache_findings > MAX_RECORDS:
                         evicted_oid, evicted = cache.popitem(last=False)
                         cache_skips.pop(evicted_oid, None)
-                        cache_findings -= 0 if isinstance(evicted, str) else len(evicted)
+                        cache_findings -= 0 if isinstance(evicted, ScanSkip) else len(evicted)
                 for reason, line in cache_skips.get(oid, ()):
                     skipped.append((file, commit, reason, line))
                     if len(skipped) > MAX_RECORDS:
                         raise ScanError("limite historique dépassée")
-                if isinstance(cached, str):
-                    skipped.append((file, commit, cached, None))
+                if isinstance(cached, ScanSkip):
+                    skipped.append((file, commit, cached.reason, cached.line))
                     if len(skipped) > MAX_RECORDS:
                         raise ScanError("limite historique dépassée")
                     continue

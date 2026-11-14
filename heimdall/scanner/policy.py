@@ -13,6 +13,10 @@ from heimdall.scanner.limits import MAX_TOKEN_LENGTH, TEXT_WINDOW_BYTES
 
 SkipReason = Literal["binary", "too_large", "symlink", "long_token", "multiline_limit"]
 _TOKEN = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
+#: Chevauchement des fenêtres d'un jeton hors borne : une signature qui
+#: traverse une frontière reste entière dans la fenêtre suivante.
+_LONG_TOKEN_OVERLAP = MAX_TOKEN_LENGTH // 2
+_LONG_TOKEN_STEP = MAX_TOKEN_LENGTH - _LONG_TOKEN_OVERLAP
 
 
 @dataclass(frozen=True)
@@ -32,17 +36,39 @@ class ScanSkip:
         return {"file": self.file, "reason": self.reason, "line": self.line}
 
 
+def _window_long_token(token: str) -> str:
+    """Découpe un jeton hors borne en fenêtres chevauchantes analysables.
+
+    Chaque fenêtre reste dans la borne ``MAX_TOKEN_LENGTH`` ; le chevauchement
+    de moitié évite qu'une signature à cheval sur deux fenêtres disparaisse.
+    Les fenêtres sont séparées par une espace pour que le moteur les traite
+    comme des jetons distincts, sans changer le numéro de ligne.
+    """
+    windows: list[str] = []
+    start = 0
+    length = len(token)
+    while start < length:
+        end = min(start + MAX_TOKEN_LENGTH, length)
+        windows.append(token[start:end])
+        start += _LONG_TOKEN_STEP
+    return " ".join(windows)
+
+
 def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip]) -> str:
-    """Écarte seulement les jetons hors borne ; conserve les autres candidats.
+    """Découpe les jetons hors borne en fenêtres ; conserve les autres candidats.
 
-    Le remplacement par des espaces conserve les lignes et les séparations.
-    Une trace par motif et fichier borne le rapport même sur une longue ligne.
-    Les fenêtres multilignes hors borne restent visibles sans masquer les
-    signatures analysables sur chacune de leurs lignes.
+    Les fenêtres sont séparées par des espaces : les lignes et les numéros de
+    ligne sont conservés, et une trace par motif et fichier borne le rapport
+    même sur une longue ligne. Les fenêtres multilignes hors borne restent
+    visibles sans masquer les signatures analysables sur chacune de leurs
+    lignes.
 
-    L'intérieur d'un jeton hors borne n'est **pas** analysé (limite
-    documentée) : le rapport est marqué incomplet par la trace ``long_token``
-    et un appelant ne doit jamais traiter ``complete is False`` comme propre.
+    Un jeton hors borne est découpé en fenêtres chevauchantes de
+    :data:`MAX_TOKEN_LENGTH` avant analyse ; l'intérieur n'est donc plus
+    blanchi en bloc. Le rapport reste marqué incomplet par la trace
+    ``long_token`` (une signature concaténée sans frontière peut encore
+    échapper aux motifs) et un appelant ne doit jamais traiter
+    ``complete is False`` comme propre.
     """
     if strict:
         return text
@@ -50,11 +76,12 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
 
     def replace(match: re.Match[str], *, line_number: int) -> str:
         nonlocal long_line
-        if len(match.group()) <= MAX_TOKEN_LENGTH:
-            return match.group()
+        token = match.group()
+        if len(token) <= MAX_TOKEN_LENGTH:
+            return token
         if long_line is None:
             long_line = line_number
-        return " " * len(match.group())
+        return _window_long_token(token)
 
     cleaned_lines: list[str] = []
     multiline_line: int | None = None

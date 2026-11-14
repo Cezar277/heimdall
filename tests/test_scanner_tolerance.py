@@ -112,6 +112,23 @@ def test_long_token_does_not_hide_a_separate_secret_on_the_same_line(
     assert SYNTHETIC not in render_json(report)
 
 
+def test_long_token_windows_find_a_secret_at_a_window_boundary(repo: GitRepo) -> None:
+    # 4096 A's, puis le secret, puis un séparateur : la fenêtre qui commence
+    # à 4096 contient exactement le secret, donc les frontières de signature
+    # sont restaurées. Le rapport reste incomplet (trace long_token).
+    repo.write("notebook.ipynb", "A" * 4096 + SYNTHETIC + " " + "B" * 5000 + "\n")
+    repo.stage("notebook.ipynb")
+    report = collect(repo.root, staged=True, allowlist=Allowlist.empty(), strict=False)
+    assert any(item.file == "notebook.ipynb" for item in report.findings)
+    assert not report.complete
+    assert any(item.reason == "long_token" for item in report.skipped)
+    payload = json.loads(render_json(report))
+    _scan_validator().validate(payload)
+    assert payload["count"] == 1
+    assert payload["complete"] is False
+    assert SYNTHETIC not in render_json(report)
+
+
 def test_concatenated_secret_inside_a_long_token_is_incomplete_not_clean(
     repo: GitRepo,
 ) -> None:

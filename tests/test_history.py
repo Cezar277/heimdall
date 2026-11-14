@@ -153,6 +153,22 @@ def test_oversized_blobs_never_read_and_cli_is_incomplete(
     assert json.loads(result.stdout)["complete"] is False
 
 
+def test_oversized_blob_reason_is_the_enum_too_large(repo: GitRepo) -> None:
+    repo.write("large.txt", "x" * 100)
+    repo.commit_all("large")
+    report = history.collect_history(repo.root, ci=True, max_file_bytes=10, strict=False)
+    assert len(report.skipped) == 1
+    file, commit, reason, line = report.skipped[0]
+    assert file == "large.txt"
+    assert len(commit) == 40
+    assert reason == "too_large"
+    assert line is None
+    payload = json.loads(history.render_history(report, json_output=True))
+    assert payload["skipped"] == [
+        {"file": "large.txt", "commit": commit, "reason": "too_large", "line": None}
+    ]
+
+
 def test_cold_start_size_limit_reports_skip(repo: GitRepo) -> None:
     repo.write("large.txt", "x" * 100)
     report = collect_cold_start(repo.root, ci=True, max_file_bytes=10)

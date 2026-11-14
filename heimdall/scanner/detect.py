@@ -576,11 +576,16 @@ class Scanner:
                     continue
                 before_skips = len(self._skipped)
                 text = prepare_text(text, relative, strict=self._strict, skipped=self._skipped)
-                if len(self._skipped) > self._max_files:
-                    del self._skipped[before_skips:]
-                    raise ScanError(_SCAN_ERROR)
-                if self._skipped_files is not None and len(self._skipped) > before_skips:
-                    self._skipped_files.append(relative)
+                added_skips = len(self._skipped) - before_skips
+                if added_skips:
+                    if len(self._skipped) > self._max_files:
+                        # Annule les traces du fichier courant avant le refus :
+                        # `skipped_files` n'est alimenté qu'après ce contrôle,
+                        # donc les deux collecteurs restent cohérents.
+                        del self._skipped[before_skips:]
+                        raise ScanError(_SCAN_ERROR)
+                    if self._skipped_files is not None:
+                        self._skipped_files.append(relative)
                 # Le plafond Findings est vérifié à deux granularités : par
                 # candidat dans `_append` (un seul fichier dense ne fait jamais
                 # gonfler la liste), et ici entre fichiers (l'accumulation sur

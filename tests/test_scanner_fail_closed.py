@@ -206,7 +206,7 @@ def test_megabyte_of_long_tokens_is_bounded_and_keeps_line_numbers() -> None:
     started = time.monotonic()
     cleaned = prepare_text(text, "payload.dat", strict=False, skipped=skipped)
     assert time.monotonic() - started < 5
-    assert len(cleaned) == len(text)
+    assert len(text) <= len(cleaned) <= 2 * len(text)
     assert cleaned.count("\n") == text.count("\n")
     assert skipped == [
         ScanSkip("payload.dat", "long_token", 1),
@@ -467,6 +467,15 @@ def test_invalid_skip_paths_use_scan_error(operation: str) -> None:
             text = "x" * 5000 if operation == "long_token" else " " * 3000 + "\n" + " " * 3000
             prepare_text(text, "../evil", strict=False, skipped=skipped)
     assert skipped == []
+
+
+def test_skip_budget_overflow_keeps_skipped_files_consistent(tmp_path: Path) -> None:
+    (tmp_path / "payload.dat").write_text("A" * 5000 + "\n" + "B" * 5000, encoding="utf-8")
+    skipped_files: list[str] = []
+    scanner = Scanner(tmp_path, strict=False, max_files=1, skipped_files=skipped_files)
+    with pytest.raises(ScanError):
+        scanner.scan()
+    assert skipped_files == []
 
 
 @pytest.mark.parametrize("fallback", [False, True])
