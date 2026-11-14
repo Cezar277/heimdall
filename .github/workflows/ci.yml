@@ -221,13 +221,13 @@ jobs:
           .venv-ci/bin/pip install -e . --no-deps --no-build-isolation
 
       - name: Lint (ruff)
-        run: .venv-ci/bin/ruff check heimdall tests scripts
+        run: .venv-ci/bin/ruff check heimdall tests scripts docker
 
       - name: Types (mypy strict)
-        run: .venv-ci/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts/regen_lock.py
+        run: .venv-ci/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts docker
 
       - name: SAST (bandit)
-        run: .venv-ci/bin/bandit -r heimdall -q
+        run: .venv-ci/bin/bandit -r heimdall scripts docker -q
 
       - name: Tests + couverture >= 85 %
         run: >-
@@ -253,7 +253,11 @@ jobs:
           --fail-under=70
 
       - name: Audit dépendances (pip-audit, exception réseau documentée README)
-        run: .venv-ci/bin/pip-audit --skip-editable
+        run: |
+          .venv-ci/bin/pip-audit --skip-editable
+          .venv-ci/bin/pip-audit --no-deps --disable-pip -r requirements-runtime.lock
+          .venv-ci/bin/pip-audit --no-deps --disable-pip -r tests/contracts/requirements.txt
+          .venv-ci/bin/pip-audit --no-deps --disable-pip -r tests/security/requirements.txt
 
   report:
     name: Clôture du check « CI (/ci) »

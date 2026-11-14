@@ -59,10 +59,10 @@ def _parse_blocks(text: str) -> list[dict[str, object]]:
         if current is None:
             continue
         cast_lines = current["lines"]
-        assert isinstance(cast_lines, list)
+        assert isinstance(cast_lines, list)  # nosec B101 -- narrowing de type, pas une garde
         cast_lines.append(line)
         via = current["via"]
-        assert isinstance(via, list)
+        assert isinstance(via, list)  # nosec B101 -- narrowing de type, pas une garde
         via_match = _VIA_RE.match(line)
         if via_match:
             if via_match.group(1):
@@ -94,7 +94,7 @@ def _closure(blocks: list[dict[str, object]], roots: set[str]) -> set[str]:
     children: dict[str, set[str]] = {name: set() for name in by_name}
     for name, block in by_name.items():
         via = block["via"]
-        assert isinstance(via, list)
+        assert isinstance(via, list)  # nosec B101 -- narrowing de type, pas une garde
         for parent in via:
             if parent in by_name:
                 children[parent].add(name)
@@ -126,7 +126,7 @@ def main() -> int:
     for block in blocks:
         if str(block["name"]) in selected:
             lines = block["lines"]
-            assert isinstance(lines, list)
+            assert isinstance(lines, list)  # nosec B101 -- narrowing de type, pas une garde
             output.extend(str(line) for line in lines)
             output.append("")
     tmp = LOCK_RUNTIME.with_name(f"{LOCK_RUNTIME.name}.tmp")
