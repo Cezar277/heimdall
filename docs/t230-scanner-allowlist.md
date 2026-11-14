@@ -35,6 +35,11 @@ Une même valeur peut produire plusieurs types de findings (par exemple
 `(type, valeur)` jusqu'à l'évaluation de l'allowlist : une règle limitée à
 `service_token` ne peut pas autoriser implicitement la vue `credential`.
 Les compteurs de findings et de traces peuvent donc compter les deux vues.
+La commande `fix` regroupe uniquement les remédiations physiques, après
+l'évaluation de l'allowlist, par fichier/ligne/empreinte : elle applique un
+seul patch et compte un seul secret restant pour deux vues au même endroit.
+Cela ne déduplique pas les résultats du scan et ne modifie pas la portée des
+règles typées. Deux emplacements distincts restent deux remédiations.
 
 Résiduels explicitement conservés : sans contexte sensible ni préfixe connu,
 les jetons non hexadécimaux de 20–22 caractères auxquels manque une des trois
@@ -45,6 +50,13 @@ classe peut donc être manquée. Les affectations non citées de moins de
 `pin=abc` n'est pas couvert non plus : `pin` n'est pas une clé reconnue.
 Ces limitations sont documentées comme risque résiduel ; elles ne prouvent
 pas l'absence de secret. Aucun élargissement implicite d'allowlist n'est ajouté.
+
+L'intégration de `main` conserve les garanties des tickets #229/#233.
+La découverte de racine Git pour le statut d'un fichier d'environnement
+imbriqué utilise le marqueur `.git` le plus proche sur les ancêtres validés,
+puis exécute `GitAccess` depuis cette racine. Le plafond Git et l'environnement
+confiné ne sont pas élargis ; un marqueur symbolique est refusé avant toute
+exécution. Cela corrige aussi le test historique du chemin `.env` avec espaces.
 
 Il s'agit d'heuristiques avec faux positifs et faux négatifs possibles,
 pas d'une preuve d'absence de secret. Les formats non couverts, les valeurs

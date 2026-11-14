@@ -13,7 +13,9 @@ from support.fake_secrets import fake_token
 from support.git_repo import GitRepo
 from typer.testing import CliRunner
 
+from heimdall.cli.fix import run_fix
 from heimdall.cli.main import app
+from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
 from heimdall.scanner.allowlist import AllowlistRule, _compile_safe_regex, _split_alternatives
 from heimdall.scanner.entropy_detection import EntropyConfig, find_line_matches
 from heimdall.scanner.errors import ScanError
@@ -22,6 +24,7 @@ from heimdall.scanner.interface import FileTarget
 from heimdall.scanner.signature_engine import SignatureEngine
 from heimdall.scanner.signatures import find_signature_matches
 from heimdall.scanner.signatures.service_tokens import PREFIXES
+from heimdall.vault.atomic import _get_git_toplevel, is_git_tracked
 
 FAKE_PASSWORD = "FAKE-only!42#local"  # noqa: S105 - marqueur synthétique explicite
 
@@ -330,3 +333,61 @@ def test_npm_minimum_payload_boundary(length: int) -> None:
     value = "npm_" + "A" * length
     matches = find_signature_matches(value)
     assert bool(matches) is (length == 16)
+
+
+@pytest.mark.parametrize("line", ["pwd=123", "pin=abc"])
+def test_very_short_unquoted_values_are_documented_residuals(line: str) -> None:
+    assert not tuple(find_line_matches(line))
+
+
+@pytest.mark.parametrize("value", ["ghijklmnopqrstuvwxyz", "GHIJKLMNOPQRSTUVWXYZ"])
+def test_short_tokens_without_three_classes_are_documented_residuals(value: str) -> None:
+    assert len(value) == 20
+    assert not tuple(find_line_matches(value))
+
+
+def test_fix_applies_once_for_two_views_after_allowlist_filtering(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = "glpat-" + "A" * 32
+    repo.write("config.py", f'DB_PASSWORD="{value}"\n')
+    repo.write(".gitignore", "*.bak\n")
+    proposals_seen = []
+
+    def review(proposals, *, apply, **kwargs):
+        proposals_seen.extend(proposals)
+        assert len(proposals_seen) == 1
+        proposal = proposals_seen[0]
+        apply(proposal)
+        return ReviewReport((ReviewOutcome(Choice.VALIDATE, True, 0, proposal),), True)
+
+    monkeypatch.setattr("heimdall.cli.fix.review_proposals", review)
+    report, remaining = run_fix(repo.root, interactive=True)
+    assert remaining == 0
+    assert len(report.outcomes) == 1
+    assert value not in (repo.root / "config.py").read_text(encoding="utf-8")
+    assert not (repo.root / "config.py.bak").exists()
+
+
+def test_git_status_discovers_root_from_nested_directory_with_spaces(repo: GitRepo) -> None:
+    repo.write("a b/nested/.env", "FAKE_VALUE=x\n")
+    repo.stage("a b/nested/.env")
+    target = repo.root / "a b/nested/.env"
+    assert _get_git_toplevel(target) == repo.root
+    assert is_git_tracked(target)
+
+
+def test_git_discovery_refuses_symlinked_metadata_before_execution(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = repo.root / ".git"
+    saved = repo.root.parent / "saved-metadata"
+    metadata.rename(saved)
+    metadata.symlink_to(saved, target_is_directory=True)
+    repo.write(".env", "FAKE_VALUE=x\n")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("symlinked Git metadata must not be executed")
+
+    monkeypatch.setattr("heimdall.vault.atomic.GitAccess.execute", forbidden)
+    assert _get_git_toplevel(repo.root / ".env") is None

@@ -11,6 +11,7 @@ import itertools
 import json
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Final
 
@@ -150,6 +151,14 @@ def _verify_root_identity(root: Path, resolved_root: Path, expected: tuple[int, 
         raise ScanError("racine modifiée depuis le scan")
 
 
+def _physical_findings(findings: Iterable[Finding]) -> list[Finding]:
+    """Un patch par emplacement/empreinte, après filtrage typé du scan."""
+    unique: dict[tuple[str, int, str], Finding] = {}
+    for finding in findings:
+        unique.setdefault((finding.file, finding.line, finding.snippet_hash), finding)
+    return list(unique.values())
+
+
 def run_fix(  # noqa: PLR0913, PLR0915
     root: Path,
     *,
@@ -186,7 +195,7 @@ def run_fix(  # noqa: PLR0913, PLR0915
     proposals: list[Proposal] = []
     unfixable = 0
 
-    for finding in scan_report.findings:
+    for finding in _physical_findings(scan_report.findings):
         try:
             confined = confine(resolved_root, finding.file)
         except PathEscape:
@@ -270,7 +279,7 @@ def run_fix(  # noqa: PLR0913, PLR0915
             respect_gitignore=not no_gitignore,
         )
         _verify_root_identity(root, resolved_root, root_id)
-        remaining = len(post_scan.findings)
+        remaining = len(_physical_findings(post_scan.findings))
     else:
         remaining = unfixable + sum(1 for outcome in report.outcomes if not outcome.applied)
     return report, remaining

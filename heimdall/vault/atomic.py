@@ -743,17 +743,32 @@ def _get_git_toplevel(path: Path) -> Path | None:
     """
     try:
         path_stat = os.lstat(path)
+        if stat.S_ISLNK(path_stat.st_mode):
+            return None
         is_plain_dir = stat.S_ISDIR(path_stat.st_mode) and not stat.S_ISLNK(path_stat.st_mode)
     except OSError:
         is_plain_dir = False
     parent_dir = path if is_plain_dir else path.parent
     try:
         access = GitAccess(parent_dir)
-        res = access.execute(("rev-parse", "--show-toplevel"), timeout=_GIT_TIMEOUT_SECONDS)
-        if res.returncode == 0:
-            top = res.stdout.decode("utf-8", errors="replace").strip()
-            if top:
-                return Path(top)
+        # GitAccess interdit la découverte au-delà de son plafond. Localiser
+        # d'abord le marqueur le plus proche sur les ancêtres validés, puis
+        # lancer Git depuis cette racine, sans élargir son environnement.
+        start = access.root
+        for candidate in (start, *start.parents):
+            try:
+                marker = os.lstat(candidate / ".git")
+            except FileNotFoundError:
+                continue
+            if not (stat.S_ISREG(marker.st_mode) or stat.S_ISDIR(marker.st_mode)):
+                return None
+            repository = access if candidate == start else GitAccess(candidate)
+            res = repository.execute(("rev-parse", "--show-toplevel"), timeout=_GIT_TIMEOUT_SECONDS)
+            if res.returncode == 0:
+                top = res.stdout.decode("utf-8", errors="strict").strip()
+                if top and Path(top) == candidate:
+                    return candidate
+            return None
     except Exception:  # noqa: S110  # nosec B110
         pass
     return None
