@@ -51,7 +51,7 @@ def _load_entrypoint():
 class DockerfileSecurityTests(unittest.TestCase):
     def test_image_is_multi_stage_and_pinned(self) -> None:
         text = DOCKERFILE.read_text(encoding="utf-8")
-        self.assertEqual(text.count("FROM python:3.12-slim@sha256:"), 2)
+        self.assertEqual(text.count("FROM python:3.15-slim@sha256:"), 2)
         self.assertIn("AS builder", text)
         self.assertIn("AS runtime", text)
         self.assertIn("--require-hashes", text)
@@ -60,7 +60,7 @@ class DockerfileSecurityTests(unittest.TestCase):
         self.assertIn("python -m pip uninstall -y pip setuptools", text)
         # Durcissement revue 32b8afd : ensurepip stdlib retiré du runtime.
         self.assertIn("ensurepip", text)
-        self.assertIn("rm -rf /usr/local/lib/python3.12/ensurepip", text)
+        self.assertIn("rm -rf /usr/local/lib/python3.15/ensurepip", text)
 
     def test_image_runs_as_non_root_and_has_healthcheck(self) -> None:
         text = DOCKERFILE.read_text(encoding="utf-8")
@@ -702,13 +702,13 @@ class LockfileAndCiHardeningTests(unittest.TestCase):
         self.assertEqual(mismatches, {"opentelemetry-api": ("1.45.1", "1.45.2")})
 
     def test_dockerfile_removes_pip_and_setuptools_in_runtime(self) -> None:
-        """M-10 : l'étape runtime supprime pip, setuptools et wheel dans python:3.12-slim."""
+        """M-10 : l'étape runtime supprime pip, setuptools et wheel dans python:3.15-slim."""
         text = DOCKERFILE.read_text(encoding="utf-8")
         runtime_stage = text.split("AS runtime", maxsplit=1)[1]
-        self.assertIn("/usr/local/lib/python3.12/site-packages/pip*", runtime_stage)
-        self.assertIn("/usr/local/lib/python3.12/site-packages/setuptools*", runtime_stage)
-        self.assertIn("/usr/local/lib/python3.12/site-packages/wheel*", runtime_stage)
-        self.assertIn("/usr/local/lib/python3.12/site-packages/_distutils_hack*", runtime_stage)
+        self.assertIn("/usr/local/lib/python3.15/site-packages/pip*", runtime_stage)
+        self.assertIn("/usr/local/lib/python3.15/site-packages/setuptools*", runtime_stage)
+        self.assertIn("/usr/local/lib/python3.15/site-packages/wheel*", runtime_stage)
+        self.assertIn("/usr/local/lib/python3.15/site-packages/_distutils_hack*", runtime_stage)
         self.assertIn("/usr/local/bin/pip*", runtime_stage)
 
     def test_dockerignore_excludes_venv_ci_and_compose_limits_cpu(self) -> None:
