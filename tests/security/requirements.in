@@ -1,5 +1,5 @@
 # Separate documentation-check tooling; no runtime dependency change.
-pytest==9.1.1
+pytest==9.2.0
 pytest-cov==7.0.0
 coverage==7.16.2
 # Included on every platform so the lock also supports Python 3.10/Linux.
