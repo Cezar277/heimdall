@@ -665,7 +665,10 @@ def _strip_env_inline_comment(raw_value: str) -> str:
                 index += 2
                 continue
             if char == quote:
-                return value[: index + 1]
+                trailing = value[index + 1 :]
+                if not trailing or trailing.lstrip().startswith("#"):
+                    return value[: index + 1]
+                return value
             index += 1
         return value
     return re.split(r"\s+#", value, maxsplit=1)[0].strip()

@@ -33,7 +33,7 @@ from heimdall.scanner.finding import Finding
 from heimdall.vault.atomic import parse_env_file, parse_example_names, read_file_secure_no_follow
 
 _FIX_ERROR_MESSAGE: Final[str] = "heimdall fix : remédiation impossible (erreur d'outillage)."
-_QUOTED_LITERAL_RE: Final[re.Pattern[str]] = re.compile(r"""(['"])((?:\\.|(?!\1).)+)\1""")
+_MAX_LINE_CHARS: Final[int] = 4096
 _ASSIGNMENT_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]")
 
 
@@ -54,6 +54,41 @@ def _default_variable_name(line_text: str, finding: Finding) -> str:
         return "APP_SECRET"
 
 
+def _find_single_quoted_literal(line_text: str) -> str | None:
+    """Extrait l'unique littéral quoté d'une ligne en temps linéaire borné (O(n))."""
+    if len(line_text) > _MAX_LINE_CHARS:
+        return None
+    found: str | None = None
+    index = 0
+    length = len(line_text)
+    while index < length:
+        char = line_text[index]
+        if char in ('"', "'"):
+            quote = char
+            start = index + 1
+            cursor = start
+            closed = False
+            while cursor < length:
+                cur = line_text[cursor]
+                if cur == "\\" and cursor + 1 < length:
+                    cursor += 2
+                    continue
+                if cur == quote:
+                    closed = True
+                    break
+                cursor += 1
+            if not closed:
+                return None
+            literal = line_text[start:cursor]
+            if not literal or found is not None:
+                return None
+            found = literal
+            index = cursor + 1
+            continue
+        index += 1
+    return found
+
+
 def _extract_secret_for_finding(
     source: str,
     finding: Finding,
@@ -63,11 +98,9 @@ def _extract_secret_for_finding(
     lines = source.splitlines()
     if not 1 <= finding.line <= len(lines):
         return None
-    line_text = lines[finding.line - 1]
-    literals = _QUOTED_LITERAL_RE.findall(line_text)
-    if len(literals) != 1:
+    raw_literal = _find_single_quoted_literal(lines[finding.line - 1])
+    if raw_literal is None:
         return None
-    _quote, raw_literal = literals[0]
     try:
         plan = plan_for_finding(finding, source, raw_literal, variable)
     except TemplateError:
@@ -129,8 +162,12 @@ def run_fix(  # noqa: PLR0913
         lines = source.splitlines()
         line_text = lines[finding.line - 1] if 1 <= finding.line <= len(lines) else ""
         base_var = _default_variable_name(line_text, finding)
-        variable = deduplicate_variable_name(base_var, used_names)
-        extracted = _extract_secret_for_finding(source, finding, variable)
+        try:
+            variable = deduplicate_variable_name(base_var, used_names)
+            extracted = _extract_secret_for_finding(source, finding, variable)
+        except TemplateError:
+            unfixable += 1
+            continue
         if extracted is None:
             unfixable += 1
             continue

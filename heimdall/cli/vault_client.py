@@ -520,6 +520,12 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             continue
         try:
             record = client.get_secret(proj, env, name)
+            if record.get("status") in ("rote", "revoque"):
+                typer.echo(
+                    f"Erreur de sécurité : le secret '{preview_name(name)}' est roté ou révoqué.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
             val = record.get("value")
             if not isinstance(val, str):
                 typer.echo(

@@ -5,13 +5,14 @@ from __future__ import annotations
 import os
 import stat
 import subprocess  # nosec B404
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
 
-from heimdall.cli.fix import run_fix
+from heimdall.cli.fix import _find_single_quoted_literal, run_fix
 from heimdall.cli.main import app
 from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
 from heimdall.remediation.apply import (
@@ -313,6 +314,75 @@ def test_f11_parse_example_names_handles_export_prefix(tmp_path: Path) -> None:
     example = tmp_path / ".env.example"
     example.write_text("export FOO=bar # comment\n", encoding="utf-8")
     assert parse_example_names(example) == ["FOO"]
+
+
+def test_f11_parse_env_file_does_not_truncate_trailing_garbage_after_quote(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text('FOO="a"b\nBAR=\'a\'b\n', encoding="utf-8")
+    parsed = parse_env_file(env_file)
+    assert parsed == {"FOO": '"a"b', "BAR": "'a'b"}
+
+
+def test_m09_fix_linear_scanner_avoids_redos_on_20kb_backslashes(tmp_path: Path) -> None:
+    evil_line = '"' + ("\\" * 20_000)
+    start = time.monotonic()
+    assert _find_single_quoted_literal(evil_line) is None
+    assert time.monotonic() - start < 0.2
+
+
+def test_m09_fix_deduplication_overflow_marks_unfixable_not_exit2(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S603, S607  # nosec B603, B607
+    app_file = tmp_path / "app.py"
+    app_file.write_text(f'API_KEY = "{_FAKE_SECRET}"\n', encoding="utf-8")
+    with patch(
+        "heimdall.cli.fix._existing_env_names",
+        return_value={f"K_{i}" for i in range(10_005)},
+    ):
+        report, remaining = run_fix(tmp_path, ci=True)
+    assert remaining == 1
+    assert report.outcomes == ()
+
+
+def test_f02_vault_pull_and_run_reject_rotated_secret(tmp_path: Path) -> None:
+    exe = tmp_path / "tool.sh"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o700)
+    runner = CliRunner()
+    with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+        with patch("heimdall.cli.vault_client._init_client") as mock_init:
+            client = MagicMock()
+            client.__enter__.return_value = client
+            client.get_secret.return_value = {
+                "project": "demo",
+                "env": "dev",
+                "name": "APP_KEY",
+                "status": "rote",
+                "value": _FAKE_SECRET,
+            }
+            mock_init.return_value = client
+            with patch("heimdall.cli.vault_client.subprocess.run") as mock_run:
+                run_res = runner.invoke(
+                    app, ["run", "--project", "demo", "--name", "APP_KEY", "--", str(exe)]
+                )
+                pull_res = runner.invoke(
+                    app,
+                    [
+                        "vault",
+                        "pull",
+                        "--project",
+                        "demo",
+                        "--name",
+                        "APP_KEY",
+                        "--output",
+                        str(tmp_path / ".env"),
+                    ],
+                )
+    assert run_res.exit_code == 1
+    assert pull_res.exit_code == 1
+    mock_run.assert_not_called()
+    assert not (tmp_path / ".env").exists()
 
 
 def test_f11_parse_env_file_handles_export_and_inline_comments(tmp_path: Path) -> None:
