@@ -16,6 +16,8 @@ import urllib.request
 
 _PORT_DEFAULT = "8443"
 _TIMEOUT_SECONDS = 2
+_MAX_PORT = 65535
+_HTTP_OK = 200
 
 
 def _validated_port() -> str | None:
@@ -24,7 +26,7 @@ def _validated_port() -> str | None:
     if not raw.isdigit():
         return None
     port = int(raw)
-    if not 1 <= port <= 65535:
+    if not 1 <= port <= _MAX_PORT:
         return None
     return str(port)
 
@@ -45,7 +47,7 @@ def main() -> int:
     opener = urllib.request.build_opener(*handlers)
     try:
         with opener.open(url, timeout=_TIMEOUT_SECONDS) as response:
-            return 0 if response.status == 200 else 1
+            return 0 if response.status == _HTTP_OK else 1
     except Exception:
         # Message générique : jamais de chemin, de certificat ni de secret.
         print("healthcheck: indisponible", file=sys.stderr)

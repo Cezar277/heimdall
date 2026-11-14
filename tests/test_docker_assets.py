@@ -657,5 +657,82 @@ class UidGidGuardTests(unittest.TestCase):
         self.assertNotIn("set -a", guide)
 
 
+class LockfileAndCiHardeningTests(unittest.TestCase):
+    """Non-régression #232 (E-06, M-10, M-12, F-13)."""
+
+    @staticmethod
+    def _parse_pinned_versions(lock_path: Path) -> dict[str, str]:
+        pinned: dict[str, str] = {}
+        pattern = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s;\\]+)")
+        for raw_line in lock_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            match = pattern.match(line)
+            if match:
+                name = match.group(1).lower().replace("_", "-")
+                pinned[name] = match.group(2)
+        return pinned
+
+    def test_runtime_lock_versions_match_main_lock(self) -> None:
+        """E-06 : les paquets partagés des deux lockfiles sont alignés."""
+        main_versions = self._parse_pinned_versions(ROOT / "requirements.lock")
+        runtime_versions = self._parse_pinned_versions(RUNTIME_LOCK)
+        self.assertGreater(len(runtime_versions), 0)
+        mismatches = {
+            pkg: (runtime_versions[pkg], main_versions[pkg])
+            for pkg in sorted(set(runtime_versions) & set(main_versions))
+            if runtime_versions[pkg] != main_versions[pkg]
+        }
+        self.assertEqual(mismatches, {})
+
+    def test_dockerfile_removes_pip_and_setuptools_in_runtime(self) -> None:
+        """M-10 : l'étape runtime supprime pip et setuptools préinstallés dans python:3.12-slim."""
+        text = DOCKERFILE.read_text(encoding="utf-8")
+        runtime_stage = text.split("AS runtime", maxsplit=1)[1]
+        self.assertIn("/usr/local/lib/python3.12/site-packages/pip*", runtime_stage)
+        self.assertIn("/usr/local/lib/python3.12/site-packages/setuptools*", runtime_stage)
+        self.assertIn("/usr/local/bin/pip*", runtime_stage)
+
+    def test_dockerignore_excludes_venv_ci_and_compose_limits_cpu(self) -> None:
+        """M-10/F-13 : .venv-ci ignoré au build et CPU borné dans docker-compose.yml."""
+        ignore_lines = {
+            line.strip()
+            for line in DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        self.assertIn(".venv-ci", ignore_lines)
+        compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+        vault = compose["services"]["vault"]
+        self.assertIn("cpus", vault)
+        self.assertGreater(float(vault["cpus"]), 0.0)
+
+    def test_ci_audits_all_locks_and_lints_scripts_and_docker(self) -> None:
+        """E-06/M-12 : ci.yml audite tous les locks et passe ruff/bandit sur scripts et docker."""
+        ci_text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("ruff check heimdall tests scripts docker", ci_text)
+        self.assertIn("bandit -r heimdall scripts docker -q", ci_text)
+        self.assertIn("pip-audit --no-deps --disable-pip -r requirements-runtime.lock", ci_text)
+        self.assertIn(
+            "pip-audit --no-deps --disable-pip -r tests/contracts/requirements.txt",
+            ci_text,
+        )
+        self.assertIn(
+            "pip-audit --no-deps --disable-pip -r tests/security/requirements.txt",
+            ci_text,
+        )
+
+    def test_dependabot_covers_pip_subprojects_npm_and_docker(self) -> None:
+        """M-12 : dependabot.yml couvre npm, docker et les requirements de tests."""
+        dep = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))
+        entries = {(u["package-ecosystem"], u["directory"]) for u in dep["updates"]}
+        self.assertIn(("pip", "/"), entries)
+        self.assertIn(("pip", "/tests/contracts"), entries)
+        self.assertIn(("pip", "/tests/security"), entries)
+        self.assertIn(("npm", "/"), entries)
+        self.assertIn(("docker", "/"), entries)
+        self.assertIn(("github-actions", "/"), entries)
+
+
 if __name__ == "__main__":
     unittest.main()
