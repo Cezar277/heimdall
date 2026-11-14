@@ -55,11 +55,16 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
     pour le fichier unique. Un chemin non analysable (octet NUL, type
     inattendu, racine absente) est refusé en ``ScanError`` statique, jamais
     en ``ValueError``/``TypeError`` brut (contrat d'erreur unique).
+
+    Les chaînes et PathLike réellement vides sont refusés avant Path().
+    Un Path déjà construit à partir de "" est identique à Path(".") :
+    il désigne le répertoire courant, sans provenance récupérable.
     """
-    if isinstance(root, str) and not root:
-        raise ScanError(_MSG_SCAN_IMPOSSIBLE)
     try:
-        absolute = Path(os.path.abspath(Path(root).expanduser()))
+        raw_root = os.fspath(root)
+        if not raw_root:
+            raise ScanError(_MSG_SCAN_IMPOSSIBLE)
+        absolute = Path(os.path.abspath(Path(raw_root).expanduser()))
         for candidate in (absolute, *absolute.parents):
             if candidate.is_symlink():
                 raise ScanError(_MSG_SCAN_IMPOSSIBLE)

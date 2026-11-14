@@ -224,7 +224,7 @@ def is_known_binary(data: bytes) -> bool:
     return _is_known_binary(data)
 
 
-def decode_text(data: bytes, *, strict: bool = False) -> str | None:  # noqa: PLR0911 - encodages distincts
+def decode_text(data: bytes, *, strict: bool = True) -> str | None:  # noqa: PLR0911 - encodages distincts
     """Décode un texte ou rend None pour un contenu non textuel (#229).
 
     - BOM UTF-8/UTF-16/UTF-32 : décodage strict ;

@@ -50,6 +50,13 @@ from heimdall.scanner.errors import ScanError
 #: par un observateur du canal stderr (invariant 8, oracle minimal).
 _SCAN_ERROR_MESSAGE: Final[str] = "heimdall scan : scan impossible (erreur d'outillage)."
 
+
+def _scan_root_argument(path: str) -> Path:
+    """Refuse un argument vide avant sa normalisation par Path en point."""
+    if not path:
+        raise ScanError("scan impossible : entrée non analysable")
+    return Path(path)
+
 app = typer.Typer(
     name="heimdall",
     help="Sentinelle DevSecOps 100 % locale : empêche les secrets de finir dans Git.",
@@ -189,7 +196,7 @@ def scan(  # noqa: PLR0913, PLR0917
     try:
         custom_allowlist = Allowlist.empty() if no_allowlist else None
         report = collect(
-            Path(path),
+            _scan_root_argument(path),
             staged=staged,
             diff=diff,
             config=config,
@@ -268,7 +275,9 @@ def cold_start(
     chemin opérateur par défaut. --ci ou --no-llm désactive ce journal.
     """
     try:
-        report = collect_cold_start(Path(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes)
+        report = collect_cold_start(
+            _scan_root_argument(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes
+        )
         typer.echo(render_cold_start(report, json_output=json_output))
     except Exception:
         _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
@@ -300,7 +309,7 @@ def deep_scan(  # noqa: PLR0913, PLR0917 - options CLI explicites
     """
     try:
         report = collect_history(
-            Path(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes, strict=strict
+            _scan_root_argument(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes, strict=strict
         )
         typer.echo(render_history(report, json_output=json_output))
         exit_code = (

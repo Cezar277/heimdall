@@ -576,6 +576,9 @@ class Scanner:
                 self._files_scanned += 1
                 before_skips = len(self._skipped)
                 text = prepare_text(text, relative, strict=self._strict, skipped=self._skipped)
+                if len(self._skipped) > self._max_files:
+                    del self._skipped[before_skips:]
+                    raise ScanError(_SCAN_ERROR)
                 if self._skipped_files is not None and len(self._skipped) > before_skips:
                     self._skipped_files.append(relative)
                 # Le plafond Findings est vérifié à deux granularités : par

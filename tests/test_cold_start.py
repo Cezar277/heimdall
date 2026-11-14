@@ -81,6 +81,12 @@ def test_clean_repo_never_calls_llm(repo: GitRepo) -> None:
     assert collect_cold_start(repo.root, chat=forbidden).opinions == ()
 
 
+def test_latin1_context_keeps_explicit_tolerant_decoding(repo: GitRepo) -> None:
+    repo.write_bytes("app.py", f'# café\nkey = "{SYNTHETIC}"\n'.encode("cp1252"))
+    report = collect_cold_start(repo.root, chat=_secret_chat)
+    assert len(report.scan.findings) == len(report.opinions) == 1
+
+
 def test_false_positive_is_kept_and_journaled(repo: GitRepo, tmp_path: Path) -> None:
     repo.write("app.py", f'key = "{SYNTHETIC}"\n')
     journal = RejectionJournal(tmp_path / "private" / "rejections.jsonl")

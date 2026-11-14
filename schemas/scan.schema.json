@@ -14,11 +14,14 @@
   "properties": {
     "complete": {
       "type": "boolean",
-      "description": "False si du contenu est exclu par la politique de tolérance (#229)."
+      "default": true,
+      "description": "Absent = analyse complète selon le périmètre déclaré. False si du contenu est exclu par la politique de tolérance (#229)."
     },
-    "skipped_count": { "type": "integer", "minimum": 0 },
+    "skipped_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Absent = aucun fichier exclu par la politique de contenu." },
     "skipped": {
       "type": "array",
+      "default": [],
+      "description": "Absent = aucune trace d'exclusion de contenu.",
       "items": {
         "type": "object",
         "additionalProperties": false,

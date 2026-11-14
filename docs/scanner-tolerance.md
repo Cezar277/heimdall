@@ -49,6 +49,11 @@ Quand du contenu est écarté, le JSON `heimdall.scan.v1` ajoute les champs
 optionnels `complete: false`, `skipped_count` (nombre de fichiers distincts)
 et `skipped`, tableau d'objets `{file, reason, line}`. Le schéma versionné
 accepte ces champs. Les rapports sans exclusion gardent leur forme précédente.
+Pour ces rapports v1, l'absence de `complete` signifie `true`, l'absence
+de `skipped_count` signifie `0` et l'absence de `skipped` signifie `[]`.
+Les `default` du schéma sont des annotations : un consommateur JSON applique
+ces valeurs, par exemple `payload.get("complete", True)`. Le producteur
+émet toujours `complete: false` lorsqu'il existe une exclusion de contenu.
 L'historique utilise ses champs existants `complete` et `skipped`, avec
 un chemin et un commit pour chaque occurrence, y compris après réutilisation
 du cache de blobs.
@@ -81,7 +86,7 @@ Les traces d'exclusion de l'index et du diff sont plafonnées à
 
 `Scanner(root)`, `scan(root)`, `find_candidates(root)`, `collect(...)` et
 `collect_history(...)` sont stricts par défaut, ainsi que les helpers privés
-de collecte et d'analyse des blobs. La tolérance doit être
+de collecte, d'analyse des blobs et `decode_text`. La tolérance doit être
 demandée explicitement par `strict=False` ; un appelant doit alors exploiter
 le rapport de couverture (`scanner.skipped` / `report.complete`). La CLI
 demande explicitement cette collecte pour rendre les traces puis applique
@@ -96,6 +101,16 @@ avec cette couverture. `deep-scan` rend son rapport et retourne 2
 s'il est partiel sans finding, ou 1 si un finding est présent. Le prétraitement
 des jetons traite chaque ligne une fois et calcule sa taille UTF-8 une fois ;
 aucun préfixe du fichier n'est recompté pour chaque jeton.
+Les traces ajoutées par le prétraitement de l'arbre respectent aussi
+`max_files` : en cas de dépassement, les ajouts du fichier courant sont
+annulés et le scan refuse sans rendre de résultat réussi.
+
+Les arguments CLI vides et les chaînes/objets `PathLike` dont `os.fspath`
+est vide sont refusés avant conversion en `Path`. `Path("")` vaut déjà
+`Path(".")`, et `os.fspath(Path(""))` vaut `"."` : aucune API ne peut
+retrouver la chaîne d'origine. Cette valeur normalisée reste une demande
+valide d'analyser le répertoire courant, comme `Path(".")` ; elle n'est
+pas présentée comme une racine vide détectable après coup.
 
 ## Vérification sur Heimdall
 

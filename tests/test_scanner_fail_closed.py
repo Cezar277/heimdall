@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -10,19 +11,22 @@ from pathlib import Path
 import pytest
 from support.fake_secrets import fake_token
 from support.git_repo import GitRepo
+from test_cli_scan import _scan_validator
 from typer.testing import CliRunner
 
 import heimdall.cli.history as history_module
 import heimdall.cli.main as main_module
 import heimdall.cli.scan as scan_module
+import heimdall.scanner.detect as detect_module
 from heimdall.cli.cold_start import ColdStartReport
 from heimdall.cli.history import collect_history
 from heimdall.cli.main import app
-from heimdall.cli.scan import ScanReport, collect
+from heimdall.cli.scan import ScanReport, collect, render_json
 from heimdall.mcp.gitdiff import GitAccess
 from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.detect import MAX_FILE_BYTES, Scanner, find_candidates, scan
 from heimdall.scanner.errors import ScanError
+from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.policy import ScanSkip, prepare_text
 
 SYNTHETIC = fake_token("ghp_", 36)
@@ -286,3 +290,80 @@ def test_private_scan_rejects_an_already_overfull_skip_collector(
             strict=False,
             skipped=[ScanSkip("a", "binary"), ScanSkip("b", "binary")],
         )
+
+
+def test_decoder_is_strict_by_default_and_tolerance_is_explicit() -> None:
+    with pytest.raises(ScanError):
+        decode_text(b"caf\xe9")
+    assert decode_text(b"caf\xe9", strict=False) == "café"
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_tree_preprocessing_keeps_skip_collector_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fallback: bool
+) -> None:
+    for name in ("a", "b"):
+        (tmp_path / name).write_text("A" * 5000 + "\n", encoding="utf-8")
+    if fallback:
+        monkeypatch.setattr(detect_module, "_DIR_FD_SUPPORTED", False)
+    scanner = Scanner(tmp_path, strict=False, max_files=2)
+    with pytest.raises(ScanError):
+        scanner.scan()
+    assert len(scanner.skipped) == 2
+    assert {item.file for item in scanner.skipped} == {"a"}
+
+
+class _EmptyPath:
+    def __fspath__(self) -> str:
+        return ""
+
+
+@pytest.mark.parametrize("api", ["scanner", "collect"])
+@pytest.mark.parametrize("kind", ["str", "pathlike"])
+def test_raw_empty_roots_are_rejected_before_path_normalization(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch, api: str, kind: str
+) -> None:
+    monkeypatch.chdir(repo.root)
+    root = "" if kind == "str" else _EmptyPath()
+    with pytest.raises(ScanError):
+        if api == "scanner":
+            Scanner(root).scan()
+        else:
+            collect(root, staged=False)
+
+
+def test_normalized_dot_paths_remain_valid_explicit_current_directory(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(repo.root)
+    assert Path("") == Path(".")
+    assert os.fspath(Path("")) == "."
+    assert Scanner(Path(".")).scan() == []
+    assert collect(Path(""), staged=False).complete
+
+
+@pytest.mark.parametrize("command", ["scan", "cold-start", "deep-scan"])
+def test_cli_rejects_empty_root_argument(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    monkeypatch.chdir(repo.root)
+    result = CliRunner().invoke(app, [command, "--ci", ""])
+    assert result.exit_code == 2
+    assert result.stdout == ""
+
+
+def test_optional_complete_field_has_documented_true_default() -> None:
+    validator = _scan_validator()
+    assert validator.schema["properties"]["complete"]["default"] is True
+    complete = json.loads(render_json(ScanReport(scope="working-tree", findings=())))
+    validator.validate(complete)
+    assert complete.get("complete", True) is True
+    partial = json.loads(
+        render_json(
+            ScanReport(
+                scope="working-tree", findings=(), skipped=(ScanSkip("image.png", "binary"),)
+            )
+        )
+    )
+    validator.validate(partial)
+    assert partial.get("complete", True) is False

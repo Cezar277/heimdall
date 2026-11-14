@@ -82,7 +82,7 @@ def test_non_utf8_text_is_scanned(repo: GitRepo, encoding: str, staged: bool) ->
 
 @pytest.mark.parametrize("data", [BINARY, b"\x00\x01\x02\x03" * 100, b"OTTO" + b"\x00\x01" * 50])
 def test_unknown_and_known_binary_content_is_classified(data: bytes) -> None:
-    assert decode_text(data) is None
+    assert decode_text(data, strict=False) is None
 
 
 @pytest.mark.parametrize("staged", [False, True])
