@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess  # nosec B404
 import time
@@ -24,6 +25,7 @@ from heimdall.remediation.apply import (
 from heimdall.remediation.env import EnvRemediationError
 from heimdall.remediation.naming import (
     _MAX_TAKEN,
+    EXECUTION_DANGEROUS_ENV_EXACT,
     is_dangerous_env_var,
     is_dangerous_exec_env_var,
 )
@@ -392,10 +394,46 @@ def test_f02_vault_pull_and_run_reject_non_vaulte_secret(
     assert not (tmp_path / ".env").exists()
 
 
-@pytest.mark.parametrize("name", ["CUSTOM_PROXY", "SSLKEYLOGFILE", "NODE_OPTIONS"])
+@pytest.mark.parametrize(
+    "name",
+    ["CUSTOM_PROXY", "SSLKEYLOGFILE", "NODE_OPTIONS", *sorted(EXECUTION_DANGEROUS_ENV_EXACT)],
+)
 def test_m08_denylist_sync_between_remediation_and_exec(name: str) -> None:
     assert is_dangerous_env_var(name) is True
     assert is_dangerous_exec_env_var(name) is True
+
+
+def test_m09_fix_rejects_replaced_root_inode(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)  # noqa: S603, S607  # nosec B603, B607
+    (repo / "app.py").write_text(f'API_KEY = "{_FAKE_SECRET}"\n', encoding="utf-8")
+
+    def _swap_and_apply(proposals, *, apply=None, **_kwargs):
+        shutil.rmtree(repo)
+        repo.mkdir()
+        (repo / "app.py").write_text(f'API_KEY = "{_FAKE_SECRET}"\n', encoding="utf-8")
+        for prop in proposals:
+            if apply is not None:
+                apply(prop)
+        return ReviewReport((), True)
+
+    with patch("heimdall.cli.fix.review_proposals", side_effect=_swap_and_apply):
+        runner = CliRunner()
+        res = runner.invoke(app, ["fix", str(repo)])
+    assert res.exit_code == 2
+    assert _FAKE_SECRET in (repo / "app.py").read_text(encoding="utf-8")
+
+
+def test_f10_cleanup_backup_file_rejects_symlink_target(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("do not delete\n", encoding="utf-8")
+    bak_link = tmp_path / "app.py.bak"
+    bak_link.symlink_to(outside)
+    receipt = AppliedPatch(file="app.py", backup="app.py.bak", mode=0o600, after="x\n")
+    with pytest.raises(ApplyError):
+        cleanup_backup_file(tmp_path, receipt)
+    assert outside.read_text(encoding="utf-8") == "do not delete\n"
 
 
 def test_m09_existing_env_names_is_bounded_on_large_env(tmp_path: Path) -> None:

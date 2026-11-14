@@ -186,21 +186,10 @@ def is_dangerous_env_var(name: object) -> bool:
 
 
 #: Noms exacts bloqués à l'exécution (`heimdall run`) et dans le Vault (`push`/`pull`).
+#: Les 13 noms exacts HTTP_PROXY..NODE_OPTIONS sont déjà vérifiés par
+#: `is_dangerous_env_var`, à laquelle `is_dangerous_exec_env_var` délègue.
 EXECUTION_DANGEROUS_ENV_EXACT: Final[frozenset[str]] = DANGEROUS_ENV_EXACT | frozenset(
     {
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "SSLKEYLOGFILE",
-        "CLASSPATH",
-        "PHPRC",
-        "PHP_INI_SCAN_DIR",
-        "CURL_HOME",
-        "WGETRC",
-        "GNUPGHOME",
-        "ELECTRON_RUN_AS_NODE",
-        "NODE_OPTIONS",
         "GIT_SSH_COMMAND",
         "DOCKER_HOST",
         "NPM_CONFIG_REGISTRY",

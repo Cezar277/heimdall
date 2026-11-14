@@ -153,8 +153,9 @@ def cleanup_backup_file(root: Path, receipt: AppliedPatch) -> None:
         confined = confine(root, receipt.backup)
     except PathEscape:
         raise ApplyError from None
+    raw_backup = root.resolve() / receipt.backup
     try:
-        if os.path.islink(confined.absolute):
+        if os.path.islink(raw_backup) or os.path.islink(confined.absolute):
             raise ApplyError
         os.unlink(confined.absolute)
     except FileNotFoundError:
@@ -203,24 +204,19 @@ def apply_replacement(  # noqa: PLR0912
             write_file_atomic(confined.absolute, plan.after, mode=mode)
         except ValueError:
             raise ApplyError from None
-        if cleanup_backup:
-            try:
-                if not os.path.islink(backup):
-                    os.unlink(backup)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                raise ApplyError from None
     except ApplyError:
         raise
     except Exception:
         raise ApplyError from None
-    return AppliedPatch(
+    receipt = AppliedPatch(
         file=confined.relative,
         backup=backup_rel,
         mode=mode,
         after=plan.after,
     )
+    if cleanup_backup:
+        cleanup_backup_file(root, receipt)
+    return receipt
 
 
 def undo_apply(root: Path, receipt: AppliedPatch) -> None:

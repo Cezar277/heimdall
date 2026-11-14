@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import re
 from pathlib import Path
 from typing import Final
@@ -142,6 +143,11 @@ def run_fix(  # noqa: PLR0913, PLR0915
     if root.is_symlink():
         raise ScanError("racine symlinkée refusée")
     resolved_root = root.resolve()
+    try:
+        root_stat = os.stat(resolved_root)
+    except OSError:
+        raise ScanError("racine inaccessible") from None
+    root_id = (root_stat.st_dev, root_stat.st_ino, root_stat.st_ctime_ns)
     scan_report = collect(
         resolved_root,
         staged=False,
@@ -194,6 +200,12 @@ def run_fix(  # noqa: PLR0913, PLR0915
 
     def _apply(proposal: Proposal) -> None:
         if root.is_symlink() or root.resolve() != resolved_root:
+            raise ApplyError
+        try:
+            current_stat = os.stat(resolved_root)
+        except OSError:
+            raise ApplyError from None
+        if (current_stat.st_dev, current_stat.st_ino, current_stat.st_ctime_ns) != root_id:
             raise ApplyError
         entry = plans_by_finding.get(proposal.finding)
         if entry is None:
