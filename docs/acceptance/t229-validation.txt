@@ -24,7 +24,21 @@ du depot ; aucune allowlist active. Ne pas confondre code 1 et erreur.
 Rapports bruts hors depot : /home/nathan/heimdall-t229-self-scan.json
 et /home/nathan/heimdall-t229-self-scan.stderr.
 
-Rejeu sur 7019d78a1c60846598ec5e786ff87efe025fb20c :
+Premier rejeu avant rebase sur la fusion #240 (base initiale c35df09) :
 python -m pytest tests/test_scanner_tolerance.py tests/security/test_prompt_injection.py -o addopts= -q
 30 passed in 2.70s
 Auto-scan ci-dessus rejoue sur cette meme revision.
+
+Integration de #240 / #228, base 6bbe7da, code 25a375cc364da9e89f50d3cac0f8210c2b17c17a :
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-integrated.xml
+3878 passed, 18 skipped, 14 warnings, 6911 subtests passed in 333.39s
+
+Auto-scan apres integration : exit 1, 4011 candidats, 324 fichiers analyses,
+3 exclusions de contenu identiques ; pas d'arret en code 2.
+Le JSON et le stderr bruts ont ete actualises aux chemins ci-dessus.
+
+Dernier ajustement : strict=True refuse aussi les gros fichiers avec un
+collecteur skipped_files explicite. Aucun changement de la politique CLI par defaut.
+python -m pytest tests/test_scanner_detect.py tests/test_scanner_tolerance.py tests/test_cold_start.py tests/test_history.py -o addopts= -q --tb=short
+316 passed in 6.47s
+Rapport : /home/nathan/heimdall-t229-strict.xml
