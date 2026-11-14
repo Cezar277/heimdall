@@ -65,6 +65,34 @@ MAX_REJECTION_EVENTS: Final[int] = 10_000
 _AUDIT_STREAM_ACCESS: Final[str] = "access"
 _AUDIT_STREAM_REJECTION: Final[str] = "rejection"
 _REJECTION_STATUS_CODES: Final[frozenset[int]] = frozenset({401, 429})
+
+# Requêtes des tables d'état de chaîne, écrites en toutes lettres pour chaque
+# table : aucun nom de table n'est interpolé dans du SQL (bandit B608).
+_CHECKPOINT_SELECT_SQL: Final[dict[str, str]] = {
+    "audit_chain_state": (
+        "SELECT checkpoint_hash, pruned_events FROM audit_chain_state WHERE id = 1"
+    ),
+    "audit_rejection_chain_state": (
+        "SELECT checkpoint_hash, pruned_events FROM audit_rejection_chain_state WHERE id = 1"
+    ),
+}
+_CHECKPOINT_UPSERT_SQL: Final[dict[str, str]] = {
+    "audit_chain_state": (
+        "INSERT INTO audit_chain_state (id, checkpoint_hash, pruned_events, updated_at) "
+        "VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+        "checkpoint_hash = excluded.checkpoint_hash, "
+        "pruned_events = audit_chain_state.pruned_events + excluded.pruned_events, "
+        "updated_at = excluded.updated_at"
+    ),
+    "audit_rejection_chain_state": (
+        "INSERT INTO audit_rejection_chain_state "
+        "(id, checkpoint_hash, pruned_events, updated_at) "
+        "VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+        "checkpoint_hash = excluded.checkpoint_hash, "
+        "pruned_events = audit_rejection_chain_state.pruned_events + excluded.pruned_events, "
+        "updated_at = excluded.updated_at"
+    ),
+}
 # Purge par lots : chaque transaction ne supprime qu'un lot borné, pour ne pas
 # tenir le verrou d'écriture SQLite pendant une purge massive (excess >> 1).
 _PRUNE_BATCH_SIZE: Final[int] = 1_000
@@ -543,11 +571,8 @@ class SqliteAuditLog(AuditLog):
     @classmethod
     def _checkpoint(cls, conn: Any, stream: str) -> tuple[str, int]:
         """Retourne le point de contrôle et le nombre d'événements purgés du flux."""
-        table = cls._state_table(stream)
-        # `table` provient d'un ensemble fermé de deux noms constants.
-        row = conn.execute(
-            f"SELECT checkpoint_hash, pruned_events FROM {table} WHERE id = 1"  # noqa: S608
-        ).fetchone()
+        # Requête constante par flux : aucun nom de table interpolé (B608).
+        row = conn.execute(_CHECKPOINT_SELECT_SQL[cls._state_table(stream)]).fetchone()
         if row is None:
             return GENESIS_HASH, 0
         return str(row["checkpoint_hash"]), int(row["pruned_events"])
@@ -581,16 +606,8 @@ class SqliteAuditLog(AuditLog):
             "DELETE FROM audit_events WHERE id = ?",
             [(int(item["id"]),) for item in rows],
         )
-        table = cls._state_table(stream)
-        # `table` provient d'un ensemble fermé de deux noms constants.
         conn.execute(
-            f"INSERT INTO {table} ("  # noqa: S608
-            "id, checkpoint_hash, pruned_events, updated_at"
-            ") VALUES (1, ?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET "
-            "checkpoint_hash = excluded.checkpoint_hash, "
-            f"pruned_events = {table}.pruned_events + excluded.pruned_events, "
-            "updated_at = excluded.updated_at",
+            _CHECKPOINT_UPSERT_SQL[cls._state_table(stream)],
             (checkpoint_hash, len(rows), get_iso_timestamp()),
         )
         return excess > len(rows)
