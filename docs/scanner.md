@@ -212,13 +212,16 @@ sous-module : `gitdir: …`), pas le répertoire `.git/` : seul un segment
 **parent** de chemin peut classer hors périmètre. Son contenu est lu comme
 celui de tout autre fichier.
 
-Depuis #229, `Scanner(root)` et la CLI tolèrent les binaires, les fichiers
+Depuis #229, `Scanner(root, strict=False)` et la collecte CLI tolèrent les binaires, les fichiers
 trop gros et les liens symboliques internes sans les suivre. Les exclusions
 de contenu sont exposées dans `scanner.skipped` et dans le rapport de la CLI.
 `strict=True` / `--strict` rétablit le refus des exclusions de contenu ; la
 base VCS et les exclusions Git sûres restent identiques dans les deux modes.
-Les helpers qui ne rendent qu'une liste (`scan`, `find_candidates`) restent
-stricts par défaut afin de ne pas perdre les informations de couverture.
+Toutes les API (`Scanner`, `scan`, `find_candidates`, `collect`, historique)
+sont strictes par défaut. La CLI rend les traces avant le verdict, mais
+aucun rapport partiel ne produit un code 0 : code 1 si un candidat est
+détecté, code 2 sinon. Les helpers ne rendant qu'une liste ne doivent pas
+servir à interpréter une analyse tolérante comme complète.
 
 ### Encodages et limites de contenu
 

@@ -4,6 +4,8 @@
 qui empêchaient auparavant toute analyse du dépôt. Les erreurs de lecture,
 les objets incohérents, les conflits d'index, les racines invalides et les
 dépassements des budgets globaux restent des erreurs d'outillage (code 2).
+Cette tolérance permet de rendre les résultats et les traces ; elle ne
+permet jamais un verdict propre sur un rapport partiel, en CI comme hors CI.
 
 ```sh
 heimdall scan --ci --no-allowlist .
@@ -18,7 +20,7 @@ heimdall deep-scan --ci --strict .
 | Contenu | Mode par défaut | Mode `--strict` |
 | --- | --- | --- |
 | Texte UTF-8, UTF-16 ou UTF-32 | analysé, avec ou sans BOM lorsque l'heuristique est applicable | analysé avec les gardes de décodage historiques |
-| Texte Latin-1 / CP1252 | repli CP1252, remplacement des octets non définis ; candidats ASCII préservés | UTF-8 invalide refusé |
+| Texte Latin-1 / CP1252 | repli CP1252, remplacement des octets non définis ; candidats ASCII préservés même avec du bruit de contrôle | UTF-8 invalide refusé |
 | Binaire connu ou contenu sans décodage textuel plausible | ignoré, trace `binary` | code 2 |
 | Fichier/blob > 1 Mio (ou plafond explicitement abaissé) | ignoré sans lire son contenu, trace `too_large` | code 2 |
 | Lien rencontré dans l'arbre de travail | jamais suivi, trace `symlink` | code 2 |
@@ -51,28 +53,41 @@ L'historique utilise ses champs existants `complete` et `skipped`, avec
 un chemin et un commit pour chaque occurrence, y compris après réutilisation
 du cache de blobs.
 
-- `0` : aucun candidat détecté dans le contenu effectivement analysé.
+- `0` : aucun candidat détecté et aucune exclusion de contenu.
 - `1` : au moins un candidat détecté, même si d'autres contenus ont été écartés.
-- `2` : erreur d'outillage ou contenu refusé en mode strict.
+- `2` : erreur d'outillage, refus strict, ou rapport partiel sans candidat détecté.
 
-Un code 0 accompagné de `complete: false` ne prouve pas que les contenus
-écartés sont exempts de secrets. Les binaires, archives, portions de texte
-hors borne et cibles de liens ne sont pas couverts. Une politique CI exigeant
-une couverture sans ces exclusions doit utiliser `--strict` ou vérifier
-les traces. `--no-allowlist` désactive l'allowlist, pas ces limites physiques.
+La combinaison `complete: false` et code 0 est interdite, y compris sans
+`--ci` : les hooks et automatismes existants restent bloqués. Les binaires,
+archives, portions de texte hors borne et cibles de liens ne sont pas
+couverts. Les traces sont informatives ; leur lecture n'est jamais nécessaire
+pour empêcher un pipeline vert sur une analyse partielle. `--strict` permet
+de refuser dès la rencontre du contenu concerné, plutôt que de poursuivre
+les autres fichiers. `--no-allowlist` ne désactive pas cette garde.
+
+Un texte UTF-8 valide ou décodé par le repli CP1252 est analysé sans seuil
+de caractères imprimables : ajouter du bruit non imprimable autour d'un
+candidat ASCII ne le transforme pas en exclusion. Le seuil reste utilisé
+pour choisir un décodage UTF-16/32 plausible, pas pour écarter ces textes.
+Les tailles annoncées des gros fichiers et blobs exclus consomment aussi
+les budgets globaux de l'arbre et de l'index, sans lecture de leur contenu.
 
 ## Bibliothèque et autres commandes
 
-`Scanner(root)` expose ses exclusions dans `scanner.skipped`. Les helpers
-`scan(root)` et `find_candidates(root)`, qui ne renvoient qu'une liste de
-Findings sans rapport de couverture, restent stricts par défaut. Le moteur
-de signatures et les primitives d'entropie restent stricts par défaut ;
-les orchestrateurs tolérants préparent explicitement leur texte.
+`Scanner(root)`, `scan(root)`, `find_candidates(root)`, `collect(...)` et
+`collect_history(...)` sont stricts par défaut. La tolérance doit être
+demandée explicitement par `strict=False` ; un appelant doit alors exploiter
+le rapport de couverture (`scanner.skipped` / `report.complete`). La CLI
+demande explicitement cette collecte pour rendre les traces puis applique
+la garde de code de sortie ci-dessus. Le moteur de signatures et les
+primitives d'entropie restent également stricts par défaut.
 
 Le cold start conserve son contrat de rapport incomplet : son collecteur
 `skipped_files` inclut les exclusions rencontrées et sa CLI retourne 2 si
-ce collecteur n'est pas vide. Le mode historique tolérant rend son rapport
-au lieu d'échouer sur un binaire ; `deep-scan --strict` conserve le refus.
+ce collecteur n'est pas vide. `deep-scan` rend son rapport et retourne 2
+s'il est partiel sans finding, ou 1 si un finding est présent. Le prétraitement
+des jetons traite chaque ligne une fois et calcule sa taille UTF-8 une fois ;
+aucun préfixe du fichier n'est recompté pour chaque jeton.
 
 ## Vérification sur Heimdall
 

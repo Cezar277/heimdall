@@ -51,7 +51,9 @@ def test_binary_is_reported_and_other_secrets_are_still_detected(repo: GitRepo, 
     if mode == "diff":
         repo.git("commit", "-qm", "changes")
     options = {"diff": base, "ci": True} if mode == "diff" else {}
-    report = collect(repo.root, staged=mode == "staged", allowlist=Allowlist.empty(), **options)
+    report = collect(
+        repo.root, staged=mode == "staged", allowlist=Allowlist.empty(), strict=False, **options
+    )
     assert any(item.file == "app.py" for item in report.findings)
     assert [(item.file, item.reason) for item in report.skipped] == [("image.png", "binary")]
     assert report.scanned_files == (2 if mode == "tree" else 1)
@@ -73,7 +75,7 @@ def test_binary_is_reported_and_other_secrets_are_still_detected(repo: GitRepo, 
 def test_non_utf8_text_is_scanned(repo: GitRepo, encoding: str, staged: bool) -> None:
     repo.write_bytes("config.txt", f'# café\nTOKEN = "{SYNTHETIC}"\n'.encode(encoding))
     repo.stage("config.txt")
-    report = collect(repo.root, staged=staged, allowlist=Allowlist.empty())
+    report = collect(repo.root, staged=staged, allowlist=Allowlist.empty(), strict=False)
     assert any(item.file == "config.txt" and item.line == 2 for item in report.findings)
     assert report.complete
 
@@ -93,7 +95,7 @@ def test_oversized_file_is_not_read(
         monkeypatch.setattr(
             GitAccess, "blob_bytes", lambda *args, **kwargs: pytest.fail("large blob read")
         )
-    report = collect(repo.root, staged=staged, allowlist=Allowlist.empty())
+    report = collect(repo.root, staged=staged, allowlist=Allowlist.empty(), strict=False)
     assert [(item.file, item.reason) for item in report.skipped] == [("large.dat", "too_large")]
     assert not report.complete
 
@@ -104,7 +106,7 @@ def test_long_token_does_not_hide_a_separate_secret_on_the_same_line(
 ) -> None:
     repo.write("notebook.ipynb", '"image": "' + "A" * 8192 + f'", "token": "{SYNTHETIC}"\n')
     repo.stage("notebook.ipynb")
-    report = collect(repo.root, staged=staged, allowlist=Allowlist.empty())
+    report = collect(repo.root, staged=staged, allowlist=Allowlist.empty(), strict=False)
     assert any(item.file == "notebook.ipynb" for item in report.findings)
     assert any(item.reason == "long_token" and item.line == 1 for item in report.skipped)
     assert SYNTHETIC not in render_json(report)
@@ -130,7 +132,7 @@ def test_symlinks_are_traced_without_resolving_or_reading_targets(
         return real_resolve(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", resolve)
-    scanner = Scanner(root)
+    scanner = Scanner(root, strict=False)
     assert scanner.scan() == []
     assert {(item.file, item.reason) for item in scanner.skipped} == {
         ("link.py", "symlink"),
@@ -146,7 +148,7 @@ def test_cli_binary_only_report_has_explicit_coverage(repo: GitRepo, strict: boo
     repo.stage("image.png")
     args = ["scan", "--ci", "--staged", "--no-allowlist", "--json", str(repo.root)]
     result = CliRunner().invoke(app, [*args, "--strict"] if strict else args)
-    assert result.exit_code == (2 if strict else 0)
+    assert result.exit_code == 2
     if not strict:
         assert json.loads(result.stdout)["complete"] is False
         assert "partielle" in result.stderr
@@ -158,7 +160,7 @@ def test_history_preserves_findings_and_skip_traces_across_cached_blobs(repo: Gi
     repo.commit_all("first")
     repo.write("readme", "still safe\n")
     repo.commit_all("second")
-    report = collect_history(repo.root, ci=True)
+    report = collect_history(repo.root, ci=True, strict=False)
     assert any(item.finding.file == "notebook.ipynb" for item in report.findings)
     assert sum(item[0] == "image.png" and item[2] == "binary" for item in report.skipped) == 2
     assert (
@@ -170,6 +172,6 @@ def test_history_preserves_findings_and_skip_traces_across_cached_blobs(repo: Gi
 
 def test_latin1_named_like_an_image_is_not_excluded(repo: GitRepo) -> None:
     repo.write_bytes("looks-like-image.png", f'# café\nTOKEN="{SYNTHETIC}"'.encode("latin-1"))
-    report = collect(repo.root, staged=False, allowlist=Allowlist.empty())
+    report = collect(repo.root, staged=False, allowlist=Allowlist.empty(), strict=False)
     assert any(item.file == "looks-like-image.png" for item in report.findings)
     assert report.complete

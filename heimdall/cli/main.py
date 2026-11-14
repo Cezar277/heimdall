@@ -31,6 +31,7 @@ from heimdall.cli.history import collect_history, render_history
 from heimdall.cli.hook import hook_app
 from heimdall.cli.scan import (
     EXIT_CLEAN,
+    EXIT_ERROR,
     EXIT_FINDINGS,
     ToolFailure,
     collect,
@@ -224,6 +225,10 @@ def scan(  # noqa: PLR0913, PLR0917
                 f"analyse {'complète' if report.complete else 'partielle'}.",
                 err=True,
             )
+        # Une couverture partielle ne met jamais au vert une CI ou un hook.
+        exit_code = (
+            EXIT_FINDINGS if report.findings else EXIT_CLEAN if report.complete else EXIT_ERROR
+        )
     except (ScanError, ToolFailure):
         # Erreur d'outillage : le périmètre n'a pas été analysé en entier.
         # Jamais 0, jamais 1 : c'est 2 (REQ-SEC-07). L'écriture est
@@ -238,7 +243,7 @@ def scan(  # noqa: PLR0913, PLR0917
         # best-effort (invariant 8).
         _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
-    raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
+    raise typer.Exit(code=exit_code)
 
 
 @app.command("cold-start")
@@ -298,12 +303,13 @@ def deep_scan(  # noqa: PLR0913, PLR0917 - options CLI explicites
             Path(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes, strict=strict
         )
         typer.echo(render_history(report, json_output=json_output))
+        exit_code = (
+            EXIT_FINDINGS if report.findings else EXIT_CLEAN if report.complete else EXIT_ERROR
+        )
     except Exception:
         _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
         raise typer.Exit(code=2) from None
-    if strict and not report.complete:
-        raise typer.Exit(code=2)
-    raise typer.Exit(code=EXIT_FINDINGS if report.findings else EXIT_CLEAN)
+    raise typer.Exit(code=exit_code)
 
 
 @app.command()

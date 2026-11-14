@@ -61,7 +61,9 @@ heimdall scan --no-gitignore [CHEMIN]  # parcours intégral de l'arbre
 
 Par défaut, les exclusions de contenu sont tracées avec leurs chemins et motifs.
 Un code 0 ne couvre que le contenu analysé ; les rapports partiels exposent
-`complete: false`, `skipped_count` et `skipped` dans le JSON. Les erreurs de
+`complete: false`, `skipped_count` et `skipped` dans le JSON. Un rapport
+partiel ne retourne jamais 0 : code 1 avec findings, code 2 sinon, même sans
+`--ci` et sans `--strict`. Les erreurs de
 lecture restent bloquantes. Voir la [politique de tolérance](scanner-tolerance.md).
 
 En `--ci`, l'allowlist du dépôt ne peut jamais s'auto-attester : si un
@@ -406,8 +408,8 @@ document si `count != len(findings)` (contrainte explicitée dans la
 - Le contenu binaire n'est pas analysé : il est signalé comme exclusion
   dans un rapport partiel, ou refusé avec `--strict`. Les noms de fichiers
   ne cachent pas de contenu textuel ; les fichiers suivis et les textes
-  non ignorés restent analysés. Un code 0 seul ne prouve pas l'absence de
-  secrets dans les contenus écartés.
+  non ignorés restent analysés. Un contenu écarté interdit le code 0 :
+  le verdict vaut 1 avec finding, 2 sinon.
 - La fenêtre multi-ligne reste bornée à 4 Kio : un secret coupé par un
   retour à la ligne au-delà de cette borne n'est pas recherché.
 - Le mode `--staged` analyse l'**index**, pas l'historique : un secret déjà

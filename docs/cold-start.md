@@ -100,6 +100,9 @@ neutralisés. Les symlinks ne sont jamais suivis sur le disque : leur blob Git
 Les commits de sous-modules (`160000`) sont exclus. Les binaires et contenus
 hors borne sont désormais signalés dans `skipped` avec leur chemin et leur
 commit, et rendent `complete: false` (#229). `deep-scan --strict` les refuse.
+Sans `--strict`, un rapport historique partiel produit 1 si un candidat est
+détecté, 2 sinon ; il ne produit jamais 0. L'API `collect_history` reste
+stricte par défaut ; `strict=False` est un choix explicite de collecte.
 Les objets absents, clones superficiels, sorties invalides et dépassements
 de budget restent des erreurs d'outillage. Voir la
 [politique de tolérance](scanner-tolerance.md).

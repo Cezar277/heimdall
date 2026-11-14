@@ -145,7 +145,14 @@ def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification opti
     # deux passes, et pas seulement les substitutions pendant la relecture.
     access = GitAccess(root) if llm and not ci else None
     skipped: list[str] = []
-    scan = collect(root, staged=False, ci=ci, max_file_bytes=max_file_bytes, skipped_files=skipped)
+    scan = collect(
+        root,
+        staged=False,
+        ci=ci,
+        max_file_bytes=max_file_bytes,
+        skipped_files=skipped,
+        strict=False,
+    )
     if access is not None:
         _verify_root_unchanged(access, root)
     if access is None or not scan.findings:

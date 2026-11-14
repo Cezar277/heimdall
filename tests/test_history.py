@@ -121,14 +121,14 @@ def test_oversized_blobs_never_read_and_cli_is_incomplete(
         pytest.fail("oversized content must not be read")
 
     monkeypatch.setattr(GitAccess, "blob_bytes", forbidden)
-    report = history.collect_history(repo.root, ci=True, max_file_bytes=10)
+    report = history.collect_history(repo.root, ci=True, max_file_bytes=10, strict=False)
     assert not report.complete
     assert report.bytes_scanned == 0
     assert report.skipped[0][0] == "large.txt"
     result = CliRunner().invoke(
         app, ["deep-scan", str(repo.root), "--ci", "--json", "--max-file-bytes", "10"]
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 2
     assert json.loads(result.stdout)["complete"] is False
 
 
@@ -154,13 +154,13 @@ def test_empty_repo_and_binary(repo: GitRepo, filename: str) -> None:
     assert history.collect_history(repo.root, ci=True).commits_scanned == 0
     repo.write_bytes(filename, b"\x89PNG\r\n\x1a\n" + b"\x00\xff" * 100)
     repo.commit_all("binary")
-    report = history.collect_history(repo.root, ci=True)
+    report = history.collect_history(repo.root, ci=True, strict=False)
     assert report.findings == ()
     assert report.skipped[0][0] == filename
     assert report.skipped[0][2] == "binary"
     assert not report.complete
     result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
-    assert result.exit_code == 0
+    assert result.exit_code == 2
     assert json.loads(result.stdout)["complete"] is False
 
 
@@ -285,11 +285,11 @@ def test_graft_cannot_hide_deleted_secret(repo: GitRepo) -> None:
 def test_unknown_binary_cannot_hide_secret(repo: GitRepo, suffix: str) -> None:
     repo.write_bytes(f"evil.{suffix}", b"\x00" + SYNTHETIC.encode() + b"\n#")
     repo.commit_all("unknown binary with synthetic secret")
-    report = history.collect_history(repo.root, ci=True)
+    report = history.collect_history(repo.root, ci=True, strict=False)
     assert report.skipped[0][0] == f"evil.{suffix}"
     assert not report.complete
     result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
-    assert result.exit_code == 0
+    assert result.exit_code == 2
     assert json.loads(result.stdout)["complete"] is False
     assert SYNTHETIC not in result.output
 

@@ -118,7 +118,7 @@ def collect_history(  # noqa: PLR0913 - explicit scan and qualification options
     llm: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
-    strict: bool = False,
+    strict: bool = True,
 ) -> HistoryReport:
     """Scan historical blobs; Git failures become static ScanError errors."""
     try:
@@ -143,14 +143,15 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     llm: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
-    strict: bool = False,
+    strict: bool = True,
 ) -> HistoryReport:
     """Scan every reachable snapshot, including merges and deleted files.
 
     Commit IDs are paged, one tree and one blob are held at a time. The LRU
     contains only bounded findings, never raw secrets. No worker fan-out:
     sequential batches keep peak memory independent of repository size.
-    Oversized files are reported as skipped and make the result incomplete.
+    With strict=False, oversized files are reported as skipped and make the
+    result incomplete. The default strict policy refuses them.
     """
     if type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES:
         raise ScanError("limite de fichier invalide")

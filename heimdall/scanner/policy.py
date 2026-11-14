@@ -49,18 +49,24 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
         if len(match.group()) <= MAX_TOKEN_LENGTH:
             return match.group()
         if long_line is None:
-            long_line = text.count("\n", 0, match.start()) + 1
+            long_line = line_number
         return " " * len(match.group())
 
-    cleaned = _TOKEN.sub(replace, text)
+    cleaned_lines: list[str] = []
+    multiline_line: int | None = None
+    previous_size = 0
+    for line_number, line in enumerate(text.split("\n"), start=1):
+        cleaned = _TOKEN.sub(replace, line)
+        size = len(cleaned.encode("utf-8"))
+        if line_number > 1 and previous_size + size > TEXT_WINDOW_BYTES and multiline_line is None:
+            multiline_line = line_number - 1
+        previous_size = size
+        cleaned_lines.append(cleaned)
     if long_line is not None:
         skipped.append(ScanSkip(file, "long_token", long_line))
-    lines = cleaned.split("\n")
-    for index in range(len(lines) - 1):
-        if len((lines[index] + lines[index + 1]).encode("utf-8")) > TEXT_WINDOW_BYTES:
-            skipped.append(ScanSkip(file, "multiline_limit", index + 1))
-            break
-    return cleaned
+    if multiline_line is not None:
+        skipped.append(ScanSkip(file, "multiline_limit", multiline_line))
+    return "\n".join(cleaned_lines)
 
 
 def skip_file(file: str, reason: SkipReason, *, strict: bool, skipped: list[ScanSkip]) -> None:

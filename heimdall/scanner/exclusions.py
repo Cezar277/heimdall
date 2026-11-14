@@ -257,7 +257,9 @@ def decode_text(data: bytes, *, strict: bool = False) -> str | None:  # noqa: PL
     if b"\x00" not in data:
         try:
             text = data.decode("utf-8")
-            return text if strict or _printable_ratio(text) >= _TEXT_RATIO_MIN else None
+            # Du bruit de contrôle autour d'un candidat ASCII ne doit pas
+            # transformer un texte UTF-8 valide en exclusion binaire.
+            return text
         except UnicodeDecodeError:
             if _is_known_binary(data):
                 return None
@@ -266,7 +268,7 @@ def decode_text(data: bytes, *, strict: bool = False) -> str | None:  # noqa: PL
             # CP1252 préserve les secrets ASCII et les textes occidentaux.
             # Les octets non définis sont remplacés, jamais exécutés.
             text = data.decode("cp1252", errors="replace")
-            return text if _printable_ratio(text) >= _TEXT_RATIO_MIN else None
+            return text
     decoded = _decode_utf16_or_32(data)
     if decoded is not None:
         return decoded

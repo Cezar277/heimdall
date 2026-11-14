@@ -88,7 +88,8 @@ MULTILINE_WINDOW: Final[int] = 4096
 #: scan est **refusé** (``ScanError``) : un dépôt adverse avec 100 000 petits
 #: fichiers ne doit pas faire durer une CI sans rendre de verdict.
 MAX_FILES: Final[int] = 50_000
-#: Plafond du volume total lu en une passe, en octets (#29). Sans lui,
+#: Plafond du volume rencontré, tailles des fichiers exclus comprises (#29).
+#: Sans lui,
 #: ``MAX_FILES`` fichiers de 1 Mio feraient 50 Gio de lecture.
 MAX_TOTAL_BYTES: Final[int] = 256 * 1024 * 1024
 # NOTE : `MAX_FINDINGS` est défini dans `signature_engine` (couche core) et
@@ -184,7 +185,7 @@ class Scanner:
 
     ``strict=False`` (#229) tolère les exclusions de contenu, exposées dans
     :attr:`skipped`. ``strict=True`` refuse binaires, liens et limites de
-    texte. Les exclusions Git/VCS ne dépendent pas de cette option.
+    texte et reste le défaut. Les exclusions Git/VCS ne dépendent pas de cette option.
 
     ``respect_gitignore`` (défaut ``True``) active les **exclusions Git sûres**
     de #59 : un fichier non suivi qu'un ``.gitignore`` du dépôt déclare
@@ -223,7 +224,7 @@ class Scanner:
         *,
         hasher: SnippetHasher | None = None,
         entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
-        strict: bool = False,
+        strict: bool = True,
         max_files: int | None = None,
         max_bytes: int | None = None,
         max_findings: int | None = None,
@@ -855,7 +856,8 @@ class Scanner:
         """Lit un descripteur déjà ouvert, vérifie son identité et le ferme.
 
         Avec un collecteur explicite, un fichier trop volumineux est signalé
-        par son chemin relatif et ``(None, 0)``, sans lire son contenu. Les
+        par son chemin relatif et ``(None, taille)``, sans lire son contenu.
+        Sa taille consomme le budget global même si le fichier est exclu. Les
         erreurs de lecture restent des ScanError ; les binaires sont tracés
         ou refusés selon le mode strict.
         """
@@ -873,7 +875,7 @@ class Scanner:
                 raise ScanError(_SCAN_ERROR)
             if after.st_size > self._max_file_bytes:
                 self._skip(relative, "too_large")
-                return None, 0
+                return None, after.st_size
             remaining = self._max_file_bytes + 1
             while remaining > 0:
                 chunk = os.read(descriptor, min(_READ_CHUNK, remaining))

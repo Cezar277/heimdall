@@ -206,12 +206,12 @@ def collect(  # noqa: PLR0913 - explicit scan options
     max_file_bytes: int | None = None,
     skipped_files: list[str] | None = None,
     respect_gitignore: bool = True,
-    strict: bool = False,
+    strict: bool = True,
 ) -> ScanReport:
     """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
     Les exclusions de contenu prévues sont rendues dans ScanReport.skipped
-    (#229), ou refusées avec strict=True. Les erreurs de lecture restent
+    (#229) avec strict=False, ou refusées par défaut. Les erreurs de lecture restent
     des ScanError, transformées en code 2 par l'appelant.
 
     ``max_file_bytes`` et ``skipped_files`` sont réservés au mode arbre.
@@ -721,12 +721,12 @@ def _scan_changes(  # noqa: PLR0913 - politique et collecteur de traces explicit
         # vide ne porte aucun candidat.
         if size < 0:
             raise ScanError(_MSG_TOO_LARGE)
-        if size > MAX_FILE_BYTES:
-            skip_file(change.path, "too_large", strict=strict, skipped=skipped)
-            continue
         total += size
         if total > MAX_STAGED_BYTES:
             raise ScanError(_MSG_TOO_LARGE)
+        if size > MAX_FILE_BYTES:
+            skip_file(change.path, "too_large", strict=strict, skipped=skipped)
+            continue
         data = access.blob_bytes(
             change.blob,
             timeout=_call_timeout(deadline),
