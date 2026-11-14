@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
-from heimdall.cli.fix import _find_single_quoted_literal, run_fix
+from heimdall.cli.fix import _existing_env_names, _find_single_quoted_literal, run_fix
 from heimdall.cli.main import app
 from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
 from heimdall.remediation.apply import (
@@ -22,7 +22,11 @@ from heimdall.remediation.apply import (
     cleanup_backup_file,
 )
 from heimdall.remediation.env import EnvRemediationError
-from heimdall.remediation.naming import is_dangerous_exec_env_var
+from heimdall.remediation.naming import (
+    _MAX_TAKEN,
+    is_dangerous_env_var,
+    is_dangerous_exec_env_var,
+)
 from heimdall.remediation.templates import plan_for_finding
 from heimdall.scanner.finding import Finding
 from heimdall.vault.atomic import (
@@ -386,6 +390,36 @@ def test_f02_vault_pull_and_run_reject_non_vaulte_secret(
     assert pull_res.exit_code == 1
     mock_run.assert_not_called()
     assert not (tmp_path / ".env").exists()
+
+
+@pytest.mark.parametrize("name", ["CUSTOM_PROXY", "SSLKEYLOGFILE", "NODE_OPTIONS"])
+def test_m08_denylist_sync_between_remediation_and_exec(name: str) -> None:
+    assert is_dangerous_env_var(name) is True
+    assert is_dangerous_exec_env_var(name) is True
+
+
+def test_m09_existing_env_names_is_bounded_on_large_env(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "".join(f"VAR_{i}=x\n" for i in range(_MAX_TAKEN + 500)),
+        encoding="utf-8",
+    )
+    names = _existing_env_names(tmp_path)
+    assert len(names) == _MAX_TAKEN + 1
+
+
+def test_m09_fix_rejects_symlink_root_before_apply(tmp_path: Path) -> None:
+    real_repo = tmp_path / "real"
+    real_repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=real_repo, check=True)  # noqa: S603, S607  # nosec B603, B607
+    (real_repo / "app.py").write_text(f'API_KEY = "{_FAKE_SECRET}"\n', encoding="utf-8")
+    link_repo = tmp_path / "link"
+    link_repo.symlink_to(real_repo)
+
+    runner = CliRunner()
+    res = runner.invoke(app, ["fix", str(link_repo)])
+    assert res.exit_code == 2
+    assert _FAKE_SECRET in (real_repo / "app.py").read_text(encoding="utf-8")
 
 
 def test_f11_parse_env_file_handles_export_and_inline_comments(tmp_path: Path) -> None:

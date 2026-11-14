@@ -265,9 +265,9 @@ def is_dangerous_exec_env_var(name: object) -> bool:
         return False
     if any(upper.startswith(prefix) for prefix in ALLOWED_EXEC_SECRET_PREFIXES):
         return False
-    if upper in EXECUTION_DANGEROUS_ENV_EXACT or upper.endswith("_PROXY"):
+    if upper in EXECUTION_DANGEROUS_ENV_EXACT:
         return True
-    return any(upper.startswith(prefix) for prefix in EXECUTION_DANGEROUS_ENV_PREFIXES)
+    return is_dangerous_env_var(name)
 
 
 def validate_variable_name(name: object) -> str:

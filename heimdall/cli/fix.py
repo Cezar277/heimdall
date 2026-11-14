@@ -7,6 +7,7 @@ la journalisation à :func:`heimdall.cli.review.review_proposals`.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 from pathlib import Path
@@ -25,7 +26,11 @@ from heimdall.cli.scan import EXIT_CLEAN, EXIT_FINDINGS, ToolFailure, collect
 from heimdall.mcp.paths import PathEscape, confine
 from heimdall.remediation.apply import ApplyError, apply_replacement, cleanup_backup_file
 from heimdall.remediation.env import EnvRemediationError, remediate_environment
-from heimdall.remediation.naming import deduplicate_variable_name, validate_variable_name
+from heimdall.remediation.naming import (
+    _MAX_TAKEN,
+    deduplicate_variable_name,
+    validate_variable_name,
+)
 from heimdall.remediation.templates import ReplacementPlan, TemplateError, plan_for_finding
 from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.errors import ScanError
@@ -111,18 +116,20 @@ def _extract_secret_for_finding(
 
 
 def _existing_env_names(root: Path) -> set[str]:
-    """Collecte de façon bornée les noms déjà présents dans ``.env`` et ``.env.example``."""
+    """Collecte de façon bornée (<= _MAX_TAKEN + 1) les noms dans ``.env`` et ``.env.example``."""
     taken: set[str] = set()
+    limit = _MAX_TAKEN + 1
     env_data = parse_env_file(root / ".env")
     if env_data:
-        taken.update(env_data.keys())
-    example_names = parse_example_names(root / ".env.example")
-    if example_names:
-        taken.update(example_names)
+        taken.update(itertools.islice(env_data.keys(), limit))
+    if len(taken) < limit:
+        example_names = parse_example_names(root / ".env.example")
+        if example_names:
+            taken.update(itertools.islice(example_names, limit - len(taken)))
     return taken
 
 
-def run_fix(  # noqa: PLR0913
+def run_fix(  # noqa: PLR0913, PLR0915
     root: Path,
     *,
     config_path: Path | None = None,
@@ -132,8 +139,11 @@ def run_fix(  # noqa: PLR0913
     interactive: bool | None = None,
 ) -> tuple[ReviewReport, int]:
     """Exécute le flux complet scan -> plans -> revue Y/N/E -> écriture atomique."""
+    if root.is_symlink():
+        raise ScanError("racine symlinkée refusée")
+    resolved_root = root.resolve()
     scan_report = collect(
-        root,
+        resolved_root,
         staged=False,
         config=config_path,
         allowlist=Allowlist() if no_allowlist else None,
@@ -143,7 +153,6 @@ def run_fix(  # noqa: PLR0913
     if not scan_report.findings:
         return ReviewReport((), False), 0
 
-    resolved_root = root.resolve()
     used_names = _existing_env_names(resolved_root)
     plans_by_finding: dict[Finding, tuple[ReplacementPlan, str]] = {}
     proposals: list[Proposal] = []
@@ -184,6 +193,8 @@ def run_fix(  # noqa: PLR0913
         )
 
     def _apply(proposal: Proposal) -> None:
+        if root.is_symlink() or root.resolve() != resolved_root:
+            raise ApplyError
         entry = plans_by_finding.get(proposal.finding)
         if entry is None:
             raise ApplyError
@@ -200,7 +211,7 @@ def run_fix(  # noqa: PLR0913
     )
     if any(outcome.applied for outcome in report.outcomes):
         post_scan = collect(
-            root,
+            resolved_root,
             staged=False,
             config=config_path,
             allowlist=Allowlist() if no_allowlist else None,
