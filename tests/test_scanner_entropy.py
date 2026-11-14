@@ -475,7 +475,9 @@ def test_signature_results_are_reused_for_lines_and_adjacent_windows(
         if engine == "tree"
         else SignatureEngine(hasher).analyser(FileTarget("config.py", text))
     )
-    assert [(f.line, f.type, f.source) for f in findings] == [(1, "aws", "regex")]
+    assert [(f.line, f.type, f.source) for f in findings] == [
+        (1, "aws", "regex"), (1, "credential", "regex"),
+    ]
     assert calls == [lines[0] + lines[1], lines[0], lines[1] + lines[2], lines[1], lines[2]]
 
 

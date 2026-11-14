@@ -152,10 +152,6 @@ def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:
                 if (debut - ROTATING_PREFIX_LEN, fin) in bornes_rotatives:
                     continue
             value = match.group("value")
-            if rule.id.startswith("credential_") and any(
-                value == previous.value for previous in matches
-            ):
-                continue
             key = (rule.secret_type, value)
             if key in seen:
                 continue

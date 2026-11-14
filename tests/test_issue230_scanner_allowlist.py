@@ -288,3 +288,45 @@ def test_joined_comments_cannot_manufacture_a_sensitive_key() -> None:
     engine = SignatureEngine(SnippetHasher(key=b"T" * 32))
     findings = engine.analyser(FileTarget("config.py", source))
     assert [(finding.line, finding.type) for finding in findings] == [(2, "credential")]
+
+
+@pytest.mark.parametrize("ci", [False, True])
+def test_typed_service_allowlist_cannot_erase_credential_view(repo: GitRepo, ci: bool) -> None:
+    value = "glpat-" + "EXAMPLE" + "A" * 32
+    line = f'DB_PASSWORD="{value}"'
+    matches = find_signature_matches(line)
+    assert {(match.secret_type, match.value) for match in matches} == {
+        ("service_token", value),
+        ("credential", value),
+    }
+    repo.write("config.py", line + "\n")
+    config = repo.root.parent / "typed-allowlist.toml"
+    config.write_text(
+        '[allowlist]\nversion="1"\n[[allowlist.rules]]\nname="service-only"\n'
+        'description="synthetic"\npatterns=["glpat-EXAMPLE"]\n'
+        'secret_types=["service_token"]\n',
+        encoding="utf-8",
+    )
+    args = ["scan", "--json", "--config", str(config), str(repo.root)]
+    if ci:
+        args.append("--ci")
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    assert [finding["type"] for finding in payload["findings"]] == ["credential"]
+    assert payload["ignored_count"] == 1
+    assert payload["traces"][0]["rule"] == "service-only"
+    assert value not in result.output
+
+
+@pytest.mark.parametrize("identifier", ["npm_packages", "npm_config_registry"])
+def test_ordinary_npm_identifiers_are_not_service_tokens(identifier: str) -> None:
+    kind = "service_token"
+    assert not any(match.secret_type == kind for match in find_signature_matches(identifier))
+
+
+@pytest.mark.parametrize("length", [15, 16])
+def test_npm_minimum_payload_boundary(length: int) -> None:
+    value = "npm_" + "A" * length
+    matches = find_signature_matches(value)
+    assert bool(matches) is (length == 16)

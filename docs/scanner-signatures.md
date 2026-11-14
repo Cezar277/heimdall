@@ -38,7 +38,9 @@ validées par #53 et ne rend que des `Finding` sans valeur brute.
 
 Total : **22 règles**. Les sept préfixes supplémentaires sont `glpat-`,
 `AIza`, `ya29.`, `npm_`, `whsec_`, `dop_v1_` et `shpat_`. Les formes sont
-heuristiques et bornées ; elles ne prouvent ni la validité ni la révocation
+bornées à 8–256 caractères de charge, avec un minimum relevé à 16 pour `npm_`
+afin d'écarter `npm_packages` et `npm_config_registry`. Ces règles restent
+heuristiques ; elles ne prouvent ni la validité ni la révocation
 d'un jeton chez un fournisseur. Les clés publiques Stripe `pk_live_` /
 `pk_test_` ne sont pas des secrets : leur masquage conservateur côté MCP
 n'impose pas de les classer comme secrets dans le scanner.

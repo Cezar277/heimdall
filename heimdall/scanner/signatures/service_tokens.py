@@ -18,13 +18,18 @@ PREFIXES: Final[tuple[tuple[str, str], ...]] = (
 
 
 def _rule(name: str, prefix: str) -> Rule:
+    minimum = 16 if prefix == "npm_" else 8
     return make_rule(
         id=f"service_{name}",
-        description=f"Jeton de service à préfixe {prefix}, charge bornée de 8 à 256 caractères.",
+        description=(
+            f"Jeton de service à préfixe {prefix}, charge bornée de {minimum} à 256 caractères."
+        ),
         regex=(
             r"(?P<value>(?<![A-Za-z0-9_])"
             + re.escape(prefix)
-            + r"[A-Za-z0-9_+/=-]{8,256}(?![A-Za-z0-9_+/=-]))"
+            + r"[A-Za-z0-9_+/=-]{"
+            + str(minimum)
+            + r",256}(?![A-Za-z0-9_+/=-]))"
         ),
         finding_type="service_token",
         positive=prefix + "A" * 32,

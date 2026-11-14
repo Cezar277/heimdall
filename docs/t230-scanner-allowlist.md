@@ -7,7 +7,10 @@ résultats ne contiennent que type, ligne, entropie et empreinte HMAC.
 ## Détection ajoutée
 
 - Préfixes `glpat-`, `AIza`, `ya29.`, `npm_`, `whsec_`, `dop_v1_`, `shpat_`
-  avec charge de 8 à 256 caractères et frontières explicites.
+  avec charge de 8 à 256 caractères et frontières explicites ; `npm_`
+  exige au moins 16 caractères pour ne pas signaler les identifiants usuels
+  `npm_packages` et `npm_config_registry`. Des identifiants plus longs peuvent
+  encore produire des faux positifs : ce seuil n'est pas une validation fournisseur.
 - URL `scheme://user:password@host` : valeur détectée = mot de passe,
   de 1 à 256 caractères ; aucune connexion au service.
 - En-tête Authorization Basic/Bearer : valeur de 4 à 512 caractères,
@@ -26,6 +29,22 @@ résultats ne contiennent que type, ligne, entropie et empreinte HMAC.
   mathématiquement inaccessible sur 20 caractères distincts (`log2(20)`).
   `EntropyConfig(short_token_adjustment=0)` restaure le seuil uniforme.
   Les valeurs hors de cette bande et l'hexadécimal conservent leurs seuils.
+
+Une même valeur peut produire plusieurs types de findings (par exemple
+`service_token` et `credential`). La déduplication conserve chaque couple
+`(type, valeur)` jusqu'à l'évaluation de l'allowlist : une règle limitée à
+`service_token` ne peut pas autoriser implicitement la vue `credential`.
+Les compteurs de findings et de traces peuvent donc compter les deux vues.
+
+Résiduels explicitement conservés : sans contexte sensible ni préfixe connu,
+les jetons non hexadécimaux de 20–22 caractères auxquels manque une des trois
+classes minuscules/majuscules/chiffres ne bénéficient pas de la correction.
+Le seuil 4,5 reste mathématiquement inaccessible dans cette bande : cette
+classe peut donc être manquée. Les affectations non citées de moins de
+4 caractères (par exemple `pwd=123`) ne sont pas détectées par cette règle.
+`pin=abc` n'est pas couvert non plus : `pin` n'est pas une clé reconnue.
+Ces limitations sont documentées comme risque résiduel ; elles ne prouvent
+pas l'absence de secret. Aucun élargissement implicite d'allowlist n'est ajouté.
 
 Il s'agit d'heuristiques avec faux positifs et faux négatifs possibles,
 pas d'une preuve d'absence de secret. Les formats non couverts, les valeurs

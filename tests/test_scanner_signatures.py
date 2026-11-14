@@ -541,7 +541,8 @@ def test_engine_keeps_diff_line_numbers() -> None:
     )
     findings = _findings(target)
     assert [(finding.file, finding.line, finding.type) for finding in findings] == [
-        ("src/payment.py", 15, "stripe")
+        ("src/payment.py", 15, "credential"),
+        ("src/payment.py", 15, "stripe"),
     ]
 
 
@@ -606,7 +607,7 @@ def test_engine_detects_a_secret_split_across_two_lines() -> None:
     findings = _findings(
         FileTarget(path="config.py", text=f'aws_secret_access_key =\n"{secret}"\n')
     )
-    assert [(finding.line, finding.type) for finding in findings] == [(1, "aws")]
+    assert [(finding.line, finding.type) for finding in findings] == [(1, "aws"), (1, "credential")]
 
 
 def test_engine_joins_consecutive_diff_lines() -> None:
@@ -616,7 +617,9 @@ def test_engine_joins_consecutive_diff_lines() -> None:
         path="config.py",
         lines=((12, "aws_secret_access_key ="), (13, f'"{secret}"')),
     )
-    assert [(finding.line, finding.type) for finding in _findings(target)] == [(12, "aws")]
+    assert [(finding.line, finding.type) for finding in _findings(target)] == [
+        (12, "aws"), (12, "credential"),
+    ]
 
 
 def test_engine_does_not_join_non_consecutive_diff_lines() -> None:
@@ -941,7 +944,9 @@ def test_ci_scan_with_an_exported_key_writes_no_file(
         findings = _findings(
             FileTarget(path="config.json", text=f'"aws_secret_access_key": "{value}"')
         )
-        assert [(finding.line, finding.type) for finding in findings] == [(1, "aws")]
+        assert [(finding.line, finding.type) for finding in findings] == [
+            (1, "aws"), (1, "credential"),
+        ]
         # Aucun fichier créé : le répertoire est resté vide.
         assert list(xdg.iterdir()) == []
         # Empreinte stable, reproductible avec la seule clé exportée.
