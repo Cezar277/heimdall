@@ -632,6 +632,8 @@ class VaultSettingsTests(unittest.TestCase):
                 "forwarded_allow_ips": "",
                 "server_header": False,
                 "date_header": False,
+                "limit_concurrency": 100,
+                "timeout_keep_alive": 5,
             },
         )
 
@@ -710,6 +712,8 @@ class VaultSettingsTests(unittest.TestCase):
                 "forwarded_allow_ips": "",
                 "server_header": False,
                 "date_header": False,
+                "limit_concurrency": 100,
+                "timeout_keep_alive": 5,
             },
         )
 
@@ -2745,12 +2749,18 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
     def test_vault_settings_rejects_public_default_pepper_outside_explicit_test_env(self) -> None:
         """Hors HEIMDALL_ENV=test explicite, la constante publique partagée est refusée."""
         _public_default = "heimdall_default_vault_pepper_dev_only"
-        for env_mode in ("", "development", "staging"):
+        for env_mode in ("production", "prod", "dev"):
             with self.subTest(env_mode=env_mode):
                 with patch.dict(os.environ, {"HEIMDALL_ENV": env_mode}, clear=True):
                     with self.assertRaises(ValidationError) as ctx:
                         VaultSettings(api_key_pepper=_public_default)
                     self.assertIn("HEIMDALL_VAULT_API_KEY_PEPPER", str(ctx.exception))
+        for invalid_mode in ("", "development", "staging"):
+            with self.subTest(invalid_mode=invalid_mode):
+                with patch.dict(os.environ, {"HEIMDALL_ENV": invalid_mode}, clear=True):
+                    with self.assertRaises(ValidationError) as ctx:
+                        VaultSettings(api_key_pepper=_public_default)
+                    self.assertIn("HEIMDALL_ENV invalide", str(ctx.exception))
         # Seul un HEIMDALL_ENV=test explicite l'autorise (fixtures déterministes).
         with patch.dict(os.environ, {"HEIMDALL_ENV": "test"}, clear=True):
             settings = VaultSettings(api_key_pepper=_public_default)
@@ -2824,7 +2834,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     def test_vault_settings_generates_ephemeral_pepper_outside_production(self) -> None:
         """Hors production, un pepper aléatoire éphémère remplace l'ancien défaut public."""
-        with patch.dict(os.environ, {"HEIMDALL_ENV": "development"}, clear=True):
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "dev"}, clear=True):
             first = VaultSettings()
             second = VaultSettings()
         for generated in (first.api_key_pepper, second.api_key_pepper):

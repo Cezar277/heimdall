@@ -792,6 +792,9 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
         conn = sqlite3.connect(resolved, timeout=SQLITE_TIMEOUT_SECONDS, factory=_SessionConnection)
 
     conn.execute("PRAGMA foreign_keys = ON;")
+    # Les lignes supprimées ne doivent pas rester lisibles dans les pages
+    # libres du fichier SQLite (audit F-05).
+    conn.execute("PRAGMA secure_delete = ON;")
     conn.row_factory = sqlite3.Row
     return conn
 

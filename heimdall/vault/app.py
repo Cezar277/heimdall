@@ -94,6 +94,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 
 from heimdall.vault import auth as vault_auth
@@ -142,6 +143,10 @@ project_api_key_header = vault_auth.project_api_key_header
 verify_api_key = vault_auth.verify_api_key
 ProjectId = vault_auth.ProjectId
 _MAX_BODY_SIZE: int = 1_048_576  # 1 Mio (1 048 576 octets)
+# Bornes uvicorn : une rafale locale ne doit pas ouvrir un nombre illimité de
+# connexions ni les garder ouvertes indéfiniment (audit F-06).
+_UVICORN_LIMIT_CONCURRENCY: int = 100
+_UVICORN_TIMEOUT_KEEP_ALIVE: int = 5
 
 logger = logging.getLogger("heimdall.vault.app")
 
@@ -1369,6 +1374,12 @@ def _register_no_store_middleware(app: FastAPI) -> None:
 
 def _register_middleware(app: FastAPI) -> None:
     """Enregistre les middlewares du serveur Vault."""
+    # Contrôle de l'en-tête Host : refuse un rebinding DNS en HTTP clair.
+    # ``testserver`` n'est ajouté qu'en mode test explicite (TestClient).
+    allowed_hosts = ["127.0.0.1", "localhost", "[::1]"]
+    if _heimdall_env_mode() == "test":
+        allowed_hosts.append("testserver")
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=_MAX_BODY_SIZE)
 
     # Le rate-limiting est enregistré avant le middleware loopback : ce dernier,
@@ -1390,41 +1401,43 @@ def _register_middleware(app: FastAPI) -> None:
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
-        """Borne le débit par clé validée, pair réseau et global (lot #63).
+        """Borne le débit par clé validée et par budget anonyme séparé (lot #63).
 
-        Rejet précoce sans coût CPU : ``peek`` pair/global (lecture seule,
-        sans consommation) précède tout hachage ou lookup. Les 400/401 sont
-        comptés par le bucket pair/global puisque le middleware s'exécute
-        avant le routage et les dépendances. Une clé invalide ne crée aucun
-        bucket arbitraire : seuls pair et global s'appliquent. Le choix du
-        bucket par clé emprunte le même parcours à coût comparable que
-        ``verify_api_key`` (``find_api_key_project_cached``) : le résultat est
-        mémoïsé dans la requête et réutilisé par l'authentification (un seul
-        full-scan par requête, lot #63) ; l'existence d'une clé n'est pas
-        observable par le temps de réponse du middleware. La phase consommatrice
-        est ensuite UNIQUE : ``check_authenticated`` consomme pair/global + clé
-        en une seule transaction (mémoire : une seule section critique ;
-        SQLite : un seul ``BEGIN IMMEDIATE``), au lieu de deux transactions
-        successives (plus de fenêtre inter-transactions ni double verrou
-        d'écriture). Sémantique préservée : pair/global restent consommés même
-        quand le bucket clé est plein. Avec le backend SQLite,
-        ``SqliteRateLimiter`` partage les buckets entre workers : la limite
-        n'est jamais multipliée par le nombre de processus. Le mode mémoire
-        reste mono-processus (dev/test).
+        Les requêtes sans clé valide consomment ``anon_peer``/``anon_global`` ;
+        les requêtes authentifiées consomment leur budget ``key`` puis le
+        budget ``global``. Un flot anonyme ne peut donc pas épuiser le budget
+        des clients authentifiés (audit M-02). Le rejet précoce ``peek`` n'est
+        appliqué qu'aux requêtes sans clé : une clé valide n'est jamais bloquée
+        par le budget anonyme. Les 400/401 sans clé valide sont comptés dans le
+        budget anonyme. Une clé invalide ne crée aucun bucket arbitraire : seuls
+        les budgets anonymes s'appliquent. Le choix du bucket par clé emprunte
+        le même parcours à coût comparable que ``verify_api_key``
+        (``find_api_key_project_cached``) : le résultat est mémoïsé dans la
+        requête et réutilisé par l'authentification (un seul full-scan par
+        requête, lot #63) ; l'existence d'une clé n'est pas observable par le
+        temps de réponse du middleware. La phase consommatrice est ensuite
+        UNIQUE : ``check_authenticated`` consomme clé + global en une seule
+        transaction (mémoire : une seule section critique ; SQLite : un seul
+        ``BEGIN IMMEDIATE``). Avec le backend SQLite, ``SqliteRateLimiter``
+        partage les buckets entre workers : la limite n'est jamais multipliée
+        par le nombre de processus. Le mode mémoire reste mono-processus
+        (dev/test).
         """
         peer = request.client.host if request.client and request.client.host else "unknown"
         limiter: RateLimiter | SqliteRateLimiter = request.app.state.rate_limiter
-
-        allowed, retry_after = await _limiter_peek(limiter, peer)
-        if not allowed:
-            return JSONResponse(
-                status_code=429,
-                content=_ERROR_PAYLOADS[429],
-                headers={"Retry-After": str(retry_after), "Connection": "close"},
-            )
-        key_hash: str | None = None
         raw_key = request.headers.get("X-Heimdall-API-Key")
-        if raw_key is not None and len(raw_key) > vault_auth.MAX_API_KEY_LENGTH:
+
+        if raw_key is None:
+            # Rejet précoce sans coût CPU : uniquement pour les anonymes.
+            allowed, retry_after = await _limiter_peek(limiter, peer)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content=_ERROR_PAYLOADS[429],
+                    headers={"Retry-After": str(retry_after), "Connection": "close"},
+                )
+            allowed, retry_after = await _limiter_consume_peer(limiter, peer)
+        elif len(raw_key) > vault_auth.MAX_API_KEY_LENGTH:
             allowed, retry_after = await _limiter_consume_peer(limiter, peer)
             if not allowed:
                 return JSONResponse(
@@ -1437,11 +1450,14 @@ def _register_middleware(app: FastAPI) -> None:
                 content=_ERROR_PAYLOADS[401],
                 headers={"Connection": "close"},
             )
-        key_hash = await _resolve_request_key_hash(request)
-        if key_hash is not None:
-            allowed, retry_after = await _limiter_consume_authenticated(limiter, peer, key_hash)
         else:
-            allowed, retry_after = await _limiter_consume_peer(limiter, peer)
+            key_hash = await _resolve_request_key_hash(request)
+            if key_hash is not None:
+                allowed, retry_after = await _limiter_consume_authenticated(
+                    limiter, peer, key_hash
+                )
+            else:
+                allowed, retry_after = await _limiter_consume_peer(limiter, peer)
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -2126,6 +2142,8 @@ def run_server() -> None:
         forwarded_allow_ips="",
         server_header=False,
         date_header=False,
+        limit_concurrency=_UVICORN_LIMIT_CONCURRENCY,
+        timeout_keep_alive=_UVICORN_TIMEOUT_KEEP_ALIVE,
     )
 
 

@@ -132,11 +132,24 @@ MIN_API_KEY_PEPPER_BYTES: int = 32
 INSECURE_DEFAULT_PEPPER: str = "heimdall_default_vault_pepper_dev_only"
 TEST_ENV_MODES: frozenset[str] = frozenset({"test"})
 PRODUCTION_ENV_MODES: frozenset[str] = frozenset({"production", "prod"})
+ALLOWED_ENV_MODES: frozenset[str] = frozenset({"production", "prod", "dev", "test"})
 
 
 def heimdall_env_mode() -> str:
-    """Retourne le mode d'environnement Heimdall normalisé (``HEIMDALL_ENV``)."""
-    return os.environ.get("HEIMDALL_ENV", "").strip().lower()
+    """Retourne le mode d'environnement Heimdall normalisé (``HEIMDALL_ENV``).
+
+    Défaut fail-closed : production si la variable est absente. Une valeur
+    inconnue est refusée (jamais traitée comme du développement par accident).
+    """
+    raw = os.environ.get("HEIMDALL_ENV")
+    if raw is None:
+        return "production"
+    mode = raw.strip().lower()
+    if mode not in ALLOWED_ENV_MODES:
+        raise ValueError(
+            "HEIMDALL_ENV invalide : valeurs acceptées production, prod, dev, test."
+        )
+    return mode
 
 
 def _unauthorized() -> StarletteHTTPException:

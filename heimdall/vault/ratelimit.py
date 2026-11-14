@@ -198,9 +198,12 @@ class RateLimiter:
 
         Le nom de bucket d'une clé est son empreinte HMAC, jamais la clé brute.
         """
+        # Les requêtes sans clé valide ont leur propre budget : un flot
+        # anonyme ne peut pas épuiser le budget des clients authentifiés
+        # (audit M-02).
         specs: list[tuple[str, int]] = [
-            ("global", self._global_limit),
-            (f"peer:{peer}", self._per_peer),
+            ("anon_global", self._global_limit),
+            (f"anon_peer:{peer}", self._per_peer),
         ]
         if key_hash is not None:
             specs.append((f"key:{key_hash}", self._per_key))
@@ -223,8 +226,8 @@ class RateLimiter:
         with self._lock:
             now = self._clock()
             for name, limit in (
-                ("global", self._global_limit),
-                (f"peer:{peer}", self._per_peer),
+                ("anon_global", self._global_limit),
+                (f"anon_peer:{peer}", self._per_peer),
             ):
                 bucket = self._buckets.get(name)
                 if bucket is None:
@@ -242,14 +245,14 @@ class RateLimiter:
         clé est plein, sans fenêtre inter-transactions.
         """
         with self._lock:
+            # Budget clé évalué en premier : une clé pleine est refusée sans
+            # consommer le budget global des clients authentifiés.
             return self._evaluate(
                 [
-                    ("global", self._global_limit),
-                    (f"peer:{peer}", self._per_peer),
                     (f"key:{key_hash}", self._per_key),
+                    ("global", self._global_limit),
                 ],
                 self._clock(),
-                consume_on_reject=frozenset({"global", f"peer:{peer}"}),
             )
 
     def clear(self) -> None:
@@ -344,6 +347,10 @@ class SqliteRateLimiter:
         for name, limit in specs:
             count = self._count(conn, name, cutoff)
             oldest = self._oldest(conn, name, cutoff)
+            # Recul d'horloge : un horodatage futur ne doit pas prolonger le
+            # blocage au-delà de la fenêtre courante (audit F-15).
+            if oldest is not None and oldest > now:
+                oldest = now
             states.append((name, limit, count, oldest))
             if full is None and count >= limit:
                 full = oldest
@@ -372,9 +379,10 @@ class SqliteRateLimiter:
 
     def check(self, peer: str, key_hash: str | None = None) -> tuple[bool, int]:
         """Consomme une unité de façon atomique entre workers, sans stocker la clé."""
+        # Budget anonyme séparé du budget authentifié (audit M-02).
         specs: list[tuple[str, int]] = [
-            ("global", self._global_limit),
-            (f"peer:{peer}", self._per_peer),
+            ("anon_global", self._global_limit),
+            (f"anon_peer:{peer}", self._per_peer),
         ]
         if key_hash is not None:
             specs.append((f"key:{key_hash}", self._per_key))
@@ -403,12 +411,14 @@ class SqliteRateLimiter:
             now = self._clock()
             cutoff = now - self._window_seconds
             for name, limit in (
-                ("global", self._global_limit),
-                (f"peer:{peer}", self._per_peer),
+                ("anon_global", self._global_limit),
+                (f"anon_peer:{peer}", self._per_peer),
             ):
                 count = self._count(conn, name, cutoff)
                 if count >= limit:
                     oldest = self._oldest(conn, name, cutoff)
+                    if oldest is not None and oldest > now:
+                        oldest = now
                     return False, _retry_after(
                         oldest if oldest is not None else now,
                         now,
@@ -428,12 +438,10 @@ class SqliteRateLimiter:
             return self._evaluate(
                 conn,
                 [
-                    ("global", self._global_limit),
-                    (f"peer:{peer}", self._per_peer),
                     (f"key:{key_hash}", self._per_key),
+                    ("global", self._global_limit),
                 ],
                 self._clock(),
-                consume_on_reject=frozenset({"global", f"peer:{peer}"}),
             )
 
     def clear(self) -> None:
