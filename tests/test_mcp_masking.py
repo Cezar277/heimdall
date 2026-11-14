@@ -329,6 +329,8 @@ class AuditE03MaskingProofTests(unittest.TestCase):
             ("tokens mysecret123", "mysecret123"),
             ("passwd S3cretP4ss", "S3cretP4ss"),
             ("pwd S3cretP4ss", "S3cretP4ss"),
+            ("password hunter2,abc12399", "hunter2,abc12399"),
+            ("password hunter2;abc12399", "hunter2;abc12399"),
             ('api_key "my secret 42"', "my secret 42"),
             ('secret "my secret 42', "my secret 42"),
         ):
@@ -382,3 +384,16 @@ class AuditE03MaskingProofTests(unittest.TestCase):
         # Vraie balise imbriquée : reste hors périmètre de la règle XML.
         inner_tag = "<password><nested>short</nested></password>"
         self.assertEqual(masking.mask_text(inner_tag), (inner_tag, 0))
+
+    def test_xml_closing_tag_case_insensitive_is_masked(self) -> None:
+        """Revue (LOW) : `<PASSWORD>…</password>` apparié quelle que soit la casse."""
+        for line, secret in (
+            ("<PASSWORD>hunter2abc123</password>", "hunter2abc123"),
+            ("<password>hunter2abc123</PASSWORD>", "hunter2abc123"),
+            ("<Api_Key>S3cr3tValue99</api_key>", "S3cr3tValue99"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:", masked)

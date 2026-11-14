@@ -156,7 +156,8 @@ _UNCLOSED_QUOTED_VALUE: Final[re.Pattern[str]] = re.compile(
 _XML_SENSITIVE_ELEMENT: Final[re.Pattern[str]] = re.compile(
     r"<(?P<tag>[A-Za-z_][A-Za-z0-9_.:\-]{0,63})(?:\s[^<>]*)?>"
     r"(?P<value>(?:[^<]|<(?![^<>]*>)){1,})"
-    r"</(?P=tag)\s*>"
+    r"</(?P=tag)\s*>",
+    re.IGNORECASE,
 )
 
 # `define('DB_PASSWORD', 'S3cr3tValue99')` (PHP/Ruby). Nom ET valeur peuvent
@@ -187,7 +188,7 @@ _NETRC_PASSWORD: Final[re.Pattern[str]] = re.compile(
     r"(?:"
     r"(?P<quote>[\"'])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=quote)"
     r"|[\"'](?P<unclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
-    r"|(?P<value>[^\s\"'`,;(){}\[\]]{1,})"
+    r"|(?P<value>[^\s\"'`(){}\[\]]{1,})"
     r")"
 )
 
