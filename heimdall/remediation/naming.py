@@ -256,6 +256,8 @@ def is_dangerous_exec_env_var(name: object) -> bool:
         return False
     if upper in EXECUTION_DANGEROUS_ENV_EXACT:
         return True
+    if any(upper.startswith(prefix) for prefix in EXECUTION_DANGEROUS_ENV_PREFIXES):
+        return True
     return is_dangerous_env_var(name)
 
 

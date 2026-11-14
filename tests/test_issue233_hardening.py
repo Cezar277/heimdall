@@ -18,7 +18,7 @@ from typer.testing import CliRunner
 from heimdall.cli.fix import _existing_env_names, _find_single_quoted_literal, run_fix
 from heimdall.cli.main import app
 from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
-from heimdall.cli.vault_client import _pull_secrets_from_vault
+from heimdall.cli.vault_client import _pull_secrets_from_vault, vault_pull
 from heimdall.remediation.apply import (
     AppliedPatch,
     ApplyError,
@@ -28,7 +28,9 @@ from heimdall.remediation.apply import (
 from heimdall.remediation.env import EnvRemediationError
 from heimdall.remediation.naming import (
     _MAX_TAKEN,
+    DANGEROUS_ENV_PREFIXES,
     EXECUTION_DANGEROUS_ENV_EXACT,
+    EXECUTION_DANGEROUS_ENV_PREFIXES,
     is_dangerous_env_var,
     is_dangerous_exec_env_var,
 )
@@ -41,7 +43,12 @@ from heimdall.vault.atomic import (
     parse_env_file,
     parse_example_names,
 )
-from heimdall.vault.client import VaultClient, _detect_from_git, _validate_secret_read_response
+from heimdall.vault.client import (
+    VaultClient,
+    VaultClientError,
+    _detect_from_git,
+    _validate_secret_read_response,
+)
 
 _TEST_API_KEY = "A" * 43
 _FAKE_SECRET = "AKIAIOSFODNN7EXAMPLE"  # noqa: S105
@@ -593,3 +600,52 @@ def test_f10_cleanup_backup_file_unresolved_root_with_symlink_prevents_outside_d
     with pytest.raises(ApplyError):
         cleanup_backup_file(unresolved_root, receipt)
     assert outside.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_m08_execution_dangerous_env_prefixes_enforced_and_in_sync() -> None:
+    assert EXECUTION_DANGEROUS_ENV_PREFIXES == DANGEROUS_ENV_PREFIXES
+    assert not is_dangerous_exec_env_var("CUSTOM_EXEC_TOKEN")
+    with patch("heimdall.remediation.naming.EXECUTION_DANGEROUS_ENV_PREFIXES", ("CUSTOM_EXEC_",)):
+        assert is_dangerous_exec_env_var("CUSTOM_EXEC_TOKEN") is True
+
+
+def test_m08_pull_secrets_uses_preview_name_on_client_error_and_newline_value(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    evil_name = "BAD\nINJECTED_LOG"
+    client = MagicMock()
+    client.get_secret.side_effect = VaultClientError("network error")
+    with patch("heimdall.cli.vault_client._SECRET_NAME_PATTERN", re.compile(r".*", re.DOTALL)):
+        with pytest.raises(typer.Exit) as exc_info:
+            _pull_secrets_from_vault(client, "proj", "dev", [evil_name])
+    assert exc_info.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "\nINJECTED_LOG" not in err
+    assert "BAD\\nINJECTED_LOG" in err
+
+    with (
+        patch("heimdall.cli.vault_client._validate_project_and_env", return_value="proj"),
+        patch("heimdall.cli.vault_client._validate_requested_names"),
+        patch("heimdall.cli.vault_client._resolve_pull_names", return_value=[evil_name]),
+        patch("heimdall.cli.vault_client._init_client", return_value=MagicMock()),
+        patch(
+            "heimdall.cli.vault_client._pull_secrets_from_vault",
+            return_value={evil_name: "line1\nline2"},
+        ),
+    ):
+        with pytest.raises(typer.Exit) as pull_exc:
+            vault_pull(
+                project="proj",
+                env="dev",
+                names=[evil_name],
+                output=tmp_path / ".env",
+                example_file=tmp_path / ".env.example",
+                backup=False,
+                vault_url=None,
+                ca_cert=None,
+            )
+    assert pull_exc.value.exit_code == 1
+    pull_err = capsys.readouterr().err
+    assert "\nINJECTED_LOG" not in pull_err
+    assert "BAD\\nINJECTED_LOG" in pull_err

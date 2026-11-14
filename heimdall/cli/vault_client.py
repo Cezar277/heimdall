@@ -570,14 +570,17 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             raise typer.Exit(code=1) from None
         except VaultClientError as exc:
             msg = _bounded_error_message(str(exc))
-            typer.echo(f"Erreur lors de la récupération de '{name}' : {msg}", err=True)
+            typer.echo(
+                f"Erreur lors de la récupération de {preview_name(name)!r} : {msg}",
+                err=True,
+            )
             raise typer.Exit(code=1) from None
         except ValueError:
             # Défense en profondeur : les patterns CLI et client sont
             # dupliqués aujourd'hui. Une divergence future ne doit jamais
             # produire un traceback (invariant 11) ni refléter la valeur.
             typer.echo(
-                f"Erreur : identifiant invalide pour le secret '{name[:32]!r}'.",
+                f"Erreur : identifiant invalide pour le secret {preview_name(name)!r}.",
                 err=True,
             )
             raise typer.Exit(code=1) from None
@@ -611,8 +614,8 @@ def vault_pull(  # noqa: PLR0912, PLR0913, PLR0917
     for key, value in retrieved.items():
         if "\n" in value or "\r" in value:
             typer.echo(
-                f"Erreur : Le secret '{key}' contient un saut de ligne interdit dans le fichier "
-                ".env (risque d'injection).",
+                f"Erreur : Le secret {preview_name(key)!r} contient un saut de ligne interdit "
+                "dans le fichier .env (risque d'injection).",
                 err=True,
             )
             raise typer.Exit(code=1)
