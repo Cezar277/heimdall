@@ -1,4 +1,29 @@
 Ticket #233 - Corrections apres revue APPROUVE AVEC COMMENTAIRES
+REVISION RACINE ET RESCAN - Code teste : 18a3d3736d8f116cc1bd587a15fa5dc907700427
+Base de cette correction : 9e79d55341d3008f036f19fcdfc2f42dfbd7f53e
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t233-root-rescan-final.xml
+1 failed, 4089 passed, 18 skipped, 19 warnings, 7124 subtests passed in 365.42s (0:06:05)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Unique echec : tests/test_remediation_env.py::test_env_path_with_spaces_properly_quoted_in_git_rm_command
+Deja reproduit sur la base 8d9298d lors de la passe precedente ; modules
+concernes et test inchanges par ce correctif. Le test ctime passe cette fois.
+La suite complete n'est pas verte. CI non declenchee, aucune fusion.
+
+python -m pytest tests/test_issue233_hardening.py -o addopts= -q --tb=short
+190 passed, 5 warnings in 2.84s.
+Cinq nouveaux cas : dossier remplace avant/pendant le rescan en API/CLI,
+avec patch applique et fichier non remediable dans le dossier original ;
+deux corrections successives acceptent les changements de ctime normaux.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q heimdall/cli/fix.py
+Exit 0, aucune alerte.
+
+RESULTATS HISTORIQUES DE LA CORRECTION PRECEDENTE
 Branche : fix/233-vault-cli-remediation-hardening
 Base revue : 8d9298d
 Code teste : 440ae9ee2b4143bc23466613bba717567fddd2d9

@@ -1,7 +1,8 @@
 # T233 — Corrections après approbation avec commentaires
 
 Ticket #233. Branche : `fix/233-vault-cli-remediation-hardening`.
-Base revue : `8d9298d`. Code testé : `440ae9ee2b4143bc23466613bba717567fddd2d9`.
+Base revue initiale : `8d9298d`. Code actuel testé : `18a3d3736d8f116cc1bd587a15fa5dc907700427`.
+Les preuves des premières corrections restent épinglées sur `440ae9e`.
 
 ## Propriétés démontrées
 
@@ -20,7 +21,33 @@ La [documentation de remédiation](remediation-env.md) précise les deux
 comportements. La transcription des commandes et résultats est archivée
 dans [acceptance/t233-validation.txt](acceptance/t233-validation.txt).
 
-## Validation locale
+## Racine inchangée autour du rescan final
+
+La revue suivante porte sur `9e79d55`. Le correctif
+`18a3d3736d8f116cc1bd587a15fa5dc907700427` ajoute :
+
+- [`fix.py:137`](https://github.com/Cezar277/heimdall/blob/18a3d3736d8f116cc1bd587a15fa5dc907700427/heimdall/cli/fix.py#L137) : relecture de l'identité `(dev, ino, ctime_ns)`, refus des redirections et conversion des erreurs d'accès en `ScanError` statique.
+- [:263](https://github.com/Cezar277/heimdall/blob/18a3d3736d8f116cc1bd587a15fa5dc907700427/heimdall/cli/fix.py#L263) et [:272](https://github.com/Cezar277/heimdall/blob/18a3d3736d8f116cc1bd587a15fa5dc907700427/heimdall/cli/fix.py#L272) : comparaison avec l'identité attendue avant et après `collect` ; le résultat d'un dossier substitué ne peut produire le bilan propre de la remédiation initiale.
+- [:244](https://github.com/Cezar277/heimdall/blob/18a3d3736d8f116cc1bd587a15fa5dc907700427/heimdall/cli/fix.py#L244) : les écritures atomiques normales changent le ctime du répertoire. L'empreinte attendue est rafraîchie après patch, remédiation de l'environnement et cleanup, seulement après vérification du même périphérique/inode. Les vérifications précédant chaque patch restent actives.
+- [`test_issue233_hardening.py:561`](https://github.com/Cezar277/heimdall/blob/18a3d3736d8f116cc1bd587a15fa5dc907700427/tests/test_issue233_hardening.py#L561) : quatre cas API/CLI remplacent le dossier par un nouveau dossier propre au même chemin avant ou pendant le rescan, après un vrai patch. Un fichier non remédiable reste dans le dossier original renommé ; le bilan est refusé par `ScanError`/code 2, sans sortie JSON propre. Le cas avant rescan vérifie que la seconde collecte n'a même pas été appelée.
+- [:614](https://github.com/Cezar277/heimdall/blob/18a3d3736d8f116cc1bd587a15fa5dc907700427/tests/test_issue233_hardening.py#L614) : deux patches successifs dans la même racine fonctionnent, sans faux positif lié au ctime de nos écritures.
+
+`test_issue233_hardening.py` : **190 tests passent en 2,84 s**, dont cinq
+nouveaux cas. Cinq avertissements existants concernent les sauvegardes de
+remédiation. Ruff sur le dépôt, MyPy (57 fichiers) et Bandit sur `fix.py`
+passent. Le rejeu complet sur ce commit figé donne **4089 tests et 7124
+sous-tests passés, 18 ignorés, 1 échec**, en **365,42 s** (19 avertissements
+existants). L'unique échec est
+`test_env_path_with_spaces_properly_quoted_in_git_rm_command`, déjà
+reproduit isolément sur la base `8d9298d` lors de la passe précédente,
+dans un checkout séparé. Les modules concernés et ce test restent inchangés
+par le correctif de racine. Le test d'identité `ctime` passe dans ce rejeu.
+La suite complète n'est donc pas verte. Aucun code ni test n'a changé
+après ce rejeu ; seuls les documents de preuve ont été actualisés.
+Rapport JUnit : `/home/nathan/heimdall-t233-root-rescan-final.xml`.
+La CI n'a pas été déclenchée ; aucune fusion n'a été effectuée.
+
+## Validation locale précédente — `440ae9e`
 
 Environnement : Debian WSL, Python 3.13, environnement Python local existant.
 Les versions verrouillées de CI n'ont pas été réinstallées pour cette passe.
