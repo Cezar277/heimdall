@@ -13,8 +13,10 @@ X-Forwarded-For, et le middleware fail-closed sur la boucle locale.
 import ast
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
+import io
 import json
 import os
 import socket
@@ -604,6 +606,40 @@ class VaultSettingsTests(unittest.TestCase):
         """run_server est défini et appelable comme point d'entrée."""
         self.assertTrue(callable(run_server))
 
+    def test_factory_get_app_unknown_env_exits_2_without_traceback(self) -> None:
+        """Déploiement factory : HEIMDALL_ENV inconnu → code 2, jamais d'app construite."""
+        import heimdall.vault.app as app_module  # noqa: PLC0415
+
+        stderr = io.StringIO()
+        with (
+            patch.dict(app_module._APP_HOLDER, clear=True),
+            patch.dict(os.environ, {"HEIMDALL_ENV": "staging"}),
+            patch.object(app_module, "create_app") as factory,
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            get_app()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("HEIMDALL_ENV invalide", stderr.getvalue())
+        factory.assert_not_called()
+
+    @patch("uvicorn.run")
+    def test_run_server_unknown_env_exits_2_without_traceback(
+        self, mock_uvicorn_run: unittest.mock.MagicMock
+    ) -> None:
+        """HEIMDALL_ENV inconnu : code 2 et message actionnable, jamais de démarrage."""
+        stderr = io.StringIO()
+        with (
+            patch.dict(os.environ, {"HEIMDALL_ENV": "staging"}),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            run_server()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("HEIMDALL_ENV invalide", stderr.getvalue())
+        self.assertIn("production, prod, dev, test", stderr.getvalue())
+        mock_uvicorn_run.assert_not_called()
+
     @patch("uvicorn.run")
     def test_run_server_passes_hardened_uvicorn_arguments(
         self, mock_uvicorn_run: unittest.mock.MagicMock
@@ -632,6 +668,8 @@ class VaultSettingsTests(unittest.TestCase):
                 "forwarded_allow_ips": "",
                 "server_header": False,
                 "date_header": False,
+                "limit_concurrency": 100,
+                "timeout_keep_alive": 5,
             },
         )
 
@@ -710,6 +748,8 @@ class VaultSettingsTests(unittest.TestCase):
                 "forwarded_allow_ips": "",
                 "server_header": False,
                 "date_header": False,
+                "limit_concurrency": 100,
+                "timeout_keep_alive": 5,
             },
         )
 
@@ -2745,12 +2785,18 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
     def test_vault_settings_rejects_public_default_pepper_outside_explicit_test_env(self) -> None:
         """Hors HEIMDALL_ENV=test explicite, la constante publique partagée est refusée."""
         _public_default = "heimdall_default_vault_pepper_dev_only"
-        for env_mode in ("", "development", "staging"):
+        for env_mode in ("production", "prod", "dev"):
             with self.subTest(env_mode=env_mode):
                 with patch.dict(os.environ, {"HEIMDALL_ENV": env_mode}, clear=True):
                     with self.assertRaises(ValidationError) as ctx:
                         VaultSettings(api_key_pepper=_public_default)
                     self.assertIn("HEIMDALL_VAULT_API_KEY_PEPPER", str(ctx.exception))
+        for invalid_mode in ("", "development", "staging"):
+            with self.subTest(invalid_mode=invalid_mode):
+                with patch.dict(os.environ, {"HEIMDALL_ENV": invalid_mode}, clear=True):
+                    with self.assertRaises(ValidationError) as ctx:
+                        VaultSettings(api_key_pepper=_public_default)
+                    self.assertIn("HEIMDALL_ENV invalide", str(ctx.exception))
         # Seul un HEIMDALL_ENV=test explicite l'autorise (fixtures déterministes).
         with patch.dict(os.environ, {"HEIMDALL_ENV": "test"}, clear=True):
             settings = VaultSettings(api_key_pepper=_public_default)
@@ -2824,7 +2870,7 @@ class VaultSecretsRouteTests(unittest.IsolatedAsyncioTestCase):
 
     def test_vault_settings_generates_ephemeral_pepper_outside_production(self) -> None:
         """Hors production, un pepper aléatoire éphémère remplace l'ancien défaut public."""
-        with patch.dict(os.environ, {"HEIMDALL_ENV": "development"}, clear=True):
+        with patch.dict(os.environ, {"HEIMDALL_ENV": "dev"}, clear=True):
             first = VaultSettings()
             second = VaultSettings()
         for generated in (first.api_key_pepper, second.api_key_pepper):
