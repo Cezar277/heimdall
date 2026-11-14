@@ -1,0 +1,99 @@
+Ticket #230 - Audit E-02 / allowlist
+DERNIERE REVISION - ECHAPPEMENTS DEFENSIFS ET GLOBS ZERO SEGMENT
+Code teste : 095e91bb8d75d0e70f12834f650fd772261148ac
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t230-escape-contract-final.xml
+4417 passed, 18 skipped, 19 warnings, 7124 subtests passed in 387.51s (0:06:27)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 19 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_issue230_scanner_allowlist.py tests/test_scanner_allowlist.py -o addopts= -q --tb=short
+207 passed in 6.51s.
+Vingt nouveaux cas : douze syntaxes incompletes sur helper/compteur/
+compilateur, deux offsets invalides, deux echappements valides et quatre
+globs montrant que logs/** couvre aussi logs, contrairement a logs/*/**.
+
+python -m ruff check heimdall tests scripts docker
+All checks passed!
+python -m mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts docker
+Success: no issues found in 69 source files
+python -m bandit -r heimdall scripts docker -q
+Exit 0, aucune alerte ; avertissements nosec existants.
+
+CI annulee par l'utilisateur. Aucun nouveau /ci pour cette revision.
+Aucune CI verte revendiquee. Les anciennes passes ci-dessous sont historiques.
+
+CORRECTION APRES REQUEST CHANGES
+Revision : a95a1f00a221c1df1dd2af93c8155487db765f1c
+Main integre : 4d5bdf8, merge f2711ce.
+
+Bloqueur : deduplication uniquement par (type, valeur). Le temoin CLI
+local/CI garde credential apres une allowlist limitee a service_token,
+avec exit 1, une trace et aucune valeur brute en sortie.
+Npm : charge minimale 16, npm_packages/npm_config_registry non signales.
+Residuels nus sans trois classes et valeurs non citees <4 documentes/testes.
+Integration fix : un patch par fichier/ligne/empreinte apres allowlist.
+Git imbrique : marqueur le plus proche, GitAccess confine conserve,
+marqueurs symboliques refuses avant execution ; temoin .env espaces passe.
+
+Passe ciblee apres integration : 1350 passed, 5 warnings in 35.10s.
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t230-typed-review-final.xml
+Sur 5eee07e : 1 failed, 4396 passed, 18 skipped, 19 warnings,
+7124 subtests passed in 380.12s.
+Unique echec : test_selected_index_changed_on_the_same_inode_is_refused[content],
+precondition ctime identique au meme tick. Temoin stabilise avec 20 ms
+avant reecriture, sans modifier la garde d'index de production.
+python -m pytest tests/test_hook_commit_index.py tests/test_issue230_scanner_allowlist.py tests/test_issue233_hardening.py tests/test_remediation_env.py -o addopts= -q --tb=short
+Apres stabilisation : 440 passed, 5 warnings in 22.99s.
+
+python -m ruff check heimdall tests scripts docker
+All checks passed!
+python -m mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts docker
+Success: no issues found in 69 source files
+python -m bandit -r heimdall scripts docker -q
+Exit 0 ; avertissements nosec existants, aucune alerte de securite.
+
+Rejeu global final de cette correction sur 3aaaddd :
+4397 passed, 18 skipped, 19 warnings, 7124 subtests passed in 379.33s.
+CI (/ci) declenchee sur la PR 253 puis annulee par l'utilisateur ;
+aucune relance. Les anciennes passes ci-dessous sont historiques.
+
+VALIDATION INITIALE - HISTORIQUE d50d0f6
+Branche : 230-audit-e-02-allowlist-scanner-détection-mots-de-passe-urls-jetons-courts-et-contournement-regex-allowlist-_compile_safe_regex
+Code teste : d50d0f6660b79b01d7711c9b9b71f180da87b71e
+Base : 336bc02
+Debian WSL, Python 3.13, environnement local existant.
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t230-final.xml
+4056 passed, 18 skipped, 14 warnings, 7125 subtests passed in 361.50s (0:06:01)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 14 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_issue230_scanner_allowlist.py tests/test_scanner_allowlist.py tests/test_scanner_signatures.py tests/test_scanner_entropy.py tests/test_scanner_detect.py tests/test_trap_acceptance.py -o addopts= -q --tb=short
+776 passed in 13.81s.
+Passe ciblee apres les correctifs d'integration ; le formatage ulterieur
+des trois nouveaux modules ne modifie pas leur logique. Suite complete
+rejouee sur le commit fige ci-dessus.
+
+python -m ruff check heimdall tests scripts docker
+All checks passed!
+python -m mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts docker
+Success: no issues found in 66 source files
+python -m bandit -r heimdall scripts docker -q
+Exit 0, aucune alerte de securite ; avertissements de lecture des anciens
+commentaires nosec et d'un nosec B603 sans alerte correspondante.
+
+Corpus E-02 : positifs=75, negatifs=15, TP=74, FN=1, FP=1.
+Rappel=74/75, precision=74/75, soit 98.6667% sur ce seul corpus.
+Le FN est le positif d'indice 34 (jeton court) ; FP : negatif d'indice 14 (UUID).
+Le test impose rappel >= 0.90 et precision >= 0.95.
+
+Corpus T21 historique, oracle inchange :
+core : TP=10 FP=12 FN=0 precision=10/22 rappel=1.0.
+all : TP=12 FP=12 FN=4 precision=12/24 rappel=0.75.
+Quatre candidats contextuels supplementaires : changeme et mocks nommes
+comme jetons, dans les deux langages. Les deux alertes artificielles par
+jointure de commentaires ont ete corrigees, avec regression dediee.
+Le script historique garde son seuil 0.90 et retourne 1, comme documente.
+
+La CI n'a pas ete declenchee. Aucun merge effectue.

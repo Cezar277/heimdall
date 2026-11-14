@@ -763,6 +763,8 @@ def _get_git_toplevel(path: Path) -> Path | None:
     """
     try:
         path_stat = os.lstat(path)
+        if stat.S_ISLNK(path_stat.st_mode):
+            return None
         is_plain_dir = stat.S_ISDIR(path_stat.st_mode) and not stat.S_ISLNK(path_stat.st_mode)
     except OSError:
         is_plain_dir = False
@@ -778,12 +780,15 @@ def _get_git_toplevel(path: Path) -> Path | None:
     try:
         access = GitAccess(repo_dir)
         res = access.execute(("rev-parse", "--show-toplevel"), timeout=_GIT_TIMEOUT_SECONDS)
+        if res.returncode != 0:
+            return None
+        top = res.stdout.decode("utf-8", errors="strict").strip()
+        # Le toplevel annoncé par Git doit être exactement le dépôt localisé
+        # par lstat, jamais un ancêtre ou une cible de lien.
+        if top and Path(top) == access.root:
+            return access.root
     except Exception:  # noqa: BLE001  # nosec B110
         return None
-    if res.returncode == 0:
-        top = res.stdout.decode("utf-8", errors="replace").strip()
-        if top:
-            return Path(top)
     return None
 
 

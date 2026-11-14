@@ -14,6 +14,8 @@ from heimdall.scanner.limits import MAX_TOKEN_LENGTH
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
 MIN_TOKEN_LENGTH = 16
+SHORT_TOKEN_MIN = 20
+SHORT_TOKEN_MAX = 22
 _SCAN_ERROR = "scan impossible : entrée non analysable"
 
 # Un caractère sentinelle au-delà du plafond : refus avant calcul d'entropie.
@@ -30,8 +32,15 @@ class EntropyConfig:
     hex_threshold: float = 3.0
     base64_threshold: float = 4.5
     min_length: int = 20
+    short_token_adjustment: float = 0.65
 
     def __post_init__(self) -> None:
+        adjustment = self.short_token_adjustment
+        if (
+            isinstance(adjustment, bool) or not isinstance(adjustment, (int, float))
+            or not math.isfinite(adjustment) or not 0 <= adjustment <= 1
+        ):
+            raise ValueError("configuration d'entropie invalide")
         for value, maximum in ((self.hex_threshold, 4.0), (self.base64_threshold, 6.0)):
             if (
                 isinstance(value, bool)
@@ -148,6 +157,12 @@ def _entropy_matches(
             continue
         hexadecimal = _HEX.fullmatch(value) is not None or _UUID.fullmatch(value) is not None
         threshold = config.hex_threshold if hexadecimal else config.base64_threshold
+        if (
+            not hexadecimal and SHORT_TOKEN_MIN <= len(value) <= SHORT_TOKEN_MAX
+            and any(char.islower() for char in value) and any(char.isupper() for char in value)
+            and any(char.isdigit() for char in value)
+        ):
+            threshold = max(0.0, threshold - config.short_token_adjustment)
         if shannon_entropy(value.encode("ascii")) >= threshold:
             yield SignatureMatch(
                 "high_entropy_hex" if hexadecimal else "high_entropy_base64",

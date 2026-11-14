@@ -10,6 +10,16 @@ l'entropie par caractère est identique à l'entropie par octet du contrat.
 | `hex_threshold` | 3,0 bits | nombre fini dans ]0 ; 4] |
 | `base64_threshold` | 4,5 bits | nombre fini dans ]0 ; 6] |
 | `min_length` | 20 caractères | entier dans [16 ; 4096] |
+| `short_token_adjustment` | 0,65 bit | nombre fini dans [0 ; 1] |
+
+E-02 (#230) : pour un jeton non hexadécimal de 20 à 22 caractères portant
+minuscules, majuscules et chiffres, le seuil base64 effectif est diminué de
+`short_token_adjustment` (plancher zéro). Au défaut : 3,85 bits. Cela corrige
+le biais des petits échantillons : `log2(20) < 4,5`. Les autres longueurs et
+l'hexadécimal conservent leurs seuils. La correction peut être désactivée
+avec `short_token_adjustment=0` ; un seuil base64 de 6 reste trop élevé
+pour ces petits échantillons même avec la correction. Ce filet peut produire
+des faux positifs et manquer des jetons ; voir le [corpus E-02](t230-scanner-allowlist.md).
 
 Un seuil est inclusif. Les booléens, NaN et infinis sont refusés. Les valeurs
 hexadécimales sont classées avant les valeurs base64/base64url. Dans chaque
@@ -32,7 +42,9 @@ est partagé entre la déduplication de l'entropie et les Findings regex.
 Chaque ligne courante n'est donc analysée qu'une fois par les signatures,
 même sans candidat entropie. Chaque fenêtre de deux lignes contiguës est
 également analysée une fois, puis son résultat est réutilisé pour dédupliquer
-l'entropie de la ligne suivante. Les valeurs brutes de ce cache temporaire
+l'entropie des deux fragments concernés. La fenêtre est calculée avant la
+ligne courante afin d'éviter de signaler le premier fragment comme jeton court.
+Les valeurs brutes de ce cache temporaire
 restent internes au scan de la cible et ne sont ni rendues ni journalisées.
 Une échéance déjà expirée est refusée avant tout parcours ; elle est
 revérifiée après les signatures, y compris sans candidat entropie. Ces

@@ -320,6 +320,7 @@ def test_m05_git_helpers_use_git_access(tmp_path: Path) -> None:
         mock_client_git.assert_called_once_with(tmp_path)
 
     with patch("heimdall.vault.atomic.GitAccess") as mock_atomic_git:
+        mock_atomic_git.return_value.root = tmp_path
         mock_atomic_git.return_value.execute.return_value = MagicMock(
             returncode=0, stdout=str(tmp_path).encode("utf-8")
         )

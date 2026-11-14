@@ -857,7 +857,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 self.assertFalse(is_git_ignored(target))
 
     def test_git_toplevel_does_not_follow_symlinked_dir(self) -> None:
-        """Répertoire symlinké → cwd = parent réel (lstat), jamais la cible suivie."""
+        """Répertoire symlinké → refus avant tout appel à GitAccess."""
         real_dir = self.tmp_dir / "real_repo"
         real_dir.mkdir()
         link_dir = self.tmp_dir / "link_repo"
@@ -872,6 +872,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             # Jamais de cwd dans la cible suivie du lien.
             for call in mock_access_cls.call_args_list:
                 self.assertNotEqual(call.args[0], real_dir)
+            mock_access_cls.assert_not_called()
 
     def test_git_toplevel_refuses_symlinked_dot_git(self) -> None:
         """``.git`` symlinké vers l'extérieur → None, git jamais lancé."""
