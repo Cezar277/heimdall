@@ -1,4 +1,28 @@
 Ticket #229 - Audit E-01
+DERNIERE REVISION - COUVERTURE JSON ET PARITE COLD START
+Code teste : 4be7a90882034f23f850bf08222f9cbb87e76b8a
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-coverage-cold-final.xml
+3962 passed, 18 skipped, 14 warnings, 6911 subtests passed in 338.06s (0:05:38)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 14 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_scanner_fail_closed.py tests/test_scanner_tolerance.py tests/test_cli_scan.py tests/test_cold_start.py -o addopts= -q --tb=short
+297 passed in 14.89s.
+Trois nouveaux cas : fichiers partiels deduits une seule fois en index et
+diff ; cold start avec finding et jeton long conserve finding/opinion,
+sort 2 pour incompletude sans faux message de modification.
+Temoins JSON existants adaptes : couverture toujours emise ; count == 0
+avec complete == false ne constitue pas un verdict propre.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite ; avertissements existants de lecture nosec.
+La CI n'a pas ete declenchee. Les passes precedentes restent historiques.
+
 DERNIERE REVISION - COMPTEURS, CP1252 SANS PERTE ET VERDICT HUMAIN
 Code teste : 7eda6e2bffdebcb7499568e5e816a98a9b2ac974
 

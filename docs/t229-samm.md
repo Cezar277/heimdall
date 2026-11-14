@@ -1,6 +1,6 @@
 # T229 — Preuves du correctif fail-closed après revue
 
-Ticket #229, audit E-01. Révision de code actuelle : `7eda6e2bffdebcb7499568e5e816a98a9b2ac974`.
+Ticket #229, audit E-01. Révision de code actuelle : `4be7a90882034f23f850bf08222f9cbb87e76b8a`.
 Base de la branche : `6bbe7da` (intégration de #228 / #240).
 Les premiers permaliens ci-dessous conservent le SHA du correctif critique
 `aba5eb3`. Les durcissements complémentaires sont épinglés séparément sur
@@ -64,6 +64,15 @@ Révision : `7eda6e2bffdebcb7499568e5e816a98a9b2ac974`.
 - [`exclusions.py:269`](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/heimdall/scanner/exclusions.py#L269) décode CP1252 sans remplacement. Les cinq octets non définis rendent le contenu non analysable : trace `binary`, couverture partielle, jamais un verdict propre. Le témoin [:379](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/tests/test_scanner_fail_closed.py#L379) couvre les cinq octets ; la charge `cp1252_split` de [:59](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/tests/test_scanner_fail_closed.py#L59) vérifie le code 2 sur arbre, index, diff et historique. La propriété n'est pas la reconstruction d'un secret altéré.
 - [`scan.py:1052`](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/heimdall/cli/scan.py#L1052) termine le rapport partiel sans finding par « ANALYSE PARTIELLE : ne pas déployer (code 2). » Le témoin [:396](https://github.com/Cezar277/heimdall/blob/7eda6e2bffdebcb7499568e5e816a98a9b2ac974/tests/test_scanner_fail_closed.py#L396) vérifie la dernière ligne et le code réel.
 
+## Couverture JSON, fichiers complets et parité cold start
+
+Révision : `4be7a90882034f23f850bf08222f9cbb87e76b8a`.
+
+- [`scan.py:966`](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/heimdall/cli/scan.py#L966) émet systématiquement `complete`, `skipped_count` et `skipped`, y compris `true`, `0`, `[]` sans exclusion. Le témoin [`test_scanner_fail_closed.py:361`](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/tests/test_scanner_fail_closed.py#L361) valide les deux formes et refuse de conclure propre sur un rapport partiel sans finding. Le [schéma](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/schemas/scan.schema.json#L18) interdit l'interprétation `count == 0` seule ; l'ancien schéma v1 reste accepté pour les archives. Aucun champ supplémentaire ne peut contraindre un vieux parseur qui l'ignore : le consommateur doit contrôler la couverture.
+- [`scan.py:859`](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/heimdall/cli/scan.py#L859) et [:940](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/heimdall/cli/scan.py#L940) comptent les fichiers entièrement analysés en index/diff en déduisant chaque chemin exclu une seule fois, quel que soit le nombre de traces. Le témoin [:409](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/tests/test_scanner_fail_closed.py#L409) couvre les deux périmètres avec deux traces pour un fichier.
+- [`cold_start.py:182`](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/heimdall/cli/cold_start.py#L182) applique le même `prepare_text(strict=False)` et le même moteur tolérant lors de la relecture. Le témoin [`test_cold_start.py:90`](https://github.com/Cezar277/heimdall/blob/4be7a90882034f23f850bf08222f9cbb87e76b8a/tests/test_cold_start.py#L90) conserve finding et opinion avec un jeton long, vérifie le code 2 d'incomplétude du cold start et l'absence du faux message « contenu modifié ». Les gardes de racine et d'appartenance des findings sont conservées.
+- La [politique de tolérance](scanner-tolerance.md) précise que l'intérieur des jetons trop longs n'est pas analysé, même s'il contient un candidat concaténé ; le mode strict refuse, le mode tolérant trace l'exclusion et bloque le verdict propre. La preuve reste celle du verdict fail-closed, sans prétendre retrouver un secret dans chaque contenu exclu.
+
 ## Validation
 
 Le correctif critique avait été validé par **3925 tests**, 18 ignorés et
@@ -90,11 +99,19 @@ dont onze nouveaux cas. Le rejeu complet après le commit de code passe :
 avertissements existants concernent les sauvegardes de remédiation.
 Ruff, MyPy (57 fichiers) et Bandit passent ; Bandit conserve ses avertissements
 de lecture des anciens commentaires `nosec`, sans alerte de sécurité.
-Rapport JUnit final : `/home/nathan/heimdall-t229-report-decoding-final.xml`.
+Rapport JUnit de `7eda6e2` : `/home/nathan/heimdall-t229-report-decoding-final.xml`.
 Aucun code ni test n'a changé après ce rejeu ; seuls les documents de preuve
 ont été mis à jour.
 Les anciennes passes archivées correspondent à l'état initial de la PR et
 ne constituent pas une preuve de cette correction fail-closed.
+
+Dernière révision `4be7a90` : **297 tests ciblés en 14,89 s** et suite complète
+après le commit de code : **3962 tests, 6911 sous-tests, 18 ignorés**, en
+**338,06 s**. Les 14 avertissements existants concernent les sauvegardes de
+remédiation. Ruff, MyPy (57 fichiers) et Bandit passent (avertissements de
+lecture `nosec` existants, aucune alerte de sécurité). Aucun code ni test
+n'a changé après ce rejeu ; seuls les documents de preuve ont été actualisés.
+Rapport JUnit final : `/home/nathan/heimdall-t229-coverage-cold-final.xml`.
 
 Environnement : Debian WSL, Python 3.13, dépendances de l'environnement
 existant. La CI aux versions verrouillées n'a pas été déclenchée.
