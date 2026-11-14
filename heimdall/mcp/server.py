@@ -109,7 +109,8 @@ _BACKUP_INFIX: Final[re.Pattern[str]] = re.compile(
 
 # `credentials` est un nom nu trop général pour un préfixe large :
 # `credentials.md` est de la documentation. On énumère les extensions qui,
-# elles, contiennent des credentials ; les suffixes de sauvegarde sont
+# elles, contiennent des credentials (configs, mais aussi coffres locaux
+# `.env`, `.db`, `.sqlite*`, `.store`) ; les suffixes de sauvegarde sont
 # retirés avant comparaison par `_strip_backup_suffixes`.
 _CREDENTIALS_VARIANTS: Final[tuple[str, ...]] = tuple(
     f"credentials{suffix}"
@@ -123,6 +124,11 @@ _CREDENTIALS_VARIANTS: Final[tuple[str, ...]] = tuple(
         ".cfg",
         ".conf",
         ".xml",
+        ".env",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".store",
     )
 )
 

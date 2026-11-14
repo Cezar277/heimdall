@@ -177,9 +177,12 @@ _DEFINE_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 # le voyait. Insensible à la casse : `Password` est accepté par les clients
 # `.netrc` et était oublié. La valeur peut être citée (guillemets simples ou
 # doubles, espaces internes inclus) : sans branche citée, la forme plausible
-# `password "…"` partait en clair (revue).
+# `password "…"` partait en clair (revue). Le jeton doit être en début de
+# ligne ou précédé d'un espace : dans `<password lang="en">`, le nom est
+# collé à `<` et l'attribut `lang=` ne doit pas être pris pour la valeur
+# (revue) ; `(?<!\S)` couvre aussi `<ns:password>` et `data-password`.
 _NETRC_PASSWORD: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?<![\w-])password[ \t]+(?![=:])"
+    r"(?i)(?<!\S)password[ \t]+(?![=:])"
     r"(?:"
     r"(?P<quote>[\"'])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=quote)"
     r"|[\"'](?P<unclosed>[^\n]*?)(?=[ \t]+#|\n|$)"

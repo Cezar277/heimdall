@@ -289,6 +289,8 @@ class SanitizeFileToolTests(FileRepoTestCase):
             ".npmrc",
             ".pypirc",
             "credentials",
+            "credentials.env",
+            "credentials.db",
             ".docker/config.json",
             ".kube/config",
             ".netrc.backup",

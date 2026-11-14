@@ -199,7 +199,8 @@ formes hors affectation sont couvertes : balise XML sensible
 (`<password>…</password>`, y compris indentée ou multiligne, indentation
 préservée), `define('DB_PASSWORD', '…')` (nom et valeur nus acceptés,
 `DEFINE` et espace avant `(` admis, comme en PHP), `.netrc` (`password …`,
-`Password` et valeur citée inclus, fermée ou tronquée), `-u user:pass`
+`Password` et valeur citée inclus, fermée ou tronquée, hors attributs XML
+`<password lang="…">`), `-u user:pass`
 (couple ou mot de passe cité, formes tronquées incluses) et `--password
 <val>`/`--password=<val>`. Le filtre anti-bruit refuse les annotations
 (`api_key: str`) et littéraux (`session = None`) ; un appel de fonction à nom
@@ -436,7 +437,8 @@ double garde : avant **et** après lecture), absent/dossier (`NOT_FOUND`),
 
 **F-09 (audit)** : `is_forbidden_path` refuse aussi les fichiers de
 credentials au-delà de `.git`/`.env*` — `.netrc`, `.pgpass`, `id_rsa*`,
-`id_ed25519*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `credentials`,
+`id_ed25519*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `credentials` et ses
+coffres (`.env`, `.db`, `.sqlite`, `.sqlite3`, `.store`),
 `.docker/config.json` et `.kube/config`, casse ignorée. Les variantes de
 sauvegarde sont refusées après normalisation du nom (`.netrc.backup`,
 `.pgpass~`, `.npmrc-backup`, `credentials.json`, `credentials-backup`,

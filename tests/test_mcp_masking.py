@@ -130,6 +130,14 @@ class AuditE03MaskingProofTests(unittest.TestCase):
         line = "<name>\n  Martin\n</name>"
         self.assertEqual(masking.mask_text(line), (line, 0))
 
+    def test_xml_attribute_is_not_taken_for_netrc(self) -> None:
+        """Revue (LOW) : `<password lang="en">` ne doit pas masquer `lang=`."""
+        line = '<password lang="en">S3cretP4ss99</password>'
+        masked, redactions = masking.mask_text(line)
+        self.assertEqual(redactions, 1, "seule la valeur est masquée")
+        self.assertIn('lang="en"', masked)
+        self.assertNotIn("S3cretP4ss99", masked)
+
     def test_passphrase_with_parens_is_pinned_readable(self) -> None:
         """Arbitrage bruit/fuite assumé (revue), sans mesure de bruit.
 
