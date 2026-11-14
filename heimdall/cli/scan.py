@@ -774,7 +774,7 @@ def _collect_staged(
     pas enchaîner 2 000 lectures jusqu'à épuisement du job CI.
     """
     deadline = time.monotonic() + MAX_STAGED_SECONDS
-    access = GitAccess(root)
+    access = GitAccess(root, index_file=os.environ.get("GIT_INDEX_FILE"))
     if not access.is_repository(timeout=_call_timeout(deadline)):
         raise ScanError(_MSG_NOT_A_REPO)
     changes = access.staged_changes(timeout=_call_timeout(deadline))

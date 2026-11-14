@@ -7,7 +7,7 @@ Statut : livré. Le hook local est une **aide** : il reste contournable par
 ## Utilisation
 
 ```sh
-heimdall hook install [CHEMIN] [--force]    # installe ou met à jour le hook
+heimdall hook install [CHEMIN] [--force] [--no-allowlist]
 heimdall hook uninstall [CHEMIN] [--force]  # retire le hook et restaure le précédent
 ```
 
@@ -51,6 +51,37 @@ travail. Une modification non indexée n'est donc jamais scannée (#104), et
 un commit partiel (`git add -p`) ne peut pas faire juger des lignes qui ne
 seront pas commitées (#106).
 
+Depuis #228, le scan respecte `GIT_INDEX_FILE` pour `git commit -a`,
+`git commit <chemin>`, `-p`, `--amend`, `--only` et `--include`. Seul un
+fichier régulier directement dans le répertoire Git du worktree courant,
+nommé `index`, `index.lock` ou `next-index-<pid>.lock`, est accepté. Les
+chemins relatifs sont résolus depuis la racine du dépôt ; les liens,
+fichiers absents, répertoires et chemins externes sont refusés en code 2.
+Le même index est utilisé pour le diff, `ls-files`, la garde anti
+auto-attestation et la vérification finale. Les autres variables Git
+héritées restent ignorées. Les accès MCP ne reprennent aucun index hérité.
+
+## Modifier la configuration avec revue
+
+La configuration stagée ne peut pas autoriser ses propres exclusions.
+Pour proposer un changement de `heimdall.toml`, installer explicitement
+le hook en mode strict, puis préparer un commit de configuration séparé :
+
+```sh
+heimdall hook install --no-allowlist .
+git add heimdall.toml
+git commit -m "chore(config): propose reviewed allowlist changes"
+heimdall hook install .
+```
+
+Ce mode scanne tous les blobs concernés sans appliquer aucune exclusion
+d'allowlist, y compris celles de la configuration proposée. Tout secret
+détecté bloque toujours le commit. Le mode reste actif jusqu'à la prochaine
+installation du hook sans `--no-allowlist`. La PR doit faire approuver les
+exclusions par un relecteur et passer la CI avec `--ci --no-allowlist` ou
+une configuration externe approuvée. Ce mécanisme ne valide pas à lui seul
+la pertinence des nouvelles exclusions.
+
 ## Hooks existants, `core.hooksPath` et worktrees
 
 Le dossier de hooks est celui rendu par `git rev-parse --git-path hooks` :
@@ -84,19 +115,25 @@ ce soit. Les parents manquants sont créés en `0700`.
 ## Anti-récursion
 
 Le script pose `HEIMDALL_IN_HOOK=1` avant d'exécuter le hook précédent et le
-scan. Si la variable vaut déjà `1`, il affiche un avertissement sur stderr
-puis sort immédiatement en `0`. Un hook hérité qui relancerait Heimdall, ou
-une future remédiation qui ré-indexe, ne déclenche donc pas de boucle (#105).
-
-Poser `HEIMDALL_IN_HOOK=1` dans l'environnement **contourne le hook** :
-c'est équivalent à `git commit --no-verify`. L'avertissement rend le
-contournement visible, mais ne le bloque pas. La CI `--ci` reste la barrière
-(REQ-SEC-08).
+scan. Si la variable est déjà présente, quelle que soit sa valeur (même
+vide), il refuse en code 2 avec un diagnostic statique sur stderr. Un hook
+hérité qui lance un commit récursif est donc bloqué ; une variable externe
+ne peut plus obtenir un verdict propre sans scan (#228). Les écritures
+internes de ré-indexation neutralisent déjà les hooks via `core.hooksPath`.
+Retirer une variable exportée par erreur avec `unset HEIMDALL_IN_HOOK`
+avant de relancer un commit normal.
 
 ## Ré-indexation après remédiation
 
 La primitive `heimdall.cli.hook.apply_and_restage(root, paths, apply)` est
 fournie pour le moteur de remédiation (#30/#32) :
+
+Si `GIT_INDEX_FILE` est présente, même vide ou égale à l'index par défaut,
+la remédiation refuse en `HookError` **avant** d'appeler `apply()`. La garde
+des modifications non indexées et la primitive interne de ré-indexation
+appliquent le même refus. Le scan du hook continue à utiliser l'index
+effectif validé ; la remédiation des index temporaires reste à intégrer
+avec #30/#32. Ce refus évite d'assainir un autre index que celui du commit.
 
 1. `assert_no_unstaged_changes` vérifie **avant** l'application qu'aucun
    fichier cible n'a de modification non indexée. Sinon la remédiation
@@ -141,8 +178,7 @@ moteur de remédiation interactif reste le ticket #30/#32.
 ## Limites
 
 - `git commit --no-verify` contourne le hook.
-- `HEIMDALL_IN_HOOK=1` contourne le hook (avertissement sur stderr) ; c'est
-  le mécanisme d'anti-récursion, pas une garantie de sécurité.
+- Toute variable `HEIMDALL_IN_HOOK` héritée bloque le hook (code 2).
 - Le hook est local et mono-utilisateur ; la CI déterministe reste la seule
   barrière opposable pour une branche partagée.
 - L'interpréteur Python doit être hors du dépôt : un venv local est refusé
@@ -163,7 +199,7 @@ moteur de remédiation interactif reste le ticket #30/#32.
 - `core.hooksPath` relatif/absolu, `--force` hors dépôt, symlink résolu et
   worktree lié ;
 - blocage d'un secret indexé, ignore d'un secret non indexé ;
-- contournement documenté `HEIMDALL_IN_HOOK=1` sur un vrai `git commit` ;
+- refus de `HEIMDALL_IN_HOOK=1` sur un vrai `git commit` ;
 - commit partiel avec deux hunks : l'index reste exactement celui préparé,
   le second hunk reste intact dans le dossier de travail ;
 - refus des modifications non indexées avant remédiation ;
@@ -185,7 +221,34 @@ moteur de remédiation interactif reste le ticket #30/#32.
   la ré-indexation est refusé sans stager `b` ;
 - fichiers non suivis ou absents refusés par l'assert (pas de `git add`
   implicite) ;
-- anti-récursion `HEIMDALL_IN_HOOK=1`.
+- anti-récursion : toute valeur héritée est refusée ;
+- `tests/test_hook_commit_index.py` : vrais commits avec index temporaire,
+  commits propres, worktree lié, index invalides, configuration et mode
+  strict `--no-allowlist` (#228).
+
+Git est cherché dans `os.defpath` puis, sur POSIX, dans `/opt/homebrew/bin`,
+`/usr/local/bin`, `/run/current-system/sw/bin` et
+`/nix/var/nix/profiles/default/bin`. Le `PATH` hérité n'est jamais utilisé.
+Une installation Nix disponible uniquement dans un profil utilisateur doit
+exposer Git via un de ces chemins système. Un binaire dans le dépôt ou le
+répertoire courant reste refusé.
+
+Pour ces préfixes supplémentaires, Heimdall vérifie désormais que le binaire,
+ses répertoires parents, les liens symboliques et leurs cibles résolues
+appartiennent à root (`st_uid == 0`). Les fichiers et répertoires doivent
+en outre être non modifiables par le groupe et les autres (`mode & 0022 == 0`).
+Les permissions des liens eux-mêmes ne sont pas utilisées : leur propriétaire,
+leurs parents et leurs cibles sont contrôlés. Un chemin illisible, absent ou
+non conforme entraîne un refus statique (code 2), sans exécuter le binaire.
+
+Un Homebrew installé dans un préfixe appartenant à l'utilisateur est donc
+refusé : utiliser une installation système protégée de Git. Les autres
+emplacements de `os.defpath` conservent la politique de confiance système
+existante. La CI doit utiliser sa propre installation Git de confiance.
+La priorité de `os.defpath`, le refus d'un Git résolu dans le dépôt ou le
+dossier courant et les contrôles d'appartenance et de permissions sont
+testés sous Linux avec des préfixes simulés, sans écrire dans les chemins
+système. Ces tests ne constituent pas une preuve native macOS ou NixOS.
 
 ```sh
 .venv/bin/python -m pytest tests/test_cli_hook.py -v
