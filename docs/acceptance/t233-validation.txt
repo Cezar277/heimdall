@@ -1,0 +1,37 @@
+Ticket #233 - Corrections apres revue APPROUVE AVEC COMMENTAIRES
+Branche : fix/233-vault-cli-remediation-hardening
+Base revue : 8d9298d
+Code teste : 440ae9ee2b4143bc23466613bba717567fddd2d9
+Environnement : Debian WSL, Python 3.13, dependances locales existantes.
+
+python -m pytest tests/test_issue233_hardening.py -o addopts= -q --tb=short
+185 passed, 5 warnings in 3.37s.
+Onze nouveaux cas : quatre CLI (CI/local, JSON/texte), un API sans I/O,
+six derivations de noms (export espace/tabulation/indentation, absence de
+prefixe, exportFOO preserve, nom invalide utilisant le fallback valide).
+Les cinq avertissements existants concernent les sauvegardes .bak.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q heimdall/cli/fix.py
+Exit 0, aucune alerte.
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t233-review-final.xml
+2 failed, 4083 passed, 18 skipped, 19 warnings, 7124 subtests passed in 405.90s (0:06:45)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Echecs :
+tests/test_hook_commit_index.py::test_selected_index_changed_on_the_same_inode_is_refused[content]
+Assertion prealable st_ctime_ns != before.st_ctime_ns non satisfaite.
+tests/test_remediation_env.py::test_env_path_with_spaces_properly_quoted_in_git_rm_command
+Assertion tracked is True non satisfaite.
+
+python -m pytest 'tests/test_hook_commit_index.py::test_selected_index_changed_on_the_same_inode_is_refused[content]' tests/test_remediation_env.py::test_env_path_with_spaces_properly_quoted_in_git_rm_command -o addopts= -q --tb=short
+Sur 440ae9e : 1 failed, 1 passed in 2.05s.
+Sur base 8d9298d (checkout separe) : 1 failed, 1 passed in 3.70s.
+Dans les deux cas, le test ctime passe ; le test env avec espaces echoue.
+Les modules Git/Vault/env concernes et ces deux tests sont inchanges entre
+la base revue et le commit teste. La suite complete n'est pas verte.
+
+La CI n'a pas ete declenchee. Aucune fusion effectuee.
