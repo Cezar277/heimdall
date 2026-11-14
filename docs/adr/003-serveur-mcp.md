@@ -197,10 +197,13 @@ coquille) est masquée jusqu'à la fin de ligne, et une valeur non quotée à no
 `password = my secret pass phrase 42` ne laisse plus sa queue en clair. Les
 formes hors affectation sont couvertes : balise XML sensible
 (`<password>…</password>`, y compris indentée ou multiligne, indentation
-préservée), `define('DB_PASSWORD', '…')` (nom et valeur nus acceptés,
-`DEFINE` et espace avant `(` admis, comme en PHP), `.netrc` (`password …`,
-`Password` et valeur citée inclus, fermée ou tronquée, hors attributs XML
-`<password lang="…">`), `-u user:pass`
+préservée, et `<` brut dans la valeur sans balise imbriquée `<…>` — les
+vraies balises imbriquées restent hors périmètre, épinglé par test),
+`define('DB_PASSWORD', '…')` (nom et valeur nus acceptés, `DEFINE` et
+espace avant `(` admis, comme en PHP), directives espace-séparées
+(`.netrc` `password …`, `passwd`, `pwd`, `secret`, `token`/`tokens`,
+`api_key`, casse ignorée et valeur citée fermée ou tronquée incluse, hors
+attributs XML `<password lang="…">` et littéraux de code), `-u user:pass`
 (couple ou mot de passe cité, formes tronquées incluses) et `--password
 <val>`/`--password=<val>`. Le filtre anti-bruit refuse les annotations
 (`api_key: str`) et littéraux (`session = None`) ; un appel de fonction à nom
@@ -436,18 +439,20 @@ double garde : avant **et** après lecture), absent/dossier (`NOT_FOUND`),
 `start_line` hors bornes (extrait vide, `end_line: 0`, rien d'inventé).
 
 **F-09 (audit)** : `is_forbidden_path` refuse aussi les fichiers de
-credentials au-delà de `.git`/`.env*` — `.netrc`, `.pgpass`, `id_rsa*`,
-`id_ed25519*`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`, `credentials` et ses
-coffres (`.env`, `.db`, `.sqlite`, `.sqlite3`, `.store`),
+credentials au-delà de `.git`/`.env*` — `.netrc`/`netrc`/`_netrc`,
+`.pgpass`/`pgpass`, `id_rsa*`, `id_ed25519*`, `*.pem`, `*.key`,
+`.npmrc`/`npmrc`, `.pypirc`/`pypirc`, `credentials`/`credential` et leurs
+coffres (`.json`, `.yaml`, `.yml`, `.txt`, `.ini`, `.toml`, `.cfg`, `.conf`,
+`.xml`, `.env`, `.db`, `.sqlite`, `.sqlite3`, `.store`),
 `.docker/config.json` et `.kube/config`, casse ignorée. Les variantes de
 sauvegarde sont refusées après normalisation du nom (`.netrc.backup`,
-`.pgpass~`, `.npmrc-backup`, `credentials.json`, `credentials-backup`,
-`credentials.bak.json`, `server.pem.bak`, `private.key.old`,
-`.docker/config.json.bak`, `.kube/config.old`…), y compris en position
-d'infixe devant l'extension finale, car une copie reste un secret. Le
-masquage E-03
-reste une seconde barrière, jamais une autorisation de lecture ; les
-ressemblances (`netrc.txt`, `credentials.md`, `server.pem.txt`,
+`.pgpass~`, `.npmrc-backup`, `credentials.json`, `credential.json`,
+`credentials-backup`, `credentials.bak.json`, `credential.bak.json`,
+`server.pem.bak`, `private.key.old`, `.docker/config.json.bak`,
+`.kube/config.old`…), y compris en position d'infixe devant l'extension
+finale, car une copie reste un secret. Le masquage E-03 reste une seconde
+barrière, jamais une autorisation de lecture ; les ressemblances
+(`netrc.txt`, `credentials.md`, `credential.md`, `server.pem.txt`,
 `.docker/config.yml`) restent lisibles. Preuve :
 `tests/test_mcp_units.py::ForbiddenPathTests`
 (`test_credential_backup_variants_are_forbidden`) et

@@ -74,7 +74,19 @@ MAX_CONTENT_CHARS: Final[int] = 100_000
 # `.git/` et `.env*` : un faux positif de lecture coûte un fichier de contexte,
 # une lecture de `.netrc`/clé privée coûte un secret envoyé au LLM.
 _FORBIDDEN_FILENAMES: Final[frozenset[str]] = frozenset(
-    {".netrc", ".pgpass", ".npmrc", ".pypirc", "credentials"}
+    {
+        ".netrc",
+        "netrc",
+        "_netrc",
+        ".pgpass",
+        "pgpass",
+        ".npmrc",
+        "npmrc",
+        ".pypirc",
+        "pypirc",
+        "credentials",
+        "credential",
+    }
 )
 
 # Suffixes qu'un éditeur ou une rotation ajoute à une copie de fichier.
@@ -107,13 +119,15 @@ _BACKUP_INFIX: Final[re.Pattern[str]] = re.compile(
     + r")(?=\.[^.]+$)"
 )
 
-# `credentials` est un nom nu trop général pour un préfixe large :
-# `credentials.md` est de la documentation. On énumère les extensions qui,
-# elles, contiennent des credentials (configs, mais aussi coffres locaux
-# `.env`, `.db`, `.sqlite*`, `.store`) ; les suffixes de sauvegarde sont
-# retirés avant comparaison par `_strip_backup_suffixes`.
+# `credentials` / `credential` sont des noms nus trop généraux pour un
+# préfixe large : `credentials.md` / `credential.md` est de la documentation.
+# On énumère les extensions qui, elles, contiennent des credentials (configs,
+# mais aussi coffres locaux `.env`, `.db`, `.sqlite*`, `.store`) ; les
+# suffixes de sauvegarde sont retirés avant comparaison par
+# `_strip_backup_suffixes`.
 _CREDENTIALS_VARIANTS: Final[tuple[str, ...]] = tuple(
-    f"credentials{suffix}"
+    f"{stem}{suffix}"
+    for stem in ("credentials", "credential")
     for suffix in (
         ".json",
         ".yaml",
@@ -560,12 +574,12 @@ def is_forbidden_path(relative: str) -> bool:
     contournement de l'interdit (sauvegardes !).
 
     F-09 : la liste couvre aussi les fichiers de credentials usuels
-    (`.netrc`, `.pgpass`, `id_rsa`, `*.pem`, `*.key`, `.npmrc`, `.pypirc`,
-    `.docker/config.json`, `.kube/config`, `credentials`) **et leurs
-    variantes de sauvegarde** (`.netrc.backup`, `credentials.json`,
-    `server.pem.bak`, `private.key.old`, `.docker/config.json.bak`…). Le
-    masquage de E-03 reste une seconde barrière, pas une autorisation de
-    lecture.
+    (`.netrc`/`netrc`/`_netrc`, `.pgpass`/`pgpass`, `id_rsa`, `*.pem`, `*.key`,
+    `.npmrc`/`npmrc`, `.pypirc`/`pypirc`, `.docker/config.json`, `.kube/config`,
+    `credentials`/`credential`) **et leurs variantes de sauvegarde**
+    (`.netrc.backup`, `credentials.json`, `credential.json`, `server.pem.bak`,
+    `private.key.old`, `.docker/config.json.bak`…). Le masquage de E-03 reste
+    une seconde barrière, pas une autorisation de lecture.
     """
     segments = relative.split("/")
     lowered = [segment.lower() for segment in segments]

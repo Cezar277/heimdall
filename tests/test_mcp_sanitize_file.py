@@ -281,7 +281,9 @@ class SanitizeFileToolTests(FileRepoTestCase):
         """F-09 : les fichiers de credentials ne sont jamais lus, même masqués."""
         for path in (
             ".netrc",
+            "netrc",
             ".pgpass",
+            "pgpass",
             "id_rsa",
             "id_ed25519",
             "server.pem",
@@ -289,8 +291,10 @@ class SanitizeFileToolTests(FileRepoTestCase):
             ".npmrc",
             ".pypirc",
             "credentials",
+            "credential",
             "credentials.env",
             "credentials.db",
+            "credential.json",
             ".docker/config.json",
             ".kube/config",
             ".netrc.backup",

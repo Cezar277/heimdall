@@ -318,3 +318,67 @@ class AuditE03MaskingProofTests(unittest.TestCase):
 
         unchanged = "curl -u admin: https://x"
         self.assertEqual(masking.mask_text(unchanged), (unchanged, 0))
+
+    def test_space_separated_secret_directives_are_masked(self) -> None:
+        """Revue (LOW) : formes espace-séparées hors `password` (`api_key`, `secret`, `token`)."""
+        for line, secret in (
+            ("api_key mysecret123", "mysecret123"),
+            ("api-key mysecret123", "mysecret123"),
+            ("secret mysecret123", "mysecret123"),
+            ("token mysecret123", "mysecret123"),
+            ("tokens mysecret123", "mysecret123"),
+            ("passwd S3cretP4ss", "S3cretP4ss"),
+            ("pwd S3cretP4ss", "S3cretP4ss"),
+            ('api_key "my secret 42"', "my secret 42"),
+            ('secret "my secret 42', "my secret 42"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:", masked)
+
+        for line in (
+            "tokenizer bert-base",
+            "api_key None",
+            "secret null",
+            "password $SECRET_ENV",
+            "--name bob",
+            "curl -u admin:$SECRET_ENV https://x",
+        ):
+            with self.subTest(readable=line):
+                self.assertEqual(masking.mask_text(line), (line, 0))
+
+        # Affectations avec échappement ou virgule : restent couvertes en entier.
+        masked, redactions = masking.mask_text('password = "abc\\"def')
+        self.assertEqual(redactions, 1)
+        self.assertNotIn("abcdef", masked)
+        self.assertNotIn("def", masked)
+
+        masked, redactions = masking.mask_text("password=abcdef,ghijkl")
+        self.assertEqual(redactions, 1)
+        self.assertNotIn("abcdef", masked)
+        self.assertNotIn("ghijkl", masked)
+
+    def test_xml_value_with_lt_is_pinned(self) -> None:
+        """Revue (LOW) : un `<` brut dans une valeur XML est masqué, pas les balises imbriquées."""
+        for line, secret in (
+            ("<password>P@ss<wo1234</password>", "P@ss<wo1234"),
+            ("<api_key>ab<cd1234ef</api_key>", "ab<cd1234ef"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+                self.assertIn("<REDACTED:", masked)
+
+        # Une balise sœur ou parente ne doit pas avaler le bloc XML environnant.
+        nested = "<auth><user>alice</user><password>S3cretP4ss99</password></auth>"
+        masked, redactions = masking.mask_text(nested)
+        self.assertEqual(redactions, 1)
+        self.assertIn("<user>alice</user>", masked)
+        self.assertNotIn("S3cretP4ss99", masked)
+
+        # Vraie balise imbriquée : reste hors périmètre de la règle XML.
+        inner_tag = "<password><nested>short</nested></password>"
+        self.assertEqual(masking.mask_text(inner_tag), (inner_tag, 0))

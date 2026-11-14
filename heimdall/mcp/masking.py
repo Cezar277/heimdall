@@ -150,11 +150,12 @@ _UNCLOSED_QUOTED_VALUE: Final[re.Pattern[str]] = re.compile(
 # valeur masquée est l'intérieur seulement. `[^<]` accepte les sauts de ligne :
 # un XML indenté (`<password>\n  secret\n</password>`) laissait sinon la
 # valeur en clair (revue). Les espaces de bord sont retirés du span pour
-# préserver l'indentation ; un contenu imbriqué (`<` interne) reste hors
-# périmètre et n'est pas masqué par cette règle.
+# préserver l'indentation ; un `<` brut dans la valeur sans `>` fermant
+# (`<password>P@ss<wo1234</password>`) est couvert, tandis qu'une vraie balise
+# imbriquée (`<…>`) reste hors périmètre et n'est pas masquée par cette règle.
 _XML_SENSITIVE_ELEMENT: Final[re.Pattern[str]] = re.compile(
     r"<(?P<tag>[A-Za-z_][A-Za-z0-9_.:\-]{0,63})(?:\s[^<>]*)?>"
-    r"(?P<value>[^<]{1,})"
+    r"(?P<value>(?:[^<]|<(?![^<>]*>)){1,})"
     r"</(?P=tag)\s*>"
 )
 
@@ -172,21 +173,21 @@ _DEFINE_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
     r"(?P=valuequote)\s*\)"
 )
 
-# `.netrc` : `machine github.com login bob password S3cretP4ss`. Le nom
-# `password` n'est pas suivi de `:`/`=`, donc aucune règle d'affectation ne
-# le voyait. Insensible à la casse : `Password` est accepté par les clients
-# `.netrc` et était oublié. La valeur peut être citée (guillemets simples ou
-# doubles, espaces internes inclus) : sans branche citée, la forme plausible
-# `password "…"` partait en clair (revue). Le jeton doit être en début de
-# ligne ou précédé d'un espace : dans `<password lang="en">`, le nom est
-# collé à `<` et l'attribut `lang=` ne doit pas être pris pour la valeur
-# (revue) ; `(?<!\S)` couvre aussi `<ns:password>` et `data-password`.
+# `.netrc` et directives espace-séparées : `machine github.com login bob
+# password S3cretP4ss`, `api_key …`, `secret …`, `token …`. Le nom n'est pas
+# suivi de `:`/`=`, donc aucune règle d'affectation ne le voyait. Insensible
+# à la casse (`Password`, `API_KEY`), valeur citée (fermée ou non) ou nue
+# couverte. Le jeton doit être en début de ligne ou précédé d'un espace : dans
+# `<password lang="en">`, le nom est collé à `<` et l'attribut `lang=` ne
+# doit pas être pris pour la valeur (revue) ; `(?<!\S)` couvre aussi
+# `<ns:password>` et `data-password`.
 _NETRC_PASSWORD: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?<!\S)password[ \t]+(?![=:])"
+    r"(?i)(?<!\S)(?P<key>password|passwd|pwd|secret|tokens?(?!izer\b)|api[-_.]?key)"
+    r"[ \t]+(?![ \t]*[=:])"
     r"(?:"
     r"(?P<quote>[\"'])(?P<quoted>(?:[^\\\n]|\\.)*?)(?P=quote)"
     r"|[\"'](?P<unclosed>[^\n]*?)(?=[ \t]+#|\n|$)"
-    r"|(?P<value>[^\s\"']{1,})"
+    r"|(?P<value>[^\s\"'`,;(){}\[\]]{1,})"
     r")"
 )
 
@@ -678,17 +679,18 @@ def _define_spans(match: re.Match[str]) -> list[_Match]:
 
 
 def _netrc_spans(match: re.Match[str]) -> list[_Match]:
-    """`.netrc` : `password <valeur>`, seule la valeur est masquée."""
+    """`.netrc` et directives espace-séparées : seule la valeur est masquée."""
     if match.group("quoted") is not None:
         group = "quoted"
     elif match.group("unclosed") is not None:
         group = "unclosed"
     else:
         group = "value"
+    key = match.group("key")
     value = match.group(group)
-    if not _looks_like_secret("password", value):
+    if _CODE_LITERAL.match(value) or not _looks_like_secret(key, value):
         return []
-    return [_span_match(match, group, _secret_type("password", value))]
+    return [_span_match(match, group, _secret_type(key, value))]
 
 
 def _cli_secret_option_spans(match: re.Match[str]) -> list[_Match]:
@@ -821,7 +823,6 @@ def _iter_matches(text: str) -> list[_Match]:
             for span in _xml_sensitive_spans(match)
         ],
         [span for match in _DEFINE_ASSIGNMENT.finditer(text) for span in _define_spans(match)],
-        [span for match in _NETRC_PASSWORD.finditer(text) for span in _netrc_spans(match)],
         [
             span
             for match in _CLI_SECRET_OPTION.finditer(text)
@@ -842,6 +843,7 @@ def _iter_matches(text: str) -> list[_Match]:
             for match in _EVOCATIVE_UNQUOTED_VALUE.finditer(text)
             if _evocative_unquoted_looks_secret(match.group("key"), match.group("value"))
         ],
+        [span for match in _NETRC_PASSWORD.finditer(text) for span in _netrc_spans(match)],
         [
             _span_match(match, "value", _secret_type(match.group("key"), match.group("value")))
             for match in _UNQUOTED_ASSIGNMENT.finditer(text)
