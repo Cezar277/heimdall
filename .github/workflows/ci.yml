@@ -224,7 +224,7 @@ jobs:
         run: .venv-ci/bin/ruff check heimdall tests scripts docker
 
       - name: Types (mypy strict)
-        run: .venv-ci/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts/regen_lock.py
+        run: .venv-ci/bin/mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts docker
 
       - name: SAST (bandit)
         run: .venv-ci/bin/bandit -r heimdall scripts docker -q

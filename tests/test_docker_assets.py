@@ -674,24 +674,41 @@ class LockfileAndCiHardeningTests(unittest.TestCase):
                 pinned[name] = match.group(2)
         return pinned
 
+    @staticmethod
+    def _find_version_mismatches(
+        main_versions: dict[str, str],
+        runtime_versions: dict[str, str],
+    ) -> dict[str, tuple[str, str]]:
+        return {
+            pkg: (runtime_versions[pkg], main_versions[pkg])
+            for pkg in sorted(set(runtime_versions) & set(main_versions))
+            if runtime_versions[pkg] != main_versions[pkg]
+        }
+
     def test_runtime_lock_versions_match_main_lock(self) -> None:
         """E-06 : les paquets partagés des deux lockfiles sont alignés."""
         main_versions = self._parse_pinned_versions(ROOT / "requirements.lock")
         runtime_versions = self._parse_pinned_versions(RUNTIME_LOCK)
         self.assertGreater(len(runtime_versions), 0)
-        mismatches = {
-            pkg: (runtime_versions[pkg], main_versions[pkg])
-            for pkg in sorted(set(runtime_versions) & set(main_versions))
-            if runtime_versions[pkg] != main_versions[pkg]
-        }
+        mismatches = self._find_version_mismatches(main_versions, runtime_versions)
         self.assertEqual(mismatches, {})
 
+    def test_version_mismatch_detector_catches_divergence(self) -> None:
+        """E-06 (cas négatif) : une divergence de version est bien détectée."""
+        mismatches = self._find_version_mismatches(
+            {"opentelemetry-api": "1.45.2"},
+            {"opentelemetry-api": "1.45.1"},
+        )
+        self.assertEqual(mismatches, {"opentelemetry-api": ("1.45.1", "1.45.2")})
+
     def test_dockerfile_removes_pip_and_setuptools_in_runtime(self) -> None:
-        """M-10 : l'étape runtime supprime pip et setuptools préinstallés dans python:3.12-slim."""
+        """M-10 : l'étape runtime supprime pip, setuptools et wheel dans python:3.12-slim."""
         text = DOCKERFILE.read_text(encoding="utf-8")
         runtime_stage = text.split("AS runtime", maxsplit=1)[1]
         self.assertIn("/usr/local/lib/python3.12/site-packages/pip*", runtime_stage)
         self.assertIn("/usr/local/lib/python3.12/site-packages/setuptools*", runtime_stage)
+        self.assertIn("/usr/local/lib/python3.12/site-packages/wheel*", runtime_stage)
+        self.assertIn("/usr/local/lib/python3.12/site-packages/_distutils_hack*", runtime_stage)
         self.assertIn("/usr/local/bin/pip*", runtime_stage)
 
     def test_dockerignore_excludes_venv_ci_and_compose_limits_cpu(self) -> None:
@@ -711,6 +728,10 @@ class LockfileAndCiHardeningTests(unittest.TestCase):
         """E-06/M-12 : ci.yml audite tous les locks et passe ruff/bandit sur scripts et docker."""
         ci_text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("ruff check heimdall tests scripts docker", ci_text)
+        self.assertIn(
+            "mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts docker",
+            ci_text,
+        )
         self.assertIn("bandit -r heimdall scripts docker -q", ci_text)
         self.assertIn("pip-audit --no-deps --disable-pip -r requirements-runtime.lock", ci_text)
         self.assertIn(
