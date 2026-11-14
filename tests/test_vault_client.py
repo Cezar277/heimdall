@@ -255,7 +255,7 @@ class VaultClientUnitTests(unittest.TestCase):
                 "project": "demo",
                 "env": "dev",
                 "name": "DB_PASS",
-                "status": "actif",
+                "status": "vaulte",
                 "value": "super_secret",
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS"),
@@ -275,7 +275,7 @@ class VaultClientUnitTests(unittest.TestCase):
                 "project": "demo",
                 "env": "dev",
                 "name": "DB_PASS",
-                "status": "actif",
+                "status": "vaulte",
                 "value": 12345,
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS"),
@@ -291,7 +291,7 @@ class VaultClientUnitTests(unittest.TestCase):
                 "project": "demo",
                 "env": "dev",
                 "name": "DB_PASS",
-                "status": "actif",
+                "status": "vaulte",
                 "value": "valid",
                 "evil_extra": True,
             },
@@ -308,7 +308,7 @@ class VaultClientUnitTests(unittest.TestCase):
                 "project": "demo",
                 "env": "dev",
                 "name": "DB_PASS",
-                "status": "actif",
+                "status": "vaulte",
                 "value": "x" * 70000,
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/DB_PASS"),
@@ -857,7 +857,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 self.assertFalse(is_git_ignored(target))
 
     def test_git_toplevel_does_not_follow_symlinked_dir(self) -> None:
-        """Répertoire symlinké → cwd = parent réel (lstat), jamais la cible suivie."""
+        """Répertoire symlinké → refus avant tout appel à GitAccess."""
         real_dir = self.tmp_dir / "real_repo"
         real_dir.mkdir()
         link_dir = self.tmp_dir / "link_repo"
@@ -865,12 +865,47 @@ class VaultAtomicOperationsTests(unittest.TestCase):
             os.symlink(real_dir, link_dir)
         except OSError:
             self.skipTest("Symlinks non supportés")
-        with patch("heimdall.vault.atomic.shutil.which", return_value="/usr/bin/git"):
-            with patch("heimdall.vault.atomic.subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1, stdout="")
-                self.assertIsNone(_get_git_toplevel(link_dir))
-                self.assertEqual(mock_run.call_args.kwargs["cwd"], link_dir.parent)
-                self.assertNotEqual(mock_run.call_args.kwargs["cwd"], link_dir)
+        with patch("heimdall.vault.atomic.GitAccess") as mock_access_cls:
+            mock_access = mock_access_cls.return_value
+            mock_access.execute.return_value = MagicMock(returncode=1, stdout=b"")
+            self.assertIsNone(_get_git_toplevel(link_dir))
+            # Jamais de cwd dans la cible suivie du lien.
+            for call in mock_access_cls.call_args_list:
+                self.assertNotEqual(call.args[0], real_dir)
+            mock_access_cls.assert_not_called()
+
+    def test_git_toplevel_refuses_symlinked_dot_git(self) -> None:
+        """``.git`` symlinké vers l'extérieur → None, git jamais lancé."""
+        repo = self.tmp_dir / "repo_with_linked_git"
+        repo.mkdir()
+        outside = self.tmp_dir / "outside_git"
+        outside.mkdir()
+        try:
+            os.symlink(outside, repo / ".git")
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        target = repo / ".env"
+        target.write_text("X=1\n", encoding="utf-8")
+        with patch("heimdall.vault.atomic.GitAccess") as mock_access_cls:
+            self.assertIsNone(_get_git_toplevel(target))
+            self.assertFalse(is_git_tracked(target))
+            mock_access_cls.assert_not_called()
+
+    def test_git_toplevel_refuses_symlinked_ancestor_without_fallback(self) -> None:
+        """Ancêtre symlinké → None, jamais le dépôt d'un ancêtre ; aucun git lancé."""
+        outer = self.tmp_dir / "outer_repo"
+        (outer / ".git").mkdir(parents=True)
+        target_dir = self.tmp_dir / "elsewhere"
+        target_dir.mkdir()
+        link = outer / "link"
+        try:
+            os.symlink(target_dir, link)
+        except OSError:
+            self.skipTest("Symlinks non supportés")
+        (target_dir / ".env").write_text("X=1\n", encoding="utf-8")
+        with patch("heimdall.vault.atomic.GitAccess") as mock_access_cls:
+            self.assertIsNone(_get_git_toplevel(link / ".env"))
+            mock_access_cls.assert_not_called()
 
     def test_git_helpers_refuse_symlink_output_without_following(self) -> None:
         """Output symlink (fichier ou répertoire) → False fail-closed, git jamais consulté.
@@ -892,7 +927,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 with patch(
                     "heimdall.vault.atomic._get_git_toplevel", return_value=self.tmp_dir
                 ):
-                    with patch("heimdall.vault.atomic.subprocess.run") as mock_run:
+                    with patch("heimdall.mcp.gitdiff.subprocess.run") as mock_run:
                         self.assertFalse(is_git_tracked(link))
                         self.assertFalse(is_git_ignored(link))
                         mock_run.assert_not_called()
@@ -909,26 +944,25 @@ class VaultAtomicOperationsTests(unittest.TestCase):
         except OSError:
             self.skipTest("Symlinks non supportés")
         with patch("heimdall.vault.atomic._get_git_toplevel", return_value=repo):
-            with patch(
-                "heimdall.vault.atomic.subprocess.run",
-                return_value=MagicMock(returncode=0),
-            ) as mock_run:
+            with patch("heimdall.vault.atomic.GitAccess") as mock_access_cls:
+                mock_access = mock_access_cls.return_value
+                mock_access.execute.return_value = MagicMock(returncode=0)
                 # Le chemin régulier continue d'interroger Git (comportement conservé).
                 self.assertTrue(is_git_tracked(target))
-                self.assertEqual(mock_run.call_args.args[0][-1], "tracked.env")
-                mock_run.reset_mock()
+                self.assertEqual(mock_access.execute.call_args.args[0][-1], "tracked.env")
+                mock_access.execute.reset_mock()
                 # Le lien final, lui, est refusé avant toute invocation de Git.
                 self.assertFalse(is_git_tracked(link))
                 self.assertFalse(is_git_ignored(link))
-                mock_run.assert_not_called()
+                mock_access.execute.assert_not_called()
 
     def test_git_helpers_survive_hanging_git_binary(self) -> None:
         """Binaire `git` bloqué : `TimeoutExpired` → statut inconnu, jamais de pendaison."""
         target = self.tmp_dir / ".env"
         target.write_text("x=1\n", encoding="utf-8")
-        with patch("heimdall.vault.atomic.shutil.which", return_value="/fake/git"):
+        with patch("heimdall.mcp.gitdiff.shutil.which", return_value="/usr/bin/git"):
             with patch(
-                "heimdall.vault.atomic.subprocess.run",
+                "heimdall.mcp.gitdiff.subprocess.run",
                 side_effect=subprocess.TimeoutExpired(["git"], 5),
             ) as mock_run:
                 self.assertFalse(is_git_tracked(target))
@@ -952,9 +986,9 @@ class VaultAtomicOperationsTests(unittest.TestCase):
 
     def test_detect_from_git_survives_hanging_git_binary(self) -> None:
         """Détection projet : `TimeoutExpired` → None, jamais de pendaison."""
-        with patch("heimdall.vault.client.shutil.which", return_value="/fake/git"):
+        with patch("heimdall.mcp.gitdiff.shutil.which", return_value="/usr/bin/git"):
             with patch(
-                "heimdall.vault.client.subprocess.check_output",
+                "heimdall.mcp.gitdiff.subprocess.run",
                 side_effect=subprocess.TimeoutExpired(["git"], 5),
             ) as mock_check:
                 self.assertIsNone(_detect_from_git(self.tmp_dir))
@@ -1081,7 +1115,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 "project": "demo",
                 "env": "dev",
                 "name": "SECRET_PASS",
-                "status": "actif",
+                "status": "vaulte",
                 "value": canary_probe * 2000,  # Dépasse 65536
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/SECRET_PASS"),
@@ -1654,7 +1688,7 @@ class VaultAtomicOperationsTests(unittest.TestCase):
                 "project": "INVALID/PROJECT!",
                 "env": "dev",
                 "name": "MY_KEY",
-                "status": "actif",
+                "status": "vaulte",
                 "value": "secret",
             },
             request=httpx.Request("GET", f"{_VALID_URL}/api/v1/secrets/demo/dev/MY_KEY"),

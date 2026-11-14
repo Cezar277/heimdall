@@ -15,9 +15,8 @@ from heimdall.scanner.detect import Scanner as TreeScanner
 findings: list[Finding] = TreeScanner(".").scan()
 payload: list[dict[str, object]] = find_candidates(".")  # contrat #14
 
-# Mode strict (#29) : accepté pour compatibilité ; la base VCS et les entrées
-# non suivies ignorées sont écartées, quel que soit le mode. Tous les autres
-# noms sont lus par contenu.
+# Mode strict : refuse les exclusions de contenu (#229).
+# Les exclusions Git et VCS restent identiques dans les deux modes.
 strict: list[Finding] = TreeScanner(".", strict=True).scan()
 
 # La base VCS est élaguée par politique, sans ScanError. Le compteur rend
@@ -71,6 +70,12 @@ La détection générique par entropie (#23), ses seuils et ses limites
 sont documentés dans [scanner-entropy.md](scanner-entropy.md).
 
 ## Signatures (#54)
+
+L'audit E-02 (#230) ajoute les préfixes de services, les mots de passe dans
+les URL, Authorization et les affectations à clé sensible. Voir
+[le périmètre actuel](t230-scanner-allowlist.md),
+[le registre complet](scanner-signatures.md) et
+[les seuils des jetons courts](scanner-entropy.md).
 
 | Règle | Type Finding | Forme attendue |
 | --- | --- | --- |
@@ -213,52 +218,32 @@ sous-module : `gitdir: …`), pas le répertoire `.git/` : seul un segment
 **parent** de chemin peut classer hors périmètre. Son contenu est lu comme
 celui de tout autre fichier.
 
-`strict` reste accepté pour compatibilité ; il ne change plus le périmètre
-(seule la base VCS est écartée dans tous les modes). C'est la correction du
-point HIGH relevé à la revue de #165 : la politique #59 laissait passer un
-secret posé dans `vendor/evil.py`, sans jamais le signaler. L'équivalence est
-figée par `tests/test_scanner_detect.py::test_strict_mode_never_changes_the_content_perimeter` :
-`Scanner(root, strict=True).scan()` et `Scanner(root, strict=False).scan()`
-rendent les mêmes Findings et les mêmes compteurs (`vcs_ignored`,
-`files_scanned`).
+Depuis #229, `Scanner(root, strict=False)` et la collecte CLI tolèrent les binaires, les fichiers
+trop gros et les liens symboliques internes sans les suivre. Les exclusions
+de contenu sont exposées dans `scanner.skipped` et dans le rapport de la CLI.
+`strict=True` / `--strict` rétablit le refus des exclusions de contenu ; la
+base VCS et les exclusions Git sûres restent identiques dans les deux modes.
+Toutes les API (`Scanner`, `scan`, `find_candidates`, `collect`, historique)
+sont strictes par défaut. La CLI rend les traces avant le verdict, mais
+aucun rapport partiel ne produit un code 0 : code 1 si un candidat est
+détecté, code 2 sinon. Les helpers ne rendant qu'une liste ne doivent pas
+servir à interpréter une analyse tolérante comme complète.
 
-Un contenu binaire **connu** (signature magique et majorité binaire) n'est pas
-silencieusement ignoré : le scanner lève `ScanError`. Un binaire inconnu
-(NUL + texte) reste fail-closed de la même façon : le nom ni le suffixe ne
-convertissent jamais un doute en skip silencieux.
+### Encodages et limites de contenu
 
-> **API dépréciée, sans autorité.** `heimdall.scanner.exclusions.is_known_binary`
-> reste importable pour compatibilité historique, mais le scanner ne l'appelle
-> **jamais** : `decode_text` passe par le helper interne `_is_known_binary`.
-> Il ne figure pas dans `__all__` du module, et aucun nouvel appelant ne doit
-> s'en servir pour décider qu'un fichier est « ignorable par son nom » : le
-> contenu décide, et un binaire non reconnu lève `ScanError`. Un appelant qui
-> l'utiliserait pour exclure un fichier sans analyser son contenu
-> réintroduirait le contournement corrigé par #59. Sa suppression est prévue
-> dans un ticket dédié ; d'ici là, seul le contenu décide.
+Voir la [politique complète de tolérance E-01](scanner-tolerance.md) pour les
+encodages UTF-8/16/32, le repli CP1252/Latin-1, les binaires et les limites
+de taille et de jetons. Un texte portant un suffixe d'image reste scanné.
+Les binaires ne sont pas ouverts au-delà du plafond ; les portions écartées
+sont signalées avec leur chemin et un motif, jamais avec leur contenu.
 
-### Encodage des fichiers lus
-
-Les fichiers texte sont décodés, pas ignorés :
-
-| Cas | Traitement |
-| --- | --- |
-| UTF-8 (avec ou sans BOM) | décodage strict ; octet invalide → `ScanError` (#23) |
-| UTF-16 / UTF-32 avec BOM | décodage strict, fichier scanné |
-| UTF-16 / UTF-32 sans BOM | heuristique bornée (proportion ASCII puis caractères imprimables), fichier scanné |
-| signature binaire **et** contenu majoritairement binaire (≥ 50 % d'octets non textuels) | `ScanError` (binaire connu, jamais un skip silencieux) en arbre **comme** en `--staged` |
-| signature binaire suivie de texte clair | `ScanError` (fail-closed) |
-| contenu NUL non décodable | `ScanError` (fail-closed) |
-
-Un secret encodé en UTF-16/UTF-32 est donc détecté ; il n'est plus sauté
-silencieusement. Quatre octets de signature binaire (`PK\x03\x04`, en-tête
-PNG…) ne suffisent plus à faire ignorer un fichier : la signature n'est retenue
-que si le contenu est réellement majoritairement binaire, sinon le fichier est
-refusé (`ScanError`) plutôt que sauté.
+L'API `is_known_binary` reste dépréciée et sans autorité : le scanner utilise
+`decode_text`, dont le résultat et le mode strict déterminent le traitement.
+Un appelant ne doit jamais décider du périmètre à partir du seul suffixe.
 
 ## Comportement fail-closed
 
-Toute situation non analysable lève `ScanError` avec un message statique
+Les erreurs de lecture et les refus du mode strict lèvent `ScanError` avec un message statique
 `scan impossible : entrée non analysable`, sans chemin ni extrait de fichier :
 
 | Situation | Résultat |
@@ -267,15 +252,15 @@ Toute situation non analysable lève `ScanError` avec un message statique
 | racine ou fichier unique symlinké (ou ancêtre symlinké) | `ScanError` |
 | racine non canonique (ex. `/tmp` symlinké vers `/private/tmp` sur macOS) | `ScanError` — passer un chemin canonique (sans lien) |
 | fichier non régulier (FIFO, device) | `ScanError` |
-| fichier > 1 Mio | `ScanError` |
+| fichier > 1 Mio | trace `too_large` ; `ScanError` en mode strict |
 | plus de 50 000 fichiers, ou plus de 256 Mio lus au total | `ScanError` (bornes #29) |
 | borne explicite `max_files`/`max_bytes`/`max_findings` hors de `1..plafond` | `ValueError` à la construction (surcharge jamais silencieuse) |
 | fichier modifié pendant la lecture | `ScanError` |
 | nom de fichier hors contrat (`..`, `:`, contrôle) | `ScanError` |
 | clé HMAC absente, illisible, trop permissive ou impossible à créer | `ScanError` |
 | clé HMAC demandée avec `..` dans le chemin | `ScanError` |
-| contenu NUL non décodable (y compris un binaire connu) | `ScanError` |
-| fichier ou répertoire symlinké **interne** au périmètre | `ScanError` (jamais suivi) |
+| contenu non décodable en texte | trace `binary` ; `ScanError` en mode strict |
+| fichier ou répertoire symlinké **interne** au périmètre | trace `symlink`, jamais suivi ; `ScanError` en mode strict |
 | base VCS `.git/`, `.hg/`, `.svn/` | élaguée par politique, comptée dans `TreeScanner.vcs_ignored` |
 | entrée **non suivie et ignorée** par un `.gitignore` du dépôt | écartée et comptée dans `TreeScanner.git_ignored` ; un fichier **suivi** n'est jamais écarté |
 | Git absent, dépôt invalide ou sortie Git hors bornes | exclusions désactivées, **parcours complet** (le scanner lit plus, jamais moins) |
@@ -290,14 +275,14 @@ Toute situation non analysable lève `ScanError` avec un message statique
 > dans `TreeScanner.vcs_ignored`, les entrées non suivies ignorées dans
 > `TreeScanner.git_ignored` (+ `files_scanned` pour savoir si un contenu a
 > été lu). Pour un hook ou une CI, c'est la CLI `heimdall scan` qu'il faut
-> utiliser : elle refuse (code 2) tout fichier du périmètre non analysable et
+> utiliser avec `--strict` pour refuser (code 2) les exclusions de contenu ; elle
 > analyse **sans aucune exclusion de chemin** les blobs de l'index en mode
 > `--staged` (voir [cli.md](cli.md)). Un scan incomplet sort en 2, jamais en
 > 0 ; un arbre vide reste un 0 assumé en local, mais `--ci` refuse (2) un
 > arbre réduit à des exclusions (base VCS ou `.gitignore`) sans contenu lu.
 > C'est `--staged` qui couvre le contenu indexé.
 
-Un scan incomplet ne devient donc jamais une liste vide ou partielle. Depuis
+Une erreur d'outillage ne devient donc jamais un rapport réussi. Depuis
 #29, la CLI est branchée : `ScanError` produit le code 2 (erreur d'outillage),
 jamais 0 ni 1.
 
@@ -327,24 +312,15 @@ jamais 0 ni 1.
   des variables : les cas reconstruits de T21 restent des `limite_connue`. Depuis #23,
   deux valeurs encodées sont détectées par entropie, sans décodage :
   rappel 0,75 sur `all`, 1,0 sur `core`. L'allowlist relève de #24.
-- Les fichiers binaires connus ne sont pas analysés : un secret placé dans un
-  binaire reste un faux négatif. Dans **les deux périmètres**, un binaire du
-  périmètre est **refusé** (`ScanError`, code 2 pour la CLI) au lieu d'être
-  ignoré silencieusement. Une entrée **non suivie et ignorée** par Git est
-  écartée avant lecture et comptée dans `TreeScanner.git_ignored` : elle ne
-  peut pas être commitée sans devenir suivie, donc sans être scannée. Les
-  répertoires et fichiers textuels de `node_modules/`, `vendor/`, `.venv/`,
-  `build/`, `dist/`, `target/` ou `htmlcov/` sont, eux, scannés dans les deux
-  périmètres : aucun nom de fichier ou de répertoire de contenu n'exclut
-  quoi que ce soit. Seules la base VCS et les entrées non suivies ignorées
-  sont élaguées, et ni l'une ni les autres ne sont du contenu commité.
-- La jointure multi-ligne est bornée à 4 Kio. Une affectation ou un jeton de
-  longueur candidate sur une des lignes provoque `ScanError` lorsque cette
-  borne est dépassée, sans exception par fournisseur. Les jetons individuels
-  > 4096 caractères provoquent également `ScanError`, jamais un skip.
+- Les binaires ne sont pas analysés : ils produisent une trace et un rapport
+  partiel, ou un refus avec `--strict`. Aucun verdict de couverture complète
+  ne doit être déduit du code 0 seul ; voir [E-01](scanner-tolerance.md).
+- La jointure multiligne est bornée à 4 Kio et les jetons individuels à
+  4096 caractères. Le dépassement est tracé dans le rapport tolérant ; le
+  mode strict conserve les refus conservateurs sans exception par fournisseur.
 - Le motif de signature JWT accepte une charge de 64 Kio et un en-tête de
-  1 Kio, mais le moteur refuse désormais tout jeton lexical > 4096 caractères
-  (`ScanError`, y compris pour un JWT). Les autres
+  1 Kio, mais un jeton lexical > 4096 caractères est écarté avec trace ou
+  refusé en mode strict, y compris pour un JWT. Les autres
   préfixes AWS (au-delà de `AKIA`/`ASIA`/`ABIA`/`ACCA`) ne sont pas couverts.
 - Seules les familles de jetons Slack publiées par Slack sont couvertes
   (`xoxb-`, `xoxp-`, `xapp-`, `xwfp-`, `xoxe.` et les historiques `xoxa-`,

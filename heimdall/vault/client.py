@@ -27,11 +27,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import socket
 import ssl
 import stat
-import subprocess  # nosec B404
 import sys
 import threading
 from http import HTTPStatus
@@ -39,6 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NoReturn
 from urllib.parse import urlparse
 
+from heimdall.mcp.gitdiff import GitAccess
 from heimdall.vault.atomic import (
     _bounded_error_message,
     _open_file_read_fd,
@@ -325,26 +324,21 @@ def resolve_vault_url(url: str | None = None) -> str:
 
 
 def _detect_from_git(start_dir: Path) -> str | None:
-    """Détecte l'identifiant du projet depuis le dépôt Git racine.
+    """Détecte l'identifiant du projet depuis le dépôt Git racine via ``GitAccess``.
 
-    Sonde informative bornée (``timeout``) : `git` vient du PATH de confiance
-    de l'opérateur ; tout échec/timeout vaut absence de détection (None).
+    Neutralise ``core.fsmonitor`` et le ``PATH`` hérité ; tout échec/timeout
+    vaut absence de détection (``None``).
     """
-    git_bin = shutil.which("git")
-    if not git_bin:
-        return None
     try:
-        git_root = subprocess.check_output(  # noqa: S603  # nosec
-            [git_bin, "rev-parse", "--show-toplevel"],
-            cwd=start_dir,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-        ).strip()
+        access = GitAccess(start_dir)
+        completed = access.execute(("rev-parse", "--show-toplevel"), timeout=_GIT_TIMEOUT_SECONDS)
+        if completed.returncode != 0:
+            return None
+        git_root = completed.stdout.decode("utf-8", errors="replace").strip()
         if git_root:
             name = Path(git_root).name.lower()
             sanitized = re.sub(r"[^a-z0-9_-]", "-", name)
-            if sanitized and sanitized[0].isalpha() and _PROJECT_ID_PATTERN.match(sanitized):
+            if sanitized and sanitized[0].isalpha() and _PROJECT_ID_PATTERN.fullmatch(sanitized):
                 return sanitized
     except Exception:  # noqa: S110  # nosec B110
         pass
@@ -364,7 +358,7 @@ def _detect_from_pyproject(start_dir: Path) -> str | None:
         name = data.get("project", {}).get("name")
         if isinstance(name, str):
             candidate = name.lower()
-            if candidate and candidate[0].isalpha() and _PROJECT_ID_PATTERN.match(candidate):
+            if candidate and candidate[0].isalpha() and _PROJECT_ID_PATTERN.fullmatch(candidate):
                 return candidate
     except Exception:  # noqa: S110  # nosec B110
         pass
@@ -376,7 +370,7 @@ def detect_project(start_dir: Path | None = None) -> str:
     env_proj = os.environ.get("HEIMDALL_PROJECT")
     if env_proj is not None and env_proj.strip():
         candidate = env_proj.strip().lower()
-        if _PROJECT_ID_PATTERN.match(candidate):
+        if _PROJECT_ID_PATTERN.fullmatch(candidate):
             return candidate
 
     try:
@@ -398,7 +392,7 @@ def detect_project(start_dir: Path | None = None) -> str:
     sanitized = re.sub(r"[^a-z0-9_-]", "-", name)
     if not (sanitized and sanitized[0].isalpha()):
         sanitized = f"p-{sanitized}"
-    if _PROJECT_ID_PATTERN.match(sanitized):
+    if _PROJECT_ID_PATTERN.fullmatch(sanitized):
         return sanitized[:64]
     return "default"
 
@@ -732,7 +726,7 @@ def _validate_secret_read_response(data: Any) -> dict[str, Any]:
             ) from None
 
     status_val = data.get("status")
-    if status_val not in ("actif", "revoque", "vaulte"):
+    if status_val not in ("vaulte", "rote"):
         status_preview = str(status_val)[:_PREVIEW_LEN]
         raise VaultClientError(f"Statut de secret non conforme : {status_preview!r}")
 
@@ -878,6 +872,7 @@ class VaultClient:
             verify=verify,
             timeout=self._timeout,
             transport=self._transport,
+            trust_env=False,
             headers={
                 "User-Agent": "heimdall-vault-client/0.1.0",
                 "Accept": "application/json",

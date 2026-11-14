@@ -8,7 +8,7 @@
     "test:js": "node --test \"tests/js/*.test.js\""
   },
   "devDependencies": {
-    "@stoplight/spectral-cli": "6.17.0",
+    "@stoplight/spectral-cli": "6.17.1",
     "minimatch": "file:./vendor/minimatch-cjs"
   },
   "overrides": {

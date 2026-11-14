@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Cezar277/heimdall/schemas/history.schema.json",
+  "title": "Heimdall history report v1",
+  "description": "Rapport rendu par `heimdall deep-scan --json` (ticket #108). Aucun secret : chaque Finding ne porte qu'une empreinte HMAC-SHA-256 et une entropie (contrat Finding v1, #14). `bytes_scanned` compte les octets effectivement lus ; `bytes_budgeted` compte les tailles annoncées imputées au budget, exclusions comprises.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "complete",
+    "findings",
+    "opinions",
+    "skipped",
+    "commits_scanned",
+    "entries_scanned",
+    "bytes_scanned",
+    "bytes_budgeted",
+    "elapsed_seconds"
+  ],
+  "properties": {
+    "schema": {
+      "const": "heimdall.history.v1",
+      "description": "Version du contrat de sortie. Un parseur CI DOIT refuser toute autre valeur."
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "False si une exclusion de contenu a été rencontrée. Un consommateur DOIT vérifier complete en plus des findings ; conclure propre sur l'absence de finding seule est interdit."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding", "commits", "warning"],
+        "properties": {
+          "finding": {
+            "$ref": "finding.schema.json"
+          },
+          "commits": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$"
+            },
+            "description": "SHA des commits où le Finding apparaît (SHA-1 40 ou SHA-256 64)."
+          },
+          "warning": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Rappel statique : proposition uniquement, validation humaine requise."
+          }
+        }
+      }
+    },
+    "opinions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding", "verdict", "reason", "validation_humaine_requise"],
+        "properties": {
+          "finding": {
+            "$ref": "finding.schema.json"
+          },
+          "verdict": {
+            "enum": ["secret", "faux_positif", "incertain", null]
+          },
+          "reason": {
+            "enum": ["empty", "model", "unavailable", "invalid", "prompt", "too_large", null]
+          },
+          "validation_humaine_requise": {
+            "const": true
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {"verdict": {"type": "string"}},
+              "required": ["verdict"]
+            },
+            "then": {
+              "properties": {"reason": {"type": "null"}}
+            }
+          },
+          {
+            "if": {
+              "properties": {"reason": {"type": "string"}},
+              "required": ["reason"]
+            },
+            "then": {
+              "properties": {"verdict": {"type": "null"}}
+            }
+          }
+        ]
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "commit", "reason", "line"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}(?:[0-9a-f]{24})?$"
+          },
+          "reason": {
+            "enum": ["binary", "too_large", "symlink", "long_token", "multiline_limit"]
+          },
+          "line": {
+            "type": ["integer", "null"],
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "commits_scanned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "entries_scanned": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "bytes_scanned": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Octets effectivement lus dans les blobs. Distinct de bytes_budgeted."
+    },
+    "bytes_budgeted": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Somme des tailles annoncées imputées au budget MAX_READ_BYTES, exclusions comprises. Toujours >= bytes_scanned."
+    },
+    "elapsed_seconds": {
+      "type": "number",
+      "minimum": 0
+    }
+  }
+}

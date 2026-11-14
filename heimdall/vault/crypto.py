@@ -230,19 +230,28 @@ ARGON2ID_MEMORY_COST_KIB: int = 64 * 1024  # 64 Mio
 ARGON2ID_PARALLELISM: int = 4
 ARGON2ID_HASH_LEN: int = _KEY_SIZE_BYTES  # 32 octets, clé AES-256
 ARGON2ID_SALT_BYTES: int = 16  # 128 bits, sel public stocké à côté de la clé maîtresse
-# Une clé maîtresse plus courte que 128 bits n'apporte pas la marge nécessaire
-# face à une attaque hors ligne : refus fail-closed en amont d'Argon2id.
-MIN_MASTER_KEY_BYTES: int = 16
+# Une clé maîtresse doit offrir 256 bits de matériau et une complexité
+# minimale (audit M-11) : Argon2id ralentit l'attaque hors ligne mais ne
+# compense pas une clé répétitive ou trop courte.
+MIN_MASTER_KEY_BYTES: int = 32
+_MIN_MASTER_KEY_DISTINCT_BYTES: int = 8
+_MIN_MASTER_KEY_SHANNON_ENTROPY: float = 3.0
 
 # Label de domaine stable de la sous-clé d'empreinte (invariant 5 : la KEK de
 # chiffrement n'est jamais réutilisée directement comme clé HMAC). Changer ce
 # label rompt la vérification d'empreintes existantes ; c'est un dérivé
 # auxiliaire, jamais une donnée de référence (rotation documentée sur la classe).
 _FINGERPRINT_HKDF_INFO: bytes = b"heimdall-vault-fingerprint-v1"
+# Label de domaine dédié au chaînage HMAC du journal d'audit (audit F-16).
+_AUDIT_HKDF_INFO: bytes = b"heimdall-vault-audit-hmac-v1"
 
 
 class VaultCipherError(ValueError):
     """Erreur de chiffrement/déchiffrement sans détail sensible."""
+
+
+class KekHmacContinuityError(VaultCipherError):
+    """La clé HMAC serveur ne permet pas la continuité de la rotation de KEK."""
 
 
 class SecretEnvelope(NamedTuple):
@@ -282,6 +291,21 @@ def generate_api_key() -> str:
 def generate_api_key_pepper() -> str:
     """Génère un pepper éphémère indépendant avec 256 bits d'entropie."""
     return secrets.token_urlsafe(_KEY_SIZE_BYTES)
+
+
+def generate_master_key() -> str:
+    """Génère une clé maîtresse aléatoire de 256 bits (audit M-11).
+
+    La clé satisfait immédiatement ``_normalize_master_key`` : 32 octets,
+    diversité et entropie suffisantes, aucune période répétitive.
+    """
+    while True:
+        candidate = secrets.token_urlsafe(_KEY_SIZE_BYTES)
+        try:
+            _normalize_master_key(candidate)
+            return candidate
+        except ValueError:
+            continue
 
 
 def generate_server_hmac_key() -> str:
@@ -779,6 +803,43 @@ def _zeroize_buffer(buffer: bytearray) -> None:
     buffer[:] = b"\x00" * len(buffer)
 
 
+def _validate_master_key_complexity(key_bytes: bytes) -> None:
+    """Refuse une clé maîtresse courte, répétitive ou à faible entropie.
+
+    Les contrôles de l'audit M-11 reprennent l'esprit de la clé HMAC serveur,
+    sans la garde « phrase humaine » : une phrase de passe est un usage
+    légitime de la clé maîtresse, protégée par Argon2id. Les motifs triviaux
+    (``aaaaaaaa…``, ``abab…``) restent refusés.
+    """
+    if len(key_bytes) < MIN_MASTER_KEY_BYTES:
+        raise ValueError(
+            f"Clé maîtresse invalide : au moins {MIN_MASTER_KEY_BYTES} octets "
+            "(256 bits) sont requis."
+        )
+    if len(key_bytes) > MAX_SERVER_HMAC_KEY_BYTES:
+        raise ValueError(
+            f"Clé maîtresse invalide : ne doit pas dépasser "
+            f"{MAX_SERVER_HMAC_KEY_BYTES} octets."
+        )
+    if len(set(key_bytes)) < _MIN_MASTER_KEY_DISTINCT_BYTES:
+        raise ValueError(
+            "Clé maîtresse invalide : diversité insuffisante "
+            f"({_MIN_MASTER_KEY_DISTINCT_BYTES} symboles distincts minimum). "
+            "Utiliser generate_master_key()."
+        )
+    for period in range(1, len(key_bytes) // 2 + 1):
+        if all(key_bytes[i] == key_bytes[i % period] for i in range(len(key_bytes))):
+            raise ValueError(
+                "Clé maîtresse invalide : motif périodique répétitif. "
+                "Utiliser generate_master_key()."
+            )
+    if _shannon_entropy(key_bytes) < _MIN_MASTER_KEY_SHANNON_ENTROPY:
+        raise ValueError(
+            "Clé maîtresse invalide : entropie insuffisante. "
+            "Utiliser generate_master_key()."
+        )
+
+
 def _normalize_master_key(master_key: str | bytes) -> bytearray:
     """Normalise la clé maîtresse en octets effaçables, sans écho dans une erreur.
 
@@ -786,9 +847,9 @@ def _normalize_master_key(master_key: str | bytes) -> bytearray:
     des octets sont copiés tels quels (utile aux tests et aux appelants qui
     détiennent déjà une clé aléatoire). Le ``bytearray`` retourné appartient à
     l'appelant, qui doit l'effacer après usage (``_zeroize_buffer``). La longueur
-    minimale de 128 bits est une défense en profondeur contre une phrase de passe
-    triviale : Argon2id ralentit l'attaque hors ligne mais ne compense pas une
-    clé maîtresse sans entropie.
+    minimale de 256 bits (``MIN_MASTER_KEY_BYTES``, audit M-11) est une défense
+    en profondeur contre une phrase de passe triviale : Argon2id ralentit
+    l'attaque hors ligne mais ne compense pas une clé maîtresse sans entropie.
     """
     if isinstance(master_key, str):
         if not master_key or not master_key.strip():
@@ -812,11 +873,7 @@ def _normalize_master_key(master_key: str | bytes) -> bytearray:
             raise ValueError("Clé maîtresse invalide : espaces de début ou de fin interdits.")
     else:
         raise ValueError("Clé maîtresse invalide : chaîne ou octets attendus.")
-    if len(raw) < MIN_MASTER_KEY_BYTES:
-        raise ValueError(
-            f"Clé maîtresse invalide : au moins {MIN_MASTER_KEY_BYTES} octets "
-            "(128 bits) sont requis."
-        )
+    _validate_master_key_complexity(bytes(raw))
     return raw
 
 
@@ -1009,6 +1066,15 @@ class VaultCipher:
                 info=_FINGERPRINT_HKDF_INFO,
             ).derive(self._key)
             self._has_explicit_server_hmac_key = False
+        # Sous-clé dédiée au journal d'audit, distincte de la KEK et de la clé
+        # d'empreinte. Dérivée de la clé d'empreinte : stable à travers une
+        # rotation de KEK lorsque la clé HMAC serveur est explicite.
+        self._audit_hmac_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=_KEY_SIZE_BYTES,
+            salt=None,
+            info=_AUDIT_HKDF_INFO,
+        ).derive(self._fingerprint_key)
 
     def __repr__(self) -> str:
         return "VaultCipher(<REDACTED>)"
@@ -1017,6 +1083,10 @@ class VaultCipher:
     def has_explicit_server_hmac_key(self) -> bool:
         """Indique si la clé HMAC serveur est explicite (non dérivée de la KEK)."""
         return self._has_explicit_server_hmac_key
+
+    def audit_hmac_key(self) -> bytes:
+        """Sous-clé HMAC dédiée au chaînage du journal d'audit (audit F-16)."""
+        return self._audit_hmac_key
 
     def key_reuses_server_hmac_key(self, server_hmac_key: str | bytes | bytearray) -> bool:
         """Détecte si la KEK de ce chiffreur réutilise l'entropie de la clé HMAC serveur.

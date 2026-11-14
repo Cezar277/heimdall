@@ -363,6 +363,15 @@ class VaultDatabaseTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_secure_delete_is_enabled_by_default(self) -> None:
+        """PRAGMA secure_delete = ON sur chaque connexion (audit F-05)."""
+        init_db(self.db_path)
+        conn = get_connection(self.db_path)
+        try:
+            self.assertEqual(conn.execute("PRAGMA secure_delete;").fetchone()[0], 1)
+        finally:
+            conn.close()
+
     # -----------------------------------------------------------------------
     # 2. Foreign keys
     # -----------------------------------------------------------------------

@@ -1,0 +1,230 @@
+Ticket #229 - Audit E-01
+DERNIERE REVISION - COMPTEUR ARBRE ET NUMEROS DE LIGNE EXPLICITES
+Code teste : 66e4bbdb4f68e8600fb4080608543678c56508ea
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-tree-count-final.xml
+3976 passed, 18 skipped, 14 warnings, 6911 subtests passed in 381.31s (0:06:21)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 14 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_scanner_fail_closed.py tests/test_scanner_tolerance.py tests/test_scanner_detect.py -o addopts= -q --tb=short
+295 passed in 6.78s.
+Quatre nouveaux cas : parite arbre/index/diff avec une ou deux traces
+(deux cas arbre ajoutes), arbre compose seulement d'un fichier partiel
+compte pour zero sur les parcours ancre et de repli (deux cas).
+Temoin direct de prepare_text renforce : appels successifs, lignes 3 puis 2.
+Gardes existantes chemins invalides et JSON partiel rejouees.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite ; avertissements existants de lecture nosec.
+La CI n'a pas ete declenchee. Les passes precedentes restent historiques.
+
+DERNIERE REVISION - COMPTEURS HISTORIQUES EXPLICITES
+Code teste : 09364abeab80ab47259be64d55246708ab03118d
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-history-volume-final.xml
+3972 passed, 18 skipped, 14 warnings, 6911 subtests passed in 380.67s (0:06:20)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 14 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_scanner_fail_closed.py tests/test_scanner_tolerance.py tests/test_history.py -o addopts= -q --tb=short
+189 passed in 8.18s.
+Extension du temoin historique : deux blobs exclus sans lecture, refus
+au plafond 150, puis 5 octets lus / 205 imputes dans API, JSON et texte.
+Deux nouveaux cas staged/diff avec long_token seul ; les cas existants
+gardent les deux traces long_token + multiline_limit, deduites une seule fois.
+La limitation de l'interieur des jetons longs reste documentee et testee.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite ; avertissements existants de lecture nosec.
+La CI n'a pas ete declenchee. Les passes precedentes restent historiques.
+
+DERNIERE REVISION - TRACES DE RELECTURE ET LIGNES HISTORIQUES
+Code teste : c7218134b87e1ac5cc8cc652ae9b064dfb84694e
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-reread-lines-final.xml
+3970 passed, 18 skipped, 14 warnings, 6911 subtests passed in 364.65s (0:06:04)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 14 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_scanner_fail_closed.py tests/test_scanner_tolerance.py tests/test_history.py tests/test_cold_start.py -o addopts= -q --tb=short
+228 passed in 8.37s.
+Huit nouveaux cas : ajout de deux sortes d'exclusions apres le premier scan
+en API et CLI (4), chemins invalides pour prepare_text et skip_file (3),
+lignes historiques conservees sur un blob renomme en cache avec verification
+des rendus et des octets reellement lus (1).
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite ; avertissements existants de lecture nosec.
+La CI n'a pas ete declenchee. Les passes precedentes restent historiques.
+
+DERNIERE REVISION - COUVERTURE JSON ET PARITE COLD START
+Code teste : 4be7a90882034f23f850bf08222f9cbb87e76b8a
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-coverage-cold-final.xml
+3962 passed, 18 skipped, 14 warnings, 6911 subtests passed in 338.06s (0:05:38)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 14 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_scanner_fail_closed.py tests/test_scanner_tolerance.py tests/test_cli_scan.py tests/test_cold_start.py -o addopts= -q --tb=short
+297 passed in 14.89s.
+Trois nouveaux cas : fichiers partiels deduits une seule fois en index et
+diff ; cold start avec finding et jeton long conserve finding/opinion,
+sort 2 pour incompletude sans faux message de modification.
+Temoins JSON existants adaptes : couverture toujours emise ; count == 0
+avec complete == false ne constitue pas un verdict propre.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite ; avertissements existants de lecture nosec.
+La CI n'a pas ete declenchee. Les passes precedentes restent historiques.
+
+DERNIERE REVISION - COMPTEURS, CP1252 SANS PERTE ET VERDICT HUMAIN
+Code teste : 7eda6e2bffdebcb7499568e5e816a98a9b2ac974
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-report-decoding-final.xml
+3959 passed, 18 skipped, 14 warnings, 6911 subtests passed in 339.68s (0:05:39)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 14 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_scanner_fail_closed.py tests/test_scanner_tolerance.py tests/test_cli_scan.py tests/test_cold_start.py -o addopts= -q --tb=short
+294 passed in 15.11s.
+Onze nouveaux cas : quatre perimetres refusent le secret traverse par 0x81,
+cinq octets CP1252 non definis sont refuses sans remplacement, deux traces
+pour un fichier ont des compteurs explicites, le dernier message humain
+partiel impose code 2 et ne pas deployer.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite ; avertissements existants de lecture nosec.
+La CI n'a pas ete declenchee. Les passes precedentes restent historiques.
+
+DERNIERE REVISION - DECODEUR, RACINES ET BORNES DES TRACES
+Code teste : 624f8d74b2cb1c34eb5e28e6ed73ece17ea8db1f
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-decoder-root-final.xml
+Rapport JUnit : 10877 entrees, 0 failures, 0 errors, 18 skipped, 336.212s.
+Soit 3948 tests passes et 6911 sous-tests passes, plus 18 ignores.
+Rejeu apres le dernier commit de code ; aucun code ni test modifie ensuite.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite ; avertissements existants de lecture nosec.
+
+Passe ciblee : 309 passed in 6.56s, treize nouveaux cas : decode_text strict
+par defaut, traces arbre bornees (fd et repli), racines vraiment vides via
+str/PathLike et CLI, contrat JSON et relecture CP1252 du cold start.
+Path("") est deja normalise en Path(".") par pathlib : les deux sont
+indistinguables. Le repertoire courant reste une racine valide ; les
+entrees str/PathLike vides sont rejetees avant conversion.
+La CI n'a pas ete declenchee. Les passes precedentes restent historiques.
+
+DERNIERS DURCISSEMENTS APRES APPROBATION AVEC COMMENTAIRES
+Code teste : 2f60301ec4427899a41fb3f45be21727050a49d7
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-final-hardening.xml
+3935 passed, 18 skipped, 14 warnings, 6911 subtests passed in 336.29s
+Rejeu apres le dernier commit de code ; aucun code ni test modifie ensuite.
+Ruff : All checks passed! Mypy : success, 57 source files. Bandit : exit 0,
+aucune alerte de securite, memes avertissements de lecture nosec existants.
+
+10 nouveaux cas : cold-start avec scan incomplet et collecteur historique
+vide ; quatre helpers stricts par defaut ; deux blobs historiques exclus
+consommant le budget sans lecture ; trois chemins d'exclusion staged bornes ;
+collecteur initial deja hors borne. Passe ciblee : 366 passed in 17.92s.
+Le compteur bytes_scanned historique reste limite aux octets effectivement lus.
+Les resultats precedents ci-dessous restent archives avec leur revision.
+
+CORRECTION APRES REQUEST CHANGES - code aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe
+Les validations initiales conservees plus bas sont historiques et ne
+prouvent pas le verdict fail-closed corrige. Resultats finaux :
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-review-full.xml
+3925 passed, 18 skipped, 14 warnings, 6911 subtests passed in 336.74s
+Rejeu effectue apres le dernier commit de code, sans modification de code
+ou de tests ensuite. Les changements suivants ne concernent que la documentation.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite (avertissements existants de lecture de commentaires nosec).
+
+47 cas adverses nouveaux ; passe ciblee complete : 708 passed in 19.79s.
+Arbre/index/diff/historique : NUL, bruit UTF-8/CP1252, secret dans jeton
+long, jointure multiligne, police binaire ; jamais 0 avec rapport partiel.
+Avec findings : 1 ; sans findings et incomplete : 2, meme hors CI.
+Budgets : tailles des fichiers/blobs exclus comptees, y compris > 1 Mio.
+Performance : environ 1 Mio de jetons longs, traces et lignes conservees.
+
+Auto-scan final du depot : exit 1, 4009 candidats, 325 fichiers analyses,
+3 exclusions de contenu ; complete=false. Le code 1 correspond aux findings,
+pas a un verdict propre. Aucun contenu exclu sans finding ne peut retourner 0.
+JSON/stderr actualises hors depot aux chemins indiques ci-dessous.
+
+--- HISTORIQUE AVANT CORRECTION DE REVUE ---
+Environnement : Debian WSL, Python 3.13, venv de test hors du depot.
+Dependances de l'environnement existant reutilisees ; CI verrouillee non lancee.
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-full.xml
+3829 passed, 18 skipped, 14 warnings, 6911 subtests passed in 320.03s
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+
+python -m mypy heimdall
+Success: no issues found in 57 source files
+
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py
+Exit 0, aucune alerte de securite.
+
+python -m heimdall.cli.main scan --ci --no-allowlist --json .
+Exit 1 : 3986 candidats, 321 fichiers analyses, 3 exclusions de contenu.
+complete=false ; pas d'erreur d'outillage (code 2).
+Exclusions : docs/security/dfd.png (binary), docs/t116-samm.md:64
+et docs/contracts/vault-traceability.md:30 (multiline_limit).
+Les candidats proviennent notamment des fixtures synthetiques et empreintes
+du depot ; aucune allowlist active. Ne pas confondre code 1 et erreur.
+Rapports bruts hors depot : /home/nathan/heimdall-t229-self-scan.json
+et /home/nathan/heimdall-t229-self-scan.stderr.
+
+Premier rejeu avant rebase sur la fusion #240 (base initiale c35df09) :
+python -m pytest tests/test_scanner_tolerance.py tests/security/test_prompt_injection.py -o addopts= -q
+30 passed in 2.70s
+Auto-scan ci-dessus rejoue sur cette meme revision.
+
+Integration de #240 / #228, base 6bbe7da, code 25a375cc364da9e89f50d3cac0f8210c2b17c17a :
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-integrated.xml
+3878 passed, 18 skipped, 14 warnings, 6911 subtests passed in 333.39s
+
+Auto-scan apres integration : exit 1, 4011 candidats, 324 fichiers analyses,
+3 exclusions de contenu identiques ; pas d'arret en code 2.
+Le JSON et le stderr bruts ont ete actualises aux chemins ci-dessus.
+
+Dernier ajustement : strict=True refuse aussi les gros fichiers avec un
+collecteur skipped_files explicite. Aucun changement de la politique CLI par defaut.
+python -m pytest tests/test_scanner_detect.py tests/test_scanner_tolerance.py tests/test_cold_start.py tests/test_history.py -o addopts= -q --tb=short
+316 passed in 6.47s
+Rapport : /home/nathan/heimdall-t229-strict.xml

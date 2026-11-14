@@ -9,9 +9,31 @@
     "schema",
     "scope",
     "count",
-    "findings"
+    "findings",
+    "complete"
   ],
   "properties": {
+    "complete": {
+      "type": "boolean",
+      "default": true,
+      "description": "Requis depuis #229. False si du contenu est exclu par la politique de tolérance (#229). Un consommateur DOIT vérifier complete en plus de count/findings ; conclure propre sur count == 0 seul est interdit. Un document sans complete est invalide."
+    },
+    "skipped_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Absent = aucun fichier exclu par la politique de contenu." },
+    "skipped": {
+      "type": "array",
+      "default": [],
+      "description": "Absent = aucune trace d'exclusion de contenu.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "reason", "line"],
+        "properties": {
+          "file": {"type": "string", "minLength": 1, "maxLength": 4096},
+          "reason": {"enum": ["binary", "too_large", "symlink", "long_token", "multiline_limit"]},
+          "line": {"type": ["integer", "null"], "minimum": 1}
+        }
+      }
+    },
     "schema": {
       "const": "heimdall.scan.v1",
       "description": "Version du contrat de sortie. Un parseur CI DOIT refuser toute autre valeur."
@@ -92,5 +114,20 @@
       "default": 0,
       "description": "Nombre d'entrées non suivies et ignorées par un `.gitignore` du dépôt, écartées lors d'un scan d'arbre (#59) : un fichier ignoré compte pour une entrée, un répertoire ignoré élagué compte aussi pour une. Un fichier suivi n'est jamais compté ni écarté, même si un `.gitignore` le matche (`git add -f`) : il reste analysé. Toujours 0 en `--staged`, `--diff` et avec `--no-gitignore`. En mode `--ci`, un arbre dont aucune entrée de contenu n'a été lue (exclusions seules) est refusé en code 2."
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"complete": {"const": false}},
+        "required": ["complete"]
+      },
+      "then": {
+        "properties": {
+          "skipped": {"minItems": 1},
+          "skipped_count": {"minimum": 1}
+        },
+        "required": ["skipped", "skipped_count"]
+      }
+    }
+  ]
 }
