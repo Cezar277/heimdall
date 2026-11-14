@@ -1,4 +1,28 @@
 Ticket #230 - Audit E-02 / allowlist
+DERNIERE REVISION - ECHAPPEMENTS DEFENSIFS ET GLOBS ZERO SEGMENT
+Code teste : 095e91bb8d75d0e70f12834f650fd772261148ac
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t230-escape-contract-final.xml
+4417 passed, 18 skipped, 19 warnings, 7124 subtests passed in 387.51s (0:06:27)
+Rejeu apres le commit de code ; aucun code ni test modifie ensuite.
+Les 19 avertissements existants concernent les sauvegardes de remediation.
+
+python -m pytest tests/test_issue230_scanner_allowlist.py tests/test_scanner_allowlist.py -o addopts= -q --tb=short
+207 passed in 6.51s.
+Vingt nouveaux cas : douze syntaxes incompletes sur helper/compteur/
+compilateur, deux offsets invalides, deux echappements valides et quatre
+globs montrant que logs/** couvre aussi logs, contrairement a logs/*/**.
+
+python -m ruff check heimdall tests scripts docker
+All checks passed!
+python -m mypy heimdall tests/contracts/fastapi_contract_fixture.py scripts docker
+Success: no issues found in 69 source files
+python -m bandit -r heimdall scripts docker -q
+Exit 0, aucune alerte ; avertissements nosec existants.
+
+CI annulee par l'utilisateur. Aucun nouveau /ci pour cette revision.
+Aucune CI verte revendiquee. Les anciennes passes ci-dessous sont historiques.
+
 CORRECTION APRES REQUEST CHANGES
 Revision : a95a1f00a221c1df1dd2af93c8155487db765f1c
 Main integre : 4d5bdf8, merge f2711ce.
@@ -29,10 +53,10 @@ Success: no issues found in 69 source files
 python -m bandit -r heimdall scripts docker -q
 Exit 0 ; avertissements nosec existants, aucune alerte de securite.
 
-Validation globale finale : rapport JUnit local au chemin ci-dessus et
-check CI (/ci) de https://github.com/Cezar277/heimdall/pull/253 apres
-commentaire /ci sur la tete corrigee. Consulter la conclusion de ce check
-pour la revision courante. Les anciennes passes ci-dessous sont historiques.
+Rejeu global final de cette correction sur 3aaaddd :
+4397 passed, 18 skipped, 19 warnings, 7124 subtests passed in 379.33s.
+CI (/ci) declenchee sur la PR 253 puis annulee par l'utilisateur ;
+aucune relance. Les anciennes passes ci-dessous sont historiques.
 
 VALIDATION INITIALE - HISTORIQUE d50d0f6
 Branche : 230-audit-e-02-allowlist-scanner-détection-mots-de-passe-urls-jetons-courts-et-contournement-regex-allowlist-_compile_safe_regex

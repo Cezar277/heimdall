@@ -1,10 +1,27 @@
 # T230 — Audit E-02 : détection et allowlist
 
-Ticket #230. Révision corrigée : `a95a1f00a221c1df1dd2af93c8155487db765f1c`.
+Ticket #230. Révision actuelle : `095e91bb8d75d0e70f12834f650fd772261148ac`.
+La correction inter-types reste prouvée sur `a95a1f0` ci-dessous.
 `main` intégré : `4d5bdf8` (merge local `f2711ce`). Le commit initial
 `d50d0f6` contient `Closes #230` ; ses preuves historiques restent ci-dessous.
 
-## Correction après REQUEST CHANGES
+## Renforcement défensif des échappements et contrat des globs
+
+- [`allowlist.py:388`](https://github.com/Cezar277/heimdall/blob/095e91bb8d75d0e70f12834f650fd772261148ac/heimdall/scanner/allowlist.py#L388) contrôle l'offset et la présence du caractère échappé ; l'absence de `}` dans un échappement nommé devient une `ScanError` statique, sans fuite d'`IndexError` ou de `ValueError`.
+- Les [douze cas de syntaxe incomplète](https://github.com/Cezar277/heimdall/blob/095e91bb8d75d0e70f12834f650fd772261148ac/tests/test_issue230_scanner_allowlist.py#L408) exercent séparément le helper, le compteur et le compilateur. Les [offsets invalides](https://github.com/Cezar277/heimdall/blob/095e91bb8d75d0e70f12834f650fd772261148ac/tests/test_issue230_scanner_allowlist.py#L419) suivent le même contrat. Les [échappements hexadécimaux et nommés valides](https://github.com/Cezar277/heimdall/blob/095e91bb8d75d0e70f12834f650fd772261148ac/tests/test_issue230_scanner_allowlist.py#L425) conservent trois littéraux obligatoires et leur correspondance attendue.
+- La [politique de globs](t230-scanner-allowlist.md) précise « zéro ou plusieurs segments » avec le cas du fichier `logs` couvert par `logs/**`, et les variantes pour descendants uniquement. Les [quatre témoins](https://github.com/Cezar277/heimdall/blob/095e91bb8d75d0e70f12834f650fd772261148ac/tests/test_issue230_scanner_allowlist.py#L181) figent cette sémantique, sans élargir la règle de valeur obligatoire.
+
+Validation ciblée : **207 tests passent en 6,51 s**, soit vingt cas
+supplémentaires. Ruff, MyPy (69 fichiers) et Bandit passent (avertissements
+`nosec` existants, aucune alerte de sécurité). Le rejeu complet local après
+le commit de code passe : **4417 tests, 7124 sous-tests, 18 ignorés**, en
+**387,51 s**, avec 19 avertissements `.bak` existants. Aucun code ni test
+n'a changé après ce rejeu ; seuls les documents de preuve ont été actualisés.
+Rapport JUnit : `/home/nathan/heimdall-t230-escape-contract-final.xml`.
+La CI a été annulée par l'utilisateur ; aucun nouveau `/ci` n'est déclenché
+pour cette révision et aucune CI verte n'est revendiquée.
+
+## Correction précédente après REQUEST CHANGES
 
 - [`signatures/__init__.py:155`](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/heimdall/scanner/signatures/__init__.py#L155) déduplique uniquement `(secret_type, value)`. Le bloc de déduplication inter-types a été supprimé : une vue `credential` n'est plus effacée par une vue de service. Les [deux cas CLI local/CI](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/tests/test_issue230_scanner_allowlist.py#L297) vérifient les deux vues avant allowlist, une règle limitée à `service_token`, la survie de `credential`, le code 1, une seule trace et l'absence de valeur brute en sortie.
 - [`service_tokens.py:21`](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/heimdall/scanner/signatures/service_tokens.py#L21) relève à 16 la charge minimale de `npm_`. [Identifiants ordinaires](https://github.com/Cezar277/heimdall/blob/a95a1f00a221c1df1dd2af93c8155487db765f1c/tests/test_issue230_scanner_allowlist.py#L326) et frontières 15/16 sont testés. Les noms longs restent une source possible de faux positifs, documentée.
@@ -23,11 +40,12 @@ ctime du témoin #228. Après stabilisation, les quatre modules ciblés passent 
 Ruff, MyPy (69 fichiers) et Bandit passent ; les avertissements de lecture
 des anciens commentaires `nosec` restent présents, sans alerte de sécurité.
 
-La validation globale finale utilise le rejeu local
-`/home/nathan/heimdall-t230-typed-review-final.xml` et le check **CI (/ci)**
-de la [PR #253](https://github.com/Cezar277/heimdall/pull/253), déclenché par
-`/ci` après la poussée de la tête corrigée. Lire son statut et sa conclusion
-sur la révision courante ; les résultats locaux ne remplacent pas ce check.
+Le rejeu local final sur la tête précédente `3aaaddd` passe : **4397 tests,
+7124 sous-tests, 18 ignorés**, en **379,33 s** (19 avertissements existants).
+Rapport : `/home/nathan/heimdall-t230-typed-review-final.xml`.
+Le check **CI (/ci)** de la [PR #253](https://github.com/Cezar277/heimdall/pull/253)
+a été déclenché puis annulé par l'utilisateur. Il n'est pas relancé et les
+résultats locaux ne constituent pas une preuve de CI verte.
 
 ## Propriétés initiales — historique `d50d0f6`
 
