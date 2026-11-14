@@ -255,7 +255,7 @@ def scan(  # noqa: PLR0913, PLR0917
 
 
 @app.command("cold-start")
-def cold_start(
+def cold_start(  # noqa: PLR0913, PLR0917 - options CLI explicites
     path: str = typer.Argument(".", help="Racine du dépôt existant à analyser."),
     ci: bool = typer.Option(False, "--ci", help="Déterministe : aucun appel LLM ni journal."),
     llm: bool = typer.Option(

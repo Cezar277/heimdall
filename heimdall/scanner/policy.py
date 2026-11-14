@@ -48,9 +48,9 @@ def _window_long_token(token: str, max_windows: int) -> tuple[str, int]:
     ``MAX_TOKEN_LENGTH - pas`` (4079 pour un jeton de 8 Kio, ~336 seulement
     pour un jeton d'1 Mio dans un fichier d'1 Mio) ; une sous-chaîne plus
     longue que ce recouvrement peut ne tenir dans aucune fenêtre, d'où la
-    trace ``long_token`` qui rend le rapport incomplet. Les fenêtres sont séparées par une espace pour que le
-    moteur les traite comme des jetons distincts, sans changer le numéro de
-    ligne.
+    trace ``long_token`` qui rend le rapport incomplet. Les fenêtres sont
+    séparées par une espace pour que le moteur les traite comme des jetons
+    distincts, sans changer le numéro de ligne.
 
     Retourne ``(texte, nombre_de_fenêtres_utilisées)``.
     """
