@@ -363,7 +363,9 @@ def test_optional_complete_field_has_documented_true_default() -> None:
     assert validator.schema["properties"]["complete"]["default"] is True
     complete = json.loads(render_json(ScanReport(scope="working-tree", findings=())))
     validator.validate(complete)
-    assert complete.get("complete", True) is True
+    assert complete["complete"] is True
+    assert complete["skipped"] == []
+    assert complete["skipped_count"] == 0
     partial = json.loads(
         render_json(
             ScanReport(
@@ -372,7 +374,9 @@ def test_optional_complete_field_has_documented_true_default() -> None:
         )
     )
     validator.validate(partial)
-    assert partial.get("complete", True) is False
+    assert partial["complete"] is False
+    assert partial["count"] == 0
+    assert not (partial["count"] == 0 and partial["complete"] is True)
 
 
 @pytest.mark.parametrize("byte", [0x81, 0x8D, 0x8F, 0x90, 0x9D])
@@ -399,3 +403,21 @@ def test_partial_human_report_ends_with_blocking_verdict(repo: GitRepo) -> None:
     assert result.exit_code == 2
     assert result.stdout.splitlines()[-1] == "ANALYSE PARTIELLE : ne pas déployer (code 2)."
     assert SYNTHETIC not in result.output
+
+
+@pytest.mark.parametrize("scope", ["staged", "diff"])
+def test_partial_blobs_are_not_counted_as_fully_scanned(repo: GitRepo, scope: str) -> None:
+    base = repo.git_output("rev-parse", "HEAD").strip()
+    repo.write("partial.dat", "A" * 5000 + "\n")
+    repo.write("complete.dat", "safe\n")
+    repo.stage("partial.dat", "complete.dat")
+    if scope == "diff":
+        repo.git("commit", "-qm", "changes")
+    report = collect(
+        repo.root, staged=scope == "staged", diff=base if scope == "diff" else None,
+        ci=True, allowlist=Allowlist.empty(), strict=False,
+    )
+    assert len(report.skipped) == 2
+    assert {item.file for item in report.skipped} == {"partial.dat"}
+    assert report.scanned_files == 1
+    assert not report.complete

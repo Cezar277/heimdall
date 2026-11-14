@@ -87,6 +87,30 @@ def test_latin1_context_keeps_explicit_tolerant_decoding(repo: GitRepo) -> None:
     assert len(report.scan.findings) == len(report.opinions) == 1
 
 
+def test_partial_context_keeps_findings_and_does_not_claim_mutation(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo.write("app.py", f'key = "{SYNTHETIC}"\n' + "A" * 5000 + "\n")
+    report = collect_cold_start(repo.root, chat=_secret_chat)
+    assert report.scan.findings
+    assert len(report.opinions) == len(report.scan.findings)
+    assert not report.scan.complete
+    assert any(item.reason == "long_token" for item in report.scan.skipped)
+    original = cold_module.collect_cold_start
+
+    def local_collect(root: Path, **kwargs: Any) -> cold_module.ColdStartReport:
+        return original(root, **kwargs, chat=_secret_chat)
+
+    monkeypatch.setattr(main_module, "collect_cold_start", local_collect)
+    result = CliRunner().invoke(app, ["cold-start", "--json", str(repo.root)])
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["scan"]["findings"]
+    assert payload["opinions"]
+    assert "contenu modifié" not in result.output
+
+
 def test_false_positive_is_kept_and_journaled(repo: GitRepo, tmp_path: Path) -> None:
     repo.write("app.py", f'key = "{SYNTHETIC}"\n')
     journal = RejectionJournal(tmp_path / "private" / "rejections.jsonl")

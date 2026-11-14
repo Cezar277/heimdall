@@ -15,7 +15,7 @@
     "complete": {
       "type": "boolean",
       "default": true,
-      "description": "Absent = analyse complète selon le périmètre déclaré. False si du contenu est exclu par la politique de tolérance (#229)."
+      "description": "Toujours émis par le producteur actuel. False si du contenu est exclu par la politique de tolérance (#229). Absent = analyse complète pour les anciens rapports v1. Un consommateur DOIT vérifier complete en plus de count/findings ; conclure propre sur count == 0 seul est interdit."
     },
     "skipped_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Absent = aucun fichier exclu par la politique de contenu." },
     "skipped": {

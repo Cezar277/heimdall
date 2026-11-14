@@ -45,15 +45,15 @@ Le rapport humain annonce **Analyse partielle** et liste les chemins relatifs,
 les motifs et, pour les limites de texte, les lignes concernées. Les chemins
 sont échappés à l'affichage. Aucun extrait de contenu ou secret n'est ajouté.
 
-Quand du contenu est écarté, le JSON `heimdall.scan.v1` ajoute les champs
-optionnels `complete: false`, `skipped_count` (nombre de fichiers distincts)
-et `skipped`, tableau d'objets `{file, reason, line}`. Le schéma versionné
-accepte ces champs. Les rapports sans exclusion gardent leur forme précédente.
-Pour ces rapports v1, l'absence de `complete` signifie `true`, l'absence
-de `skipped_count` signifie `0` et l'absence de `skipped` signifie `[]`.
-Les `default` du schéma sont des annotations : un consommateur JSON applique
-ces valeurs, par exemple `payload.get("complete", True)`. Le producteur
-émet toujours `complete: false` lorsqu'il existe une exclusion de contenu.
+Le JSON `heimdall.scan.v1` émet toujours `complete: true/false`,
+`skipped_count` (nombre de fichiers distincts) et `skipped`, tableau
+d'objets `{file, reason, line}` (vide sans exclusion). Un consommateur doit
+vérifier la couverture en plus des findings : `count == 0` seul ne signifie
+jamais « propre ». Pour le producteur actuel, exiger `complete is True`
+et aucun finding ; vérifier aussi le code de sortie en CLI.
+Le schéma conserve les champs optionnels pour les anciens rapports v1 :
+leur absence signifiait respectivement `true`, `0` et `[]`. Ses `default`
+sont des annotations, pas des valeurs insérées automatiquement.
 L'historique utilise ses champs existants `complete` et `skipped`, avec
 un chemin et un commit pour chaque occurrence, y compris après réutilisation
 du cache de blobs.
@@ -81,6 +81,13 @@ L'historique compte lui aussi la taille de chaque blob absent du cache,
 même s'il est exclu ; `bytes_scanned` reste le compteur des octets lus.
 Les traces d'exclusion de l'index et du diff sont plafonnées à
 `MAX_STAGED_FINDINGS`, y compris avec un collecteur déjà rempli.
+Dans ces deux périmètres, `scanned_files` compte les fichiers entièrement
+analysés : chaque fichier portant une ou plusieurs traces est déduit une fois.
+
+L'intérieur d'un jeton lexical de plus de 4096 caractères n'est pas analysé,
+y compris s'il contient un secret concaténé sans séparateur. Le mode tolérant
+le remplace par des espaces, conserve la trace `long_token` et déclare le
+rapport partiel (code 2 sans autre finding). Le mode strict le refuse.
 
 ## Bibliothèque et autres commandes
 
@@ -109,7 +116,13 @@ Le cold start conserve son contrat de rapport incomplet : son collecteur
 `skipped_files` inclut les exclusions rencontrées et sa CLI retourne 2 si
 ce collecteur n'est pas vide ou si son rapport de scan interne est incomplet,
 même avec un collecteur historique vide. Le JSON externe reste cohérent
-avec cette couverture. `deep-scan` rend son rapport et retourne 2
+avec cette couverture. La seconde passe locale applique le même prétraitement
+tolérant que la première et conserve les findings analysables ainsi que leur
+qualification. Un finding accompagné d'un jeton long reste un rapport partiel :
+le cold start conserve son code 2 d'incomplétude, sans prétendre que le contenu
+a été modifié. Les vérifications de racine et de présence des findings restent
+actives.
+`deep-scan` rend son rapport et retourne 2
 s'il est partiel sans finding, ou 1 si un finding est présent. Le prétraitement
 des jetons traite chaque ligne une fois et calcule sa taille UTF-8 une fois ;
 aucun préfixe du fichier n'est recompté pour chaque jeton.

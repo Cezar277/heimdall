@@ -26,6 +26,7 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.interface import FileTarget, Scanner
+from heimdall.scanner.policy import ScanSkip, prepare_text
 from heimdall.scanner.signature_engine import SignatureEngine
 
 CONTEXT_LINES = 5
@@ -178,12 +179,14 @@ def _collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification opti
             raise ScanError("contenu modifié depuis le scan déterministe") from None
         if text is None:
             raise ScanError("contenu modifié depuis le scan déterministe")
+        reread_skipped: list[ScanSkip] = []
+        text = prepare_text(text, file, strict=False, skipped=reread_skipped)
         target = FileTarget(file, text)
         # Sur-ensemble volontaire sans allowlist : on vérifie l'appartenance
         # des findings retenus, pas l'égalité de deux rapports. TreeScanner et
         # SignatureEngine partagent DEFAULT_ENTROPY_CONFIG et la même clé HMAC
         # locale persistante via SnippetHasher() ; le test de parité le prouve.
-        current = Scanner(SignatureEngine(deadline=deadline)).scan(target)
+        current = Scanner(SignatureEngine(deadline=deadline, strict=False)).scan(target)
         if any(finding not in current for finding in findings):
             raise ScanError("contenu modifié depuis le scan déterministe")
         opinions.extend(

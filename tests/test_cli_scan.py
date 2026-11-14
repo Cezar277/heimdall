@@ -2027,6 +2027,9 @@ def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
     )
     assert document["count"] == len(document["findings"]) == 1
     assert set(document) == {
+        "complete",
+        "skipped",
+        "skipped_count",
         "schema",
         "scope",
         "count",

@@ -856,8 +856,7 @@ def _collect_staged(
         findings=tuple(findings),
         traces=traces,
         config_hash=allowlist.sha256,
-        scanned_files=len(changes)
-        - sum(item.reason in {"binary", "too_large"} for item in skipped),
+        scanned_files=len(changes) - len({item.file for item in skipped}),
         skipped=tuple(skipped),
     )
 
@@ -938,8 +937,7 @@ def _collect_diff(
         findings=tuple(findings),
         traces=traces,
         config_hash=allowlist.sha256,
-        scanned_files=len(changes)
-        - sum(item.reason in {"binary", "too_large"} for item in skipped),
+        scanned_files=len(changes) - len({item.file for item in skipped}),
         skipped=tuple(skipped),
     )
 
@@ -965,15 +963,10 @@ def render_json(report: ScanReport) -> str:
         "config_hash": report.config_hash,
         "vcs_ignored": report.vcs_ignored,
         "git_ignored": report.git_ignored,
+        "complete": report.complete,
+        "skipped_count": len({item.file for item in report.skipped}),
+        "skipped": [item.as_dict() for item in report.skipped],
     }
-    if report.skipped:
-        payload.update(
-            {
-                "complete": False,
-                "skipped_count": len({item.file for item in report.skipped}),
-                "skipped": [item.as_dict() for item in report.skipped],
-            }
-        )
     return json.dumps(
         payload,
         ensure_ascii=False,
