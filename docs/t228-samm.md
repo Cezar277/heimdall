@@ -109,3 +109,28 @@ rejoué avec les deux autres cas d'identité : `3 passed`. Ruff, MyPy
 (56 fichiers), Bandit et la vérification des permaliens passent. Rapport
 JUnit local : `/home/nathan/heimdall-t228-review.xml`. La suite complète
 n'a pas été rejouée pour ces durcissements.
+
+## Contrôle automatique des préfixes supplémentaires
+
+Révision de code : `da0a649d176349aec40eba70867c6ad18c70417c`.
+Cette section remplace l'ancienne limite « exigence de déploiement sans
+contrôle automatique » pour les quatre préfixes Git ajoutés.
+
+- [`gitdiff.py:212`](https://github.com/Cezar277/heimdall/blob/da0a649d176349aec40eba70867c6ad18c70417c/heimdall/mcp/gitdiff.py#L212) : `verify_git_prefix` exige `st_uid == 0` sur le binaire, ses parents lexicaux, les liens et leurs cibles résolues avec leurs parents ; les fichiers et répertoires doivent avoir `mode & 0022 == 0`. Les permissions des liens ne remplacent pas le contrôle de leurs parents et cibles. Un fichier absent, illisible ou non régulier est refusé.
+- Appel avant toute exécution dans [`GitAccess`, ligne 410](https://github.com/Cezar277/heimdall/blob/da0a649d176349aec40eba70867c6ad18c70417c/heimdall/mcp/gitdiff.py#L410) et dans [`hook.py:145`](https://github.com/Cezar277/heimdall/blob/da0a649d176349aec40eba70867c6ad18c70417c/heimdall/cli/hook.py#L145). Erreurs statiques `ToolFailure(INTERNAL)` / `HookError`, traduites en code 2 par la CLI, sans reflet du chemin.
+- [`test_hook_commit_index.py:320`](https://github.com/Cezar277/heimdall/blob/da0a649d176349aec40eba70867c6ad18c70417c/tests/test_hook_commit_index.py#L320) : dix cas simulant un déploiement protégé, puis propriétaire non root sur le lien, le préfixe, son parent, la cible ou son parent ; écriture groupe/autres ; cible absente. Chaque refus est vérifié dans le hook et dans `GitAccess`, sans exécuter le faux Git.
+
+La priorité du Git système et le refus des chemins sous dépôt/cwd restent
+couverts. Un Homebrew appartenant au compte utilisateur est maintenant
+refusé ; utiliser un Git système protégé. Les autres emplacements du chemin
+système conservent la politique historique. La CI doit toujours fournir sa
+propre installation Git de confiance. Les contrôles ajoutés portent sur
+l'appartenance et les bits de permission POSIX ; les tests restent simulés
+sous Linux. Aucune exécution native macOS/NixOS n'est revendiquée.
+
+Validation : même commande de régression élargie, `563 passed, 750 subtests
+passed in 90.81s`. Les dix nouveaux cas de permissions passent aussi dans
+un rejeu ciblé. Ruff, MyPy (56 fichiers), Bandit et la vérification des
+permaliens passent. Rapport JUnit local :
+`/home/nathan/heimdall-t228-prefix-trust.xml`. La suite complète n'a pas été
+relancée pour ce durcissement.
