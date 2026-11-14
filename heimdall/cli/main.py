@@ -63,7 +63,10 @@ app.add_typer(hook_app, name="hook")
 
 app.command(
     "fix",
-    help="Propose et applique la remédiation interactive (Y/N/E) des secrets détectés.",
+    help=(
+        "Propose et applique la remédiation interactive (Y/N) des secrets détectés. "
+        "L'édition (E) n'est pas prise en charge par cette commande."
+    ),
 )(fix_command)
 
 # Exécution avec injection en mémoire (ticket #101). Voie canonique :

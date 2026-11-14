@@ -149,15 +149,16 @@ def cleanup_backup_file(root: Path, receipt: AppliedPatch) -> None:
         raise ApplyError
     if receipt.backup != f"{receipt.file}.bak":
         raise ApplyError
-    resolved_root = root.resolve()
     try:
-        confined = confine(resolved_root, receipt.backup)
+        confined = confine(root, receipt.backup)
     except PathEscape:
         raise ApplyError from None
-    raw_backup = resolved_root / receipt.backup
+    # Un seul chemin fait foi : celui déjà résolu et confiné par `confine`.
+    # `relative` est canonique ; s'il diffère du reçu, un lien symbolique a
+    # redirigé la cible (même à l'intérieur de la racine) : refus fail-closed.
+    if confined.relative != receipt.backup:
+        raise ApplyError
     try:
-        if os.path.islink(raw_backup) or confined.absolute != raw_backup:
-            raise ApplyError
         os.unlink(confined.absolute)
     except FileNotFoundError:
         pass

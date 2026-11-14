@@ -1,4 +1,4 @@
-"""Commande ``heimdall fix`` : branche la revue Y/N/E (#32) et la remédiation (#30/#31).
+"""Commande ``heimdall fix`` : branche la revue Y/N (#32) et la remédiation (#30/#31).
 
 Lit les résultats du scan déterministe, prépare les plans de remplacement en
 mémoire via :mod:`heimdall.remediation`, puis délègue la validation humaine et
@@ -139,7 +139,7 @@ def run_fix(  # noqa: PLR0913, PLR0915
     ci: bool = False,
     interactive: bool | None = None,
 ) -> tuple[ReviewReport, int]:
-    """Exécute le flux complet scan -> plans -> revue Y/N/E -> écriture atomique."""
+    """Exécute le flux complet scan -> plans -> revue Y/N -> écriture atomique."""
     if root.is_symlink():
         raise ScanError("racine symlinkée refusée")
     resolved_root = root.resolve()
@@ -219,6 +219,9 @@ def run_fix(  # noqa: PLR0913, PLR0915
         proposals,
         ci=ci,
         interactive=interactive,
+        # `fix` ne fournit pas de handler d'édition : E est refusé sans
+        # écriture et le prompt ne l'annonce pas (fail-closed explicite).
+        allow_edit=False,
         apply=_apply,
     )
     if any(outcome.applied for outcome in report.outcomes):

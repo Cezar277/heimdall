@@ -336,7 +336,7 @@ def test_f11_parse_env_file_does_not_truncate_trailing_garbage_after_quote(
     tmp_path: Path,
 ) -> None:
     env_file = tmp_path / ".env"
-    env_file.write_text('FOO="a"b\nBAR=\'a\'b\n', encoding="utf-8")
+    env_file.write_text("FOO=\"a\"b\nBAR='a'b\n", encoding="utf-8")
     parsed = parse_env_file(env_file)
     assert parsed == {"FOO": '"a"b', "BAR": "'a'b"}
 
@@ -362,9 +362,7 @@ def test_m09_fix_deduplication_overflow_marks_unfixable_not_exit2(tmp_path: Path
 
 
 @pytest.mark.parametrize("bad_status", ["rote", "actif", "confirme"])
-def test_f02_vault_pull_and_run_reject_non_vaulte_secret(
-    tmp_path: Path, bad_status: str
-) -> None:
+def test_f02_vault_pull_and_run_reject_non_vaulte_secret(tmp_path: Path, bad_status: str) -> None:
     exe = tmp_path / "tool.sh"
     exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     exe.chmod(0o700)
@@ -413,6 +411,33 @@ def test_m08_denylist_sync_between_remediation_and_exec(name: str) -> None:
     assert is_dangerous_exec_env_var(name) is True
 
 
+def test_m09_fix_refuses_edit_without_writing(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S603, S607  # nosec B603, B607
+    app_file = tmp_path / "app.py"
+    original = f'API_KEY = "{_FAKE_SECRET}"\n'
+    app_file.write_text(original, encoding="utf-8")
+    prompts: list[str] = []
+
+    def _fake_stdin_ask(prompt: str, **_kwargs: object) -> str:
+        prompts.append(prompt)
+        return "e"
+
+    with (
+        patch("heimdall.cli.review.is_interactive", return_value=True),
+        patch("heimdall.cli.review._stdin_ask", side_effect=_fake_stdin_ask),
+    ):
+        runner = CliRunner()
+        res = runner.invoke(app, ["fix", str(tmp_path)])
+
+    assert res.exit_code == 2, res.output
+    assert prompts
+    assert "éditer (E)" not in prompts[0]
+    assert "Valider (Y) ou ignorer (N)" in prompts[0]
+    assert app_file.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "app.py.bak").exists()
+    assert not (tmp_path / ".env").exists()
+
+
 def test_m09_fix_rejects_replaced_root_inode(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -444,6 +469,18 @@ def test_f10_cleanup_backup_file_rejects_symlink_target(tmp_path: Path) -> None:
     with pytest.raises(ApplyError):
         cleanup_backup_file(tmp_path, receipt)
     assert outside.read_text(encoding="utf-8") == "do not delete\n"
+
+
+def test_f10_cleanup_backup_file_rejects_symlink_redirect_inside_root(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("keep me\n", encoding="utf-8")
+    (tmp_path / "app.py.bak").symlink_to(target)
+    receipt = AppliedPatch(file="app.py", backup="app.py.bak", mode=0o600, after="x\n")
+    with pytest.raises(ApplyError):
+        cleanup_backup_file(tmp_path, receipt)
+    assert target.read_text(encoding="utf-8") == "keep me\n"
 
 
 def test_m09_existing_env_names_is_bounded_on_large_env(tmp_path: Path) -> None:
