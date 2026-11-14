@@ -61,6 +61,7 @@ from heimdall.scanner.finding import (
 from heimdall.scanner.gitignore import GitExclusions, _PinnedRoot, collect_git_exclusions
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import _open_flags, _resolve_root
+from heimdall.scanner.limits import MULTILINE_WINDOW
 from heimdall.scanner.policy import ScanSkip, SkipReason, prepare_text, skip_file
 from heimdall.scanner.signature_engine import MAX_FINDINGS
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
@@ -83,7 +84,6 @@ def _directory_flags() -> int:
 
 
 MAX_FILE_BYTES: Final[int] = 1_048_576
-MULTILINE_WINDOW: Final[int] = 4096
 #: Plafond du nombre de fichiers analysés en une passe (#29). Au-delà, le
 #: scan est **refusé** (``ScanError``) : un dépôt adverse avec 100 000 petits
 #: fichiers ne doit pas faire durer une CI sans rendre de verdict.

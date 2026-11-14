@@ -7,12 +7,11 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Literal
 
-from heimdall.scanner.entropy_detection import MAX_TOKEN_LENGTH
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import validate_relative_path
+from heimdall.scanner.limits import MAX_TOKEN_LENGTH, TEXT_WINDOW_BYTES
 
 SkipReason = Literal["binary", "too_large", "symlink", "long_token", "multiline_limit"]
-TEXT_WINDOW_BYTES = 4096
 _TOKEN = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
 
 
@@ -40,6 +39,10 @@ def prepare_text(text: str, file: str, *, strict: bool, skipped: list[ScanSkip])
     Une trace par motif et fichier borne le rapport même sur une longue ligne.
     Les fenêtres multilignes hors borne restent visibles sans masquer les
     signatures analysables sur chacune de leurs lignes.
+
+    L'intérieur d'un jeton hors borne n'est **pas** analysé (limite
+    documentée) : le rapport est marqué incomplet par la trace ``long_token``
+    et un appelant ne doit jamais traiter ``complete is False`` comme propre.
     """
     if strict:
         return text

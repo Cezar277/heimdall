@@ -34,10 +34,8 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import ScanTarget
+from heimdall.scanner.limits import MULTILINE_WINDOW
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
-
-#: Fenêtre maximale de jointure de deux lignes, en **octets UTF-8** (4 Kio).
-MULTILINE_WINDOW: Final[int] = 4096
 
 #: Plafond du nombre de Findings rendus en une passe (#29). Les bornes
 #: d'entrée ne suffisent pas : un dépôt adverse dense en candidats (un millier

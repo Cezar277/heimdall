@@ -23,6 +23,7 @@ from heimdall.cli.history import collect_history
 from heimdall.cli.main import app
 from heimdall.cli.scan import ScanReport, collect, render_json
 from heimdall.mcp.gitdiff import GitAccess
+from heimdall.scanner import entropy_detection, limits, policy, signature_engine
 from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.detect import MAX_FILE_BYTES, Scanner, find_candidates, scan
 from heimdall.scanner.errors import ScanError
@@ -187,6 +188,16 @@ def test_partial_local_command_is_not_clean(repo: GitRepo, command: str) -> None
     result = CliRunner().invoke(app, [command, "--json", *options, str(repo.root)])
     assert result.exit_code == 2
     assert json.loads(result.stdout)["complete"] is False
+
+
+def test_all_4k_bounds_share_one_source() -> None:
+    assert limits.TEXT_WINDOW_BYTES == 4096
+    assert limits.MAX_TOKEN_LENGTH == limits.TEXT_WINDOW_BYTES
+    assert limits.MULTILINE_WINDOW == limits.TEXT_WINDOW_BYTES
+    assert policy.TEXT_WINDOW_BYTES == limits.TEXT_WINDOW_BYTES
+    assert entropy_detection.MAX_TOKEN_LENGTH == limits.TEXT_WINDOW_BYTES
+    assert detect_module.MULTILINE_WINDOW == limits.TEXT_WINDOW_BYTES
+    assert signature_engine.MULTILINE_WINDOW == limits.TEXT_WINDOW_BYTES
 
 
 def test_megabyte_of_long_tokens_is_bounded_and_keeps_line_numbers() -> None:
@@ -371,7 +382,7 @@ def test_cli_rejects_empty_root_argument(
     assert result.stdout == ""
 
 
-def test_optional_complete_field_has_documented_true_default() -> None:
+def test_complete_field_is_required_and_partial_requires_skipped() -> None:
     validator = _scan_validator()
     assert validator.schema["properties"]["complete"]["default"] is True
     complete = json.loads(render_json(ScanReport(scope="working-tree", findings=())))
@@ -379,6 +390,9 @@ def test_optional_complete_field_has_documented_true_default() -> None:
     assert complete["complete"] is True
     assert complete["skipped"] == []
     assert complete["skipped_count"] == 0
+    without_complete = dict(complete)
+    without_complete.pop("complete")
+    assert not validator.is_valid(without_complete)
     partial = json.loads(
         render_json(
             ScanReport(
@@ -390,6 +404,10 @@ def test_optional_complete_field_has_documented_true_default() -> None:
     assert partial["complete"] is False
     assert partial["count"] == 0
     assert not (partial["count"] == 0 and partial["complete"] is True)
+    partial_without_skipped = dict(partial)
+    partial_without_skipped.pop("skipped")
+    assert not validator.is_valid(partial_without_skipped)
+    assert not validator.is_valid(dict(partial, skipped=[], skipped_count=0))
 
 
 @pytest.mark.parametrize("byte", [0x81, 0x8D, 0x8F, 0x90, 0x9D])

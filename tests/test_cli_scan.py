@@ -2045,19 +2045,22 @@ def test_scan_json_output_validates_against_the_schema(tmp_path: Path) -> None:
 def test_scan_schema_refuses_invalid_documents() -> None:
     """Le schéma fige le contrat : valeur, enum, fermeture et items Finding."""
     validator = _scan_validator()
-    # Rétrocompatibilité : l'ancien document sans ignored_count/traces/config_hash reste valide
+    # #229 : complete est requis ; un ancien document sans complete est refusé.
     legacy_base = {
         "schema": "heimdall.scan.v1",
         "scope": "staged",
         "count": 0,
         "findings": [],
     }
-    assert validator.is_valid(legacy_base)
+    assert not validator.is_valid(legacy_base)
     base = {
         "schema": "heimdall.scan.v1",
         "scope": "staged",
         "count": 0,
         "findings": [],
+        "complete": True,
+        "skipped_count": 0,
+        "skipped": [],
         "ignored_count": 0,
         "traces": [],
         "config_hash": None,
@@ -2065,7 +2068,22 @@ def test_scan_schema_refuses_invalid_documents() -> None:
         "git_ignored": 0,
     }
     assert validator.is_valid(base)
+    partial = dict(
+        base,
+        complete=False,
+        skipped_count=1,
+        skipped=[{"file": "image.png", "reason": "binary", "line": None}],
+    )
+    assert validator.is_valid(partial)
     for invalide in (
+        dict(base, complete=False),
+        dict(base, complete=False, skipped_count=1, skipped=[]),
+        dict(
+            base,
+            complete=False,
+            skipped_count=0,
+            skipped=[{"file": "image.png", "reason": "binary", "line": None}],
+        ),
         dict(base, schema="heimdall.scan.v2"),
         dict(base, scope="historique"),
         dict(base, count="1"),

@@ -24,7 +24,7 @@ heimdall deep-scan --ci --strict .
 | Binaire connu ou contenu sans décodage textuel plausible | ignoré, trace `binary` | code 2 |
 | Fichier/blob > 1 Mio (ou plafond explicitement abaissé) | ignoré sans lire son contenu, trace `too_large` | code 2 |
 | Lien rencontré dans l'arbre de travail | jamais suivi, trace `symlink` | code 2 |
-| Jeton lexical > 4096 caractères | jeton remplacé par des espaces pour l'analyse, trace `long_token` avec sa ligne ; les autres candidats restent analysés | code 2 |
+| Jeton lexical > 4096 caractères | jeton remplacé par des espaces pour l'analyse, trace `long_token` avec sa ligne ; l'intérieur n'est pas analysé, les autres candidats restent analysés | code 2 |
 | Jointure de deux lignes > 4096 octets UTF-8 | lignes analysées séparément, trace `multiline_limit` | refus conservateur historique si la jointure pourrait porter un candidat |
 
 Le suffixe ne décide jamais de l'exclusion : un texte Latin-1 portant un
@@ -51,9 +51,11 @@ d'objets `{file, reason, line}` (vide sans exclusion). Un consommateur doit
 vérifier la couverture en plus des findings : `count == 0` seul ne signifie
 jamais « propre ». Pour le producteur actuel, exiger `complete is True`
 et aucun finding ; vérifier aussi le code de sortie en CLI.
-Le schéma conserve les champs optionnels pour les anciens rapports v1 :
-leur absence signifiait respectivement `true`, `0` et `[]`. Ses `default`
-sont des annotations, pas des valeurs insérées automatiquement.
+Depuis #229, le schéma exige `complete` : un document sans ce champ est
+invalide. Si `complete` vaut `false`, `skipped` doit être non vide et
+`skipped_count` au moins 1 ; un rapport partiel sans trace est refusé par
+le schéma. Les `default` restent des annotations, pas des valeurs insérées
+automatiquement.
 L'historique utilise ses champs existants `complete` et `skipped`, avec
 un chemin, un commit, un motif et une `line` pour chaque occurrence, y compris
 après réutilisation du cache de blobs sous un autre chemin. `line` est le
@@ -103,7 +105,9 @@ applique la même règle, y compris avec `long_token` / `multiline_limit`.
 L'intérieur d'un jeton lexical de plus de 4096 caractères n'est pas analysé,
 y compris s'il contient un secret concaténé sans séparateur. Le mode tolérant
 le remplace par des espaces, conserve la trace `long_token` et déclare le
-rapport partiel (code 2 sans autre finding). Le mode strict le refuse.
+rapport partiel (code 2 sans autre finding). Le mode strict le refuse. Le
+schéma impose `complete` et refuse un rapport partiel sans `skipped` : un
+consommateur ne peut donc pas traiter `count == 0` seul comme propre.
 
 ## Bibliothèque et autres commandes
 

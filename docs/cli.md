@@ -325,6 +325,9 @@ change. Le JSON garde le chemin exact.
 
 ```json
 {
+  "complete": true,
+  "skipped_count": 0,
+  "skipped": [],
   "count": 1,
   "findings": [
     {
@@ -349,18 +352,20 @@ change. Le JSON garde le chemin exact.
 
 Le document porte le périmètre (`scope`), le nombre de Findings (`count`) et
 les Findings eux-mêmes, avec **exactement les sept champs** du contrat
-Finding v1 (#14). Il porte aussi les décomptes d'allowlist (#24),
-`vcs_ignored` (bases VCS élaguées par le mode arbre) et `git_ignored`
-(entrées non suivies ignorées par un `.gitignore` du dépôt). Les deux
-compteurs valent toujours 0 en `--staged` et `--diff` ; `git_ignored` vaut aussi 0 avec
-`--no-gitignore`. En mode `--diff`, `scope` vaut `"diff"`. Il n'y a rien
-d'autre : pas de valeur de secret, pas de champ libre, pas d'extrait de ligne.
+Finding v1 (#14). Il porte aussi `complete`, `skipped_count` et `skipped`
+(couverture de l'analyse), les décomptes d'allowlist (#24), `vcs_ignored`
+(bases VCS élaguées par le mode arbre) et `git_ignored` (entrées non suivies
+ignorées par un `.gitignore` du dépôt). Les deux compteurs valent toujours 0
+en `--staged` et `--diff` ; `git_ignored` vaut aussi 0 avec `--no-gitignore`.
+En mode `--diff`, `scope` vaut `"diff"`. Il n'y a rien d'autre : pas de valeur
+de secret, pas de champ libre, pas d'extrait de ligne.
 
 Le contrat machine est figé par [`schemas/scan.schema.json`](../schemas/scan.schema.json)
 (draft 2020-12) : objet fermé (`additionalProperties: false`), `schema` en
-constante `heimdall.scan.v1`, `scope` en enum, `count` entier ≥ 0, et chaque
-élément de `findings` validé contre le contrat Finding v1 par `$ref` (sans
-duplication : toute dérive du Finding casse la validation). Les deux `$id`
+constante `heimdall.scan.v1`, `scope` en enum, `count` entier ≥ 0, `complete`
+requis, et chaque élément de `findings` validé contre le contrat Finding v1
+par `$ref` (sans duplication : toute dérive du Finding casse la validation).
+Un document `complete: false` sans `skipped` non vide est invalide. Les deux `$id`
 sont alignés sur la même base (`https://github.com/Cezar277/heimdall/schemas/`),
 donc le `$ref` relatif se résout sans registre câblé, depuis le filesystem.
 La cohérence `count == len(findings)`, inexprimable en JSON Schema pur, est

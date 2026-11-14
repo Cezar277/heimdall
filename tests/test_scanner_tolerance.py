@@ -112,6 +112,25 @@ def test_long_token_does_not_hide_a_separate_secret_on_the_same_line(
     assert SYNTHETIC not in render_json(report)
 
 
+def test_concatenated_secret_inside_a_long_token_is_incomplete_not_clean(
+    repo: GitRepo,
+) -> None:
+    repo.write("notebook.ipynb", "A" * 5000 + SYNTHETIC + "B" * 5000 + "\n")
+    repo.stage("notebook.ipynb")
+    report = collect(repo.root, staged=True, allowlist=Allowlist.empty(), strict=False)
+    assert report.findings == ()
+    assert not report.complete
+    assert any(item.reason == "long_token" for item in report.skipped)
+    payload = json.loads(render_json(report))
+    _scan_validator().validate(payload)
+    assert payload["count"] == 0
+    assert payload["complete"] is False
+    assert payload["skipped_count"] == 1
+    assert payload["skipped"]
+    assert not (payload["count"] == 0 and payload["complete"] is True)
+    assert SYNTHETIC not in render_json(report)
+
+
 @pytest.mark.parametrize("fallback", [False, True])
 def test_symlinks_are_traced_without_resolving_or_reading_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fallback: bool
