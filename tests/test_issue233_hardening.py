@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess  # nosec B404
@@ -11,11 +12,13 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from heimdall.cli.fix import _existing_env_names, _find_single_quoted_literal, run_fix
 from heimdall.cli.main import app
 from heimdall.cli.review import Choice, ReviewOutcome, ReviewReport
+from heimdall.cli.vault_client import _pull_secrets_from_vault
 from heimdall.remediation.apply import (
     AppliedPatch,
     ApplyError,
@@ -557,3 +560,36 @@ def test_m09_fix_preserves_bak_if_env_remediation_fails(tmp_path: Path) -> None:
 
     assert res.exit_code == 2
     assert (tmp_path / "app.py.bak").is_file()
+
+
+def test_m08_pull_secrets_uses_preview_name_on_null_byte_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = MagicMock()
+    client.get_secret.return_value = {"status": "vaulte", "value": "abc\x00def"}
+    evil_name = "BAD\nINJECTED_LOG"
+    with patch("heimdall.cli.vault_client._SECRET_NAME_PATTERN", re.compile(r".*", re.DOTALL)):
+        with pytest.raises(typer.Exit) as exc_info:
+            _pull_secrets_from_vault(client, "proj", "dev", [evil_name])
+    assert exc_info.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "\nINJECTED_LOG" not in err
+    assert "octet nul" in err
+
+
+def test_f10_cleanup_backup_file_unresolved_root_with_symlink_prevents_outside_delete(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep me\n", encoding="utf-8")
+
+    (real_root / "app.py.bak").symlink_to(outside)
+    unresolved_root = tmp_path / "link_root"
+    unresolved_root.symlink_to(real_root)
+
+    receipt = AppliedPatch(file="app.py", backup="app.py.bak", mode=0o600, after="x\n")
+    with pytest.raises(ApplyError):
+        cleanup_backup_file(unresolved_root, receipt)
+    assert outside.read_text(encoding="utf-8") == "keep me\n"

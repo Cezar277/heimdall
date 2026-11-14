@@ -149,13 +149,14 @@ def cleanup_backup_file(root: Path, receipt: AppliedPatch) -> None:
         raise ApplyError
     if receipt.backup != f"{receipt.file}.bak":
         raise ApplyError
+    resolved_root = root.resolve()
     try:
-        confined = confine(root, receipt.backup)
+        confined = confine(resolved_root, receipt.backup)
     except PathEscape:
         raise ApplyError from None
-    raw_backup = root.resolve() / receipt.backup
+    raw_backup = resolved_root / receipt.backup
     try:
-        if os.path.islink(raw_backup) or os.path.islink(confined.absolute):
+        if os.path.islink(raw_backup) or confined.absolute != raw_backup:
             raise ApplyError
         os.unlink(confined.absolute)
     except FileNotFoundError:

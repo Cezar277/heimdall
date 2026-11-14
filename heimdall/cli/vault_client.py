@@ -522,7 +522,7 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             record = client.get_secret(proj, env, name)
             if record.get("status") != "vaulte":
                 typer.echo(
-                    f"Erreur de sécurité : le secret '{preview_name(name)}' "
+                    f"Erreur de sécurité : le secret {preview_name(name)!r} "
                     "n'est pas au statut 'vaulte'.",
                     err=True,
                 )
@@ -530,13 +530,14 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             val = record.get("value")
             if not isinstance(val, str):
                 typer.echo(
-                    f"Erreur : valeur de type inattendu pour '{name}' dans le Vault.",
+                    f"Erreur : valeur de type inattendu pour {preview_name(name)!r} dans le Vault.",
                     err=True,
                 )
                 raise typer.Exit(code=1)
             if "\x00" in val:
                 typer.echo(
-                    f"Erreur de sécurité : le secret '{name}' contient un octet nul interdit.",
+                    f"Erreur de sécurité : le secret {preview_name(name)!r} "
+                    "contient un octet nul interdit.",
                     err=True,
                 )
                 raise typer.Exit(code=1)
@@ -545,7 +546,7 @@ def _pull_secrets_from_vault(  # noqa: PLR0912, PLR0915
             retrieved[name] = val
         except VaultNotFoundError:
             typer.echo(
-                f"Erreur : secret '{name}' introuvable dans le Vault ({proj}/{env}).",
+                f"Erreur : secret {preview_name(name)!r} introuvable dans le Vault ({proj}/{env}).",
                 err=True,
             )
             raise typer.Exit(code=1) from None
