@@ -65,10 +65,11 @@ pour empêcher un pipeline vert sur une analyse partielle. `--strict` permet
 de refuser dès la rencontre du contenu concerné, plutôt que de poursuivre
 les autres fichiers. `--no-allowlist` ne désactive pas cette garde.
 
-Un texte UTF-8 valide ou décodé par le repli CP1252 est analysé sans seuil
+Un texte UTF-8 sans BOM ou décodé par le repli CP1252 est analysé sans seuil
 de caractères imprimables : ajouter du bruit non imprimable autour d'un
-candidat ASCII ne le transforme pas en exclusion. Le seuil reste utilisé
-pour choisir un décodage UTF-16/32 plausible, pas pour écarter ces textes.
+candidat ASCII ne le transforme pas en exclusion. Les décodages avec BOM
+et le choix UTF-16/32 conservent leurs gardes ; un rejet rend le rapport
+incomplet et ne permet jamais un code 0.
 Les tailles annoncées des gros fichiers et blobs exclus consomment aussi
 les budgets globaux de l'arbre et de l'index, sans lecture de leur contenu.
 

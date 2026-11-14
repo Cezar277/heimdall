@@ -1,78 +1,65 @@
-# T229 — Tolérance du scanner : preuves SAMM
+# T229 — Preuves du correctif fail-closed après revue
 
-Ticket : #229, audit E-01. Base : `6bbe7da`, fusion du ticket #228 (#240).
-Révision de code finale : `ba9443fbbfae046fe7af8bf40fce36ec938cd6a7`.
-Cette fiche et le complément de transcription sont ajoutés dans un commit
-de documentation distinct.
+Ticket #229, audit E-01. Révision de code : `aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe`.
+Base de la branche : `6bbe7da` (intégration de #228 / #240).
 
-## Menace et choix de politique
+## Propriété démontrée
 
-STRIDE : déni de service du contrôle local/CI par un contenu normal de dépôt
-(image, encodage occidental, notebook, gros fichier ou lien). Le scanner
-continuait auparavant à refuser toute l'analyse dès le premier de ces cas.
+Une exclusion visible ne prouve pas l'absence de secret. Le premier état de
+la PR autorisait un code 0 avec un rapport partiel : cette propriété était
+insuffisante et a été corrigée après REQUEST CHANGES.
 
-La tolérance est désormais explicite et observable : un rapport partiel
-liste les chemins et motifs d'exclusion, sans secret ni extrait. Le code 0
-couvre uniquement le contenu effectivement analysé. Les contenus écartés
-peuvent contenir des secrets ; une politique sans ces exclusions doit
-utiliser `--strict`. Les erreurs d'accès, incohérences d'objets, conflits et
-dépassements de budgets globaux restent des erreurs d'outillage (code 2).
+Les commandes `scan` et `deep-scan` appliquent désormais le même verdict,
+avec ou sans `--ci`, et sans nécessiter `--strict` :
 
-## Garanties et preuves permanentes
+- findings présents : code 1, même si le rapport est partiel ;
+- aucun finding et aucune exclusion de contenu : code 0 ;
+- aucun finding et rapport partiel : code 2 ;
+- erreur d'outillage ou refus strict : code 2.
 
-| Garantie | Implémentation et témoin |
+La combinaison code 0 / `complete: false` est interdite. Le rapport reste
+disponible pour le diagnostic, mais un pipeline ou un hook ne lisant que
+le code de sortie reste bloqué. Cette garantie ne signifie pas « aucun secret
+manqué » : les limites algorithmiques et les périmètres Git restent documentés.
+
+## Preuves permanentes
+
+| Remarque de revue | Implémentation et témoin |
 | --- | --- |
-| Exclusions explicites et bornées | [`policy.py:19`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/heimdall/scanner/policy.py#L19) : chemin relatif validé, motif fermé, ligne optionnelle, aucun contenu. [`policy.py:35`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/heimdall/scanner/policy.py#L35) : jetons hors borne remplacés par des espaces, lignes conservées ; une trace par motif/fichier. |
-| Binaires et texte non UTF-8 | [`exclusions.py:227`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/heimdall/scanner/exclusions.py#L227) : UTF-8/16/32 et repli CP1252 ; contenu non textuel tracé ou refusé en mode strict. [`test_scanner_tolerance.py:73`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/tests/test_scanner_tolerance.py#L73) : candidat synthétique détecté en Latin-1, CP1252, UTF-16 et UTF-32, dans l'arbre et l'index. |
-| Arbre, index et diff | [`scan.py:683`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/heimdall/cli/scan.py#L683) : même politique pour les blobs de l'index et des plages de commits. [`test_scanner_tolerance.py:46`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/tests/test_scanner_tolerance.py#L46) : binaire signalé, candidat dans un autre fichier toujours détecté, schéma JSON validé et strict refusé, sur les trois périmètres. |
-| Gros fichiers non lus | [`detect.py:852`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/heimdall/scanner/detect.py#L852) : borne avant lecture, gardes du descripteur et identité conservées. [`test_scanner_tolerance.py:87`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/tests/test_scanner_tolerance.py#L87) : trace `too_large`, lecture du blob interdite ; les tests #59 existants gardent les témoins de lecture bornée. |
-| Jetons longs sans masquer les autres candidats | [`test_scanner_tolerance.py:102`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/tests/test_scanner_tolerance.py#L102) : notebook avec jeton de 8192 caractères et candidat distinct sur la même ligne ; candidat détecté, trace avec ligne, aucune valeur brute dans le rapport. |
-| Symlinks jamais suivis | [`detect.py:294`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/heimdall/scanner/detect.py#L294) : exclusion tracée ou refus strict. [`test_scanner_tolerance.py:114`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/tests/test_scanner_tolerance.py#L114) : cible externe non résolue et non lue, parcours par descripteur et repli par chemin ; strict refuse. Les racines symlinkées restent refusées. |
-| Historique et cache | [`history.py:113`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/heimdall/cli/history.py#L113) : mode tolérant ou strict, motifs conservés dans le cache borné. [`test_scanner_tolerance.py:155`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/tests/test_scanner_tolerance.py#L155) : Findings et exclusions présents pour chaque commit réutilisant le même blob. |
-| Pas d'exclusion par suffixe | [`test_scanner_tolerance.py:171`](https://github.com/Cezar277/heimdall/blob/ba9443fbbfae046fe7af8bf40fce36ec938cd6a7/tests/test_scanner_tolerance.py#L171) : texte Latin-1 portant un candidat dans un fichier nommé comme une image, toujours analysé. |
+| CRITICAL : exclusion devenue verdict propre | [`main.py:229`](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/heimdall/cli/main.py#L229) et [`main.py:306`](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/heimdall/cli/main.py#L306) : calcul du verdict dans la garde d'erreurs. [`test_scanner_fail_closed.py:64`](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L64) : 28 combinaisons adverses sur arbre, index, diff et historique, jamais de code 0. |
+| HIGH : NUL, jeton long, jointure multiligne | Même témoin : secret préfixé de NUL, noyé sans séparateur dans un jeton >4096, ou coupé sur une jointure >4096. Les portions non analysées rendent le rapport incomplet et le code 2. Aucun blanchiment de contenu n'autorise un verdict propre. |
+| HIGH : bruit de contrôle | [`exclusions.py:227`](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/heimdall/scanner/exclusions.py#L227) : plus de filtre de ratio imprimable sur le texte UTF-8 sans BOM ou le repli CP1252. Le témoin CI vérifie un finding et le code 1 malgré le bruit, sur les quatre périmètres. |
+| MEDIUM : budget volumétrique | [`detect.py:571`](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/heimdall/scanner/detect.py#L571), [`detect.py:878`](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/heimdall/scanner/detect.py#L878) et [`scan.py:724`](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/heimdall/cli/scan.py#L724) : les tailles des fichiers/blobs trop gros sont comptées avant de les écarter, sans lecture de contenu. [`test_scanner_fail_closed.py:144`](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L144) et [:153](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L153) : deux fichiers dépassant chacun 1 Mio épuisent le budget, lecture de blobs interdite. |
+| MEDIUM : coût du prétraitement | [`policy.py:35`](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/heimdall/scanner/policy.py#L35) : parcours par ligne, pas de recomptage des préfixes, taille UTF-8 calculée une fois par ligne. [:178](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L178) : environ 1 Mio de jetons longs, travail borné et traces conservées ; [:192](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L192) : ligne exacte d'un jeton situé après plusieurs lignes. |
+| LOW : défauts incohérents | `Scanner`, `scan`, `find_candidates`, `collect` et `collect_history` sont stricts par défaut. La tolérance exige `strict=False`. [:103](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L103) vérifie les cinq API sur un contenu adverse. La CLI collecte explicitement les traces avant d'appliquer le verdict sûr. |
+| Pas de régression sur les findings et les hooks | [:120](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L120) : partialité + finding = code 1. [:91](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L91) et [:169](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L169) : liens et rapports partiels hors CI restent en code 2. |
 
 ## Validation
 
-Transcription : [docs/acceptance/t229-validation.txt](acceptance/t229-validation.txt).
+Les 47 cas adverses et les tests associés du scanner passent dans une
+passe ciblée de **708 tests**. Ruff, MyPy (57 fichiers) et Bandit passent.
+La suite complète a été relancée après le dernier commit de code ci-dessus :
+**3925 passed, 18 skipped, 6911 subtests passed**, en **336,74 secondes**.
+Les 14 avertissements proviennent des tests existants de sauvegardes de
+remédiation. Aucun changement de code ou de test n'a suivi ce rejeu ; seule
+la documentation des résultats et des preuves est actualisée ensuite.
 
-- Première suite complète, avant intégration de #240 : **3829 passed, 18 skipped, 6911 subtests passed** en
-  320,03 secondes ; 14 avertissements existants des tests de remédiation.
-- Rejeu avant rebase : **30 passed**, comprenant les
-  24 cas de tolérance et la garde de sécurité statique de la CI.
-- Ruff : succès. MyPy : succès sur 57 fichiers. Bandit : aucune alerte.
-- `heimdall scan --ci --no-allowlist --json .`, après intégration de #240 :
-  **code 1**, 4011 candidats, 324 fichiers analysés, `dfd.png` tracé en `binary` et deux limites de
-  fenêtre multiligne ; aucun arrêt en code 2. Les fixtures synthétiques et
-  empreintes du dépôt expliquent la présence de candidats sans allowlist ;
-  cette commande ne déclare pas le dépôt propre.
-
-Sur la base intégrée `25a375cc364da9e89f50d3cac0f8210c2b17c17a`, la suite
-complète passe : **3878 passed, 18 skipped, 6911 subtests passed**, en
-333,39 secondes (rapport `/home/nathan/heimdall-t229-integrated.xml`).
-Le dernier ajustement renforce uniquement le refus strict de taille : un
-collecteur `skipped_files` explicite ne doit pas le désactiver. Les tests
-du scanner, de la tolérance, de l'historique et du cold start sont rejoués
-après cet ajustement : **316 passed** en 6,47 secondes (rapport
-`/home/nathan/heimdall-t229-strict.xml`). La suite complète n'a pas été
-réexécutée après ce dernier ajustement.
+Transcription : [acceptance/t229-validation.txt](acceptance/t229-validation.txt).
+Rapport JUnit final : `/home/nathan/heimdall-t229-review-full.xml`.
+Les anciennes passes archivées correspondent à l'état initial de la PR et
+ne constituent pas une preuve de cette correction fail-closed.
 
 Environnement : Debian WSL, Python 3.13, dépendances de l'environnement
-de test existant ; la CI aux versions verrouillées n'a pas été déclenchée.
-Les rapports JUnit et JSON bruts sont conservés hors dépôt, aux chemins
-indiqués dans la transcription. Aucun appel réseau n'a été ajouté au scanner.
+existant. La CI aux versions verrouillées n'a pas été déclenchée.
 
-## Limites et re-pin
+## Limites
 
-La classification de contenu est heuristique. Le scanner ne décompresse
-pas les archives, n'extrait pas le texte des images et n'analyse pas les
-cibles des liens. Les exclusions ne prouvent aucune absence de secrets.
-Voir la [politique utilisateur](scanner-tolerance.md), notamment les
-différences entre rapports de couverture et helpers ne rendant qu'une liste.
+Les contenus exclus ne sont pas déclarés exempts de secrets. Ils bloquent
+le verdict propre. Les binaires ne sont pas décompressés ou OCRisés, les
+liens ne sont pas suivis, les portions hors borne ne sont pas déclarées
+analysées. Les exclusions Git/VCS restent celles du périmètre documenté.
+Voir [la politique utilisateur](scanner-tolerance.md).
 
-Les permaliens deviennent accessibles après push de la branche. Après une
-fusion squash, re-pinner sur le SHA final :
-
-```sh
-python scripts/repin_samm.py --sha <SHA> --fiche docs/t229-samm.md
-python scripts/repin_samm.py --check --fiche docs/t229-samm.md
-```
+Après une fusion squash, re-pinner avec
+`python scripts/repin_samm.py --sha <SHA> --fiche docs/t229-samm.md`, puis
+vérifier avec `python scripts/repin_samm.py --check --fiche docs/t229-samm.md`.

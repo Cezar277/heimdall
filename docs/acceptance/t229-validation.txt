@@ -1,4 +1,33 @@
 Ticket #229 - Audit E-01
+CORRECTION APRES REQUEST CHANGES - code aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe
+Les validations initiales conservees plus bas sont historiques et ne
+prouvent pas le verdict fail-closed corrige. Resultats finaux :
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-review-full.xml
+3925 passed, 18 skipped, 14 warnings, 6911 subtests passed in 336.74s
+Rejeu effectue apres le dernier commit de code, sans modification de code
+ou de tests ensuite. Les changements suivants ne concernent que la documentation.
+
+python -m ruff check heimdall tests scripts
+All checks passed!
+python -m mypy heimdall
+Success: no issues found in 57 source files
+python -m bandit -q -r heimdall/scanner heimdall/cli/scan.py heimdall/cli/history.py heimdall/cli/main.py heimdall/cli/cold_start.py
+Exit 0, aucune alerte de securite (avertissements existants de lecture de commentaires nosec).
+
+47 cas adverses nouveaux ; passe ciblee complete : 708 passed in 19.79s.
+Arbre/index/diff/historique : NUL, bruit UTF-8/CP1252, secret dans jeton
+long, jointure multiligne, police binaire ; jamais 0 avec rapport partiel.
+Avec findings : 1 ; sans findings et incomplete : 2, meme hors CI.
+Budgets : tailles des fichiers/blobs exclus comptees, y compris > 1 Mio.
+Performance : environ 1 Mio de jetons longs, traces et lignes conservees.
+
+Auto-scan final du depot : exit 1, 4009 candidats, 325 fichiers analyses,
+3 exclusions de contenu ; complete=false. Le code 1 correspond aux findings,
+pas a un verdict propre. Aucun contenu exclu sans finding ne peut retourner 0.
+JSON/stderr actualises hors depot aux chemins indiques ci-dessous.
+
+--- HISTORIQUE AVANT CORRECTION DE REVUE ---
 Environnement : Debian WSL, Python 3.13, venv de test hors du depot.
 Dependances de l'environnement existant reutilisees ; CI verrouillee non lancee.
 
