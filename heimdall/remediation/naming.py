@@ -164,9 +164,23 @@ def is_dangerous_env_var(name: object) -> bool:
     if not isinstance(name, str):
         return True
     upper = name.upper()
-    if upper in DANGEROUS_ENV_EXACT or upper in EXECUTION_DANGEROUS_ENV_EXACT:
+    if upper in DANGEROUS_ENV_EXACT or upper.endswith("_PROXY"):
         return True
-    if upper.endswith("_PROXY"):
+    if upper in {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSLKEYLOGFILE",
+        "CLASSPATH",
+        "PHPRC",
+        "PHP_INI_SCAN_DIR",
+        "CURL_HOME",
+        "WGETRC",
+        "GNUPGHOME",
+        "ELECTRON_RUN_AS_NODE",
+        "NODE_OPTIONS",
+    }:
         return True
     return any(upper.startswith(prefix) for prefix in DANGEROUS_ENV_PREFIXES)
 

@@ -181,6 +181,35 @@ def test_m06_vault_run_strips_heimdall_credentials_from_child_env(tmp_path: Path
     assert "HEIMDALL_VAULT_CA" not in child_env
 
 
+@pytest.mark.parametrize("secret_name", ["HEIMDALL_API_KEY", "HEIMDALL_VAULT_URL"])
+def test_m06_vault_run_rejects_heimdall_prefixed_secret_name(
+    tmp_path: Path, secret_name: str
+) -> None:
+    exe = tmp_path / "tool.sh"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o700)
+    runner = CliRunner()
+    with patch.dict(os.environ, {"HEIMDALL_API_KEY": _TEST_API_KEY}):
+        with patch("heimdall.cli.vault_client._init_client") as mock_init:
+            client = MagicMock()
+            client.__enter__.return_value = client
+            client.get_secret.return_value = {
+                "project": "demo",
+                "env": "dev",
+                "name": secret_name,
+                "status": "vaulte",
+                "value": _FAKE_SECRET,
+            }
+            mock_init.return_value = client
+            with patch("heimdall.cli.vault_client.subprocess.run") as mock_run:
+                result = runner.invoke(
+                    app,
+                    ["run", "--project", "demo", "--name", secret_name, "--", str(exe)],
+                )
+    assert result.exit_code == 1
+    mock_run.assert_not_called()
+
+
 def test_m04_vault_client_disables_trust_env() -> None:
     client = VaultClient(base_url="https://127.0.0.1:8443", api_key=_TEST_API_KEY)
     try:
@@ -244,6 +273,24 @@ def test_f10_apply_replacement_cleanup_backup_removes_bak(tmp_path: Path) -> Non
     plan = plan_for_finding(finding, source, _FAKE_SECRET, "API_KEY")
     apply_replacement(tmp_path, plan, cleanup_backup=True)
     assert not (tmp_path / "app.py.bak").exists()
+    assert 'os.environ["API_KEY"]' in target.read_text(encoding="utf-8")
+
+
+def test_f10_apply_replacement_cleanup_backup_tolerates_missing_bak(tmp_path: Path) -> None:
+    source = f'API_KEY = "{_FAKE_SECRET}"\n'
+    target = tmp_path / "app.py"
+    target.write_text(source, encoding="utf-8")
+    finding = Finding(
+        file="app.py",
+        line=1,
+        type="aws_key",
+        entropy=3.5,
+        snippet_hash="a" * 64,
+    )
+    plan = plan_for_finding(finding, source, _FAKE_SECRET, "API_KEY")
+    with patch("heimdall.remediation.apply.os.unlink", side_effect=FileNotFoundError):
+        receipt = apply_replacement(tmp_path, plan, cleanup_backup=True)
+    assert receipt.file == "app.py"
     assert 'os.environ["API_KEY"]' in target.read_text(encoding="utf-8")
 
 

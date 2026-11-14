@@ -205,6 +205,8 @@ def apply_replacement(  # noqa: PLR0912
             try:
                 if not os.path.islink(backup):
                     os.unlink(backup)
+            except FileNotFoundError:
+                pass
             except OSError:
                 raise ApplyError from None
     except ApplyError:
