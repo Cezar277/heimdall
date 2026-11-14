@@ -296,6 +296,7 @@ class SanitizeFileToolTests(FileRepoTestCase):
             ".npmrc-backup",
             "credentials.json",
             "credentials.txt",
+            "credentials.bak.json",
             "credentials-backup",
             "credentials_backup",
             "server.pem.bak",

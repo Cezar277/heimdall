@@ -27,6 +27,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import stat
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -95,6 +96,15 @@ _BACKUP_SUFFIXES: Final[tuple[str, ...]] = (
     "_bak",
     "_backup",
     "_old",
+)
+
+# Même vocabulaire en position d'INFIXE, devant l'extension finale :
+# `credentials.bak.json` → `credentials.json`. Le lookahead exige une
+# extension finale, sinon `.bak` serait déjà traité comme suffixe.
+_BACKUP_INFIX: Final[re.Pattern[str]] = re.compile(
+    "(?:"
+    + "|".join(re.escape(suffix) for suffix in sorted(_BACKUP_SUFFIXES, key=len, reverse=True))
+    + r")(?=\.[^.]+$)"
 )
 
 # `credentials` est un nom nu trop général pour un préfixe large :
@@ -493,13 +503,18 @@ def _tools(root: Path) -> dict[str, Callable[..., str]]:
 
 
 def _strip_backup_suffixes(segment: str) -> str:
-    """Retire les suffixes de sauvegarde, en boucle.
+    """Retire les suffixes et infixes de sauvegarde, en boucle.
 
-    `.netrc.backup.old` doit redevenir `.netrc` ; une seule passe laisserait
-    `.netrc.backup`, qui n'est pas égal à `.netrc`. La borne de longueur
-    évite de réduire un nom à la chaîne vide.
+    `.netrc.backup.old` doit redevenir `.netrc` et `credentials.bak.json`
+    doit redevenir `credentials.json` ; une seule passe laisserait
+    `.netrc.backup` (pas égal à `.netrc`) ou le `.bak` en position d'infixe.
+    La borne de longueur évite de réduire un nom à la chaîne vide.
     """
     while True:
+        without_infix = _BACKUP_INFIX.sub("", segment)
+        if without_infix != segment:
+            segment = without_infix
+            continue
         for suffix in _BACKUP_SUFFIXES:
             if segment.endswith(suffix) and len(segment) > len(suffix):
                 segment = segment[: -len(suffix)]

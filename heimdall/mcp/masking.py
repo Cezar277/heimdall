@@ -157,9 +157,10 @@ _XML_SENSITIVE_ELEMENT: Final[re.Pattern[str]] = re.compile(
 # `define('DB_PASSWORD', 'S3cr3tValue99')` (PHP/Ruby). Nom ET valeur peuvent
 # être nus (`define(DB_PASSWORD, S3cr3tValue99)`) : PHP les accepte comme
 # constantes, et la valeur reste un secret. Guillemets optionnels mais
-# symétriques ; le jugement final reste `_looks_like_secret`.
+# symétriques ; le jugement final reste `_looks_like_secret`. Insensible à la
+# casse : les fonctions PHP le sont (`DEFINE(...)` est valide).
 _DEFINE_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
-    r"define\(\s*(?P<keyquote>[\"']?)"
+    r"(?i)define\(\s*(?P<keyquote>[\"']?)"
     r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,63})"
     r"(?P=keyquote)\s*,\s*"
     r"(?P<valuequote>[\"']?)"
@@ -169,9 +170,10 @@ _DEFINE_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 
 # `.netrc` : `machine github.com login bob password S3cretP4ss`. Le nom
 # `password` n'est pas suivi de `:`/`=`, donc aucune règle d'affectation ne
-# le voyait.
+# le voyait. Insensible à la casse : `Password` est accepté par les clients
+# `.netrc` et était oublié.
 _NETRC_PASSWORD: Final[re.Pattern[str]] = re.compile(
-    r"(?<![\w-])password[ \t]+(?![=:])(?P<value>[^\s\"']{1,})"
+    r"(?i)(?<![\w-])password[ \t]+(?![=:])(?P<value>[^\s\"']{1,})"
 )
 
 # Option CLI `--password <val>` / `--password=<val>` / `--api-key=…`.

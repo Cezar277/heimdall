@@ -197,12 +197,15 @@ coquille) est masquée jusqu'à la fin de ligne, et une valeur non quotée à no
 `password = my secret pass phrase 42` ne laisse plus sa queue en clair. Les
 formes hors affectation sont couvertes : balise XML sensible
 (`<password>…</password>`), `define('DB_PASSWORD', '…')` (nom et valeur nus
-acceptés),
-`.netrc` (`password …`), `-u user:pass` et `--password <val>`/`--password=<val>`.
-Le filtre anti-bruit refuse les annotations (`api_key: str`), littéraux
-(`session = None`) et appels de fonction ; les clés JSON usuelles
-(`"author"`, `"tokenizer"`) restent lisibles. Preuve : les 11 cas de l'audit
-rejoués dans `tests/test_mcp_masking.py`.
+acceptés, `DEFINE` insensible à la casse comme en PHP), `.netrc`
+(`password …`, `Password` inclus), `-u user:pass` et `--password
+<val>`/`--password=<val>`. Le filtre anti-bruit refuse les annotations
+(`api_key: str`) et littéraux (`session = None`) ; un appel de fonction à nom
+évocateur (`get_password()`) reste partiellement masqué par la règle
+d'affectation — comportement préexistant, épinglé par test et hors périmètre
+de ce correctif. Les clés JSON usuelles (`"author"`, `"tokenizer"`) restent
+lisibles. Preuve : les 11 cas de l'audit rejoués dans
+`tests/test_mcp_masking.py`.
 
 Limites honnêtes : un jeton **sans préfixe connu, noyé dans 100 Ko de
 remplissage**, reste indétectable par fenêtre ; un SHA de commit copié en
@@ -433,8 +436,10 @@ credentials au-delà de `.git`/`.env*` — `.netrc`, `.pgpass`, `id_rsa*`,
 `.docker/config.json` et `.kube/config`, casse ignorée. Les variantes de
 sauvegarde sont refusées après normalisation du nom (`.netrc.backup`,
 `.pgpass~`, `.npmrc-backup`, `credentials.json`, `credentials-backup`,
-`server.pem.bak`, `private.key.old`, `.docker/config.json.bak`,
-`.kube/config.old`…), car une copie reste un secret. Le masquage E-03
+`credentials.bak.json`, `server.pem.bak`, `private.key.old`,
+`.docker/config.json.bak`, `.kube/config.old`…), y compris en position
+d'infixe devant l'extension finale, car une copie reste un secret. Le
+masquage E-03
 reste une seconde barrière, jamais une autorisation de lecture ; les
 ressemblances (`netrc.txt`, `credentials.md`, `server.pem.txt`,
 `.docker/config.yml`) restent lisibles. Preuve :

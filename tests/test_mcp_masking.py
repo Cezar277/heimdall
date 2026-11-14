@@ -84,6 +84,33 @@ class AuditE03MaskingProofTests(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(masking.mask_text(line), (line, 0))
 
+    def test_case_insensitive_netrc_and_define_are_masked(self) -> None:
+        """Revue (LOW) : `Password` et `DEFINE` sont valides, donc masqués."""
+        for line, secret in (
+            ("machine x login bob Password S3cretP4ss", "S3cretP4ss"),
+            ("machine x login bob PASSWORD S3cretP4ss", "S3cretP4ss"),
+            ("DEFINE('DB_PASSWORD', 'S3cr3tValue99');", "S3cr3tValue99"),
+            ('Define("DB_PASSWORD", "S3cr3tValue99");', "S3cr3tValue99"),
+        ):
+            with self.subTest(line=line):
+                masked, redactions = masking.mask_text(line)
+                self.assertEqual(redactions, 1)
+                self.assertNotIn(secret, masked)
+
+    def test_function_call_partial_mask_is_pinned(self) -> None:
+        """Comportement préexistant figé (revue), hors périmètre de ce ticket.
+
+        `_UNQUOTED_ASSIGNMENT` masque le nom de la fonction évocatrice
+        (`get_password`) mais laisse la parenthèse fermante. L'ADR affirmait
+        que les appels de fonction restaient lisibles : c'est faux pour un
+        nom évocateur, et ce test évite une régression silencieuse dans un
+        sens ou dans l'autre.
+        """
+        masked, redactions = masking.mask_text("password = get_password()")
+        self.assertEqual(redactions, 1)
+        self.assertNotIn("get_password", masked)
+        self.assertTrue(masked.endswith(")"))
+
     def test_define_with_unquoted_arguments_is_masked(self) -> None:
         """`define(DB_PASSWORD, S3cr3tValue99)` : nom et valeur nus sont valides."""
         for line, secret in (

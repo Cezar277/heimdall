@@ -3,8 +3,10 @@
 > **Document de sécurité interne, versionné depuis le ticket #231.** Il liste des vulnérabilités,
 > dont certaines non corrigées : à manipuler et diffuser avec les précautions d'usage.
 > Le versionner est un choix assumé de traçabilité : il publie aussi les contournements
-> non corrigés par cette PR (notamment C-01, `git commit -a`), qui restent documentés
-> ici pour être traités dans leurs tickets dédiés.
+> non corrigés par cette PR (notamment C-01, `git commit -a`, suivi dans
+> [#228](https://github.com/Cezar277/heimdall/issues/228)), qui restent documentés
+> ici pour être traités dans leurs tickets dédiés. La visibilité de ce document dans
+> le dépôt est assumée ; il ne contient que des valeurs manifestement synthétiques.
 
 - **Date** : 13 novembre 2026 — commit audité : `c35df09` (branche `main`)
 - **Périmètre lu** : `heimdall/` (Vault, CLI, MCP, LLM, scanner), `docker/`, `Dockerfile`, `docker-compose.yml`, `.github/workflows/`, fichiers de configuration et de verrouillage.
