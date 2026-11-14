@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -249,6 +250,9 @@ def test_selected_index_changed_on_the_same_inode_is_refused(
     before = index.stat()
     if change == "content":
         assert replacement is not None
+        # Le témoin exige un ctime distinct : éviter deux écritures dans le
+        # même tick du système de fichiers. La garde de production est inchangée.
+        time.sleep(0.02)
         index.write_bytes(replacement)
         # Même inode, même taille et mtime restauré : seul ctime atteste
         # encore la réécriture. Pas besoin de provoquer un recyclage ext4.

@@ -19,12 +19,14 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding, validate_relative_path
 from heimdall.scanner.interface import FileTarget, Scanner
+from heimdall.scanner.policy import ScanSkip, SkipReason, prepare_text, skip_file
 from heimdall.scanner.signature_engine import SignatureEngine
 
 BATCH_SIZE = 128
 MAX_COMMITS = 100_000
 MAX_TREE_BYTES = 8 * 1024 * 1024
 MAX_ENTRIES = 1_000_000
+# Budget des tailles annoncées sur chaque défaut de cache, exclusions comprises.
 MAX_READ_BYTES = 256 * 1024 * 1024
 MAX_RECORDS = 10_000
 MAX_OCCURRENCES = 1_000_000
@@ -45,11 +47,12 @@ class HistoricalFinding:
 class HistoryReport:
     findings: tuple[HistoricalFinding, ...]
     opinions: tuple[CandidateOpinion, ...]
-    skipped: tuple[tuple[str, str, str], ...]
+    skipped: tuple[tuple[str, str, str, int | None], ...]
     commits_scanned: int
     entries_scanned: int
-    bytes_scanned: int
+    bytes_scanned: int  # octets effectivement lus, distincts du budget annoncé
     elapsed_seconds: float
+    bytes_budgeted: int = 0  # tailles annoncées sur défaut de cache, exclusions comprises
 
     @property
     def complete(self) -> bool:
@@ -117,14 +120,28 @@ def collect_history(  # noqa: PLR0913 - explicit scan and qualification options
     llm: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
+    strict: bool = True,
 ) -> HistoryReport:
     """Scan historical blobs; Git failures become static ScanError errors."""
     try:
         return _collect_history(
-            root, max_file_bytes=max_file_bytes, ci=ci, llm=llm, chat=chat, journal=journal
+            root,
+            max_file_bytes=max_file_bytes,
+            ci=ci,
+            llm=llm,
+            chat=chat,
+            journal=journal,
+            strict=strict,
         )
     except ToolFailure:
         raise ScanError("historique non analysable") from None
+
+
+def _scan_skip(file: str, reason: SkipReason) -> ScanSkip:
+    """Construit une trace via la garde unique, en ``ScanError`` statique."""
+    skipped: list[ScanSkip] = []
+    skip_file(file, reason, strict=False, skipped=skipped)
+    return skipped[0]
 
 
 def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan accounting
@@ -135,16 +152,20 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     llm: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
+    strict: bool = True,
 ) -> HistoryReport:
     """Scan every reachable snapshot, including merges and deleted files.
 
     Commit IDs are paged, one tree and one blob are held at a time. The LRU
     contains only bounded findings, never raw secrets. No worker fan-out:
     sequential batches keep peak memory independent of repository size.
-    Oversized files are reported as skipped and make the result incomplete.
+    With strict=False, oversized files are reported as skipped and make the
+    result incomplete. The default strict policy refuses them.
     """
     if type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES:
         raise ScanError("limite de fichier invalide")
+    if type(strict) is not bool:
+        raise ScanError("politique de contenu invalide")
     started = time.monotonic()
     deadline = started + MAX_SECONDS
     access = GitAccess(root)
@@ -158,11 +179,12 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
     tips = _tips(access, deadline)
     records: dict[tuple[str, str, str], tuple[Finding, dict[str, None]]] = {}
     qualified: set[tuple[str, str]] = set()
-    cache: OrderedDict[str, tuple[Finding, ...] | str] = OrderedDict()
-    skipped: list[tuple[str, str, str]] = []
+    cache: OrderedDict[str, tuple[Finding, ...] | ScanSkip] = OrderedDict()
+    cache_skips: dict[str, tuple[tuple[str, int | None], ...]] = {}
+    skipped: list[tuple[str, str, str, int | None]] = []
     opinions: list[CandidateOpinion] = []
-    commits = entries = volume = occurrences = cache_findings = 0
-    scanner = Scanner(SignatureEngine(deadline=deadline))
+    commits = entries = volume = read_volume = occurrences = cache_findings = 0
+    scanner = Scanner(SignatureEngine(deadline=deadline, strict=strict))
     while tips:
         raw = _git(
             access,
@@ -202,20 +224,27 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                     cache.move_to_end(oid)
                 else:
                     size = access.blob_size(oid, timeout=_call_timeout(deadline))
+                    volume += size
+                    if size < 0 or volume > MAX_READ_BYTES:
+                        raise ScanError("limite historique dépassée")
                     if size > max_file_bytes:
-                        cached = "taille maximale dépassée"
+                        if strict:
+                            raise ScanError("historique non analysable")
+                        cached = _scan_skip(file, "too_large")
                     else:
-                        volume += size
-                        if volume > MAX_READ_BYTES:
-                            raise ScanError("limite historique dépassée")
                         data = access.blob_bytes(oid, timeout=_call_timeout(deadline))
                         if len(data) != size:
                             raise ScanError("objet historique modifié")
-                        text = decode_text(data)
-                        # Match the working-tree and staged scanners: a binary
-                        # blob cannot yield a clean verdict, regardless of name.
+                        read_volume += len(data)
+                        text = decode_text(data, strict=strict)
+                        content_skips: list[ScanSkip] = []
                         if text is None:
-                            raise ScanError("historique non analysable")
+                            if strict:
+                                raise ScanError("historique non analysable")
+                            content_skips.append(_scan_skip(file, "binary"))
+                            text = ""
+                        text = prepare_text(text, file, strict=strict, skipped=content_skips)
+                        cache_skips[oid] = tuple((item.reason, item.line) for item in content_skips)
                         target = FileTarget(file, text)
                         cached = tuple(scanner.scan(target))
                         if llm and not ci:
@@ -236,12 +265,17 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
                             )
                             qualified.update((f.type, f.snippet_hash) for f in new)
                     cache[oid] = cached
-                    cache_findings += 0 if isinstance(cached, str) else len(cached)
+                    cache_findings += 0 if isinstance(cached, ScanSkip) else len(cached)
                     while len(cache) > CACHE_SIZE or cache_findings > MAX_RECORDS:
-                        _, evicted = cache.popitem(last=False)
-                        cache_findings -= 0 if isinstance(evicted, str) else len(evicted)
-                if isinstance(cached, str):
-                    skipped.append((file, commit, cached))
+                        evicted_oid, evicted = cache.popitem(last=False)
+                        cache_skips.pop(evicted_oid, None)
+                        cache_findings -= 0 if isinstance(evicted, ScanSkip) else len(evicted)
+                for reason, line in cache_skips.get(oid, ()):
+                    skipped.append((file, commit, reason, line))
+                    if len(skipped) > MAX_RECORDS:
+                        raise ScanError("limite historique dépassée")
+                if isinstance(cached, ScanSkip):
+                    skipped.append((file, commit, cached.reason, cached.line))
                     if len(skipped) > MAX_RECORDS:
                         raise ScanError("limite historique dépassée")
                     continue
@@ -266,8 +300,9 @@ def _collect_history(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915 - bounded scan
         tuple(skipped),
         commits,
         entries,
-        volume,
+        read_volume,
         time.monotonic() - started,
+        bytes_budgeted=volume,
     )
 
 
@@ -282,10 +317,14 @@ def render_history(report: HistoryReport, *, json_output: bool = False) -> str:
                     for item in report.findings
                 ],
                 "opinions": [item.as_dict() for item in report.opinions],
-                "skipped": [{"file": f, "commit": c, "reason": r} for f, c, r in report.skipped],
+                "skipped": [
+                    {"file": f, "commit": c, "reason": r, "line": line}
+                    for f, c, r, line in report.skipped
+                ],
                 "commits_scanned": report.commits_scanned,
                 "entries_scanned": report.entries_scanned,
                 "bytes_scanned": report.bytes_scanned,
+                "bytes_budgeted": report.bytes_budgeted,
                 "elapsed_seconds": report.elapsed_seconds,
             },
             ensure_ascii=True,
@@ -293,7 +332,9 @@ def render_history(report: HistoryReport, *, json_output: bool = False) -> str:
         )
     lines = [
         f"Historique : {report.commits_scanned} commits, "
-        f"{len(report.findings)} secret(s), {report.elapsed_seconds:.3f} s."
+        f"{len(report.findings)} secret(s), {report.elapsed_seconds:.3f} s.",
+        f"Volume : {report.bytes_scanned} octet(s) lu(s), "
+        f"{report.bytes_budgeted} octet(s) imputé(s) au budget (exclusions comprises).",
     ]
     for item in report.findings:
         commits = ", ".join(item.commits[:MAX_TEXT_COMMITS])
@@ -305,9 +346,10 @@ def render_history(report: HistoryReport, *, json_output: bool = False) -> str:
             f"{WARNING}. {json.dumps(item.finding.file, ensure_ascii=True)}:"
             f"{item.finding.line} [{item.finding.type}]"
         )
-    for file, commit, reason in report.skipped:
+    for file, commit, reason, line in report.skipped:
+        location = f":{line}" if line is not None else ""
         lines.append(
-            f"Fichier ignoré {json.dumps(file, ensure_ascii=True)} (commit {commit}) : "
+            f"Fichier ignoré {json.dumps(file, ensure_ascii=True)}{location} (commit {commit}) : "
             f"{reason}. Scan incomplet."
         )
     for opinion in report.opinions:

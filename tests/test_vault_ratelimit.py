@@ -55,18 +55,18 @@ class SlidingWindowMemoryTests(unittest.TestCase):
             window_seconds=10,
             clock=lambda: now[0],
         )
-        self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+        self.assertTrue(limiter.check("127.0.0.1")[0])
         now[0] = 1.0
-        self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+        self.assertTrue(limiter.check("127.0.0.1")[0])
         now[0] = 2.0
         allowed, retry = limiter.peek("127.0.0.1")
         self.assertFalse(allowed)
         self.assertEqual(retry, 8)
         # Le peek n'a pas consommé : le budget pair est toujours à 2, pas 3.
-        self.assertEqual(limiter._buckets["peer:127.0.0.1"].count, 2)
+        self.assertEqual(limiter._buckets["anon_peer:127.0.0.1"].count, 2)
 
-    def test_peer_and_global_are_consumed_even_when_key_is_full(self) -> None:
-        """La sémantique du middleware est conservée : pair/global comptent."""
+    def test_authenticated_key_budget_is_evaluated_first(self) -> None:
+        """Une clé pleine est refusée sans consommer le budget global authentifié."""
         now = [0.0]
         limiter = RateLimiter(
             per_key=1,
@@ -80,11 +80,31 @@ class SlidingWindowMemoryTests(unittest.TestCase):
         self.assertFalse(limiter.check_authenticated("127.0.0.1", "key")[0])
         now[0] = 2.0
         self.assertFalse(limiter.check_authenticated("127.0.0.1", "key")[0])
-        self.assertEqual(limiter._buckets["peer:127.0.0.1"].count, 3)
+        self.assertEqual(limiter._buckets["key:key"].count, 1)
+        self.assertEqual(limiter._buckets["global"].count, 1)
         now[0] = 3.0
         allowed, retry = limiter.check_authenticated("127.0.0.1", "key")
         self.assertFalse(allowed)
         self.assertEqual(retry, 7)
+
+    def test_anonymous_flood_does_not_block_authenticated_requests(self) -> None:
+        """Le budget anonyme est séparé du budget authentifié (audit M-02)."""
+        now = [0.0]
+        limiter = RateLimiter(
+            per_key=2,
+            per_peer=2,
+            global_limit=2,
+            window_seconds=10,
+            clock=lambda: now[0],
+        )
+        self.assertTrue(limiter.check("127.0.0.1")[0])
+        self.assertTrue(limiter.check("127.0.0.1")[0])
+        self.assertFalse(limiter.check("127.0.0.1")[0])
+        # Le flot anonyme a épuisé anon_peer/anon_global, pas key/global.
+        self.assertTrue(limiter.check_authenticated("127.0.0.1", "key")[0])
+        now[0] = 1.0
+        self.assertTrue(limiter.check_authenticated("127.0.0.1", "key")[0])
+        self.assertFalse(limiter.check_authenticated("127.0.0.1", "key")[0])
 
     def test_clear_resets_every_budget(self) -> None:
         limiter = RateLimiter(
@@ -129,8 +149,9 @@ class SlidingWindowMemoryTests(unittest.TestCase):
             clock=lambda: now[0],
         )
         with patch.object(ratelimit_module, "_MAX_TRACKED_BUCKETS", 100):
+            # Remplit des budgets clé distincts (check_key public supprimé, M-02).
             for index in range(10):
-                self.assertTrue(limiter.check_key(f"key-{index}")[0])
+                self.assertTrue(limiter._evaluate([(f"key:key-{index}", 1)], now[0])[0])
             now[0] = 20.0
             self.assertTrue(limiter.check_authenticated("127.0.0.1", "key-new")[0])
             self.assertGreater(len(limiter._buckets), 5)
@@ -138,6 +159,88 @@ class SlidingWindowMemoryTests(unittest.TestCase):
             allowed, _retry = limiter.check_authenticated("127.0.0.1", "key-other")
         self.assertFalse(allowed)
         self.assertLessEqual(len(limiter._buckets), 3)
+
+
+class AuthenticatedPeerAndClockTests(unittest.TestCase):
+    """Budget par pair authentifié (M-02) et recul d'horloge mémoire (F-15)."""
+
+    def test_non_monotonic_clock_drops_every_future_hit(self) -> None:
+        """Deque non trié [100, 50] à now=50 : le futur 100 n'est plus compté (F-15)."""
+        now = [50.0]
+        limiter = RateLimiter(
+            per_key=100, per_peer=2, global_limit=100, window_seconds=10, clock=lambda: now[0]
+        )
+        bucket = limiter._ensure_bucket("anon_peer:10.0.0.7")
+        bucket.hits.extend([100.0, 50.0])  # horloge reculée puis avancée
+        limiter._prune_bucket(bucket, now[0])
+        pruned = limiter._buckets["anon_peer:10.0.0.7"]
+        self.assertEqual(list(pruned.hits), [50.0])
+        # Un seul hit réel : la requête suivante passe, puis per_peer=2 est atteint.
+        allowed, retry = limiter.check("10.0.0.7")
+        self.assertTrue(allowed)
+        self.assertEqual(retry, 0)
+        allowed, retry = limiter.check("10.0.0.7")
+        self.assertFalse(allowed)
+        self.assertLessEqual(retry, 10)
+
+    def test_no_public_key_only_budget_entry_point(self) -> None:
+        """Aucune voie publique ne consomme le budget clé sans auth_peer ni global."""
+        for cls in (RateLimiter, SqliteRateLimiter):
+            with self.subTest(backend=cls.__name__):
+                self.assertFalse(hasattr(cls, "check_key"))
+
+    def _limiters(self, tmp: str, clock: object) -> list[RateLimiter | SqliteRateLimiter]:
+        kwargs = {
+            "per_key": 100,
+            "per_peer": 2,
+            "global_limit": 100,
+            "window_seconds": 10,
+            "clock": clock,
+        }
+        return [
+            RateLimiter(**kwargs),  # type: ignore[arg-type]
+            SqliteRateLimiter(Path(tmp) / "vault.db", **kwargs),  # type: ignore[arg-type]
+        ]
+
+    def test_distinct_keys_from_one_peer_share_the_peer_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for limiter in self._limiters(tmp, lambda: 1000.0):
+                with self.subTest(backend=type(limiter).__name__):
+                    self.assertTrue(limiter.check_authenticated("10.0.0.1", "k1")[0])
+                    self.assertTrue(limiter.check_authenticated("10.0.0.1", "k2")[0])
+                    self.assertFalse(limiter.check_authenticated("10.0.0.1", "k3")[0])
+                    # Un autre pair n'est pas affecté.
+                    self.assertTrue(limiter.check_authenticated("10.0.0.2", "k3")[0])
+
+    def test_check_with_key_never_consumes_anonymous_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for limiter in self._limiters(tmp, lambda: 1000.0):
+                with self.subTest(backend=type(limiter).__name__):
+                    self.assertTrue(limiter.check("10.0.0.5", "k1")[0])
+                    self.assertTrue(limiter.check("10.0.0.5", "k2")[0])
+                    # auth_peer (per_peer=2) plein, mais budget anonyme intact.
+                    self.assertFalse(limiter.check("10.0.0.5", "k3")[0])
+                    self.assertTrue(limiter.check("10.0.0.5")[0])
+                    self.assertTrue(limiter.check("10.0.0.5")[0])
+                    self.assertFalse(limiter.check("10.0.0.5")[0])
+
+    def test_clock_rollback_ignores_future_hits_and_bounds_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [1000.0]
+            for limiter in self._limiters(tmp, lambda: now[0]):
+                with self.subTest(backend=type(limiter).__name__):
+                    now[0] = 1000.0
+                    self.assertTrue(limiter.check_authenticated("10.0.0.9", "k")[0])
+                    self.assertTrue(limiter.check_authenticated("10.0.0.9", "k")[0])
+                    self.assertFalse(limiter.check_authenticated("10.0.0.9", "k")[0])
+                    now[0] = 1000.0 - 3600.0
+                    allowed, retry = limiter.check_authenticated("10.0.0.9", "k")
+                    self.assertTrue(allowed)
+                    self.assertEqual(retry, 0)
+                    self.assertTrue(limiter.check_authenticated("10.0.0.9", "k")[0])
+                    allowed, retry = limiter.check_authenticated("10.0.0.9", "k")
+                    self.assertFalse(allowed)
+                    self.assertLessEqual(retry, 10)
 
 
 class SlidingWindowSqliteTests(unittest.TestCase):
@@ -178,9 +281,9 @@ class SlidingWindowSqliteTests(unittest.TestCase):
                 window_seconds=10,
                 clock=lambda: now[0],
             )
-            self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+            self.assertTrue(limiter.check("127.0.0.1")[0])
             self.assertTrue(limiter.peek("127.0.0.1")[0])
-            self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+            self.assertTrue(limiter.check("127.0.0.1")[0])
             allowed, retry = limiter.peek("127.0.0.1")
             self.assertFalse(allowed)
             self.assertEqual(retry, 10)
@@ -254,6 +357,28 @@ class SlidingWindowSqliteTests(unittest.TestCase):
             with db_session(db_path) as conn:
                 rows = conn.execute("SELECT COUNT(*) FROM rate_limit_hits").fetchone()[0]
             self.assertLessEqual(rows, 1 + 3 + 5)
+
+    def test_sqlite_clock_rollback_bounds_retry_after(self) -> None:
+        """Un recul d'horloge ne prolonge pas le blocage au-delà de la fenêtre (F-15)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [1000.0]
+            limiter = SqliteRateLimiter(
+                Path(tmp) / "vault.db",
+                per_key=1,
+                per_peer=1,
+                global_limit=1,
+                window_seconds=10,
+                clock=lambda: now[0],
+            )
+            self.assertTrue(limiter.check("127.0.0.1", "key")[0])
+            now[0] = 1000.0 - 3600.0
+            # Les admissions « futures » sont ignorées : pas de blocage à tort.
+            allowed, retry = limiter.check("127.0.0.1", "key")
+            self.assertTrue(allowed)
+            self.assertEqual(retry, 0)
+            allowed, retry = limiter.check("127.0.0.1", "key")
+            self.assertFalse(allowed)
+            self.assertLessEqual(retry, 10)
 
     def test_sqlite_clear_resets_every_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -205,10 +205,11 @@ def test_scanner_precision_and_recall_without_implicit_allowlist(tmp_path):
     report = scan_corpus(tmp_path)
     print(json.dumps(report, indent=2))
     # T23 review: public UUID/hash/integrity shapes cannot authorize a skip.
-    # Keep the independent oracle and count all eight false positives honestly.
+    # E-02: keep the independent oracle. Contextual rules additionally flag
+    # changeme and named mocks in both languages, with no implicit allowlist.
     # measure_trap.py retains its 0.9 threshold and must return 1 on this report.
-    assert report["core"] == {"tp": 10, "fp": 8, "fn": 0, "precision": 10 / 18, "recall": 1.0}
-    assert report["all"] == {"tp": 12, "fp": 8, "fn": 4, "precision": 0.6, "recall": 0.75}
+    assert report["core"] == {"tp": 10, "fp": 12, "fn": 0, "precision": 10 / 22, "recall": 1.0}
+    assert report["all"] == {"tp": 12, "fp": 12, "fn": 4, "precision": 0.5, "recall": 0.75}
 
 
 def test_generated_python_is_valid_source(tmp_path):

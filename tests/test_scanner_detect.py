@@ -91,12 +91,21 @@ def test_size_skip_preserves_confined_readers_and_file_count(
 
     monkeypatch.setattr(os, "read", bounded_read)
     skipped: list[str] = []
-    scanner = Scanner(oversized if single else tmp_path, max_file_bytes=32, skipped_files=skipped)
+    scanner = Scanner(
+        oversized if single else tmp_path, max_file_bytes=32, skipped_files=skipped, strict=False
+    )
     assert scanner.scan() == []
     assert skipped == ["large.txt" if single else "nested/large.txt"]
     assert scanner.files_scanned == (0 if single else 1)
     with pytest.raises(ScanError):
-        Scanner(oversized if single else tmp_path, max_file_bytes=32).scan()
+        Scanner(oversized if single else tmp_path, max_file_bytes=32, strict=True).scan()
+    with pytest.raises(ScanError):
+        Scanner(
+            oversized if single else tmp_path,
+            max_file_bytes=32,
+            skipped_files=[],
+            strict=True,
+        ).scan()
 
 
 def _stripe(seed: str = "stripe") -> str:
@@ -173,6 +182,7 @@ def test_each_signature_is_detected_with_its_type(tmp_path: Path) -> None:
         (6, "jwt"),
         (7, "pem"),
         (8, "aws"),
+        (8, "credential"),
     ]
     assert all(finding["status"] == "detecte" for finding in findings)
     assert all(finding["source"] == "regex" for finding in findings)
@@ -192,6 +202,18 @@ def test_signature_rules_are_identifiable() -> None:
         "github_fine_grained_pat",
         "jwt",
         "pem_private_key",
+        "service_gitlab",
+        "service_google_api",
+        "service_google_oauth",
+        "service_npm",
+        "service_stripe_webhook",
+        "service_digitalocean",
+        "service_shopify",
+        "url_password",
+        "authorization_header",
+        "credential_double_quoted",
+        "credential_single_quoted",
+        "credential_unquoted",
     }
     matches = find_signature_matches(f'AWS = "{_aws()}"')
     assert len(matches) == 1
@@ -247,6 +269,8 @@ def test_public_values_are_not_silently_allowlisted(tmp_path: Path, line: str) -
     findings = _scan_lines(tmp_path, line)
     if line.startswith(("UUID =", "SHA256 =", "COMMIT =")):
         assert findings and all(f["source"] == "entropy" for f in findings)
+    elif line.startswith("PASSWORD ="):
+        assert findings and all(f["type"] == "credential" for f in findings)
     else:
         assert findings == []
 
@@ -526,7 +550,9 @@ def test_secret_split_across_two_lines_is_detected(tmp_path: Path) -> None:
     secret = fake_token("", 40)
     _write(tmp_path, "split.py", f'aws_secret_access_key =\n"{secret}"\n')
     findings = find_candidates(str(tmp_path))
-    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+    assert [(finding["line"], finding["type"]) for finding in findings] == [
+        (1, "aws"), (1, "credential"),
+    ]
 
 
 def test_split_secret_beyond_the_window_is_fail_closed(tmp_path: Path) -> None:
@@ -553,7 +579,9 @@ def test_secret_split_across_two_contiguous_lines_is_detected(tmp_path: Path) ->
     secret = fake_token("", 40)
     _write(tmp_path, "three.py", f'aws_secret_access_key = "{secret[:20]}\n{secret[20:]}"\n')
     findings = find_candidates(str(tmp_path))
-    assert [(finding["line"], finding["type"]) for finding in findings] == [(1, "aws")]
+    assert [(finding["line"], finding["type"]) for finding in findings] == [
+        (1, "aws"), (1, "credential"),
+    ]
 
 
 def test_secret_split_by_more_than_two_newlines_is_a_documented_limit(tmp_path: Path) -> None:
@@ -660,7 +688,7 @@ def test_a_real_binary_is_fail_closed(tmp_path: Path) -> None:
     _write(tmp_path, "image.png", b"\x89PNG\r\n\x1a\n" + bytes(range(256)))
     _write(tmp_path, "app.py", f'AWS = "{_aws()}"')
     with pytest.raises(ScanError):
-        scan(tmp_path)
+        scan(tmp_path, strict=True)
 
 
 def test_scanner_does_not_consult_the_deprecated_binary_helper(
@@ -681,7 +709,7 @@ def test_scanner_does_not_consult_the_deprecated_binary_helper(
 
     monkeypatch.setattr(exclusions, "is_known_binary", forbidden)
     with pytest.raises(ScanError):
-        scan(tmp_path)
+        scan(tmp_path, strict=True)
 
 
 def test_the_deprecated_binary_helper_warns_and_stays_without_authority() -> None:
@@ -924,7 +952,7 @@ def test_a_tier_failure_never_becomes_a_clean_list(tmp_path: Path) -> None:
     _write(tmp_path, "vendor/secret.txt", f'AWS = "{_aws("vendor")}"')
     _write(tmp_path, "vendor/broken.bin", b"\x00\x01\x02not-decodable")
     with pytest.raises(ScanError) as context:
-        scan(tmp_path)
+        scan(tmp_path, strict=True)
     assert str(context.value) == "scan impossible : entrée non analysable"
     with pytest.raises(ScanError):
         find_candidates(str(tmp_path))
@@ -934,7 +962,7 @@ def test_an_oversized_tier_file_never_becomes_a_clean_list(tmp_path: Path) -> No
     """Un fichier hors borne en arbre de tiers n'est jamais un `[]` propre."""
     _write(tmp_path, "vendor/huge.txt", b"A" * (MAX_FILE_BYTES + 1))
     with pytest.raises(ScanError):
-        scan(tmp_path)
+        scan(tmp_path, strict=True)
     with pytest.raises(ScanError):
         find_candidates(str(tmp_path))
 
@@ -1028,7 +1056,7 @@ def test_a_symlinked_directory_is_fail_closed(tmp_path: Path) -> None:
             pytest.skip("Création de liens symboliques non autorisée sous Windows")
         raise
     with pytest.raises(ScanError):
-        scan(repository)
+        scan(repository, strict=True)
 
 
 def test_utf16_utf32_without_bom_is_scanned(tmp_path: Path) -> None:
@@ -1056,24 +1084,24 @@ def test_decode_text_handles_utf16_utf32_without_bom(encoding: str) -> None:
 
 
 def test_decode_text_handles_bom_and_plain_utf8() -> None:
-    assert decode_text(b"") == ""
-    assert decode_text(b"abc") == "abc"
+    assert decode_text(b"", strict=True) == ""
+    assert decode_text(b"abc", strict=True) == "abc"
     for encoding in ("utf-8-sig", "utf-16", "utf-32"):
-        assert decode_text("AZERTY".encode(encoding)) == "AZERTY"
+        assert decode_text("AZERTY".encode(encoding), strict=True) == "AZERTY"
     with pytest.raises(ScanError):
-        decode_text(b"caf\xe9")
-    assert decode_text(b"\xef\xbb\xbf") == ""
+        decode_text(b"caf\xe9", strict=True)
+    assert decode_text(b"\xef\xbb\xbf", strict=True) == ""
 
 
 @pytest.mark.parametrize("payload", [b"\xff\xfeA", b"\xef\xbb\xbf\xff", b"\xfe\xff\x00\x00"])
 def test_decode_text_fails_closed_on_invalid_bom_text(payload: bytes) -> None:
     with pytest.raises(ScanError):
-        decode_text(payload)
+        decode_text(payload, strict=True)
 
 
 def test_decode_text_fails_closed_on_ambiguous_nul() -> None:
     with pytest.raises(ScanError):
-        decode_text(b"abc\x00def")
+        decode_text(b"abc\x00def", strict=True)
 
 
 @pytest.mark.parametrize("magic", [b"\x7fELF", b"\x89PNG\r\n\x1a\n", b"PK\x03\x04"])
@@ -1086,7 +1114,7 @@ def test_decode_text_identifies_known_binary_magic(magic: bytes) -> None:
 def test_decode_text_refuses_magic_followed_by_text(magic: bytes) -> None:
     """Une signature binaire suivie de texte clair n'est pas un contournement."""
     with pytest.raises(ScanError):
-        decode_text(magic + b"\x00" + b"AKIA" + b"A" * 16)
+        decode_text(magic + b"\x00" + b"AKIA" + b"A" * 16, strict=True)
 
 
 def test_extensionless_known_binary_is_fail_closed(tmp_path: Path) -> None:
@@ -2042,6 +2070,6 @@ def test_long_lines_are_processed_linearly(tmp_path: Path) -> None:
         path = _write(tmp_path, f"long_{index}.txt", payload)
         started = time.perf_counter()
         with pytest.raises(ScanError):
-            scan(path)
+            scan(path, strict=True)
         elapsed = time.perf_counter() - started
         assert elapsed < 10.0, (index, elapsed)

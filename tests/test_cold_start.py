@@ -52,6 +52,29 @@ def repo(monkeypatch: pytest.MonkeyPatch) -> Iterator[GitRepo]:
         value.close()
 
 
+def test_cold_start_refuses_clean_file_changed_between_passes(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write("clean.py", "x = 1\n")
+    repo.write("config.py", f'TOKEN = "{SYNTHETIC}"\n')
+    repo.commit_all("base")
+    real_collect = cold_module.collect
+
+    def collect_then_modify(*args: Any, **kwargs: Any) -> Any:
+        result = real_collect(*args, **kwargs)
+        repo.write("clean.py", f'TOKEN = "{SYNTHETIC}"\n')
+        return result
+
+    def chat(**kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            message=SimpleNamespace(content='{"verdict":"secret","confidence":1}')
+        )
+
+    monkeypatch.setattr(cold_module, "collect", collect_then_modify)
+    with pytest.raises(ScanError, match="contenu modifié"):
+        collect_cold_start(repo.root, chat=chat)
+
+
 def test_llm_only_sees_masked_candidates(repo: GitRepo) -> None:
     repo.write("app.py", "# safe\n" * 1000 + f'key = "{SYNTHETIC}"\n' + "# safe\n" * 1000)
     calls: list[str] = []
@@ -79,6 +102,56 @@ def test_clean_repo_never_calls_llm(repo: GitRepo) -> None:
         pytest.fail("aucun candidat, aucun appel LLM")
 
     assert collect_cold_start(repo.root, chat=forbidden).opinions == ()
+
+
+def test_latin1_context_keeps_explicit_tolerant_decoding(repo: GitRepo) -> None:
+    repo.write_bytes("app.py", f'# café\nkey = "{SYNTHETIC}"\n'.encode("cp1252"))
+    report = collect_cold_start(repo.root, strict=False, chat=_secret_chat)
+    assert len(report.scan.findings) == len(report.opinions) == 1
+
+
+def test_strict_cold_start_refuses_excluded_content(repo: GitRepo) -> None:
+    repo.write("app.py", f'key = "{SYNTHETIC}"\n' + "A" * 5000 + "\n")
+    with pytest.raises(ScanError):
+        collect_cold_start(repo.root, strict=True, chat=_secret_chat)
+    result = CliRunner().invoke(app, ["cold-start", "--ci", "--strict", str(repo.root)])
+    assert result.exit_code == 2
+    assert SYNTHETIC not in result.output
+
+
+def test_library_default_is_strict(repo: GitRepo) -> None:
+    repo.write("app.py", f'key = "{SYNTHETIC}"\n' + "A" * 5000 + "\n")
+    with pytest.raises(ScanError):
+        collect_cold_start(repo.root, chat=_secret_chat)
+
+
+def test_strict_cold_start_rejects_non_bool_policy(repo: GitRepo) -> None:
+    with pytest.raises(ScanError, match="politique de contenu invalide"):
+        collect_cold_start(repo.root, strict=1, chat=_secret_chat)  # type: ignore[arg-type]
+
+
+def test_partial_context_keeps_findings_and_does_not_claim_mutation(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo.write("app.py", f'key = "{SYNTHETIC}"\n' + "A" * 5000 + "\n")
+    report = collect_cold_start(repo.root, strict=False, chat=_secret_chat)
+    assert report.scan.findings
+    assert len(report.opinions) == len(report.scan.findings)
+    assert not report.scan.complete
+    assert any(item.reason == "long_token" for item in report.scan.skipped)
+    original = cold_module.collect_cold_start
+
+    def local_collect(root: Path, **kwargs: Any) -> cold_module.ColdStartReport:
+        return original(root, **kwargs, chat=_secret_chat)
+
+    monkeypatch.setattr(main_module, "collect_cold_start", local_collect)
+    result = CliRunner().invoke(app, ["cold-start", "--json", str(repo.root)])
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["complete"] is False
+    assert payload["scan"]["findings"]
+    assert payload["opinions"]
+    assert "contenu modifié" not in result.output
 
 
 def test_false_positive_is_kept_and_journaled(repo: GitRepo, tmp_path: Path) -> None:
@@ -251,6 +324,38 @@ def test_content_mutation_refuses_api_and_cli(
                 collect_cold_start(repo.root, chat=_secret_chat)
 
 
+@pytest.mark.parametrize("cli", [False, True])
+@pytest.mark.parametrize("addition", ["A" * 5000, " " * 3000 + "\n" + " " * 3000])
+def test_new_reread_exclusions_refuse_complete_report(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch, cli: bool, addition: str,
+) -> None:
+    original = cold_module.collect
+    content = f'key = "{SYNTHETIC}"\n'
+    repo.write("app.py", content)
+
+    def mutate(*args: Any, **kwargs: Any) -> Any:
+        report = original(*args, **kwargs)
+        assert report.complete
+        repo.write("app.py", content + addition + "\n")
+        return report
+
+    def forbidden(**kwargs: Any) -> None:
+        pytest.fail("new exclusions must not reach qualification")
+
+    monkeypatch.setattr(cold_module, "collect", mutate)
+    monkeypatch.setattr(
+        main_module, "collect_cold_start", partial(collect_cold_start, chat=forbidden)
+    )
+    if cli:
+        result = CliRunner().invoke(app, ["cold-start", "--json", str(repo.root)])
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert SYNTHETIC not in result.output
+    else:
+        with pytest.raises(ScanError, match="^contenu modifié depuis le scan déterministe$"):
+            collect_cold_start(repo.root, strict=False, chat=forbidden)
+
+
 def test_reread_respects_configured_size_limit(
     repo: GitRepo,
     monkeypatch: pytest.MonkeyPatch,
@@ -317,7 +422,7 @@ def test_same_size_mutation_during_reread_is_refused(
         assert SYNTHETIC not in result.output
     else:
         with pytest.raises(ScanError, match="^contenu modifié depuis le scan déterministe$"):
-            collect_cold_start(repo.root, chat=forbidden)
+            collect_cold_start(repo.root, strict=False, chat=forbidden)
     assert mutations == [True]
 
 

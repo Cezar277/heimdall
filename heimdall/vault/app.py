@@ -94,6 +94,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 
 from heimdall.vault import auth as vault_auth
@@ -142,6 +143,10 @@ project_api_key_header = vault_auth.project_api_key_header
 verify_api_key = vault_auth.verify_api_key
 ProjectId = vault_auth.ProjectId
 _MAX_BODY_SIZE: int = 1_048_576  # 1 Mio (1 048 576 octets)
+# Bornes uvicorn : une rafale locale ne doit pas ouvrir un nombre illimité de
+# connexions ni les garder ouvertes indéfiniment (audit F-06).
+_UVICORN_LIMIT_CONCURRENCY: int = 100
+_UVICORN_TIMEOUT_KEEP_ALIVE: int = 5
 
 logger = logging.getLogger("heimdall.vault.app")
 
@@ -718,6 +723,16 @@ class VaultSettings(BaseSettings):
             "dédiée dérivée de la KEK est utilisée. Jamais renvoyée au client ni journalisée."
         ),
     )
+    audit_hmac_key: str | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,  # jamais dans model_dump()/model_dump_json()
+        description=(
+            "Clé HMAC dédiée au chaînage du journal d'audit (audit F-16). "
+            "Configurable via HEIMDALL_VAULT_AUDIT_HMAC_KEY. Si absente, une sous-clé "
+            "HKDF du chiffreur est utilisée. Jamais renvoyée au client ni journalisée."
+        ),
+    )
     storage_backend: Literal["memory", "sqlite"] | None = Field(
         default=None,
         description=(
@@ -1010,6 +1025,15 @@ class VaultSettings(BaseSettings):
         validate_server_hmac_key(value)
         return value
 
+    @field_validator("audit_hmac_key")
+    @classmethod
+    def validate_audit_hmac_key(cls, value: str | None) -> str | None:
+        """Valide la clé HMAC d'audit avec les mêmes contrôles que la clé serveur."""
+        if value is None:
+            return None
+        validate_server_hmac_key(value)
+        return value
+
     @model_validator(mode="after")
     def validate_server_hmac_key_distinct(self) -> "VaultSettings":
         """La clé HMAC serveur doit être distincte de la KEK, clé maîtresse et pepper."""
@@ -1032,6 +1056,24 @@ class VaultSettings(BaseSettings):
             raise ValueError(
                 "Le pepper d'authentification et la clé HMAC serveur doivent être distincts."
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_audit_hmac_key_distinct(self) -> "VaultSettings":
+        """La clé HMAC d'audit doit être distincte des autres secrets serveur."""
+        audit_k = self.audit_hmac_key
+        if audit_k is None:
+            return self
+        for label, other in (
+            ("clé maîtresse", self.master_key),
+            ("KEK", self.kek),
+            ("pepper", self.api_key_pepper),
+            ("clé HMAC serveur", self.server_hmac_key),
+        ):
+            if other is not None and server_hmac_key_matches_master_key(other, audit_k):
+                raise ValueError(
+                    f"La clé HMAC d'audit et la {label} doivent être distinctes (invariant 5)."
+                )
         return self
 
     @field_validator("db_path")
@@ -1284,6 +1326,15 @@ async def _limiter_peek(limiter: RateLimiter | SqliteRateLimiter, peer: str) -> 
     return limiter.peek(peer)
 
 
+async def _limiter_peek_authenticated(
+    limiter: RateLimiter | SqliteRateLimiter, peer: str
+) -> tuple[bool, int]:
+    """Lecture seule des budgets ``auth_peer`` et global, avant tout hachage."""
+    if isinstance(limiter, SqliteRateLimiter):
+        return await asyncio.to_thread(limiter.peek_authenticated, peer)
+    return limiter.peek_authenticated(peer)
+
+
 async def _limiter_consume_peer(
     limiter: RateLimiter | SqliteRateLimiter, peer: str
 ) -> tuple[bool, int]:
@@ -1369,6 +1420,11 @@ def _register_no_store_middleware(app: FastAPI) -> None:
 
 def _register_middleware(app: FastAPI) -> None:
     """Enregistre les middlewares du serveur Vault."""
+    # Contrôle de l'en-tête Host : refuse un rebinding DNS en HTTP clair.
+    # ``testserver`` n'est ajouté qu'en mode test explicite (TestClient).
+    allowed_hosts = ["127.0.0.1", "localhost", "[::1]"]
+    if _heimdall_env_mode() == "test":
+        allowed_hosts.append("testserver")
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=_MAX_BODY_SIZE)
 
     # Le rate-limiting est enregistré avant le middleware loopback : ce dernier,
@@ -1390,41 +1446,43 @@ def _register_middleware(app: FastAPI) -> None:
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
-        """Borne le débit par clé validée, pair réseau et global (lot #63).
+        """Borne le débit par clé validée et par budget anonyme séparé (lot #63).
 
-        Rejet précoce sans coût CPU : ``peek`` pair/global (lecture seule,
-        sans consommation) précède tout hachage ou lookup. Les 400/401 sont
-        comptés par le bucket pair/global puisque le middleware s'exécute
-        avant le routage et les dépendances. Une clé invalide ne crée aucun
-        bucket arbitraire : seuls pair et global s'appliquent. Le choix du
-        bucket par clé emprunte le même parcours à coût comparable que
-        ``verify_api_key`` (``find_api_key_project_cached``) : le résultat est
-        mémoïsé dans la requête et réutilisé par l'authentification (un seul
-        full-scan par requête, lot #63) ; l'existence d'une clé n'est pas
-        observable par le temps de réponse du middleware. La phase consommatrice
-        est ensuite UNIQUE : ``check_authenticated`` consomme pair/global + clé
-        en une seule transaction (mémoire : une seule section critique ;
-        SQLite : un seul ``BEGIN IMMEDIATE``), au lieu de deux transactions
-        successives (plus de fenêtre inter-transactions ni double verrou
-        d'écriture). Sémantique préservée : pair/global restent consommés même
-        quand le bucket clé est plein. Avec le backend SQLite,
-        ``SqliteRateLimiter`` partage les buckets entre workers : la limite
-        n'est jamais multipliée par le nombre de processus. Le mode mémoire
-        reste mono-processus (dev/test).
+        Les requêtes sans clé valide consomment ``anon_peer``/``anon_global`` ;
+        les requêtes authentifiées consomment leur budget ``key`` puis le
+        budget ``global``. Un flot anonyme ne peut donc pas épuiser le budget
+        des clients authentifiés (audit M-02). Le rejet précoce ``peek`` n'est
+        appliqué qu'aux requêtes sans clé : une clé valide n'est jamais bloquée
+        par le budget anonyme. Les 400/401 sans clé valide sont comptés dans le
+        budget anonyme. Une clé invalide ne crée aucun bucket arbitraire : seuls
+        les budgets anonymes s'appliquent. Le choix du bucket par clé emprunte
+        le même parcours à coût comparable que ``verify_api_key``
+        (``find_api_key_project_cached``) : le résultat est mémoïsé dans la
+        requête et réutilisé par l'authentification (un seul full-scan par
+        requête, lot #63) ; l'existence d'une clé n'est pas observable par le
+        temps de réponse du middleware. La phase consommatrice est ensuite
+        UNIQUE : ``check_authenticated`` consomme clé + global en une seule
+        transaction (mémoire : une seule section critique ; SQLite : un seul
+        ``BEGIN IMMEDIATE``). Avec le backend SQLite, ``SqliteRateLimiter``
+        partage les buckets entre workers : la limite n'est jamais multipliée
+        par le nombre de processus. Le mode mémoire reste mono-processus
+        (dev/test).
         """
         peer = request.client.host if request.client and request.client.host else "unknown"
         limiter: RateLimiter | SqliteRateLimiter = request.app.state.rate_limiter
-
-        allowed, retry_after = await _limiter_peek(limiter, peer)
-        if not allowed:
-            return JSONResponse(
-                status_code=429,
-                content=_ERROR_PAYLOADS[429],
-                headers={"Retry-After": str(retry_after), "Connection": "close"},
-            )
-        key_hash: str | None = None
         raw_key = request.headers.get("X-Heimdall-API-Key")
-        if raw_key is not None and len(raw_key) > vault_auth.MAX_API_KEY_LENGTH:
+
+        if raw_key is None:
+            # Rejet précoce sans coût CPU : uniquement pour les anonymes.
+            allowed, retry_after = await _limiter_peek(limiter, peer)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content=_ERROR_PAYLOADS[429],
+                    headers={"Retry-After": str(retry_after), "Connection": "close"},
+                )
+            allowed, retry_after = await _limiter_consume_peer(limiter, peer)
+        elif len(raw_key) > vault_auth.MAX_API_KEY_LENGTH:
             allowed, retry_after = await _limiter_consume_peer(limiter, peer)
             if not allowed:
                 return JSONResponse(
@@ -1437,11 +1495,24 @@ def _register_middleware(app: FastAPI) -> None:
                 content=_ERROR_PAYLOADS[401],
                 headers={"Connection": "close"},
             )
-        key_hash = await _resolve_request_key_hash(request)
-        if key_hash is not None:
-            allowed, retry_after = await _limiter_consume_authenticated(limiter, peer, key_hash)
         else:
-            allowed, retry_after = await _limiter_consume_peer(limiter, peer)
+            # Rejet précoce sur les budgets auth_peer et global, avant le hachage
+            # et le parcours d'empreintes. Le budget par clé, lui, exige
+            # l'empreinte et reste vérifié après résolution.
+            allowed, retry_after = await _limiter_peek_authenticated(limiter, peer)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content=_ERROR_PAYLOADS[429],
+                    headers={"Retry-After": str(retry_after), "Connection": "close"},
+                )
+            key_hash = await _resolve_request_key_hash(request)
+            if key_hash is not None:
+                allowed, retry_after = await _limiter_consume_authenticated(
+                    limiter, peer, key_hash
+                )
+            else:
+                allowed, retry_after = await _limiter_consume_peer(limiter, peer)
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -1479,6 +1550,10 @@ def _register_middleware(app: FastAPI) -> None:
             )
         return await call_next(request)
 
+    # TrustedHost ajouté après rate-limit et loopback, donc exécuté AVANT eux
+    # (Starlette : le dernier ajouté est le plus externe). Un Host forgé est
+    # rejeté en 400 sans consommer de budget anon_* / auth_peer / global.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     _register_no_store_middleware(app)
 
 
@@ -1977,10 +2052,17 @@ def create_app(
     # Journal d'audit (ticket #113) : SQLite en mode persistant (partagé entre
     # workers), mémoire pour le backend de développement/test. Le chemin est
     # celui du store effectif, aligné sur l'authentification et le débit.
+    audit_hmac_key = (
+        validate_server_hmac_key(effective_settings.audit_hmac_key)
+        if effective_settings.audit_hmac_key is not None
+        else app.state.secret_store.audit_hmac_key()
+    )
     if app.state.storage_backend == "sqlite":
-        app.state.audit_log = SqliteAuditLog(app.state.db_path)
+        app.state.audit_log = SqliteAuditLog(
+            app.state.db_path, hmac_key=audit_hmac_key
+        )
     else:
-        app.state.audit_log = InMemoryAuditLog()
+        app.state.audit_log = InMemoryAuditLog(hmac_key=audit_hmac_key)
 
     if api_key_hashes is not None and api_keys is not None:
         raise ValueError("Spécifiez 'api_key_hashes' ou 'api_keys', pas les deux simultanément.")
@@ -2077,8 +2159,26 @@ def get_app() -> FastAPI:
     if "app" not in _APP_HOLDER:
         with _app_lock:
             if "app" not in _APP_HOLDER:
+                _require_valid_env_mode()
                 _APP_HOLDER["app"] = create_app()
     return _APP_HOLDER["app"]
+
+
+def _require_valid_env_mode() -> str:
+    """Valide ``HEIMDALL_ENV`` aux deux points d'entrée serveur (M-13).
+
+    ``run_server`` et la factory ``get_app`` (déploiement uvicorn factory)
+    refusent une valeur inconnue avec un message actionnable et le code 2,
+    jamais un traceback. ``create_app`` appelé directement (bibliothèque,
+    tests) lève toujours ``ValueError``.
+    """
+    try:
+        return _heimdall_env_mode()
+    except ValueError as exc:
+        import sys  # noqa: PLC0415
+
+        print(f"Erreur : {exc}", file=sys.stderr)  # noqa: T201
+        raise SystemExit(2) from None
 
 
 def __dir__() -> list[str]:
@@ -2103,8 +2203,9 @@ def run_server() -> None:
     et cette contrainte évite tout écart de configuration. Le backend SQLite
     peut être répliqué sans multiplier la limite de débit.
     """
+    env_mode = _require_valid_env_mode()
     server_settings = get_settings()
-    if _heimdall_env_mode() in _PRODUCTION_ENV_MODES and (
+    if env_mode in _PRODUCTION_ENV_MODES and (
         server_settings.ssl_certfile is None or server_settings.ssl_keyfile is None
     ):
         raise ValueError(
@@ -2126,6 +2227,8 @@ def run_server() -> None:
         forwarded_allow_ips="",
         server_header=False,
         date_header=False,
+        limit_concurrency=_UVICORN_LIMIT_CONCURRENCY,
+        timeout_keep_alive=_UVICORN_TIMEOUT_KEEP_ALIVE,
     )
 
 
