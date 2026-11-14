@@ -10,18 +10,18 @@ from dataclasses import dataclass
 
 from heimdall.scanner.entropy import shannon_entropy
 from heimdall.scanner.errors import ScanError
+from heimdall.scanner.limits import MAX_TOKEN_LENGTH
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
 MIN_TOKEN_LENGTH = 16
-MAX_TOKEN_LENGTH = 4096
 SHORT_TOKEN_MIN = 20
 SHORT_TOKEN_MAX = 22
 _SCAN_ERROR = "scan impossible : entrée non analysable"
 
 # Un caractère sentinelle au-delà du plafond : refus avant calcul d'entropie.
-_TOKEN = re.compile(r"[A-Za-z0-9_+/-]{1,4097}={0,2}")
+_TOKEN = re.compile(rf"[A-Za-z0-9_+/-]{{1,{MAX_TOKEN_LENGTH + 1}}}={{0,2}}")
 _HEX = re.compile(r"[0-9a-fA-F]+")
-_HEX_FRAGMENT = re.compile(r"[0-9a-fA-F]{16,4096}")
+_HEX_FRAGMENT = re.compile(rf"[0-9a-fA-F]{{16,{MAX_TOKEN_LENGTH}}}")
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 

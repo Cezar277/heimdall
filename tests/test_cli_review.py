@@ -283,6 +283,27 @@ def test_edit_without_backend_is_refused(proposal: Proposal, journal: DecisionJo
     assert journal.read() == []
 
 
+def test_edit_disabled_is_refused_before_journal(
+    proposal: Proposal, journal: DecisionJournal
+) -> None:
+    ask, prompts = _asker(["e"])
+
+    with pytest.raises(ReviewError):
+        review_proposal(
+            proposal,
+            ask=ask,
+            apply=_forbidden,
+            journal=journal,
+            stream=TTY,
+            allow_edit=False,
+        )
+
+    assert journal.read() == []
+    assert prompts
+    assert "éditer (E)" not in prompts[0]
+    assert "Valider (Y) ou ignorer (N)" in prompts[0]
+
+
 def test_cancelled_edit_asks_again(proposal: Proposal, journal: DecisionJournal) -> None:
     ask, prompts = _asker(["e", "n"])
     notices: list[str] = []
@@ -457,6 +478,8 @@ def test_invalid_proposal_is_refused(proposal: Proposal) -> None:
         review_proposal(cast(Proposal, "nope"))
     with pytest.raises(ReviewError):
         review_proposal(proposal, interactive=cast(bool, "yes"))
+    with pytest.raises(ReviewError):
+        review_proposal(proposal, allow_edit=cast(bool, "yes"))
 
 
 def test_review_proposals_rejects_foreign_items() -> None:
@@ -466,6 +489,8 @@ def test_review_proposals_rejects_foreign_items() -> None:
         review_proposals((), ci=cast(bool, "yes"))
     with pytest.raises(ReviewError):
         review_proposals((), interactive=cast(bool, "yes"))
+    with pytest.raises(ReviewError):
+        review_proposals((), allow_edit=cast(bool, "yes"))
 
 
 def test_is_interactive_rejects_a_non_boolean_ci() -> None:

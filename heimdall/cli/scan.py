@@ -11,7 +11,7 @@ verdict propre.
 
 Deux périmètres, un seul verdict :
 
-- ``working-tree`` (par défaut) : l'arbre de travail, en **mode strict** —
+- ``working-tree`` (par défaut) : l'arbre de travail, en mode tolérant —
   la base VCS et les entrées **non suivies** qu'un ``.gitignore`` du dépôt
   déclare ignorées sont écartées ; ``vendor/``, ``third_party/``, les
   lockfiles et les fichiers de contrôle sont parcourus dès qu'ils sont
@@ -61,6 +61,7 @@ from heimdall.scanner.exclusions import decode_text
 from heimdall.scanner.finding import Finding
 from heimdall.scanner.interface import FileTarget, _open_flags, _resolve_root
 from heimdall.scanner.interface import Scanner as TargetScanner
+from heimdall.scanner.policy import ScanSkip, prepare_text, skip_file
 from heimdall.scanner.signature_engine import SignatureEngine
 
 #: Codes de sortie (invariant 11, REQ-SEC-07).
@@ -111,7 +112,6 @@ _MSG_TOO_MANY_FILES: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_LARGE: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TOO_MANY_FINDINGS: Final[str] = "scan impossible : entrée non analysable"
 _MSG_BLOB_CHANGED: Final[str] = "scan impossible : entrée non analysable"
-_MSG_BINARY: Final[str] = "scan impossible : entrée non analysable"
 _MSG_INDEX_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_ROOT_CHANGED: Final[str] = "scan impossible : entrée non analysable"
 _MSG_TIMEOUT: Final[str] = "scan impossible : entrée non analysable"
@@ -168,6 +168,11 @@ class ScanReport:
     #: (contrat v1 inchangé) : il rend seulement observable une plage vide
     #: (``--diff HEAD``) ou un périmètre sans contenu.
     scanned_files: int | None = None
+    skipped: tuple[ScanSkip, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.skipped
 
     def __post_init__(self) -> None:
         # Garde runtime pour les appelants non typés : le `Literal` protège
@@ -201,12 +206,13 @@ def collect(  # noqa: PLR0913 - explicit scan options
     max_file_bytes: int | None = None,
     skipped_files: list[str] | None = None,
     respect_gitignore: bool = True,
+    strict: bool = True,
 ) -> ScanReport:
     """Analyse ``root`` et rend ses Findings et traces d'allowlist (#24).
 
-    Lève ``ScanError`` si le périmètre n'a pas pu être
-    analysé **en entier** : l'appelant transforme cela en code 2, jamais en
-    code 0.
+    Les exclusions de contenu prévues sont rendues dans ScanReport.skipped
+    (#229) avec strict=False, ou refusées par défaut. Les erreurs de lecture restent
+    des ScanError, transformées en code 2 par l'appelant.
 
     ``max_file_bytes`` et ``skipped_files`` sont réservés au mode arbre.
     Les fournir avec ``staged=True`` lève ``ScanError`` avant tout accès Git.
@@ -233,6 +239,8 @@ def collect(  # noqa: PLR0913 - explicit scan options
     de ``heimdall.toml`` interne. En cas de doute, ne pas injecter
     d'allowlist non-vide ou utiliser ``config`` externe / ``--no-allowlist``.
     """
+    if type(strict) is not bool:
+        raise ScanError("politique de contenu invalide")
     if diff is not None:
         if staged:
             raise ScanError("périmètres incompatibles")
@@ -252,9 +260,13 @@ def collect(  # noqa: PLR0913 - explicit scan options
         raise ScanError("politique d'exclusions Git invalide")
     try:
         if diff is not None:
-            return _collect_diff(root, base=diff, config=config, custom_allowlist=allowlist)
+            return _collect_diff(
+                root, base=diff, config=config, custom_allowlist=allowlist, strict=strict
+            )
         if staged:
-            return _collect_staged(root, config=config, custom_allowlist=allowlist, ci=ci)
+            return _collect_staged(
+                root, config=config, custom_allowlist=allowlist, ci=ci, strict=strict
+            )
         return _collect_tree(
             root,
             config=config,
@@ -263,6 +275,7 @@ def collect(  # noqa: PLR0913 - explicit scan options
             max_file_bytes=max_file_bytes,
             skipped_files=skipped_files,
             respect_gitignore=respect_gitignore,
+            strict=strict,
         )
     except ToolFailure:
         raise ScanError(_MSG_NOT_A_REPO) from None
@@ -545,6 +558,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
     max_file_bytes: int | None = None,
     skipped_files: list[str] | None = None,
     respect_gitignore: bool = True,
+    strict: bool = True,
 ) -> ScanReport:
     """Scanne l'arbre de travail, en mode strict (#29) avec allowlist (#24).
 
@@ -613,7 +627,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
     )
     scanner = TreeScanner(
         access.root,
-        strict=True,
+        strict=strict,
         allowlist=allowlist,
         max_file_bytes=max_file_bytes,
         skipped_files=skipped_files,
@@ -627,6 +641,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
         and (scanner.vcs_ignored > 0 or scanner.git_ignored > 0)
         and scanner.files_scanned == 0
         and skipped_now == 0
+        and not scanner.skipped
     ):
         # Aucun contenu n'a été lu : le seul périmètre observé est une base
         # VCS ou des entrées `.gitignore` élaguées. En CI stricte, un code 0
@@ -647,6 +662,7 @@ def _collect_tree(  # noqa: PLR0913 - explicit scan options
         vcs_ignored=scanner.vcs_ignored,
         git_ignored=scanner.git_ignored,
         scanned_files=scanner.files_scanned,
+        skipped=scanner.skipped,
     )
 
 
@@ -664,11 +680,19 @@ def _call_timeout(deadline: float) -> float:
     return min(remaining, GIT_TIMEOUT_SECONDS)
 
 
-def _scan_changes(
+def _check_skip_budget(skipped: Sequence[ScanSkip]) -> None:
+    if len(skipped) > MAX_STAGED_FINDINGS:
+        raise ScanError(_MSG_TOO_MANY_FINDINGS)
+
+
+def _scan_changes(  # noqa: PLR0913 - politique et collecteur de traces explicites
     access: GitAccess,
     changes: Sequence[StagedChange],
     allowlist: Allowlist,
     deadline: float,
+    *,
+    strict: bool = True,
+    skipped: list[ScanSkip] | None = None,
 ) -> tuple[list[Finding], tuple[AllowlistTrace, ...]]:
     """Scanne les blobs d'une liste de changements (index ou plage de commits).
 
@@ -680,10 +704,14 @@ def _scan_changes(
     """
     # Même échéance que la passe : un blob dense est interrompu à l'intérieur,
     # pas seulement entre deux blobs (cf. `SignatureEngine`, `deadline`).
+    if skipped is None:
+        skipped = []
+    _check_skip_budget(skipped)
     engine = SignatureEngine(
         max_findings=MAX_STAGED_FINDINGS,
         deadline=deadline,
         allowlist=allowlist,
+        strict=strict,
     )
     moteur = TargetScanner(engine)
     findings: list[Finding] = []
@@ -697,11 +725,15 @@ def _scan_changes(
         # taille négative, `total` ne doit jamais reculer (la borne de
         # volume serait sinon contournable). Zéro reste valide : un blob
         # vide ne porte aucun candidat.
-        if size < 0 or size > MAX_FILE_BYTES:
+        if size < 0:
             raise ScanError(_MSG_TOO_LARGE)
         total += size
         if total > MAX_STAGED_BYTES:
             raise ScanError(_MSG_TOO_LARGE)
+        if size > MAX_FILE_BYTES:
+            skip_file(change.path, "too_large", strict=strict, skipped=skipped)
+            _check_skip_budget(skipped)
+            continue
         data = access.blob_bytes(
             change.blob,
             timeout=_call_timeout(deadline),
@@ -714,17 +746,19 @@ def _scan_changes(
             raise ScanError(_MSG_BLOB_CHANGED)
         if len(data) > MAX_FILE_BYTES:
             raise ScanError(_MSG_TOO_LARGE)
-        text = decode_text(data)
+        text = decode_text(data, strict=strict)
         # Le texte n'est jamais retenu : chaque blob est lu, décodé, scanné
         # puis oublié avant le suivant — au plus un blob (1 Mio) vit en
         # mémoire, pas les 32 Mio du périmètre. `text`, `data` et `target`
         # sont réassignés à chaque tour ; rien ne les accumule.
         if text is None:
-            # Binaire reconnu : aucun texte à analyser. Contrairement à une
-            # exclusion de chemin, ce n'est pas une raison de rendre un
-            # verdict propre : un secret peut vivre dans le binaire (même
-            # limite qu'en mode arbre). Refus fail-closed, code 2.
-            raise ScanError(_MSG_BINARY)
+            # Aucun texte à analyser : couverture partielle explicite, ou
+            # refus strict. Le contenu binaire n'est jamais déclaré propre.
+            skip_file(change.path, "binary", strict=strict, skipped=skipped)
+            _check_skip_budget(skipped)
+            continue
+        text = prepare_text(text, change.path, strict=strict, skipped=skipped)
+        _check_skip_budget(skipped)
         # `FileTarget` valide le chemin (contrat #14) : un chemin que le
         # contrat ne sait pas représenter est une erreur, pas un fichier
         # ignoré en silence.
@@ -754,15 +788,15 @@ def _collect_staged(
     config: str | Path | None = None,
     custom_allowlist: Allowlist | None = None,
     ci: bool = False,
+    strict: bool = True,
 ) -> ScanReport:
     """Scanne les blobs **ajoutés ou modifiés** de l'index git avec allowlist (#24).
 
     Aucune exclusion de chemin : c'est le contenu que le commit va contenir
     qui est jugé, quel que soit son chemin (``vendor/evil.py``,
-    ``package-lock.json``…). Un blob binaire connu est **refusé** (code 2),
-    exactement comme un fichier binaire connu en mode arbre : il n'y a pas de
-    texte à analyser, donc aucun verdict propre ne peut être rendu. Un blob
-    illisible ou trop gros est également une **erreur** (code 2).
+    ``package-lock.json``…). Les binaires et blobs trop gros sont tracés
+    dans le rapport partiel, ou refusés avec strict=True. Un blob illisible
+    ou modifié pendant sa lecture reste une erreur d'outillage (code 2).
 
     Les lectures sont adressées par SHA : un ``git add`` concurrent ne peut
     pas corrompre un blob déjà lu, mais la **liste** figée au départ peut
@@ -804,7 +838,10 @@ def _collect_staged(
             )
         )
     )
-    findings, traces = _scan_changes(access, changes, allowlist, deadline)
+    skipped: list[ScanSkip] = []
+    findings, traces = _scan_changes(
+        access, changes, allowlist, deadline, strict=strict, skipped=skipped
+    )
     if set(access.staged_changes(timeout=_call_timeout(deadline))) != set(changes):
         # L'index a bougé pendant le scan : le snapshot analysé ne décrit
         # plus ce qui sera committé. Refus, pas de verdict périmé. La
@@ -819,7 +856,8 @@ def _collect_staged(
         findings=tuple(findings),
         traces=traces,
         config_hash=allowlist.sha256,
-        scanned_files=len(changes),
+        scanned_files=len(changes) - len({item.file for item in skipped}),
+        skipped=tuple(skipped),
     )
 
 
@@ -829,6 +867,7 @@ def _collect_diff(
     base: str,
     config: str | Path | None = None,
     custom_allowlist: Allowlist | None = None,
+    strict: bool = True,
 ) -> ScanReport:
     """Scanne les blobs ajoutés ou modifiés entre ``base...HEAD`` (#37).
 
@@ -883,7 +922,10 @@ def _collect_diff(
             allow_external=True,
         )
     )
-    findings, traces = _scan_changes(access, changes, allowlist, deadline)
+    skipped: list[ScanSkip] = []
+    findings, traces = _scan_changes(
+        access, changes, allowlist, deadline, strict=strict, skipped=skipped
+    )
     if access.resolve_commit("HEAD", timeout=_call_timeout(deadline)) != head_sha:
         # HEAD a bougé pendant l'analyse : le diff figé ne décrit plus le
         # commit courant. Refus, pas de verdict périmé.
@@ -895,7 +937,8 @@ def _collect_diff(
         findings=tuple(findings),
         traces=traces,
         config_hash=allowlist.sha256,
-        scanned_files=len(changes),
+        scanned_files=len(changes) - len({item.file for item in skipped}),
+        skipped=tuple(skipped),
     )
 
 
@@ -920,6 +963,9 @@ def render_json(report: ScanReport) -> str:
         "config_hash": report.config_hash,
         "vcs_ignored": report.vcs_ignored,
         "git_ignored": report.git_ignored,
+        "complete": report.complete,
+        "skipped_count": len({item.file for item in report.skipped}),
+        "skipped": [item.as_dict() for item in report.skipped],
     }
     return json.dumps(
         payload,
@@ -958,8 +1004,17 @@ def render_text(report: ScanReport) -> str:
     Affiche toujours le nombre de findings ignorés par l'allowlist (#24).
     """
     lines = [f"heimdall scan : périmètre {_SCOPE_LABELS[report.scope]}"]
+    if report.skipped:
+        lines.append("Analyse partielle : certains contenus ont été écartés.")
+        for item in report.skipped:
+            location = f":{item.line}" if item.line is not None else ""
+            lines.append(f"  {_visible(item.file)}{location}  ignoré={item.reason}")
     if not report.findings:
-        lines.append("Aucun secret détecté.")
+        lines.append(
+            "ANALYSE PARTIELLE : aucun secret détecté dans le contenu analysé ; "
+            "ne pas déployer (code 2)."
+            if report.skipped else "Aucun secret détecté."
+        )
     else:
         lines.append(f"{len(report.findings)} secret(s) détecté(s) :")
         for finding in report.findings:
@@ -977,10 +1032,7 @@ def render_text(report: ScanReport) -> str:
             lines.append(f"  {_visible(trace.file)}:{trace.line}  règle={trace.rule}")
     # L'élagage VCS est une politique, pas un résultat : l'afficher évite de
     # lire un « aucun secret » comme une couverture de l'historique.
-    lines.append(
-        f"Base VCS : {report.vcs_ignored} base(s) élaguée(s) "
-        "(historique non parcouru)."
-    )
+    lines.append(f"Base VCS : {report.vcs_ignored} base(s) élaguée(s) (historique non parcouru).")
     # Les exclusions .gitignore sont aussi une politique : un fichier non
     # suivi et ignoré n'a pas été lu. Le compteur évite de lire un « aucun
     # secret » comme une couverture de ces entrées.
@@ -989,6 +1041,8 @@ def render_text(report: ScanReport) -> str:
         "écartée(s) (non analysée(s))."
     )
     lines.append(_CODES_LINE)
+    if not report.complete and not report.findings:
+        lines.append("ANALYSE PARTIELLE : ne pas déployer (code 2).")
     return "\n".join(lines)
 
 

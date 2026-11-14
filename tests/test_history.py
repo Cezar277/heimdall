@@ -8,6 +8,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from jsonschema import Draft202012Validator
+from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT202012
 from support.git_repo import GitRepo
 from typer.testing import CliRunner
 
@@ -25,6 +28,51 @@ from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
 
 SYNTHETIC = "AKIAIOSFODNN7EXAMPLE"
+REPO = Path(__file__).resolve().parents[1]
+
+
+def _history_validator() -> Draft202012Validator:
+    """Validateur du contrat `heimdall.history.v1`, Finding v1 résolu par registre."""
+    history_schema = json.loads(
+        (REPO / "schemas/history.schema.json").read_text(encoding="utf-8")
+    )
+    finding_schema = json.loads(
+        (REPO / "schemas/finding.schema.json").read_text(encoding="utf-8")
+    )
+    registry = Registry().with_resources(
+        [
+            (
+                "https://github.com/Cezar277/heimdall/schemas/finding.schema.json",
+                Resource(contents=finding_schema, specification=DRAFT202012),
+            ),
+            (
+                "https://github.com/Cezar277/heimdall/schemas/history.schema.json",
+                Resource(contents=history_schema, specification=DRAFT202012),
+            ),
+        ]
+    )
+    return Draft202012Validator(history_schema, registry=registry)
+
+
+def test_history_keeps_skip_lines_on_cache_hits(repo: GitRepo) -> None:
+    content = "safe\nsafe\n" + "A" * 5000 + "\n"
+    repo.write("original.dat", content)
+    repo.commit_all("first")
+    repo.git("mv", "original.dat", "renamed.dat")
+    repo.commit_all("rename")
+    report = history.collect_history(repo.root, ci=True, strict=False)
+    payload = json.loads(history.render_history(report, json_output=True))
+    long_tokens = [item for item in payload["skipped"] if item["reason"] == "long_token"]
+    assert {item["file"] for item in long_tokens} == {"original.dat", "renamed.dat"}
+    assert len(long_tokens) == 2
+    assert all(item["line"] == 3 for item in long_tokens)
+    assert all(
+        item["line"] == 2 for item in payload["skipped"] if item["reason"] == "multiline_limit"
+    )
+    assert '"original.dat":3' in history.render_history(report)
+    assert '"renamed.dat":3' in history.render_history(report)
+    assert report.bytes_scanned == len(content.encode())
+    assert not report.complete
 
 
 @pytest.fixture
@@ -121,7 +169,7 @@ def test_oversized_blobs_never_read_and_cli_is_incomplete(
         pytest.fail("oversized content must not be read")
 
     monkeypatch.setattr(GitAccess, "blob_bytes", forbidden)
-    report = history.collect_history(repo.root, ci=True, max_file_bytes=10)
+    report = history.collect_history(repo.root, ci=True, max_file_bytes=10, strict=False)
     assert not report.complete
     assert report.bytes_scanned == 0
     assert report.skipped[0][0] == "large.txt"
@@ -132,9 +180,41 @@ def test_oversized_blobs_never_read_and_cli_is_incomplete(
     assert json.loads(result.stdout)["complete"] is False
 
 
+def test_history_json_validates_against_the_versioned_schema(repo: GitRepo) -> None:
+    repo.write("large.txt", "x" * 100)
+    repo.commit_all("large")
+    report = history.collect_history(repo.root, ci=True, max_file_bytes=10, strict=False)
+    payload = json.loads(history.render_history(report, json_output=True))
+    _history_validator().validate(payload)
+    assert payload["bytes_budgeted"] >= payload["bytes_scanned"]
+    assert payload["skipped"][0]["reason"] == "too_large"
+    assert payload["skipped"][0]["line"] is None
+
+
+def test_oversized_blob_reason_is_the_enum_too_large(repo: GitRepo) -> None:
+    repo.write("large.txt", "x" * 100)
+    repo.commit_all("large")
+    report = history.collect_history(repo.root, ci=True, max_file_bytes=10, strict=False)
+    assert len(report.skipped) == 1
+    file, commit, reason, line = report.skipped[0]
+    assert file == "large.txt"
+    assert len(commit) == 40
+    assert reason == "too_large"
+    assert line is None
+    payload = json.loads(history.render_history(report, json_output=True))
+    assert payload["skipped"] == [
+        {"file": "large.txt", "commit": commit, "reason": "too_large", "line": None}
+    ]
+
+
+def test_history_skip_uses_the_static_scan_error_contract() -> None:
+    with pytest.raises(ScanError):
+        history._scan_skip("../evil", "too_large")
+
+
 def test_cold_start_size_limit_reports_skip(repo: GitRepo) -> None:
     repo.write("large.txt", "x" * 100)
-    report = collect_cold_start(repo.root, ci=True, max_file_bytes=10)
+    report = collect_cold_start(repo.root, ci=True, max_file_bytes=10, strict=False)
     assert report.skipped_files == ("large.txt",)
     result = CliRunner().invoke(
         app, ["cold-start", str(repo.root), "--ci", "--json", "--max-file-bytes", "10"]
@@ -154,11 +234,14 @@ def test_empty_repo_and_binary(repo: GitRepo, filename: str) -> None:
     assert history.collect_history(repo.root, ci=True).commits_scanned == 0
     repo.write_bytes(filename, b"\x89PNG\r\n\x1a\n" + b"\x00\xff" * 100)
     repo.commit_all("binary")
-    with pytest.raises(ScanError):
-        history.collect_history(repo.root, ci=True)
+    report = history.collect_history(repo.root, ci=True, strict=False)
+    assert report.findings == ()
+    assert report.skipped[0][0] == filename
+    assert report.skipped[0][2] == "binary"
+    assert not report.complete
     result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
     assert result.exit_code == 2
-    assert result.stdout == ""
+    assert json.loads(result.stdout)["complete"] is False
 
 
 def test_bounds_fail_closed(repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,6 +317,9 @@ def test_rejection_is_displayed_and_does_not_remove_finding(
     assert SYNTHETIC not in calls[0]
     assert "faux_positif" in history.render_history(report)
     assert len(journal.read()) == 1
+    payload = json.loads(history.render_history(report, json_output=True))
+    _history_validator().validate(payload)
+    assert payload["opinions"][0]["verdict"] == "faux_positif"
 
 
 def test_cache_eviction_preserves_commits(repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -282,11 +368,12 @@ def test_graft_cannot_hide_deleted_secret(repo: GitRepo) -> None:
 def test_unknown_binary_cannot_hide_secret(repo: GitRepo, suffix: str) -> None:
     repo.write_bytes(f"evil.{suffix}", b"\x00" + SYNTHETIC.encode() + b"\n#")
     repo.commit_all("unknown binary with synthetic secret")
-    with pytest.raises(ScanError):
-        history.collect_history(repo.root, ci=True)
+    report = history.collect_history(repo.root, ci=True, strict=False)
+    assert report.skipped[0][0] == f"evil.{suffix}"
+    assert not report.complete
     result = CliRunner().invoke(app, ["deep-scan", str(repo.root), "--ci", "--json"])
     assert result.exit_code == 2
-    assert result.stdout == ""
+    assert json.loads(result.stdout)["complete"] is False
     assert SYNTHETIC not in result.output
 
 

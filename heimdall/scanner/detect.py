@@ -61,6 +61,8 @@ from heimdall.scanner.finding import (
 from heimdall.scanner.gitignore import GitExclusions, _PinnedRoot, collect_git_exclusions
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import _open_flags, _resolve_root
+from heimdall.scanner.limits import MULTILINE_WINDOW
+from heimdall.scanner.policy import ScanSkip, SkipReason, prepare_text, skip_file
 from heimdall.scanner.signature_engine import MAX_FINDINGS
 from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
 
@@ -82,12 +84,12 @@ def _directory_flags() -> int:
 
 
 MAX_FILE_BYTES: Final[int] = 1_048_576
-MULTILINE_WINDOW: Final[int] = 4096
 #: Plafond du nombre de fichiers analysés en une passe (#29). Au-delà, le
 #: scan est **refusé** (``ScanError``) : un dépôt adverse avec 100 000 petits
 #: fichiers ne doit pas faire durer une CI sans rendre de verdict.
 MAX_FILES: Final[int] = 50_000
-#: Plafond du volume total lu en une passe, en octets (#29). Sans lui,
+#: Plafond du volume rencontré, tailles des fichiers exclus comprises (#29).
+#: Sans lui,
 #: ``MAX_FILES`` fichiers de 1 Mio feraient 50 Gio de lecture.
 MAX_TOTAL_BYTES: Final[int] = 256 * 1024 * 1024
 # NOTE : `MAX_FINDINGS` est défini dans `signature_engine` (couche core) et
@@ -161,14 +163,6 @@ def _validate_relative_path(relative: str) -> str:
         raise ScanError(_SCAN_ERROR) from None
 
 
-def _decode_data(data: bytes) -> str:
-    """Décode le contenu ; un binaire connu est refusé (fail-closed)."""
-    text = decode_text(data)
-    if text is None:
-        raise ScanError(_SCAN_ERROR)
-    return text
-
-
 class Scanner:
     """Scanner déterministe d'une racine confinée (couche système #22/#59).
 
@@ -189,9 +183,9 @@ class Scanner:
     (:attr:`git_ignored`), mais jamais un fichier suivi : voir
     ``respect_gitignore``.
 
-    ``strict`` (mode strict, livré par #29 pour la CLI ``heimdall scan``)
-    reste accepté pour compatibilité : seule la base VCS est écartée, quel que
-    soit le mode.
+    ``strict=False`` (#229) tolère les exclusions de contenu, exposées dans
+    :attr:`skipped`. ``strict=True`` refuse binaires, liens et limites de
+    texte et reste le défaut. Les exclusions Git/VCS ne dépendent pas de cette option.
 
     ``respect_gitignore`` (défaut ``True``) active les **exclusions Git sûres**
     de #59 : un fichier non suivi qu'un ``.gitignore`` du dépôt déclare
@@ -214,6 +208,7 @@ class Scanner:
         "_max_findings",
         "_max_file_bytes",
         "_skipped_files",
+        "_skipped",
         "_root",
         "_root_id",
         "_single",
@@ -229,7 +224,7 @@ class Scanner:
         *,
         hasher: SnippetHasher | None = None,
         entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
-        strict: bool = False,
+        strict: bool = True,
         max_files: int | None = None,
         max_bytes: int | None = None,
         max_findings: int | None = None,
@@ -249,6 +244,9 @@ class Scanner:
         self._max_findings = _checked_bound(max_findings, MAX_FINDINGS)
         self._max_file_bytes = _checked_bound(max_file_bytes, MAX_FILE_BYTES)
         self._skipped_files = skipped_files
+        self._skipped: list[ScanSkip] = []
+        if type(strict) is not bool:
+            raise ValueError("politique de contenu invalide")
         resolved = _resolve_root(root)
         try:
             resolved_stat = os.lstat(resolved)
@@ -291,6 +289,17 @@ class Scanner:
         return tuple(self._traces)
 
     @property
+    def skipped(self) -> tuple[ScanSkip, ...]:
+        return tuple(self._skipped)
+
+    def _skip(self, relative: str, reason: SkipReason) -> None:
+        if len(self._skipped) >= self._max_files:
+            raise ScanError(_SCAN_ERROR)
+        skip_file(relative, reason, strict=self._strict, skipped=self._skipped)
+        if self._skipped_files is not None:
+            self._skipped_files.append(relative)
+
+    @property
     def vcs_ignored(self) -> int:
         """Nombre de bases VCS élaguées lors du dernier scan.
 
@@ -306,10 +315,11 @@ class Scanner:
 
     @property
     def files_scanned(self) -> int:
-        """Nombre de fichiers effectivement lus lors du dernier scan.
+        """Nombre de fichiers entièrement analysés lors du dernier scan.
 
         Un fichier n'est compté qu'après une lecture complète et vérifiée
-        (identité, taille, ``mtime_ns``). Ce compteur décrit donc le
+        (identité, taille, ``mtime_ns``), sans exclusion de prétraitement
+        (jeton long ou jointure hors borne). Ce compteur décrit donc le
         **contenu réellement analysé**, hors base VCS élaguée. Il rend
         observable le cas d'un arbre réduit à sa base VCS (aucun fichier de
         contenu lu) sans transformer un dépôt vide en erreur : la politique
@@ -413,9 +423,7 @@ class Scanner:
         exclusions = self._git_exclusions
         if exclusions is None:
             return False
-        skipped = (
-            exclusions.skip_dir(f"{relative}/") if is_dir else exclusions.skip_file(relative)
-        )
+        skipped = exclusions.skip_dir(f"{relative}/") if is_dir else exclusions.skip_file(relative)
         if skipped:
             self._git_ignored += 1
         return skipped
@@ -488,6 +496,7 @@ class Scanner:
         self._git_ignored = 0
         self._git_exclusions = None
         self._files_scanned = 0
+        self._skipped.clear()
         if deadline is not None and time.monotonic() > deadline:
             raise ScanError(_SCAN_ERROR)
         # La racine et ses ancêtres sont re-contrôlés avant toute ouverture :
@@ -560,12 +569,23 @@ class Scanner:
                 if count > self._max_files:
                     raise ScanError(_SCAN_ERROR)
                 text, size = reader()
-                if text is None:
-                    continue
                 total += size
-                self._files_scanned += 1
                 if total > self._max_bytes:
                     raise ScanError(_SCAN_ERROR)
+                if text is None:
+                    continue
+                before_skips = len(self._skipped)
+                text = prepare_text(text, relative, strict=self._strict, skipped=self._skipped)
+                added_skips = len(self._skipped) - before_skips
+                if added_skips:
+                    if len(self._skipped) > self._max_files:
+                        # Annule les traces du fichier courant avant le refus :
+                        # `skipped_files` n'est alimenté qu'après ce contrôle,
+                        # donc les deux collecteurs restent cohérents.
+                        del self._skipped[before_skips:]
+                        raise ScanError(_SCAN_ERROR)
+                    if self._skipped_files is not None:
+                        self._skipped_files.append(relative)
                 # Le plafond Findings est vérifié à deux granularités : par
                 # candidat dans `_append` (un seul fichier dense ne fait jamais
                 # gonfler la liste), et ici entre fichiers (l'accumulation sur
@@ -573,6 +593,8 @@ class Scanner:
                 findings.extend(self._scan_text(text, relative, deadline=deadline))
                 if len(findings) > self._max_findings:
                     raise ScanError(_SCAN_ERROR)
+                if len(self._skipped) == before_skips:
+                    self._files_scanned += 1
         except RecursionError:
             # Parcours ancré récursif : un arbre d'une profondeur extrême ne
             # doit pas produire une exception brute (contrat ``ScanError``,
@@ -695,7 +717,8 @@ class Scanner:
                 if est_base_vcs(name):
                     self._vcs_ignored += 1
                     continue
-                raise ScanError(_SCAN_ERROR)
+                self._skip(relative, "symlink")
+                continue
             if est_base_vcs(name) and stat.S_ISDIR(mode):
                 self._vcs_ignored += 1
                 continue
@@ -762,7 +785,8 @@ class Scanner:
                 if self._skip_git_excluded(relative_dir, is_dir=True):
                     continue
                 if not _not_link(current_path / name):
-                    raise ScanError(_SCAN_ERROR)
+                    self._skip(relative_dir, "symlink")
+                    continue
                 kept.append(name)
             directories[:] = kept
             for name in sorted(filenames):
@@ -786,7 +810,8 @@ class Scanner:
                 if est_chemin_hors_perimetre(relative):
                     raise ScanError(_SCAN_ERROR)
                 if not _not_link(path):
-                    raise ScanError(_SCAN_ERROR)
+                    self._skip(relative, "symlink")
+                    continue
                 yield path, _validate_relative_path(relative)
 
     def _read_text(self, path: Path) -> tuple[str | None, int]:
@@ -841,8 +866,10 @@ class Scanner:
         """Lit un descripteur déjà ouvert, vérifie son identité et le ferme.
 
         Avec un collecteur explicite, un fichier trop volumineux est signalé
-        par son chemin relatif et ``(None, 0)``, sans lire son contenu. Les
-        autres refus restent des ``ScanError``, y compris les binaires.
+        par son chemin relatif et ``(None, taille)``, sans lire son contenu.
+        Sa taille consomme le budget global même si le fichier est exclu. Les
+        erreurs de lecture restent des ScanError ; les binaires sont tracés
+        ou refusés selon le mode strict.
         """
         chunks: list[bytes] = []
         try:
@@ -857,10 +884,8 @@ class Scanner:
             if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
                 raise ScanError(_SCAN_ERROR)
             if after.st_size > self._max_file_bytes:
-                if self._skipped_files is None:
-                    raise ScanError(_SCAN_ERROR)
-                self._skipped_files.append(relative)
-                return None, 0
+                self._skip(relative, "too_large")
+                return None, after.st_size
             remaining = self._max_file_bytes + 1
             while remaining > 0:
                 chunk = os.read(descriptor, min(_READ_CHUNK, remaining))
@@ -886,7 +911,10 @@ class Scanner:
                 os.close(descriptor)
             except OSError:
                 raise ScanError(_SCAN_ERROR) from None
-        return _decode_data(data), len(data)
+        text = decode_text(data, strict=self._strict)
+        if text is None:
+            self._skip(relative, "binary")
+        return text, len(data)
 
     def _scan_text(
         self,
@@ -948,7 +976,8 @@ class Scanner:
         # Fenêtre en octets UTF-8 (doc 4 Kio), pas en caractères : l'écart
         # doc/implantation sur UTF-8 multioctets serait une borne contournable.
         if len((line + following).encode("utf-8")) > MULTILINE_WINDOW:
-            check_multiline_overflow(line, following, self._entropy_config, deadline=deadline)
+            if self._strict:
+                check_multiline_overflow(line, following, self._entropy_config, deadline=deadline)
             return None
         return line + following, len(line)
 
@@ -1008,14 +1037,15 @@ def scan(
     root: str | os.PathLike[str],
     *,
     hasher: SnippetHasher | None = None,
-    strict: bool = False,
+    strict: bool = True,
     entropy_config: EntropyConfig = DEFAULT_ENTROPY_CONFIG,
     allowlist: Allowlist | None = None,
 ) -> list[Finding]:
     """Analyse ``root`` et retourne des objets :class:`Finding`.
 
-    ``strict`` (mode strict de #29) reste accepté pour compatibilité : seule
-    la base VCS est écartée, quel que soit le mode.
+    Le helper reste strict par défaut : sa liste ne porte pas les traces
+    d'exclusion. Pour un scan tolérant avec rapport, utiliser Scanner.skipped
+    ou la CLI (#229).
     """
     return Scanner(
         root, hasher=hasher, strict=strict, entropy_config=entropy_config, allowlist=allowlist
@@ -1036,5 +1066,5 @@ def find_candidates(
     """
     return [
         finding.as_dict()
-        for finding in scan(path, entropy_config=entropy_config, allowlist=allowlist)
+        for finding in scan(path, strict=True, entropy_config=entropy_config, allowlist=allowlist)
     ]
