@@ -1,7 +1,10 @@
 # T229 — Preuves du correctif fail-closed après revue
 
-Ticket #229, audit E-01. Révision de code : `aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe`.
+Ticket #229, audit E-01. Révision de code actuelle : `2f60301ec4427899a41fb3f45be21727050a49d7`.
 Base de la branche : `6bbe7da` (intégration de #228 / #240).
+Les premiers permaliens ci-dessous conservent le SHA du correctif critique
+`aba5eb3`. Les durcissements complémentaires sont épinglés séparément sur
+la révision actuelle, sans modifier la propriété de verdict démontrée.
 
 ## Propriété démontrée
 
@@ -34,18 +37,29 @@ manqué » : les limites algorithmiques et les périmètres Git restent document
 | LOW : défauts incohérents | `Scanner`, `scan`, `find_candidates`, `collect` et `collect_history` sont stricts par défaut. La tolérance exige `strict=False`. [:103](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L103) vérifie les cinq API sur un contenu adverse. La CLI collecte explicitement les traces avant d'appliquer le verdict sûr. |
 | Pas de régression sur les findings et les hooks | [:120](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L120) : partialité + finding = code 1. [:91](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L91) et [:169](https://github.com/Cezar277/heimdall/blob/aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe/tests/test_scanner_fail_closed.py#L169) : liens et rapports partiels hors CI restent en code 2. |
 
+## Durcissements complémentaires après approbation avec commentaires
+
+| Remarque | Correction et preuve permanente |
+| --- | --- |
+| Cold start : deux compteurs de couverture | [`main.py:276`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/heimdall/cli/main.py#L276) contrôle `skipped_files` et `scan.complete`. [`cold_start.py:204`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/heimdall/cli/cold_start.py#L204) rend aussi le JSON externe incomplet. [`test_scanner_fail_closed.py:202`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/tests/test_scanner_fail_closed.py#L202) simule une couverture interne incomplète et un collecteur historique vide : code 2 et `complete: false`. |
+| Helpers privés stricts | Les quatre helpers `_collect_tree`, `_scan_changes`, `_collect_staged`, `_collect_diff` ont désormais `strict=True` par défaut. [`test_scanner_fail_closed.py:219`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/tests/test_scanner_fail_closed.py#L219) les appelle directement sans option sur un contenu adverse ; tous refusent. |
+| Volume historique | [`history.py:219`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/heimdall/cli/history.py#L219) consomme la taille annoncée avant le test d'exclusion, sur chaque défaut de cache. `bytes_scanned` conserve son sens d'octets effectivement lus. [`test_scanner_fail_closed.py:242`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/tests/test_scanner_fail_closed.py#L242) : deux blobs distincts trop gros épuisent le budget sans être lus. |
+| Borne des traces staged/diff | [`scan.py:683`](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/heimdall/cli/scan.py#L683) borne le collecteur à `MAX_STAGED_FINDINGS`, avant usage puis après chaque ajout binaire, taille ou préparation de texte. Les témoins [:262](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/tests/test_scanner_fail_closed.py#L262) et [:276](https://github.com/Cezar277/heimdall/blob/2f60301ec4427899a41fb3f45be21727050a49d7/tests/test_scanner_fail_closed.py#L276) couvrent ces trois chemins et un collecteur initial déjà hors borne. |
+
 ## Validation
 
-Les 47 cas adverses et les tests associés du scanner passent dans une
-passe ciblée de **708 tests**. Ruff, MyPy (57 fichiers) et Bandit passent.
-La suite complète a été relancée après le dernier commit de code ci-dessus :
-**3925 passed, 18 skipped, 6911 subtests passed**, en **336,74 secondes**.
-Les 14 avertissements proviennent des tests existants de sauvegardes de
-remédiation. Aucun changement de code ou de test n'a suivi ce rejeu ; seule
-la documentation des résultats et des preuves est actualisée ensuite.
+Le correctif critique avait été validé par **3925 tests**, 18 ignorés et
+6911 sous-tests sur `aba5eb3`. La nouvelle passe ciblée incluant les dix cas
+de défense en profondeur passe : **366 tests**, en 17,92 secondes.
+Ruff, MyPy (57 fichiers) et Bandit passent sur `2f60301`.
+La suite complète est relancée après ce dernier commit de code et passe :
+**3935 passed, 18 skipped, 6911 subtests passed**, en **336,29 secondes**.
+Les 14 avertissements existants concernent les tests de sauvegardes de
+remédiation. Aucun code ni test n'a changé après ce rejeu ; seuls les
+documents de preuve sont mis à jour ensuite.
 
 Transcription : [acceptance/t229-validation.txt](acceptance/t229-validation.txt).
-Rapport JUnit final : `/home/nathan/heimdall-t229-review-full.xml`.
+Rapport JUnit final : `/home/nathan/heimdall-t229-final-hardening.xml`.
 Les anciennes passes archivées correspondent à l'état initial de la PR et
 ne constituent pas une preuve de cette correction fail-closed.
 

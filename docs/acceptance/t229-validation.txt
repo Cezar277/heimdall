@@ -1,4 +1,20 @@
 Ticket #229 - Audit E-01
+DERNIERS DURCISSEMENTS APRES APPROBATION AVEC COMMENTAIRES
+Code teste : 2f60301ec4427899a41fb3f45be21727050a49d7
+
+python -m pytest -o addopts= -q --tb=short --junitxml=/home/nathan/heimdall-t229-final-hardening.xml
+3935 passed, 18 skipped, 14 warnings, 6911 subtests passed in 336.29s
+Rejeu apres le dernier commit de code ; aucun code ni test modifie ensuite.
+Ruff : All checks passed! Mypy : success, 57 source files. Bandit : exit 0,
+aucune alerte de securite, memes avertissements de lecture nosec existants.
+
+10 nouveaux cas : cold-start avec scan incomplet et collecteur historique
+vide ; quatre helpers stricts par defaut ; deux blobs historiques exclus
+consommant le budget sans lecture ; trois chemins d'exclusion staged bornes ;
+collecteur initial deja hors borne. Passe ciblee : 366 passed in 17.92s.
+Le compteur bytes_scanned historique reste limite aux octets effectivement lus.
+Les resultats precedents ci-dessous restent archives avec leur revision.
+
 CORRECTION APRES REQUEST CHANGES - code aba5eb3047d2b9f0cfcee552050fc1e2c9b67cbe
 Les validations initiales conservees plus bas sont historiques et ne
 prouvent pas le verdict fail-closed corrige. Resultats finaux :
