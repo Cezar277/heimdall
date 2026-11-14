@@ -125,8 +125,13 @@ class RateLimiter:
             bucket.hits.popleft()
         # Recul d'horloge (audit F-15) : les admissions « futures » ne
         # comptent plus, sinon elles bloqueraient à tort jusqu'à une fenêtre.
-        while bucket.hits and bucket.hits[-1] > now:
-            bucket.hits.pop()
+        # Une horloge qui recule puis avance laisse un deque non trié (ex.
+        # [100, 50] à now=50) : un futur peut alors se trouver n'importe où.
+        # Chemin rapide si les deux extrémités sont dans la fenêtre ; sinon
+        # reconstruction triée sans aucun futur ni expiré.
+        hits = bucket.hits
+        if hits and (hits[0] > now or hits[-1] > now):
+            bucket.hits = deque(sorted(hit for hit in hits if cutoff < hit <= now))
 
     def _existing_bucket(self, name: str, now: float) -> _Bucket | None:
         """Retourne le bucket existant après purge, sans jamais en créer.
@@ -221,11 +226,6 @@ class RateLimiter:
         ]
         with self._lock:
             return self._evaluate(specs, self._clock())
-
-    def check_key(self, key_hash: str) -> tuple[bool, int]:
-        """Consomme seulement le budget clé après admission pair/global."""
-        with self._lock:
-            return self._evaluate([(f"key:{key_hash}", self._per_key)], self._clock())
 
     def peek(self, peer: str) -> tuple[bool, int]:
         """Contrôle sans consommation des budgets pair/global (rejet précoce).
@@ -425,16 +425,6 @@ class SqliteRateLimiter:
         with db_session(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             return self._evaluate(conn, specs, self._clock())
-
-    def check_key(self, key_hash: str) -> tuple[bool, int]:
-        """Consomme seulement le budget clé après admission pair/global."""
-        with db_session(self._db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            return self._evaluate(
-                conn,
-                [(f"key:{key_hash}", self._per_key)],
-                self._clock(),
-            )
 
     def peek(self, peer: str) -> tuple[bool, int]:
         """Contrôle sans consommation des budgets pair/global (rejet précoce).

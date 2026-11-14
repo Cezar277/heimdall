@@ -85,7 +85,10 @@ class EarlyRejectionTests(unittest.TestCase):
                 "127.0.0.1", hash_api_key(key, pepper="p" * 32)
             )
         elif rejection == "key":
-            target.state.rate_limiter.check_key(hash_api_key(key, pepper="p" * 32))
+            # Budget clé plein via la seule voie authentifiée (M-02).
+            target.state.rate_limiter.check_authenticated(
+                "127.0.0.1", hash_api_key(key, pepper="p" * 32)
+            )
         elif rejection == "header":
             key = "A" * 513
             key_header = f"X-Heimdall-API-Key: {key}\r\n"

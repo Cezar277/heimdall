@@ -149,8 +149,9 @@ class SlidingWindowMemoryTests(unittest.TestCase):
             clock=lambda: now[0],
         )
         with patch.object(ratelimit_module, "_MAX_TRACKED_BUCKETS", 100):
+            # Remplit des budgets clé distincts (check_key public supprimé, M-02).
             for index in range(10):
-                self.assertTrue(limiter.check_key(f"key-{index}")[0])
+                self.assertTrue(limiter._evaluate([(f"key:key-{index}", 1)], now[0])[0])
             now[0] = 20.0
             self.assertTrue(limiter.check_authenticated("127.0.0.1", "key-new")[0])
             self.assertGreater(len(limiter._buckets), 5)
@@ -162,6 +163,31 @@ class SlidingWindowMemoryTests(unittest.TestCase):
 
 class AuthenticatedPeerAndClockTests(unittest.TestCase):
     """Budget par pair authentifié (M-02) et recul d'horloge mémoire (F-15)."""
+
+    def test_non_monotonic_clock_drops_every_future_hit(self) -> None:
+        """Deque non trié [100, 50] à now=50 : le futur 100 n'est plus compté (F-15)."""
+        now = [50.0]
+        limiter = RateLimiter(
+            per_key=100, per_peer=2, global_limit=100, window_seconds=10, clock=lambda: now[0]
+        )
+        bucket = limiter._ensure_bucket("anon_peer:10.0.0.7")
+        bucket.hits.extend([100.0, 50.0])  # horloge reculée puis avancée
+        limiter._prune_bucket(bucket, now[0])
+        pruned = limiter._buckets["anon_peer:10.0.0.7"]
+        self.assertEqual(list(pruned.hits), [50.0])
+        # Un seul hit réel : la requête suivante passe, puis per_peer=2 est atteint.
+        allowed, retry = limiter.check("10.0.0.7")
+        self.assertTrue(allowed)
+        self.assertEqual(retry, 0)
+        allowed, retry = limiter.check("10.0.0.7")
+        self.assertFalse(allowed)
+        self.assertLessEqual(retry, 10)
+
+    def test_no_public_key_only_budget_entry_point(self) -> None:
+        """Aucune voie publique ne consomme le budget clé sans auth_peer ni global."""
+        for cls in (RateLimiter, SqliteRateLimiter):
+            with self.subTest(backend=cls.__name__):
+                self.assertFalse(hasattr(cls, "check_key"))
 
     def _limiters(self, tmp: str, clock: object) -> list[RateLimiter | SqliteRateLimiter]:
         kwargs = {
