@@ -9,7 +9,12 @@ description = "Heimdall: 100 % local DevSecOps sentry. Deterministic secret inte
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Heimdall team" }]
+authors = [
+  { name = "Ardhaljian Cezar" },
+  { name = "Blanchet Erwan" },
+  { name = "Bocher Nathan" },
+  { name = "Boisserie Estelle" },
+]
 keywords = ["devsecops", "secrets", "vault", "mcp", "ollama"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
