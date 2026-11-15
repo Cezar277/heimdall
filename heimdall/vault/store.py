@@ -36,6 +36,7 @@ import logging
 import sqlite3
 import unicodedata
 from collections import deque
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,7 @@ from heimdall.vault.database import (
 from heimdall.vault.database import runtime_db_session as db_session
 from heimdall.vault.transitions import (
     InvalidTransitionError,
+    UnknownStateError,
     canonicalize_state,
     validate_transition,
 )
@@ -97,6 +99,44 @@ class SecretStoreError(Exception):
     """Erreur interne de stockage/déchiffrement sans détail sensible."""
 
 
+def _is_live_status(status: object) -> bool:
+    """Vrai seulement si l'état canonique est ``vaulte``.
+
+    ``rote``, un état inconnu ou corrompu (casse, espaces, valeur hors
+    matrice) n'est jamais déchiffré par ``_decrypt_record``.
+    """
+    try:
+        return canonicalize_state(status) == "vaulte"
+    except UnknownStateError:
+        return False
+
+
+def _nothing_to_rewrap(records: Iterable[Mapping[str, Any]]) -> bool:
+    """Vrai si aucun secret ne porte de DEK ; refuse une ligne héritée sans DEK."""
+    has_dek = False
+    for record in records:
+        if record.get("encrypted_dek"):
+            has_dek = True
+        else:
+            _purged_rote_with_version(record, 1)
+    return not has_dek
+
+
+def _purged_rote_with_version(record: Mapping[str, Any], new_version: int) -> dict[str, Any]:
+    """Copie d'un secret roté purgé (F-03) à la nouvelle version de KEK.
+
+    Toute autre ligne sans DEK est refusée : la rotation échoue et le
+    store est restauré par l'appelant.
+    """
+    try:
+        rote = canonicalize_state(record.get("status")) == "rote"
+    except UnknownStateError:
+        rote = False
+    if not rote or record.get("encrypted_dek") or record.get("encrypted_value"):
+        raise VaultCipherError("Rotation impossible : un secret sans enveloppe de DEK est présent.")
+    return {**record, "kek_version": new_version}
+
+
 def _decrypt_record(
     record: dict[str, Any],
     cipher: VaultCipher,
@@ -107,8 +147,10 @@ def _decrypt_record(
     """Déchiffre un enregistrement (enveloppe #70 ou ligne héritée) en clair."""
     aad = VaultCipher.aad(project, env, name)
     status = str(record.get("status", "vaulte"))
-    if status == "rote":
-        # Un secret roté ne conserve plus de valeur chiffrée (audit F-03).
+    if not _is_live_status(status):
+        # Un secret roté ne conserve plus de valeur chiffrée (audit F-03) ; un
+        # état inconnu ou corrompu n'est jamais déchiffré non plus (l'API
+        # répond 404 sur l'état brut, sans valeur en mémoire ni 500).
         return {
             "project": str(record.get("project", record.get("project_id", project))),
             "env": str(record["env"]),
@@ -210,6 +252,19 @@ class InMemorySecretStore:
             if record is None:
                 return None
             return _decrypt_record(record, self._cipher, project, env, name)
+
+    async def get_state(self, project: str, env: str, name: str) -> dict[str, str] | None:
+        """Métadonnées d'état seules : ni DEK déballée, ni valeur déchiffrée."""
+        async with self._lock:
+            record = self._secrets.get((project, env, name))
+            if record is None:
+                return None
+            return {
+                "project": str(record.get("project", project)),
+                "env": str(record["env"]),
+                "name": str(record["name"]),
+                "status": str(record.get("status", "vaulte")),
+            }
 
     async def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         key = (project, env, name)
@@ -537,6 +592,9 @@ class InMemorySecretStore:
                 # ne peut pas restituer l'ancien secret via l'API (audit F-03).
                 record["encrypted_value"] = ""
                 record["encrypted_dek"] = None
+                # L'empreinte d'une valeur purgée ne doit plus apparier une
+                # fuite : la valeur n'est plus en production (contrat #116).
+                record["fingerprint"] = ""
             journal = self._transitions.get(project)
             if journal is None:
                 journal = deque(maxlen=MAX_SECRET_TRANSITIONS)
@@ -651,7 +709,9 @@ class InMemorySecretStore:
             # clear() » (aucun secret, aucun canari) reste exempté dans
             # _check_rotate_hmac_continuity.
             self._check_rotate_hmac_continuity(new_cipher)
-            if not self._secrets:
+            if _nothing_to_rewrap(self._secrets.values()):
+                # Store vide ou uniquement des rotés purgés : aucune DEK à
+                # réenvelopper, chiffreur et version inchangés (parité SQLite).
                 return 0
             for r in self._secrets.values():
                 v = r.get("kek_version")
@@ -694,9 +754,11 @@ class InMemorySecretStore:
                 for key, record in list(self._secrets.items()):
                     enc_dek = record.get("encrypted_dek")
                     if not enc_dek:
-                        raise VaultCipherError(
-                            "Rotation impossible : un secret sans enveloppe de DEK est présent."
-                        )
+                        # F-03 a purgé valeur et DEK d'un secret roté : rien à
+                        # réenvelopper, seule la version suit (sinon un seul
+                        # secret roté bloquerait toute rotation de KEK).
+                        self._secrets[key] = _purged_rote_with_version(record, new_version)
+                        continue
                     aad = VaultCipher.aad(record["project"], record["env"], record["name"])
                     new_dek = active_old.rewrap_dek(new_cipher, enc_dek, aad=aad)
                     updated_record = dict(record)
@@ -825,6 +887,22 @@ class SqliteSecretStore:
         if record is None:
             return None
         return _decrypt_record(record, self._cipher, project, env, name)
+
+    async def get_state(self, project: str, env: str, name: str) -> dict[str, str] | None:
+        """Métadonnées d'état seules (``get_secret_metadata``) : aucun déchiffrement."""
+        return await asyncio.to_thread(self._get_state, project, env, name)
+
+    def _get_state(self, project: str, env: str, name: str) -> dict[str, str] | None:
+        with db_session(self._db_path) as conn:
+            record = get_secret_metadata(conn, project, env, name)
+        if record is None:
+            return None
+        return {
+            "project": str(record["project_id"]),
+            "env": str(record["env"]),
+            "name": str(record["name"]),
+            "status": str(record["status"]),
+        }
 
     async def create(self, project: str, env: str, name: str, value: str) -> dict[str, str]:
         return await asyncio.to_thread(self._create, project, env, name, value)

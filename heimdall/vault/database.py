@@ -68,6 +68,7 @@ from uuid import uuid4
 
 from heimdall.vault.transitions import (
     InvalidTransitionError,
+    UnknownStateError,
     canonicalize_state,
     validate_transition,
 )
@@ -1871,6 +1872,58 @@ def _check_rotate_kek_hmac_continuity(
         )
 
 
+def _is_rote_status(status: object) -> bool:
+    """Vrai si l'état canonique est ``rote`` ; un état illisible n'est jamais roté."""
+    try:
+        return canonicalize_state(status) == "rote"
+    except UnknownStateError:
+        return False
+
+
+def _nothing_to_rewrap(rows: list[sqlite3.Row]) -> bool:
+    """Vrai si aucune ligne ne porte de DEK (base vide ou uniquement des rotés purgés).
+
+    Une ligne sans DEK qui n'est pas un roté purgé (ligne héritée) est
+    refusée ici, avant toute écriture.
+    """
+    for row in rows:
+        if not row["encrypted_dek"]:
+            _require_purged_rote(row)
+    return not any(row["encrypted_dek"] for row in rows)
+
+
+def _require_purged_rote(row: sqlite3.Row) -> None:
+    """Refuse toute ligne sans DEK qui n'est pas un secret roté purgé (F-03)."""
+    if row["encrypted_dek"] or row["encrypted_value"] or not _is_rote_status(row["status"]):
+        from heimdall.vault.crypto import VaultCipherError  # noqa: PLC0415 - cycle d'import
+
+        raise VaultCipherError(
+            "Rotation impossible : un secret hérité sans enveloppe de DEK est présent."
+        )
+
+
+def _bump_purged_rote_version(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    new_version: int,
+    now_ts: str,
+) -> None:
+    """Avance la version d'un secret roté purgé (F-03), sinon refuse la ligne.
+
+    Valeur et DEK ont été effacées à la transition vers ``rote`` : il n'y a
+    rien à réenvelopper. Seule la version suit, sous la même garde
+    anti-downgrade ; sinon un seul secret roté bloquerait toute rotation de
+    KEK (confondu avec une ligne héritée sans DEK).
+    """
+    _require_purged_rote(row)
+    cursor = conn.execute(
+        "UPDATE secrets SET kek_version = ?, updated_at = ? WHERE id = ? AND kek_version < ?",
+        (new_version, now_ts, row["id"], new_version),
+    )
+    if cursor.rowcount != 1:
+        raise KekConcurrencyError("Concurrence détectée sur kek_version.")
+
+
 def rotate_secrets_kek(
     conn: sqlite3.Connection,
     old_cipher: "VaultCipher",
@@ -1899,7 +1952,7 @@ def rotate_secrets_kek(
     Returns:
         tuple[int, int]: Un tuple (nombre_de_secrets_reenveloppes, nouvelle_version_kek).
     """
-    from heimdall.vault.crypto import VaultCipher, VaultCipherError  # noqa: PLC0415
+    from heimdall.vault.crypto import VaultCipher  # noqa: PLC0415
 
     if old_cipher.has_same_key_as(new_cipher):
         raise ValueError("L'ancienne et la nouvelle KEK doivent être distinctes.")
@@ -1914,12 +1967,15 @@ def rotate_secrets_kek(
         # exempté dans _check_rotate_kek_hmac_continuity.
         _check_rotate_kek_hmac_continuity(conn, new_cipher)
         cursor = conn.execute(
-            "SELECT id, project_id, env, name, encrypted_dek, kek_version "
+            "SELECT id, project_id, env, name, encrypted_dek, kek_version, "
+            "status, encrypted_value "
             "FROM secrets ORDER BY id ASC"
         )
         secrets_to_rotate = cursor.fetchall()
-        if not secrets_to_rotate:
-            # Base vide : aucun secret réenveloppé, aucune version n'est persistée.
+        if _nothing_to_rewrap(secrets_to_rotate):
+            # Base vide, ou uniquement des secrets rotés purgés : aucune DEK à
+            # réenvelopper, donc aucune écriture (sinon la base avancerait de
+            # version sans que le store ne bascule de chiffreur).
             # target_kek_version est ignorée pour ne pas faire croire à l'appelant
             # qu'une version non persistée est active (#71 LOW 2).
             return 0, 1
@@ -1962,9 +2018,10 @@ def rotate_secrets_kek(
             enc_dek = row["encrypted_dek"]
 
             if not enc_dek:
-                raise VaultCipherError(
-                    "Rotation impossible : un secret hérité sans enveloppe de DEK est présent."
-                )
+                # Roté purgé : version avancée, rien à réenvelopper. Ligne
+                # héritée sans DEK : VaultCipherError (rollback complet).
+                _bump_purged_rote_version(conn, row, new_version, now_ts)
+                continue
 
             aad = VaultCipher.aad(project_id, env, name)
             new_wrapped_dek = old_cipher.rewrap_dek(new_cipher, str(enc_dek), aad=aad)
@@ -2115,9 +2172,11 @@ def transition_secret(  # noqa: PLR0913
         if target == "rote":
             # Efface la valeur et la DEK : un retour en base à ``vaulte`` ne
             # peut pas restituer l'ancien secret via l'API (audit F-03).
+            # L'empreinte est vidée aussi : la valeur purgée n'est plus en
+            # production et ne doit plus apparier une fuite (contrat #116).
             cursor = conn.execute(
                 "UPDATE secrets SET status = ?, updated_at = ?, "
-                "encrypted_value = '', encrypted_dek = NULL "
+                "encrypted_value = '', encrypted_dek = NULL, fingerprint = '' "
                 "WHERE project_id = ? AND env = ? AND name = ? AND status = ?",
                 (target, timestamp, project_id, env, name, previous),
             )

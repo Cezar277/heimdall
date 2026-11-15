@@ -279,12 +279,27 @@ def cold_start(  # noqa: PLR0913, PLR0917 - options CLI explicites
         help="Taille maximale par fichier, en octets.",
     ),
     strict: bool = typer.Option(False, "--strict", help="Refuse les exclusions de contenu."),
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        help="Configuration explicite (requise hors dépôt avec --ci si heimdall.toml existe).",
+    ),
+    no_allowlist: bool = typer.Option(
+        False,
+        "--no-allowlist",
+        help="Désactive l'allowlist déterministe.",
+    ),
 ) -> None:
     """Premier scan complet : regex/entropie puis avis du LLM local (#107).
 
     Hors CI avec LLM, les propositions faux_positif sont journalisées au
     chemin opérateur par défaut. --ci ou --no-llm désactive ce journal.
+    Comme ``scan --ci``, ``--ci`` refuse l'allowlist du dépôt scanné
+    (CWE-345) : fournir ``--config`` hors dépôt ou ``--no-allowlist``.
     """
+    if config is not None and no_allowlist:
+        _echo_stderr_best_effort("options incompatibles : --config et --no-allowlist")
+        raise typer.Exit(code=2)
     try:
         report = collect_cold_start(
             _scan_root_argument(path),
@@ -292,6 +307,8 @@ def cold_start(  # noqa: PLR0913, PLR0917 - options CLI explicites
             llm=llm,
             max_file_bytes=max_file_bytes,
             strict=strict,
+            config=config,
+            allowlist=Allowlist.empty() if no_allowlist else None,
         )
         typer.echo(render_cold_start(report, json_output=json_output))
     except Exception:

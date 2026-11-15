@@ -522,7 +522,14 @@ def format_env_value(value: str) -> str:
     backtick) sont échappés. ``parse_env_file`` applique l'encodage inverse,
     ce qui garantit un aller-retour fidèle sans exécution si le fichier est
     sourcé.
+
+    Un saut de ligne (``\\n`` ou ``\\r``) est refusé (``ValueError``) : il
+    injecterait une ligne ``NOM=…`` que ``parse_env_file`` ne relirait pas à
+    l'identique. Les appelants filtrent déjà en amont ; ce refus est la
+    défense en profondeur pour tout appel direct.
     """
+    if "\n" in value or "\r" in value:
+        raise ValueError("Saut de ligne interdit dans une valeur .env.")
     escaped = (
         value.replace("\\", "\\\\")
         .replace('"', '\\"')

@@ -364,8 +364,10 @@ def vault_push(  # noqa: PLR0913, PLR0917
     total_chars = 0
     for name, value in to_push.items():
         if not isinstance(value, str) or "\x00" in value or "\n" in value or "\r" in value:
-            # Refus franc avant tout envoi : un octet nul ou un saut de ligne
-            # rendrait le secret inexploitable (pull/run le rejettent).
+            # Refus franc avant tout envoi : un octet nul est rejeté par pull
+            # et run, un saut de ligne par pull (fichier .env). `run` accepte
+            # le multiligne (variables d'environnement), mais `push` reste
+            # restrictif pour que tout secret poussé soit relisible par pull.
             # Message statique : la valeur n'est jamais reflétée.
             typer.echo(
                 f"Erreur : valeur invalide pour le secret {name[:32]!r} "

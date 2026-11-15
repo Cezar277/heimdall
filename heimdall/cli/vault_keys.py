@@ -700,7 +700,8 @@ def rotate_kek_command(
 
     if count == 0:
         typer.echo(
-            "Erreur : aucun secret trouvé dans la base — vérifiez --db-path.",
+            "Erreur : aucun secret trouvé dans la base (ou uniquement des secrets "
+            "rotés, sans DEK à réenvelopper) — vérifiez --db-path.",
             err=True,
         )
         raise typer.Exit(code=1)

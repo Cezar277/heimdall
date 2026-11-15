@@ -27,6 +27,16 @@ le candidat. `--ci` interdit le modèle et son journal, même avec `--llm`.
 Le dépôt reste en lecture seule ; le journal éventuel est un état opérateur
 hors dépôt. Le mode LLM est plafonné à 256 candidats (au-delà : code 2).
 
+Comme `scan --ci`, `cold-start --ci` refuse l'allowlist du dépôt scanné
+(anti-auto-attestation, CWE-345) : si un `heimdall.toml` est présent, passer
+`--config <fichier hors dépôt>` ou `--no-allowlist` (options exclusives),
+sinon la commande sort en 2.
+
+```bash
+heimdall cold-start . --ci --config /etc/heimdall/heimdall.toml
+heimdall cold-start . --ci --no-allowlist
+```
+
 La phase de qualification dispose d'une échéance globale de **300 secondes**,
 vérifiée entre fichiers et avant/après chaque candidat, y compris dans un même
 fichier. Le re-scan reçoit cette échéance. Un appel Ollama déjà en cours garde

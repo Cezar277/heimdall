@@ -22,6 +22,7 @@ from heimdall.mcp.errors import ToolFailure
 from heimdall.mcp.gitdiff import GitAccess
 from heimdall.mcp.masking import mask_text
 from heimdall.mcp.paths import PathEscape, confine
+from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.detect import MAX_FILE_BYTES
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.exclusions import decode_text
@@ -151,6 +152,8 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
     strict: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
+    config: str | Path | None = None,
+    allowlist: Allowlist | None = None,
 ) -> ColdStartReport:
     """Collect and qualify candidates; Git failures use the scanner contract.
 
@@ -168,6 +171,8 @@ def collect_cold_start(  # noqa: PLR0913 - explicit scan and qualification optio
             strict=strict,
             chat=chat,
             journal=journal,
+            config=config,
+            allowlist=allowlist,
         )
     except ToolFailure:
         raise ScanError("scan impossible : entrée non analysable") from None
@@ -182,6 +187,8 @@ def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification opti
     strict: bool = True,
     chat: ChatFn | None = None,
     journal: RejectionJournal | None = None,
+    config: str | Path | None = None,
+    allowlist: Allowlist | None = None,
 ) -> ColdStartReport:
     if type(max_file_bytes) is not int or not 1 <= max_file_bytes <= MAX_FILE_BYTES:
         raise ScanError("limite de fichier invalide")
@@ -201,6 +208,8 @@ def _collect_cold_start(  # noqa: PLR0912, PLR0913 - scan and qualification opti
     scan = collect(
         root,
         staged=False,
+        config=config,
+        allowlist=allowlist,
         ci=ci,
         max_file_bytes=max_file_bytes,
         skipped_files=skipped,

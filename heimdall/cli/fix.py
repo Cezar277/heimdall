@@ -33,7 +33,13 @@ from heimdall.remediation.naming import (
     deduplicate_variable_name,
     validate_variable_name,
 )
-from heimdall.remediation.templates import ReplacementPlan, TemplateError, plan_for_finding
+from heimdall.remediation.templates import (
+    Language,
+    ReplacementPlan,
+    TemplateError,
+    detect_language,
+    plan_for_finding,
+)
 from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
@@ -65,32 +71,65 @@ def _default_variable_name(line_text: str, finding: Finding) -> str:
         return "APP_SECRET"
 
 
-def _find_single_quoted_literal(line_text: str) -> str | None:
-    """Extrait l'unique littéral quoté d'une ligne en temps linéaire borné (O(n))."""
+#: Échappements décodés à l'identique en Python et en JavaScript. Tout autre
+#: échappement (``\\n``, ``\\x41``, ``\\u…``) rend le littéral ambigu entre
+#: langages : refus fail-closed plutôt qu'une valeur fausse dans ``.env``.
+_SIMPLE_ESCAPES: Final[frozenset[str]] = frozenset({"\\", '"', "'"})
+#: Marqueur de commentaire de ligne par langage pris en charge par ``fix``.
+_LINE_COMMENT_MARKERS: Final[dict[Language, str]] = {
+    Language.PYTHON: "#",
+    Language.JAVASCRIPT: "//",
+}
+
+
+def _scan_quoted(line_text: str, quote_index: int) -> tuple[str, int] | None:
+    """Décode le littéral ouvert en ``quote_index`` ; ``(valeur, fin)`` ou ``None``."""
+    quote = line_text[quote_index]
+    length = len(line_text)
+    cursor = quote_index + 1
+    decoded: list[str] = []
+    escaped = False
+    while cursor < length:
+        cur = line_text[cursor]
+        if cur == "\\":
+            if cursor + 1 >= length or line_text[cursor + 1] not in _SIMPLE_ESCAPES:
+                return None
+            decoded.append(line_text[cursor + 1])
+            escaped = True
+            cursor += 2
+            continue
+        if cur == quote:
+            # Préfixe Python (r"", b"", f"") : les échappements n'y ont pas le
+            # même sens, donc aucun décodage n'est sûr.
+            if escaped and quote_index > 0 and line_text[quote_index - 1].isalnum():
+                return None
+            return "".join(decoded), cursor
+        decoded.append(cur)
+        cursor += 1
+    return None
+
+
+def _find_single_quoted_literal(line_text: str, comment_marker: str | None = None) -> str | None:
+    """Extrait l'unique littéral quoté d'une ligne en temps linéaire borné (O(n)).
+
+    La valeur rendue est **décodée** (``\\"`` → ``"``) comme le font l'AST
+    Python et le parseur JS des templates. Hors littéral, ``comment_marker``
+    termine l'analyse : une apostrophe dans un commentaire (« clé d'API ») ne
+    rend plus la ligne ambiguë.
+    """
     if len(line_text) > _MAX_LINE_CHARS:
         return None
     found: str | None = None
     index = 0
     length = len(line_text)
     while index < length:
-        char = line_text[index]
-        if char in ('"', "'"):
-            quote = char
-            start = index + 1
-            cursor = start
-            closed = False
-            while cursor < length:
-                cur = line_text[cursor]
-                if cur == "\\" and cursor + 1 < length:
-                    cursor += 2
-                    continue
-                if cur == quote:
-                    closed = True
-                    break
-                cursor += 1
-            if not closed:
+        if comment_marker is not None and line_text.startswith(comment_marker, index):
+            break
+        if line_text[index] in ('"', "'"):
+            scanned = _scan_quoted(line_text, index)
+            if scanned is None:
                 return None
-            literal = line_text[start:cursor]
+            literal, cursor = scanned
             if not literal or found is not None:
                 return None
             found = literal
@@ -109,7 +148,9 @@ def _extract_secret_for_finding(
     lines = source.splitlines()
     if not 1 <= finding.line <= len(lines):
         return None
-    raw_literal = _find_single_quoted_literal(lines[finding.line - 1])
+    language = detect_language(finding.file)
+    marker = _LINE_COMMENT_MARKERS.get(language) if language is not None else None
+    raw_literal = _find_single_quoted_literal(lines[finding.line - 1], marker)
     if raw_literal is None:
         return None
     try:
