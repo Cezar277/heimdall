@@ -17,10 +17,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Python 3.10 (version de génération de requirements.lock)
+      # Python 3.12, pas 3.10 : requirements.lock épingle filelock 4.1.0 (CVE,
+      # correctifs >= 4.2.1 réservés à Python >= 3.11) sous 3.10 et 4.2.4 au-delà ;
+      # pip-audit échouerait en 3.10. La compatibilité 3.10 du code reste
+      # vérifiée statiquement (mypy python_version / ruff target-version).
+      - name: Python 3.12
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.10"
+          python-version: "3.12"
       - name: Install locked dependencies
         run: |
           python3 -m venv --clear .venv-injection

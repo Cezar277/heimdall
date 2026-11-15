@@ -322,7 +322,7 @@ openapi.yaml         contrat Vault API v1 (#15)
 Le workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (« CI Security
 & Quality ») exécute ruff, mypy (strict), bandit, les tests avec un seuil de
 couverture de 85 % (`pytest-cov`) et `pip-audit`, sur les runners **hébergés par
-GitHub** (`ubuntu-latest`, Python 3.10 épinglé), comme les autres workflows :
+GitHub** (`ubuntu-latest`, Python 3.12 épinglé), comme les autres workflows :
 chaque job tourne dans une VM jetable, aucune machine du projet n'exécute le
 code d'une PR (gratuit pour un dépôt public).
 
