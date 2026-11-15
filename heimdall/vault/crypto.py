@@ -53,21 +53,26 @@ pas rendre illisibles les blobs existants ; les deux modes sont exclusifs.
 
 import base64
 import collections
+import datetime
 import hashlib
 import hmac
+import ipaddress
 import math
 import os
 import re
 import secrets
 import unicodedata
 from collections.abc import Sequence
-from typing import NamedTuple
+from typing import Final, NamedTuple
 
 import argon2.low_level
+from cryptography import x509
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 _KEY_SIZE_BYTES: int = 32  # AES-256 / KEK 256 bits
 _NONCE_SIZE_BYTES: int = 12  # nonce AES-GCM 96 bits, unique par chiffrement (#67)
@@ -757,6 +762,79 @@ def generate_kek_salt() -> str:
     existants illisibles (la KEK dérivée change).
     """
     return base64.urlsafe_b64encode(secrets.token_bytes(ARGON2ID_SALT_BYTES)).decode("ascii")
+
+
+#: Durée de validité du certificat TLS local généré par ``heimdall vault init``.
+LOOPBACK_TLS_VALIDITY_DAYS: Final[int] = 365
+_MAX_TLS_VALIDITY_DAYS: Final[int] = 3650
+
+
+def generate_loopback_tls_pair(
+    *, days: int = LOOPBACK_TLS_VALIDITY_DAYS
+) -> tuple[bytes, bytes, datetime.datetime]:
+    """Génère un certificat TLS autosigné pour le Vault en boucle locale.
+
+    Rend ``(certificat PEM, clé privée PEM PKCS#8 non chiffrée, expiration)``.
+    Clé EC P-256 ; SAN ``IP:127.0.0.1`` et ``IP:::1`` (le client épingle l'IP de
+    boucle locale, jamais un nom DNS) ; ``CA:FALSE``, ``serverAuth`` seul — même
+    profil que la procédure ``openssl`` de ``docs/install.md``. Le certificat sert
+    aussi d'ancre de confiance au client (``vault-ca.pem``) : il n'émet rien.
+    La clé privée ne quitte jamais l'appelant, qui l'écrit en ``0600``.
+    """
+    if (
+        isinstance(days, bool)
+        or not isinstance(days, int)
+        or not 1 <= days <= _MAX_TLS_VALIDITY_DAYS
+    ):
+        raise ValueError("durée de validité invalide (1 à 3650 jours)")
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    not_after = now + datetime.timedelta(days=days)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(not_after)
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [
+                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                    x509.IPAddress(ipaddress.ip_address("::1")),
+                ]
+            ),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = certificate.public_bytes(serialization.Encoding.PEM)
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return cert_pem, key_pem, not_after
 
 
 def decode_kek_salt(salt: str | bytes) -> bytes:

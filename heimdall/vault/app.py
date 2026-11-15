@@ -102,6 +102,7 @@ from heimdall.vault.audit import AuditMiddleware, InMemoryAuditLog, SqliteAuditL
 from heimdall.vault.crypto import (
     MIN_MASTER_KEY_BYTES,
     VaultCipher,
+    _validate_master_key_complexity,
     constant_time_equal,
     decode_kek_salt,
     derive_kek_from_master_key,
@@ -923,11 +924,13 @@ class VaultSettings(BaseSettings):
     @field_validator("master_key")
     @classmethod
     def validate_master_key(cls, value: str | None) -> str | None:
-        """Valide la clé maîtresse : phrase de passe UTF-8 d'au moins 128 bits.
+        """Valide la clé maîtresse : phrase de passe UTF-8 d'au moins 256 bits.
 
-        Le seuil de 16 octets est une défense en profondeur : Argon2id ralentit
-        une attaque hors ligne mais ne rend pas une phrase de passe triviale
-        résistante. La valeur n'est jamais écho dans un message d'erreur. La
+        Le seuil de 32 octets et la complexité (M-11, mêmes règles que la
+        dérivation) sont vérifiés dès la configuration, même si un store
+        injecté ne dérive jamais la KEK. C'est une défense en profondeur :
+        Argon2id ralentit une attaque hors ligne mais ne rend pas une phrase de
+        passe triviale résistante. La valeur n'est jamais écho dans un message d'erreur. La
         valeur retournée est canonisée NFC (ticket #262) : deux formes Unicode
         équivalentes (précomposée vs combinée) produisent la même KEK.
         """
@@ -948,8 +951,9 @@ class VaultSettings(BaseSettings):
         if len(raw) < MIN_MASTER_KEY_BYTES:
             raise ValueError(
                 f"La clé maîtresse doit comporter au moins {MIN_MASTER_KEY_BYTES} "
-                "octets (128 bits)."
+                "octets (256 bits)."
             )
+        _validate_master_key_complexity(raw)
         return normalized
 
     @field_validator("kek_salt")
@@ -1860,7 +1864,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: PLR0915
             )
         response.headers["Cache-Control"] = "no-store"
         store: InMemorySecretStore = app.state.secret_store
-        record = await store.get(project=project, env=env, name=name)
+        # Métadonnées seules : /state ne déballe aucune DEK (invariant de store.py).
+        record = await store.get_state(project=project, env=env, name=name)
         if record is None:
             raise StarletteHTTPException(
                 status_code=404,

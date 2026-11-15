@@ -166,7 +166,10 @@ TEST_HMAC_KEY = "00" * 32
 
 #: Libellé unique du code 2 : panne anticipée et panne inattendue ne sont
 #: pas distinguables sur stderr (revue, oracle minimal).
-SCAN_ERROR_MESSAGE = "heimdall scan : scan impossible (erreur d'outillage)."
+SCAN_ERROR_MESSAGE = (
+    "heimdall scan : scan impossible (erreur d'outillage). "
+    "Relancez avec --debug pour afficher la cause."
+)
 
 
 @pytest.fixture(autouse=True)

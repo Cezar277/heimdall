@@ -35,7 +35,11 @@ from heimdall.scanner.finding import Finding
 from heimdall.scanner.hashing import SnippetHasher
 from heimdall.scanner.interface import ScanTarget
 from heimdall.scanner.limits import MULTILINE_WINDOW
-from heimdall.scanner.signatures import SignatureMatch, find_signature_matches
+from heimdall.scanner.signatures import (
+    SignatureMatch,
+    crosses_into_own_assignment,
+    find_signature_matches,
+)
 
 #: Plafond du nombre de Findings rendus en une passe (#29). Les bornes
 #: d'entrée ne suffisent pas : un dépôt adverse dense en candidats (un millier
@@ -152,7 +156,9 @@ class SignatureEngine:
             following = self._joined_window(line, lines, index)
             current_window = () if following is None else tuple(
                 match for match in find_signature_matches(following[0])
-                if match.start < following[1] and match.context_end <= following[1]
+                if match.start < following[1]
+                and match.context_end <= following[1]
+                and not crosses_into_own_assignment(match, following[1], following[0])
             )
             for match in find_line_matches(
                 line, self._entropy_config, preceding + current_window, deadline=self._deadline

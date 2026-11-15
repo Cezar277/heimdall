@@ -17,6 +17,7 @@ from typing import Final
 
 import typer
 
+from heimdall.cli import diagnostics
 from heimdall.cli.review import (
     Proposal,
     ReviewError,
@@ -25,15 +26,27 @@ from heimdall.cli.review import (
     review_proposals,
 )
 from heimdall.cli.scan import EXIT_CLEAN, EXIT_FINDINGS, ToolFailure, collect
-from heimdall.mcp.paths import PathEscape, confine
-from heimdall.remediation.apply import ApplyError, apply_replacement, cleanup_backup_file
+from heimdall.mcp.paths import ConfinedPath, PathEscape, confine
+from heimdall.remediation.apply import (
+    AppliedPatch,
+    ApplyError,
+    apply_replacement,
+    cleanup_backup_file,
+    undo_apply,
+)
 from heimdall.remediation.env import EnvRemediationError, remediate_environment
 from heimdall.remediation.naming import (
     _MAX_TAKEN,
     deduplicate_variable_name,
     validate_variable_name,
 )
-from heimdall.remediation.templates import ReplacementPlan, TemplateError, plan_for_finding
+from heimdall.remediation.templates import (
+    Language,
+    ReplacementPlan,
+    TemplateError,
+    detect_language,
+    plan_for_finding,
+)
 from heimdall.scanner.allowlist import Allowlist
 from heimdall.scanner.errors import ScanError
 from heimdall.scanner.finding import Finding
@@ -41,6 +54,11 @@ from heimdall.vault.atomic import parse_env_file, parse_example_names, read_file
 
 _FIX_ERROR_MESSAGE: Final[str] = "heimdall fix : remédiation impossible (erreur d'outillage)."
 _INCOMPATIBLE_OPTIONS_MESSAGE: Final[str] = "options incompatibles : --config et --no-allowlist"
+_NON_INTERACTIVE_HINT: Final[str] = (
+    "Aucun terminal interactif détecté : aucune modification n'a été faite. "
+    "Lancez `heimdall fix` dans un terminal pour valider chaque correction (Y/N), "
+    "ou utilisez `--ci` pour un simple rapport."
+)
 _MAX_LINE_CHARS: Final[int] = 4096
 _ASSIGNMENT_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]")
 
@@ -65,32 +83,65 @@ def _default_variable_name(line_text: str, finding: Finding) -> str:
         return "APP_SECRET"
 
 
-def _find_single_quoted_literal(line_text: str) -> str | None:
-    """Extrait l'unique littéral quoté d'une ligne en temps linéaire borné (O(n))."""
+#: Échappements décodés à l'identique en Python et en JavaScript. Tout autre
+#: échappement (``\\n``, ``\\x41``, ``\\u…``) rend le littéral ambigu entre
+#: langages : refus fail-closed plutôt qu'une valeur fausse dans ``.env``.
+_SIMPLE_ESCAPES: Final[frozenset[str]] = frozenset({"\\", '"', "'"})
+#: Marqueur de commentaire de ligne par langage pris en charge par ``fix``.
+_LINE_COMMENT_MARKERS: Final[dict[Language, str]] = {
+    Language.PYTHON: "#",
+    Language.JAVASCRIPT: "//",
+}
+
+
+def _scan_quoted(line_text: str, quote_index: int) -> tuple[str, int] | None:
+    """Décode le littéral ouvert en ``quote_index`` ; ``(valeur, fin)`` ou ``None``."""
+    quote = line_text[quote_index]
+    length = len(line_text)
+    cursor = quote_index + 1
+    decoded: list[str] = []
+    escaped = False
+    while cursor < length:
+        cur = line_text[cursor]
+        if cur == "\\":
+            if cursor + 1 >= length or line_text[cursor + 1] not in _SIMPLE_ESCAPES:
+                return None
+            decoded.append(line_text[cursor + 1])
+            escaped = True
+            cursor += 2
+            continue
+        if cur == quote:
+            # Préfixe Python (r"", b"", f"") : les échappements n'y ont pas le
+            # même sens, donc aucun décodage n'est sûr.
+            if escaped and quote_index > 0 and line_text[quote_index - 1].isalnum():
+                return None
+            return "".join(decoded), cursor
+        decoded.append(cur)
+        cursor += 1
+    return None
+
+
+def _find_single_quoted_literal(line_text: str, comment_marker: str | None = None) -> str | None:
+    """Extrait l'unique littéral quoté d'une ligne en temps linéaire borné (O(n)).
+
+    La valeur rendue est **décodée** (``\\"`` → ``"``) comme le font l'AST
+    Python et le parseur JS des templates. Hors littéral, ``comment_marker``
+    termine l'analyse : une apostrophe dans un commentaire (« clé d'API ») ne
+    rend plus la ligne ambiguë.
+    """
     if len(line_text) > _MAX_LINE_CHARS:
         return None
     found: str | None = None
     index = 0
     length = len(line_text)
     while index < length:
-        char = line_text[index]
-        if char in ('"', "'"):
-            quote = char
-            start = index + 1
-            cursor = start
-            closed = False
-            while cursor < length:
-                cur = line_text[cursor]
-                if cur == "\\" and cursor + 1 < length:
-                    cursor += 2
-                    continue
-                if cur == quote:
-                    closed = True
-                    break
-                cursor += 1
-            if not closed:
+        if comment_marker is not None and line_text.startswith(comment_marker, index):
+            break
+        if line_text[index] in ('"', "'"):
+            scanned = _scan_quoted(line_text, index)
+            if scanned is None:
                 return None
-            literal = line_text[start:cursor]
+            literal, cursor = scanned
             if not literal or found is not None:
                 return None
             found = literal
@@ -109,7 +160,9 @@ def _extract_secret_for_finding(
     lines = source.splitlines()
     if not 1 <= finding.line <= len(lines):
         return None
-    raw_literal = _find_single_quoted_literal(lines[finding.line - 1])
+    language = detect_language(finding.file)
+    marker = _LINE_COMMENT_MARKERS.get(language) if language is not None else None
+    raw_literal = _find_single_quoted_literal(lines[finding.line - 1], marker)
     if raw_literal is None:
         return None
     try:
@@ -119,6 +172,41 @@ def _extract_secret_for_finding(
     if not plan.manual_remediation and plan.before != plan.after:
         return raw_literal, plan
     return None
+
+
+def _confine_fixable(root: Path, file: str, planned: set[str]) -> ConfinedPath | None:
+    """Confine le fichier du finding ; ``None`` s'il ne peut pas être remédié.
+
+    - Un ``<fichier>.bak`` déjà présent (sauvegarde de l'utilisateur, parfois
+      suivie par Git) serait écrasé par la sauvegarde de ``fix`` puis supprimé
+      au nettoyage : le finding reste non remédiable.
+    - Un fichier qui porte déjà une proposition dans ce passage est différé :
+      chaque plan est calculé sur le contenu d'origine, donc un second plan
+      sur le même fichier serait périmé dès l'application du premier (et le
+      diff validé par l'humain ne serait plus celui écrit). Le finding est
+      compté comme restant ; relancer ``fix`` le propose sur le contenu à jour.
+    """
+    try:
+        confined = confine(root, file)
+    except PathEscape:
+        return None
+    if confined.relative in planned:
+        return None
+    if os.path.lexists(confined.absolute.with_name(f"{confined.absolute.name}.bak")):
+        return None
+    return confined
+
+
+def _rollback_apply(root: Path, receipt: AppliedPatch) -> None:
+    """Annule une application dont la mise à jour de ``.env`` a échoué."""
+    try:
+        undo_apply(root, receipt)
+    except ApplyError:
+        return
+    try:
+        cleanup_backup_file(root, receipt)
+    except ApplyError:
+        return
 
 
 def _existing_env_names(root: Path) -> set[str]:
@@ -193,12 +281,12 @@ def run_fix(  # noqa: PLR0913, PLR0915
     used_names = _existing_env_names(resolved_root)
     plans_by_finding: dict[Finding, tuple[ReplacementPlan, str]] = {}
     proposals: list[Proposal] = []
+    planned_files: set[str] = set()
     unfixable = 0
 
     for finding in _physical_findings(scan_report.findings):
-        try:
-            confined = confine(resolved_root, finding.file)
-        except PathEscape:
+        confined = _confine_fixable(resolved_root, finding.file, planned_files)
+        if confined is None:
             unfixable += 1
             continue
         source = read_file_secure_no_follow(confined.absolute)
@@ -231,6 +319,7 @@ def run_fix(  # noqa: PLR0913, PLR0915
             unfixable += 1
             continue
         used_names.add(variable)
+        planned_files.add(confined.relative)
         plans_by_finding[finding] = (plan, secret_value)
         proposals.append(proposal)
 
@@ -246,8 +335,22 @@ def run_fix(  # noqa: PLR0913, PLR0915
         if entry is None:
             raise ApplyError
         plan, secret_value = entry
-        receipt = apply_replacement(resolved_root, plan, cleanup_backup=False)
-        remediate_environment(resolved_root, {plan.variable: secret_value})
+        try:
+            receipt = apply_replacement(resolved_root, plan, cleanup_backup=False)
+        except BaseException as exc:
+            diagnostics.remember(exc)
+            raise
+        try:
+            remediate_environment(resolved_root, {plan.variable: secret_value})
+        except BaseException as exc:
+            diagnostics.remember(exc)
+            # Le source ne référence plus le secret mais `.env` ne le contient
+            # pas : sans retour arrière, l'application casse et la seule copie
+            # du secret reste dans un `.bak` non ignoré. Restauration du source
+            # puis suppression du `.bak` (best-effort : en cas d'échec, le
+            # `.bak` est conservé, c'est la dernière copie de la valeur).
+            _rollback_apply(resolved_root, receipt)
+            raise
         cleanup_backup_file(resolved_root, receipt)
         try:
             current_id = _checked_root_identity(root, resolved_root)
@@ -328,8 +431,14 @@ def fix_command(  # noqa: PLR0913, PLR0917
         "--json",
         help="Sortie JSON sur stdout sans secret.",
     ),
+    debug: bool = typer.Option(
+        False,
+        "--debug",
+        help="En cas d'erreur, affiche la cause et l'action à faire (jamais de valeur).",
+    ),
 ) -> None:
-    """Propose et applique la remédiation interactive des secrets détectés (#233)."""
+    """Propose et applique la remédiation interactive des secrets détectés."""
+    diagnostics.set_debug(debug)
     if config is not None and no_allowlist:
         typer.echo(_INCOMPATIBLE_OPTIONS_MESSAGE, err=True)
         raise typer.Exit(code=2)
@@ -342,6 +451,10 @@ def fix_command(  # noqa: PLR0913, PLR0917
             ci=ci,
         )
         typer.echo(render_fix_summary(report, remaining, json_output=json_output))
+        if not ci and not json_output and not report.interactive and remaining > 0:
+            # Sans terminal, la revue Y/N est impossible : rien n'est écrit.
+            # Le dire évite de croire à un bug (« 0 remédiation appliquée »).
+            typer.echo(_NON_INTERACTIVE_HINT, err=True)
     except (
         ScanError,
         ToolFailure,
@@ -349,10 +462,10 @@ def fix_command(  # noqa: PLR0913, PLR0917
         ApplyError,
         EnvRemediationError,
         TemplateError,
-    ):
-        typer.echo(_FIX_ERROR_MESSAGE, err=True)
+    ) as exc:
+        diagnostics.report_failure(_FIX_ERROR_MESSAGE, exc)
         raise typer.Exit(code=2) from None
-    except Exception:
-        typer.echo(_FIX_ERROR_MESSAGE, err=True)
+    except Exception as exc:
+        diagnostics.report_failure(_FIX_ERROR_MESSAGE, exc)
         raise typer.Exit(code=2) from None
     raise typer.Exit(code=EXIT_FINDINGS if remaining > 0 else EXIT_CLEAN)

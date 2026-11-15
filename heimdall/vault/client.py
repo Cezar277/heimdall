@@ -178,6 +178,45 @@ def _key_from_env() -> str | None:
     return None
 
 
+#: Noms des fichiers de configuration client sous ``heimdall_config_dir()``.
+DEFAULT_KEY_FILENAME: Final[str] = "vault.key"
+DEFAULT_CA_FILENAME: Final[str] = "vault-ca.pem"
+
+
+def heimdall_config_dir() -> Path:
+    """Répertoire de configuration client : ``$XDG_CONFIG_HOME/heimdall`` ou ``~/.config/heimdall``.
+
+    Lève ``OSError``/``RuntimeError`` si ``HOME`` est indéterminable : l'appelant
+    décide (repli ``None`` ou erreur actionnable).
+    """
+    xdg_config = os.environ.get("XDG_CONFIG_HOME")
+    config_dir = Path(xdg_config) if xdg_config else Path.home() / ".config"
+    return config_dir / "heimdall"
+
+
+def resolve_ca_cert(ca_cert: Path | None = None) -> Path | None:
+    """Résout le certificat CA du Vault : option, ``HEIMDALL_VAULT_CA_CERT``, puis défaut.
+
+    Le défaut ``<config>/heimdall/vault-ca.pem`` est celui qu'écrit
+    ``heimdall vault init`` : après l'initialisation, aucune option ``--ca-cert``
+    n'est nécessaire. Le fichier reste lu par ``read_file_secure_no_follow``
+    (lien symbolique refusé) à la construction du client. Sans aucune source,
+    ``None`` : seuls les certificats système sont approuvés.
+    """
+    if ca_cert is not None:
+        return ca_cert
+    env_ca = os.environ.get("HEIMDALL_VAULT_CA_CERT")
+    if env_ca is not None and env_ca.strip():
+        return Path(env_ca.strip())
+    try:
+        default_file = heimdall_config_dir() / DEFAULT_CA_FILENAME
+        if default_file.is_file():
+            return default_file
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return None
+
+
 def _find_key_file(key_file: Path | None) -> Path | None:
     """Détermine le chemin du fichier de clé API.
 
@@ -192,9 +231,7 @@ def _find_key_file(key_file: Path | None) -> Path | None:
         env_file = os.environ.get("HEIMDALL_API_KEY_FILE")
         if env_file is not None and env_file.strip():
             return Path(env_file.strip())
-        xdg_config = os.environ.get("XDG_CONFIG_HOME")
-        config_dir = Path(xdg_config) if xdg_config else Path.home() / ".config"
-        default_file = config_dir / "heimdall" / "vault.key"
+        default_file = heimdall_config_dir() / DEFAULT_KEY_FILENAME
         if default_file.exists():
             return default_file
         return None

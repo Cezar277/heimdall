@@ -50,6 +50,7 @@ from heimdall.vault.client import (
     VaultRateLimitError,
     detect_project,
     resolve_api_key,
+    resolve_ca_cert,
     resolve_vault_url,
 )
 
@@ -125,7 +126,10 @@ _VAULT_URL_OPTION = typer.Option(
 _CA_CERT_OPTION = typer.Option(
     None,
     "--ca-cert",
-    help="Chemin vers un certificat CA interne pour vérifier le Vault TLS.",
+    help=(
+        "Certificat CA du Vault (défaut : $HEIMDALL_VAULT_CA_CERT, sinon "
+        "~/.config/heimdall/vault-ca.pem écrit par `heimdall vault init`)."
+    ),
 )
 
 
@@ -140,7 +144,7 @@ def _init_client(vault_url: str | None, ca_cert: Path | None) -> VaultClient:
         raise typer.Exit(code=2) from None
 
     try:
-        return VaultClient(base_url=url, api_key=api_key, ca_cert=ca_cert)
+        return VaultClient(base_url=url, api_key=api_key, ca_cert=resolve_ca_cert(ca_cert))
     except ValueError as exc:
         typer.echo(f"Configuration du client invalide : {exc}", err=True)
         raise typer.Exit(code=2) from None
@@ -332,7 +336,7 @@ def vault_push(  # noqa: PLR0913, PLR0917
     vault_url: str | None = _VAULT_URL_OPTION,
     ca_cert: Path | None = _CA_CERT_OPTION,
 ) -> None:
-    """Pousse les secrets d'un fichier local vers le Vault (ticket #99).
+    """Pousse les secrets d'un fichier local vers le Vault.
 
     Ne divulgue JAMAIS les valeurs secrètes dans la sortie terminal ou les erreurs.
 
@@ -364,8 +368,10 @@ def vault_push(  # noqa: PLR0913, PLR0917
     total_chars = 0
     for name, value in to_push.items():
         if not isinstance(value, str) or "\x00" in value or "\n" in value or "\r" in value:
-            # Refus franc avant tout envoi : un octet nul ou un saut de ligne
-            # rendrait le secret inexploitable (pull/run le rejettent).
+            # Refus franc avant tout envoi : un octet nul est rejeté par pull
+            # et run, un saut de ligne par pull (fichier .env). `run` accepte
+            # le multiligne (variables d'environnement), mais `push` reste
+            # restrictif pour que tout secret poussé soit relisible par pull.
             # Message statique : la valeur n'est jamais reflétée.
             typer.echo(
                 f"Erreur : valeur invalide pour le secret {name[:32]!r} "
@@ -597,7 +603,7 @@ def vault_pull(  # noqa: PLR0912, PLR0913, PLR0917
     vault_url: str | None = _VAULT_URL_OPTION,
     ca_cert: Path | None = _CA_CERT_OPTION,
 ) -> None:
-    """Récupère les secrets du Vault et écrit le fichier .env en droits 0600 (ticket #100)."""
+    """Récupère les secrets du Vault et écrit le fichier .env en droits 0600."""
     proj = _validate_project_and_env(project, env)
     _validate_requested_names(names)
     target_names = _resolve_pull_names(names, example_file, output)
@@ -760,7 +766,7 @@ def vault_run(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
     vault_url: str | None = _VAULT_URL_OPTION,
     ca_cert: Path | None = _CA_CERT_OPTION,
 ) -> None:
-    """Lance une commande avec les secrets injectés en mémoire (ticket #101).
+    """Lance une commande avec les secrets injectés en mémoire.
 
     Allowlist locale : seuls les noms explicitement fournis par ``--name``, le
     ``.env.example`` ou le ``.env`` local sont demandés au Vault. Le nom renvoyé

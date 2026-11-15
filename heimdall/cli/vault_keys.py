@@ -38,6 +38,15 @@ from heimdall.cli.vault_client import (
     vault_push,
     vault_run,
 )
+from heimdall.cli.vault_setup import (
+    SetupError,
+    display_path,
+    load_server_env_or_exit,
+    save_client_key,
+    vault_init_command,
+    vault_login_command,
+    vault_serve_command,
+)
 from heimdall.vault import auth as vault_auth
 from heimdall.vault.audit import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, SqliteAuditLog
 from heimdall.vault.crypto import (
@@ -58,23 +67,43 @@ from heimdall.vault.database import (
 
 key_app = typer.Typer(
     name="key",
-    help="Cycle de vie des clés API de projet (ticket #64).",
+    help="Cycle de vie des clés API de projet.",
     no_args_is_help=True,
 )
 
 vault_app = typer.Typer(
     name="vault",
-    help="Administration et client du Vault Heimdall (tickets #35, #64).",
+    help="Administration et client du Vault Heimdall.",
     no_args_is_help=True,
 )
 vault_app.add_typer(key_app, name="key")
 
 audit_app = typer.Typer(
     name="audit",
-    help="Consultation du journal d'audit chaîné (ticket #113).",
+    help="Consultation du journal d'audit chaîné.",
     no_args_is_help=True,
 )
 vault_app.add_typer(audit_app, name="audit")
+
+
+@key_app.callback()
+def _key_app_setup() -> None:
+    """Cycle de vie des clés API de projet."""
+    # Commandes d'administration côté serveur : la configuration écrite par
+    # `heimdall vault init` (pepper, base) est chargée si elle existe.
+    load_server_env_or_exit()
+
+
+@audit_app.callback()
+def _audit_app_setup() -> None:
+    """Consultation du journal d'audit chaîné."""
+    load_server_env_or_exit()
+
+
+# Mise en route en une commande (voir heimdall/cli/vault_setup.py).
+vault_app.command("init")(vault_init_command)
+vault_app.command("serve")(vault_serve_command)
+vault_app.command("login")(vault_login_command)
 
 # Client Vault CLI (tickets #35, #99, #100, #101).
 # `vault run` est un alias de la voie canonique `heimdall run` (main.py) :
@@ -84,7 +113,7 @@ vault_app.command("push")(vault_push)
 vault_app.command("pull")(vault_pull)
 vault_app.command(
     "run",
-    help="Lance une commande avec les secrets injectés en mémoire (ticket #101).",
+    help="Lance une commande avec les secrets injectés en mémoire.",
     context_settings=RUN_CONTEXT_SETTINGS,
 )(vault_run)
 
@@ -148,11 +177,19 @@ def create_key(
         ...,
         "--project",
         "-p",
-        help="Identifiant du projet (^[a-z][a-z0-9_-]{0,63}$).",
+        help="Identifiant du projet : une minuscule, puis minuscules, chiffres, _ ou - (64 max).",
     ),
     db_path: Path | None = _DB_PATH_OPTION,
+    save: bool = typer.Option(
+        False,
+        "--save",
+        help=(
+            "Enregistre la clé pour le client local (~/.config/heimdall/vault.key, "
+            "0600) au lieu de l'afficher."
+        ),
+    ),
 ) -> None:
-    """Émet une clé API de projet et l'affiche UNE SEULE FOIS."""
+    """Émet une clé API de projet et l'affiche UNE SEULE FOIS (ou l'enregistre avec --save)."""
     try:
         resolved = _resolve_db_path(db_path)
         pepper = _explicit_pepper()
@@ -168,6 +205,20 @@ def create_key(
         # reste générique, comme le contrat d'erreurs du serveur.
         typer.echo("Erreur : échec de l'émission de la clé API.", err=True)
         raise typer.Exit(code=1) from None
+    if save:
+        try:
+            saved = save_client_key(issued.raw_key)
+        except SetupError as exc:
+            # La clé est émise : ne jamais la perdre, l'afficher en repli.
+            typer.echo(f"Avertissement : {exc}", err=True)
+        else:
+            typer.echo(
+                f"Clé API de projet émise et enregistrée dans {display_path(saved)} "
+                "(droits 0600)."
+            )
+            typer.echo(f"Identifiant : {issued.key_id}")
+            typer.echo(f"Projet      : {issued.project_id}")
+            return
     typer.echo(
         "Clé API de projet émise — affichée UNE SEULE FOIS, à copier maintenant :"
     )
@@ -601,7 +652,7 @@ def _require_rotation_audit_key(resolved: Path) -> bytes:
 @vault_app.command(
     "rotate-kek",
     help=(
-        "Effectue la rotation transactionnelle de la KEK sur tous les secrets (ticket #71).\n\n"
+        "Effectue la rotation transactionnelle de la KEK sur tous les secrets.\n\n"
         "RÈGLES DE SÉCURITÉ (invariant 9) :\n"
         "Pour éviter toute fuite dans les arguments de processus ('ps') et l'historique shell,\n"
         "les clés et phrases de passe sont lues EXCLUSIVEMENT depuis l'environnement :\n"
@@ -635,7 +686,10 @@ def rotate_kek_command(
         help="Autorise la rotation même si un serveur Vault semble écouter sur le port.",
     ),
 ) -> None:
-    """Effectue la rotation transactionnelle de la KEK sur tous les secrets (ticket #71)."""
+    """Effectue la rotation transactionnelle de la KEK sur tous les secrets."""
+    # Base et clé HMAC serveur depuis `heimdall vault init`, si présent. Les
+    # clés d'origine et cible restent explicites (HEIMDALL_VAULT_OLD_* / _NEW_*).
+    from_server_env = load_server_env_or_exit()
     try:
         resolved = _resolve_db_path(db_path)
         # Pré-contrôle sans suivi de lien symbolique (lstat), avant la garde
@@ -700,7 +754,8 @@ def rotate_kek_command(
 
     if count == 0:
         typer.echo(
-            "Erreur : aucun secret trouvé dans la base — vérifiez --db-path.",
+            "Erreur : aucun secret trouvé dans la base (ou uniquement des secrets "
+            "rotés, sans DEK à réenvelopper) — vérifiez --db-path.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -725,6 +780,15 @@ def rotate_kek_command(
         raise typer.Exit(code=1) from None
 
     typer.echo(f"Rotation de la KEK réussie : {count} secret(s) réenveloppé(s).")
+    if from_server_env:
+        # La base est désormais chiffrée sous la NOUVELLE clé : server.env doit
+        # la porter, sinon `heimdall vault serve` ne pourra plus déchiffrer.
+        typer.echo(
+            "IMPORTANT : mettez à jour ~/.config/heimdall/server/server.env avec la "
+            "nouvelle clé (HEIMDALL_VAULT_MASTER_KEY et HEIMDALL_VAULT_KEK_SALT, ou "
+            "HEIMDALL_VAULT_KEK) avant de relancer `heimdall vault serve`.",
+            err=True,
+        )
 
 
 vault_app.command("kek-rotate", hidden=True)(rotate_kek_command)

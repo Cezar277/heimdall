@@ -26,10 +26,12 @@ from typing import Final
 import typer
 
 import heimdall
+from heimdall.cli import diagnostics
 from heimdall.cli.cold_start import collect_cold_start, render_cold_start
 from heimdall.cli.fix import fix_command
 from heimdall.cli.history import collect_history, render_history
 from heimdall.cli.hook import hook_app
+from heimdall.cli.onboarding import init_command
 from heimdall.cli.scan import (
     EXIT_CLEAN,
     EXIT_ERROR,
@@ -52,15 +54,33 @@ from heimdall.scanner.errors import ScanError
 _SCAN_ERROR_MESSAGE: Final[str] = "heimdall scan : scan impossible (erreur d'outillage)."
 
 
+#: Option ``--debug`` partagée : la cause statique et l'action à faire.
+_DEBUG_OPTION = typer.Option(
+    False,
+    "--debug",
+    help="En cas d'erreur, affiche la cause et l'action à faire (jamais de valeur).",
+)
+
+
 def _scan_root_argument(path: str) -> Path:
     """Refuse un argument vide avant sa normalisation par Path en point."""
     if not path:
         raise ScanError("scan impossible : entrée non analysable")
     return Path(path)
 
+_QUICKSTART: Final[str] = (
+    "Pour commencer, dans votre dépôt :\n\n"
+    "  heimdall init          installe le hook et fait un premier scan\n\n"
+    "  heimdall scan          cherche les secrets dans l'arbre de travail\n\n"
+    "  heimdall fix           déplace chaque secret vers .env, avec validation Y/N\n\n"
+    "Vault local chiffré : heimdall vault init --help. "
+    "En cas d'erreur, ajoutez --debug pour voir la cause."
+)
+
 app = typer.Typer(
     name="heimdall",
     help="Sentinelle DevSecOps 100 % locale : empêche les secrets de finir dans Git.",
+    epilog=_QUICKSTART,
     no_args_is_help=True,
     invoke_without_command=True,  # `--version` seul ne doit pas exiger de sous-commande.
 )
@@ -68,6 +88,8 @@ app = typer.Typer(
 app.add_typer(vault_app, name="vault")
 # Hook Git pre-commit (tickets #36, #103-#106).
 app.add_typer(hook_app, name="hook")
+
+app.command("init")(init_command)
 
 app.command(
     "fix",
@@ -84,7 +106,7 @@ app.command(
 app.command(
     "run",
     help=(
-        "Lance une commande avec les secrets injectés en mémoire (ticket #101).\n\n"
+        "Lance une commande avec les secrets injectés en mémoire.\n\n"
         "Limite de sécurité : sous Linux, les variables d'environnement d'un processus sont "
         "visibles par les processus du même utilisateur via /proc/<pid>/environ."
     ),
@@ -111,7 +133,9 @@ def _echo_stderr_best_effort(message: str) -> None:
 @app.callback()
 def _root(
     version: bool = typer.Option(False, "--version", help="Affiche la version et sort."),
+    debug: bool = _DEBUG_OPTION,
 ) -> None:
+    diagnostics.begin_invocation(debug)
     if version:
         typer.echo(f"heimdall {heimdall.__version__}")
         raise typer.Exit(0)
@@ -165,10 +189,11 @@ def scan(  # noqa: PLR0913, PLR0917
         "--json",
         help="Sortie JSON sur stdout (contrat machine heimdall.scan.v1).",
     ),
+    debug: bool = _DEBUG_OPTION,
 ) -> None:
-    """Scanne le dépôt à la recherche de secrets (#29, #24 et #59).
+    """Scanne le dépôt à la recherche de secrets.
 
-    Par défaut, l'arbre de travail est analysé en mode tolérant (#229) : la base
+    Par défaut, l'arbre de travail est analysé en mode tolérant : la base
     VCS et les entrées non suivies qu'un ``.gitignore`` du dépôt déclare
     ignorées sont écartées (compteurs ``vcs_ignored`` et ``git_ignored``).
     Un fichier **suivi** est toujours analysé, même s'il matche un
@@ -181,7 +206,7 @@ def scan(  # noqa: PLR0913, PLR0917
     l'ancêtre commun de ``REF`` et ``HEAD`` et ``HEAD`` (trois points) :
     seuls les changements de la branche courante sont jugés.
 
-    L'allowlist déterministe (#24) écarte les cas évidents sans passer par
+    L'allowlist déterministe écarte les cas évidents sans passer par
     le LLM et émet une trace pour chaque rejet (règle, fichier, ligne).
 
     ``--ci`` active le mode headless : aucun dialogue, aucun LLM, aucun
@@ -192,6 +217,7 @@ def scan(  # noqa: PLR0913, PLR0917
     En cas de doute, **refus par défaut** : une entrée non analysable (racine
     absente, index en conflit, fichier illisible) sort en 2, jamais en 0.
     """
+    diagnostics.set_debug(debug)
     if config is not None and no_allowlist:
         _echo_stderr_best_effort("options incompatibles : --config et --no-allowlist")
         raise typer.Exit(code=2)
@@ -246,19 +272,21 @@ def scan(  # noqa: PLR0913, PLR0917
         exit_code = (
             EXIT_FINDINGS if report.findings else EXIT_CLEAN if report.complete else EXIT_ERROR
         )
-    except (ScanError, ToolFailure):
+    except (ScanError, ToolFailure) as exc:
         # Erreur d'outillage : le périmètre n'a pas été analysé en entier.
         # Jamais 0, jamais 1 : c'est 2 (REQ-SEC-07). L'écriture est
         # best-effort (stderr fermé en CI) : elle ne doit pas lever à son
-        # tour, sinon la traceback sortirait en 1.
-        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
+        # tour, sinon la traceback sortirait en 1. La cause n'est affichée
+        # qu'en --debug (message statique, voir heimdall.cli.diagnostics).
+        diagnostics.report_failure(_SCAN_ERROR_MESSAGE, exc)
         raise typer.Exit(code=2) from None
-    except Exception:
+    except Exception as exc:
         # Panne inattendue (collecte, rendu ou résumé --ci) : même contrat,
         # **même libellé** que ci-dessus (un observateur ne doit pas
         # distinguer une panne anticipée d'une panne inattendue), écriture
-        # best-effort (invariant 8).
-        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
+        # best-effort (invariant 8). En --debug : le type seul, jamais le
+        # message (il pourrait contenir une valeur).
+        diagnostics.report_failure(_SCAN_ERROR_MESSAGE, exc)
         raise typer.Exit(code=2) from None
     raise typer.Exit(code=exit_code)
 
@@ -279,12 +307,29 @@ def cold_start(  # noqa: PLR0913, PLR0917 - options CLI explicites
         help="Taille maximale par fichier, en octets.",
     ),
     strict: bool = typer.Option(False, "--strict", help="Refuse les exclusions de contenu."),
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        help="Configuration explicite (requise hors dépôt avec --ci si heimdall.toml existe).",
+    ),
+    no_allowlist: bool = typer.Option(
+        False,
+        "--no-allowlist",
+        help="Désactive l'allowlist déterministe.",
+    ),
+    debug: bool = _DEBUG_OPTION,
 ) -> None:
-    """Premier scan complet : regex/entropie puis avis du LLM local (#107).
+    """Premier scan complet : regex/entropie puis avis du LLM local.
 
     Hors CI avec LLM, les propositions faux_positif sont journalisées au
     chemin opérateur par défaut. --ci ou --no-llm désactive ce journal.
+    Comme ``scan --ci``, ``--ci`` refuse l'allowlist du dépôt scanné
+    (CWE-345) : fournir ``--config`` hors dépôt ou ``--no-allowlist``.
     """
+    diagnostics.set_debug(debug)
+    if config is not None and no_allowlist:
+        _echo_stderr_best_effort("options incompatibles : --config et --no-allowlist")
+        raise typer.Exit(code=2)
     try:
         report = collect_cold_start(
             _scan_root_argument(path),
@@ -292,10 +337,12 @@ def cold_start(  # noqa: PLR0913, PLR0917 - options CLI explicites
             llm=llm,
             max_file_bytes=max_file_bytes,
             strict=strict,
+            config=config,
+            allowlist=Allowlist.empty() if no_allowlist else None,
         )
         typer.echo(render_cold_start(report, json_output=json_output))
-    except Exception:
-        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
+    except Exception as exc:
+        diagnostics.report_failure(_SCAN_ERROR_MESSAGE, exc)
         raise typer.Exit(code=2) from None
     if report.skipped_files or not report.scan.complete:
         raise typer.Exit(code=2)
@@ -316,12 +363,14 @@ def deep_scan(  # noqa: PLR0913, PLR0917 - options CLI explicites
         max=1_048_576,
         help="Taille maximale par blob, en octets.",
     ),
+    debug: bool = _DEBUG_OPTION,
 ) -> None:
-    """Scanne tous les commits accessibles et signale les secrets à révoquer (#108–#110).
+    """Scanne tous les commits accessibles et signale les secrets à révoquer.
 
     Hors CI avec LLM, les propositions faux_positif sont journalisées au
     chemin opérateur par défaut. --ci ou --no-llm désactive ce journal.
     """
+    diagnostics.set_debug(debug)
     try:
         report = collect_history(
             _scan_root_argument(path), ci=ci, llm=llm, max_file_bytes=max_file_bytes, strict=strict
@@ -330,8 +379,8 @@ def deep_scan(  # noqa: PLR0913, PLR0917 - options CLI explicites
         exit_code = (
             EXIT_FINDINGS if report.findings else EXIT_CLEAN if report.complete else EXIT_ERROR
         )
-    except Exception:
-        _echo_stderr_best_effort(_SCAN_ERROR_MESSAGE)
+    except Exception as exc:
+        diagnostics.report_failure(_SCAN_ERROR_MESSAGE, exc)
         raise typer.Exit(code=2) from None
     raise typer.Exit(code=exit_code)
 
@@ -340,7 +389,7 @@ def deep_scan(  # noqa: PLR0913, PLR0917 - options CLI explicites
 def rejections(
     details: bool = typer.Option(False, "--details", help="Affiche les entrées JSONL vérifiées."),
 ) -> None:
-    """Vérifie et affiche le journal local des propositions de rejet du LLM (#33)."""
+    """Vérifie et affiche le journal local des propositions de rejet du LLM."""
     try:
         entries = RejectionJournal().read()
         typer.echo(rejection_summary(len(entries)))
@@ -357,12 +406,12 @@ def rejections(
 def mcp(
     root: str = typer.Option(".", "--root", help="Racine du dépôt exposée au LLM."),
 ) -> None:
-    """Démarre le serveur MCP sur stdio (outils en lecture seule, contrat #16).
+    """Démarre le serveur MCP sur stdio (outils en lecture seule).
 
     Le serveur vit en sous-processus et n'ouvre aucun port. La racine est
-    fixée ici, au démarrage : le LLM ne la fournit jamais (contrat #16,
-    invariant 2). stdout ne porte que le protocole — tout le reste va sur
-    stderr, sous peine de casser le canal.
+    fixée ici, au démarrage : le LLM ne la fournit jamais. stdout ne porte
+    que le protocole — tout le reste va sur stderr, sous peine de casser le
+    canal.
     """
     try:
         run_stdio(root)
