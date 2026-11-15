@@ -175,6 +175,17 @@ def test_fix_without_terminal_explains_why_nothing_changed(tmp_path: Path) -> No
 # -- Aide lisible -------------------------------------------------------------
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _help(*argv: str) -> str:
+    """Aide rendue en texte brut : Rich colore la sortie si la CI force la couleur
+    (``FORCE_COLOR``), et les codes ANSI découpent alors ``--debug``."""
+    result = CliRunner().invoke(app, [*argv, "--help"], terminal_width=200)
+    assert result.exit_code == 0, argv
+    return _ANSI.sub("", result.output)
+
+
 def _all_command_paths(command: object, prefix: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
     paths = [prefix]
     for name, sub in getattr(command, "commands", {}).items():
@@ -186,23 +197,21 @@ def test_help_has_no_internal_ticket_references() -> None:
     root = typer.main.get_command(app)
     offenders = []
     for path in _all_command_paths(root):
-        result = CliRunner().invoke(app, [*path, "--help"], terminal_width=200)
-        assert result.exit_code == 0, path
-        if re.search(r"#\d+|\bticket", result.output):
+        if re.search(r"#\d+|\bticket", _help(*path)):
             offenders.append(" ".join(path) or "heimdall")
     assert offenders == []
 
 
 def test_root_help_says_where_to_start() -> None:
-    result = CliRunner().invoke(app, ["--help"], terminal_width=200)
-    assert "heimdall init" in result.output
-    assert "--debug" in result.output
+    output = _help()
+    assert "heimdall init" in output
+    assert "--debug" in output
 
 
 def test_project_id_help_is_rendered_in_full() -> None:
-    result = CliRunner().invoke(app, ["vault", "key", "create", "--help"], terminal_width=200)
-    assert "^{0,63}$" not in result.output
-    assert "minuscules, chiffres" in result.output
+    output = _help("vault", "key", "create")
+    assert "^{0,63}$" not in output
+    assert "minuscules, chiffres" in output
 
 
 # -- heimdall init --------------------------------------------------------------
