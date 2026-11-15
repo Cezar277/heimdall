@@ -41,10 +41,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Python 3.10 (version de génération de requirements.lock)
+      # tests/contracts/requirements.txt est compilé pour Python >= 3.11 (pip-compile 3.12 :
+      # pas d'exceptiongroup, coverage 7.17 exige >= 3.11) ; requirements.lock
+      # (CLI, ci.yml) reste en 3.10.
+      - name: Python 3.12 (version de génération de tests/contracts/requirements.txt)
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
       - name: Setup Python venv and install dependencies
         run: |
