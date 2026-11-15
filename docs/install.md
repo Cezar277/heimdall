@@ -50,6 +50,15 @@ git rev-parse --short HEAD
 
 ## 3. Générer les secrets et le certificat TLS
 
+> **Raccourci.** Depuis le dépôt, `heimdall vault init --docker .` fait tout ce
+> paragraphe en une commande : `.env` (clé maîtresse, sel, pepper, clé HMAC
+> serveur), `secrets/` (certificat EC P-256, SAN `127.0.0.1` et `::1`) et
+> `data/`, en droits `0600`/`0700`, sans jamais écraser l'existant. Il configure
+> aussi le client (`~/.config/heimdall/vault-ca.pem` : plus besoin de
+> `--ca-cert`) et affiche les commandes `sudo chown` restantes. Sans Docker :
+> `heimdall vault init` puis `heimdall vault serve`. La procédure manuelle
+> ci-dessous reste la référence auditée.
+
 Les secrets ne sont **jamais** commités : `.env` et `secrets/` sont ignorés
 par Git. Les commandes ci-dessous créent des valeurs aléatoires et les
 écrivent avec des permissions restrictives.

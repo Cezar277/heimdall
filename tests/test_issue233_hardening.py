@@ -604,7 +604,10 @@ def test_fix_refuses_replaced_root_after_apply(tmp_path: Path, cli: bool, moment
             result = CliRunner().invoke(app, ["fix", str(repo), "--json"])
             assert result.exit_code == 2
             assert result.stdout == ""
-            assert result.stderr == "heimdall fix : remédiation impossible (erreur d'outillage).\n"
+            assert result.stderr == (
+                "heimdall fix : remédiation impossible (erreur d'outillage). "
+                "Relancez avec --debug pour afficher la cause.\n"
+            )
         else:
             with pytest.raises(ScanError, match="^racine modifiée depuis le scan$"):
                 run_fix(repo, interactive=True)

@@ -17,6 +17,7 @@ from typing import Final
 
 import typer
 
+from heimdall.cli import diagnostics
 from heimdall.cli.review import (
     Proposal,
     ReviewError,
@@ -53,6 +54,11 @@ from heimdall.vault.atomic import parse_env_file, parse_example_names, read_file
 
 _FIX_ERROR_MESSAGE: Final[str] = "heimdall fix : remédiation impossible (erreur d'outillage)."
 _INCOMPATIBLE_OPTIONS_MESSAGE: Final[str] = "options incompatibles : --config et --no-allowlist"
+_NON_INTERACTIVE_HINT: Final[str] = (
+    "Aucun terminal interactif détecté : aucune modification n'a été faite. "
+    "Lancez `heimdall fix` dans un terminal pour valider chaque correction (Y/N), "
+    "ou utilisez `--ci` pour un simple rapport."
+)
 _MAX_LINE_CHARS: Final[int] = 4096
 _ASSIGNMENT_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]")
 
@@ -329,10 +335,15 @@ def run_fix(  # noqa: PLR0913, PLR0915
         if entry is None:
             raise ApplyError
         plan, secret_value = entry
-        receipt = apply_replacement(resolved_root, plan, cleanup_backup=False)
+        try:
+            receipt = apply_replacement(resolved_root, plan, cleanup_backup=False)
+        except BaseException as exc:
+            diagnostics.remember(exc)
+            raise
         try:
             remediate_environment(resolved_root, {plan.variable: secret_value})
-        except BaseException:
+        except BaseException as exc:
+            diagnostics.remember(exc)
             # Le source ne référence plus le secret mais `.env` ne le contient
             # pas : sans retour arrière, l'application casse et la seule copie
             # du secret reste dans un `.bak` non ignoré. Restauration du source
@@ -420,8 +431,14 @@ def fix_command(  # noqa: PLR0913, PLR0917
         "--json",
         help="Sortie JSON sur stdout sans secret.",
     ),
+    debug: bool = typer.Option(
+        False,
+        "--debug",
+        help="En cas d'erreur, affiche la cause et l'action à faire (jamais de valeur).",
+    ),
 ) -> None:
-    """Propose et applique la remédiation interactive des secrets détectés (#233)."""
+    """Propose et applique la remédiation interactive des secrets détectés."""
+    diagnostics.set_debug(debug)
     if config is not None and no_allowlist:
         typer.echo(_INCOMPATIBLE_OPTIONS_MESSAGE, err=True)
         raise typer.Exit(code=2)
@@ -434,6 +451,10 @@ def fix_command(  # noqa: PLR0913, PLR0917
             ci=ci,
         )
         typer.echo(render_fix_summary(report, remaining, json_output=json_output))
+        if not ci and not json_output and not report.interactive and remaining > 0:
+            # Sans terminal, la revue Y/N est impossible : rien n'est écrit.
+            # Le dire évite de croire à un bug (« 0 remédiation appliquée »).
+            typer.echo(_NON_INTERACTIVE_HINT, err=True)
     except (
         ScanError,
         ToolFailure,
@@ -441,10 +462,10 @@ def fix_command(  # noqa: PLR0913, PLR0917
         ApplyError,
         EnvRemediationError,
         TemplateError,
-    ):
-        typer.echo(_FIX_ERROR_MESSAGE, err=True)
+    ) as exc:
+        diagnostics.report_failure(_FIX_ERROR_MESSAGE, exc)
         raise typer.Exit(code=2) from None
-    except Exception:
-        typer.echo(_FIX_ERROR_MESSAGE, err=True)
+    except Exception as exc:
+        diagnostics.report_failure(_FIX_ERROR_MESSAGE, exc)
         raise typer.Exit(code=2) from None
     raise typer.Exit(code=EXIT_FINDINGS if remaining > 0 else EXIT_CLEAN)

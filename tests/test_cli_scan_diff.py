@@ -35,7 +35,10 @@ FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 #: Clé HMAC locale de test : empreintes déterministes, aucun fichier créé.
 TEST_HMAC_KEY = "00" * 32
 #: Libellé unique du code 2 (invariant 8 : aucune entrée reflétée).
-SCAN_ERROR_MESSAGE = "heimdall scan : scan impossible (erreur d'outillage)."
+SCAN_ERROR_MESSAGE = (
+    "heimdall scan : scan impossible (erreur d'outillage). "
+    "Relancez avec --debug pour afficher la cause."
+)
 
 
 @pytest.fixture(autouse=True)

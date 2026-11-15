@@ -7,6 +7,36 @@ les secrets (mots de passe, clés API, clés privées) de finir dans Git.
 Le LLM local propose, le programme vérifie, l'humain valide (`Y / N / E`) ;
 en CI (`heimdall scan --ci`), un secret en clair fait échouer le pipeline.
 
+## Démarrage rapide
+
+Une fois Heimdall installé (voir [Installation](#installation)), dans votre dépôt :
+
+```sh
+heimdall init     # hook pre-commit + .env ignoré par Git + premier scan
+heimdall fix      # déplace chaque secret trouvé vers .env (validation Y/N)
+```
+
+Désormais, un commit qui contient un secret est bloqué. En CI :
+`heimdall scan --ci` (code 1 si un secret est trouvé).
+
+**Coffre chiffré local (optionnel)**, sans rien configurer à la main :
+
+```sh
+heimdall vault init                                  # clés, certificat TLS, config client
+heimdall vault serve                                 # démarre le Vault (laisser tourner)
+heimdall vault key create --project monprojet --save # dans un autre terminal
+heimdall vault push --project monprojet              # envoie votre .env chiffré
+heimdall run --project monprojet -- npm start        # secrets injectés en mémoire
+```
+
+`vault init` écrit tout dans `~/.config/heimdall` (droits privés) et n'écrase
+jamais rien. **Sauvegardez `~/.config/heimdall/server/server.env`** : sans lui,
+les secrets du Vault sont illisibles. Pour Docker :
+`heimdall vault init --docker <dossier du dépôt Heimdall>`.
+
+En cas d'erreur, ajoutez `--debug` pour voir la cause et l'action à faire
+(jamais de valeur secrète).
+
 ## Installation
 
 Python 3.10 ou supérieur. Voie vérifiée **en premier** (hashes SHA-256) :
