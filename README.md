@@ -504,3 +504,7 @@ Preuves : [`docs/t68-samm.md`](docs/t68-samm.md).
 Règles de contribution : [CONTRIBUTING.md](CONTRIBUTING.md).
 Jamais de vrai secret dans le dépôt, même expiré ; seul `.env.example`
 (noms sans valeurs) est versionné — `.env` est ignoré (voir `.gitignore`).
+
+## Licence
+
+Heimdall est distribué sous licence [Apache 2.0](LICENSE). Voir aussi [NOTICE](NOTICE).

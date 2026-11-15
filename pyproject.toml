@@ -8,14 +8,14 @@ version = "0.1.0"
 description = "Heimdall: 100 % local DevSecOps sentry. Deterministic secret interception, local agentic remediation (MCP/Ollama), encrypted on-premise vault sync."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Heimdall team" }]
 keywords = ["devsecops", "secrets", "vault", "mcp", "ollama"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "Environment :: Console",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Topic :: Security",

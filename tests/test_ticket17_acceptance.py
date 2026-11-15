@@ -162,10 +162,12 @@ class Ticket17AcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(ignored.returncode, 1, msg=".env.example doit rester versionnable")
 
-    def test_license_mit(self) -> None:
+    def test_license_apache(self) -> None:
         content = (ROOT / "LICENSE").read_text(encoding="utf-8")
-        self.assertTrue(content.strip())
-        self.assertIn("MIT", content)
+        self.assertIn("Apache License", content)
+        self.assertIn("Version 2.0, January 2004", content)
+        notice = (ROOT / "NOTICE").read_text(encoding="utf-8")
+        self.assertIn("Heimdall", notice)
 
     def test_readme_basics(self) -> None:
         content = (ROOT / "README.md").read_text(encoding="utf-8")
