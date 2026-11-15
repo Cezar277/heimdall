@@ -10,8 +10,9 @@ name: CI Security & Quality
 #   3. push sur `main` : preuve « pipeline vert sur main » après merge.
 #      (`workflow_dispatch` reste dispo pour le débogage : il ne publie PAS
 #      le check `CI (/ci)`, donc ne débloque pas une PR ; il est limité à main.)
-# Les PR de forks ne sont jamais exécutées sur le runner self-hosted. Le dispatch
-# de debug est limité à main.
+# Runners hébergés par GitHub (`ubuntu-latest`, VM jetable par job) : aucun
+# code de PR ne tourne sur une machine du projet. Les PR de forks restent
+# ignorées par `/ci` (garde inchangée). Le dispatch de debug est limité à main.
 #
 # Pourquoi un check publié à la main (`CI (/ci)`) et pas le check des jobs ?
 # GitHub n'évalue pour une PR que les checks des runs déclenchés par push /
@@ -55,7 +56,7 @@ jobs:
     # Job de confiance : résout la PR et publie le check « en attente ». Il ne
     # touche jamais au code de la PR — avec `report`, c'est le seul endroit
     # autorisé à écrire des checks.
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       pull-requests: read  # pulls.get : numéro de commit de merge
@@ -118,7 +119,7 @@ jobs:
               owner, repo, pull_number: prNumber,
             });
             if (!pr.head.repo || pr.head.repo.fork) {
-              core.notice('PR de fork ignorée : le runner self-hosted n’exécute pas de code de fork.');
+              core.notice('PR de fork ignorée : /ci ne lance pas de code de fork.');
               core.setOutput('has_pr', 'false');
               core.setOutput('run_tests', 'false');
               return;
@@ -188,7 +189,7 @@ jobs:
     # token privilégié n'est injecté dans ses steps.
     needs: resolve
     if: needs.resolve.outputs.run_tests == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read   # checkout uniquement
@@ -212,6 +213,11 @@ jobs:
             echo "::error::La PR a bougé pendant le lancement (HEAD=$tested, check=$EXPECTED_SHA). Relancez /ci."
             exit 1
           fi
+
+      - name: Python 3.10 (version de génération de requirements.lock)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
 
       - name: Install (requirements.lock, hashes SHA-256)
         run: |
@@ -265,7 +271,7 @@ jobs:
     # job `test`. Aucun checkout — il ne voit jamais le code de la PR.
     needs: [resolve, test]
     if: ${{ always() && needs.resolve.outputs.has_pr == 'true' }}
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       checks: write

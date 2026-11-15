@@ -34,12 +34,17 @@ permissions:
 
 jobs:
   validate:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Python 3.10 (version de génération de requirements.lock)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
 
       - name: Setup Python venv and install dependencies
         run: |
@@ -60,13 +65,18 @@ jobs:
           .venv/bin/bandit tests/contracts/fastapi_contract_fixture.py
           .venv/bin/ruff check --select S tests/contracts/fastapi_contract_fixture.py
 
+      - name: Node 24 (spectral-cli exige Node 22 ou >=24)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
       - name: Install npm dependencies
         # LOW-4 : Spectral figé par package-lock.json, installé via `npm ci`
         # (intégrité vérifiée) au lieu d'un `npx` sans vérification.
         # Node 22 ou >=24 requis par spectral-cli 6.17.0 ; .npmrc active
         # engine-strict pour échouer tôt sur une version incompatible.
         # Garde-temps : un registre npm accroché ne doit pas immobiliser le
-        # runner self-hosted (défaut 360 min).
+        # runner (défaut 360 min).
         timeout-minutes: 5
         run: |
           node --version

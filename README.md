@@ -321,8 +321,10 @@ openapi.yaml         contrat Vault API v1 (#15)
 
 Le workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (« CI Security
 & Quality ») exécute ruff, mypy (strict), bandit, les tests avec un seuil de
-couverture de 85 % (`pytest-cov`) et `pip-audit`, sur un runner **self-hosted**
-(comme les autres workflows) : zéro minute GitHub consommée.
+couverture de 85 % (`pytest-cov`) et `pip-audit`, sur les runners **hébergés par
+GitHub** (`ubuntu-latest`, Python 3.10 épinglé), comme les autres workflows :
+chaque job tourne dans une VM jetable, aucune machine du projet n'exécute le
+code d'une PR (gratuit pour un dépôt public).
 
 Il ne tourne volontairement **pas** à chaque push de branche (quota GitHub et
 bruit contenus) : sur une PR, deux déclencheurs équivalents, réservés aux
@@ -350,8 +352,8 @@ privilégié ni forger `CI (/ci)` (séparation des privilèges).
 
 Conséquence voulue : **sans `/ci` ni approbation, le check est absent et la PR
 reste bloquée** (« Waiting for status to be reported »). Les PR provenant d'un
-fork ne sont jamais exécutées sur le runner self-hosted ; elles doivent être
-proposées depuis une branche du dépôt pour passer cette CI. Après un nouveau
+fork ne sont pas lancées par `/ci` ; elles doivent être proposées depuis une
+branche du dépôt pour passer cette CI. Après un nouveau
 commit (y compris « Update branch »), relancer `/ci` (ou ré-approuver) — le
 check repart « en attente » puis passe au vert si tout passe.
 
@@ -359,7 +361,11 @@ En dehors des PR : `push` sur `main` (preuve « pipeline vert sur main ») et
 `workflow_dispatch` sur `main` uniquement (bouton *Run workflow*, pour
 déboguer — il ne publie pas le check, donc ne débloque pas une PR ; disponible
 une fois le workflow sur `main`). Les autres workflows (`Vault contract`, `Security model`,
-`OpenCode review`) gardent leurs propres déclencheurs.
+`Prompt injection corpus`) gardent leurs propres déclencheurs. La revue IA
+`OpenCode review` est désactivée : son workflow est archivé en
+`.github/workflows/opencode-review.yml.bak` (GitHub n'exécute que les `.yml` /
+`.yaml`) ; le renommer en `.yml` et recréer le secret `OPENCODE_API_KEY` la
+réactive.
 
 ### Exception réseau documentée : `pip-audit`
 
@@ -419,17 +425,15 @@ prouve l'absence de connexion sur ce chemin opérationnel.
 
   Rappel : ce ruleset ne remplace pas la revue humaine — il empêche seulement
   l'auteur de merger sa propre PR.
-- **Actions** (Settings > Actions > General) : garder l'approbation requise
-  pour les workflows déclenchés depuis un fork (« Require approval for all
-  outside collaborators »). **Exigence bloquante** — le runner `self-hosted`
-  exécute le code de la PR (après `/ci` ou approbation) : VM d'équipe
-  **dédiée et jetable** (ou restaurée par snapshot avant chaque run),
-  utilisateur dédié non-root, aucun secret ni donnée personnelle dessus ;
-  considérée comme compromise après chaque run. Les PR de forks ne tournent
-  pas sur ce runner. Jamais une machine perso.
-  **Avant merge**, joindre à la preuve SAMM la configuration attestant le
-  mode éphémère (par ex. runner enregistré avec `--ephemeral` ou snapshot
-  restauré/nettoyage post-job) ; le label `self-hosted` seul ne le prouve pas.
+- **Actions** (Settings > Actions > General) : exiger l'approbation des
+  workflows déclenchés depuis un fork (« Require approval for all external
+  contributors ») ; *Workflow permissions* sur « Read repository contents » ;
+  décocher « Allow GitHub Actions to create and approve pull requests ».
+  Aucun runner self-hosted : tous les workflows tournent sur `ubuntu-latest`
+  (VM jetable par job) et
+  `tests/security/test_ci_workflow_static.py::test_aucun_workflow_actif_sur_runner_self_hosted`
+  bloque toute régression. Ne jamais enregistrer de runner self-hosted sur ce
+  dépôt public (une PR de fork y exécuterait son code).
 - **Option** : « Require branches to be up to date before merging » augmente
   les re-runs — chaque « Update branch » exige de relancer `/ci` (ou
   ré-approuver) pour re-signaler le check. À n'activer que si nécessaire.
@@ -502,6 +506,7 @@ tronqués ou étendus sont également refusés (gardes de format/longueur).
 Preuves : [`docs/t68-samm.md`](docs/t68-samm.md).
 
 Règles de contribution : [CONTRIBUTING.md](CONTRIBUTING.md).
+Signaler une vulnérabilité (en privé) : [SECURITY.md](SECURITY.md).
 Jamais de vrai secret dans le dépôt, même expiré ; seul `.env.example`
 (noms sans valeurs) est versionné — `.env` est ignoré (voir `.gitignore`).
 

@@ -48,6 +48,7 @@ def test_actions_epinglees_par_sha() -> None:
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
         "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
+        "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
     ]
     assert sorted(uses) == sorted(expected)
 
@@ -83,8 +84,24 @@ def test_pas_de_pull_request_target_ni_pull_request() -> None:
     assert not re.search(r"^  pull_request:$", ACTIVE, re.MULTILINE)
 
 
-def test_runner_self_hosted_pour_tous_les_jobs() -> None:
-    assert set(re.findall(r"runs-on:\s*(\S+)", ACTIVE)) == {"self-hosted"}
+def test_runners_heberges_par_github_pour_tous_les_jobs() -> None:
+    assert set(re.findall(r"runs-on:\s*(\S+)", ACTIVE)) == {"ubuntu-latest"}
+
+
+def test_aucun_workflow_actif_sur_runner_self_hosted() -> None:
+    """Dépôt public : une PR (y compris de fork) ne doit jamais exécuter de
+    code sur une machine du projet. Seuls les `*.yml`/`*.yaml` sont lus par
+    GitHub ; un workflow archivé en `.bak` est inerte."""
+    workflows = sorted((REPO / ".github" / "workflows").glob("*.y*ml"))
+    assert workflows, "aucun workflow ?"
+    for workflow in workflows:
+        active = "\n".join(
+            line
+            for line in workflow.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        runners = set(re.findall(r"runs-on:\s*(\S+)", active))
+        assert runners == {"ubuntu-latest"}, f"{workflow.name}: {runners}"
 
 
 def test_separation_des_privileges_entre_check_et_code_de_pr() -> None:
