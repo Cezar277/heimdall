@@ -776,7 +776,12 @@ def test_m09_fix_preserves_bak_if_env_remediation_fails(tmp_path: Path) -> None:
             res = runner.invoke(app, ["fix", str(tmp_path)])
 
     assert res.exit_code == 2
-    assert (tmp_path / "app.py.bak").is_file()
+    # Le secret n'est jamais perdu : le source est restauré à l'identique
+    # (retour arrière), donc la sauvegarde devenue inutile est supprimée. Si
+    # la restauration est impossible, le `.bak` est conservé (voir
+    # test_fix_rollback_keeps_backup_when_source_changed_meanwhile).
+    assert app_file.read_text(encoding="utf-8") == f'API_KEY = "{_FAKE_SECRET}"\n'
+    assert not (tmp_path / "app.py.bak").exists()
 
 
 def test_m08_vault_run_previews_dangerous_injected_name(tmp_path: Path) -> None:

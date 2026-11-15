@@ -7,6 +7,10 @@
 7. ``VaultSettings`` applique la complexité de la clé maîtresse.
 8. Un secret ``rote`` (purgé par F-03) ne bloque plus la rotation de KEK.
 9. Un secret ``rote`` ou à l'état corrompu n'est ni déchiffré ni apparié.
+10. ``heimdall fix`` restaure le source si la mise à jour de ``.env`` échoue.
+11. ``heimdall fix`` n'écrase jamais un ``<fichier>.bak`` préexistant.
+12. ``heimdall fix`` ne propose qu'un plan par fichier et par passage.
+13. La jointure multiligne ne prend pas l'affectation suivante pour une valeur.
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ import sqlite3
 import subprocess  # nosec B404
 from contextlib import closing
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -25,8 +31,13 @@ from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from heimdall.cli import fix as fix_module
-from heimdall.cli.fix import _extract_secret_for_finding, _find_single_quoted_literal
+from heimdall.cli.fix import _extract_secret_for_finding, _find_single_quoted_literal, run_fix
 from heimdall.cli.main import app as cli_app
+from heimdall.cli.review import Choice, ReviewError, ReviewOutcome, ReviewReport
+from heimdall.cli.scan import collect
+from heimdall.remediation.apply import ApplyError, apply_replacement
+from heimdall.remediation.env import EnvRemediationError
+from heimdall.remediation.templates import build_replacement
 from heimdall.scanner.finding import Finding
 from heimdall.vault import store as vault_store
 from heimdall.vault.app import VaultSettings, create_app
@@ -414,3 +425,156 @@ def test_get_on_purged_secret_with_corrupted_status_is_404_not_500(
             conn.commit()
     response = client.get("/api/v1/secrets/myproj/prod/TOKEN", headers=headers)
     assert response.status_code == 404
+
+
+# -- 10/11. heimdall fix : retour arrière et sauvegarde préexistante ------------
+
+_FIX_SECRET = "AKIAIOSFODNN7EXAMPLE"  # noqa: S105 - clé d'exemple AWS documentée
+
+
+def _fix_repo(root: Path) -> Path:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)  # noqa: S603, S607  # nosec B603, B607
+    app_file = root / "app.py"
+    app_file.write_text(f'import os\nAPI_KEY = "{_FIX_SECRET}"\n', encoding="utf-8")
+    (root / ".gitignore").write_text(".env\n", encoding="utf-8")
+    return app_file
+
+
+def _validate_all(proposals: Any, *, apply: Any = None, **_kwargs: Any) -> ReviewReport:
+    """Revue simulée : valide chaque proposition comme `review_proposals`."""
+    outcomes = []
+    for proposal in proposals:
+        try:
+            apply(proposal)
+        except BaseException:
+            raise ReviewError from None
+        outcomes.append(ReviewOutcome(Choice.VALIDATE, True, 0, proposal))
+    return ReviewReport(tuple(outcomes), True)
+
+
+def test_fix_restores_source_when_env_update_fails(tmp_path: Path) -> None:
+    app_file = _fix_repo(tmp_path)
+    original = app_file.read_text(encoding="utf-8")
+    # `export` est refusé par le parseur strict : remediate_environment échoue
+    # APRÈS la réécriture du source.
+    (tmp_path / ".env").write_text("export FOO=bar\n", encoding="utf-8")
+    with (
+        patch("heimdall.cli.fix.review_proposals", side_effect=_validate_all),
+        pytest.raises(ReviewError),
+    ):
+        run_fix(tmp_path, interactive=True)
+    assert app_file.read_text(encoding="utf-8") == original
+    # Aucune copie du secret ne reste dans un `.bak` non ignoré.
+    assert not (tmp_path / "app.py.bak").exists()
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "export FOO=bar\n"
+
+
+def test_fix_rollback_keeps_backup_when_source_changed_meanwhile(tmp_path: Path) -> None:
+    """Si le source a bougé, la restauration est refusée et le `.bak` conservé."""
+    app_file = _fix_repo(tmp_path)
+
+    def _env_fails(*_args: object, **_kwargs: object) -> None:
+        app_file.write_text("modifié par un tiers\n", encoding="utf-8")
+        raise EnvRemediationError("échec simulé")
+
+    with (
+        patch("heimdall.cli.fix.review_proposals", side_effect=_validate_all),
+        patch("heimdall.cli.fix.remediate_environment", side_effect=_env_fails),
+        pytest.raises(ReviewError),
+    ):
+        run_fix(tmp_path, interactive=True)
+    assert app_file.read_text(encoding="utf-8") == "modifié par un tiers\n"
+    # Dernière copie de la valeur : jamais supprimée sans restauration.
+    assert _FIX_SECRET in (tmp_path / "app.py.bak").read_text(encoding="utf-8")
+
+
+def test_fix_never_overwrites_existing_backup(tmp_path: Path) -> None:
+    app_file = _fix_repo(tmp_path)
+    original = app_file.read_text(encoding="utf-8")
+    backup = tmp_path / "app.py.bak"
+    backup.write_text("sauvegarde personnelle\n", encoding="utf-8")
+    with patch("heimdall.cli.fix.review_proposals", side_effect=_validate_all):
+        report, remaining = run_fix(tmp_path, interactive=True)
+    assert report.applied == 0
+    assert remaining == 1
+    assert backup.read_text(encoding="utf-8") == "sauvegarde personnelle\n"
+    assert app_file.read_text(encoding="utf-8") == original
+
+
+def test_apply_replacement_refuses_existing_backup(tmp_path: Path) -> None:
+    app_file = _fix_repo(tmp_path)
+    source = app_file.read_text(encoding="utf-8")
+    (tmp_path / "app.py.bak").write_text("perso\n", encoding="utf-8")
+    plan = build_replacement("app.py", source, 2, _FIX_SECRET, "API_KEY")
+    with pytest.raises(ApplyError):
+        apply_replacement(tmp_path, plan)
+    assert app_file.read_text(encoding="utf-8") == source
+    assert (tmp_path / "app.py.bak").read_text(encoding="utf-8") == "perso\n"
+
+
+def test_fix_two_secrets_in_same_file_does_not_abort(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S603, S607  # nosec B603, B607
+    app_file = tmp_path / "app.py"
+    app_file.write_text(
+        f'import os\nAPI_KEY = "{_FIX_SECRET}"\nOTHER_KEY = "{_FIX_SECRET[:-1]}Z"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / ".gitignore").write_text(".env\n", encoding="utf-8")
+    with patch("heimdall.cli.fix.review_proposals", side_effect=_validate_all):
+        report, remaining = run_fix(tmp_path, interactive=True)
+    # Un seul plan appliqué, sans abandon du lot ; le second reste à traiter.
+    assert report.applied == 1
+    assert remaining == 1
+    assert 'os.environ["API_KEY"]' in app_file.read_text(encoding="utf-8")
+    # Le passage suivant traite le secret restant sur le contenu à jour.
+    with patch("heimdall.cli.fix.review_proposals", side_effect=_validate_all):
+        report, remaining = run_fix(tmp_path, interactive=True)
+    assert report.applied == 1
+    assert remaining == 0
+    assert _FIX_SECRET not in app_file.read_text(encoding="utf-8")
+
+
+# -- 13. jointure multiligne : affectations consécutives vides ------------------
+
+
+def _scan_types(tmp_path: Path, name: str, content: str) -> list[tuple[int, str]]:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S603, S607  # nosec B603, B607
+    (tmp_path / name).write_text(content, encoding="utf-8")
+    return sorted((f.line, f.type) for f in collect(tmp_path, staged=False).findings)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "API_KEY=\nOTHER_KEY=\n",
+        "DB_PASSWORD=\nAPI_TOKEN=\nAUTH_SECRET=\n",
+        'db_password:\n  "api_token": x\n',
+    ],
+)
+def test_consecutive_empty_assignments_are_not_a_secret(tmp_path: Path, content: str) -> None:
+    assert _scan_types(tmp_path, "f.env.example", content) == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "api_key:\n  Xq9-vR2pL7mK4tZ8wB1n\n",  # valeur YAML sur la ligne suivante
+        "API_KEY=\nXq9-vR2pL7mK4tZ8wB1n\n",
+    ],
+)
+def test_value_on_next_line_is_still_detected(tmp_path: Path, content: str) -> None:
+    assert (1, "credential") in _scan_types(tmp_path, "f.yaml", content)
+
+
+def test_fix_generated_env_example_is_clean_after_two_variables(tmp_path: Path) -> None:
+    """Le `.env.example` produit par `fix` ne déclenche plus de finding."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S603, S607  # nosec B603, B607
+    (tmp_path / "a.py").write_text(f'import os\nAPI_KEY = "{_FIX_SECRET}"\n', encoding="utf-8")
+    (tmp_path / "b.py").write_text(
+        f'import os\nOTHER_KEY = "{_FIX_SECRET[:-1]}Z"\n', encoding="utf-8"
+    )
+    (tmp_path / ".gitignore").write_text(".env\n", encoding="utf-8")
+    with patch("heimdall.cli.fix.review_proposals", side_effect=_validate_all):
+        report, remaining = run_fix(tmp_path, interactive=True)
+    assert report.applied == 2
+    assert remaining == 0

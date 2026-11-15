@@ -13,6 +13,7 @@ des ``Finding`` avec une empreinte HMAC (voir ``signature_engine``).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Final, Literal
 
@@ -112,6 +113,32 @@ def _matches_rotatifs(line: str) -> tuple[RuleMatch, ...]:
         if rule.id == ROTATING_RULE_ID:
             return rule.matches(line)
     return ()
+
+
+#: Ligne qui commence par sa propre affectation (``NOM=``, ``"nom":``,
+#: ``nom:``). Borné et linéaire (aucun quantificateur imbriqué).
+_OWN_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
+    r"[ \t]{0,64}[\"']?[A-Za-z_][A-Za-z0-9_.-]{0,128}[\"']?[ \t]{0,32}[:=]"
+)
+
+
+def crosses_into_own_assignment(match: SignatureMatch, boundary: int, joined: str) -> bool:
+    """Vrai si la « valeur » jointe n'est que l'affectation de la ligne suivante.
+
+    La jointure colle deux lignes sans séparateur pour reconstituer un secret
+    coupé. Quand la clé se termine exactement à la frontière (``API_KEY=``
+    vide) et que la ligne suivante est elle-même une affectation
+    (``OTHER_KEY=``), ``API_KEY=OTHER_KEY=`` n'est pas un secret : c'est un
+    ``.env.example`` (celui que ``heimdall fix`` génère). Une valeur seule sur
+    la ligne suivante (bloc YAML ``api_key:`` puis la valeur) reste détectée.
+    """
+    if not 0 < match.context_end <= boundary:
+        return False
+    # Entre la fin de la clé et la frontière : séparateur seul, donc la
+    # valeur commence sur la ligne suivante.
+    if joined[match.context_end : boundary].strip(" \t\"':=") != "":
+        return False
+    return _OWN_ASSIGNMENT.match(joined, boundary) is not None
 
 
 def find_signature_matches(line: str) -> tuple[SignatureMatch, ...]:

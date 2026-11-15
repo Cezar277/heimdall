@@ -25,8 +25,14 @@ from heimdall.cli.review import (
     review_proposals,
 )
 from heimdall.cli.scan import EXIT_CLEAN, EXIT_FINDINGS, ToolFailure, collect
-from heimdall.mcp.paths import PathEscape, confine
-from heimdall.remediation.apply import ApplyError, apply_replacement, cleanup_backup_file
+from heimdall.mcp.paths import ConfinedPath, PathEscape, confine
+from heimdall.remediation.apply import (
+    AppliedPatch,
+    ApplyError,
+    apply_replacement,
+    cleanup_backup_file,
+    undo_apply,
+)
 from heimdall.remediation.env import EnvRemediationError, remediate_environment
 from heimdall.remediation.naming import (
     _MAX_TAKEN,
@@ -162,6 +168,41 @@ def _extract_secret_for_finding(
     return None
 
 
+def _confine_fixable(root: Path, file: str, planned: set[str]) -> ConfinedPath | None:
+    """Confine le fichier du finding ; ``None`` s'il ne peut pas être remédié.
+
+    - Un ``<fichier>.bak`` déjà présent (sauvegarde de l'utilisateur, parfois
+      suivie par Git) serait écrasé par la sauvegarde de ``fix`` puis supprimé
+      au nettoyage : le finding reste non remédiable.
+    - Un fichier qui porte déjà une proposition dans ce passage est différé :
+      chaque plan est calculé sur le contenu d'origine, donc un second plan
+      sur le même fichier serait périmé dès l'application du premier (et le
+      diff validé par l'humain ne serait plus celui écrit). Le finding est
+      compté comme restant ; relancer ``fix`` le propose sur le contenu à jour.
+    """
+    try:
+        confined = confine(root, file)
+    except PathEscape:
+        return None
+    if confined.relative in planned:
+        return None
+    if os.path.lexists(confined.absolute.with_name(f"{confined.absolute.name}.bak")):
+        return None
+    return confined
+
+
+def _rollback_apply(root: Path, receipt: AppliedPatch) -> None:
+    """Annule une application dont la mise à jour de ``.env`` a échoué."""
+    try:
+        undo_apply(root, receipt)
+    except ApplyError:
+        return
+    try:
+        cleanup_backup_file(root, receipt)
+    except ApplyError:
+        return
+
+
 def _existing_env_names(root: Path) -> set[str]:
     """Collecte de façon bornée (<= _MAX_TAKEN + 1) les noms dans ``.env`` et ``.env.example``."""
     taken: set[str] = set()
@@ -234,12 +275,12 @@ def run_fix(  # noqa: PLR0913, PLR0915
     used_names = _existing_env_names(resolved_root)
     plans_by_finding: dict[Finding, tuple[ReplacementPlan, str]] = {}
     proposals: list[Proposal] = []
+    planned_files: set[str] = set()
     unfixable = 0
 
     for finding in _physical_findings(scan_report.findings):
-        try:
-            confined = confine(resolved_root, finding.file)
-        except PathEscape:
+        confined = _confine_fixable(resolved_root, finding.file, planned_files)
+        if confined is None:
             unfixable += 1
             continue
         source = read_file_secure_no_follow(confined.absolute)
@@ -272,6 +313,7 @@ def run_fix(  # noqa: PLR0913, PLR0915
             unfixable += 1
             continue
         used_names.add(variable)
+        planned_files.add(confined.relative)
         plans_by_finding[finding] = (plan, secret_value)
         proposals.append(proposal)
 
@@ -288,7 +330,16 @@ def run_fix(  # noqa: PLR0913, PLR0915
             raise ApplyError
         plan, secret_value = entry
         receipt = apply_replacement(resolved_root, plan, cleanup_backup=False)
-        remediate_environment(resolved_root, {plan.variable: secret_value})
+        try:
+            remediate_environment(resolved_root, {plan.variable: secret_value})
+        except BaseException:
+            # Le source ne référence plus le secret mais `.env` ne le contient
+            # pas : sans retour arrière, l'application casse et la seule copie
+            # du secret reste dans un `.bak` non ignoré. Restauration du source
+            # puis suppression du `.bak` (best-effort : en cas d'échec, le
+            # `.bak` est conservé, c'est la dernière copie de la valeur).
+            _rollback_apply(resolved_root, receipt)
+            raise
         cleanup_backup_file(resolved_root, receipt)
         try:
             current_id = _checked_root_identity(root, resolved_root)

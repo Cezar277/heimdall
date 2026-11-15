@@ -194,6 +194,10 @@ def apply_replacement(  # noqa: PLR0912
         current, mode = _read_current_secure(confined.absolute)
         if current != plan.before:
             raise ApplyError
+        if os.path.lexists(confined.absolute.with_name(f"{confined.absolute.name}.bak")):
+            # Ne jamais écraser (puis supprimer au nettoyage) un `.bak`
+            # préexistant : il appartient à l'utilisateur, parfois suivi par Git.
+            raise ApplyError
         try:
             backup = backup_file(confined.absolute)
         except ValueError:
